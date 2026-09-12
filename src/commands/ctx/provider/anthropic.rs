@@ -32,6 +32,12 @@ const MAX_ERROR_BODY_BYTES: u64 = 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 const STREAM_EVENT_QUEUE: usize = 256;
+/// Bounds how long the worker's blocking body read may go without new bytes
+/// before it loops back and rechecks cancellation. The real first-event/idle
+/// deadlines are enforced independently by `perform()`'s wall-clock loop, so
+/// this only bounds how promptly a cancelled or timed-out worker notices and
+/// exits instead of blocking for up to `AnthropicTimeouts::idle`.
+const WORKER_READ_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnthropicTimeouts {
@@ -285,7 +291,7 @@ impl AnthropicMessagesAdapter {
             .http_status_as_error(false)
             .timeout_connect(Some(self.timeouts.connect))
             .timeout_recv_response(Some(self.timeouts.first_event))
-            .timeout_recv_body(Some(self.timeouts.idle))
+            .timeout_recv_body(Some(WORKER_READ_POLL))
             .build()
             .into();
         let payload = serde_json::to_string(&encoded.body).map_err(|error| {
@@ -768,26 +774,39 @@ fn parse_sse<R: BufRead>(
     let mut accumulator = Accumulator::default();
     let mut event_name = String::new();
     let mut data = String::new();
+    let mut line = String::new();
     loop {
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
-        let mut line = String::new();
-        let read = (&mut reader)
-            .take((MAX_SSE_LINE_BYTES + 1) as u64)
-            .read_line(&mut line)
-            .map_err(|error| {
+        let remaining = (MAX_SSE_LINE_BYTES + 1).saturating_sub(line.len());
+        let read = match (&mut reader).take(remaining as u64).read_line(&mut line) {
+            Ok(read) => read,
+            Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) {
-                    timeout_failure(accumulator.saw_event, target)
-                } else if error.kind() == std::io::ErrorKind::InvalidData {
-                    invalid_stream("Anthropic SSE contains invalid UTF-8".into())
-                } else {
-                    transport_failure(format!("Anthropic stream read failed: {error}"), target)
-                }
-            })?;
+                ) =>
+            {
+                // The worker's socket read is bounded to WORKER_READ_POLL so it
+                // can notice cancellation promptly; real first-event/idle
+                // deadlines are enforced independently by perform()'s
+                // wall-clock loop, so a bare poll timeout is not itself a
+                // stream failure here.
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(invalid_stream(
+                    "Anthropic SSE contains invalid UTF-8".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(transport_failure(
+                    format!("Anthropic stream read failed: {error}"),
+                    target,
+                ));
+            }
+        };
         if read == 0 {
             if !event_name.is_empty() || !data.is_empty() {
                 process_sse_event(&event_name, &data, &mut accumulator, sink, target)?;
@@ -808,6 +827,7 @@ fn parse_sse<R: BufRead>(
                 event_name.clear();
                 data.clear();
             }
+            line.clear();
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("event:") {
@@ -818,6 +838,7 @@ fn parse_sse<R: BufRead>(
             }
             data.push_str(value.trim_start());
         }
+        line.clear();
     }
 
     if !accumulator.saw_stop {
@@ -1547,6 +1568,43 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_mid_stream_tears_down_the_worker_promptly() {
+        let prefix = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-5\",\"usage\":{}}}\n\n";
+        let (url, server_observed_close) = slow_body_server(prefix);
+        let adapter = AnthropicMessagesAdapter::new(
+            target(url),
+            credential(),
+            AnthropicTimeouts {
+                connect: Duration::from_secs(1),
+                first_event: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let flag = Arc::new(super::super::adapter::CancellationFlag::default());
+        let canceller = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+        });
+        let error = adapter
+            .stream(&request(), flag.as_ref(), &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(error.class, FailureClass::Cancelled);
+
+        // perform() already returned; the worker's TCP read must not linger
+        // for anywhere near ureq's own (multi-second) recv-body budget.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !server_observed_close.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not close its TCP connection within 2s of cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
     fn status_failures_have_stable_class_scope_request_id_and_retry_hint() {
         let target = target("https://api.anthropic.com".into());
         for (status, body, class, scope, retryable) in [
@@ -1848,6 +1906,38 @@ mod tests {
             let _ = stream.write_all(suffix.as_bytes());
         });
         (format!("http://{address}"), receiver)
+    }
+
+    /// Sends `prefix` but declares a much larger `Content-Length` and then
+    /// never sends the rest, simulating a connection stalled mid-stream.
+    /// Reports (via the returned flag) whether it observed the client side
+    /// of the connection close, which is how a test can prove a cancelled
+    /// worker actually tore down its TCP read instead of leaking it.
+    fn slow_body_server(prefix: &'static str) -> (String, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let server_closed = Arc::clone(&closed);
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            let declared_length = prefix.len() + 4096;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n{prefix}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0u8; 64];
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => server_closed.store(true, Ordering::Release),
+                Ok(_) => {}
+            }
+        });
+        (format!("http://{address}"), closed)
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {
