@@ -1245,6 +1245,39 @@ into a review or verify step, so a review/verify gate the initial `workflow
 start` measurement missed (an empty tree, before any code existed) still gets
 added once the real change exists.
 
+### Linked worktrees
+
+A workflow started in a repository's main checkout is discoverable, and
+gated, from any `git worktree add`-linked sibling of it (and vice versa):
+`--repo <path>` (or the current directory when it is omitted) resolves to the
+repository's identity through its shared `.git` common dir, so `zirv workflow
+status|advance|review package <id> --repo <worktree>` finds the same
+workflow `zirv workflow start` created in the main checkout, and bare `zirv
+workflow status` run from inside the worktree sees its active-workflow
+pointer too.
+
+Finding the workflow is only half of it: once found, every subsequent
+change-set check (the `Test`/`Verify` evidence gate, `review package`'s diff
+and fingerprint, frontend detection) measures the literal path the command
+was actually invoked with, not wherever the workflow happened to be started.
+This is what lets the common orchestrator/worker split work correctly: start
+the workflow in the main checkout, have a worker implement and run `zirv test
+changed` in `<repo>/.claude/worktrees/<name>`, then `zirv workflow advance
+<id> --outcome success --repo <repo>/.claude/worktrees/<name>` -- the gate
+sees the worktree's real change set, the same one the evidence was recorded
+against, not the main checkout's clean tree. `zirv workflow classify` and
+`zirv workflow start` behave the same way: pointed at a worktree (`--repo` or
+plain cwd), they measure that worktree's own branch diff against its base,
+not an empty diff off an unrelated main checkout still sitting on the base
+branch.
+
+No new flag was added for this: `--repo` (already accepted by every verb
+above) is sufficient once resolution and the change-set measurement both key
+off the literal path given, rather than off the workflow's own persisted
+`repo` field. The one unsupported edge case is a main checkout whose `.git`
+was relocated with `git init --separate-git-dir=...`; its worktree siblings
+are not resolved to it.
+
 ### Deploy tiers
 
 `[workflow.deploy] tier = "development" | "staging" | "production"` in
