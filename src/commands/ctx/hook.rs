@@ -1348,7 +1348,10 @@ fn verify_on_stop_nudge(
     }
     // Any doubt here (no git, no repo, ...) reads as "fresh": a nudge is
     // advisory, never worth a false positive over an unreadable repo state.
-    if verification::latest_is_fresh_and_passing(state, repo, false).unwrap_or(true) {
+    // No specific workflow branch in view here (a generic advisory nudge),
+    // so this never widens to a sibling worktree's evidence -- see
+    // `latest_is_fresh_and_passing`'s own doc comment.
+    if verification::latest_is_fresh_and_passing(state, repo, false, None).unwrap_or(true) {
         return None;
     }
     let changed = verification::changed_paths(repo).ok()?;
