@@ -1248,35 +1248,42 @@ added once the real change exists.
 ### Linked worktrees
 
 A workflow started in a repository's main checkout is discoverable, and
-gated, from any `git worktree add`-linked sibling of it (and vice versa):
-`--repo <path>` (or the current directory when it is omitted) resolves to the
-repository's identity through its shared `.git` common dir, so `zirv workflow
-status|advance|review package <id> --repo <worktree>` finds the same
-workflow `zirv workflow start` created in the main checkout, and bare `zirv
-workflow status` run from inside the worktree sees its active-workflow
-pointer too.
+gated, from any `git worktree add`-linked sibling of it (and vice versa).
+This is narrowly scoped to two things -- every other piece of per-repository
+state (crash witnesses, handoffs, telemetry, test baselines, mail, ...) stays
+keyed by the literal checkout a session or process actually runs in, never
+merged across worktrees:
 
-Finding the workflow is only half of it: once found, every subsequent
-change-set check (the `Test`/`Verify` evidence gate, `review package`'s diff
-and fingerprint, frontend detection) measures the literal path the command
-was actually invoked with, not wherever the workflow happened to be started.
-This is what lets the common orchestrator/worker split work correctly: start
-the workflow in the main checkout, have a worker implement and run `zirv test
-changed` in `<repo>/.claude/worktrees/<name>`, then `zirv workflow advance
-<id> --outcome success --repo <repo>/.claude/worktrees/<name>` -- the gate
-sees the worktree's real change set, the same one the evidence was recorded
-against, not the main checkout's clean tree. `zirv workflow classify` and
-`zirv workflow start` behave the same way: pointed at a worktree (`--repo` or
-plain cwd), they measure that worktree's own branch diff against its base,
-not an empty diff off an unrelated main checkout still sitting on the base
-branch.
+- **Workflow-state lookup.** `--repo <path>` (or the current directory when
+  it is omitted) resolves through the repository's shared `.git` common dir,
+  so `zirv workflow status|advance|review package <id> --repo <worktree>`
+  finds the same workflow `zirv workflow start` created in the main checkout,
+  and bare `zirv workflow status` run from inside the worktree sees its
+  active-workflow pointer too.
+- **The `Test`/`Verify` evidence gate's read side.** `zirv test changed`
+  always records its evidence under the literal checkout it ran in --
+  concurrent runs in sibling worktrees never clobber each other's evidence.
+  The gate itself widens only its read: if the checkout it is evaluated from
+  has no fresh, passing evidence of its own, it also checks every sibling
+  checkout for evidence that is fresh and passing against *that sibling's
+  own* tree. This is what lets the common orchestrator/worker split work
+  correctly: start the workflow in the main checkout, have a worker implement
+  and run `zirv test changed` in `<repo>/.claude/worktrees/<name>`, then
+  `zirv workflow advance <id> --outcome success` from the main checkout (or
+  `--repo <repo>/.claude/worktrees/<name>`, either finds the same evidence) --
+  the gate sees the worktree's real, fresh evidence rather than the main
+  checkout's clean, evidence-less tree.
+
+`zirv workflow classify`/`start` needed no change here: `git diff --numstat
+<base>` already measures whichever repository it is given, so pointed at a
+worktree (`--repo` or plain cwd) it already saw that worktree's own branch
+diff against its base, not an empty diff off an unrelated main checkout still
+sitting on the base branch.
 
 No new flag was added for this: `--repo` (already accepted by every verb
-above) is sufficient once resolution and the change-set measurement both key
-off the literal path given, rather than off the workflow's own persisted
-`repo` field. The one unsupported edge case is a main checkout whose `.git`
-was relocated with `git init --separate-git-dir=...`; its worktree siblings
-are not resolved to it.
+above) is sufficient. The one unsupported edge case is a main checkout whose
+`.git` was relocated with `git init --separate-git-dir=...`; its worktree
+siblings are not resolved to it.
 
 ### Deploy tiers
 
