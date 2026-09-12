@@ -14,7 +14,7 @@ use super::deploy::DeployTier;
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
-    StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
+    StateDir, create_private_dir_all, now_secs, workflow_identity_slug, write_private,
 };
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
@@ -1090,7 +1090,11 @@ pub struct UsageCheckpoint {
 }
 
 fn repo_dir(state: &StateDir, repo: &Path) -> PathBuf {
-    state.workflows().join(repo_slug(repo))
+    // Issue #467 review: `workflow_identity_slug`, not plain `repo_slug` --
+    // workflow state is one of the two places a linked worktree and its main
+    // checkout must share a key. See that function's own doc comment for why
+    // this is deliberately not `repo_slug`'s default behavior.
+    state.workflows().join(workflow_identity_slug(repo))
 }
 
 fn state_path(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
@@ -1158,17 +1162,22 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
         .into());
     }
     // Issue #467: retarget to the literal `repo` this lookup was actually
-    // reached through. `state_path` above already resolved via `repo_slug`,
-    // which folds a linked worktree back to its main checkout's identity
-    // (`pathutil::worktree_identity`) -- so reaching this point means `repo`
-    // and the persisted `value.repo` are the SAME repository, just possibly
-    // different checkouts of it. Every downstream evidence/change-set check
-    // that reads `state.repo` (`advance`'s Test/Verify/Review gates,
+    // reached through. `state_path` above already resolved via
+    // `workflow_identity_slug`, which folds a linked worktree back to its
+    // main checkout's identity (`pathutil::worktree_identity`) -- so
+    // reaching this point means `repo` and the persisted `value.repo` are
+    // the SAME repository, just possibly different checkouts of it. Every
+    // downstream check that reads `state.repo` (`advance`'s Review gate,
     // `review package`'s diff and fingerprint, frontend detection, ...) must
     // measure wherever the caller actually is, not wherever the workflow
     // happened to be started -- that mismatch (main checkout clean, worktree
-    // dirty) was the whole bug. A no-op in the ordinary single-checkout case,
-    // where `repo` already equals `value.repo`.
+    // dirty) was the whole bug. The Test/Verify evidence gate itself no
+    // longer strictly needs this (it widens its own read across every
+    // sibling checkout, see `verification::latest_is_fresh_and_passing`),
+    // but retargeting still makes the immediate, no-widening-needed case
+    // (evidence and gate check both reached through the SAME worktree) the
+    // common one. A no-op in the ordinary single-checkout case, where `repo`
+    // already equals `value.repo`.
     value.repo = repo.to_path_buf();
     Ok(value)
 }
@@ -3616,6 +3625,11 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only this test module still reads the LITERAL-checkout slug directly
+    // (to locate `verification`'s own, deliberately non-identity-redirected
+    // report directory); production code here now goes through
+    // `workflow_identity_slug` exclusively, via `repo_dir`.
+    use crate::commands::ctx::state::repo_slug;
     use tempfile::tempdir;
 
     fn low_classification() -> Classification {
@@ -4848,7 +4862,7 @@ mod tests {
     /// status` -- run from inside the worktree -- goes through). Before
     /// #467 both returned "unknown workflow"/"no active workflow": the main
     /// checkout and the worktree keyed two different, unrelated state
-    /// directories under `repo_slug`.
+    /// directories under plain `repo_slug`.
     #[test]
     fn workflow_started_in_the_main_checkout_is_found_from_a_linked_worktree() {
         let main_repo = tempdir().unwrap();
