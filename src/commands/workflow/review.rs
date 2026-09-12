@@ -768,6 +768,23 @@ pub fn default_base(repo: &Path) -> CtxResult<String> {
     git(repo, &["rev-parse", "HEAD"])
 }
 
+/// Like [`default_base`], but resolves relative to `branch` (a ref name)
+/// rather than `HEAD` -- issue #467's `--branch`: the checkout given as
+/// `repo` need not have `branch` checked out at all, so the base must be
+/// found by asking git about the ref directly, never by inspecting whatever
+/// happens to be checked out.
+pub fn default_base_for(repo: &Path, branch: &str) -> CtxResult<String> {
+    let parent = format!("{branch}^");
+    for candidate in ["origin/main", "main", parent.as_str()] {
+        if let Ok(base) = git(repo, &["merge-base", branch, candidate])
+            && !base.is_empty()
+        {
+            return Ok(base);
+        }
+    }
+    git(repo, &["rev-parse", branch])
+}
+
 fn read_capped_head(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     let mut kept = Vec::with_capacity(cap);
     let mut truncated = false;
@@ -5102,6 +5119,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             mode: verification::VerificationMode::Final,
             source: "configured".into(),
             repo: repo.to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
