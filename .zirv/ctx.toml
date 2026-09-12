@@ -31,6 +31,8 @@
 # active key in this file -- every other key below is commented out.
 model = "fable"
 
+# claude_permission_mode = "default"  # REPO-FORBIDDEN (ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE): overrides the INTERACTIVE launch's Claude Code --permission-mode ("default" | "acceptEdits" | "bypassPermissions"). Default: unset (behaves as "default"). Headless launches always stay "dontAsk" regardless of this key.
+
 # [review]                          # every key below is REPO-FORBIDDEN (ZIRV_CTX_REVIEW_MODEL_CLAUDE / ZIRV_CTX_REVIEW_MODEL_CODEX)
 # claude = "opus"                   # code-review model for a claude harness. Default: unset (one tier below the orchestrator seat's model on claude's ladder -- see AgentAdapter::review_model_below).
 # codex = "gpt-5.6-terra"           # code-review model for a codex harness. Default: unset (one tier below the seat on codex's own ladder).
