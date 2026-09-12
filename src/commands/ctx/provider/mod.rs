@@ -6,6 +6,7 @@ pub mod capability;
 pub mod config;
 pub mod credential;
 pub mod inventory;
+pub mod openai;
 pub mod probe;
 pub mod transport;
 
