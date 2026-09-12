@@ -21,6 +21,7 @@ use crate::commands::ctx::config::EnvLookup;
 use crate::commands::ctx::runtime::context::{
     CompiledNativeContext, MessageRole as ContextMessageRole,
 };
+use crate::commands::ctx::runtime::journal::{AssistantBlock, ToolCallId};
 use crate::commands::ctx::runtime::tools::ToolDefinition;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +170,74 @@ pub enum ProviderContent {
         #[serde(default)]
         is_error: bool,
     },
+    /// A provider-declared refusal. It is assistant output, but never
+    /// ordinary assistant text: the journal keeps it as its own block kind
+    /// and a provider whose protocol has no refusal content rejects it
+    /// rather than replaying it as prose.
+    Refusal {
+        text: String,
+    },
+}
+
+/// Projects one turn of provider content onto the N03 journal's block model
+/// so a same-route replay can rebuild the exact assistant message, opaque
+/// continuation material included. Tool *arguments* are not carried here:
+/// the journal owns complete tool calls in their own records, and a block
+/// only references the call id.
+pub fn journal_blocks(content: &[ProviderContent]) -> Result<Vec<AssistantBlock>, ProviderFailure> {
+    content
+        .iter()
+        .map(|block| match block {
+            ProviderContent::Text { text } => Ok(AssistantBlock::Text { text: text.clone() }),
+            ProviderContent::Refusal { text } => Ok(AssistantBlock::Refusal { text: text.clone() }),
+            ProviderContent::Thinking {
+                thinking,
+                signature,
+            } => Ok(AssistantBlock::Thinking {
+                text: thinking.clone(),
+                signature: Some(signature.clone()),
+            }),
+            ProviderContent::RedactedThinking { data } => {
+                Ok(AssistantBlock::RedactedThinking { data: data.clone() })
+            }
+            ProviderContent::ToolUse { id, .. } => ToolCallId::new(id.clone())
+                .map(|tool_call| AssistantBlock::ToolCall { tool_call })
+                .map_err(|error| {
+                    ProviderFailure::new(
+                        FailureClass::InvalidToolArguments,
+                        FailureScope::request(),
+                        error.to_string(),
+                    )
+                }),
+            ProviderContent::ToolResult { .. } => Err(ProviderFailure::new(
+                FailureClass::Configuration,
+                FailureScope::request(),
+                "tool results are user content and never part of an assistant message",
+            )),
+        })
+        .collect()
+}
+
+/// The inverse projection used when a stored turn is replayed into the next
+/// request. `ToolCall` yields `None` because its arguments live in the
+/// journal's tool-call record, not in the block.
+pub fn replayed_content(block: &AssistantBlock) -> Option<ProviderContent> {
+    match block {
+        AssistantBlock::Text { text } => Some(ProviderContent::Text { text: text.clone() }),
+        AssistantBlock::Refusal { text } => Some(ProviderContent::Refusal { text: text.clone() }),
+        AssistantBlock::Thinking { text, signature } => {
+            signature
+                .as_ref()
+                .map(|signature| ProviderContent::Thinking {
+                    thinking: text.clone(),
+                    signature: signature.clone(),
+                })
+        }
+        AssistantBlock::RedactedThinking { data } => {
+            Some(ProviderContent::RedactedThinking { data: data.clone() })
+        }
+        AssistantBlock::ToolCall { .. } => None,
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,6 +567,44 @@ pub(crate) fn resolve_target(
 mod tests {
     use super::*;
     use crate::commands::ctx::provider::credential::FakeStore;
+
+    #[test]
+    fn assistant_blocks_round_trip_through_the_journal_model() {
+        let content = vec![
+            ProviderContent::Thinking {
+                thinking: "summary".into(),
+                signature: super::super::OpaqueProviderData::new(
+                    serde_json::json!({"type":"reasoning","id":"rs_1"}),
+                ),
+            },
+            ProviderContent::Refusal { text: "no".into() },
+            ProviderContent::ToolUse {
+                id: "call_1".into(),
+                name: "file_read".into(),
+                input: serde_json::json!({}),
+            },
+        ];
+        let blocks = journal_blocks(&content).unwrap();
+        assert!(matches!(blocks[1], AssistantBlock::Refusal { .. }));
+        assert!(matches!(
+            &blocks[2],
+            AssistantBlock::ToolCall { tool_call } if tool_call.as_str() == "call_1"
+        ));
+        assert_eq!(replayed_content(&blocks[0]), Some(content[0].clone()));
+        assert_eq!(replayed_content(&blocks[1]), Some(content[1].clone()));
+        assert_eq!(replayed_content(&blocks[2]), None);
+    }
+
+    #[test]
+    fn tool_results_are_never_assistant_blocks() {
+        let error = journal_blocks(&[ProviderContent::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "ok".into(),
+            is_error: false,
+        }])
+        .unwrap_err();
+        assert_eq!(error.class, FailureClass::Configuration);
+    }
 
     #[test]
     fn cancellation_flag_is_monotonic() {
