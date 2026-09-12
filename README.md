@@ -1543,6 +1543,23 @@ credential-gated live contract test cover the provider boundary; N09 owns
 wiring this adapter into the durable agent loop. The transport contract is in
 [`docs/design/2026-09-12-native-anthropic-provider.md`](docs/design/2026-09-12-native-anthropic-provider.md).
 
+The second direct-model adapter speaks OpenAI's Responses API the same way --
+raw HTTPS/SSE to `POST /v1/responses`, with no Codex binary, Codex SDK, or
+Codex App Server in the path. Zirv owns the conversation: every request sends
+`store: false` with the full local history, and `previous_response_id` is
+never used as durable state. Reasoning items keep their id and encrypted
+content verbatim for replay and are refused when they reach a provider that
+cannot carry them; function calls commit only from a completed output item
+whose arguments match the streamed ones, an incomplete response drops every
+function call and records why, and a stream without a terminal event is a
+typed error rather than a completion. Only a Platform API key is accepted: a
+ChatGPT/Codex subscription login is refused with an entitlement error instead
+of being billed as API usage. Controls are validated against exact API model
+ids -- a Codex harness model id is not assumed to be a Responses model. The
+routes are fixture-verified with live validation still pending; the contract
+is in
+[`docs/design/2026-09-12-native-openai-provider.md`](docs/design/2026-09-12-native-openai-provider.md).
+
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
 honest against the real command surface and source tree: every command verb
