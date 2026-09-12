@@ -19,8 +19,8 @@ use std::io::Write;
 use serde_json::{Map, Value, json};
 
 use super::wire::{
-    self, ADVERTISED, ApiEvent, Capability, ErrorCode, FieldSpec, InputMode, Method,
-    PROTOCOL_VERSION, SERVER_NAME, SessionFacts, SessionState, WaitUntil,
+    self, ADVERTISED, ApiEvent, AttachMode, AttachRole, Capability, ErrorCode, FieldSpec,
+    InputMode, Method, PROTOCOL_VERSION, SERVER_NAME, SessionFacts, SessionState, WaitUntil,
 };
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::runtime::{RuntimeKind, UiSurface};
@@ -62,7 +62,29 @@ pub fn vocabularies() -> Vec<(&'static str, Vec<String>)> {
         ),
         (
             "input_mode",
-            names(&[InputMode::Submit, InputMode::Steer, InputMode::Unknown]),
+            names(&[
+                InputMode::Submit,
+                InputMode::Steer,
+                InputMode::Raw,
+                InputMode::Unknown,
+            ]),
+        ),
+        (
+            "attach_mode",
+            names(&[
+                AttachMode::Observer,
+                AttachMode::Controller,
+                AttachMode::Unknown,
+            ]),
+        ),
+        (
+            "attach_role",
+            names(&[
+                AttachRole::Controller,
+                AttachRole::Observer,
+                AttachRole::Detached,
+                AttachRole::Unknown,
+            ]),
         ),
         (
             "runtime_kind",
@@ -126,6 +148,7 @@ fn event_kinds() -> Vec<String> {
         ApiEvent::SessionEnded {
             session_id: "s".to_string(),
         },
+        ApiEvent::ControllerChanged { controller: None },
         ApiEvent::Heartbeat,
         ApiEvent::Unknown,
     ]
