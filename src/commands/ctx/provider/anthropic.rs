@@ -30,6 +30,7 @@ use crate::commands::ctx::config::EnvLookup;
 const API_VERSION: &str = "2023-06-01";
 const MAX_ERROR_BODY_BYTES: u64 = 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_BLOCK_ACCUMULATOR_BYTES: usize = 16 * 1024 * 1024;
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 const STREAM_EVENT_QUEUE: usize = 256;
 /// Bounds how long the worker's blocking body read may go without new bytes
@@ -971,6 +972,7 @@ fn process_sse_event(
                     let BlockState::Text(buffer) = state else {
                         return Err(invalid_stream("text delta on non-text block".into()));
                     };
+                    check_block_accumulator_cap(buffer.len(), text.len())?;
                     buffer.push_str(&text);
                     sink.push(ProviderStreamEvent::TextDelta { index, text });
                 }
@@ -981,6 +983,7 @@ fn process_sse_event(
                             "thinking delta on non-thinking block".into(),
                         ));
                     };
+                    check_block_accumulator_cap(buffer.len(), text.len())?;
                     buffer.push_str(&text);
                     sink.push(ProviderStreamEvent::ThinkingDelta { index, text });
                 }
@@ -1007,6 +1010,7 @@ fn process_sse_event(
                     else {
                         return Err(invalid_stream("tool input delta on non-tool block".into()));
                     };
+                    check_block_accumulator_cap(buffer.len(), partial_json.len())?;
                     buffer.push_str(&partial_json);
                     sink.push(ProviderStreamEvent::ToolInputDelta {
                         index,
@@ -1157,6 +1161,22 @@ fn invalid_stream(message: String) -> ProviderFailure {
         FailureScope::request(),
         message,
     )
+}
+
+/// Rejects a content block whose accumulated text/thinking/partial-JSON
+/// buffer would exceed `MAX_BLOCK_ACCUMULATOR_BYTES` once the next delta is
+/// appended, settling the stream to the same typed failure class used for an
+/// oversized SSE line instead of growing the buffer without bound.
+fn check_block_accumulator_cap(
+    current_len: usize,
+    delta_len: usize,
+) -> Result<(), ProviderFailure> {
+    if current_len.saturating_add(delta_len) > MAX_BLOCK_ACCUMULATOR_BYTES {
+        return Err(invalid_stream(format!(
+            "Anthropic content block exceeds {MAX_BLOCK_ACCUMULATOR_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn cancelled() -> ProviderFailure {
@@ -1474,6 +1494,40 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.class, FailureClass::InvalidToolArguments);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::BlockCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn oversized_content_block_settles_to_invalid_stream() {
+        let target = target("https://api.anthropic.com".into());
+        // Each individual SSE line stays well under MAX_SSE_LINE_BYTES; only
+        // the cumulative text_delta payload across many lines crosses
+        // MAX_BLOCK_ACCUMULATOR_BYTES, exercising the new per-block cap
+        // rather than the pre-existing per-line cap.
+        let chunk = "a".repeat(900_000);
+        let overflow_deltas = MAX_BLOCK_ACCUMULATOR_BYTES / chunk.len() + 2;
+        let mut stream = String::from(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        );
+        for _ in 0..overflow_deltas {
+            stream.push_str(&format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{chunk}\"}}}}\n\n"
+            ));
+        }
+        let mut events = Vec::new();
+        let error = parse_sse(
+            BufReader::new(stream.as_bytes()),
+            None,
+            &super::super::adapter::NeverCancelled,
+            &mut events,
+            &target,
+        )
+        .unwrap_err();
+        assert_eq!(error.class, FailureClass::InvalidStream);
         assert!(
             !events
                 .iter()
