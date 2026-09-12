@@ -9122,6 +9122,14 @@ fn next_deliverable(queue: &mut VecDeque<String>, injectable: bool) -> Option<St
 pub(crate) trait Injector {
     fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()>;
     fn track_delivery_sender(&mut self, _sender: &str) {}
+    /// Issue #468: this pane's own attention-block dedup pairing -- see
+    /// `Pane::mail_block_log`'s own doc comment. Defaults to `None`/no-op for
+    /// an injector double that does not exercise the dedup itself; a fake
+    /// that does must back this with real storage the way `Pane` does.
+    fn mail_block_log(&self) -> Option<&(&'static str, String)> {
+        None
+    }
+    fn set_mail_block_log(&mut self, _value: Option<(&'static str, String)>) {}
 }
 
 impl Injector for Pane {
@@ -9131,6 +9139,14 @@ impl Injector for Pane {
 
     fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
         self.inject_visible(label, body)
+    }
+
+    fn mail_block_log(&self) -> Option<&(&'static str, String)> {
+        self.mail_block_log.as_ref()
+    }
+
+    fn set_mail_block_log(&mut self, value: Option<(&'static str, String)>) {
+        self.mail_block_log = value;
     }
 }
 
@@ -9218,6 +9234,88 @@ fn mail_injection_label(from_agent: &str, from_session: &str, is_parent: bool) -
     )
 }
 
+/// Issue #468: whether a mail sweep target may be typed into a pane right
+/// now, given `status` (`attention::load`'s own return for this pane), and
+/// the specific [`attention::Attention`] blocking it when it may not.
+///
+/// `Pane::injectable`'s turn-signal gate (the caller's own precondition
+/// before either `sweep_one_pane` or `advise_one_pane` is even reached) is
+/// silent about WHY a pane looks idle: a Claude permission dialog pauses the
+/// harness between the model's own turns, so the turn-signal side can report
+/// idle while the hook-driven attention axis still latches
+/// `Attention::Approval` (see `attention.rs`'s own doc comment on the
+/// `AdapterHook`/`Supervisor` authority split, and #456/#457, which taught
+/// hooks to clear that latch again once the prompt resolves). Typing into a
+/// pane in that state lands as raw keystrokes on the open dialog -- exactly
+/// the "must not answer the prompt" failure this function exists to
+/// prevent.
+///
+/// `Projection::Blocked(Attention::None)` (a bare `Lifecycle::Waiting` with
+/// no named reason) is deliberately NOT treated as blocking: nothing in this
+/// codebase currently latches that combination from a live hook, and
+/// treating it as a mail block would risk silently withholding an ordinary
+/// advisory from a session that is simply waiting on its next prompt.
+fn mail_blocked_by_attention(
+    status: &super::attention::SessionStatus,
+) -> Option<super::attention::Attention> {
+    match super::attention::project(status) {
+        super::attention::Projection::Blocked(super::attention::Attention::None) => None,
+        super::attention::Projection::Blocked(attention) => Some(attention),
+        _ => None,
+    }
+}
+
+/// Pure: the decision-log skip reason named by issue #468's own acceptance
+/// criterion (`approval-open`) for [`attention::Attention::Approval`], and an
+/// analogous reason for every other variant [`mail_blocked_by_attention`] can
+/// return -- so a skip row is never just "blocked" with no way to tell which
+/// latch caused it.
+fn mail_block_reason(attention: super::attention::Attention) -> &'static str {
+    use super::attention::Attention;
+    match attention {
+        Attention::Approval => "approval-open",
+        Attention::Question => "question-open",
+        Attention::Permission => "permission-open",
+        Attention::Quota => "quota-open",
+        Attention::WorkflowGate => "workflow-gate-open",
+        Attention::WriterConflict => "writer-conflict-open",
+        Attention::VerificationFailure => "verification-failure-open",
+        Attention::Compacting => "compacting",
+        Attention::Stalled => "stalled",
+        Attention::None | Attention::Unknown => "attention-blocked",
+    }
+}
+
+/// Issue #468: the one decision-log row shape for an attention-blocked mail
+/// sweep target, used both for the skip (`action` = `mail-attention-skip`)
+/// and for the delivery that eventually follows one (`action` =
+/// `mail-attention-delivered`). Both rows carry the SAME `mail_id` in
+/// `detail`, so `logs/decisions.jsonl` alone answers "was this message ever
+/// actually shown, and if not, why" without cross-referencing anything else.
+/// Best-effort, like every other decision-log write in this module: a
+/// logging failure must never affect whether the mail sweep itself proceeds.
+fn log_mail_attention_event(
+    state: &StateDir,
+    session_id: &str,
+    action: &str,
+    reason: &str,
+    mail_id: &str,
+) {
+    let _ = super::log::append(
+        state,
+        &super::log::Decision {
+            ts: super::state::now_secs(),
+            session: session_id,
+            verb: "dash",
+            verdict: "n/a",
+            score: 0,
+            action,
+            detail: &format!("mail {mail_id}: {reason}"),
+            observed_at: None,
+        },
+    );
+}
+
 /// One pane's share of a mail sweep: **at most one** message, injected
 /// visibly and consumed only if the injection itself succeeded. Returns
 /// whether anything was delivered.
@@ -9238,6 +9336,11 @@ fn mail_injection_label(from_agent: &str, from_session: &str, is_parent: bool) -
 #[allow(clippy::too_many_arguments)]
 fn sweep_one_pane<I: Injector>(
     injector: &mut I,
+    // Issue #468: this pane's own zirv session id, for the attention-block
+    // decision-log rows below -- the same value `advise_one_pane` already
+    // takes as `session_id`, matching `report_back_reminder_sweep`'s own
+    // `Decision::session` convention.
+    session_id: &str,
     state: &StateDir,
     slug: &str,
     agent: &str,
@@ -9257,8 +9360,34 @@ fn sweep_one_pane<I: Injector>(
         }
     };
     let Some((path, msg)) = messages.into_iter().next() else {
+        // Issue #468: nothing unread any more -- if a blocked-mail pairing
+        // was still held (the message was consumed some other way, e.g. a
+        // roster restart or a direct `zirv ctx inbox`), there is no
+        // delivery left to pair it with a decision-log row.
+        injector.set_mail_block_log(None);
         return false;
     };
+    let mail_id = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Issue #468: the hook-driven attention axis, not just the turn-signal
+    // `injectable` gate the caller already applied -- see
+    // `mail_blocked_by_attention`'s own doc comment for why both are needed.
+    let status = super::attention::load(state, short);
+    if let Some(attention) = mail_blocked_by_attention(&status) {
+        let reason = mail_block_reason(attention);
+        let already_logged = injector
+            .mail_block_log()
+            .is_some_and(|(_, id)| id == &mail_id);
+        if !already_logged {
+            log_mail_attention_event(state, session_id, "mail-attention-skip", reason, &mail_id);
+            injector.set_mail_block_log(Some((reason, mail_id)));
+        }
+        return false;
+    }
+
     let is_parent =
         parent_short.is_some_and(|parent| sessions::short_id(&msg.from_session) == parent);
     // D5: label and body share one budget. The label carries the sender's own
@@ -9274,6 +9403,20 @@ fn sweep_one_pane<I: Injector>(
     match deliver_and_consume(injector, state, slug, short, &label, &path, &body) {
         Ok(()) => {
             injector.track_delivery_sender(&msg.from_session);
+            // Issue #468: pair a delivery with the skip row logged earlier
+            // for this SAME mail id, if any.
+            if let Some((reason, blocked_id)) = injector.mail_block_log().cloned()
+                && blocked_id == mail_id
+            {
+                log_mail_attention_event(
+                    state,
+                    session_id,
+                    "mail-attention-delivered",
+                    reason,
+                    &blocked_id,
+                );
+            }
+            injector.set_mail_block_log(None);
             true
         }
         Err(e) => {
@@ -9371,6 +9514,10 @@ fn advise_one_pane<I: Injector>(
     entry.forget_missing(ids.iter().map(String::as_str));
 
     let Some((newest_path, newest_msg)) = messages.last() else {
+        // Issue #468: nothing unread any more -- drop any blocked-mail
+        // pairing that was still held; there is no delivery left to pair it
+        // with a decision-log row.
+        injector.set_mail_block_log(None);
         return false;
     };
     let newest_name = newest_path
@@ -9380,6 +9527,32 @@ fn advise_one_pane<I: Injector>(
     if entry.contains(&newest_name) {
         return false;
     }
+
+    // Issue #468: the hook-driven attention axis, not just the turn-signal
+    // `injectable` gate the caller already applied -- see
+    // `mail_blocked_by_attention`'s own doc comment for why both are needed.
+    // Checked here, AFTER the `entry.contains` dedup above and BEFORE the
+    // injection, so `attention::load` is only ever paid for a message this
+    // pane has not already been advised about.
+    let status = super::attention::load(state, short);
+    if let Some(attention) = mail_blocked_by_attention(&status) {
+        let reason = mail_block_reason(attention);
+        let already_logged = injector
+            .mail_block_log()
+            .is_some_and(|(_, id)| id == &newest_name);
+        if !already_logged {
+            log_mail_attention_event(
+                state,
+                session_id,
+                "mail-attention-skip",
+                reason,
+                &newest_name,
+            );
+            injector.set_mail_block_log(Some((reason, newest_name)));
+        }
+        return false;
+    }
+
     let body = orchestrator_mail_advisory_body(
         messages.len(),
         &newest_msg.from_agent,
@@ -9388,6 +9561,20 @@ fn advise_one_pane<I: Injector>(
     match injector.try_inject("mail", &body) {
         Ok(()) => {
             entry.insert(&newest_name);
+            // Issue #468: pair a delivery with the skip row logged earlier
+            // for this SAME mail id, if any.
+            if let Some((reason, blocked_id)) = injector.mail_block_log().cloned()
+                && blocked_id == newest_name
+            {
+                log_mail_attention_event(
+                    state,
+                    session_id,
+                    "mail-attention-delivered",
+                    reason,
+                    &blocked_id,
+                );
+            }
+            injector.set_mail_block_log(None);
             true
         }
         Err(e) => {
@@ -9426,11 +9613,13 @@ fn mail_sweep(
         if is_delivery_eligible(pane.verb(), injectable) {
             let agent = pane.agent().to_string();
             let short = pane.short().to_string();
+            let session_id = pane.session_id().to_string();
             // Issue #249: captured before `pane` is reborrowed mutably as
             // the `Injector` below.
             let parent_short = pane.parent_session().map(str::to_string);
             sweep_one_pane(
                 pane,
+                &session_id,
                 state,
                 &slug,
                 &agent,
@@ -18702,6 +18891,254 @@ mod tests {
         );
     }
 
+    // Issue #468: a mail advisory held back by an open permission dialog
+    // (`Attention::Approval`) must never be typed while the dialog is open,
+    // and must be retried -- typed exactly once -- at the next verified-idle
+    // boundary once the dialog closes. `SucceedingInjector`'s own dedup
+    // field is a permanent no-op `None` (see its own `Injector` impl), which
+    // cannot exercise "log the skip once, not every tick" -- this fake backs
+    // the pairing with real storage the way `Pane` does.
+    struct RecordingInjector {
+        calls: Vec<(String, String)>,
+        mail_block_log: Option<(&'static str, String)>,
+    }
+    impl Injector for RecordingInjector {
+        fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+            self.calls.push((label.to_string(), body.to_string()));
+            Ok(())
+        }
+        fn mail_block_log(&self) -> Option<&(&'static str, String)> {
+            self.mail_block_log.as_ref()
+        }
+        fn set_mail_block_log(&mut self, value: Option<(&'static str, String)>) {
+            self.mail_block_log = value;
+        }
+    }
+
+    fn latch_approval(state: &StateDir, short: &str, now: u64) {
+        super::super::attention::record(
+            state,
+            short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "permission requested",
+                100,
+                now,
+            )
+            .with_attention(super::super::attention::Attention::Approval),
+            now,
+        );
+    }
+
+    /// The #456/#457 clearing shape (`hook::clear_resolved_approval`),
+    /// reproduced here rather than imported: an `AdapterHook` observation
+    /// asserting `Attention::None` outranks and replaces the latched
+    /// `Approval`.
+    fn clear_approval(state: &StateDir, short: &str, now: u64) {
+        super::super::attention::record(
+            state,
+            short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "tool ran",
+                100,
+                now,
+            )
+            .with_attention(super::super::attention::Attention::None),
+            now,
+        );
+    }
+
+    /// Acceptance test (b): the advisory is never typed while the dialog is
+    /// open -- typing into that pane would land as raw keystrokes on the
+    /// open dialog, not as a visible line the operator reads, and could
+    /// silently answer the prompt.
+    #[test]
+    fn advise_one_pane_never_types_while_approval_is_open() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+        latch_approval(&state, "short0000", 1);
+
+        let mut injector = RecordingInjector {
+            calls: Vec::new(),
+            mail_block_log: None,
+        };
+        let mut advised = HashMap::new();
+        let delivered = advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut ErrorLog::default(),
+        );
+
+        assert!(!delivered, "must not advise while the dialog is open");
+        assert!(
+            injector.calls.is_empty(),
+            "nothing may be typed into the pane while approval is pending: {:?}",
+            injector.calls
+        );
+    }
+
+    /// Acceptance test (a): mail arrives while the pane is `Approval`; the
+    /// state clears; the advisory is typed exactly once at the next idle
+    /// boundary (never re-typed on a later, unchanged tick).
+    #[test]
+    fn advise_one_pane_retries_once_approval_clears_and_delivers_exactly_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+        latch_approval(&state, "short0000", 1);
+
+        let mut injector = RecordingInjector {
+            calls: Vec::new(),
+            mail_block_log: None,
+        };
+        let mut advised = HashMap::new();
+        let mut errors = ErrorLog::default();
+
+        // The dialog is still open: held back, not dropped.
+        assert!(!advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+        assert!(injector.calls.is_empty());
+
+        // The dialog closes.
+        clear_approval(&state, "short0000", 2);
+
+        // Next verified-idle boundary: retried and delivered.
+        assert!(advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+        assert_eq!(
+            injector.calls.len(),
+            1,
+            "typed exactly once: {:?}",
+            injector.calls
+        );
+
+        // A further, unchanged tick must not re-type it.
+        assert!(!advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+        assert_eq!(
+            injector.calls.len(),
+            1,
+            "still exactly once: {:?}",
+            injector.calls
+        );
+        assert!(errors.is_empty(), "got errors: {errors:?}");
+    }
+
+    /// Acceptance test (c): a decision-log row records the skip (`reason` =
+    /// `approval-open`) and the later delivery names the SAME mail id, so
+    /// `logs/decisions.jsonl` alone is enough to diagnose a missed ping.
+    #[test]
+    fn attention_blocked_mail_logs_a_skip_and_a_matching_delivery_for_the_same_mail_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+        let mail_id = mail::list(&state, slug, None, None).expect("list")[0]
+            .0
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+
+        latch_approval(&state, "short0000", 1);
+
+        let mut injector = RecordingInjector {
+            calls: Vec::new(),
+            mail_block_log: None,
+        };
+        let mut advised = HashMap::new();
+        let mut errors = ErrorLog::default();
+        assert!(!advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+
+        clear_approval(&state, "short0000", 2);
+        assert!(advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+
+        let log = std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE))
+            .expect("decision log");
+        let skip_line = log
+            .lines()
+            .find(|l| l.contains("mail-attention-skip"))
+            .unwrap_or_else(|| panic!("no skip row in {log}"));
+        let delivered_line = log
+            .lines()
+            .find(|l| l.contains("mail-attention-delivered"))
+            .unwrap_or_else(|| panic!("no delivered row in {log}"));
+        assert!(
+            skip_line.contains("approval-open"),
+            "skip row names the reason: {skip_line}"
+        );
+        assert!(
+            skip_line.contains(&mail_id),
+            "skip row names the mail id: {skip_line}"
+        );
+        assert!(
+            delivered_line.contains(&mail_id),
+            "delivery row names the SAME mail id: {delivered_line}"
+        );
+        assert!(
+            skip_line.contains("\"session\":\"session-a\""),
+            "got {skip_line}"
+        );
+        assert!(
+            delivered_line.contains("\"session\":\"session-a\""),
+            "got {delivered_line}"
+        );
+    }
+
     // F8: one mail message per pane per tick.
 
     /// The idle gate is checked once, before the first injection, and an
@@ -18735,6 +19172,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         let delivered = sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -18793,6 +19231,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         let delivered = sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -18825,6 +19264,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(!sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             "-work-repo",
             "claude",
@@ -18864,6 +19304,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(!sweep_one_pane(
             &mut FailingInjector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -24303,6 +24744,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -24361,6 +24803,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",
