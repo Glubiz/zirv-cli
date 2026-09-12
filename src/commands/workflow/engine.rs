@@ -14,7 +14,7 @@ use super::deploy::DeployTier;
 use super::skill::{SkillRegistry, WorkflowPhase};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
-    StateDir, create_private_dir_all, now_secs, workflow_identity_slug, write_private,
+    StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
@@ -640,6 +640,17 @@ pub struct WorkflowState {
     pub schema_version: u32,
     pub id: String,
     pub repo: PathBuf,
+    /// The branch this workflow gates -- `--branch` at `start`, or the
+    /// checkout's own current branch when not given (empty when neither is
+    /// resolvable: a detached HEAD, no commits, or `git` unavailable).
+    /// Issue #467: the relatedness key `verification::
+    /// latest_is_fresh_and_passing`'s widened sibling-worktree read matches
+    /// against a candidate's own recorded `VerificationReport::branch` --
+    /// an empty value never matches anything, so an unresolvable branch
+    /// safely disables widening rather than matching too broadly.
+    /// `#[serde(default)]` for state persisted before this field existed.
+    #[serde(default)]
+    pub branch: String,
     pub task: String,
     pub kind: WorkflowKind,
     /// Automatically selected methodology overlay. This is derived from the
@@ -742,6 +753,7 @@ impl WorkflowState {
             schema_version: WORKFLOW_SCHEMA_VERSION,
             id,
             repo,
+            branch: String::new(),
             task,
             kind,
             profile,
@@ -1090,11 +1102,18 @@ pub struct UsageCheckpoint {
 }
 
 fn repo_dir(state: &StateDir, repo: &Path) -> PathBuf {
-    // Issue #467 review: `workflow_identity_slug`, not plain `repo_slug` --
-    // workflow state is one of the two places a linked worktree and its main
-    // checkout must share a key. See that function's own doc comment for why
-    // this is deliberately not `repo_slug`'s default behavior.
-    state.workflows().join(workflow_identity_slug(repo))
+    // Issue #467 round 3 (Finding 1): plain, literal `repo_slug` -- NOT a
+    // shared cross-worktree identity. Round 2's `workflow_identity_slug`
+    // keyed workflow state (and the active-workflow pointer) by the main
+    // checkout's identity for every linked worktree; review caught that this
+    // made every sibling worktree of one repository share ONE active
+    // pointer, so two unrelated `zirv workflow start` runs in two different
+    // worker worktrees clobbered each other. `load`/`load_active` below
+    // instead search sibling checkouts explicitly, with fallback rules
+    // narrow enough to stay safe (see their own doc comments), while
+    // storage itself -- what this function decides -- stays exactly where
+    // pre-#467 code put it.
+    state.workflows().join(repo_slug(repo))
 }
 
 fn state_path(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
@@ -1143,8 +1162,38 @@ fn save_inactive_if_active(state_dir: &StateDir, state: &WorkflowState) -> CtxRe
     Ok(())
 }
 
+/// Issue #467 round 3 (Finding 1): workflow state itself stays keyed by the
+/// LITERAL checkout (see `repo_dir`'s doc comment), but `--repo <path>` on
+/// `status|advance|review package <id>` must still find a workflow tracked
+/// by a DIFFERENT checkout of the same repository. This checks the literal
+/// `repo` first, then every sibling checkout (`pathutil::sibling_checkouts`,
+/// in whatever order git reports them) for one holding `id` -- unlike the
+/// active-pointer fallback in `load_active`, this is safe to widen to every
+/// sibling: an explicit id is never ambiguous the way "whichever pointer
+/// happens to be there" is.
+fn resolve_state_path_for_id(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
+    let primary = state_path(state, repo, id)?;
+    if primary.exists() {
+        return Ok(primary);
+    }
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    for sibling in crate::commands::ctx::pathutil::sibling_checkouts(repo) {
+        if sibling == canonical {
+            continue;
+        }
+        let candidate = state_path(state, &sibling, id)?;
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Let the caller's own `!path.exists()` check produce the domain-shaped
+    // "unknown workflow" error uniformly, whether `repo` never had `id` at
+    // all or simply is not (and has no sibling that is) a git repository.
+    Ok(primary)
+}
+
 pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState> {
-    let path = state_path(state, repo, id)?;
+    let path = resolve_state_path_for_id(state, repo, id)?;
     // Every verb that resolves a workflow by id (`status`, `resume`,
     // `context`, `artifacts`, `approve`, `advance`, ...) goes through this
     // one function, so checking here once is enough to keep a bogus id from
@@ -1162,33 +1211,48 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
         .into());
     }
     // Issue #467: retarget to the literal `repo` this lookup was actually
-    // reached through. `state_path` above already resolved via
-    // `workflow_identity_slug`, which folds a linked worktree back to its
-    // main checkout's identity (`pathutil::worktree_identity`) -- so
-    // reaching this point means `repo` and the persisted `value.repo` are
-    // the SAME repository, just possibly different checkouts of it. Every
-    // downstream check that reads `state.repo` (`advance`'s Review gate,
+    // reached through, regardless of which checkout `resolve_state_path_
+    // for_id` above actually found `id`'s state file in. Every downstream
+    // check that reads `state.repo` (`advance`'s Test/Verify/Review gates,
     // `review package`'s diff and fingerprint, frontend detection, ...) must
     // measure wherever the caller actually is, not wherever the workflow
     // happened to be started -- that mismatch (main checkout clean, worktree
-    // dirty) was the whole bug. The Test/Verify evidence gate itself no
-    // longer strictly needs this (it widens its own read across every
-    // sibling checkout, see `verification::latest_is_fresh_and_passing`),
-    // but retargeting still makes the immediate, no-widening-needed case
-    // (evidence and gate check both reached through the SAME worktree) the
-    // common one. A no-op in the ordinary single-checkout case, where `repo`
-    // already equals `value.repo`.
+    // dirty) was the whole bug. A no-op in the ordinary single-checkout
+    // case, where `repo` already equals `value.repo`.
     value.repo = repo.to_path_buf();
     Ok(value)
 }
 
-pub fn load_active(state: &StateDir, repo: &Path) -> CtxResult<Option<WorkflowState>> {
+fn read_active_pointer(state: &StateDir, repo: &Path) -> CtxResult<Option<String>> {
     let path = active_path(state, repo);
     if !path.exists() {
         return Ok(None);
     }
-    let id = std::fs::read_to_string(path)?;
-    load(state, repo, id.trim()).map(Some)
+    Ok(Some(std::fs::read_to_string(path)?.trim().to_string()))
+}
+
+/// Issue #467 round 3 (Finding 1): the literal checkout's own active-
+/// workflow pointer first; if it has none, falls back to the MAIN
+/// checkout's own pointer ONLY (`pathutil::worktree_identity`) -- never an
+/// arbitrary other sibling. A worker worktree with no workflow of its own
+/// (bare `zirv workflow status` run there) inherits the orchestrator's, but
+/// two workers each running their own `zirv workflow start` in their own
+/// worktrees never collide: neither's pointer is ever mistaken for the
+/// other's, since neither is the main checkout. The main checkout itself
+/// has no further fallback (its own pointer, or nothing).
+pub fn load_active(state: &StateDir, repo: &Path) -> CtxResult<Option<WorkflowState>> {
+    if let Some(id) = read_active_pointer(state, repo)? {
+        return load(state, repo, &id).map(Some);
+    }
+    let main = crate::commands::ctx::pathutil::worktree_identity(repo);
+    let canonical_repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    if main == canonical_repo {
+        return Ok(None);
+    }
+    match read_active_pointer(state, &main)? {
+        Some(id) => load(state, repo, &id).map(Some),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1872,6 +1936,7 @@ pub fn advance_with_evidence(
                     state_dir,
                     &state.repo,
                     final_only,
+                    Some(&state.branch),
                 )? {
                     let command = if final_only {
                         "zirv verify"
@@ -2564,6 +2629,15 @@ pub struct StartArgs {
     pub complexity: Option<Complexity>,
     #[arg(long, value_enum)]
     pub risk: Option<RiskBand>,
+    /// The branch this workflow gates, when it differs from `--repo`'s own
+    /// checked-out branch (issue #467: an orchestrator in the main checkout
+    /// starting a workflow for a worker's feature branch it does not have
+    /// checked out here). Classification diffs this branch against its own
+    /// base as refs, not `--repo`'s working tree. Recorded on the workflow
+    /// and matched against a linked worktree's own recorded branch when the
+    /// Test/Verify gate widens its read to that worktree's evidence.
+    #[arg(long)]
+    pub branch: Option<String>,
     /// Repository whose frontend the auto-run detector/render evidence
     /// should scan for a Frontend-profile workflow, when it differs from
     /// `--repo` (for example a workflow tracked in this repo whose frontend
@@ -2813,6 +2887,7 @@ fn run_required_checks(
     phase: WorkflowPhase,
     step_id: &str,
     attempts_so_far: u8,
+    branch: &str,
     writer: &mut impl Write,
 ) -> CtxResult<super::verification::GateOutcome> {
     if !matches!(phase, WorkflowPhase::Test | WorkflowPhase::Verify) {
@@ -2869,7 +2944,8 @@ fn run_required_checks(
         )?;
         return Ok(super::verification::GateOutcome::Fail);
     }
-    if super::verification::latest_is_fresh_and_passing(state_dir, repo, final_only)? {
+    if super::verification::latest_is_fresh_and_passing(state_dir, repo, final_only, Some(branch))?
+    {
         Ok(super::verification::GateOutcome::Pass)
     } else {
         Ok(super::verification::GateOutcome::Fail)
@@ -3325,6 +3401,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 complexity: args.complexity,
                 risk: args.risk,
                 repo: Some(repo.clone()),
+                branch: args.branch.clone(),
                 json: false,
             };
             let classification = classify::from_args(&classify_args)?;
@@ -3375,6 +3452,10 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 !args.built_in_only,
                 classification,
             );
+            state.branch = args
+                .branch
+                .clone()
+                .unwrap_or_else(|| super::verification::current_branch(&state.repo));
             if brainstorm != state.brainstorm {
                 state.brainstorm = brainstorm;
                 apply_brainstorm_selection(brainstorm, &mut state.steps);
@@ -3532,6 +3613,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     current.phase,
                     &current.id,
                     attempts_so_far,
+                    &state.branch,
                     writer,
                 )? {
                     super::verification::GateOutcome::Pass => StepOutcome::Success,
@@ -3625,11 +3707,6 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only this test module still reads the LITERAL-checkout slug directly
-    // (to locate `verification`'s own, deliberately non-identity-redirected
-    // report directory); production code here now goes through
-    // `workflow_identity_slug` exclusively, via `repo_dir`.
-    use crate::commands::ctx::state::repo_slug;
     use tempfile::tempdir;
 
     fn low_classification() -> Classification {
@@ -4703,6 +4780,7 @@ mod tests {
             mode: super::super::verification::VerificationMode::Changed,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4817,6 +4895,7 @@ mod tests {
             mode: super::super::verification::VerificationMode::Changed,
             source: "configured".into(),
             repo: worktree_path.clone(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4928,6 +5007,104 @@ mod tests {
             "a linked worktree must also see the started repo's active-workflow pointer"
         );
         assert_eq!(active.unwrap().id, state.id);
+    }
+
+    /// Issue #467 round 3 (Finding 1): workflow state and the active
+    /// pointer are keyed by the LITERAL checkout, not a shared identity --
+    /// two unrelated `zirv workflow start` runs in two DIFFERENT worker
+    /// worktrees of the same repository must never collide. A third
+    /// sibling with no active workflow of its own must still see the MAIN
+    /// checkout's (never a's or b's), matching "a worker worktree with no
+    /// workflow of its own inherits the orchestrator's".
+    #[test]
+    fn sibling_worktrees_each_resolve_their_own_active_workflow() {
+        let main_repo = tempdir().unwrap();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "hello\n").unwrap();
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let mut worktree_paths = Vec::new();
+        for name in ["worker-a", "worker-b", "worker-c"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().to_path_buf();
+            std::fs::remove_dir(&path).unwrap();
+            git(
+                main_repo.path(),
+                &["worktree", "add", "-q", "-b", name, path.to_str().unwrap()],
+            );
+            worktree_paths.push((dir, path));
+        }
+        let worktree_a = &worktree_paths[0].1;
+        let worktree_b = &worktree_paths[1].1;
+        let worktree_c = &worktree_paths[2].1;
+
+        // The orchestrator's own workflow, started in the main checkout.
+        let main_state = WorkflowState::start(
+            main_repo.path().to_path_buf(),
+            "orchestrator work".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &main_state, true).unwrap();
+
+        // Two DIFFERENT workers, each starting their own workflow in their
+        // own worktree -- the exact scenario that clobbered under a shared
+        // identity.
+        let state_a = WorkflowState::start(
+            worktree_a.clone(),
+            "worker a's task".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state_a, true).unwrap();
+        let state_b = WorkflowState::start(
+            worktree_b.clone(),
+            "worker b's task".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state_b, true).unwrap();
+
+        assert_eq!(
+            load_active(&state_dir, worktree_a).unwrap().unwrap().id,
+            state_a.id,
+            "worktree a must resolve its OWN workflow, not b's or the main checkout's"
+        );
+        assert_eq!(
+            load_active(&state_dir, worktree_b).unwrap().unwrap().id,
+            state_b.id,
+            "worktree b must resolve its OWN workflow, not a's or the main checkout's"
+        );
+        assert_eq!(
+            load_active(&state_dir, worktree_c).unwrap().unwrap().id,
+            main_state.id,
+            "a worktree with no workflow of its own must inherit the MAIN checkout's, \
+             never an arbitrary sibling's"
+        );
     }
 
     /// #260-adjacent: `zirv workflow advance --run-checks` collapses "run
@@ -5509,6 +5686,7 @@ mod tests {
             mode: super::super::verification::VerificationMode::Changed,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -5920,6 +6098,7 @@ mod tests {
                 tests_changed: true,
                 complexity: None,
                 risk: None,
+                branch: None,
                 frontend_root: None,
                 brainstorm: false,
                 no_brainstorm: false,
