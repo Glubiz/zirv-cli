@@ -1591,6 +1591,34 @@ pub struct ChatConfig {
     /// `--quiet`/`ZIRV_CTX_QUIET`. The banner and the dashboard header still
     /// show it too, as the standing on-screen copy.
     pub model: Option<String>,
+
+    /// Issue #504: overrides the INTERACTIVE launch's Claude Code
+    /// `--permission-mode`, one of `"default"` (the shipped posture: every
+    /// action outside the projected allow-list prompts), `"acceptEdits"` or
+    /// `"bypassPermissions"`. `None` (the default) reproduces `"default"`
+    /// exactly, so behavior is unchanged unless an operator sets this.
+    /// Headless launches are untouched either way -- they always carry
+    /// `dontAsk` -- and this key never suppresses or widens the
+    /// `--allowedTools`/`--disallowedTools` lists themselves, even under
+    /// `bypassPermissions`: only the mode flag changes.
+    ///
+    /// Reached, before this key existed, only by editing the operator's own
+    /// `~/.claude/settings.json` `permissions.defaultMode` -- which the CLI
+    /// flag zirv always passes silently outranks, so that setting had no
+    /// effect (the observed report, issue #504: an operator running several
+    /// native subagents delegating into worktrees outside the launch cwd's
+    /// own `./**` scope got prompted for every Edit/Write and every
+    /// unlisted compound command, with no config knob to quiet it).
+    ///
+    /// `REPO_FORBIDDEN`: a repository checkout must not be able to widen its
+    /// own session's permission posture -- the same trust asymmetry
+    /// `sandbox.enabled`/`sandbox.extra_allow` already hold, applied to this
+    /// adapter-native flag instead. Set it in `~/.zirv/ctx.toml`, or with
+    /// `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE`. Validated at load (see
+    /// `CtxConfig::load`) against the same fixed set Claude Code's own CLI
+    /// accepts; an unrecognized value is a load-time error naming the key,
+    /// not a silent fallback to `"default"`.
+    pub claude_permission_mode: Option<String>,
 }
 
 /// Per-agent override for which model runs code review, keyed the same way
@@ -2860,6 +2888,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
     (
+        "ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE",
+        &["chat", "claude_permission_mode"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_REVIEW_MODEL_CLAUDE",
         &["review", "claude"],
         EnvKind::Str,
@@ -3840,6 +3873,20 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // does not. This is a narrower, correctness-preserving guard than banning
     // the key outright, which is why it stays out of `REPO_FORBIDDEN`.
     //
+    // `chat.claude_permission_mode` (issue #504) is the opposite call from
+    // `chat.model` right above, on purpose: unlike a model choice, which is
+    // disclosed on screen and cannot itself widen what a session may DO,
+    // this key picks the interactive launch's native `--permission-mode` --
+    // `bypassPermissions` silently skips every prompt the shipped `default`
+    // posture and the safety hook both rely on. A repo checkout choosing it
+    // for the operator would be exactly the widening `sandbox.enabled`/
+    // `sandbox.extra_allow` already stand between an untrusted layer and, so
+    // it is `REPO_FORBIDDEN` outright rather than charset-validated like
+    // `chat.model`'s narrower guard above.
+    (
+        &["chat", "claude_permission_mode"],
+        "ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE",
+    ),
     // `review.claude`/`review.codex` are the opposite call from `chat.model`
     // right above, on purpose: those pick which model spends the operator's
     // vendor account running review work in the *background* (every `zirv
@@ -5278,6 +5325,24 @@ impl CtxConfig {
         // reads the value only after this point.
         if let Some(model) = cfg.chat.model.as_deref() {
             validate_model_str("chat.model", model)?;
+        }
+
+        // Issue #504: `chat.claude_permission_mode` reaches an interactive
+        // launch's own `--permission-mode` argv (`ClaudeAdapter::default_
+        // sandbox_args`) verbatim, so it is constrained to exactly the fixed
+        // set Claude Code's own CLI accepts, the same "loud rather than
+        // silent" style `validate_endpoint_target`'s `wire_api` check uses --
+        // an unrecognized value is a load-time error naming the key, never a
+        // value that reaches argv unexamined or silently falls back to
+        // `"default"`.
+        if let Some(mode) = cfg.chat.claude_permission_mode.as_deref()
+            && !matches!(mode, "default" | "acceptEdits" | "bypassPermissions")
+        {
+            return Err(format!(
+                "chat.claude_permission_mode must be \"default\", \"acceptEdits\" or \
+                 \"bypassPermissions\", got \"{mode}\""
+            )
+            .into());
         }
 
         // `review.claude`/`review.codex` land in injected prompt text (see
@@ -9792,6 +9857,85 @@ mod tests {
         assert_eq!(cfg.chat.model.as_deref(), Some("sonnet"));
     }
 
+    /// Issue #504: the operator's own `~/.zirv/ctx.toml` may set
+    /// `chat.claude_permission_mode` (unlike a repo layer -- see the
+    /// `REPO_FORBIDDEN` test right below), and an unrecognized value is a
+    /// load-time error rather than a value that reaches argv unexamined.
+    #[test]
+    fn chat_claude_permission_mode_parses_and_validates_the_fixed_set() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        // Separate from `home`: the operator and repo layers must not
+        // collapse onto the same file, or the REPO_FORBIDDEN check below
+        // would reject this operator-only value too.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+
+        for mode in ["default", "acceptEdits", "bypassPermissions"] {
+            std::fs::write(
+                home.path().join(".zirv/ctx.toml"),
+                format!("[chat]\nclaude_permission_mode = \"{mode}\"\n"),
+            )
+            .expect("write");
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+            assert_eq!(cfg.chat.claude_permission_mode.as_deref(), Some(mode));
+        }
+
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[chat]\nclaude_permission_mode = \"askForever\"\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("an unrecognized permission mode must fail to load");
+        assert!(
+            err.to_string().contains("chat.claude_permission_mode"),
+            "got {err}"
+        );
+    }
+
+    /// Issue #504: `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE` follows the same
+    /// env-override pattern as every other operator-only `[chat]`/`REPO_
+    /// FORBIDDEN` key (`ZIRV_CTX_CHAT_MODEL` right above).
+    #[test]
+    fn env_overrides_the_chat_claude_permission_mode() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE", "acceptEdits")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.chat.claude_permission_mode.as_deref(),
+            Some("acceptEdits")
+        );
+    }
+
+    /// Issue #504: unlike `chat.model` right above -- which a repo checkout
+    /// MAY set (see `a_repository_config_may_set_the_chat_model`'s own doc
+    /// comment) -- `chat.claude_permission_mode` widens what a session may
+    /// silently DO, so a repo layer setting it at all is a hard load error,
+    /// not merely a rejected value.
+    #[test]
+    fn a_repo_may_not_set_the_chat_claude_permission_mode() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chat]\nclaude_permission_mode = \"bypassPermissions\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to set chat.claude_permission_mode");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "chat.claude_permission_mode must be rejected as REPO_FORBIDDEN: {err}"
+        );
+    }
+
     /// SECURITY (FIX 1): `chat.model` is repo-settable and reaches an argv that
     /// `resolve_program` may route through `cmd.exe /c` on Windows, so a repo
     /// value bearing a shell/cmd metacharacter must fail the load rather than
@@ -10753,6 +10897,7 @@ mod tests {
             agents: cfg.agents.clone(),
             chat: ChatConfig {
                 model: Some("fable".to_string()),
+                claude_permission_mode: None,
             },
             output: OutputConfig {
                 filter: super::super::output_filters::bundled_output_filter_rules(),
