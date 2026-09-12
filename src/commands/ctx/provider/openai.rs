@@ -14,7 +14,7 @@
 #![allow(dead_code)] // N09 wires direct providers into the persistent runtime loop.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 
 use serde_json::{Map, Value, json};
 
@@ -28,8 +28,8 @@ use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
 use super::probe::is_plaintext_non_loopback;
 use super::transport::{
-    MAX_ERROR_BODY_BYTES, MAX_SSE_LINE_BYTES, StreamTimeouts, parse_retry_after_ms, supervise,
-    target_scope,
+    MAX_ERROR_BODY_BYTES, StreamTimeouts, WORKER_READ_POLL, parse_retry_after_ms, read_sse_line,
+    supervise, target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId};
 use crate::commands::ctx::config::EnvLookup;
@@ -201,7 +201,7 @@ impl OpenAiResponsesAdapter {
             .http_status_as_error(false)
             .timeout_connect(Some(self.timeouts.connect))
             .timeout_recv_response(Some(self.timeouts.first_event))
-            .timeout_recv_body(Some(self.timeouts.idle))
+            .timeout_recv_body(Some(WORKER_READ_POLL))
             .build()
             .into();
         let payload = serde_json::to_string(&encoded.body).map_err(|error| {
@@ -754,36 +754,14 @@ fn parse_sse<R: BufRead>(
     let mut accumulator = Accumulator::default();
     let mut event_name = String::new();
     let mut data = String::new();
+    let mut line = String::new();
     loop {
-        if cancellation.is_cancelled() {
-            return Err(cancelled());
-        }
-        let mut line = String::new();
-        let read = (&mut reader)
-            .take((MAX_SSE_LINE_BYTES + 1) as u64)
-            .read_line(&mut line)
-            .map_err(|error| {
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) {
-                    timeout_failure(accumulator.saw_event, target)
-                } else if error.kind() == std::io::ErrorKind::InvalidData {
-                    invalid_stream("OpenAI SSE contains invalid UTF-8")
-                } else {
-                    transport_failure(format!("OpenAI stream read failed: {error}"), target)
-                }
-            })?;
+        let read = read_sse_line(&mut reader, &mut line, "OpenAI", cancellation, target)?;
         if read == 0 {
             if !event_name.is_empty() || !data.is_empty() {
                 process_sse_event(&event_name, &data, &mut accumulator, sink, target)?;
             }
             break;
-        }
-        if line.len() > MAX_SSE_LINE_BYTES {
-            return Err(invalid_stream(format!(
-                "OpenAI SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"
-            )));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -792,6 +770,7 @@ fn parse_sse<R: BufRead>(
                 event_name.clear();
                 data.clear();
             }
+            line.clear();
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("event:") {
@@ -802,6 +781,7 @@ fn parse_sse<R: BufRead>(
             }
             data.push_str(value.trim_start());
         }
+        line.clear();
     }
     finish_response(accumulator, request_id)
 }
@@ -973,8 +953,14 @@ fn process_sse_event(
                 return Err(invalid_stream("text delta on a non-message item"));
             };
             match parts.get_mut(&content_index) {
-                Some(PartState::OutputText(buffer)) if !refusal => buffer.push_str(&delta),
-                Some(PartState::Refusal(buffer)) if refusal => buffer.push_str(&delta),
+                Some(PartState::OutputText(buffer)) if !refusal => {
+                    check_block_accumulator_cap(buffer.len(), delta.len())?;
+                    buffer.push_str(&delta);
+                }
+                Some(PartState::Refusal(buffer)) if refusal => {
+                    check_block_accumulator_cap(buffer.len(), delta.len())?;
+                    buffer.push_str(&delta);
+                }
                 Some(_) => return Err(invalid_stream("delta does not match its content part")),
                 None => {
                     return Err(invalid_stream(format!(
@@ -997,6 +983,7 @@ fn process_sse_event(
                     "function-call argument delta on a non-function item",
                 ));
             };
+            check_block_accumulator_cap(streamed_arguments.len(), delta.len())?;
             streamed_arguments.push_str(&delta);
             sink.push(ProviderStreamEvent::ToolInputDelta {
                 index,
@@ -1023,7 +1010,9 @@ fn process_sse_event(
                     "reasoning summary delta on a non-reasoning item",
                 ));
             };
-            summary.entry(summary_index).or_default().push_str(&delta);
+            let buffer = summary.entry(summary_index).or_default();
+            check_block_accumulator_cap(buffer.len(), delta.len())?;
+            buffer.push_str(&delta);
             sink.push(ProviderStreamEvent::ThinkingDelta { index, text: delta });
         }
         "response.output_item.done" => {
@@ -1238,6 +1227,13 @@ fn invalid_stream(message: impl Into<String>) -> ProviderFailure {
     super::transport::invalid_stream(message.into())
 }
 
+fn check_block_accumulator_cap(
+    current_len: usize,
+    delta_len: usize,
+) -> Result<(), ProviderFailure> {
+    super::transport::check_block_accumulator_cap("OpenAI", current_len, delta_len)
+}
+
 fn cancelled() -> ProviderFailure {
     super::transport::cancelled("OpenAI")
 }
@@ -1385,8 +1381,9 @@ fn classify_error_payload(value: &Value, target: &ProviderTarget) -> ProviderFai
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::commands::ctx::provider::adapter::{
@@ -1394,6 +1391,7 @@ mod tests {
     };
     use crate::commands::ctx::provider::anthropic::{AnthropicMessagesAdapter, AnthropicTimeouts};
     use crate::commands::ctx::provider::credential::Secret;
+    use crate::commands::ctx::provider::transport::MAX_BLOCK_ACCUMULATOR_BYTES;
     use crate::commands::ctx::provider::{
         AccountId, BillingPoolId, EndpointId, ModelId, ProviderId,
     };
@@ -1593,6 +1591,36 @@ mod tests {
         let error = parse(STREAM_ERROR).unwrap_err();
         assert_eq!(error.class, FailureClass::RateLimited);
         assert!(error.retry.retryable);
+    }
+
+    #[test]
+    fn oversized_content_block_settles_to_invalid_stream() {
+        // Each individual SSE line stays well under MAX_SSE_LINE_BYTES; only
+        // the cumulative output_text delta payload across many lines crosses
+        // MAX_BLOCK_ACCUMULATOR_BYTES, exercising the per-block cap rather
+        // than the pre-existing per-line cap.
+        let chunk = "a".repeat(900_000);
+        let overflow_deltas = MAX_BLOCK_ACCUMULATOR_BYTES / chunk.len() + 2;
+        let mut stream = String::from(concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_big\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_big\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+        ));
+        for _ in 0..overflow_deltas {
+            stream.push_str(&format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"{chunk}\"}}\n\n"
+            ));
+        }
+        let error = parse(&stream).unwrap_err();
+        assert_eq!(error.class, FailureClass::InvalidStream);
+        assert!(
+            error.message.contains("content block exceeds"),
+            "expected the per-block cap, got: {}",
+            error.message
+        );
     }
 
     #[test]
@@ -2017,6 +2045,45 @@ mod tests {
         assert_eq!(error.class, FailureClass::Cancelled);
     }
 
+    #[test]
+    fn cancellation_mid_stream_tears_down_the_worker_promptly() {
+        let split = FINAL_TEXT
+            .find("event: response.output_item.added")
+            .unwrap();
+        let (url, server_observed_close) = slow_body_server(&FINAL_TEXT[..split]);
+        let adapter = OpenAiResponsesAdapter::new(
+            target(url),
+            credential(),
+            OpenAiTimeouts {
+                connect: Duration::from_secs(1),
+                first_event: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let flag = Arc::new(CancellationFlag::default());
+        let canceller = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+        });
+        let error = adapter
+            .stream(&request(), flag.as_ref(), &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(error.class, FailureClass::Cancelled);
+
+        // perform() already returned; the worker's TCP read must not linger
+        // for anywhere near ureq's own (multi-second) recv-body budget.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !server_observed_close.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not close its TCP connection within 2s of cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn one_shot_server(
         status: u16,
         body: &'static str,
@@ -2072,6 +2139,38 @@ mod tests {
             let _ = stream.write_all(suffix.as_bytes());
         });
         (format!("http://{address}"), receiver)
+    }
+
+    /// Sends `prefix` but declares a much larger `Content-Length` and then
+    /// never sends the rest, simulating a connection stalled mid-stream.
+    /// Reports (via the returned flag) whether it observed the client side of
+    /// the connection close, which is how a test can prove a cancelled worker
+    /// actually tore down its TCP read instead of leaking it.
+    fn slow_body_server(prefix: &'static str) -> (String, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let server_closed = Arc::clone(&closed);
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            let declared_length = prefix.len() + 4096;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n{prefix}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0u8; 64];
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => server_closed.store(true, Ordering::Release),
+                Ok(_) => {}
+            }
+        });
+        (format!("http://{address}"), closed)
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {
