@@ -31,7 +31,8 @@ use serde_json::{Value, json};
 use super::transport::{Connection, Endpoint, Listener, server_uid};
 use super::wire::{
     ADVERTISED, ApiError, ApiEvent, ErrorCode, EventFrame, Hello, InputMode, Method, Outcome,
-    PROTOCOL_VERSION, Request, Response, SERVER_NAME, SessionFacts, SessionState, WaitUntil, spec_for,
+    PROTOCOL_VERSION, Request, Response, SERVER_NAME, SessionFacts, SessionState, WaitUntil,
+    spec_for,
 };
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::runtime::{
@@ -606,7 +607,9 @@ impl ApiServer {
         let (facts, handle) = self.resolve(&target)?;
         let handle = handle.ok_or_else(|| not_this_servers_session(&facts.session_id))?;
         match params.mode {
-            InputMode::Submit => self.with_backend(|backend| backend.submit(&handle, &params.input)),
+            InputMode::Submit => {
+                self.with_backend(|backend| backend.submit(&handle, &params.input))
+            }
             InputMode::Steer => self.with_backend(|backend| backend.steer(&handle, &params.input)),
             InputMode::Unknown => Err(ApiError::new(
                 ErrorCode::InvalidParams,
@@ -688,7 +691,10 @@ impl ApiServer {
         };
         let (facts, _) = self.resolve(&target)?;
         let pinned = facts.generation;
-        let budget = params.timeout_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS);
+        let budget = params
+            .timeout_ms
+            .unwrap_or(DEFAULT_WAIT_MS)
+            .min(MAX_WAIT_MS);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
 
         loop {
@@ -810,8 +816,8 @@ impl ApiServer {
         connection.write_frame(&super::wire::ServerFrame::Hello(self.hello()))?;
 
         while let Some(request) = connection.read_frame::<Request>()? {
-            let subscribing = request.method == Method::EventsSubscribe
-                && request.version == PROTOCOL_VERSION;
+            let subscribing =
+                request.method == Method::EventsSubscribe && request.version == PROTOCOL_VERSION;
             let response = self.handle(&request);
             let accepted = matches!(response.outcome, Outcome::Ok { .. });
             let after_revision = subscription_start(&request.params);
@@ -988,7 +994,6 @@ impl RunningServer {
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
-
 }
 
 impl Drop for RunningServer {
@@ -1097,14 +1102,16 @@ mod tests {
             before["sessions"][0]["session_id"],
             after["sessions"][0]["session_id"]
         );
-        assert_eq!(before["sessions"][0]["short"], after["sessions"][0]["short"]);
+        assert_eq!(
+            before["sessions"][0]["short"],
+            after["sessions"][0]["short"]
+        );
         assert_eq!(
             before["sessions"][0]["generation"],
             after["sessions"][0]["generation"]
         );
         assert_ne!(
-            before["sessions"][0]["surface"],
-            after["sessions"][0]["surface"],
+            before["sessions"][0]["surface"], after["sessions"][0]["surface"],
             "the surface is the one axis a client change moves"
         );
     }
@@ -1124,9 +1131,16 @@ mod tests {
     fn list_filters_by_state() {
         let server = server_with(vec![
             facts("aaaaaaaa-0000-4000-8000-000000000001", SessionState::Idle),
-            facts("bbbbbbbb-0000-4000-8000-000000000002", SessionState::Working),
+            facts(
+                "bbbbbbbb-0000-4000-8000-000000000002",
+                SessionState::Working,
+            ),
         ]);
-        let value = result(&call(&server, Method::SessionList, json!({"state": "idle"})));
+        let value = result(&call(
+            &server,
+            Method::SessionList,
+            json!({"state": "idle"}),
+        ));
         let sessions = value["sessions"].as_array().expect("array");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["state"], json!("idle"));
@@ -1174,7 +1188,11 @@ mod tests {
         )
         .with_idempotency_key("start-once");
         let second = server.handle(&retry);
-        assert_eq!(result(&second)["session"], created, "same session, not a new one");
+        assert_eq!(
+            result(&second)["session"],
+            created,
+            "same session, not a new one"
+        );
         assert_eq!(
             server.revision(),
             revision_after_first,
@@ -1284,7 +1302,11 @@ mod tests {
         ));
         assert_eq!(value["recorded"], json!(true));
         assert_eq!(server.revision(), before + 1);
-        let get = result(&call(&server, Method::SessionGet, json!({"session_id": id})));
+        let get = result(&call(
+            &server,
+            Method::SessionGet,
+            json!({"session_id": id}),
+        ));
         assert_eq!(get["session"]["state"], json!("working"));
     }
 

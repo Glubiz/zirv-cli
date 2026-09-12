@@ -277,7 +277,9 @@ impl Client {
         if !self.negotiated.allows(method) {
             return Err(Box::new(ApiError::new(
                 ErrorCode::Unsupported,
-                format!("{method} is disabled locally: the server did not advertise its capability"),
+                format!(
+                    "{method} is disabled locally: the server did not advertise its capability"
+                ),
             )));
         }
         let id = self.mint_id();
@@ -478,10 +480,7 @@ mod tests {
         );
 
         let denied = client
-            .call(
-                Method::SessionStart,
-                json!({"cwd": ".", "prompt": "go"}),
-            )
+            .call(Method::SessionStart, json!({"cwd": ".", "prompt": "go"}))
             .expect_err("no backend attached");
         assert!(denied.to_string().contains("unsupported"), "{denied}");
         drop(client);

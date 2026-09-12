@@ -84,7 +84,11 @@ fn run_with(args: &ApiArgs, w: &mut dyn Write, env: EnvLookup<'_>) -> CtxResult<
     match &args.command {
         ApiVerb::Schema { json } => {
             if *json {
-                writeln!(w, "{}", serde_json::to_string_pretty(&schema::json_schema())?)?;
+                writeln!(
+                    w,
+                    "{}",
+                    serde_json::to_string_pretty(&schema::json_schema())?
+                )?;
             } else {
                 schema::render_human(w)?;
             }

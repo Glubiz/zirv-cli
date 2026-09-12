@@ -2,9 +2,9 @@ use clap::{Parser, Subcommand};
 
 pub mod adapters;
 pub mod agent;
-pub mod api;
 pub mod allocator;
 pub mod announce;
+pub mod api;
 pub mod ask;
 pub mod attention;
 pub mod breakdown;
