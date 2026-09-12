@@ -1,0 +1,6 @@
+[
+  "session.read",
+  "session.control",
+  "session.wait",
+  "events.subscribe"
+]
