@@ -493,16 +493,15 @@ pub(crate) fn is_workflow_work_path(path: &Path) -> bool {
         && matches!(components.next(), Some(std::path::Component::Normal(name)) if name == "work")
 }
 
-pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
-    // The same base `review::package` uses (merge-base against origin/main,
-    // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
-    // classification and review disagree about what "the change" even is:
-    // everything already committed on the branch was invisible here.
-    let base = super::review::default_base(repo)?;
+/// Parses `git diff --numstat`'s output into changed paths and total added
+/// plus removed lines. Shared by [`git_change_input`] (working tree vs a
+/// base) and [`git_change_input_for_branch`] (one named branch vs its own
+/// base, as pure refs).
+fn numstat_paths_and_lines(repo: &Path, args: &[&str]) -> CtxResult<(Vec<PathBuf>, usize)> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff", "--numstat", &base])
+        .args(args)
         .output()?;
     if !output.status.success() {
         return Err(format!(
@@ -527,6 +526,16 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
         lines = lines.saturating_add(added).saturating_add(removed);
         paths.push(PathBuf::from(path));
     }
+    Ok((paths, lines))
+}
+
+pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
+    // The same base `review::package` uses (merge-base against origin/main,
+    // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
+    // classification and review disagree about what "the change" even is:
+    // everything already committed on the branch was invisible here.
+    let base = super::review::default_base(repo)?;
+    let (mut paths, mut lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base])?;
     let untracked = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -580,6 +589,41 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
     })
 }
 
+/// Like [`git_change_input`], but diffs `branch` against its own base as
+/// pure refs (`git diff --numstat <base> <branch>`) rather than `repo`'s
+/// working tree -- for `--branch <name>` (issue #467): the checkout given as
+/// `repo` need not have `branch` checked out at all (an orchestrator's main
+/// checkout classifying a worker's feature branch). No untracked-file scan:
+/// there is no working tree standing in for `branch`'s own content to
+/// sample. A currently-checked-out branch with uncommitted edits given via
+/// `--branch` will therefore not see those edits reflected here -- accepted,
+/// since `--branch`'s purpose is inspecting a branch this checkout is NOT
+/// sitting on; plain `git_change_input` already covers the checkout's own
+/// current branch, uncommitted edits included.
+pub fn git_change_input_for_branch(
+    repo: &Path,
+    branch: &str,
+    task: String,
+) -> CtxResult<ClassificationInput> {
+    let base = super::review::default_base_for(repo, branch)?;
+    let (mut paths, lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base, branch])?;
+    paths.sort();
+    paths.dedup();
+    let tests_changed = paths.iter().any(|path| {
+        let value = path.to_string_lossy().to_ascii_lowercase();
+        value.contains("test") || value.contains("spec")
+    });
+    Ok(ClassificationInput {
+        task,
+        paths,
+        changed_lines: lines,
+        tests_changed,
+        intent_override: None,
+        complexity_override: None,
+        risk_override: None,
+    })
+}
+
 #[derive(Debug, Args)]
 pub struct ClassifyArgs {
     /// Task summary used for deterministic intent inference.
@@ -602,8 +646,27 @@ pub struct ClassifyArgs {
     pub risk: Option<RiskBand>,
     #[arg(long)]
     pub repo: Option<PathBuf>,
+    /// Diff this branch against its own base as refs, instead of `--repo`'s
+    /// working tree (issue #467: classifying a branch `--repo` does not
+    /// have checked out).
+    #[arg(long)]
+    pub branch: Option<String>,
     #[arg(long)]
     pub json: bool,
+}
+
+/// `git_change_input`, or its branch-scoped sibling when `--branch` was
+/// given -- the one seam both of `from_args`'s two measurement points
+/// (the undeclared path, and the declared-input measured floor below) share.
+fn measured_input(
+    repo: &Path,
+    branch: Option<&str>,
+    task: String,
+) -> CtxResult<ClassificationInput> {
+    match branch {
+        Some(branch) => git_change_input_for_branch(repo, branch, task),
+        None => git_change_input(repo, task),
+    }
 }
 
 pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
@@ -620,7 +683,7 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
             risk_override: None,
         }
     } else {
-        git_change_input(&repo, args.task.clone())?
+        measured_input(&repo, args.branch.as_deref(), args.task.clone())?
     };
     input.intent_override = args.intent;
     input.complexity_override = args.complexity;
@@ -641,16 +704,16 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     // exactly the moment a mis-declared low-risk scope is hardest to catch.
     // `mark_unavailable` fails safe instead: it records the unmeasured state
     // and escalates the risk band one step.
-    let Ok(mut measured_input) = git_change_input(&repo, args.task.clone()) else {
+    let Ok(mut measured) = measured_input(&repo, args.branch.as_deref(), args.task.clone()) else {
         mark_unavailable(
             &mut classification,
             "git measurement unavailable (not a repository, or no commits)",
         );
         return Ok(classification);
     };
-    measured_input.intent_override = args.intent;
-    measured_input.complexity_override = args.complexity;
-    let measured = classify(&measured_input)?;
+    measured.intent_override = args.intent;
+    measured.complexity_override = args.complexity;
+    let measured = classify(&measured)?;
     let mut raised = false;
     if measured.risk > classification.risk {
         classification
@@ -774,6 +837,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(repo.path().to_path_buf()),
             json: false,
         };
@@ -825,6 +889,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(repo.path().to_path_buf()),
             json: false,
         })
@@ -856,6 +921,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(dir.path().to_path_buf()),
             json: false,
         })
@@ -900,6 +966,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(dir.path().to_path_buf()),
             json: false,
         })
@@ -928,6 +995,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(repo.path().to_path_buf()),
             json: false,
         })

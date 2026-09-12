@@ -1183,7 +1183,8 @@ fn render_report<W: Write>(
     // fails: `status` must never fail just because this one line could not
     // be computed.
     if let Ok(Some(_)) = verification::latest_report_id(&state, repo) {
-        let fresh = verification::latest_is_fresh_and_passing(&state, repo, false).unwrap_or(false);
+        let fresh =
+            verification::latest_is_fresh_and_passing(&state, repo, false, None).unwrap_or(false);
         let (text, tone) = if fresh {
             ("gates: fresh".to_string(), Tone::Ok)
         } else {
@@ -2675,6 +2676,7 @@ mod tests {
             mode: verification::VerificationMode::Changed,
             source: "configured".into(),
             repo: repo.to_path_buf(),
+            branch: String::new(),
             change_fingerprint: verification::change_fingerprint(repo).expect("fingerprint"),
             changed_paths: vec![],
             fallback_to_full: false,

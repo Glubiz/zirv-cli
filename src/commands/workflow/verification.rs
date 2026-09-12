@@ -436,6 +436,33 @@ fn git_at(repo: &Path) -> Command {
     command
 }
 
+/// `repo`'s current branch name, or an empty string when it cannot be
+/// resolved (detached HEAD, no commits, `git` missing or not a repository).
+/// Issue #467: recorded on every persisted [`VerificationReport`] and
+/// matched against a workflow's own recorded branch by
+/// [`latest_is_fresh_and_passing`]'s widened sibling-worktree read -- an
+/// empty value never matches another empty or named value, so an
+/// unresolvable branch degrades to "never widens" rather than "widens to
+/// everything".
+pub fn current_branch(repo: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text.is_empty() || text == "HEAD" {
+                String::new()
+            } else {
+                text
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 fn git_paths(stdout: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
     stdout
         .split(|byte| *byte == 0)
@@ -735,6 +762,16 @@ pub struct VerificationReport {
     pub mode: VerificationMode,
     pub source: String,
     pub repo: PathBuf,
+    /// The checkout's branch when this report was produced (`current_branch`),
+    /// or empty when unresolvable (detached HEAD, no commits, `git`
+    /// unavailable). Issue #467: the relatedness key
+    /// `latest_is_fresh_and_passing`'s widened sibling-worktree read matches
+    /// against a workflow's own recorded `WorkflowState::branch` -- an empty
+    /// value never matches, so an unresolvable branch safely narrows rather
+    /// than widens. `#[serde(default)]` for reports persisted before this
+    /// field existed.
+    #[serde(default)]
+    pub branch: String,
     pub change_fingerprint: u64,
     pub changed_paths: Vec<PathBuf>,
     pub fallback_to_full: bool,
@@ -2254,32 +2291,45 @@ pub(crate) fn latest_report_id(state: &StateDir, repo: &Path) -> CtxResult<Optio
     Ok(load_latest(state, repo)?.map(|report| report.id))
 }
 
+/// `branch` is the workflow's own recorded branch (`WorkflowState::branch`),
+/// when the caller has one -- `None` for contexts with no specific workflow
+/// in view (an advisory nudge, a presentation-only status line). It is ONLY
+/// ever used to gate the widened, cross-checkout half of this check; the
+/// literal checkout's own evidence is always trusted regardless, exactly as
+/// before #467.
 pub fn latest_is_fresh_and_passing(
     state: &StateDir,
     repo: &Path,
     final_only: bool,
+    branch: Option<&str>,
 ) -> CtxResult<bool> {
-    if latest_is_fresh_and_passing_at(state, repo, final_only)? {
+    if latest_is_fresh_and_passing_at(state, repo, final_only, None)? {
         return Ok(true);
     }
-    // Issue #467 review (defect 1): `report_dir`/`save_report` stay keyed by
-    // the literal checkout (plain `repo_slug`), so two sibling worktrees
-    // never clobber each other's `zirv test changed` evidence -- but that
-    // also means this gate, evaluated from one checkout (typically the
-    // orchestrator's own main checkout, its tree clean), could never see a
-    // worker's fresh, passing evidence recorded in a linked worktree. This
-    // widens only the READ side: every OTHER checkout sharing `repo`'s
-    // repository (`pathutil::sibling_checkouts`) gets the exact same check
-    // run again, against ITS OWN current tree and ITS OWN latest report --
-    // never `repo`'s freshly computed fingerprint compared against a report
-    // recorded somewhere else, which would silently treat two unrelated
-    // trees as identical.
+    // Issue #467 round 3 (relatedness): `report_dir`/`save_report` stay
+    // keyed by the literal checkout (plain `repo_slug`), so two sibling
+    // worktrees never clobber each other's `zirv test changed` evidence --
+    // but that also means this gate, evaluated from one checkout (typically
+    // the orchestrator's own main checkout, its tree clean), could never see
+    // a worker's fresh, passing evidence recorded in a linked worktree. This
+    // widens only the READ side, and ONLY to a sibling whose OWN recorded
+    // evidence branch matches the workflow's own recorded branch exactly --
+    // review round 2 caught that widening to ANY fresh, passing sibling
+    // (with no relatedness check at all) let an entirely unrelated worker's
+    // evidence on a DIFFERENT branch satisfy this workflow's gate, reaching
+    // as far as `deploy.rs`'s production tier. `branch.filter(|b|
+    // !b.is_empty())` also means a caller with no workflow branch context,
+    // or a workflow whose own branch could not be resolved at `start`, never
+    // widens at all -- there is nothing safe to match against.
+    let Some(branch) = branch.filter(|b| !b.is_empty()) else {
+        return Ok(false);
+    };
     let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     for sibling in crate::commands::ctx::pathutil::sibling_checkouts(repo) {
         if sibling == canonical {
             continue;
         }
-        if latest_is_fresh_and_passing_at(state, &sibling, final_only)? {
+        if latest_is_fresh_and_passing_at(state, &sibling, final_only, Some(branch))? {
             return Ok(true);
         }
     }
@@ -2288,18 +2338,28 @@ pub fn latest_is_fresh_and_passing(
 
 /// The single-checkout freshness/pass check: is `repo`'s own latest
 /// persisted report fresh (matches `repo`'s current change fingerprint,
-/// covers the whole changed-check surface) and passing (outright, or every
-/// failure covered by the operator's recorded baseline)? Split out so
-/// [`latest_is_fresh_and_passing`]'s widened search can run the exact same
-/// check against a sibling worktree rather than duplicating it.
+/// covers the whole changed-check surface, and -- only when
+/// `required_branch` is given -- was produced on that exact branch) and
+/// passing (outright, or every failure covered by the operator's recorded
+/// baseline)? Split out so [`latest_is_fresh_and_passing`]'s widened search
+/// can run the exact same check against a sibling worktree rather than
+/// duplicating it. `required_branch` is always `None` for the literal
+/// checkout's own evidence (trusted unconditionally, as before #467) and
+/// always `Some` for a sibling's (the relatedness gate).
 fn latest_is_fresh_and_passing_at(
     state: &StateDir,
     repo: &Path,
     final_only: bool,
+    required_branch: Option<&str>,
 ) -> CtxResult<bool> {
     let Some(report) = load_latest(state, repo)? else {
         return Ok(false);
     };
+    if let Some(required_branch) = required_branch
+        && report.branch != required_branch
+    {
+        return Ok(false);
+    }
     if !((!final_only || report.mode == VerificationMode::Final)
         // A `--check format` run is evidence about formatting, not about the
         // change set, so it can never satisfy a step gate.
@@ -2467,6 +2527,7 @@ fn run_mode(
             mode,
             source: resolved.origin.to_string(),
             repo: repo.to_path_buf(),
+            branch: current_branch(repo),
             change_fingerprint: change_fingerprint(repo)?,
             changed_paths: Vec::new(),
             fallback_to_full: false,
@@ -2617,6 +2678,7 @@ fn run_mode(
         mode,
         source: resolved.origin.to_string(),
         repo: repo.to_path_buf(),
+        branch: current_branch(repo),
         change_fingerprint,
         changed_paths: paths,
         fallback_to_full,
@@ -3596,11 +3658,11 @@ mod tests {
             std::fs::write(path.join(format!("{name}.rs")), "fn work() {}\n").unwrap();
             git(&path, &["add", "."]);
             git(&path, &["commit", "-q", "-m", name]);
-            worktrees.push((dir, path));
+            worktrees.push((dir, path, name.to_string()));
         }
 
         let mut report_ids = Vec::new();
-        for (index, (_dir, path)) in worktrees.iter().enumerate() {
+        for (index, (_dir, path, branch)) in worktrees.iter().enumerate() {
             let fingerprint = change_fingerprint(path).unwrap();
             let id = format!("worktree-evidence-{index}");
             let report = VerificationReport {
@@ -3609,6 +3671,7 @@ mod tests {
                 mode: VerificationMode::Changed,
                 source: "configured".into(),
                 repo: path.clone(),
+                branch: branch.clone(),
                 change_fingerprint: fingerprint,
                 changed_paths: vec![],
                 fallback_to_full: false,
@@ -3635,30 +3698,33 @@ mod tests {
 
         // Neither write clobbered the other: each worktree's own `latest`
         // still names its own report, not whichever was saved last.
-        for ((_dir, path), expected_id) in worktrees.iter().zip(report_ids.iter()) {
+        for ((_dir, path, _branch), expected_id) in worktrees.iter().zip(report_ids.iter()) {
             let latest = load_latest(&state_dir, path).unwrap().expect("a report");
             assert_eq!(&latest.id, expected_id, "clobbered by a sibling worktree");
         }
 
         // And each worktree's Test gate independently passes against its
-        // OWN evidence.
-        for (_dir, path) in &worktrees {
+        // OWN evidence (a literal-checkout hit, so no branch is needed).
+        for (_dir, path, _branch) in &worktrees {
             assert!(
-                latest_is_fresh_and_passing(&state_dir, path, false).unwrap(),
+                latest_is_fresh_and_passing(&state_dir, path, false, None).unwrap(),
                 "worktree {} must gate-pass on its own evidence",
                 path.display()
             );
         }
     }
 
-    /// Issue #467 review (defect 1), the widening half: a gate evaluated
-    /// against a checkout with NO evidence of its own (the orchestrator's
-    /// main checkout, its tree clean) must still pass when a linked
-    /// worktree sibling has fresh, passing evidence for its own tree --
-    /// this is the mechanism the fixed workflow gate relies on, exercised
-    /// directly here rather than through the whole `advance` path.
-    #[test]
-    fn latest_is_fresh_and_passing_widens_to_a_sibling_worktrees_evidence() {
+    /// Builds the shared main-checkout-plus-one-linked-worktree fixture both
+    /// the positive and negative relatedness tests below need: a repo, a
+    /// worktree checked out on `worktree_branch` with a real commit, and a
+    /// passing `VerificationReport` persisted for the worktree, recorded as
+    /// produced on `report_branch`. Returns `(main_repo, worktree_dir,
+    /// worktree_path, state_dir)`; the caller decides what branch to ask
+    /// the gate for.
+    fn main_plus_worktree_with_evidence(
+        worktree_branch: &str,
+        report_branch: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, StateDir) {
         let main_repo = tempdir().unwrap();
         let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
         let git = |dir: &Path, args: &[&str]| {
@@ -3692,7 +3758,7 @@ mod tests {
                 "add",
                 "-q",
                 "-b",
-                "feature",
+                worktree_branch,
                 worktree_path.to_str().unwrap(),
             ],
         );
@@ -3702,7 +3768,7 @@ mod tests {
 
         // The main checkout records no evidence of its own at all.
         assert!(
-            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false).unwrap(),
+            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, None).unwrap(),
             "the main checkout has no evidence yet and must not gate-pass"
         );
 
@@ -3713,6 +3779,7 @@ mod tests {
             mode: VerificationMode::Changed,
             source: "configured".into(),
             repo: worktree_path.clone(),
+            branch: report_branch.to_string(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -3734,13 +3801,54 @@ mod tests {
             }],
         };
         save_report(&state_dir, &report).unwrap();
+        (main_repo, worktree_dir, worktree_path, state_dir)
+    }
+
+    /// Issue #467 round 3 (Finding 2, positive half): a gate evaluated
+    /// against a checkout with NO evidence of its own (the orchestrator's
+    /// main checkout, its tree clean) must still pass when a linked
+    /// worktree sibling has fresh, passing evidence for its own tree --
+    /// PROVIDED the sibling's recorded branch matches the workflow's own
+    /// recorded branch, the relatedness key `--branch`/`WorkflowState::
+    /// branch` establishes.
+    #[test]
+    fn latest_is_fresh_and_passing_widens_to_a_sibling_worktrees_evidence_on_the_same_branch() {
+        let (main_repo, _worktree_dir, _worktree_path, state_dir) =
+            main_plus_worktree_with_evidence("feature", "feature");
 
         // The main checkout's OWN report_dir still has nothing -- this can
-        // only pass through the widened, sibling-checkout search.
+        // only pass through the widened, sibling-checkout search, and only
+        // because the workflow's own branch ("feature") matches what the
+        // worktree's evidence was recorded against.
         assert!(
-            latest_is_fresh_and_passing(&state_dir, main_repo.path(), false).unwrap(),
-            "a linked worktree's fresh, passing evidence must satisfy the gate evaluated \
-             from the main checkout"
+            latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, Some("feature"))
+                .unwrap(),
+            "a linked worktree's fresh, passing evidence on the workflow's OWN branch must \
+             satisfy the gate evaluated from the main checkout"
+        );
+    }
+
+    /// Issue #467 round 3 (Finding 2, negative half): the mirror of the
+    /// above -- review round 2 caught that widening with no relatedness
+    /// check at all let ANY sibling's fresh, passing evidence satisfy a
+    /// gate that has nothing to do with it. A worktree on a DIFFERENT
+    /// branch than the one this gate is asked about must never open it,
+    /// no matter how fresh and passing its own evidence is.
+    #[test]
+    fn latest_is_fresh_and_passing_does_not_widen_to_an_unrelated_branch() {
+        let (main_repo, _worktree_dir, _worktree_path, state_dir) =
+            main_plus_worktree_with_evidence("someone-elses-feature", "someone-elses-feature");
+
+        assert!(
+            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, Some("my-feature"))
+                .unwrap(),
+            "an unrelated sibling's evidence, on a different branch, must not open this gate"
+        );
+        // With no workflow branch context at all, the same must hold: there
+        // is nothing to prove relatedness with, so it never widens.
+        assert!(
+            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, None).unwrap(),
+            "widening with no branch to check against must never happen"
         );
     }
 
@@ -4122,6 +4230,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4144,7 +4253,7 @@ mod tests {
         };
         save_report(&state, &report).unwrap();
         assert!(
-            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            !latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "a narrowed run is not completion evidence"
         );
 
@@ -4152,7 +4261,7 @@ mod tests {
         report.narrowed_to.clear();
         save_report(&state, &report).unwrap();
         assert!(
-            latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "the same run, un-narrowed, is"
         );
     }
@@ -4206,6 +4315,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: PathBuf::from("/repo"),
+            branch: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4261,6 +4371,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.to_path_buf(),
+            branch: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4704,6 +4815,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: PathBuf::from("/repo"),
+            branch: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4934,7 +5046,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         save_report(&state, &report).unwrap();
 
         assert!(
-            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            !latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "no baseline recorded yet: must still be strict"
         );
 
@@ -4944,7 +5056,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         )
         .unwrap();
         assert!(
-            latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "the same failure, now baselined, satisfies the gate"
         );
     }
@@ -5609,6 +5721,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -5631,7 +5744,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         };
         save_report(&state, &report).unwrap();
         assert!(
-            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            !latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "an Inconclusive report must never satisfy the gate"
         );
 
@@ -5772,6 +5885,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -5816,6 +5930,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,

@@ -3756,6 +3756,7 @@ mod tests {
                 mode: VerificationMode::Final,
                 source: "test".to_string(),
                 repo: repo.to_path_buf(),
+                branch: String::new(),
                 change_fingerprint: fingerprint,
                 changed_paths: Vec::new(),
                 fallback_to_full: false,

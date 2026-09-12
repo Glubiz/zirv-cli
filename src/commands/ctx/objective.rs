@@ -313,7 +313,9 @@ pub fn record_completion(state: &StateDir, repo: &Path, evidence: Vec<String>) -
     if record.status == Status::Closed {
         return Ok(true);
     }
-    if !crate::commands::workflow::verification::latest_is_fresh_and_passing(state, repo, true)? {
+    if !crate::commands::workflow::verification::latest_is_fresh_and_passing(
+        state, repo, true, None,
+    )? {
         return Ok(false);
     }
     record.status = Status::Closed;
@@ -714,6 +716,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "test".to_string(),
             repo: repo.to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: Vec::new(),
             fallback_to_full: false,
