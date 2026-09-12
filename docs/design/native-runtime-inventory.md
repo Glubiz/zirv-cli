@@ -66,6 +66,7 @@ criterion).
 | `create` | shared |  |
 | `ctx` | shared | command-group umbrella; each subcommand owned individually below |
 | `ctx agent` | N10 (#479) |  |
+| `ctx api` | N20 (#489) | the versioned local runtime protocol (issue #353): `schema`/`serve`/`call`. Backend-neutral by construction -- it publishes redacted session facts and a narrow method set over whichever `RuntimeBackend` is attached -- but the persistent runtime it exists to front is N20's, so the verb is owned there rather than marked `shared` |
 | `ctx ask` | N15 (#484) |  |
 | `ctx chat` | N11 (#480) |  |
 | `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |

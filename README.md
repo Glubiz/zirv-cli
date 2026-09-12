@@ -607,6 +607,11 @@ to the section that documents it in depth.
   your instruction files](#reviewing-your-instruction-files) and
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
+- **Local runtime protocol** — `api` (`schema`/`serve`/`call`) publishes zirv's
+  versioned local control surface: an owner-only unix socket or Windows named
+  pipe carrying NDJSON requests, replies and event subscriptions, with a
+  generated schema and frozen wire fixtures. See [Runtime protocol
+  v1](#runtime-protocol-v1-zirv-ctx-api).
 - **Hooks** — `hook` wires zirv into Claude Code's and Codex's own lifecycle
   events (stop, prompt, pre-compact, pretool/posttool, permission, notify,
   session-start), audits recorded decisions, and checks or heals the
@@ -1469,6 +1474,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
 | `zirv ctx handover [--agent <name>] [--model <tier\|id>] [--dry-run] [--force]` | Swaps the orchestrator seat's harness or model in place mid-session, carrying a handoff packet across the swap — see [Cross-harness fallback and handover](#cross-harness-fallback-and-handover) below |
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
+| `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 
 ### Runtime backends
 
@@ -1607,6 +1613,82 @@ and every model-calling call site in `src/` has a named implementation
 owner, checked on every run. The architecture decision behind all of this is
 recorded in
 [`docs/design/2026-09-11-native-runtime-contracts.md`](docs/design/2026-09-11-native-runtime-contracts.md).
+
+### Runtime protocol v1 (`zirv ctx api`)
+
+The `RuntimeBackend` wire above is in-process. **Protocol v1** is the public,
+versioned surface around it: the one a durable subscriber, an alternate
+client or a future daemon is allowed to depend on. The CLI wrappers remain
+the normal automation interface — raw protocol access exists for clients zirv
+does not ship.
+
+```bash
+zirv ctx api schema          # the contract, for a human
+zirv ctx api schema --json   # the same contract as a JSON Schema document
+zirv ctx api serve           # bind the endpoint for a bounded time
+zirv ctx api call session.snapshot
+```
+
+Both schema renderings are generated from the binary's own types — the method
+table, the real enum variants, and a test that pins the published frame field
+lists against what serde actually writes — so the documentation cannot drift
+from the wire.
+
+**Transport.** A unix domain socket at `<state>/s/api.sock` on unix, a named
+pipe on Windows, carrying NDJSON in both directions. The server writes one
+`hello` frame per connection before reading anything; a client intersects the
+capabilities that frame advertises with its own and disables locally whatever
+is missing, which is how an older client connects to a newer server and vice
+versa. Requests carry a caller-chosen `id`; replies echo it and carry the
+server `revision`; mutations accept an optional `idempotency_key`, and a retry
+with the same key returns the first attempt's result instead of repeating the
+work. Unknown fields are ignored everywhere, and every published enum
+vocabulary ends with an `unknown` fallback.
+
+**Methods** (v1 is deliberately narrow): `server.ping`,
+`server.capabilities`, `session.snapshot|list|get`, `session.start|stop`,
+`session.read|send_input`, `session.wait`, `session.report_status`,
+`events.subscribe`. Mail, memory, work-group, workflow, layout and plugin
+methods are added only when a concrete client needs them.
+
+**Events and gaps.** The server-wide `revision` advances by exactly one per
+emitted event, so a subscriber that sees a revision other than `last + 1` has
+missed something and refreshes `session.snapshot` rather than drifting. Waits
+pin the session generation resolved at call time: a session replaced while a
+wait is running fails that wait with `stale_generation` instead of letting the
+replacement satisfy it.
+
+**What is shared and what is not.** Server state holds runtime facts only —
+which sessions exist, their stable ids, generations and lifecycle state, and
+the event log. Layout, colour, sidebar selection, mouse state and modals stay
+in whichever client draws them; no method can read or write any of it. Session
+ids are stable across panes, tabs, worktrees and client attachment: `surface`
+is the only axis a client change moves.
+
+**Security.** The endpoint path is always derived from the operator-owned
+state directory — there is no flag, config key or environment variable that
+points the server or a client at an arbitrary path, so a checkout cannot name
+or redirect it (see [Trust boundary](#trust-boundary)). On unix the socket
+lives in a 0700 directory, is chmod'ed 0600, and the server verifies the peer
+uid (`SO_PEERCRED`/`getpeereid`) against its own; on Windows the pipe is
+created with an explicit owner-only DACL, because the *default* named-pipe
+descriptor grants read access to Everyone and the anonymous account. Snapshots
+publish a redacted session shape by construction: no transcript path or body,
+no prompt, no mail body, no terminal history, no credential and no absolute
+repository path — only the sanitised repo slug. Mutations go through the same
+narrowing-only trust model as everything else.
+
+**What v1 is not.** There is no daemon: the reference server runs in-process
+(`zirv ctx api serve`, or for the duration of one `zirv ctx api call`), and
+PTY ownership stays with the dashboard. A server with no runtime backend
+attached serves every read method off the session registry and refuses
+`session.start|stop|send_input` with a structured `unsupported` naming
+[issue #352](https://github.com/Glubiz/zirv-cli/issues/352) — never a silent
+success. Frozen request/response/event fixtures under
+`tests/fixtures/protocol/v1/` are replayed against the server on every test
+run, so the wire cannot change by accident. The full contract and its
+trade-offs are recorded in
+[`docs/design/2026-09-12-runtime-protocol-v1.md`](docs/design/2026-09-12-runtime-protocol-v1.md).
 
 ### Signals and verdicts
 
@@ -1779,6 +1861,13 @@ Process environment overrides are part of the broker-signed action and may
 not replace protected credential variables. Declared process effects only
 request additional sandbox access; under-declaring an effect leaves that
 resource read-only or disconnected rather than bypassing policy.
+
+The local runtime protocol ([`zirv ctx api`](#runtime-protocol-v1-zirv-ctx-api))
+adds no configuration key, and deliberately so: its endpoint is always derived
+from the operator-owned state directory, there is no setting or flag that
+names one, and the server's policy — which methods exist, which capabilities
+are advertised, who may connect — is compiled into the binary. A repository
+therefore has nothing to narrow here, and nothing to widen either.
 
 | Forbidden repo key | Set instead via |
 |---|---|

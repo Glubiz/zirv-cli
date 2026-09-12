@@ -860,10 +860,6 @@ impl ApiServer {
         }
     }
 
-    /// The emit seam a runtime owner drives events through without going via
-    /// a mutation method -- the tests below, and issue #489's native session
-    /// integration. Nothing inside this module calls it, hence the allow.
-    #[allow(dead_code)]
     /// The retained event log, for the frozen-fixture guard in
     /// `super::fixtures`, which has to freeze event frames a reply never
     /// carries.
@@ -872,6 +868,10 @@ impl ApiServer {
         self.lock().events.iter().cloned().collect()
     }
 
+    /// The emit seam a runtime owner drives events through without going via
+    /// a mutation method -- the tests below, and issue #489's native session
+    /// integration. Nothing inside this module calls it, hence the allow.
+    #[allow(dead_code)]
     pub fn publish(&self, session_id: Option<String>, generation: Option<u64>, event: ApiEvent) {
         self.lock().emit(session_id, generation, event);
     }

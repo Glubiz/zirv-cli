@@ -146,6 +146,9 @@ const READ_ONLY: &[&str] = &[
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
+    // Issue #353: renders the protocol contract compiled into this binary.
+    // Touches no disk, no registry and no socket.
+    "zirv ctx api schema",
 ];
 
 /// Leaf paths that write: state on disk, a session/registry entry, a
@@ -154,6 +157,12 @@ const READ_ONLY: &[&str] = &[
 /// on a GitHub issue). See [`READ_ONLY`]'s own doc comment for the
 /// completeness guarantee both tables share.
 const MUTATING: &[&str] = &[
+    // Issue #353. Both bind the local runtime endpoint and write its
+    // state-directory marker file, and `api call` can carry a mutating
+    // protocol method (`session.start|stop|send_input`). Classified by what
+    // the verb CAN do, not by what the narrowest invocation happens to do.
+    "zirv ctx api serve",
+    "zirv ctx api call",
     "zirv init",
     "zirv create",
     "zirv report bug",
