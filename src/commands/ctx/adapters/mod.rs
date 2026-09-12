@@ -698,12 +698,29 @@ pub(crate) fn scratchpad_rules(temp_dir: &Path) -> Vec<String> {
     scratchpad_rules_from_roots(&scratchpad_roots(temp_dir))
 }
 
+/// Claude Code's absolute-path permission-rule form, extracted so every
+/// caller that projects a real filesystem root into an `Edit`/`Read` rule
+/// (this module's own scratchpad rules, and issue #504's `--add-dir`
+/// widening in `adapters::claude::add_dir_edit_read_rules`) spells it
+/// identically rather than duplicating the normalization: forward slashes,
+/// no trailing slash, and a DOUBLED leading slash (`//<path>`, verified live
+/// findings cited in this function's own doc comment above). `root` may
+/// carry either separator -- a raw OS-native path (backslashes on Windows,
+/// as `ClaudeAdapter::grant_path` produces) is normalized here, not just an
+/// already-forward-slash scratchpad root -- and the result always has
+/// exactly two leading slashes, never one or three.
+pub(crate) fn doubled_slash_rule_base(root: &str) -> String {
+    let normalized = root.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    let stripped = normalized.strip_prefix('/').unwrap_or(normalized);
+    format!("//{stripped}")
+}
+
 fn scratchpad_rules_from_roots(roots: &[String]) -> Vec<String> {
     roots
         .iter()
         .flat_map(|root| {
-            let stripped = root.strip_prefix('/').unwrap_or(root);
-            let base = format!("//{stripped}/**");
+            let base = format!("{}/**", doubled_slash_rule_base(root));
             [format!("Read({base})"), format!("Edit({base})")]
         })
         .collect()

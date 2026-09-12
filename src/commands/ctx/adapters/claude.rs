@@ -1727,15 +1727,19 @@ fn current_worktree_grant_paths() -> Vec<String> {
 /// pair -- the same widening `super::scratchpad_rules` already does for the
 /// scratchpad -- so a delegated worker's Edit/Write inside its own
 /// `--add-dir` worktree never falls through to Claude Code's native
-/// permission prompt under the interactive posture. Pure and
-/// cfg-independent so a unit test can exercise it directly with fabricated
-/// paths, unlike [`current_worktree_grant_paths`]'s own real git worktree
-/// discovery.
+/// permission prompt under the interactive posture. `grant_path` returns an
+/// OS-native path (backslashes on Windows, verbatim-prefix stripped only),
+/// never forward-slash-normalized, so this reuses `super::
+/// doubled_slash_rule_base` -- the same forward-slash/doubled-leading-slash
+/// projection `scratchpad_rules_from_roots` applies -- rather than
+/// interpolating the raw path directly. Pure and cfg-independent so a unit
+/// test can exercise it directly with fabricated paths, unlike
+/// [`current_worktree_grant_paths`]'s own real git worktree discovery.
 fn add_dir_edit_read_rules(grant_paths: &[String]) -> Vec<String> {
     grant_paths
         .iter()
         .flat_map(|path| {
-            let base = format!("{path}/**");
+            let base = format!("{}/**", super::doubled_slash_rule_base(path));
             [format!("Read({base})"), format!("Edit({base})")]
         })
         .collect()
@@ -4913,15 +4917,21 @@ mod tests {
     /// -- see that function's own doc comment).
     #[test]
     fn add_dir_edit_read_rules_derives_a_pair_per_grant_path() {
-        let grants = vec!["/work/wt-a".to_string(), "/work/wt-b".to_string()];
+        // Review fix (issue #504): a raw grant path -- Windows-shaped
+        // (backslashes, as `grant_path`/`display_path` actually produce) or
+        // Unix-shaped -- must come out forward-slashed with a DOUBLED
+        // leading slash, the same `//<path>` convention `scratchpad_rules_
+        // from_roots` already applies (`doubled_slash_rule_base`), not the
+        // raw OS-native path interpolated verbatim.
+        let grants = vec![r"D:\GitHub\wt".to_string(), "/home/u/wt".to_string()];
         let rules = add_dir_edit_read_rules(&grants);
         assert_eq!(
             rules,
             vec![
-                "Read(/work/wt-a/**)".to_string(),
-                "Edit(/work/wt-a/**)".to_string(),
-                "Read(/work/wt-b/**)".to_string(),
-                "Edit(/work/wt-b/**)".to_string(),
+                "Read(//D:/GitHub/wt/**)".to_string(),
+                "Edit(//D:/GitHub/wt/**)".to_string(),
+                "Read(//home/u/wt/**)".to_string(),
+                "Edit(//home/u/wt/**)".to_string(),
             ]
         );
     }

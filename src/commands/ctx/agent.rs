@@ -2502,7 +2502,7 @@ pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
 /// every other worktree helper in this module (`allocate_worktree`,
 /// `reclaim_worktree`): git missing, `repo` not a work tree, or an
 /// unparseable/uncanonicalizable path all degrade to an empty list, never a
-/// wrong hint. Unlike main's own `adapters::claude::linked_worktree_args`
+/// wrong hint. Unlike main's own `adapters::claude::current_worktree_grant_paths`
 /// (which this deliberately does not depend on -- that helper is `#[cfg(not
 /// (test))]`, so `workdir_visibility_hint`'s own tests could never exercise
 /// it), this always runs, the same as every other git shellout in this file.
