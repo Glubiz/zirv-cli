@@ -140,6 +140,13 @@ struct Inner {
     idempotency: BTreeMap<String, Value>,
     idempotency_order: VecDeque<String>,
     subscribers: Vec<Sender<EventFrame>>,
+    /// Lifecycle states a CLIENT reported (`session.report_status`) or this
+    /// server itself caused (`session.send_input`, `session.stop`). A
+    /// refresh from the session source must not silently undo them: the
+    /// registry projection is a coarse "is the process alive and is a turn
+    /// in flight", and the client driving a session knows better. Every
+    /// other field still comes from the source on every refresh.
+    reported: BTreeMap<String, SessionState>,
 }
 
 impl Inner {
@@ -204,6 +211,7 @@ impl ApiServer {
                 idempotency: BTreeMap::new(),
                 idempotency_order: VecDeque::new(),
                 subscribers: Vec::new(),
+                reported: BTreeMap::new(),
             }),
             backend: Mutex::new(backend),
             source,
@@ -222,8 +230,11 @@ impl ApiServer {
         let fresh = self.source.sessions();
         let mut inner = self.lock();
         let mut seen: Vec<String> = Vec::new();
-        for facts in fresh {
+        for mut facts in fresh {
             seen.push(facts.session_id.clone());
+            if let Some(reported) = inner.reported.get(&facts.session_id) {
+                facts.state = *reported;
+            }
             match inner.sessions.get(&facts.session_id) {
                 Some(existing) if *existing == facts => {}
                 Some(_) => {
@@ -334,9 +345,13 @@ impl ApiServer {
             .as_ref()
             .filter(|_| spec.mutation)
             .map(|key| format!("{}:{key}", spec.name));
-        if let Some(key) = &cache_key
-            && let Some(cached) = self.lock().idempotency.get(key).cloned()
-        {
+        // The lookup is its own statement on purpose: an `if let` chain
+        // would hold the guard across the `self.ok` call in its body, and
+        // `self.ok` locks again to read the revision.
+        let cached = cache_key
+            .as_ref()
+            .and_then(|key| self.lock().idempotency.get(key).cloned());
+        if let Some(cached) = cached {
             return self.ok(request, cached);
         }
 
@@ -536,6 +551,9 @@ impl ApiServer {
         if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
             entry.state = SessionState::Ended;
         }
+        inner
+            .reported
+            .insert(facts.session_id.clone(), SessionState::Ended);
         inner.emit(
             Some(facts.session_id.clone()),
             Some(facts.generation),
@@ -599,6 +617,9 @@ impl ApiServer {
         if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
             entry.state = SessionState::Working;
             let updated = entry.clone();
+            inner
+                .reported
+                .insert(facts.session_id.clone(), SessionState::Working);
             inner.emit(
                 Some(facts.session_id.clone()),
                 Some(facts.generation),
@@ -628,6 +649,9 @@ impl ApiServer {
         };
         entry.state = params.state;
         let updated = entry.clone();
+        inner
+            .reported
+            .insert(facts.session_id.clone(), params.state);
         inner.emit(
             Some(facts.session_id.clone()),
             Some(facts.generation),
@@ -1175,11 +1199,15 @@ mod tests {
         let server = server_with(vec![facts(id, SessionState::Working)]);
         let waiting = Arc::clone(&server);
         let session = id.to_string();
+        // The pin is explicit, so this test cannot race: whether the
+        // replacement lands before the wait resolves (refused at resolve
+        // time) or after (refused by the poll), the answer is the same
+        // stale_generation.
         let waiter = std::thread::spawn(move || {
             waiting.handle(&Request::new(
                 "w",
                 Method::SessionWait,
-                json!({"session_id": session, "until": "idle", "timeout_ms": 5000}),
+                json!({"session_id": session, "generation": 1, "until": "idle", "timeout_ms": 5000}),
             ))
         });
         // The replacement: same id, new generation, and immediately idle --

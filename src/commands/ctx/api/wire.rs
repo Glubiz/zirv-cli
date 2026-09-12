@@ -44,7 +44,11 @@ pub const SERVER_NAME: &str = "zirv";
 /// Every method v1 publishes. Deliberately narrow (issue #353: "Add mail,
 /// memory, work-group, workflow, layout, and plugin methods only as concrete
 /// clients need them").
+// `rename_all` only reaches `Unknown`: every real variant carries its own
+// explicit wire name, and the fallback must still serialize as the
+// lowercase `unknown` every other published vocabulary uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Method {
     #[serde(rename = "server.ping")]
     ServerPing,
@@ -121,6 +125,7 @@ impl std::str::FromStr for Method {
 /// feature in itself rather than calling and failing (see
 /// `super::client::Negotiated`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// `server.ping`, `server.capabilities`, `session.snapshot|list|get`,
     /// `session.read`. Always advertised; a server without it is not a v1
