@@ -1598,6 +1598,27 @@ mod tests {
     }
 
     #[test]
+    fn refusal_blocks_are_rejected_before_transport() {
+        let target = target("https://api.anthropic.com".into());
+        let mut refused = request();
+        refused
+            .messages
+            .push(super::super::adapter::ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: vec![ProviderContent::Refusal {
+                    text: "I cannot help with that.".into(),
+                }],
+            });
+        let failure = validate_request(&refused, &target).unwrap_err();
+        assert_eq!(failure.class, FailureClass::Configuration);
+        assert!(
+            failure.message.contains("no refusal content block"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
     fn continuation_requires_unchanged_thinking_and_exact_tool_relationships() {
         let target = target("https://api.anthropic.com".into());
         let mut continued = request();
