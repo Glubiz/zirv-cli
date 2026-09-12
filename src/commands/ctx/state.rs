@@ -33,7 +33,14 @@ pub fn now_secs() -> u64 {
 /// path that cannot be canonicalized (it does not exist yet, or is not
 /// readable) falls back to its own text, which is the pre-existing behavior.
 pub fn repo_slug(path: &Path) -> String {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Issue #467: redirected to the main checkout's identity for a linked
+    // `git worktree add` checkout, so a workflow/report/telemetry key
+    // computed from a worktree lands in the SAME place as one computed from
+    // its main checkout -- see `pathutil::worktree_identity`. A no-op (falls
+    // straight through to the pre-existing canonicalize) for every ordinary
+    // single-checkout repository, which is every repository this function
+    // keyed before #467.
+    let path = super::pathutil::worktree_identity(path);
     let rendered = display_path(&path);
     let legacy: String = rendered
         .chars()
