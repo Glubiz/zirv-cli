@@ -2259,6 +2259,44 @@ pub fn latest_is_fresh_and_passing(
     repo: &Path,
     final_only: bool,
 ) -> CtxResult<bool> {
+    if latest_is_fresh_and_passing_at(state, repo, final_only)? {
+        return Ok(true);
+    }
+    // Issue #467 review (defect 1): `report_dir`/`save_report` stay keyed by
+    // the literal checkout (plain `repo_slug`), so two sibling worktrees
+    // never clobber each other's `zirv test changed` evidence -- but that
+    // also means this gate, evaluated from one checkout (typically the
+    // orchestrator's own main checkout, its tree clean), could never see a
+    // worker's fresh, passing evidence recorded in a linked worktree. This
+    // widens only the READ side: every OTHER checkout sharing `repo`'s
+    // repository (`pathutil::sibling_checkouts`) gets the exact same check
+    // run again, against ITS OWN current tree and ITS OWN latest report --
+    // never `repo`'s freshly computed fingerprint compared against a report
+    // recorded somewhere else, which would silently treat two unrelated
+    // trees as identical.
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    for sibling in crate::commands::ctx::pathutil::sibling_checkouts(repo) {
+        if sibling == canonical {
+            continue;
+        }
+        if latest_is_fresh_and_passing_at(state, &sibling, final_only)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The single-checkout freshness/pass check: is `repo`'s own latest
+/// persisted report fresh (matches `repo`'s current change fingerprint,
+/// covers the whole changed-check surface) and passing (outright, or every
+/// failure covered by the operator's recorded baseline)? Split out so
+/// [`latest_is_fresh_and_passing`]'s widened search can run the exact same
+/// check against a sibling worktree rather than duplicating it.
+fn latest_is_fresh_and_passing_at(
+    state: &StateDir,
+    repo: &Path,
+    final_only: bool,
+) -> CtxResult<bool> {
     let Some(report) = load_latest(state, repo)? else {
         return Ok(false);
     };
@@ -3510,6 +3548,200 @@ mod tests {
                 verify.notes
             );
         });
+    }
+
+    /// Issue #467 review (defect 1): report storage must stay keyed by the
+    /// LITERAL checkout, never merged across `git worktree add` siblings by
+    /// identity -- otherwise two workers running `zirv test changed`
+    /// concurrently in sibling worktrees of the same repository would share
+    /// one `report_dir` and one `latest` pointer, so the second write
+    /// clobbers the first and its own workflow's Test/Verify gate would then
+    /// reject the first worktree's fresh, still-passing evidence as stale.
+    /// Each worktree's own evidence must independently satisfy its own
+    /// gate check.
+    #[test]
+    fn sibling_worktrees_record_and_gate_pass_independently() {
+        let main_repo = tempdir().unwrap();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "hello\n").unwrap();
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let mut worktrees = Vec::new();
+        for name in ["worker-a", "worker-b"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().to_path_buf();
+            std::fs::remove_dir(&path).unwrap();
+            git(
+                main_repo.path(),
+                &["worktree", "add", "-q", "-b", name, path.to_str().unwrap()],
+            );
+            std::fs::write(path.join(format!("{name}.rs")), "fn work() {}\n").unwrap();
+            git(&path, &["add", "."]);
+            git(&path, &["commit", "-q", "-m", name]);
+            worktrees.push((dir, path));
+        }
+
+        let mut report_ids = Vec::new();
+        for (index, (_dir, path)) in worktrees.iter().enumerate() {
+            let fingerprint = change_fingerprint(path).unwrap();
+            let id = format!("worktree-evidence-{index}");
+            let report = VerificationReport {
+                schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+                id: id.clone(),
+                mode: VerificationMode::Changed,
+                source: "configured".into(),
+                repo: path.clone(),
+                change_fingerprint: fingerprint,
+                changed_paths: vec![],
+                fallback_to_full: false,
+                narrowed_to: vec![],
+                notes: vec![],
+                started_at: 0,
+                finished_at: 0,
+                checks: vec![CheckResult {
+                    id: "unit".into(),
+                    kind: CheckKind::Unit,
+                    command: "true".into(),
+                    source: CheckSource::DiscoveredToolchain,
+                    status: CheckStatus::Passed,
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                    failure_output: None,
+                    failure_test_names: Vec::new(),
+                    inconclusive_reason: None,
+                }],
+            };
+            save_report(&state_dir, &report).unwrap();
+            report_ids.push(id);
+        }
+
+        // Neither write clobbered the other: each worktree's own `latest`
+        // still names its own report, not whichever was saved last.
+        for ((_dir, path), expected_id) in worktrees.iter().zip(report_ids.iter()) {
+            let latest = load_latest(&state_dir, path).unwrap().expect("a report");
+            assert_eq!(&latest.id, expected_id, "clobbered by a sibling worktree");
+        }
+
+        // And each worktree's Test gate independently passes against its
+        // OWN evidence.
+        for (_dir, path) in &worktrees {
+            assert!(
+                latest_is_fresh_and_passing(&state_dir, path, false).unwrap(),
+                "worktree {} must gate-pass on its own evidence",
+                path.display()
+            );
+        }
+    }
+
+    /// Issue #467 review (defect 1), the widening half: a gate evaluated
+    /// against a checkout with NO evidence of its own (the orchestrator's
+    /// main checkout, its tree clean) must still pass when a linked
+    /// worktree sibling has fresh, passing evidence for its own tree --
+    /// this is the mechanism the fixed workflow gate relies on, exercised
+    /// directly here rather than through the whole `advance` path.
+    #[test]
+    fn latest_is_fresh_and_passing_widens_to_a_sibling_worktrees_evidence() {
+        let main_repo = tempdir().unwrap();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "hello\n").unwrap();
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let worktree_dir = tempdir().unwrap();
+        let worktree_path = worktree_dir.path().to_path_buf();
+        std::fs::remove_dir(&worktree_path).unwrap();
+        git(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree_path.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worktree_path.join("feature.rs"), "fn feature() {}\n").unwrap();
+        git(&worktree_path, &["add", "."]);
+        git(&worktree_path, &["commit", "-q", "-m", "feature work"]);
+
+        // The main checkout records no evidence of its own at all.
+        assert!(
+            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false).unwrap(),
+            "the main checkout has no evidence yet and must not gate-pass"
+        );
+
+        let fingerprint = change_fingerprint(&worktree_path).unwrap();
+        let report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "worktree-evidence".into(),
+            mode: VerificationMode::Changed,
+            source: "configured".into(),
+            repo: worktree_path.clone(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![CheckResult {
+                id: "unit".into(),
+                kind: CheckKind::Unit,
+                command: "true".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: None,
+            }],
+        };
+        save_report(&state_dir, &report).unwrap();
+
+        // The main checkout's OWN report_dir still has nothing -- this can
+        // only pass through the widened, sibling-checkout search.
+        assert!(
+            latest_is_fresh_and_passing(&state_dir, main_repo.path(), false).unwrap(),
+            "a linked worktree's fresh, passing evidence must satisfy the gate evaluated \
+             from the main checkout"
+        );
     }
 
     #[cfg(unix)]
