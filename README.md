@@ -1207,7 +1207,7 @@ and database/schema changes cannot be downgraded below High risk.
 zirv workflow list                              # built-in workflow definitions
 zirv workflow show feature                       # one definition's steps
 zirv workflow classify --task "..."               # classify without starting
-zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm]
+zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>]
 zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off and per-step wall-clock
 zirv workflow resume <id>                         # restore as the active workflow
 zirv workflow context [id]                        # the current step's resolved skill context
@@ -1247,43 +1247,60 @@ added once the real change exists.
 
 ### Linked worktrees
 
-A workflow started in a repository's main checkout is discoverable, and
-gated, from any `git worktree add`-linked sibling of it (and vice versa).
-This is narrowly scoped to two things -- every other piece of per-repository
-state (crash witnesses, handoffs, telemetry, test baselines, mail, ...) stays
-keyed by the literal checkout a session or process actually runs in, never
-merged across worktrees:
+A workflow started in a repository's main checkout can be found from, and
+gated against evidence in, a `git worktree add`-linked sibling of it (and
+vice versa) -- but workflow state, and evidence, are never merged into one
+shared identity: every piece of per-repository state (workflow state, the
+active-workflow pointer, verification reports, crash witnesses, handoffs,
+telemetry, test baselines, mail, ...) stays keyed by the LITERAL checkout a
+session, process, or `zirv test changed` run actually used. Two independent
+lookup/relatedness rules make cross-worktree orchestration work without that:
 
-- **Workflow-state lookup.** `--repo <path>` (or the current directory when
-  it is omitted) resolves through the repository's shared `.git` common dir,
-  so `zirv workflow status|advance|review package <id> --repo <worktree>`
-  finds the same workflow `zirv workflow start` created in the main checkout,
-  and bare `zirv workflow status` run from inside the worktree sees its
-  active-workflow pointer too.
-- **The `Test`/`Verify` evidence gate's read side.** `zirv test changed`
-  always records its evidence under the literal checkout it ran in --
-  concurrent runs in sibling worktrees never clobber each other's evidence.
-  The gate itself widens only its read: if the checkout it is evaluated from
-  has no fresh, passing evidence of its own, it also checks every sibling
-  checkout for evidence that is fresh and passing against *that sibling's
-  own* tree. This is what lets the common orchestrator/worker split work
-  correctly: start the workflow in the main checkout, have a worker implement
-  and run `zirv test changed` in `<repo>/.claude/worktrees/<name>`, then
-  `zirv workflow advance <id> --outcome success` from the main checkout (or
-  `--repo <repo>/.claude/worktrees/<name>`, either finds the same evidence) --
-  the gate sees the worktree's real, fresh evidence rather than the main
-  checkout's clean, evidence-less tree.
+- **Finding a workflow by id or by "the active one".** `zirv workflow
+  status|advance|review package <id> --repo <path>` looks in `<path>`'s own
+  state directory first, then in each of its sibling checkouts
+  (`git worktree list`) for that id -- an explicit id is never ambiguous, so
+  this is safe to widen to every sibling. Bare `zirv workflow status` (no
+  id) is different: it reads `<path>`'s own active-workflow pointer first,
+  and if `<path>` has none, falls back ONLY to the MAIN checkout's own
+  pointer -- never an arbitrary other sibling. This is what lets a worker
+  worktree with no workflow of its own inherit the orchestrator's, while two
+  workers each running their own `zirv workflow start` in their own
+  worktrees never collide or clobber one another's active pointer.
+- **The `Test`/`Verify` evidence gate's relatedness check.** A workflow
+  records the branch it gates (`WorkflowState.branch`: `--branch <name>` at
+  `start`, or the checkout's own current branch when not given), and every
+  `zirv test changed`/`zirv verify` run records the branch it was produced
+  on. `zirv test changed` always writes its evidence under the literal
+  checkout it ran in, so concurrent runs in sibling worktrees never clobber
+  each other's evidence. The gate widens only its read: if the checkout it
+  is evaluated from has no fresh, passing evidence of its own, it also
+  checks every sibling checkout's own evidence against that sibling's own
+  tree -- but ONLY accepts a sibling whose recorded branch matches the
+  workflow's own recorded branch exactly. A sibling with fresh, passing
+  evidence on a *different* branch never opens this gate, no matter how
+  fresh or passing.
 
-`zirv workflow classify`/`start` needed no change here: `git diff --numstat
-<base>` already measures whichever repository it is given, so pointed at a
-worktree (`--repo` or plain cwd) it already saw that worktree's own branch
-diff against its base, not an empty diff off an unrelated main checkout still
-sitting on the base branch.
+Together: start the workflow in the main checkout (`--branch
+worker/feature-x` if that main checkout is not itself on the worker's
+branch), have the worker implement and run `zirv test changed` in
+`<repo>/.claude/worktrees/<name>` (checked out on `worker/feature-x`), then
+`zirv workflow advance <id> --outcome success` from the main checkout (or
+`--repo <repo>/.claude/worktrees/<name>`, either finds the same workflow) --
+the gate accepts the worktree's evidence because its recorded branch matches,
+not merely because it happens to be fresh and passing for someone.
 
-No new flag was added for this: `--repo` (already accepted by every verb
-above) is sufficient. The one unsupported edge case is a main checkout whose
-`.git` was relocated with `git init --separate-git-dir=...`; its worktree
-siblings are not resolved to it.
+`zirv workflow classify`/`start --branch <name>` diffs that branch against
+its own base as refs (`git diff <base> <name>`), not `--repo`'s working tree
+-- necessary because the checkout given as `--repo` need not have `<name>`
+checked out at all. Without `--branch`, classification is unchanged: `git
+diff --numstat <base>` already measures whichever repository it is given, so
+pointed at a worktree (`--repo` or plain cwd) it already saw that worktree's
+own branch diff (uncommitted edits included) against its base.
+
+The one unsupported edge case is a main checkout whose `.git` was relocated
+with `git init --separate-git-dir=...`; its worktree siblings are not
+resolved to it as "the main checkout" for the active-pointer fallback above.
 
 ### Deploy tiers
 
