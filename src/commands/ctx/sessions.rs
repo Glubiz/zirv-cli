@@ -5420,6 +5420,72 @@ mod tests {
         assert!(take_interrupted_in_flight(&state, &this_repo).is_none());
     }
 
+    /// Issue #467 review (defect 2): unlike workflow-state lookup, crash
+    /// witnesses must stay keyed by the LITERAL checkout even for a `git
+    /// worktree add` sibling of the same repository -- a new session
+    /// starting in one worktree must never consume (or even see) a crash
+    /// witness left by a session that died in a sibling worktree, since the
+    /// two are different processes working on different trees. `repo_slug`
+    /// (this module's match key) resolves worktree siblings independently
+    /// of `workflow::engine`'s own, deliberately separate,
+    /// `workflow_identity_slug`.
+    #[test]
+    fn a_sibling_worktrees_dead_in_flight_record_is_not_reported() {
+        use super::super::testenv::dead_pid;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+
+        let main_repo = tmp.path().join("main-repo");
+        std::fs::create_dir_all(&main_repo).expect("create main repo dir");
+        let git = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&main_repo, &["init", "-q"]);
+        std::fs::write(main_repo.join("README.md"), "hello\n").unwrap();
+        git(&main_repo, &["add", "."]);
+        git(&main_repo, &["commit", "-q", "-m", "base"]);
+
+        let worktree = tmp.path().join("linked-worktree");
+        git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        // The crash witness belongs to the linked worktree.
+        let record = in_flight_record(&worktree, dead_pid(), Some(sample_in_flight()));
+        write_record(&state, &record);
+
+        // A session starting fresh in the main checkout must not see it,
+        // even though both share the same `.git` and the same commit
+        // history.
+        assert!(
+            take_interrupted_in_flight(&state, &main_repo).is_none(),
+            "a sibling worktree's crash witness must never leak into the main checkout"
+        );
+        // The witness is still there for the worktree itself, unconsumed.
+        assert!(take_interrupted_in_flight(&state, &worktree).is_some());
+    }
+
     /// Back-compat: a `Record` serialized by a build before this field
     /// existed has no `in_flight` key at all in its JSON. It must still
     /// deserialize, with `in_flight` defaulting to `None` -- never a parse
