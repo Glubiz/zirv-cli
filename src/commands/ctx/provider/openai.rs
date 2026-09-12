@@ -1414,6 +1414,7 @@ mod tests {
     const INCOMPLETE: &str = fixture!("stream-incomplete.sse");
     const REFUSAL: &str = fixture!("stream-refusal.sse");
     const STREAM_ERROR: &str = fixture!("stream-error.sse");
+    const STREAM_FAILED: &str = fixture!("stream-failed.sse");
     const FINAL_TEXT: &str = fixture!("stream-final-text.sse");
 
     fn target(base_url: String) -> ProviderTarget {
@@ -1621,6 +1622,20 @@ mod tests {
             "expected the per-block cap, got: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn failed_response_events_are_typed_from_their_nested_error() {
+        // `response.failed` carries its error under `/response/error`, unlike
+        // the top-level `error` event, and it arrives after partial output:
+        // the turn must settle to the typed failure, never to a completion
+        // holding the half-streamed text.
+        let error = parse(STREAM_FAILED).unwrap_err();
+        assert_eq!(error.class, FailureClass::Provider);
+        assert_eq!(error.scope.kind, FailureScopeKind::Endpoint);
+        assert_eq!(error.scope.id.as_deref(), Some("openai"));
+        assert!(error.retry.retryable);
+        assert!(error.message.contains("The model failed to generate"));
     }
 
     #[test]
