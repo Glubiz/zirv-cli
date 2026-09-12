@@ -559,6 +559,14 @@ mod imp {
     pub struct Listener {
         name: String,
         path: std::path::PathBuf,
+        /// A created-but-not-yet-connected instance, so the pipe NAME exists
+        /// from the moment `bind` returns rather than only once some thread
+        /// gets around to calling `accept`. Without it a client (or
+        /// [`super::probe`]) that tries immediately after `bind` sees
+        /// `ERROR_FILE_NOT_FOUND` -- the Windows equivalent of a unix
+        /// listener whose socket file does not exist yet, which
+        /// `UnixListener::bind` never leaves open.
+        spare: std::sync::Mutex<Option<OwnedHandle>>,
     }
 
     impl Listener {
@@ -573,20 +581,39 @@ mod imp {
             // stale file is never mistaken for a live endpoint -- exactly
             // what `signal::SignalServer::bind` already does.
             state::write_private(path, &name)?;
-            // Proves the name is usable (and the DACL buildable) before any
-            // caller is told the endpoint exists.
             let descriptor = owner_only_descriptor()?;
-            let probe = create_instance(&name, &descriptor)?;
-            drop(probe);
+            let spare = create_instance(&name, &descriptor)?;
             Ok(Self {
                 name,
                 path: path.to_path_buf(),
+                spare: std::sync::Mutex::new(Some(spare)),
             })
         }
 
-        pub fn accept(&self) -> CtxResult<Connection> {
+        fn take_or_create(&self) -> CtxResult<OwnedHandle> {
+            if let Ok(mut spare) = self.spare.lock()
+                && let Some(handle) = spare.take()
+            {
+                return Ok(handle);
+            }
             let descriptor = owner_only_descriptor()?;
-            let instance = create_instance(&self.name, &descriptor)?;
+            create_instance(&self.name, &descriptor)
+        }
+
+        fn replace_spare(&self) {
+            let Ok(descriptor) = owner_only_descriptor() else {
+                return;
+            };
+            let Ok(handle) = create_instance(&self.name, &descriptor) else {
+                return;
+            };
+            if let Ok(mut spare) = self.spare.lock() {
+                *spare = Some(handle);
+            }
+        }
+
+        pub fn accept(&self) -> CtxResult<Connection> {
+            let instance = self.take_or_create()?;
             // SAFETY: `instance` is live for the call; a null overlapped
             // pointer is the documented blocking form on a synchronous pipe.
             let ok = unsafe { ConnectNamedPipe(instance.as_raw_handle() as _, std::ptr::null_mut()) };
@@ -595,9 +622,13 @@ mod imp {
                 // A client that connected between `CreateNamedPipeW` and
                 // `ConnectNamedPipe` is already connected, not an error.
                 if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+                    self.replace_spare();
                     return Err(format!("accept failed on {}: {error}", self.name).into());
                 }
             }
+            // Restored before this connection is handed back, so the pipe
+            // name never disappears between two accepts.
+            self.replace_spare();
             connection_from(instance)
         }
 

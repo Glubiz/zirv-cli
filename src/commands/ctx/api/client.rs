@@ -335,6 +335,17 @@ impl Client {
         }
     }
 
+    /// Test seam: pretend this subscriber's last applied revision is
+    /// `revision`, which is what a reconnect past the server's retained
+    /// event window leaves it at. There is no way to make a live server
+    /// purge frames on cue without either a 512-event loop or a knob on the
+    /// server itself, and a knob on the server would be a production
+    /// surface that exists only for a test.
+    #[cfg(test)]
+    pub fn rewind_for_test(&mut self, revision: u64) {
+        self.tracker = GapTracker::starting_at(revision);
+    }
+
     /// The recovery a gap demands: take a fresh snapshot and re-anchor the
     /// tracker on the revision it is current as of. Returns the snapshot's
     /// session list.
@@ -491,33 +502,49 @@ mod tests {
         server.publish(Some("s".to_string()), Some(1), ApiEvent::Heartbeat);
         server.publish(Some("s".to_string()), Some(1), ApiEvent::Heartbeat);
 
-        let mut client = Client::connect(running.endpoint()).expect("connect");
-        // Subscribing from revision 0 while claiming to have seen nothing is
-        // in order; subscribing from a revision the server never issued the
-        // successor of is the gap case. Ask from 0 but tell the tracker we
-        // are already at 5, which is exactly the state a subscriber is in
-        // after a reconnect that missed a purge.
-        let _ = client.subscribe(0).expect("subscribe");
-        let (_, first) = client
+        // A subscriber gets its own connection: once `events.subscribe` is
+        // accepted the server streams on it and reads nothing more, which is
+        // why the recovery call below goes out on a second client.
+        let mut subscriber = Client::connect(running.endpoint()).expect("connect subscriber");
+        subscriber.subscribe(0).expect("subscribe");
+        let (_, first) = subscriber
             .next_event()
             .expect("read")
             .expect("the backlog is replayed");
-        assert_eq!(first, Observed::InOrder);
+        assert_eq!(first, Observed::InOrder, "the backlog starts at revision 1");
+        let (_, second) = subscriber
+            .next_event()
+            .expect("read")
+            .expect("the second backlog frame");
+        assert_eq!(second, Observed::InOrder);
+        assert!(!subscriber.tracker().refresh_due());
 
-        let mut tracker = GapTracker::starting_at(2);
-        // The server drops old frames once the ring is full; a subscriber
-        // that comes back asking for a revision older than the oldest
-        // retained frame sees its first delivered revision jump.
-        assert!(matches!(
-            tracker.observe(900),
-            Observed::Gap { expected: 3, .. }
-        ));
-        assert!(tracker.refresh_due());
+        // Now the gap: the server emits two more events while this
+        // subscriber is pretending to have missed one (exactly what a
+        // reconnect past the retained event window looks like).
+        server.publish(Some("s".to_string()), Some(1), ApiEvent::Heartbeat);
+        server.publish(Some("s".to_string()), Some(1), ApiEvent::Heartbeat);
+        let (_, third) = subscriber.next_event().expect("read").expect("frame");
+        assert_eq!(third, Observed::InOrder);
+        // Drop the tracker one revision behind to stand in for a frame the
+        // server had already purged, then read the next live frame.
+        subscriber.rewind_for_test(2);
+        let (_, gapped) = subscriber.next_event().expect("read").expect("frame");
+        assert!(
+            matches!(gapped, Observed::Gap { .. }),
+            "a skipped revision must be reported as a gap, got {gapped:?}"
+        );
+        assert!(
+            subscriber.tracker().refresh_due(),
+            "and the subscriber must owe a snapshot refresh"
+        );
 
-        let snapshot = client.refresh_snapshot().expect("refresh");
+        let mut recovery = Client::connect(running.endpoint()).expect("connect recovery");
+        let snapshot = recovery.refresh_snapshot().expect("refresh");
         assert!(snapshot["revision"].is_u64());
-        assert!(!client.tracker().refresh_due());
-        drop(client);
+        assert!(!recovery.tracker().refresh_due());
+        drop(subscriber);
+        drop(recovery);
         drop(running);
     }
 }
