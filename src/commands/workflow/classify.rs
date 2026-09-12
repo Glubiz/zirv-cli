@@ -935,6 +935,78 @@ mod tests {
         assert_eq!(classification.risk_measurement, RiskMeasurement::Measured);
     }
 
+    /// Issue #467, acceptance 3: undeclared (no `--path`/`--changed-lines`)
+    /// classification measures whichever repository it is given via `git
+    /// diff --numstat <base>` (`git_change_input`) -- so pointing `zirv
+    /// workflow start` at a linked `git worktree add` sibling sees that
+    /// worktree's own branch diff against its base, not an empty diff off
+    /// the main checkout it shares a `.git` with (which never touched the
+    /// feature branch's files at all).
+    #[test]
+    fn git_change_input_sees_a_linked_worktrees_branch_diff_against_its_base() {
+        let main_repo = tempfile::tempdir().expect("tempdir");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "readme\n").expect("write");
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let worktree_dir = tempfile::tempdir().expect("tempdir");
+        let worktree_path = worktree_dir.path().to_path_buf();
+        std::fs::remove_dir(&worktree_path).expect("remove placeholder dir");
+        git(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf-8 path"),
+            ],
+        );
+        for index in 0..8 {
+            std::fs::write(
+                worktree_path.join(format!("src-{index}.rs")),
+                "fn work() {}\n",
+            )
+            .unwrap();
+        }
+        git(&worktree_path, &["add", "."]);
+        git(&worktree_path, &["commit", "-q", "-m", "feature work"]);
+
+        // The main checkout was never touched after "base": its own diff
+        // against its own resolvable history is empty.
+        let from_main = git_change_input(main_repo.path(), "small feature".into()).unwrap();
+        assert!(
+            from_main.paths.is_empty(),
+            "the main checkout was never touched: {from_main:?}"
+        );
+
+        // The worktree's diff against the shared base is real, even though
+        // it shares its `.git` common dir with the (clean) main checkout.
+        let from_worktree = git_change_input(&worktree_path, "small feature".into()).unwrap();
+        assert_eq!(from_worktree.paths.len(), 8, "{from_worktree:?}");
+
+        let measured = classify(&from_worktree).unwrap();
+        assert!(measured.complexity > Complexity::Trivial, "{measured:?}");
+    }
+
     #[test]
     fn classification_task_is_bounded() {
         let mut value = input(&["README.md"], 5);
