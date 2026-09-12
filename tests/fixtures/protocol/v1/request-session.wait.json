@@ -1,0 +1,11 @@
+{
+  "id": "req-wait",
+  "method": "session.wait",
+  "params": {
+    "generation": 1,
+    "session_id": "fake-1",
+    "timeout_ms": 100,
+    "until": "idle"
+  },
+  "v": 1
+}

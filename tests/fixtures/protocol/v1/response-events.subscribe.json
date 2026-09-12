@@ -1,0 +1,12 @@
+{
+  "id": "req-subscribe",
+  "outcome": {
+    "result": {
+      "revision": 6,
+      "subscribed": true
+    },
+    "status": "ok"
+  },
+  "revision": 6,
+  "v": 1
+}

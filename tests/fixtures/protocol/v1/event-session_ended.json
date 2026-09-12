@@ -1,0 +1,11 @@
+{
+  "generation": 1,
+  "payload": {
+    "kind": "session_ended",
+    "session_id": "fake-1"
+  },
+  "revision": 6,
+  "session_id": "fake-1",
+  "type": "event",
+  "v": 1
+}

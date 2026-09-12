@@ -1,0 +1,8 @@
+{
+  "id": "req-list",
+  "method": "session.list",
+  "params": {
+    "state": "idle"
+  },
+  "v": 1
+}

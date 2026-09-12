@@ -14,6 +14,8 @@
 //! call.
 
 pub mod client;
+#[cfg(test)]
+mod fixtures;
 pub mod schema;
 pub mod server;
 pub mod transport;

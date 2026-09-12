@@ -1,0 +1,8 @@
+{
+  "id": "req-subscribe",
+  "method": "events.subscribe",
+  "params": {
+    "after_revision": 0
+  },
+  "v": 1
+}

@@ -1,0 +1,12 @@
+{
+  "id": "req-unknown-session",
+  "outcome": {
+    "error": {
+      "code": "unknown_session",
+      "message": "no session 00000000-0000-4000-8000-000000000000"
+    },
+    "status": "error"
+  },
+  "revision": 6,
+  "v": 1
+}

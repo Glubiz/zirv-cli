@@ -1,0 +1,13 @@
+{
+  "id": "req-wait",
+  "outcome": {
+    "result": {
+      "generation": 1,
+      "outcome": "matched",
+      "state": "idle"
+    },
+    "status": "ok"
+  },
+  "revision": 5,
+  "v": 1
+}

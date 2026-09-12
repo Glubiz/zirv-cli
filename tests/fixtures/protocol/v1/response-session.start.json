@@ -1,0 +1,23 @@
+{
+  "id": "req-start",
+  "outcome": {
+    "result": {
+      "session": {
+        "agent": "native",
+        "generation": 1,
+        "reachable": true,
+        "repo_slug": null,
+        "role": "worker",
+        "runtime": "native",
+        "session_id": "fake-1",
+        "short": "fake-1",
+        "started_at": null,
+        "state": "starting",
+        "surface": "headless"
+      }
+    },
+    "status": "ok"
+  },
+  "revision": 3,
+  "v": 1
+}
