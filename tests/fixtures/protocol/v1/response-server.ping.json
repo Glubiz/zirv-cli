@@ -1,0 +1,13 @@
+{
+  "id": "req-ping",
+  "outcome": {
+    "result": {
+      "protocol": 1,
+      "server": "zirv",
+      "server_version": "<version>"
+    },
+    "status": "ok"
+  },
+  "revision": 2,
+  "v": 1
+}

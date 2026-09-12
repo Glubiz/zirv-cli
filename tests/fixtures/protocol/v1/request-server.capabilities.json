@@ -1,0 +1,6 @@
+{
+  "id": "req-capabilities",
+  "method": "server.capabilities",
+  "params": null,
+  "v": 1
+}

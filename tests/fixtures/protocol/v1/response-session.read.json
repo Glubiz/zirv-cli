@@ -1,0 +1,57 @@
+{
+  "id": "req-read",
+  "outcome": {
+    "result": {
+      "events": [
+        {
+          "generation": 1,
+          "payload": {
+            "kind": "session_started",
+            "session": {
+              "agent": "native",
+              "generation": 1,
+              "reachable": true,
+              "repo_slug": null,
+              "role": "worker",
+              "runtime": "native",
+              "session_id": "fake-1",
+              "short": "fake-1",
+              "started_at": null,
+              "state": "starting",
+              "surface": "headless"
+            }
+          },
+          "revision": 3,
+          "session_id": "fake-1",
+          "v": 1
+        },
+        {
+          "generation": 1,
+          "payload": {
+            "kind": "session_updated",
+            "session": {
+              "agent": "native",
+              "generation": 1,
+              "reachable": true,
+              "repo_slug": null,
+              "role": "worker",
+              "runtime": "native",
+              "session_id": "fake-1",
+              "short": "fake-1",
+              "started_at": null,
+              "state": "working",
+              "surface": "headless"
+            }
+          },
+          "revision": 4,
+          "session_id": "fake-1",
+          "v": 1
+        }
+      ],
+      "revision": 4
+    },
+    "status": "ok"
+  },
+  "revision": 4,
+  "v": 1
+}

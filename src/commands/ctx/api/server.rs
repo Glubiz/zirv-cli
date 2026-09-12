@@ -864,6 +864,14 @@ impl ApiServer {
     /// a mutation method -- the tests below, and issue #489's native session
     /// integration. Nothing inside this module calls it, hence the allow.
     #[allow(dead_code)]
+    /// The retained event log, for the frozen-fixture guard in
+    /// `super::fixtures`, which has to freeze event frames a reply never
+    /// carries.
+    #[cfg(test)]
+    pub fn frozen_events(&self) -> Vec<EventFrame> {
+        self.lock().events.iter().cloned().collect()
+    }
+
     pub fn publish(&self, session_id: Option<String>, generation: Option<u64>, event: ApiEvent) {
         self.lock().emit(session_id, generation, event);
     }

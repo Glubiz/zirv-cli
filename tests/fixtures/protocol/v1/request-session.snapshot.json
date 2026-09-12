@@ -1,0 +1,6 @@
+{
+  "id": "req-snapshot",
+  "method": "session.snapshot",
+  "params": null,
+  "v": 1
+}

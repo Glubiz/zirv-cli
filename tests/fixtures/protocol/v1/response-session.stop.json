@@ -1,0 +1,11 @@
+{
+  "id": "req-stop",
+  "outcome": {
+    "result": {
+      "stopped": true
+    },
+    "status": "ok"
+  },
+  "revision": 6,
+  "v": 1
+}

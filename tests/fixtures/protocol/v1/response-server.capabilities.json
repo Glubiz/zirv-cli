@@ -1,0 +1,44 @@
+{
+  "id": "req-capabilities",
+  "outcome": {
+    "result": {
+      "capabilities": [
+        "session.read",
+        "session.control",
+        "session.wait",
+        "session.report_status",
+        "events.subscribe",
+        "idempotency"
+      ],
+      "methods": [
+        "server.ping",
+        "server.capabilities",
+        "session.snapshot",
+        "session.list",
+        "session.get",
+        "session.start",
+        "session.stop",
+        "session.read",
+        "session.send_input",
+        "session.wait",
+        "session.report_status",
+        "events.subscribe"
+      ],
+      "protocol": 1,
+      "runtime": {
+        "events": true,
+        "interrupt": true,
+        "resume": true,
+        "steer": true,
+        "surfaces": [
+          "headless",
+          "terminal",
+          "dashboardpane"
+        ]
+      }
+    },
+    "status": "ok"
+  },
+  "revision": 2,
+  "v": 1
+}

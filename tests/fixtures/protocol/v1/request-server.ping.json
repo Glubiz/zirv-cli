@@ -1,0 +1,6 @@
+{
+  "id": "req-ping",
+  "method": "server.ping",
+  "params": null,
+  "v": 1
+}

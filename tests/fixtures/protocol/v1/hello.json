@@ -1,0 +1,15 @@
+{
+  "capabilities": [
+    "session.read",
+    "session.control",
+    "session.wait",
+    "session.report_status",
+    "events.subscribe",
+    "idempotency"
+  ],
+  "revision": 2,
+  "server": "zirv",
+  "server_version": "<version>",
+  "type": "hello",
+  "v": 1
+}
