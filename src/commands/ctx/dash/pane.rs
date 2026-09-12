@@ -957,6 +957,20 @@ pub struct Pane {
     /// direction, where re-reporting a completed one is not (which is why
     /// the settled flag is persisted and this one is not).
     pub(crate) stalled_mail_sent: bool,
+    /// Issue #468: `Some((reason, mail_id))` while this pane's next mail
+    /// sweep target (the oldest unread message for a worker's body
+    /// delivery, the newest for an orchestrator's one-line advisory) is
+    /// held back because `attention::project` reports the session
+    /// `Blocked` -- a permission dialog or similar, which `Pane::injectable`
+    /// alone does not see (see `dash::mod::mail_blocked_by_attention`'s own
+    /// doc comment). Sweep logic reads this to log the skip at most once per
+    /// mail id and to pair a later successful delivery with the same id in
+    /// the decision log. Deliberately NOT carried across a roster
+    /// save/restore or persisted anywhere -- like `stalled_mail_sent`, it is
+    /// a fresh dashboard's fresh look at the session, and the mail itself
+    /// (still unread on disk) is what actually matters, not this diagnostic
+    /// pairing.
+    pub(crate) mail_block_log: Option<(&'static str, String)>,
     pub(crate) result_schema: Option<String>,
     /// Review F1/F2 (PR #116): the deadline for phase 2 of a deferred
     /// `inject_visible` call -- `Some` from the moment phase 1's write
@@ -1285,6 +1299,7 @@ impl Pane {
             report_reminder_sent: false,
             settled_mail_sent: false,
             stalled_mail_sent: false,
+            mail_block_log: None,
             result_schema: turn_env
                 .iter()
                 .find(|(key, _)| key == super::super::agent::RESULT_SCHEMA_ENV)
@@ -2709,6 +2724,10 @@ impl Pane {
         // SAME logical session and must therefore keep its sent flag.
         self.report_reminder_sent = false;
         self.settled_mail_sent = false;
+        // Issue #468: the dedup key names a mail id in the OLD child's own
+        // inbox view; a successor has a fresh look at the mailbox, same
+        // reasoning as `report_reminder_sent` just above.
+        self.mail_block_log = None;
         // R6: this pane keeps its session id across the swap, so codex's
         // rollout pin would otherwise keep answering the retired child's file
         // for every later usage/budget read. Dropped here, after the
