@@ -630,6 +630,17 @@ fn validate_thinking_controls(request: &ProviderRequest) -> Result<(), ProviderF
     let is_45_or_older =
         model_family(&model, "4-5") || model_family(&model, "4-1") || model.ends_with("-4");
     let always_on = is_v5 && (model.contains("fable") || model.contains("mythos"));
+    let display = match request.thinking {
+        ThinkingConfig::Adaptive { display } => display,
+        ThinkingConfig::Enabled { display, .. } => display,
+        ThinkingConfig::Default | ThinkingConfig::Disabled => None,
+    };
+    if display == Some(ThinkingDisplay::Updates) && !(is_v5 || is_47_or_48) {
+        return Err(config_error(format!(
+            "model `{}` does not support the `updates` thinking display",
+            request.model
+        )));
+    }
     match request.thinking {
         ThinkingConfig::Default => {}
         ThinkingConfig::Disabled if always_on => {
@@ -1739,6 +1750,35 @@ mod tests {
                 .class,
             FailureClass::Configuration
         );
+    }
+
+    #[test]
+    fn thinking_display_updates_is_gated_to_the_owning_model_family() {
+        // claude-sonnet-4-6 predates the family that owns the
+        // thinking-display-updates beta; it must fail locally, before any
+        // transport call is even reachable from a pure validation function.
+        let mut unsupported_target = target("https://api.anthropic.com".into());
+        unsupported_target.model.id = "claude-sonnet-4-6".into();
+        let mut unsupported = request();
+        unsupported.model = "claude-sonnet-4-6".into();
+        unsupported.thinking = ThinkingConfig::Enabled {
+            budget_tokens: 2048,
+            display: Some(ThinkingDisplay::Updates),
+            interleaved: false,
+        };
+        assert_eq!(
+            validate_request(&unsupported, &unsupported_target)
+                .unwrap_err()
+                .class,
+            FailureClass::Configuration
+        );
+
+        let supported_target = target("https://api.anthropic.com".into());
+        let mut supported = request();
+        supported.thinking = ThinkingConfig::Adaptive {
+            display: Some(ThinkingDisplay::Updates),
+        };
+        validate_request(&supported, &supported_target).unwrap();
     }
 
     #[test]
