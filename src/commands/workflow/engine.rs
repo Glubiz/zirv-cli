@@ -1149,7 +1149,7 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
     if !path.exists() {
         return Err(format!("unknown workflow '{id}'").into());
     }
-    let value: WorkflowState = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let mut value: WorkflowState = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     if value.schema_version != WORKFLOW_SCHEMA_VERSION {
         return Err(format!(
             "workflow '{}': unsupported state schema {}",
@@ -1157,6 +1157,19 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
         )
         .into());
     }
+    // Issue #467: retarget to the literal `repo` this lookup was actually
+    // reached through. `state_path` above already resolved via `repo_slug`,
+    // which folds a linked worktree back to its main checkout's identity
+    // (`pathutil::worktree_identity`) -- so reaching this point means `repo`
+    // and the persisted `value.repo` are the SAME repository, just possibly
+    // different checkouts of it. Every downstream evidence/change-set check
+    // that reads `state.repo` (`advance`'s Test/Verify/Review gates,
+    // `review package`'s diff and fingerprint, frontend detection, ...) must
+    // measure wherever the caller actually is, not wherever the workflow
+    // happened to be started -- that mismatch (main checkout clean, worktree
+    // dirty) was the whole bug. A no-op in the ordinary single-checkout case,
+    // where `repo` already equals `value.repo`.
+    value.repo = repo.to_path_buf();
     Ok(value)
 }
 
@@ -4701,6 +4714,206 @@ mod tests {
         let advanced = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .expect("zero frontend files in scope must not fail the frontend gate");
         assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Verify);
+    }
+
+    /// Issue #467, acceptance 1: a workflow started in the main checkout
+    /// must accept `zirv test changed` evidence recorded in a linked `git
+    /// worktree add` sibling of it. The main checkout's own tree stays
+    /// clean while the real work happens in the worktree, so the evidence's
+    /// change fingerprint can only ever be computed from the worktree, never
+    /// from `state.repo` as originally started -- before #467 this gate
+    /// always rejected with "requires fresh passing evidence for the
+    /// current change set" because it fingerprinted the clean main checkout.
+    #[test]
+    fn advance_accepts_test_changed_evidence_recorded_in_a_linked_worktree() {
+        let main_repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "hello\n").unwrap();
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        // A linked worktree on its own feature branch -- the main checkout
+        // stays exactly at "base", untouched.
+        let worktree_dir = tempdir().unwrap();
+        let worktree_path = worktree_dir.path().to_path_buf();
+        std::fs::remove_dir(&worktree_path).unwrap();
+        git(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree_path.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worktree_path.join("feature.rs"), "fn feature() {}\n").unwrap();
+        git(&worktree_path, &["add", "."]);
+        git(&worktree_path, &["commit", "-q", "-m", "feature work"]);
+
+        // Workflow tracked from the main checkout, as `zirv workflow start`
+        // ran there -- unchanged from every other test in this module.
+        let mut state = WorkflowState::start(
+            main_repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .expect("fixture has a Test step");
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        save(&state_dir, &state, true).unwrap();
+
+        // `zirv test changed`, run inside the worktree: evidence
+        // fingerprinted against the worktree's own tree, where the real
+        // change lives.
+        let fingerprint = super::super::verification::change_fingerprint(&worktree_path).unwrap();
+        let evidence_report = super::super::verification::VerificationReport {
+            schema_version: super::super::verification::VERIFY_REPORT_SCHEMA_VERSION,
+            id: "worktree-evidence".into(),
+            mode: super::super::verification::VerificationMode::Changed,
+            source: "configured".into(),
+            repo: worktree_path.clone(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![super::super::verification::CheckResult {
+                id: "unit".into(),
+                kind: super::super::verification::CheckKind::Unit,
+                command: "true".into(),
+                source: super::super::verification::CheckSource::DiscoveredToolchain,
+                status: super::super::verification::CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: None,
+            }],
+        };
+        super::super::verification::save_report(&state_dir, &evidence_report).unwrap();
+
+        // `zirv workflow advance <id> --outcome success --repo <worktree>`:
+        // `load` (fixed for #467) resolves the SAME workflow through the
+        // worktree's path and retargets `state.repo` to it, so the gate
+        // below measures the worktree's own change set -- where the
+        // evidence just persisted actually lives -- not the clean main
+        // checkout `state.repo` was started with.
+        let loaded = load(&state_dir, &worktree_path, &state.id)
+            .expect("a linked worktree must resolve the workflow the main checkout started");
+        assert_eq!(loaded.repo, worktree_path);
+
+        let advanced = advance_with_evidence(&state_dir, loaded, StepOutcome::Success, None, false)
+            .expect("evidence recorded in the linked worktree must satisfy the Test gate");
+        assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Verify);
+    }
+
+    /// Issue #467, acceptance 2: `zirv workflow status|advance|review
+    /// package <id> --repo <worktree>` must find a workflow started (and
+    /// tracked) from the main checkout -- both by id (`load`, what
+    /// `status <id>`, `advance` and `review package` all go through) and via
+    /// the active-workflow pointer (`load_active`, what bare `zirv workflow
+    /// status` -- run from inside the worktree -- goes through). Before
+    /// #467 both returned "unknown workflow"/"no active workflow": the main
+    /// checkout and the worktree keyed two different, unrelated state
+    /// directories under `repo_slug`.
+    #[test]
+    fn workflow_started_in_the_main_checkout_is_found_from_a_linked_worktree() {
+        let main_repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "hello\n").unwrap();
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let worktree_dir = tempdir().unwrap();
+        let worktree_path = worktree_dir.path().to_path_buf();
+        std::fs::remove_dir(&worktree_path).unwrap();
+        git(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree_path.to_str().unwrap(),
+            ],
+        );
+
+        let state = WorkflowState::start(
+            main_repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+
+        let by_id = load(&state_dir, &worktree_path, &state.id);
+        assert!(
+            by_id.is_ok(),
+            "a linked worktree of the started repo must resolve the workflow by id: {:?}",
+            by_id.err()
+        );
+        assert_eq!(by_id.unwrap().id, state.id);
+
+        let active = load_active(&state_dir, &worktree_path).unwrap();
+        assert!(
+            active.is_some(),
+            "a linked worktree must also see the started repo's active-workflow pointer"
+        );
+        assert_eq!(active.unwrap().id, state.id);
     }
 
     /// #260-adjacent: `zirv workflow advance --run-checks` collapses "run
