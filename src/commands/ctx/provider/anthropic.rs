@@ -7,11 +7,7 @@
 #![allow(dead_code)] // N09 wires direct providers into the persistent runtime loop.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::time::{Duration, Instant};
+use std::io::{BufRead, BufReader};
 
 use serde_json::{Value, json};
 
@@ -24,38 +20,18 @@ use super::adapter::{
 use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
 use super::probe::is_plaintext_non_loopback;
+use super::transport::{
+    MAX_ERROR_BODY_BYTES, StreamTimeouts, WORKER_READ_POLL, invalid_stream, parse_retry_after_ms,
+    read_sse_line, supervise, target_scope,
+};
 use super::{OpaqueProviderData, Protocol, RouteId};
 use crate::commands::ctx::config::EnvLookup;
 
 const API_VERSION: &str = "2023-06-01";
-const MAX_ERROR_BODY_BYTES: u64 = 1024 * 1024;
-const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
-const MAX_BLOCK_ACCUMULATOR_BYTES: usize = 16 * 1024 * 1024;
-const CANCELLATION_POLL: Duration = Duration::from_millis(25);
-const STREAM_EVENT_QUEUE: usize = 256;
-/// Bounds how long the worker's blocking body read may go without new bytes
-/// before it loops back and rechecks cancellation. The real first-event/idle
-/// deadlines are enforced independently by `perform()`'s wall-clock loop, so
-/// this only bounds how promptly a cancelled or timed-out worker notices and
-/// exits instead of blocking for up to `AnthropicTimeouts::idle`.
-const WORKER_READ_POLL: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AnthropicTimeouts {
-    pub connect: Duration,
-    pub first_event: Duration,
-    pub idle: Duration,
-}
-
-impl Default for AnthropicTimeouts {
-    fn default() -> Self {
-        Self {
-            connect: Duration::from_secs(10),
-            first_event: Duration::from_secs(60),
-            idle: Duration::from_secs(120),
-        }
-    }
-}
+/// The direct providers share one timeout contract; the alias keeps the
+/// Anthropic call sites reading as Anthropic ones.
+pub type AnthropicTimeouts = StreamTimeouts;
 
 #[derive(Clone)]
 pub struct AnthropicMessagesAdapter {
@@ -132,7 +108,7 @@ impl AnthropicMessagesAdapter {
                 "Anthropic credentials cannot be sent over plaintext HTTP to a non-loopback host",
             ));
         }
-        if [timeouts.connect, timeouts.first_event, timeouts.idle].contains(&Duration::ZERO) {
+        if timeouts.has_zero() {
             return Err(ProviderFailure::new(
                 FailureClass::Configuration,
                 FailureScope::request(),
@@ -351,63 +327,19 @@ impl AnthropicMessagesAdapter {
         cancellation: &dyn Cancellation,
         sink: &mut dyn EventSink,
     ) -> Result<ProviderResponse, ProviderFailure> {
-        if cancellation.is_cancelled() {
-            return Err(cancelled());
-        }
         let adapter = self.clone();
         let encoded = encoded.clone();
-        let worker_cancelled = Arc::new(AtomicBool::new(false));
-        let worker_flag = WorkerCancellation(Arc::clone(&worker_cancelled));
-        let (sender, receiver) = mpsc::sync_channel(STREAM_EVENT_QUEUE);
-        std::thread::Builder::new()
-            .name("zirv-anthropic-stream".into())
-            .spawn(move || {
-                let mut stream_sink = ChannelSink(sender.clone());
-                let result = adapter.perform_blocking(&encoded, &worker_flag, &mut stream_sink);
-                let _ = sender.send(TransportUpdate::Done(result));
-            })
-            .map_err(|error| {
-                transport_failure(
-                    format!("failed to start Anthropic transport worker: {error}"),
-                    &self.target,
-                )
-            })?;
-
-        let mut saw_event = false;
-        let mut deadline = Instant::now() + self.timeouts.first_event;
-        loop {
-            if cancellation.is_cancelled() {
-                worker_cancelled.store(true, Ordering::Release);
-                return Err(cancelled());
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                worker_cancelled.store(true, Ordering::Release);
-                return Err(timeout_failure(saw_event, &self.target));
-            }
-            let wait = deadline
-                .saturating_duration_since(now)
-                .min(CANCELLATION_POLL);
-            match receiver.recv_timeout(wait) {
-                Ok(TransportUpdate::Activity) => {
-                    saw_event = true;
-                    deadline = Instant::now() + self.timeouts.idle;
-                }
-                Ok(TransportUpdate::Event(event)) => {
-                    saw_event = true;
-                    deadline = Instant::now() + self.timeouts.idle;
-                    sink.push(event);
-                }
-                Ok(TransportUpdate::Done(result)) => return result,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(transport_failure(
-                        "Anthropic transport worker stopped unexpectedly".into(),
-                        &self.target,
-                    ));
-                }
-            }
-        }
+        supervise(
+            "Anthropic",
+            "zirv-anthropic-stream",
+            self.timeouts,
+            &self.target,
+            cancellation,
+            sink,
+            move |worker_cancellation, worker_sink| {
+                adapter.perform_blocking(&encoded, worker_cancellation, worker_sink)
+            },
+        )
     }
 }
 
@@ -435,34 +367,6 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
 struct EncodedRequest {
     body: Value,
     beta_headers: Vec<&'static str>,
-}
-
-enum TransportUpdate {
-    Activity,
-    Event(ProviderStreamEvent),
-    Done(Result<ProviderResponse, ProviderFailure>),
-}
-
-struct ChannelSink(SyncSender<TransportUpdate>);
-
-impl EventSink for ChannelSink {
-    fn push(&mut self, event: ProviderStreamEvent) {
-        let update = if event == ProviderStreamEvent::ProtocolActivity {
-            TransportUpdate::Activity
-        } else {
-            TransportUpdate::Event(event)
-        };
-        let _ = self.0.send(update);
-    }
-}
-
-#[derive(Debug)]
-struct WorkerCancellation(Arc<AtomicBool>);
-
-impl Cancellation for WorkerCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
 }
 
 fn display_name(display: ThinkingDisplay) -> &'static str {
@@ -600,6 +504,13 @@ fn validate_content_relationships(request: &ProviderRequest) -> Result<(), Provi
                         FailureClass::Configuration,
                         FailureScope::request(),
                         "redacted thinking blocks must retain opaque provider data on an assistant message",
+                    ));
+                }
+                ProviderContent::Refusal { .. } => {
+                    return Err(ProviderFailure::new(
+                        FailureClass::Configuration,
+                        FailureScope::request(),
+                        "the Anthropic Messages API has no refusal content block",
                     ));
                 }
                 ProviderContent::Text { .. } | ProviderContent::RedactedThinking { .. } => {}
@@ -788,49 +699,12 @@ fn parse_sse<R: BufRead>(
     let mut data = String::new();
     let mut line = String::new();
     loop {
-        if cancellation.is_cancelled() {
-            return Err(cancelled());
-        }
-        let remaining = (MAX_SSE_LINE_BYTES + 1).saturating_sub(line.len());
-        let read = match (&mut reader).take(remaining as u64).read_line(&mut line) {
-            Ok(read) => read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                // The worker's socket read is bounded to WORKER_READ_POLL so it
-                // can notice cancellation promptly; real first-event/idle
-                // deadlines are enforced independently by perform()'s
-                // wall-clock loop, so a bare poll timeout is not itself a
-                // stream failure here.
-                continue;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                return Err(invalid_stream(
-                    "Anthropic SSE contains invalid UTF-8".into(),
-                ));
-            }
-            Err(error) => {
-                return Err(transport_failure(
-                    format!("Anthropic stream read failed: {error}"),
-                    target,
-                ));
-            }
-        };
+        let read = read_sse_line(&mut reader, &mut line, "Anthropic", cancellation, target)?;
         if read == 0 {
             if !event_name.is_empty() || !data.is_empty() {
                 process_sse_event(&event_name, &data, &mut accumulator, sink, target)?;
             }
             break;
-        }
-        if line.len() > MAX_SSE_LINE_BYTES {
-            return Err(ProviderFailure::new(
-                FailureClass::InvalidStream,
-                FailureScope::request(),
-                format!("Anthropic SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"),
-            ));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -1166,54 +1040,19 @@ fn required_string(value: &Value, field: &str, context: &str) -> Result<String, 
         .ok_or_else(|| invalid_stream(format!("Anthropic {context} has no string `{field}`")))
 }
 
-fn invalid_stream(message: String) -> ProviderFailure {
-    ProviderFailure::new(
-        FailureClass::InvalidStream,
-        FailureScope::request(),
-        message,
-    )
-}
-
-/// Rejects a content block whose accumulated text/thinking/partial-JSON
-/// buffer would exceed `MAX_BLOCK_ACCUMULATOR_BYTES` once the next delta is
-/// appended, settling the stream to the same typed failure class used for an
-/// oversized SSE line instead of growing the buffer without bound.
 fn check_block_accumulator_cap(
     current_len: usize,
     delta_len: usize,
 ) -> Result<(), ProviderFailure> {
-    if current_len.saturating_add(delta_len) > MAX_BLOCK_ACCUMULATOR_BYTES {
-        return Err(invalid_stream(format!(
-            "Anthropic content block exceeds {MAX_BLOCK_ACCUMULATOR_BYTES} bytes"
-        )));
-    }
-    Ok(())
+    super::transport::check_block_accumulator_cap("Anthropic", current_len, delta_len)
 }
 
 fn cancelled() -> ProviderFailure {
-    ProviderFailure::new(
-        FailureClass::Cancelled,
-        FailureScope::request(),
-        "Anthropic request cancelled",
-    )
+    super::transport::cancelled("Anthropic")
 }
 
 fn timeout_failure(saw_event: bool, target: &ProviderTarget) -> ProviderFailure {
-    let (class, message) = if saw_event {
-        (FailureClass::IdleTimeout, "Anthropic stream became idle")
-    } else {
-        (
-            FailureClass::FirstEventTimeout,
-            "Anthropic did not produce a first event before the timeout",
-        )
-    };
-    let mut failure = ProviderFailure::new(
-        class,
-        target_scope(target, FailureScopeKind::Endpoint),
-        message,
-    );
-    failure.retry.retryable = true;
-    failure
+    super::transport::timeout_failure("Anthropic", saw_event, target)
 }
 
 fn classify_transport_error(
@@ -1228,13 +1067,7 @@ fn classify_transport_error(
 }
 
 fn transport_failure(message: String, target: &ProviderTarget) -> ProviderFailure {
-    let mut failure = ProviderFailure::new(
-        FailureClass::Transport,
-        target_scope(target, FailureScopeKind::Endpoint),
-        message,
-    );
-    failure.retry.retryable = true;
-    failure
+    super::transport::transport_failure(message, target)
 }
 
 fn classify_http_error(
@@ -1351,34 +1184,17 @@ fn classify_stream_error(value: &Value, target: &ProviderTarget) -> ProviderFail
     failure
 }
 
-fn target_scope(target: &ProviderTarget, kind: FailureScopeKind) -> FailureScope {
-    let id = match kind {
-        FailureScopeKind::Request => None,
-        FailureScopeKind::Model => Some(target.model.id.clone()),
-        FailureScopeKind::Account => Some(target.account.to_string()),
-        FailureScopeKind::BillingPool => Some(target.billing_pool.to_string()),
-        FailureScopeKind::Endpoint => Some(target.endpoint.to_string()),
-        FailureScopeKind::Provider => Some(target.provider.to_string()),
-    };
-    FailureScope { kind, id }
-}
-
-fn parse_retry_after_ms(value: &str) -> Option<u64> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .and_then(|seconds| seconds.checked_mul(1000))
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::commands::ctx::provider::credential::Secret;
+    use crate::commands::ctx::provider::transport::MAX_BLOCK_ACCUMULATOR_BYTES;
     use crate::commands::ctx::provider::{
         AccountId, BillingPoolId, EndpointId, ModelId, ProviderId,
     };
