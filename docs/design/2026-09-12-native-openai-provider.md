@@ -115,8 +115,8 @@ Fixture-verified shapes (frozen under `tests/fixtures/provider/openai/v1/`):
 `response.function_call_arguments.delta`,
 `response.function_call_arguments.done`, `response.output_item.done` for
 message/function_call/reasoning items, `response.completed`,
-`response.incomplete` with `incomplete_details.reason`, and the top-level
-`error` event.
+`response.incomplete` with `incomplete_details.reason`, the top-level `error`
+event, and `response.failed` carrying its error under `/response/error`.
 
 Assumed from documentation and **not** yet observed live here: the exact
 reasoning-item field set beyond `id`/`summary`/`encrypted_content`, HTTP
