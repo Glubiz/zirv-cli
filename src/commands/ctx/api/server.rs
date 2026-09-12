@@ -30,9 +30,9 @@ use serde_json::{Value, json};
 
 use super::transport::{Connection, Endpoint, Listener, server_uid};
 use super::wire::{
-    ADVERTISED, ApiError, ApiEvent, ErrorCode, EventFrame, Hello, InputMode, Method, Outcome,
-    PROTOCOL_VERSION, Request, Response, SERVER_NAME, SessionFacts, SessionState, WaitUntil,
-    spec_for,
+    ADVERTISED, ADVERTISED_WITHOUT_HOST, ApiError, ApiEvent, AttachMode, Attachment, Capability,
+    ErrorCode, EventFrame, Hello, InputMode, Method, Outcome, PROTOCOL_VERSION, Request, Response,
+    SERVER_NAME, ScreenView, SessionFacts, SessionState, WaitUntil, spec_for,
 };
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::runtime::{
@@ -84,6 +84,51 @@ impl SessionSource for RegistrySource {
             .map(|(record, liveness)| facts_from_record(record, *liveness))
             .collect()
     }
+}
+
+/// Issue #352: the seam to a runtime that OWNS the sessions' terminals.
+///
+/// `ApiServer` deliberately holds no pty, no child process and no vt100
+/// parser of its own: it is the protocol, and the protocol must not grow a
+/// second, private implementation of the thing `session::host` already does.
+/// A server with no host attached is exactly the server issue #353 shipped --
+/// every read method answers off the session source, and the five attachment
+/// methods are refused with a structured `unsupported` that names #352.
+///
+/// `&self` throughout (not `&mut self`) because a host is shared by every
+/// connection thread and does its own interior locking; the server's single
+/// mutex must never be held across a pty write.
+pub trait SessionHost: Send + Sync + std::fmt::Debug {
+    /// Facts for the sessions this host owns, in the same redacted shape a
+    /// registry record projects to.
+    fn sessions(&self) -> Vec<SessionFacts>;
+    fn attach(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        mode: AttachMode,
+        size: Option<(u16, u16)>,
+    ) -> Result<Attachment, ApiError>;
+    fn detach(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    fn takeover(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    fn resize(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Attachment, ApiError>;
+    fn screen(&self, session_id: &str, client_id: &str) -> Result<ScreenView, ApiError>;
+    /// The controller's literal keystrokes. Refused for anyone else.
+    fn write_raw(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), ApiError>;
+    /// The operator's explicit `zirv session stop`: terminate the child
+    /// through the existing ladder. Detaching a client never reaches this.
+    fn stop(&self, session_id: &str) -> Result<bool, ApiError>;
 }
 
 /// A fixed list. The deterministic source the frozen-fixture replay and the
@@ -148,6 +193,10 @@ struct Inner {
     /// in flight", and the client driving a session knows better. Every
     /// other field still comes from the source on every refresh.
     reported: BTreeMap<String, SessionState>,
+    /// Issue #352: the controller seat this server last ANNOUNCED for each
+    /// session, so `controller_changed` is emitted once per real change
+    /// rather than once per attachment call.
+    controllers: BTreeMap<String, Option<String>>,
 }
 
 impl Inner {
@@ -194,6 +243,10 @@ pub struct ApiServer {
     inner: Mutex<Inner>,
     backend: Mutex<Option<Box<dyn RuntimeBackend + Send>>>,
     source: Box<dyn SessionSource>,
+    /// Issue #352. `None` for every server issue #353 shipped, which is why
+    /// the attachment capability is negotiated away rather than advertised
+    /// and then refused.
+    host: Mutex<Option<Arc<dyn SessionHost>>>,
     stopping: Arc<AtomicBool>,
     owner_uid: Option<u32>,
 }
@@ -213,14 +266,60 @@ impl ApiServer {
                 idempotency_order: VecDeque::new(),
                 subscribers: Vec::new(),
                 reported: BTreeMap::new(),
+                controllers: BTreeMap::new(),
             }),
             backend: Mutex::new(backend),
             source,
+            host: Mutex::new(None),
             stopping: Arc::new(AtomicBool::new(false)),
             owner_uid: server_uid(),
         });
         server.refresh_from_source();
         server
+    }
+
+    /// Issue #352: hands this server the runtime that owns the terminals.
+    /// Called once, by `session::service`, before the listener binds --
+    /// attaching a host mid-flight would let two connections disagree about
+    /// which capabilities were advertised to them.
+    pub fn attach_host(&self, host: Arc<dyn SessionHost>) {
+        match self.host.lock() {
+            Ok(mut guard) => *guard = Some(host),
+            Err(poisoned) => *poisoned.into_inner() = Some(host),
+        }
+    }
+
+    fn host(&self) -> Option<Arc<dyn SessionHost>> {
+        match self.host.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// What THIS server advertises, as opposed to what the protocol defines:
+    /// the attachment surface only when there is a runtime host behind it.
+    /// The filtering is here rather than at the call sites so `hello`,
+    /// `server.capabilities` and any future advertiser cannot disagree.
+    pub fn advertised(&self) -> Vec<Capability> {
+        if self.host().is_some() {
+            ADVERTISED.to_vec()
+        } else {
+            ADVERTISED_WITHOUT_HOST.to_vec()
+        }
+    }
+
+    fn with_host<T>(
+        &self,
+        call: impl FnOnce(&dyn SessionHost) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        let Some(host) = self.host() else {
+            return Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "this server owns no terminals: attach, detach, takeover, resize and screen \
+                 need the persistent runtime (issue #352), started with `zirv session serve`",
+            ));
+        };
+        call(host.as_ref())
     }
 
     /// Pulls the current session facts from the source, emitting one event
@@ -299,7 +398,7 @@ impl ApiServer {
             server: SERVER_NAME.to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             revision: self.revision(),
-            capabilities: ADVERTISED.to_vec(),
+            capabilities: self.advertised(),
         }
     }
 
@@ -372,6 +471,11 @@ impl ApiServer {
             Method::SessionSendInput => self.send_input_result(&request.params),
             Method::SessionWait => self.wait_result(&request.params),
             Method::SessionReportStatus => self.report_status_result(&request.params),
+            Method::SessionAttach => self.attach_result(&request.params),
+            Method::SessionDetach => self.detach_result(&request.params),
+            Method::SessionTakeover => self.takeover_result(&request.params),
+            Method::SessionResize => self.resize_result(&request.params),
+            Method::SessionScreen => self.screen_result(&request.params),
             // The reply is produced here; the streaming half lives in
             // `serve_connection`, which is the only place that owns a
             // connection to stream on.
@@ -425,10 +529,18 @@ impl ApiServer {
                 .and_then(|backend| serde_json::to_value(backend.capabilities()).ok()),
             Err(_) => None,
         };
+        let advertised = self.advertised();
+        // Only the methods this server's own capabilities cover: a client
+        // reading `methods` must not find one it could never call.
+        let methods: Vec<&'static str> = super::wire::METHODS
+            .iter()
+            .filter(|spec| advertised.contains(&spec.capability))
+            .map(|spec| spec.name)
+            .collect();
         let mut value = json!({
             "protocol": PROTOCOL_VERSION,
-            "capabilities": ADVERTISED.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            "methods": super::wire::METHODS.iter().map(|spec| spec.name).collect::<Vec<_>>(),
+            "capabilities": advertised.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            "methods": methods,
         });
         if let Some(runtime) = runtime
             && let Some(map) = value.as_object_mut()
@@ -546,8 +658,18 @@ impl ApiServer {
         if facts.state == SessionState::Ended {
             return Ok(json!({ "stopped": false }));
         }
-        let handle = handle.ok_or_else(|| not_this_servers_session(&facts.session_id))?;
-        self.with_backend(|backend| backend.interrupt(&handle))?;
+        // Issue #352: a session the runtime host owns is stopped through the
+        // host's own child-termination ladder. This is the ONE path that ends
+        // a session -- `session.detach` and a dropped connection never reach
+        // it, which is what "client disconnection never terminates an agent"
+        // means in code rather than in prose.
+        match (self.host(), handle) {
+            (Some(host), _) if host.sessions().iter().any(|f| f.session_id == facts.session_id) => {
+                host.stop(&facts.session_id)?;
+            }
+            (_, Some(handle)) => self.with_backend(|backend| backend.interrupt(&handle))?,
+            (_, None) => return Err(not_this_servers_session(&facts.session_id)),
+        }
         let mut inner = self.lock();
         if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
             entry.state = SessionState::Ended;
@@ -598,6 +720,8 @@ impl ApiServer {
             input: String,
             #[serde(default)]
             mode: InputMode,
+            #[serde(default)]
+            client_id: Option<String>,
         }
         let params: Params = parse_params(params)?;
         let target = TargetParams {
@@ -605,15 +729,34 @@ impl ApiServer {
             generation: params.generation,
         };
         let (facts, handle) = self.resolve(&target)?;
+        // Issue #352: raw bytes belong to the terminal, so they go to the
+        // runtime host and never to a `RuntimeBackend` -- a backend has no
+        // keyboard. Handled before the handle lookup below, because a
+        // host-owned session has no backend handle at all.
+        if params.mode == InputMode::Raw {
+            let Some(client_id) = params.client_id.as_deref() else {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParams,
+                    "mode=raw needs client_id: only the session's controller may type into it",
+                ));
+            };
+            self.with_host(|host| {
+                host.write_raw(&params.session_id, client_id, params.input.as_bytes())
+            })?;
+            return Ok(json!({ "accepted": true }));
+        }
         let handle = handle.ok_or_else(|| not_this_servers_session(&facts.session_id))?;
         match params.mode {
             InputMode::Submit => {
                 self.with_backend(|backend| backend.submit(&handle, &params.input))
             }
             InputMode::Steer => self.with_backend(|backend| backend.steer(&handle, &params.input)),
+            // Handled above; repeated here only because the match is
+            // exhaustive over the vocabulary.
+            InputMode::Raw => Ok(()),
             InputMode::Unknown => Err(ApiError::new(
                 ErrorCode::InvalidParams,
-                "mode must be submit or steer",
+                "mode must be submit, steer or raw",
             )),
         }?;
         let mut inner = self.lock();
@@ -661,6 +804,136 @@ impl ApiServer {
             ApiEvent::SessionUpdated { session: updated },
         );
         Ok(json!({ "recorded": true }))
+    }
+
+    // -----------------------------------------------------------------
+    // Attachment (issue #352)
+    // -----------------------------------------------------------------
+
+    /// Every attachment method takes the same three things, so they parse the
+    /// same struct: which session, which client, and (for the two that can
+    /// move a terminal) how big the caller's own window is.
+    fn attach_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            client_id: String,
+            #[serde(default)]
+            mode: AttachMode,
+            #[serde(default)]
+            rows: Option<u16>,
+            #[serde(default)]
+            cols: Option<u16>,
+        }
+        let params: Params = parse_params(params)?;
+        if params.mode == AttachMode::Unknown {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "mode must be observer or controller",
+            ));
+        }
+        // The generation pin is enforced against the server's own view before
+        // the host is touched at all, exactly like every other mutation: an
+        // attach to a session that has been replaced must fail rather than
+        // silently land on the replacement.
+        let facts = self.pinned_facts(&params.session_id, params.generation)?;
+        let size = match (params.rows, params.cols) {
+            (Some(rows), Some(cols)) => Some((rows, cols)),
+            _ => None,
+        };
+        let attachment = self.with_host(|host| {
+            host.attach(&params.session_id, &params.client_id, params.mode, size)
+        })?;
+        self.publish_controller(&facts, &attachment);
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn detach_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: ClientParams = parse_params(params)?;
+        let facts = self.pinned_facts(&params.session_id, None)?;
+        // Deliberately nothing else: detaching is a CLIENT lifecycle event.
+        // The session keeps its process, its pty, its supervisor and its
+        // state -- `session.stop` is the only method that ends one.
+        let attachment =
+            self.with_host(|host| host.detach(&params.session_id, &params.client_id))?;
+        self.publish_controller(&facts, &attachment);
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn takeover_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: ClientParams = parse_params(params)?;
+        let facts = self.pinned_facts(&params.session_id, None)?;
+        let attachment =
+            self.with_host(|host| host.takeover(&params.session_id, &params.client_id))?;
+        self.publish_controller(&facts, &attachment);
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn resize_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            client_id: String,
+            rows: u16,
+            cols: u16,
+        }
+        let params: Params = parse_params(params)?;
+        self.pinned_facts(&params.session_id, None)?;
+        let attachment = self.with_host(|host| {
+            host.resize(
+                &params.session_id,
+                &params.client_id,
+                params.rows,
+                params.cols,
+            )
+        })?;
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn screen_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: ClientParams = parse_params(params)?;
+        self.pinned_facts(&params.session_id, None)?;
+        let screen =
+            self.with_host(|host| host.screen(&params.session_id, &params.client_id))?;
+        Ok(json!({ "revision": self.revision(), "screen": screen }))
+    }
+
+    /// The session the server knows under `session_id`, with the caller's
+    /// generation pin enforced. A host-owned session is always in the
+    /// server's own map, because the host is its session source.
+    fn pinned_facts(
+        &self,
+        session_id: &str,
+        generation: Option<u64>,
+    ) -> Result<SessionFacts, ApiError> {
+        let target = TargetParams {
+            session_id: session_id.to_string(),
+            generation,
+        };
+        self.resolve(&target).map(|(facts, _)| facts)
+    }
+
+    /// One `controller_changed` per ACTUAL change, never per call: a client
+    /// that re-attaches as an observer while somebody else is typing must not
+    /// make every other observer redraw a takeover banner.
+    fn publish_controller(&self, facts: &SessionFacts, attachment: &Attachment) {
+        let mut inner = self.lock();
+        let previous = inner.controllers.get(&facts.session_id).cloned().flatten();
+        if previous == attachment.controller {
+            return;
+        }
+        inner
+            .controllers
+            .insert(facts.session_id.clone(), attachment.controller.clone());
+        inner.emit(
+            Some(facts.session_id.clone()),
+            Some(facts.generation),
+            ApiEvent::ControllerChanged {
+                controller: attachment.controller.clone(),
+            },
+        );
     }
 
     /// Waits are PINNED: the generation resolved at call time is compared on
@@ -888,6 +1161,13 @@ struct TargetParams {
     session_id: String,
     #[serde(default)]
     generation: Option<u64>,
+}
+
+/// Issue #352: what `detach`, `takeover` and `screen` all take.
+#[derive(Debug, Deserialize)]
+struct ClientParams {
+    session_id: String,
+    client_id: String,
 }
 
 fn subscription_start(params: &Value) -> u64 {
@@ -1390,5 +1670,504 @@ mod tests {
         let without = ApiServer::new(Box::new(StaticSource(Vec::new())), None);
         let value = result(&call(&without, Method::ServerCapabilities, Value::Null));
         assert!(value["runtime"].is_null(), "{value}");
+    }
+
+    // -----------------------------------------------------------------
+    // Attachment (issue #352)
+    // -----------------------------------------------------------------
+
+    /// The attachment rules with no pty in the way: observers are unbounded,
+    /// the controller seat holds one client, and the seat only ever changes
+    /// through an explicit grant, release or takeover. `session::host` is the
+    /// production implementation of the same trait; this one exists so the
+    /// PROTOCOL's own enforcement is provable without spawning a process.
+    #[derive(Debug, Default)]
+    struct FakeHost {
+        state: Mutex<FakeHostState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeHostState {
+        facts: Vec<SessionFacts>,
+        clients: Vec<String>,
+        controller: Option<String>,
+        rows: u16,
+        cols: u16,
+        typed: Vec<u8>,
+        stopped: Vec<String>,
+    }
+
+    impl FakeHost {
+        fn with(facts: Vec<SessionFacts>) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(FakeHostState {
+                    facts,
+                    rows: 24,
+                    cols: 80,
+                    ..FakeHostState::default()
+                }),
+            })
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeHostState> {
+            match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+
+        fn snapshot(&self, caller: &str) -> Attachment {
+            let state = self.lock();
+            Attachment {
+                controller: state.controller.clone(),
+                clients: state.clients.clone(),
+                rows: state.rows,
+                cols: state.cols,
+                role: if state.controller.as_deref() == Some(caller) {
+                    super::super::wire::AttachRole::Controller
+                } else if state.clients.iter().any(|id| id == caller) {
+                    super::super::wire::AttachRole::Observer
+                } else {
+                    super::super::wire::AttachRole::Detached
+                },
+            }
+        }
+    }
+
+    impl SessionHost for FakeHost {
+        fn sessions(&self) -> Vec<SessionFacts> {
+            self.lock().facts.clone()
+        }
+
+        fn attach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            mode: AttachMode,
+            size: Option<(u16, u16)>,
+        ) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                    state.clients.sort();
+                }
+                if mode == AttachMode::Controller {
+                    if let Some(current) = state.controller.clone()
+                        && current != client_id
+                    {
+                        return Err(ApiError::new(
+                            ErrorCode::Busy,
+                            format!("{current} already controls this session"),
+                        ));
+                    }
+                    state.controller = Some(client_id.to_string());
+                    if let Some((rows, cols)) = size {
+                        state.rows = rows;
+                        state.cols = cols;
+                    }
+                }
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn detach(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                state.clients.retain(|id| id != client_id);
+                if state.controller.as_deref() == Some(client_id) {
+                    state.controller = None;
+                }
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn takeover(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                    state.clients.sort();
+                }
+                state.controller = Some(client_id.to_string());
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn resize(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            rows: u16,
+            cols: u16,
+        ) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if state.controller.as_deref() != Some(client_id) {
+                    return Err(ApiError::new(
+                        ErrorCode::Denied,
+                        "only the controller resizes the terminal",
+                    ));
+                }
+                state.rows = rows;
+                state.cols = cols;
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn screen(&self, _session_id: &str, client_id: &str) -> Result<ScreenView, ApiError> {
+            let state = self.lock();
+            if !state.clients.iter().any(|id| id == client_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Denied,
+                    "attach before reading the screen",
+                ));
+            }
+            Ok(ScreenView {
+                rows: state.rows,
+                cols: state.cols,
+                contents: String::from_utf8_lossy(&state.typed).into_owned(),
+                ..ScreenView::default()
+            })
+        }
+
+        fn write_raw(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            bytes: &[u8],
+        ) -> Result<(), ApiError> {
+            let mut state = self.lock();
+            if state.controller.as_deref() != Some(client_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Denied,
+                    "only the controller may type into this session",
+                ));
+            }
+            state.typed.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn stop(&self, session_id: &str) -> Result<bool, ApiError> {
+            self.lock().stopped.push(session_id.to_string());
+            Ok(true)
+        }
+    }
+
+    const HOSTED: &str = "33333333-3333-4333-8333-333333333333";
+
+    fn hosted_server() -> (Arc<ApiServer>, Arc<FakeHost>) {
+        let host = FakeHost::with(vec![facts(HOSTED, SessionState::Idle)]);
+        let server = ApiServer::new(Box::new(StaticSource(host.sessions())), None);
+        server.attach_host(host.clone() as Arc<dyn SessionHost>);
+        (server, host)
+    }
+
+    /// Capability negotiation, the direction that matters: a server with no
+    /// terminals never advertises the attachment surface, so a client turns
+    /// the feature off LOCALLY rather than learning about it from a failed
+    /// call. Attaching a host turns it on in the same breath.
+    #[test]
+    fn the_attach_capability_is_advertised_only_by_a_server_that_owns_terminals() {
+        let hostless = ApiServer::new(Box::new(StaticSource(Vec::new())), None);
+        assert!(
+            !hostless
+                .hello()
+                .capabilities
+                .contains(&Capability::SessionAttach),
+            "issue #353's reference server has no terminal to attach to"
+        );
+        let methods = result(&call(&hostless, Method::ServerCapabilities, Value::Null));
+        let listed = serde_json::to_string(&methods["methods"]).expect("serialize");
+        assert!(
+            !listed.contains("session.attach"),
+            "a method a client could never call must not be advertised: {listed}"
+        );
+
+        let (server, _host) = hosted_server();
+        assert!(
+            server
+                .hello()
+                .capabilities
+                .contains(&Capability::SessionAttach)
+        );
+    }
+
+    /// A hostless server refuses every attachment method loudly, naming the
+    /// issue -- the same discipline `session.start` already follows, and for
+    /// the same reason: a silent no-op would be worse than no method.
+    #[test]
+    fn a_server_without_a_host_refuses_every_attachment_method() {
+        let server = ApiServer::new(
+            Box::new(StaticSource(vec![facts(HOSTED, SessionState::Idle)])),
+            None,
+        );
+        for method in [
+            Method::SessionAttach,
+            Method::SessionDetach,
+            Method::SessionTakeover,
+            Method::SessionScreen,
+        ] {
+            let failure = error(&call(
+                &server,
+                method,
+                json!({"session_id": HOSTED, "client_id": "c1"}),
+            ));
+            assert_eq!(failure.code, ErrorCode::Unsupported, "{method}");
+            assert!(failure.message.contains("#352"), "{method}: {failure}");
+        }
+    }
+
+    /// The core rule: many observers, at most one controller, and a second
+    /// client asking for the seat is refused rather than silently promoted.
+    #[test]
+    fn many_clients_may_observe_but_only_one_may_control() {
+        let (server, _host) = hosted_server();
+        let first = result(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller", "rows": 40, "cols": 120}),
+        ));
+        assert_eq!(first["attachment"]["role"], json!("controller"));
+        assert_eq!(first["attachment"]["controller"], json!("dash"));
+
+        let watcher = result(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch-1"}),
+        ));
+        assert_eq!(watcher["attachment"]["role"], json!("observer"));
+        let second_watcher = result(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch-2"}),
+        ));
+        assert_eq!(
+            second_watcher["attachment"]["clients"],
+            json!(["dash", "watch-1", "watch-2"]),
+            "observers are unbounded"
+        );
+        assert_eq!(second_watcher["attachment"]["controller"], json!("dash"));
+
+        let refused = error(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch-1", "mode": "controller"}),
+        ));
+        assert_eq!(
+            refused.code,
+            ErrorCode::Busy,
+            "an occupied seat is refused, never quietly handed over: {refused}"
+        );
+    }
+
+    /// Takeover is explicit (its own method) and visible (one
+    /// `controller_changed` event every observer sees). One event per real
+    /// change, not per call.
+    #[test]
+    fn a_takeover_is_explicit_and_announced_to_every_observer() {
+        let (server, _host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let before = server.revision();
+        // Re-attaching as an observer changes nothing, so it announces
+        // nothing.
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        );
+        assert_eq!(
+            server.revision(),
+            before,
+            "an attachment that did not move the seat must not emit an event"
+        );
+
+        let taken = result(&call(
+            &server,
+            Method::SessionTakeover,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        ));
+        assert_eq!(taken["attachment"]["controller"], json!("watch"));
+        let announced = server
+            .frozen_events()
+            .into_iter()
+            .filter(|frame| {
+                matches!(frame.payload, ApiEvent::ControllerChanged { .. })
+                    && frame.session_id.as_deref() == Some(HOSTED)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            announced.len(),
+            2,
+            "one grant and one takeover, each announced exactly once: {announced:?}"
+        );
+        assert!(matches!(
+            &announced[1].payload,
+            ApiEvent::ControllerChanged { controller } if controller.as_deref() == Some("watch")
+        ));
+    }
+
+    /// Detaching is a CLIENT lifecycle event: the seat empties, but the
+    /// session is never stopped. Proven on the host's own stop log, not on a
+    /// status field a caller could have set for some other reason.
+    #[test]
+    fn detaching_releases_the_seat_and_never_stops_the_session() {
+        let (server, host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let detached = result(&call(
+            &server,
+            Method::SessionDetach,
+            json!({"session_id": HOSTED, "client_id": "dash"}),
+        ));
+        assert_eq!(detached["attachment"]["role"], json!("detached"));
+        assert_eq!(detached["attachment"]["controller"], Value::Null);
+        assert!(
+            host.lock().stopped.is_empty(),
+            "a detach must never reach the termination ladder"
+        );
+
+        // ... and `stop` is what does, distinctly.
+        let stopped = result(&call(
+            &server,
+            Method::SessionStop,
+            json!({"session_id": HOSTED}),
+        ));
+        assert_eq!(stopped["stopped"], json!(true));
+        assert_eq!(host.lock().stopped, vec![HOSTED.to_string()]);
+    }
+
+    /// Raw keystrokes and resize both belong to the controller alone: an
+    /// observer that tries either is refused, and after a takeover the roles
+    /// swap without either client having to reattach.
+    #[test]
+    fn only_the_controller_types_into_or_resizes_a_session() {
+        let (server, host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        );
+
+        let refused = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "client_id": "watch", "input": "ls\r", "mode": "raw"}),
+        ));
+        assert_eq!(refused.code, ErrorCode::Denied, "{refused}");
+        let refused = error(&call(
+            &server,
+            Method::SessionResize,
+            json!({"session_id": HOSTED, "client_id": "watch", "rows": 10, "cols": 10}),
+        ));
+        assert_eq!(refused.code, ErrorCode::Denied, "{refused}");
+
+        let accepted = result(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "client_id": "dash", "input": "ls\r", "mode": "raw"}),
+        ));
+        assert_eq!(accepted["accepted"], json!(true));
+        assert_eq!(host.lock().typed, b"ls\r".to_vec());
+
+        let _ = call(
+            &server,
+            Method::SessionTakeover,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        );
+        let resized = result(&call(
+            &server,
+            Method::SessionResize,
+            json!({"session_id": HOSTED, "client_id": "watch", "rows": 50, "cols": 200}),
+        ));
+        assert_eq!(resized["attachment"]["rows"], json!(50));
+    }
+
+    /// `mode: raw` without a `client_id` is a parameter error, not an
+    /// unauthenticated write: there is no "the caller must be the controller"
+    /// check that can pass when nobody said who the caller is.
+    #[test]
+    fn raw_input_without_a_client_id_is_refused_rather_than_attributed() {
+        let (server, host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let failure = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "input": "rm -rf /\r", "mode": "raw"}),
+        ));
+        assert_eq!(failure.code, ErrorCode::InvalidParams, "{failure}");
+        assert!(host.lock().typed.is_empty(), "nothing may have been typed");
+    }
+
+    /// The screen is reachable only by a client that actually attached, and
+    /// what comes back is the rendered terminal -- not a snapshot field.
+    #[test]
+    fn the_screen_needs_an_attachment_and_never_leaks_into_a_snapshot() {
+        let (server, _host) = hosted_server();
+        let failure = error(&call(
+            &server,
+            Method::SessionScreen,
+            json!({"session_id": HOSTED, "client_id": "stranger"}),
+        ));
+        assert_eq!(failure.code, ErrorCode::Denied, "{failure}");
+
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let _ = call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "client_id": "dash", "input": "secret", "mode": "raw"}),
+        );
+        let view = result(&call(
+            &server,
+            Method::SessionScreen,
+            json!({"session_id": HOSTED, "client_id": "dash"}),
+        ));
+        assert_eq!(view["screen"]["contents"], json!("secret"));
+
+        let snapshot = serde_json::to_string(&result(&call(
+            &server,
+            Method::SessionSnapshot,
+            Value::Null,
+        )))
+        .expect("serialize");
+        assert!(
+            !snapshot.contains("secret"),
+            "terminal contents must never ride a snapshot: {snapshot}"
+        );
+    }
+
+    /// An attach pinned to a generation the session has moved past is refused
+    /// before the host is touched -- the same rule every other mutation
+    /// follows, so a client cannot attach to a replacement by accident.
+    #[test]
+    fn an_attach_pinned_to_a_stale_generation_never_reaches_the_host() {
+        let (server, host) = hosted_server();
+        let failure = error(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "generation": 7}),
+        ));
+        assert_eq!(failure.code, ErrorCode::StaleGeneration, "{failure}");
+        assert!(host.lock().clients.is_empty());
     }
 }

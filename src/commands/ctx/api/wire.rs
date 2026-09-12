@@ -72,6 +72,20 @@ pub enum Method {
     SessionWait,
     #[serde(rename = "session.report_status")]
     SessionReportStatus,
+    /// Issue #352: the four attachment verbs plus the screen read. All five
+    /// need a runtime that OWNS the session's terminal, so all five are
+    /// gated on [`Capability::SessionAttach`], which a server without a
+    /// [`super::server::SessionHost`] does not advertise.
+    #[serde(rename = "session.attach")]
+    SessionAttach,
+    #[serde(rename = "session.detach")]
+    SessionDetach,
+    #[serde(rename = "session.takeover")]
+    SessionTakeover,
+    #[serde(rename = "session.resize")]
+    SessionResize,
+    #[serde(rename = "session.screen")]
+    SessionScreen,
     #[serde(rename = "events.subscribe")]
     EventsSubscribe,
     /// Forward-compat fallback: a method name this build has never heard of.
@@ -94,6 +108,11 @@ impl Method {
             Method::SessionSendInput => "session.send_input",
             Method::SessionWait => "session.wait",
             Method::SessionReportStatus => "session.report_status",
+            Method::SessionAttach => "session.attach",
+            Method::SessionDetach => "session.detach",
+            Method::SessionTakeover => "session.takeover",
+            Method::SessionResize => "session.resize",
+            Method::SessionScreen => "session.screen",
             Method::EventsSubscribe => "events.subscribe",
             Method::Unknown => "unknown",
         }
@@ -141,6 +160,14 @@ pub enum Capability {
     /// `session.report_status`.
     #[serde(rename = "session.report_status")]
     SessionReportStatus,
+    /// Issue #352: `session.attach|detach|takeover|resize|screen` -- the
+    /// surface a client needs when the SERVER owns the terminal rather than
+    /// the client. Advertised only by a server with a runtime host attached
+    /// (`zirv session serve`), never by the bounded in-process reference
+    /// server, so a client negotiates it away instead of discovering the
+    /// difference through a failed round trip.
+    #[serde(rename = "session.attach")]
+    SessionAttach,
     /// `events.subscribe`.
     #[serde(rename = "events.subscribe")]
     EventsSubscribe,
@@ -162,6 +189,7 @@ impl Capability {
             Capability::SessionControl => "session.control",
             Capability::SessionWait => "session.wait",
             Capability::SessionReportStatus => "session.report_status",
+            Capability::SessionAttach => "session.attach",
             Capability::EventsSubscribe => "events.subscribe",
             Capability::Idempotency => "idempotency",
             Capability::Unknown => "unknown",
@@ -242,8 +270,94 @@ pub enum InputMode {
     Submit,
     /// Mid-turn steering, where the backend supports it.
     Steer,
+    /// Issue #352: the literal bytes go to the session's terminal, exactly as
+    /// typed -- control characters, arrow keys and all. Only the CONTROLLER
+    /// of an attached session may send this, and only a server with a
+    /// runtime host has a terminal to send it to; every other server answers
+    /// `unsupported`. It is a separate mode rather than a separate method
+    /// because a raw keystroke is still "input for this session", and giving
+    /// it its own method would mean a second authorization path to keep in
+    /// step with this one.
+    Raw,
     #[serde(other)]
     Unknown,
+}
+
+// ---------------------------------------------------------------------------
+// Attachment (issue #352)
+// ---------------------------------------------------------------------------
+
+/// What a client asks to be when it attaches. Many clients may observe one
+/// session; at most one may control it, and taking control away from another
+/// client is `session.takeover`, never a side effect of attaching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMode {
+    /// Read the screen, send nothing. The default, deliberately: an
+    /// attachment that silently seized the keyboard from whoever was already
+    /// typing would be the opposite of "takeover is explicit and visible".
+    #[default]
+    Observer,
+    /// Ask for the controller seat. Granted only when the session has no
+    /// controller; an occupied seat is refused with [`ErrorCode::Busy`] and
+    /// the caller can then choose `session.takeover`.
+    Controller,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Who is attached to one session right now. Returned by every attachment
+/// method so a client always learns the outcome of its own call and the
+/// current occupant in the same breath.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Attachment {
+    /// The client id holding terminal input and resize, if any.
+    #[serde(default)]
+    pub controller: Option<String>,
+    /// Every attached client id, controller included, sorted.
+    #[serde(default)]
+    pub clients: Vec<String>,
+    /// The size the server-owned terminal is currently at. A client whose own
+    /// window is smaller renders a clipped view rather than resizing a
+    /// terminal it does not control.
+    pub rows: u16,
+    pub cols: u16,
+    /// What the CALLER ended up as after this call.
+    pub role: AttachRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachRole {
+    Controller,
+    #[default]
+    Observer,
+    /// Not attached at all -- what `session.detach` reports back.
+    Detached,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The rendered terminal state of one server-owned session: exactly what a
+/// reattaching client must paint to look like it never left.
+///
+/// `contents` is the vt100 parser's own formatted rendering (cells plus the
+/// SGR escapes that colour them), not a transcript and not scrollback
+/// history. It is reachable ONLY through `session.screen`, only on a server
+/// with a runtime host, and only for a session the caller is attached to --
+/// it is deliberately NOT part of [`SessionFacts`], so no snapshot, list or
+/// event ever carries terminal output.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ScreenView {
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub cursor_visible: bool,
+    /// Whether the child has switched to the alternate screen (a full-screen
+    /// TUI). A client must not paint its own chrome over one.
+    pub alternate: bool,
+    pub contents: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +542,14 @@ pub enum ApiEvent {
     SessionEnded {
         session_id: String,
     },
+    /// Issue #352: the controller seat for a session changed hands. Emitted
+    /// on every grant, release and takeover, so a takeover is VISIBLE to
+    /// every observer rather than only to the two clients involved.
+    /// `controller` is `null` when the seat is now empty.
+    ControllerChanged {
+        #[serde(default)]
+        controller: Option<String>,
+    },
     /// Emitted only when a subscriber asks for it; exists so a long-idle
     /// subscription proves the connection is still alive.
     Heartbeat,
@@ -512,6 +634,39 @@ const GENERATION_IN: FieldSpec = FieldSpec {
     ty: "integer",
     required: false,
     doc: "pin the call to this session generation; a newer one is refused with stale_generation",
+};
+/// Issue #352. Caller-chosen and caller-owned: the server never invents one,
+/// so a client that reconnects under the same id resumes its own attachment
+/// rather than accumulating ghosts.
+const CLIENT_ID: FieldSpec = FieldSpec {
+    name: "client_id",
+    ty: "string",
+    required: true,
+    doc: "the calling client's own stable id",
+};
+const ATTACH_MODE: FieldSpec = FieldSpec {
+    name: "mode",
+    ty: "attach_mode",
+    required: false,
+    doc: "observer (default) or controller",
+};
+const ROWS_IN: FieldSpec = FieldSpec {
+    name: "rows",
+    ty: "integer",
+    required: false,
+    doc: "the controller's own terminal height; ignored for an observer",
+};
+const COLS_IN: FieldSpec = FieldSpec {
+    name: "cols",
+    ty: "integer",
+    required: false,
+    doc: "the controller's own terminal width; ignored for an observer",
+};
+const ATTACHMENT_OUT: FieldSpec = FieldSpec {
+    name: "attachment",
+    ty: "attachment",
+    required: true,
+    doc: "controller, every attached client id, the terminal size, and the caller's own role",
 };
 
 /// Every method this build serves, in the order `zirv ctx api schema` prints
@@ -755,7 +910,13 @@ pub static METHODS: &[MethodSpec] = &[
                 name: "mode",
                 ty: "input_mode",
                 required: false,
-                doc: "submit (default) or steer",
+                doc: "submit (default), steer, or raw (the controller's literal terminal bytes)",
+            },
+            FieldSpec {
+                name: "client_id",
+                ty: "string",
+                required: false,
+                doc: "required for mode=raw: only the session's controller may type into it",
             },
         ],
         result: &[FieldSpec {
@@ -832,6 +993,79 @@ pub static METHODS: &[MethodSpec] = &[
         }],
     },
     MethodSpec {
+        method: Method::SessionAttach,
+        name: "session.attach",
+        summary: "Attach a client to a server-owned session as an observer or (if the seat is free) its controller.",
+        mutation: true,
+        capability: Capability::SessionAttach,
+        params: &[SESSION_ID, GENERATION_IN, CLIENT_ID, ATTACH_MODE, ROWS_IN, COLS_IN],
+        result: &[ATTACHMENT_OUT],
+    },
+    MethodSpec {
+        method: Method::SessionDetach,
+        name: "session.detach",
+        summary: "Detach one client. The session, its process and its supervisor keep running.",
+        mutation: true,
+        capability: Capability::SessionAttach,
+        params: &[SESSION_ID, CLIENT_ID],
+        result: &[ATTACHMENT_OUT],
+    },
+    MethodSpec {
+        method: Method::SessionTakeover,
+        name: "session.takeover",
+        summary: "Take the controller seat from whoever holds it. Always emits controller_changed.",
+        mutation: true,
+        capability: Capability::SessionAttach,
+        params: &[SESSION_ID, CLIENT_ID],
+        result: &[ATTACHMENT_OUT],
+    },
+    MethodSpec {
+        method: Method::SessionResize,
+        name: "session.resize",
+        summary: "Resize the server-owned terminal. Controller only -- an observer's window never moves it.",
+        mutation: true,
+        capability: Capability::SessionAttach,
+        params: &[
+            SESSION_ID,
+            CLIENT_ID,
+            FieldSpec {
+                name: "rows",
+                ty: "integer",
+                required: true,
+                doc: "",
+            },
+            FieldSpec {
+                name: "cols",
+                ty: "integer",
+                required: true,
+                doc: "",
+            },
+        ],
+        result: &[ATTACHMENT_OUT],
+    },
+    MethodSpec {
+        method: Method::SessionScreen,
+        name: "session.screen",
+        summary: "The session's current rendered terminal state, for a client that just (re)attached.",
+        mutation: false,
+        capability: Capability::SessionAttach,
+        params: &[SESSION_ID, CLIENT_ID],
+        result: &[
+            FieldSpec {
+                name: "revision",
+                ty: "integer",
+                required: true,
+                doc: "current server revision",
+            },
+            FieldSpec {
+                name: "screen",
+                ty: "screen_view",
+                required: true,
+                doc: "rendered cells plus cursor; never scrollback, a transcript or a prompt",
+            },
+        ],
+    },
+    MethodSpec {
         method: Method::EventsSubscribe,
         name: "events.subscribe",
         summary: "Stream event frames on this connection from after_revision onward until it closes.",
@@ -860,8 +1094,26 @@ pub static METHODS: &[MethodSpec] = &[
     },
 ];
 
-/// The capabilities this build's reference server advertises.
+/// Every capability protocol v1 defines. NOT what a given server advertises:
+/// [`Capability::SessionAttach`] is advertised only by a server that actually
+/// owns terminals (issue #352's `zirv session serve`), which is why
+/// [`super::server::ApiServer::advertised`] filters this list rather than
+/// handing it out wholesale. The schema prints this one, because the schema
+/// documents the PROTOCOL; a `hello` frame carries the filtered one, because
+/// it documents the SERVER.
 pub static ADVERTISED: &[Capability] = &[
+    Capability::SessionRead,
+    Capability::SessionControl,
+    Capability::SessionWait,
+    Capability::SessionReportStatus,
+    Capability::SessionAttach,
+    Capability::EventsSubscribe,
+    Capability::Idempotency,
+];
+
+/// What a server with no [`super::server::SessionHost`] advertises: every
+/// capability except the attachment surface it has no terminal to serve.
+pub static ADVERTISED_WITHOUT_HOST: &[Capability] = &[
     Capability::SessionRead,
     Capability::SessionControl,
     Capability::SessionWait,
@@ -897,6 +1149,11 @@ mod tests {
             Method::SessionSendInput,
             Method::SessionWait,
             Method::SessionReportStatus,
+            Method::SessionAttach,
+            Method::SessionDetach,
+            Method::SessionTakeover,
+            Method::SessionResize,
+            Method::SessionScreen,
             Method::EventsSubscribe,
         ];
         for method in every {
@@ -949,6 +1206,14 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<InputMode>("\"levitate\"").expect("parse"),
             InputMode::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<AttachMode>("\"levitate\"").expect("parse"),
+            AttachMode::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<AttachRole>("\"levitate\"").expect("parse"),
+            AttachRole::Unknown
         );
         assert_eq!(
             serde_json::from_str::<ApiEvent>(r#"{"kind":"levitated","extra":1}"#).expect("parse"),
@@ -1015,6 +1280,60 @@ mod tests {
             !keys.iter().any(|key| key == "repo"),
             "the absolute repository path is not"
         );
+    }
+
+    /// Issue #352: the attachment surface added a way to READ a terminal, and
+    /// the privacy boundary above must stay exactly where it was -- the
+    /// screen travels only as `session.screen`'s own result, never folded
+    /// into the shape every snapshot, list and event carries.
+    #[test]
+    fn the_screen_is_reachable_only_through_its_own_method() {
+        let attach = spec_for(Method::SessionScreen).expect("spec");
+        assert_eq!(attach.capability, Capability::SessionAttach);
+        assert!(
+            attach.result.iter().any(|field| field.name == "screen"),
+            "session.screen is where a rendered terminal is published"
+        );
+        for method in [
+            Method::SessionSnapshot,
+            Method::SessionList,
+            Method::SessionGet,
+            Method::SessionRead,
+        ] {
+            let spec = spec_for(method).expect("spec");
+            assert!(
+                !spec.result.iter().any(|field| field.name == "screen"),
+                "{method} must not publish terminal contents"
+            );
+        }
+    }
+
+    /// Every attachment method is gated on the one capability a hostless
+    /// server does not advertise, so a client's LOCAL negotiation is enough
+    /// to know none of them is callable -- no failed round trip required.
+    #[test]
+    fn every_attachment_method_is_gated_on_the_attach_capability() {
+        for method in [
+            Method::SessionAttach,
+            Method::SessionDetach,
+            Method::SessionTakeover,
+            Method::SessionResize,
+            Method::SessionScreen,
+        ] {
+            let spec = spec_for(method).expect("spec");
+            assert_eq!(spec.capability, Capability::SessionAttach, "{method}");
+        }
+        assert!(
+            !ADVERTISED_WITHOUT_HOST.contains(&Capability::SessionAttach),
+            "a server with no terminals must not advertise the attachment surface"
+        );
+        assert!(ADVERTISED.contains(&Capability::SessionAttach));
+        for capability in ADVERTISED_WITHOUT_HOST {
+            assert!(
+                ADVERTISED.contains(capability),
+                "the hostless set must be a subset of the protocol's own: {capability}"
+            );
+        }
     }
 
     #[test]
