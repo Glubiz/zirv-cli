@@ -7,6 +7,7 @@ pub mod config;
 pub mod credential;
 pub mod inventory;
 pub mod probe;
+pub mod transport;
 
 use serde::{Deserialize, Serialize};
 
