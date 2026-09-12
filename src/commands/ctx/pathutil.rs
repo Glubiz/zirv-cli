@@ -21,8 +21,8 @@ pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
         .map(|root| root.join(tail))
 }
 
-/// The canonical repository identity used by [`super::state::
-/// workflow_identity_slug`]: for a linked `git worktree add` checkout (its
+/// The canonical repository identity behind `workflow::engine::load_active`'s
+/// main-checkout fallback and [`sibling_checkouts`]: for a linked `git worktree add` checkout (its
 /// own gitdir differs from the shared common dir) this is the common dir's
 /// own parent -- the main checkout's working-tree root, since every
 /// worktree's `--git-common-dir` resolves back to that main checkout's
@@ -33,8 +33,8 @@ pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
 /// Deliberately NOT wired into `state::repo_slug` itself (issue #467
 /// review): most `repo_slug` consumers must stay keyed by the literal
 /// checkout a process is actually in, never merged across worktrees --
-/// `workflow_identity_slug`'s own doc comment lists the two call sites this
-/// is reserved for and why.
+/// `workflow::engine::load_active` (main-checkout fallback) and
+/// `sibling_checkouts` are the two call sites this is reserved for.
 ///
 /// A relocated main-checkout `.git` (`git init --separate-git-dir=...`)
 /// breaks the "common dir's parent is the main checkout" assumption -- a
@@ -42,10 +42,10 @@ pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
 /// attempted here.
 ///
 /// Memoized per canonical path with no invalidation for the life of the
-/// process: resolving this shells out to `git`, and `workflow_identity_slug`
-/// is called from a hook that fires once per agent turn, so paying that cost
+/// process: resolving this shells out to `git`, and `load_active` runs from
+/// a hook that fires once per agent turn, so paying that cost
 /// more than once per path per process would be wasteful. Safe only because
-/// both of `workflow_identity_slug`'s consumers ask a question ("is this the
+/// both consumers ask a question ("is this the
 /// same repository as that one") that cannot change out from under a single
 /// process, and neither runs as a long-lived daemon that would accumulate
 /// entries for many unrelated repositories over time -- a future caller with
@@ -83,7 +83,7 @@ pub(crate) fn worktree_identity(path: &Path) -> PathBuf {
 ///
 /// Reserved for `workflow::verification::latest_is_fresh_and_passing`'s
 /// widened read (issue #467 review): report storage itself stays keyed by
-/// the literal checkout (`state::repo_slug`, not `workflow_identity_slug`),
+/// the literal checkout (`state::repo_slug`),
 /// so two sibling worktrees never clobber each other's `zirv test changed`
 /// evidence -- this is what lets the gate still find a sibling's own fresh,
 /// passing evidence for that sibling's own tree. Not memoized: called far
@@ -134,9 +134,9 @@ mod tests {
 
     /// The core of issue #467: a linked worktree and its main checkout are
     /// two different literal paths that must still resolve to one identity,
-    /// since that identity is what `state::workflow_identity_slug` keys
-    /// workflow-state lookup and the Test/Verify evidence gate's read side
-    /// under -- never `repo_slug` itself, which every other consumer keeps
+    /// since that identity is what `workflow::engine::load_active`'s
+    /// main-checkout fallback and the Test/Verify evidence gate's widened
+    /// read key on -- never `repo_slug` itself, which every other consumer keeps
     /// keyed by the literal checkout.
     #[test]
     fn a_linked_worktree_resolves_to_its_main_checkouts_identity() {
