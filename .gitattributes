@@ -26,8 +26,10 @@
 /tests/fixtures/noisy-output.sh text eol=lf
 /tests/fixtures/noisy-output.cmd text eol=crlf
 
-# Issue #353: the protocol v1 fixtures are compared BYTE FOR BYTE against what
-# `serde_json::to_string_pretty` produces (LF), so a CRLF checkout on Windows
-# would fail the wire-compatibility guard for a reason that has nothing to do
-# with the wire.
+# Issues #353 and #470: both wire-fixture sets are compared BYTE FOR BYTE
+# against what `serde_json::to_string_pretty` produces (LF), so a CRLF checkout
+# on Windows fails the compatibility guard for a reason that has nothing to do
+# with the wire. `runtime/v1` (#470) shipped without this pin and its three
+# round-trip tests fail on any Windows checkout with core.autocrlf on.
 /tests/fixtures/protocol/v1/*.json text eol=lf
+/tests/fixtures/runtime/v1/*.json text eol=lf

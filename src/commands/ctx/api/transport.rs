@@ -126,7 +126,9 @@ pub struct Connection {
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection").field("peer", &self.peer).finish()
+        f.debug_struct("Connection")
+            .field("peer", &self.peer)
+            .finish()
     }
 }
 
@@ -189,7 +191,7 @@ impl Connection {
 
 #[cfg(unix)]
 mod imp {
-    use super::{CONNECT_RETRY, Connection, CtxResult, Endpoint, POLL, Peer, Path, state};
+    use super::{CONNECT_RETRY, Connection, CtxResult, Endpoint, POLL, Path, Peer, state};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -336,7 +338,7 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use super::{CONNECT_RETRY, Connection, CtxResult, Endpoint, POLL, Peer, Path, state};
+    use super::{CONNECT_RETRY, Connection, CtxResult, Endpoint, POLL, Path, Peer, state};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 
@@ -509,7 +511,7 @@ mod imp {
 
     fn create_instance(name: &str, descriptor: &OwnedDescriptor) -> CtxResult<OwnedHandle> {
         let wide_name = wide(name);
-        let mut attributes = SECURITY_ATTRIBUTES {
+        let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
@@ -525,7 +527,7 @@ mod imp {
                 PIPE_BUFFER_BYTES,
                 PIPE_BUFFER_BYTES,
                 0,
-                &mut attributes,
+                &attributes,
             )
         };
         if handle == INVALID_HANDLE_VALUE {
@@ -616,7 +618,8 @@ mod imp {
             let instance = self.take_or_create()?;
             // SAFETY: `instance` is live for the call; a null overlapped
             // pointer is the documented blocking form on a synchronous pipe.
-            let ok = unsafe { ConnectNamedPipe(instance.as_raw_handle() as _, std::ptr::null_mut()) };
+            let ok =
+                unsafe { ConnectNamedPipe(instance.as_raw_handle() as _, std::ptr::null_mut()) };
             if ok == 0 {
                 let error = std::io::Error::last_os_error();
                 // A client that connected between `CreateNamedPipeW` and
@@ -655,7 +658,11 @@ mod imp {
         let name = pipe_name(endpoint.path());
         let deadline = std::time::Instant::now() + CONNECT_RETRY;
         loop {
-            let error = match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+            let error = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&name)
+            {
                 Ok(file) => {
                     let reader = file.try_clone()?;
                     return Ok(Connection::new(
@@ -681,7 +688,11 @@ mod imp {
         use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
         let name = pipe_name(endpoint.path());
-        match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+        {
             Ok(_) => true,
             Err(error) => error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32),
         }

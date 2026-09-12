@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 
 use super::server::{ApiServer, StaticSource};
 use super::wire::{
-    ApiEvent, Method, PROTOCOL_VERSION, Request, SessionFacts, SessionState, ServerFrame,
+    ApiEvent, Method, PROTOCOL_VERSION, Request, ServerFrame, SessionFacts, SessionState,
 };
 use crate::commands::ctx::runtime::fake::FakeNativeBackend;
 use crate::commands::ctx::runtime::{RuntimeKind, UiSurface};

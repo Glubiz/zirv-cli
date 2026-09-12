@@ -396,10 +396,7 @@ fn object_schema(fields: &[FieldSpec]) -> Value {
 pub fn json_schema() -> Value {
     let mut defs = Map::new();
     for (name, values) in vocabularies() {
-        defs.insert(
-            name.to_string(),
-            json!({"type": "string", "enum": values}),
-        );
+        defs.insert(name.to_string(), json!({"type": "string", "enum": values}));
     }
     defs.insert("request".to_string(), object_schema(REQUEST_FIELDS));
     defs.insert("hello".to_string(), object_schema(HELLO_FIELDS));
@@ -449,11 +446,7 @@ pub fn render_human(w: &mut dyn Write) -> CtxResult<()> {
     writeln!(w, "transport")?;
     if let Some(map) = transport().as_object() {
         for (key, value) in map {
-            writeln!(
-                w,
-                "  {key}: {}",
-                value.as_str().unwrap_or_default()
-            )?;
+            writeln!(w, "  {key}: {}", value.as_str().unwrap_or_default())?;
         }
     }
     writeln!(w)?;
@@ -523,8 +516,8 @@ fn render_fields(w: &mut dyn Write, fields: &[FieldSpec]) -> CtxResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::wire::{ApiError, EventFrame, Hello, Outcome, Request, Response};
+    use super::*;
 
     /// A fully populated example of each real frame type, so the field
     /// lists this module publishes can be compared against what serde
@@ -656,7 +649,10 @@ mod tests {
         assert_eq!(schema["protocol"], json!(PROTOCOL_VERSION));
         // Unknown fields being ignored is part of the contract, so the
         // generated schema must not tell a client to reject them.
-        assert_eq!(schema["$defs"]["request"]["additionalProperties"], json!(true));
+        assert_eq!(
+            schema["$defs"]["request"]["additionalProperties"],
+            json!(true)
+        );
     }
 
     #[test]

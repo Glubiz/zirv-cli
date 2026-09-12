@@ -360,8 +360,12 @@ pub struct Hello {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
-    Ok { result: serde_json::Value },
-    Error { error: ApiError },
+    Ok {
+        result: serde_json::Value,
+    },
+    Error {
+        error: ApiError,
+    },
     /// Forward-compat fallback for a status this build has never heard of.
     #[serde(other)]
     Unknown,
@@ -415,9 +419,15 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApiEvent {
-    SessionStarted { session: SessionFacts },
-    SessionUpdated { session: SessionFacts },
-    SessionEnded { session_id: String },
+    SessionStarted {
+        session: SessionFacts,
+    },
+    SessionUpdated {
+        session: SessionFacts,
+    },
+    SessionEnded {
+        session_id: String,
+    },
     /// Emitted only when a subscriber asks for it; exists so a long-idle
     /// subscription proves the connection is still alive.
     Heartbeat,
@@ -891,7 +901,11 @@ mod tests {
         ];
         for method in every {
             let spec = spec_for(method).unwrap_or_else(|| panic!("no spec for {method}"));
-            assert_eq!(spec.name, method.as_str(), "spec name must be the wire name");
+            assert_eq!(
+                spec.name,
+                method.as_str(),
+                "spec name must be the wire name"
+            );
         }
         assert_eq!(METHODS.len(), every.len(), "the table has an extra entry");
         assert!(spec_for(Method::Unknown).is_none());
@@ -973,12 +987,7 @@ mod tests {
     fn session_facts_publish_no_bodies_secrets_or_absolute_paths() {
         let facts = SessionFacts::new("11111111-2222-4333-8444-555555555555");
         let value = serde_json::to_value(&facts).expect("serialize");
-        let keys: Vec<String> = value
-            .as_object()
-            .expect("object")
-            .keys()
-            .cloned()
-            .collect();
+        let keys: Vec<String> = value.as_object().expect("object").keys().cloned().collect();
         for forbidden in [
             "transcript",
             "prompt",
