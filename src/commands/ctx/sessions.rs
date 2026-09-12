@@ -5427,8 +5427,8 @@ mod tests {
     /// witness left by a session that died in a sibling worktree, since the
     /// two are different processes working on different trees. `repo_slug`
     /// (this module's match key) resolves worktree siblings independently
-    /// of `workflow::engine`'s own, deliberately separate,
-    /// `workflow_identity_slug`.
+    /// of `workflow::engine`'s own, deliberately separate, sibling-checkout
+    /// lookup.
     #[test]
     fn a_sibling_worktrees_dead_in_flight_record_is_not_reported() {
         use super::super::testenv::dead_pid;
