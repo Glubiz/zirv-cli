@@ -1703,7 +1703,7 @@ A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
-`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `mail.enabled`,
+`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
@@ -1738,6 +1738,7 @@ resource read-only or disconnected rather than bypassing policy.
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
 | `prompt.codex_orchestrator` | `ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR` |
+| `chat.claude_permission_mode` | `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
 | `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |
@@ -2654,10 +2655,36 @@ or the explicit opt-out below do.
   and runs Bash without OS sandboxing; Zirv's permission mode, allowed/disallowed
   tools and `zirv ctx safety check` PreToolUse hook remain in force.
   macOS uses the built-in `sandbox-exec`. Native Windows has no OS sandbox
-  and receives the hook and credential rules.
+  and receives the hook and credential rules. The interactive `Edit(./**)`/
+  `Read(./**)` scope also covers Claude Code's own agent-worktree convention
+  (`.claude/worktrees/**`) and any `--add-dir` grant this launch passes (a
+  linked git worktree of the launch repo, issue #329), so a native subagent's
+  Edit/Write inside a delegation worktree never falls through to a prompt.
 - **Claude headless:** `--permission-mode dontAsk`; ordinary allow rules are
   pre-approved and both deny and ask rules are disallowed, so no prompt can
   stall automation.
+- **`chat.claude_permission_mode`** (issue #504, operator-only, see
+  [Trust boundary](#trust-boundary)): overrides the INTERACTIVE launch's own
+  `--permission-mode` to `"acceptEdits"` or `"bypassPermissions"` instead of
+  the shipped `"default"`. Claude Code's own `--permission-mode` flag
+  outranks `permissions.defaultMode` in the operator's `~/.claude/
+  settings.json`, so before this key existed there was no way to quiet the
+  interactive prompt volume from config at all — an operator running several
+  native subagents delegating into worktrees got prompted for every
+  Edit/Write and every unlisted compound command, with `bypassPermissions`
+  reachable only via the live `/permissions` slash command each session.
+  Headless is untouched either way, and the mode change never suppresses or
+  widens the `--allowedTools`/`--disallowedTools` lists above — only the flag
+  itself changes:
+
+  ```toml
+  [chat]
+  claude_permission_mode = "acceptEdits"   # or "bypassPermissions"
+  ```
+
+  or `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE=acceptEdits`. Unset (the default)
+  reproduces `"default"` exactly. `REPO_FORBIDDEN`: a repository checkout
+  must not be able to widen its own session's permission posture.
 - **Codex interactive:** `--sandbox workspace-write --ask-for-approval
   on-request` when the installed CLI's own bounded capability probe documents
   it, otherwise `never`. When that CLI also advertises `--approve-for-me`,
