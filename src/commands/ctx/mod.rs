@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 pub mod adapters;
 pub mod agent;
+pub mod api;
 pub mod allocator;
 pub mod announce;
 pub mod ask;
@@ -547,6 +548,10 @@ pub enum CtxVerb {
     /// transcripts into one `learned:`-prefixed private memory entry
     /// (issue #425). Read-only with `--dry-run`.
     Learn(learn::LearnArgs),
+    /// The versioned local runtime protocol (issue #353): `schema` prints
+    /// the v1 contract, `serve` binds the local endpoint, `call` invokes one
+    /// method over it.
+    Api(api::ApiArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -676,6 +681,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Measure(a) => measure::run(a, &mut out),
         CtxVerb::Discover(a) => discover::run(a, &mut out),
         CtxVerb::Learn(a) => learn::run(a, &mut out),
+        CtxVerb::Api(a) => api::run(a, &mut out),
     };
 
     match result {

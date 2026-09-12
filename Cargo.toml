@@ -50,6 +50,13 @@ tar = "0.4.44"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # Issue #353: the runtime API's named pipe is created with an explicit
+    # owner-only DACL, built from an SDDL string
+    # (`ConvertStringSecurityDescriptorToSecurityDescriptorW`) around the
+    # calling user's own SID (`ConvertSidToStringSidW`). The DEFAULT named-pipe
+    # security descriptor grants read access to Everyone and the anonymous
+    # account, which is not what "owner-only endpoint permissions" means.
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",
