@@ -25,3 +25,9 @@
 # would otherwise hand a CRLF `.sh` to `sh`, which chokes on it).
 /tests/fixtures/noisy-output.sh text eol=lf
 /tests/fixtures/noisy-output.cmd text eol=crlf
+
+# Issue #353: the protocol v1 fixtures are compared BYTE FOR BYTE against what
+# `serde_json::to_string_pretty` produces (LF), so a CRLF checkout on Windows
+# would fail the wire-compatibility guard for a reason that has nothing to do
+# with the wire.
+/tests/fixtures/protocol/v1/*.json text eol=lf
