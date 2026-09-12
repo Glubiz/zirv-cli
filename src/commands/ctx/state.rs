@@ -69,42 +69,6 @@ pub fn repo_slug(path: &Path) -> String {
     current
 }
 
-/// Like [`repo_slug`], but first redirects a linked `git worktree add`
-/// checkout to its main checkout's own identity (`pathutil::
-/// worktree_identity`), so a main checkout and every worktree linked to it
-/// compute the SAME slug. A no-op (identical to `repo_slug`) for every
-/// ordinary single-checkout repository, a bare repository, or anywhere
-/// `git` does not resolve at all.
-///
-/// Deliberately NOT what `repo_slug` itself does: most of `repo_slug`'s
-/// consumers (crash-witness and handoff lookup in `sessions.rs`/
-/// `handoff.rs`, telemetry, test baselines, mail, ...) must stay keyed by
-/// the literal checkout a session or process is actually running in --
-/// merging them across worktrees would let a session in one checkout
-/// consume a crash witness, handoff, or piece of evidence left by a
-/// completely different session in a sibling checkout (issue #467 review:
-/// making `repo_slug` itself worktree-aware was rejected for exactly this
-/// reason). This is reserved for the two places issue #467 needs one shared
-/// identity across worktrees: workflow-state lookup (`workflow::engine::
-/// {state_path, active_path, load, load_active}`, so `--repo <worktree>`
-/// finds a workflow started in its main checkout and vice versa) and the
-/// Test/Verify evidence gate's READ side (`workflow::verification::
-/// latest_is_fresh_and_passing`, which widens its search to every checkout
-/// sharing this identity -- report storage itself, `report_dir`/
-/// `save_report`, stays keyed by the literal checkout via plain `repo_slug`,
-/// so concurrent `zirv test changed` runs in sibling worktrees never clobber
-/// each other's evidence).
-///
-/// `pathutil::worktree_identity` memoizes per canonical path with no
-/// invalidation for the life of the process; safe here because both
-/// consumers above only ever need "is this the same repository", which
-/// cannot change out from under a running process, and neither is a
-/// long-lived daemon that would accumulate stale entries across repositories
-/// over time.
-pub fn workflow_identity_slug(path: &Path) -> String {
-    repo_slug(&super::pathutil::worktree_identity(path))
-}
-
 #[derive(Clone, Copy)]
 enum SlugEntry {
     Directory,
