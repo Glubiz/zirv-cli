@@ -1249,6 +1249,18 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = endpoint;
     }
 
+    /// Issue #504 (operator-only interactive permission mode): attaches
+    /// `cfg.chat` to this adapter INSTANCE, mirroring `apply_endpoint`
+    /// immediately above -- `select`/`resolve_default` call this exactly
+    /// once, right after constructing the adapter, so `ClaudeAdapter::
+    /// default_sandbox_args`'s interactive `--permission-mode` argv reads
+    /// the same resolved `chat.claude_permission_mode` every other read of
+    /// this adapter instance does. Default no-op: only `ClaudeAdapter`
+    /// overrides it today; codex has no equivalent flag.
+    fn apply_chat_config(&mut self, chat: &super::config::ChatConfig) {
+        let _ = chat;
+    }
+
     /// Issue #395: the catalogue vendor slug of this adapter INSTANCE's own
     /// attached endpoint override, or `None` when it has none -- what
     /// `harness_prompt_lines`'s roster line and `zirv ctx status` render as
@@ -2848,6 +2860,18 @@ fn apply_endpoint_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig)
     adapter.apply_endpoint(target);
 }
 
+/// Issue #504: attaches `cfg.chat` (via [`AgentAdapter::apply_chat_config`])
+/// the same way [`apply_endpoint_override`] attaches `cfg.endpoint` --
+/// called at each of that function's own call sites, right after
+/// constructing the adapter. Whole-`ChatConfig` rather than a single
+/// resolved field: `apply_endpoint_override` picks per-adapter because
+/// `[endpoint.claude]`/`[endpoint.codex]` are two different tables, but
+/// `[chat]` has no per-adapter split, so every adapter's own `apply_chat_
+/// config` reads the one shared config directly.
+fn apply_chat_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
+    adapter.apply_chat_config(&cfg.chat);
+}
+
 /// Issue #395: the credential-presence check both `ClaudeAdapter::ready`
 /// and `CodexAdapter::ready` apply when an operator endpoint override is
 /// configured. Named by the environment variable's own NAME only, never its
@@ -3262,6 +3286,7 @@ pub(crate) fn adapter_liveness(
     let names_other = agent_bin_names_a_different_adapter(bin, name).is_some();
     let mut adapter = if names_other { ctor(None) } else { ctor(bin) };
     apply_endpoint_override(&mut adapter, cfg);
+    apply_chat_override(&mut adapter, cfg);
     adapter.ready().map_err(|err| err.to_string())?;
     let program = adapter.program().to_string();
     let resolved_bin = if names_other { None } else { bin };
@@ -3787,6 +3812,7 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
                 )
             })?;
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -3800,6 +3826,7 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
     for (name, ctor) in ADAPTERS {
         let mut adapter = ctor(bin);
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(name) {
             // Final wave item 3: the same cross-adapter skip Medium 2 gave
             // the enabled-and-ready arm below, applied here too. Without
@@ -3886,6 +3913,7 @@ pub fn select(
             )
         })?;
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -3896,6 +3924,7 @@ pub fn select(
 
     if let Some(mut adapter) = adapters.into_iter().find(|a| a.detect(command)) {
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4734,6 +4763,7 @@ mod tests {
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("haiku".to_string()),
+                claude_permission_mode: None,
             },
             ..permissive_cfg()
         };
@@ -4765,6 +4795,7 @@ mod tests {
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("opus".to_string()),
+                claude_permission_mode: None,
             },
             review: crate::commands::ctx::config::ReviewConfig {
                 claude: Some("opus".to_string()),
@@ -4834,6 +4865,7 @@ mod tests {
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("sonnet".to_string()),
+                claude_permission_mode: None,
             },
             ..permissive_cfg()
         };
