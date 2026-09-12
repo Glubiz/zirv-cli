@@ -1410,6 +1410,72 @@ impl Default for TaskConfig {
     }
 }
 
+/// Issue #352: the persistent runtime service -- the one that owns PTYs so a
+/// session survives the client that was looking at it. EXPERIMENTAL and
+/// operator-only: with `persistent = false` (the default) nothing in this
+/// table has any effect and every surface behaves exactly as it did before
+/// the feature existed.
+///
+/// Every key here is `REPO_FORBIDDEN`. A checked-out repository must not be
+/// able to decide that sessions started from it outlive the operator's
+/// terminal, and -- the sharper half -- must not be able to turn on
+/// `history`, which persists rendered terminal output (and therefore any
+/// secret an agent happened to print) to disk. Only `~/.zirv/ctx.toml`, the
+/// `ZIRV_CTX_SESSION_*` variables, or an explicit flag may set them.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// The master switch (`ZIRV_CTX_SESSION_PERSISTENT`). Off by default:
+    /// until crash, upgrade and cross-platform recovery are proven on every
+    /// platform, `zirv session serve` is something an operator opts into, and
+    /// `zirv chat` keeps launching its own PTY in its own process.
+    pub persistent: bool,
+    /// Tier 3 (`ZIRV_CTX_SESSION_HISTORY`): persist each session's rendered
+    /// terminal state across a RUNTIME restart, not just across a client
+    /// detach. Off by default and warned about at the point of use, because
+    /// terminal output routinely contains tokens, keys and repository
+    /// contents, and this is the only zirv setting that writes that stream to
+    /// disk. Detach/reattach (tier 1) does not need it: the original PTY and
+    /// its live screen never left the service's memory.
+    pub history: bool,
+    /// How many rows of scrollback each server-owned PTY keeps in memory for
+    /// a reattaching client (`ZIRV_CTX_SESSION_SCROLLBACK_ROWS`). Memory, not
+    /// disk: unaffected by `history`.
+    pub scrollback_rows: usize,
+    /// How long a namespace record may go without a heartbeat before another
+    /// process treats it as stale (`ZIRV_CTX_SESSION_STALE_AFTER_SECS`).
+    /// Only ever a secondary signal: staleness is decided by process start
+    /// identity first (see `session::namespace`), never by age or pid alone.
+    pub stale_after_secs: u64,
+}
+
+/// Defaults are written out rather than derived so the "off by default"
+/// promise is one visible line rather than an inference about `bool`.
+impl SessionConfig {
+    pub const DEFAULT_SCROLLBACK_ROWS: usize = 2000;
+    pub const DEFAULT_STALE_AFTER_SECS: u64 = 120;
+
+    /// The resolved scrollback budget, with `0` (an unset or explicitly
+    /// zeroed key) reading as the built-in default rather than "keep
+    /// nothing": the same clamping convention `setup.backup_retention_runs`
+    /// and `workflow.telemetry_max_events` already use.
+    pub fn scrollback_rows_or_default(&self) -> usize {
+        if self.scrollback_rows == 0 {
+            Self::DEFAULT_SCROLLBACK_ROWS
+        } else {
+            self.scrollback_rows
+        }
+    }
+
+    pub fn stale_after_secs_or_default(&self) -> u64 {
+        if self.stale_after_secs == 0 {
+            Self::DEFAULT_STALE_AFTER_SECS
+        } else {
+            self.stale_after_secs
+        }
+    }
+}
+
 /// Bookkeeping for the guided `zirv setup` flow (issues #87, #93, #95). Not
 /// `REPO_FORBIDDEN`: unlike the workflow/memory tables above, nothing here
 /// gates execution of repository content or spend on the operator's
@@ -2239,6 +2305,9 @@ pub struct CtxConfig {
     pub objective: ObjectiveConfig,
     pub screen: ScreenConfig,
     pub task: TaskConfig,
+    /// Issue #352's experimental persistent-runtime gate. Every key is
+    /// `REPO_FORBIDDEN`; see [`SessionConfig`].
+    pub session: SessionConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -2985,6 +3054,29 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES",
         &["task", "max_parent_outcome_bytes"],
+        EnvKind::Int,
+    ),
+    // Issue #352: the operator's own override for every persistent-runtime
+    // key. These are the ONLY spellings besides `~/.zirv/ctx.toml` and an
+    // explicit flag that can set them -- see `REPO_FORBIDDEN` below.
+    (
+        "ZIRV_CTX_SESSION_PERSISTENT",
+        &["session", "persistent"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_SESSION_HISTORY",
+        &["session", "history"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_SESSION_SCROLLBACK_ROWS",
+        &["session", "scrollback_rows"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
+        &["session", "stale_after_secs"],
         EnvKind::Int,
     ),
 ];
@@ -4110,6 +4202,23 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["task", "max_parent_outcome_bytes"],
         "ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES",
+    ),
+    // Issue #352, one entry per key so the refusal names the exact one the
+    // checkout tried to set. `persistent` decides whether cloning a
+    // repository is enough to make sessions started from it outlive the
+    // operator's terminal; `history` decides whether rendered terminal
+    // output -- tokens and keys included -- is written to disk at all; and
+    // the two bounds would be decorative if the untrusted layer could simply
+    // raise its own, the same reasoning as every cap above.
+    (&["session", "persistent"], "ZIRV_CTX_SESSION_PERSISTENT"),
+    (&["session", "history"], "ZIRV_CTX_SESSION_HISTORY"),
+    (
+        &["session", "scrollback_rows"],
+        "ZIRV_CTX_SESSION_SCROLLBACK_ROWS",
+    ),
+    (
+        &["session", "stale_after_secs"],
+        "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
     ),
 ];
 
@@ -11574,5 +11683,89 @@ mod tests {
             err.to_string().contains("reactive_force_after_secs"),
             "{err}"
         );
+    }
+
+    /// Issue #352: with nothing configured, the persistent runtime is OFF and
+    /// terminal history is OFF. Pinned as a test rather than left to
+    /// `#[derive(Default)]` so turning either default around is a visible
+    /// change to an assertion about operator safety, not a one-character edit.
+    #[test]
+    fn the_persistent_runtime_and_its_history_are_both_off_by_default() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.session.persistent,
+            "the experimental runtime must be opt-in"
+        );
+        assert!(
+            !cfg.session.history,
+            "terminal history writes secrets to disk and must be opt-in"
+        );
+        assert_eq!(
+            cfg.session.scrollback_rows_or_default(),
+            SessionConfig::DEFAULT_SCROLLBACK_ROWS
+        );
+        assert_eq!(
+            cfg.session.stale_after_secs_or_default(),
+            SessionConfig::DEFAULT_STALE_AFTER_SECS
+        );
+    }
+
+    /// Issue #352: every `[session]` key is operator-only, one assertion per
+    /// key so a future edit that drops one entry from `REPO_FORBIDDEN` fails
+    /// here naming it. `persistent` and `history` are the two that matter
+    /// most -- a checkout must not be able to decide that sessions outlive
+    /// the operator's terminal, nor that rendered terminal output (tokens
+    /// included) is written to disk.
+    #[test]
+    fn every_session_key_is_operator_only() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        for (key, line) in [
+            ("persistent", "persistent = true"),
+            ("history", "history = true"),
+            ("scrollback_rows", "scrollback_rows = 100000"),
+            ("stale_after_secs", "stale_after_secs = 99999"),
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[session]\n{line}\n"),
+            )
+            .expect("write repo");
+            let err = CtxConfig::load(repo.path(), &|_| None)
+                .err()
+                .unwrap_or_else(|| panic!("a repo must not be able to set session.{key}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "session.{key} must be a REPO_FORBIDDEN rejection: {err}"
+            );
+            assert!(
+                err.to_string().contains(key),
+                "the refusal must name session.{key}: {err}"
+            );
+        }
+    }
+
+    /// The other direction of the same boundary: the operator's own
+    /// environment override does set it, so the gate is reachable at all.
+    #[test]
+    fn the_operator_environment_turns_the_persistent_runtime_on() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let env = env_map(&[
+            ("ZIRV_CTX_SESSION_PERSISTENT", "true"),
+            ("ZIRV_CTX_SESSION_HISTORY", "1"),
+            ("ZIRV_CTX_SESSION_SCROLLBACK_ROWS", "64"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.session.persistent);
+        assert!(cfg.session.history);
+        assert_eq!(cfg.session.scrollback_rows_or_default(), 64);
     }
 }
