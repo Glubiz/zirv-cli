@@ -436,6 +436,52 @@ pub fn compose(
     candidate
 }
 
+/// Issue #468, generalised for issue #479 (roadmap N10): the one predicate
+/// that decides whether an unsolicited notification may be delivered to a
+/// session right now. `Some(attention)` means a latch is open -- a harness
+/// permission dialog, a question, a quota park -- and typing into that
+/// session would land as raw keystrokes on whatever is open, which is
+/// exactly the "must never be typed into a legacy approval dialog" failure
+/// #468 reported. The caller queues and retries at the next boundary where
+/// this returns `None`.
+///
+/// `Projection::Blocked(Attention::None)` (a bare `Lifecycle::Waiting` with
+/// no named reason) is deliberately NOT blocking: nothing in this codebase
+/// latches that combination from a live hook, and treating it as one would
+/// silently withhold ordinary advisories from a session merely waiting for
+/// its next prompt.
+///
+/// Lives here rather than in `dash` because BOTH delivery surfaces need the
+/// identical answer: the dashboard's own pane mail sweep
+/// (`dash::advise_one_pane`) and the runtime-neutral delegation mail service
+/// (`delegation::send`), which must reach native and legacy workers alike.
+pub fn blocking(status: &SessionStatus) -> Option<Attention> {
+    match project(status) {
+        Projection::Blocked(Attention::None) => None,
+        Projection::Blocked(attention) => Some(attention),
+        _ => None,
+    }
+}
+
+/// Pure: the skip reason named by issue #468's own acceptance criterion
+/// (`approval-open`) for [`Attention::Approval`], and an analogous reason for
+/// every other variant [`blocking`] can return -- so a skip row is never just
+/// "blocked" with no way to tell which latch caused it.
+pub fn block_reason(attention: Attention) -> &'static str {
+    match attention {
+        Attention::Approval => "approval-open",
+        Attention::Question => "question-open",
+        Attention::Permission => "permission-open",
+        Attention::Quota => "quota-open",
+        Attention::WorkflowGate => "workflow-gate-open",
+        Attention::WriterConflict => "writer-conflict-open",
+        Attention::VerificationFailure => "verification-failure-open",
+        Attention::Compacting => "compacting",
+        Attention::Stalled => "stalled",
+        Attention::None | Attention::Unknown => "attention-blocked",
+    }
+}
+
 /// A `SessionStatus` into the small enum a UI actually renders. Attention
 /// always wins over lifecycle -- a session that is technically `Working` but
 /// has a pending permission prompt is blocked, not busy.

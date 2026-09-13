@@ -9255,35 +9255,25 @@ fn mail_injection_label(from_agent: &str, from_session: &str, is_parent: bool) -
 /// codebase currently latches that combination from a live hook, and
 /// treating it as a mail block would risk silently withholding an ordinary
 /// advisory from a session that is simply waiting on its next prompt.
+///
+/// Issue #479 (roadmap N10) moved the predicate itself to
+/// [`attention::blocking`] so the runtime-neutral delegation mail service
+/// (`ctx::delegation::send`) answers the identical question for a NATIVE
+/// worker that this sweep answers for a legacy pane -- one rule, not two
+/// that can drift apart.
 fn mail_blocked_by_attention(
     status: &super::attention::SessionStatus,
 ) -> Option<super::attention::Attention> {
-    match super::attention::project(status) {
-        super::attention::Projection::Blocked(super::attention::Attention::None) => None,
-        super::attention::Projection::Blocked(attention) => Some(attention),
-        _ => None,
-    }
+    super::attention::blocking(status)
 }
 
 /// Pure: the decision-log skip reason named by issue #468's own acceptance
 /// criterion (`approval-open`) for [`attention::Attention::Approval`], and an
 /// analogous reason for every other variant [`mail_blocked_by_attention`] can
 /// return -- so a skip row is never just "blocked" with no way to tell which
-/// latch caused it.
+/// latch caused it. Shared with the delegation mail service since issue #479.
 fn mail_block_reason(attention: super::attention::Attention) -> &'static str {
-    use super::attention::Attention;
-    match attention {
-        Attention::Approval => "approval-open",
-        Attention::Question => "question-open",
-        Attention::Permission => "permission-open",
-        Attention::Quota => "quota-open",
-        Attention::WorkflowGate => "workflow-gate-open",
-        Attention::WriterConflict => "writer-conflict-open",
-        Attention::VerificationFailure => "verification-failure-open",
-        Attention::Compacting => "compacting",
-        Attention::Stalled => "stalled",
-        Attention::None | Attention::Unknown => "attention-blocked",
-    }
+    super::attention::block_reason(attention)
 }
 
 /// Issue #468: the one decision-log row shape for an attention-blocked mail
