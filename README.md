@@ -1474,7 +1474,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Initializes, inventories, validates, or stores credentials for opt-in native provider routes |
 | `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat |
-| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal (also `zirv agent`) |
+| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` delegates to a native worker instead, with the same task/ownership/receipt contracts (also `zirv agent`) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
@@ -1724,6 +1724,78 @@ provider/tool scripts under `tests/fixtures/runtime/native/` prove loop
 correctness for both primary provider shapes without a paid call. The contract
 is in
 [`docs/design/2026-09-13-native-agent-loop.md`](docs/design/2026-09-13-native-agent-loop.md).
+
+#### Native workers, shared ownership and delegation receipts
+
+`zirv agent --runtime native` (equally `zirv ctx agent --runtime native`)
+delegates one task to a **native** worker -- no coding harness installed, no
+child process, no PTY:
+
+```
+zirv agent native "read src/main.rs and report the entry point" --runtime native
+zirv agent work-sonnet "run the failing test and report" --runtime native --task task-12 --json
+zirv agent claude "review this diff" --mode read-only          # unchanged: the harness fork
+```
+
+Flags: `--runtime harness|native` (default `harness`) and `--route <id>`,
+the same two flags and the same two values `zirv ctx exec` already takes.
+**Without `--runtime native` nothing changes** -- the harness delegation is
+reached by the same code, in the same order, with the same arguments. With
+it, the positional `<name>` names the provider **route** rather than a
+harness (a native worker has no harness to name), and the reserved value
+`native` defers to the `[roles]` entry for `--role`; `--route` overrides it.
+`--max-restarts` and a trailing `-- <flags>` passthrough are **refused**, not
+ignored, for the same reason `zirv ctx exec --runtime native` refuses them.
+
+Everything else about the delegation is identical, because it is literally
+the same code: `--workdir`/`--worktree`, `--task`, `--group`, `--mode`,
+`--path-scope`/`--no-network`/`--depth`, `--result-schema`/`--result-kind`,
+`--budget-tokens`/`--max-tool-calls` and `--json` all behave exactly as they
+do for a harness worker. A native worker takes the **same** ownership a
+legacy one does and is therefore mutually exclusive with it:
+
+| Exclusive claim | Mechanism | Effect |
+|---|---|---|
+| Task card | `zirv ctx task` claim (`task::claim_locked`) | one live claimant per card, whichever runtime asked |
+| Checkout write | writer permit (`permit::acquire_writer`) | one writer per tree; a native worker's permit is handed to its execution broker, which refuses any repository write not backed by a permit for that exact tree |
+| Provider tokens | per-provider reservation ledger | one machine-wide outstanding total, settled from the run's real usage |
+
+Each delegation gets a **stable handle** -- minted by zirv, independent of
+any provider conversation id a resume would change -- and a durable record at
+`<state>/delegations/<repo-slug>/<handle>.json` holding the launch receipt
+(written *before* anything runs), the ownership taken, every attempt, and
+every delivery already published or consumed. Terminal outcomes are persisted
+first and notified second, over ordinary mail, carrying a **delivery
+identity** `<handle>:<attempt>:<revision>`. Mail is at-least-once: a
+consuming `zirv ctx inbox` drops an exact repeat of an identity it has
+already consumed (and still shows anything it cannot account for), so one
+completion is never acted on twice and never lost. A message that arrives
+while its target has an approval or other attention latch open is queued
+durably and retried at the next idle boundary -- never typed at the dialog
+(the same rule the dashboard's own pane sweep applies).
+
+A native session drives all of this with seven typed tools in its own
+registry -- `delegate`, `send`, `wait`, `result`, `follow_up`, `interrupt`,
+`close` -- each a validated argument shape in front of the *same* service
+method the CLI verb calls. `result` returns a bounded manifest (outcome,
+delivery identities, report reference, unknown tool outcomes, whether the
+summary was cut), never a transcript. `follow_up` is addressed to the
+delegation handle: directed mail while the worker is live, a journal resume
+for a finished native worker, otherwise an explicit replacement checkpoint
+that says it has none of the original's hidden context -- there is no
+"most recent session" fallback, and an unknown handle is an error. `close`
+releases the reservation and the write claim while preserving every receipt
+and every `outcome_unknown` effect. The contract is in
+[`docs/design/2026-09-13-native-workers.md`](docs/design/2026-09-13-native-workers.md).
+
+Trust boundary: every delegation tool crosses the native execution broker as
+an `ExecutionAction::Delegate`, so a native session cannot delegate around
+the seat fence and policy its other tools run behind; the delegation handle
+is validated as `[A-Za-z0-9_-]{1,128}` at the argument boundary, so provider
+output can never name a file outside its own repository's delegation
+directory; and a nested worker gets its own principal and a
+`delegation_depth` one hop shorter than its parent's, so it inherits none of
+the parent's session authority.
 
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
@@ -2068,6 +2140,21 @@ token is one input to the final status rather than the answer. A repository
 can still narrow, through the same `[supervise] orchestrator_writes` posture
 that governs the harness path, which the native loop applies to its own
 `file_write`/`apply_patch` calls.
+
+Native workers and the delegation tools add no repository-settable key
+either. Which runtime a worker runs on, which route it spends and which task
+it claims come from the command line (or from the parent's own delegation
+tool call), never from a checkout. A delegation tool call is model output and
+is treated as such: it crosses the broker as an `ExecutionAction::Delegate`
+under the same seat generation fence every other native tool runs behind, the
+delegation handle it names is validated as `[A-Za-z0-9_-]{1,128}` before it
+can reach a file, and the worker it asks for is narrowed against the parent's
+own envelope (`--path-scope`, `--no-network`, `--depth`, writing vs
+read-only) — asking for more than the parent holds is refused, never clamped.
+A nested worker gets its own principal and one hop less delegation depth, so
+it inherits none of the parent's session authority. The delegation record
+itself lives under the operator-owned state directory, never in the
+repository.
 
 The local runtime protocol ([`zirv ctx api`](#runtime-protocol-v1-zirv-ctx-api))
 adds no configuration key, and deliberately so: its endpoint is always derived
