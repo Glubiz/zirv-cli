@@ -1863,6 +1863,9 @@ pub fn advance_with_evidence(
                         repo: Some(frontend_root.to_path_buf()),
                         agent: None,
                         model: None,
+                        runtime: crate::commands::ctx::runtime::RuntimeKind::Harness
+                            .as_str()
+                            .to_string(),
                         json: false,
                     },
                 )?;

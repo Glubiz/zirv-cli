@@ -80,6 +80,20 @@ impl RuntimeKind {
     }
 }
 
+/// The one place a `--runtime` FLAG is turned into a decision.
+///
+/// [`RuntimeKind::from_str`] is infallible on purpose -- it exists to decode
+/// a persisted value a future build may have written, where `Unknown` is the
+/// only safe answer. A command-line flag is the opposite case: an unrecognised
+/// value is an operator mistake and must be a hard error, never a silent fall
+/// back to a harness the operator did not ask for.
+pub fn selected(flag: &str) -> crate::commands::ctx::CtxResult<RuntimeKind> {
+    match flag.parse::<RuntimeKind>() {
+        Ok(kind @ (RuntimeKind::Harness | RuntimeKind::Native)) => Ok(kind),
+        _ => Err(format!("--runtime '{flag}': expected `harness` or `native`").into()),
+    }
+}
+
 impl std::fmt::Display for RuntimeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
