@@ -221,6 +221,18 @@ pub fn prompt_role(role: &str) -> PromptRole {
         .unwrap_or(PromptRole::Worker)
 }
 
+/// Which team roles this machine can actually staff, in team order.
+///
+/// Item 2's "preserve the operator's preferred team composition": a
+/// coordinator planning work needs to know which roles have a route before it
+/// plans around one that does not, and the answer is the operator's `[roles]`
+/// table rather than anything the model may assume.
+pub fn roster(config: &NativeConfig) -> Vec<(TeamRole, Option<RouteId>)> {
+    TEAM.into_iter()
+        .map(|role| (role, config.roles.get(role.as_str()).cloned()))
+        .collect()
+}
+
 /// Why a role could not be given a route.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteRefusal {
@@ -470,6 +482,28 @@ mod tests {
         // The refusal names what IS configured rather than silently handing
         // the reviewer somebody else's route.
         assert!(refusal.to_string().contains("coordinator"));
+    }
+
+    #[test]
+    fn the_roster_says_which_roles_this_machine_can_actually_staff() {
+        let staffed = roster(&two_postures());
+        assert_eq!(staffed.len(), TEAM.len());
+        let named: Vec<(&str, bool)> = staffed
+            .iter()
+            .map(|(role, route)| (role.as_str(), route.is_some()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (COORDINATOR, true),
+                (SUB_ORCHESTRATOR, false),
+                (RESEARCHER, false),
+                (PLANNER, false),
+                (IMPLEMENTER, true),
+                (REVIEWER, false),
+                (TESTER, false),
+            ]
+        );
     }
 
     #[test]
