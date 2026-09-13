@@ -276,6 +276,132 @@ opens the session's own journal fresh and renders it through
 headless transcript and a live pane's transcript can never disagree about
 what a tool call, a diff or a test outcome looks like.
 
+## Round 3: Claude Code-style restyle (operator direction, PR #531 follow-up)
+
+The operator asked for the pane to look and behave like Claude Code's own
+interactive UI, on the reasoning that it is the harness UX this project's
+users already know. This round restyles the renderers and extends the key
+contract; it deliberately keeps round 1's reducer/composer/presentation
+model untouched (no `TranscriptItem`/`ConversationState` shape changed
+except one new, purely presentational `TranscriptItem::Elided` variant from
+the review-fix round earlier on this branch) -- only how things are drawn
+and which keys reach the pane changed.
+
+### Shipped
+
+- **Bullet/tree transcript.** `render_item`/`render_tool_call` now render
+  assistant text and tool calls as `⏺` bullets (`with_marker`, shared by
+  both), user turns as `>` lines, and a tool call's result as an indented
+  `⎿` tree line carrying a one-line summary plus `(ctrl+r to expand)` while
+  collapsed (dropped once actually expanded, and never shown at all for a
+  pending/running/cancelled outcome, which has nothing more to reveal --
+  `outcome_is_expandable`). A per-line shaded background for user turns is
+  **not** implemented: the shared `StyledSpan`/`Tone` vocabulary both
+  renderers (ratatui and plain-text) use has no per-line background concept
+  today, and adding one is a crate-wide change to `style::Tone` (used well
+  outside this module) rather than a native-pane-scoped one.
+- **Diffs with a line-number gutter.** `render_diff_lines` parses each
+  `@@ -a,b +c,d @@` hunk header and threads running old/new counters through
+  context/added/removed rows, still colouring +/- rows the way round 1
+  already did.
+- **The activity line.** `activity_line_text(elapsed, tokens)` is a pure
+  function producing a spinner frame, a rotating (decorative) verb, real
+  elapsed seconds and a running token count, ending with "esc to interrupt".
+  `NativePaneRuntime` tracks `turn_started_at` (set on the first `Busy`
+  progress tick of a turn, cleared on `Idle`/`Failed`/`Ended`) and appends
+  the line to the transcript's own content via `render_lines_with_activity`
+  (not a separately reserved row, so it scrolls/wraps like everything else
+  and follow-mode keeps it in view for free) rather than a fixed status-bar
+  slot. The token count is the conversation's own total recorded usage so
+  far, not a per-turn count -- the journal has no "usage recorded since this
+  turn started" read, so it only grows across turns within one pane's
+  lifetime rather than resetting each turn; a truer per-turn reading would
+  need that journal capability.
+- **The bottom status line.** `StatusFacts` gained `context_left_pct`,
+  `cwd` and `git_branch`, appended after the existing model/route/runtime/
+  billing/state segment. `context_left_pct` is an ESTIMATE --
+  `context_left_pct` divides the conversation's own recorded
+  input+output token usage by the route's declared context window
+  (`provider::capability::declared`); it is not the compaction budget's own
+  accounting, which also weighs distillation and lives inside the worker
+  thread's `NativeSessionConfig`, never read back by this pane. `git_branch`
+  reads `.git/HEAD` directly (resolving a linked worktree's `gitdir:`
+  redirect) rather than shelling out to `git` -- this pane polls on a
+  ~150ms tick, and spawning a process that often is not acceptable -- read
+  once at spawn time, never per-tick, since a session's checked-out branch
+  essentially never changes across its own lifetime.
+- **The composer's hint line.** Extended (not replaced) to lead with
+  "? for shortcuts", show the `Shift+Tab`-cycled `ComposerMode` label and,
+  when non-zero, a queued-input count (`composer_hint_line`). The `>`
+  prompt marker on the composer's first line already existed from round 1
+  and is unchanged.
+- **`ComposerMode` (`Shift+Tab`).** `Default`/`AcceptEdits`/`Plan`, cycled
+  by `Shift+Tab` (or `BackTab`, which is what most terminals actually report
+  for it) and shown on the hint line. **Decorative only**: no submit path
+  reads it back to change approval or tool-write behaviour. An
+  `AcceptEdits`/`Plan` mode that actually gated the execution broker would
+  be a policy change at the enforcement layer -- out of scope for a
+  rendering/key-contract pass, and a materially larger, separately
+  reviewable change.
+- **Key contract.** `Esc` now interrupts (Claude Code's own convention);
+  `Ctrl+C` no longer interrupts by itself -- a single press only arms a
+  quit confirmation (`ctrl_c_confirms_quit`), and the pane quits on a
+  SECOND `Ctrl+C` within `CTRL_C_QUIT_WINDOW` (2s) of the first. `Ctrl+Q`
+  still quits immediately, kept for backward compatibility with round 2's
+  own key contract. `Ctrl+R` toggles the most recently rendered tool call's
+  expanded state regardless of which region has focus (the composer's own
+  `e`/`Enter`-while-`Transcript`-focused binding still works too, factored
+  into the same `toggle_most_recent_tool_call` helper so the two never
+  drift).
+- **`/` slash commands -- real, not a mock.** `apply_slash_command`
+  intercepts a `/`-prefixed submission before it ever reaches
+  `classify_submit_intent`. `/clear` has a real effect (drops the queued
+  backlog); `/help` reports the key contract; `/status` (handled directly
+  by `NativePaneRuntime::handle_composer_action`, since it needs live
+  `StatusFacts` the pure helper cannot produce) reports model/state/
+  billing; `/compact` is an honest inert stub -- its own notice says so --
+  rather than a command that looks wired but does nothing. An unrecognised
+  `/`-prefixed line, or ordinary text, falls through to the normal submit
+  path unchanged.
+
+### Deferred (this round)
+
+- **A live approval dialog.** `StatusFacts.blocked` is still hardcoded
+  `false` (unchanged from round 2's own deferred item) -- nothing here reads
+  the enforcement broker's own approval-gate state, and no numbered dialog
+  was added. Rendering one without a real decision to route it to would be
+  UI that looks live but is not; wiring the actual decision needs the
+  broker/approval-authority seam this pane does not touch anywhere else
+  either.
+- **An interactive `@` fuzzy file picker.** `resolve_file_refs` (tested,
+  containment-safe since the PR #531 review-finding-2 fix earlier on this
+  branch) is still not called from `run_native_dashboard`'s own key
+  handling -- unchanged from round 2's own deferred item. A live `@`-hint
+  overlay needs a picker widget (selection state, filtering, rendering) this
+  round did not build.
+- **A `!`-prefixed shell line.** The interactive session has no direct-exec
+  path that bypasses a model turn -- every submission today becomes a turn
+  `NativeLoop` drives. Adding one is an architecture change (a new command
+  on `InteractiveSession`, threaded through the worker thread and the
+  broker's own process tool) rather than a rendering/key-contract change,
+  and risks the exact kind of un-brokered write path issue #480's own
+  enforcement model exists to prevent if done hastily.
+- **A real bordered composer box.** The composer is still `>`-marker text
+  plus a hint line (round 1's own layout), not a `ratatui::widgets::Block`
+  with drawn borders. Adding one changes `composer_height`'s own row
+  accounting, which several existing layout tests pin; doing that safely
+  needs its own reviewable pass rather than folding it into an already
+  large rendering change.
+- **The visual mock (`docs/design/mocks/2026-09-13-native-pane.html`) was
+  not regenerated for this round.** It still shows round 1/2's own look. A
+  faithful three-size, current-vs-proposed redraw matching everything above
+  is real design work in its own right; shipping the CODE unreviewed
+  against a stale mock was judged the lesser risk than either skipping the
+  code or rushing a mock that misrepresents what actually renders. Whoever
+  picks this back up should regenerate the mock from the shipped renderer
+  behaviour (or, better, from a screenshot of the actual pane) rather than
+  hand-drawing it again from the operator's prose brief.
+
 ## What is still deferred
 
 - **Mixing a native pane into the wrapped-harness dashboard.** No
