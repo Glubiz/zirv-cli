@@ -1656,9 +1656,12 @@ struct NativeConversation {
     session: String,
     /// The harness's own conversation id.
     conversation: String,
-    /// Issue #470: which backend recorded this conversation. Every writer
-    /// today is the existing harness-process backend, so this is always
-    /// `RuntimeKind::Harness`. `#[serde(default)]` so a marker written by an
+    /// Issue #470: which backend recorded this conversation. Issue #488 makes
+    /// this genuinely vary -- `record_conversation_on` lets a native session
+    /// record its own journal session id here -- and [`native_conversation`]
+    /// refuses a marker whose runtime does not match the reader's, so a
+    /// return can never resume a harness resume-id as a native conversation
+    /// or the other way round. `#[serde(default)]` so a marker written by an
     /// older build still parses (and, correctly, still answers as
     /// `Harness`, the only runtime that existed when it was written).
     #[serde(default)]
@@ -1684,6 +1687,34 @@ pub fn record_native_conversation(
     session: &str,
     conversation: &str,
 ) {
+    record_conversation_on(
+        state,
+        short,
+        agent,
+        session,
+        conversation,
+        RuntimeKind::Harness,
+    )
+}
+
+/// [`record_native_conversation`], naming the BACKEND the reference belongs
+/// to (issue #488).
+///
+/// A conversation id is opaque and its meaning is the backend's: a coding
+/// harness's own resume id and a native journal session id are not
+/// interchangeable, and [`native_conversation`] already refuses to hand back
+/// a marker whose runtime does not match what the reader asked for.
+/// Recording the runtime honestly is what makes that refusal mean anything
+/// for a session that is not a harness -- and it is what stops a rollover
+/// return resuming the wrong kind of conversation id.
+pub fn record_conversation_on(
+    state: &StateDir,
+    short: &str,
+    agent: &str,
+    session: &str,
+    conversation: &str,
+    runtime: RuntimeKind,
+) {
     if agent.is_empty() || session.is_empty() || conversation.is_empty() {
         return;
     }
@@ -1691,8 +1722,7 @@ pub fn record_native_conversation(
         agent: agent.to_string(),
         session: session.to_string(),
         conversation: conversation.to_string(),
-        // Issue #470: the only backend that can call this today.
-        runtime: RuntimeKind::Harness,
+        runtime,
     };
     let Ok(body) = serde_json::to_string(&record) else {
         return;
