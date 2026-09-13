@@ -2024,12 +2024,42 @@ vocabulary ends with an `unknown` fallback.
 **Methods** (v1 is deliberately narrow): `server.ping`,
 `server.capabilities`, `session.snapshot|list|get`, `session.start|stop`,
 `session.read|send_input`, `session.wait`, `session.report_status`,
-`session.attach|detach|takeover|resize|screen`, `events.subscribe`. Mail,
-memory, work-group, workflow, layout and plugin methods are added only when a
-concrete client needs them. The five attachment methods need a server that
-owns terminals, so they sit behind their own `session.attach` capability: a
-server without one does not advertise it and a client disables that surface
-locally rather than calling it and being refused.
+`session.attach|detach|takeover|resize|screen`,
+`session.interrupt|approve|task_result|history|journal`, `events.subscribe`.
+Mail, memory, work-group, workflow, layout and plugin methods are added only
+when a concrete client needs them. The five attachment methods need a server
+that owns terminals, so they sit behind their own `session.attach` capability;
+the five native methods need one that owns native conversations, so they sit
+behind `session.native`. A server without either does not advertise it, and a
+client disables that surface locally rather than calling it and being refused.
+
+**Native sessions on the protocol.** A native conversation has a journal
+instead of a pseudoterminal, so it reaches the same endpoint through the same
+methods with a different half of the surface. Input is `session.send_input`'s
+ordinary `submit`/`steer` modes — there is no second way to hand a session
+text. `session.interrupt` cancels the turn in flight and leaves the session
+alive (`session.stop` is still the only verb that ends one); `session.approve`
+decides one pending approval; `session.task_result` records a delegated task's
+outcome; `session.history` reads the conversation; `session.journal` pages its
+durable event stream by cursor. `session.screen`, `session.resize` and
+`mode=raw` are refused by name: there is no terminal to act on.
+
+`session.history` is the one method in v1 that publishes conversation text.
+It is capability-gated, seat-checked, and its tool entries carry a tool's name
+and never its arguments or results. Session facts, snapshots, lists and event
+frames still carry none of it.
+
+**Seats and durable retries.** Once any client is attached to a native session,
+every mutation must name a `client_id` holding the controller seat — omitting
+it is refused too, so an observer cannot mutate by leaving the field out. A
+session nobody has attached to is driven by whoever can reach the owner-only
+endpoint, which is the rule a headless `zirv ctx exec` needs. For a native
+session an `idempotency_key` becomes the journal's own message id, so a retry
+after a reconnect — or after the runtime restarted, which loses every in-memory
+cache — is deduplicated on disk and answered with `duplicate: true` and the
+original `message_id`; no second turn is queued. `session.journal` answers
+`gap: true` when a caller's cursor can no longer be continued from, which is
+the durable counterpart of the live revision gap rule.
 
 **Events and gaps.** The server-wide `revision` advances by exactly one per
 emitted event, so a subscriber that sees a revision other than `last + 1` has
@@ -2128,7 +2158,26 @@ A detached session keeps every Zirv guarantee that reads the registry, because
 the runtime files the same registry record a dashboard pane does and holds it
 for the life of the session: usage pacing, budgets, rot scoring, mail
 addressing, writer permits and workflow policy all keep working with nobody
-watching, and the harness's turn signals keep being observed.
+watching, and the harness's turn signals keep being observed. **Mail is
+delivered while nobody is watching too** — the service types it into the
+session on its own heartbeat, through the dashboard's own sweep, instead of
+leaving it queued until a client attaches.
+
+**Native conversations live here too.** The same runtime owns native sessions
+(`runtime = "native"`), publishes them in the same session list and serves them
+over the same endpoint — one service with two hosts, not two daemons. A native
+conversation's durable state is its journal, so a runtime restart brings it
+back by reading it: every tool execution that was merely *started* becomes
+outcome-unknown and is named on startup rather than retried, the generation
+advances to fence out any straggler, and nothing is re-submitted. No process is
+ever described as having survived.
+
+**The dashboard is a client, not a second owner.** With the gate on and a
+runtime listening, `zirv dash` refuses to open a second terminal over a session
+the runtime already holds and points at `zirv session attach`; two supervisors
+on one conversation is what the runtime exists to prevent. With the gate off,
+or with nothing listening, the dashboard owns its own terminals exactly as
+before.
 
 **Identity.** Each namespace publishes a record under `<state>/runtime/` with
 its owner, version, endpoint, creation time and last-client time. Staleness is
@@ -2138,6 +2187,9 @@ free, while a record nothing can verify is left alone rather than seized.
 Every service start mints a fresh instance id, so a crashed runtime's session
 identities can never be republished by its successor.
 
+The native integration — the two hosts, the seat rule, durable idempotency,
+journal cursors and restart reconciliation — is recorded in
+[`docs/design/2026-09-13-native-runtime-integration.md`](docs/design/2026-09-13-native-runtime-integration.md).
 See
 [`docs/design/2026-09-13-persistent-runtime.md`](docs/design/2026-09-13-persistent-runtime.md)
 for the design, the measurements and what is deferred.
