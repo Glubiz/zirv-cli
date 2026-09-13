@@ -397,9 +397,10 @@ pub fn build_overview(
         let approval = approvals
             .iter()
             .find(|request| request.session == record.handle.worker_session);
-        let node = graph.nodes.values().find(|node| {
-            node.delegation.as_deref() == Some(record.handle.delegation.as_str())
-        });
+        let node = graph
+            .nodes
+            .values()
+            .find(|node| node.delegation.as_deref() == Some(record.handle.delegation.as_str()));
         let state = classify_agent_state(record, node, approval.is_some());
         let result = record.result_path.as_ref().map(|path| ResultRef {
             delegation: record.handle.delegation.clone(),
@@ -946,7 +947,11 @@ impl UsageStrip {
         }
         out.push(StyledLine::toned(
             usage,
-            if self.degraded { Tone::Warn } else { Tone::Muted },
+            if self.degraded {
+                Tone::Warn
+            } else {
+                Tone::Muted
+            },
         ));
         out.push(StyledLine::toned(
             format!(
@@ -1009,10 +1014,10 @@ pub enum NoticeKind {
 impl NoticeKind {
     pub fn glyph(self) -> &'static str {
         match self {
-            Self::Compacted => "\u{27f3}",         // ⟳
-            Self::Rollover => "\u{2913}",          // ⤓
-            Self::Reconnected => "\u{21c4}",       // ⇄
-            Self::DeferredDelivery => "\u{2709}",  // ✉
+            Self::Compacted => "\u{27f3}",        // ⟳
+            Self::Rollover => "\u{2913}",         // ⤓
+            Self::Reconnected => "\u{21c4}",      // ⇄
+            Self::DeferredDelivery => "\u{2709}", // ✉
         }
     }
 
@@ -1585,7 +1590,10 @@ impl ApprovalDialog {
                 format!("{} \u{2014} approval needed", self.request.tool),
                 Tone::Emphasis,
             ),
-            StyledLine::toned(format!("  scope  {}", self.request.scope.text()), Tone::Warn),
+            StyledLine::toned(
+                format!("  scope  {}", self.request.scope.text()),
+                Tone::Warn,
+            ),
             StyledLine::toned(format!("  actor  {}", self.request.actor), Tone::Muted),
             StyledLine::toned(format!("  why    {}", self.request.reason), Tone::Muted),
         ];
@@ -1953,10 +1961,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
 ];
 
 pub fn help_lines(focus: Option<Focus>) -> Vec<StyledLine> {
-    let mut out = vec![StyledLine::toned(
-        "shortcuts".to_string(),
-        Tone::Emphasis,
-    )];
+    let mut out = vec![StyledLine::toned("shortcuts".to_string(), Tone::Emphasis)];
     for shortcut in SHORTCUTS {
         if let Some(want) = focus
             && let Some(theirs) = shortcut.focus
@@ -2042,9 +2047,10 @@ pub fn classify_entry(draft: &str) -> EntryMode {
     match draft.chars().next() {
         Some('/') => EntryMode::Slash,
         Some('!') => EntryMode::Shell,
-        _ if draft.rsplit(char::is_whitespace).next().is_some_and(|token| {
-            token.starts_with('@') && token.len() > 1
-        }) =>
+        _ if draft
+            .rsplit(char::is_whitespace)
+            .next()
+            .is_some_and(|token| token.starts_with('@') && token.len() > 1) =>
         {
             EntryMode::File
         }
@@ -2068,7 +2074,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/approve", "focus the pending approval dialog"),
     ("/artifacts", "open the selected worker's bounded evidence"),
     ("/compact", "compact this conversation now"),
-    ("/follow-up", "send a bounded follow-up to the selected worker"),
+    (
+        "/follow-up",
+        "send a bounded follow-up to the selected worker",
+    ),
     ("/help", "show the shortcut list"),
     ("/status", "print the authoritative facts as JSON"),
 ];
@@ -2674,7 +2683,11 @@ mod tests {
             &approvals,
             300,
         );
-        let row = overview.rows.iter().find(|row| row.id == "w1").expect("row");
+        let row = overview
+            .rows
+            .iter()
+            .find(|row| row.id == "w1")
+            .expect("row");
         assert_eq!(row.state, AgentState::ApprovalNeeded);
         assert_eq!(
             row.pending_decision.as_deref(),
@@ -2748,7 +2761,11 @@ mod tests {
             },
         );
         let overview = build_overview(&graph, &[], &[], &[], 300);
-        let row = overview.rows.iter().find(|row| row.id == "task:T9").expect("row");
+        let row = overview
+            .rows
+            .iter()
+            .find(|row| row.id == "task:T9")
+            .expect("row");
         assert_eq!(row.state, AgentState::Queued);
         assert_eq!(row.since_secs, 50);
         assert_eq!(row.model_provenance, Provenance::Unknown);
@@ -2763,13 +2780,7 @@ mod tests {
             reason: "limit".to_string(),
             since: 200,
         };
-        let overview = build_overview(
-            &coordinator::Coordinator::default(),
-            &[],
-            &[seat],
-            &[],
-            300,
-        );
+        let overview = build_overview(&coordinator::Coordinator::default(), &[], &[seat], &[], 300);
         assert_eq!(overview.rows[0].state, AgentState::Draining);
     }
 
@@ -3309,7 +3320,10 @@ mod tests {
 
         let released = deferred.resume(false);
         assert_eq!(
-            released.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            released
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["m1", "a1"]
         );
         assert!(deferred.is_empty());
@@ -3334,14 +3348,8 @@ mod tests {
 
     #[test]
     fn focus_cycles_only_through_visible_regions() {
-        assert_eq!(
-            focus_next(Focus::Composer, false, false),
-            Focus::Transcript
-        );
-        assert_eq!(
-            focus_next(Focus::Transcript, false, false),
-            Focus::Composer
-        );
+        assert_eq!(focus_next(Focus::Composer, false, false), Focus::Transcript);
+        assert_eq!(focus_next(Focus::Transcript, false, false), Focus::Composer);
         assert_eq!(focus_next(Focus::Transcript, true, false), Focus::Overview);
         assert_eq!(focus_next(Focus::Overview, true, true), Focus::Inspection);
         assert_eq!(focus_prev(Focus::Composer, true, true), Focus::Inspection);
@@ -3500,7 +3508,10 @@ mod tests {
 
     #[test]
     fn a_bang_line_yields_a_command_for_the_process_tool_not_an_execution() {
-        assert_eq!(shell_command("!cargo nextest run"), Some("cargo nextest run"));
+        assert_eq!(
+            shell_command("!cargo nextest run"),
+            Some("cargo nextest run")
+        );
         assert_eq!(shell_command("!   "), None);
         assert_eq!(shell_command("cargo build"), None);
     }
@@ -3526,7 +3537,13 @@ mod tests {
         let bounded = bound_lines(lines, 100);
         assert_eq!(bounded.len(), 101);
         assert!(bounded[0].to_plain_string().contains("4900 earlier lines"));
-        assert!(bounded.last().expect("last").to_plain_string().contains("4999"));
+        assert!(
+            bounded
+                .last()
+                .expect("last")
+                .to_plain_string()
+                .contains("4999")
+        );
     }
 
     #[test]
@@ -3536,7 +3553,13 @@ mod tests {
         assert_eq!(plan.polled, budget.max_sessions);
         assert_eq!(plan.deferred, 500 - budget.max_sessions);
         // A small fleet is never deferred at all.
-        assert_eq!(fanout_plan(3, &budget), FanoutPlan { polled: 3, deferred: 0 });
+        assert_eq!(
+            fanout_plan(3, &budget),
+            FanoutPlan {
+                polled: 3,
+                deferred: 0
+            }
+        );
     }
 
     #[test]
@@ -3577,8 +3600,14 @@ mod tests {
         assert_eq!(ux.focus, Focus::Approval);
         // Tab, '?', 'a' -- all normally meaningful -- are swallowed.
         assert_eq!(ux.handle_key(key(KeyCode::Tab), true), UxKey::Consumed);
-        assert_eq!(ux.handle_key(key(KeyCode::Char('?')), true), UxKey::Consumed);
-        assert_eq!(ux.handle_key(key(KeyCode::Char('a')), true), UxKey::Consumed);
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Char('?')), true),
+            UxKey::Consumed
+        );
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Char('a')), true),
+            UxKey::Consumed
+        );
         assert_eq!(ux.focus, Focus::Approval);
         match ux.handle_key(key(KeyCode::Char('1')), true) {
             UxKey::Decided(request, decision) => {
@@ -3695,18 +3724,30 @@ mod tests {
     fn keys_route_by_focus_and_the_composer_keeps_its_printable_characters() {
         let mut ux = UxState::default();
         // Composer focus: 'a' and '?' are text, not commands.
-        assert_eq!(ux.handle_key(key(KeyCode::Char('a')), true), UxKey::Composer);
-        assert_eq!(ux.handle_key(key(KeyCode::Char('?')), true), UxKey::Composer);
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Char('a')), true),
+            UxKey::Composer
+        );
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Char('?')), true),
+            UxKey::Composer
+        );
         assert!(!ux.help);
         // Transcript focus: scrolling keys go to the transcript.
         ux.handle_key(key(KeyCode::Tab), true);
         assert_eq!(ux.focus, Focus::Transcript);
         assert_eq!(ux.handle_key(key(KeyCode::Up), true), UxKey::Transcript);
         // ...and '?' is now the help list.
-        assert_eq!(ux.handle_key(key(KeyCode::Char('?')), true), UxKey::Consumed);
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Char('?')), true),
+            UxKey::Consumed
+        );
         assert!(ux.help);
         // Any key dismisses help again.
-        assert_eq!(ux.handle_key(key(KeyCode::Char('x')), true), UxKey::Consumed);
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Char('x')), true),
+            UxKey::Consumed
+        );
         assert!(!ux.help);
     }
 
@@ -3883,16 +3924,23 @@ mod tests {
         // The facts the overview row renders are all addressable headlessly.
         let agent = &json["agents"][0];
         assert_eq!(agent["state"], "approval-needed");
-        assert!(agent["pending_decision"].as_str().is_some_and(|text| {
-            text.contains("src/journal.rs") && text.contains("/repo/wt")
-        }));
+        assert!(
+            agent["pending_decision"].as_str().is_some_and(|text| {
+                text.contains("src/journal.rs") && text.contains("/repo/wt")
+            })
+        );
         assert_eq!(agent["model_provenance"], "measured");
         assert!(json["usage"]["routes"].as_array().is_some_and(|routes| {
             routes
                 .iter()
                 .any(|route| route["reason"] == "429 cooldown 4m")
         }));
-        assert!(!json["limitations"].as_array().expect("limitations").is_empty());
+        assert!(
+            !json["limitations"]
+                .as_array()
+                .expect("limitations")
+                .is_empty()
+        );
     }
 
     #[test]
