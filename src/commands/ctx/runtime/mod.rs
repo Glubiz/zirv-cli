@@ -31,6 +31,8 @@
 #![allow(dead_code)]
 
 pub mod capabilities;
+pub mod checkpoint;
+pub mod compaction;
 pub mod context;
 pub mod enforcement;
 pub mod fake;
@@ -40,6 +42,8 @@ pub mod journal;
 pub mod mcp;
 pub mod native;
 pub mod protocol;
+#[cfg(test)]
+pub mod testsupport;
 pub mod tools;
 
 use std::path::PathBuf;
