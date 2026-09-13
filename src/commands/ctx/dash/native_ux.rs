@@ -1483,6 +1483,11 @@ pub enum DialogAction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ApprovalDialog {
     pub request: ApprovalRequest,
+    /// Whether this build can actually issue a grant for this request. When
+    /// false the allow options are not offered AT ALL rather than offered and
+    /// then quietly failing -- see [`PendingApproval::grantable`].
+    pub grantable: bool,
+    pub unavailable_reason: Option<String>,
     selected: usize,
 }
 
@@ -1490,6 +1495,17 @@ impl ApprovalDialog {
     pub fn new(request: ApprovalRequest) -> Self {
         Self {
             request,
+            grantable: true,
+            unavailable_reason: None,
+            selected: 0,
+        }
+    }
+
+    pub fn from_pending(pending: PendingApproval) -> Self {
+        Self {
+            request: pending.request,
+            grantable: pending.grantable,
+            unavailable_reason: pending.unavailable_reason,
             selected: 0,
         }
     }
@@ -1503,6 +1519,12 @@ impl ApprovalDialog {
     /// carries a directory to widen to -- an option whose scope cannot be
     /// stated is never shown.
     pub fn options(&self) -> Vec<(ApprovalDecision, String)> {
+        if !self.grantable {
+            return vec![(
+                ApprovalDecision::Deny,
+                "No, and tell the agent what to do differently (esc)".to_string(),
+            )];
+        }
         let mut options = vec![(ApprovalDecision::Allow, "Yes".to_string())];
         if let Some(dir) = &self.request.scope.directory {
             options.push((
@@ -1549,6 +1571,9 @@ impl ApprovalDialog {
         ];
         for line in self.request.preview.iter().take(APPROVAL_PREVIEW_LINES) {
             out.push(StyledLine::toned(format!("  {line}"), Tone::Plain));
+        }
+        if let Some(reason) = &self.unavailable_reason {
+            out.push(StyledLine::toned(format!("  \u{2691} {reason}"), Tone::Err));
         }
         out.push(StyledLine::toned(
             "Do you want to proceed?".to_string(),
@@ -1610,6 +1635,84 @@ pub fn dialog_action(dialog: &mut ApprovalDialog, key: KeyEvent) -> DialogAction
         }
         _ => DialogAction::Ignored,
     }
+}
+
+/// The exact marker `enforcement::BrokerError::ApprovalRequired`/
+/// `ApprovalUnavailable` render through `ToolError`, and therefore the only
+/// thing [`detect_pending_approval`] matches on. A prefix, not a contains:
+/// an ordinary tool result that happens to quote this sentence is not an
+/// approval.
+pub const APPROVAL_REQUIRED_MARKER: &str = "operator approval is required";
+/// The suffix the broker adds when the session's own `ApprovalMode` is
+/// `Headless` -- i.e. when the refusal cannot be approved away at all.
+pub const APPROVAL_HEADLESS_MARKER: &str = "this session is headless";
+
+/// An approval the transcript says is outstanding, and whether this build can
+/// actually grant it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApproval {
+    /// The tool call it belongs to, so answering it once dismisses it for
+    /// good rather than re-raising the same permanent transcript entry on
+    /// every tick.
+    pub tool_call_id: String,
+    pub request: ApprovalRequest,
+    pub grantable: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+/// Finds the newest outstanding approval in a transcript. Reads only what the
+/// journal actually recorded -- the tool name, its argument preview and the
+/// broker's own refusal message -- and never invents a path or a directory
+/// the record did not carry, which is why the scope it builds names the tool
+/// and its arguments rather than a guessed filesystem grant.
+pub fn detect_pending_approval(
+    items: &[super::native_pane::TranscriptItem],
+    session: &str,
+    actor: &str,
+) -> Option<PendingApproval> {
+    use super::native_pane::{ToolOutcomeView, TranscriptItem};
+    for item in items.iter().rev() {
+        let TranscriptItem::ToolCall {
+            tool_call_id,
+            name,
+            arguments_preview,
+            outcome: ToolOutcomeView::Error { message },
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if !message.starts_with(APPROVAL_REQUIRED_MARKER) {
+            continue;
+        }
+        let headless = message.contains(APPROVAL_HEADLESS_MARKER);
+        return Some(PendingApproval {
+            tool_call_id: tool_call_id.clone(),
+            request: ApprovalRequest {
+                id: tool_call_id.clone(),
+                session: session.to_string(),
+                tool: name.clone(),
+                scope: Scope {
+                    verb: "run".to_string(),
+                    paths: Vec::new(),
+                    // No standing grant is offered from a transcript-derived
+                    // request: the record does not carry the resolved paths
+                    // the broker fenced, and an option whose scope cannot be
+                    // stated exactly is never shown.
+                    directory: None,
+                },
+                actor: actor.to_string(),
+                reason: message.clone(),
+                preview: vec![arguments_preview.clone()],
+                asked_at: 0,
+            },
+            grantable: !headless,
+            unavailable_reason: headless.then(|| {
+                "this session's broker runs in headless approval mode, so no grant can be issued from the pane; answer 3 to redirect the agent".to_string()
+            }),
+        });
+    }
+    None
 }
 
 /// Mail or an attention ping that could not be delivered because the target
@@ -1684,7 +1787,6 @@ pub enum Focus {
     Overview,
     Inspection,
     Approval,
-    Help,
 }
 
 impl Focus {
@@ -1695,7 +1797,6 @@ impl Focus {
             Self::Overview => "agents",
             Self::Inspection => "worker",
             Self::Approval => "approval",
-            Self::Help => "help",
         }
     }
 }
@@ -2145,6 +2246,282 @@ pub fn fanout_plan(sessions: usize, budget: &Budget) -> FanoutPlan {
     FanoutPlan {
         polled,
         deferred: sessions - polled,
+    }
+}
+
+// =========================================================================
+// The driver: one state bag, one pure key router
+// =========================================================================
+
+/// Everything the native dashboard owns beyond the conversation itself.
+/// Deliberately free of any handle to a session, a journal or a terminal:
+/// the pane driver refreshes it from records ([`UxState::refresh`]) and
+/// routes keys through it ([`UxState::handle_key`]), and both of those are
+/// pure enough to test without any of the above.
+#[derive(Debug)]
+pub struct UxState {
+    pub overview: Overview,
+    pub usage: UsageStrip,
+    pub notices: NoticeLog,
+    pub approval: Option<ApprovalDialog>,
+    pub inspection: Option<Inspection>,
+    pub deferred: DeferredDelivery,
+    pub focus: Focus,
+    pub help: bool,
+    pub budget: Budget,
+    /// When [`UxState::refresh`] last ran, so the driver can rate-limit the
+    /// record reads without owning a clock of its own.
+    pub refreshed_at: u64,
+    /// Approvals the operator has already answered. A failed tool call stays
+    /// in the transcript forever, so without this the same dialog would
+    /// re-open on every tick after it was answered.
+    answered: std::collections::BTreeSet<String>,
+}
+
+impl Default for UxState {
+    fn default() -> Self {
+        Self {
+            overview: Overview::default(),
+            usage: UsageStrip {
+                measures: Vec::new(),
+                routes: Vec::new(),
+                seats: SeatHealth {
+                    active: 0,
+                    parked: 0,
+                    draining: 0,
+                    billing: style::PLACEHOLDER.to_string(),
+                },
+                degraded: false,
+            },
+            notices: NoticeLog::new(NOTICE_LOG_CAP),
+            approval: None,
+            inspection: None,
+            deferred: DeferredDelivery::default(),
+            focus: Focus::Composer,
+            help: false,
+            budget: Budget::default(),
+            refreshed_at: 0,
+            answered: std::collections::BTreeSet::new(),
+        }
+    }
+}
+
+/// What the driver must do about a key the UX layer saw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UxKey {
+    /// Handled here; the driver does nothing else with it.
+    Consumed,
+    /// Not ours: give it to the composer.
+    Composer,
+    /// Not ours: give it to the transcript (scroll/expand).
+    Transcript,
+    Quit,
+    Interrupt,
+    /// Open the bounded manifest of this delegation.
+    Inspect(String),
+    /// Start a bounded follow-up to this delegation.
+    FollowUp(String),
+    /// The operator answered an approval; deliver it.
+    Decided(Box<ApprovalRequest>, ApprovalDecision),
+}
+
+impl UxState {
+    /// Whether the pane is blocked on the operator. Feeds
+    /// `native_pane::StatusFacts::blocked`, which is what makes a submission
+    /// queue rather than run -- so an open approval and a queued Enter are
+    /// the same fact, read from one place.
+    pub fn blocked(&self) -> bool {
+        self.approval.is_some()
+    }
+
+    /// Re-derives the overview and the usage strip from records, keeping the
+    /// operator's selection on the same AGENT rather than the same row, and
+    /// noting any newly-appeared approval as a notice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refresh(
+        &mut self,
+        graph: &coordinator::Coordinator,
+        records: &[delegation::Record],
+        seats: &[seat::Seat],
+        approvals: &[ApprovalRequest],
+        pool_view: &pool::PoolView,
+        billing: &str,
+        now: u64,
+    ) {
+        let selected = self.overview.selected().map(|row| row.id.clone());
+        self.overview = build_overview(graph, records, seats, approvals, now);
+        if let Some(id) = selected {
+            self.overview.reselect(&id);
+        }
+        self.usage = build_usage(pool_view, billing);
+        self.refreshed_at = now;
+    }
+
+    /// Opens (or replaces) the approval dialog and takes focus. Focus moves
+    /// to the dialog deliberately: an approval the operator cannot see is
+    /// indistinguishable from a hung fleet.
+    pub fn open_approval(&mut self, request: ApprovalRequest) {
+        self.notices.push(Notice {
+            kind: NoticeKind::DeferredDelivery,
+            headline: format!("approval needed: {}", request.scope_text()),
+            detail: vec![request.actor.clone()],
+            at: request.asked_at,
+        });
+        self.approval = Some(ApprovalDialog::new(request));
+        self.focus = Focus::Approval;
+    }
+
+    /// Opens the dialog for a transcript-detected approval, unless the
+    /// operator already answered that exact tool call. Idempotent: calling it
+    /// every tick with the same pending approval opens exactly one dialog.
+    pub fn sync_approval(&mut self, pending: Option<PendingApproval>) {
+        let Some(pending) = pending else {
+            return;
+        };
+        if self.answered.contains(&pending.tool_call_id) {
+            return;
+        }
+        if self
+            .approval
+            .as_ref()
+            .is_some_and(|open| open.request.id == pending.tool_call_id)
+        {
+            return;
+        }
+        self.notices.push(Notice {
+            kind: NoticeKind::DeferredDelivery,
+            headline: format!("approval needed: {}", pending.request.scope_text()),
+            detail: vec![pending.request.actor.clone()],
+            at: pending.request.asked_at,
+        });
+        self.approval = Some(ApprovalDialog::from_pending(pending));
+        self.focus = Focus::Approval;
+    }
+
+    /// Closes the dialog, returns focus to the composer, and releases
+    /// anything deferred while it was open.
+    pub fn close_approval(&mut self) -> Vec<Deferred> {
+        if let Some(dialog) = &self.approval {
+            self.answered.insert(dialog.request.id.clone());
+        }
+        self.approval = None;
+        self.focus = Focus::Composer;
+        let released = self.deferred.resume(false);
+        if let Some(notice) = DeferredDelivery::notice(&released) {
+            self.notices.push(notice);
+        }
+        released
+    }
+
+    /// The one key router. `overview_visible` comes from [`resolve_layout`],
+    /// so the same key means different things at 80 and 200 columns only
+    /// because a different set of regions exists, never because the binding
+    /// changed.
+    pub fn handle_key(&mut self, key: KeyEvent, overview_visible: bool) -> UxKey {
+        // The modal comes first: while a decision is outstanding nothing
+        // else may claim a key, so there is no path from a stray keystroke
+        // to an unnoticed approval.
+        if let Some(dialog) = self.approval.as_mut() {
+            return match dialog_action(dialog, key) {
+                DialogAction::Moved | DialogAction::Ignored => UxKey::Consumed,
+                DialogAction::Decided(decision) => {
+                    let request = dialog.request.clone();
+                    UxKey::Decided(Box::new(request), decision)
+                }
+            };
+        }
+        if self.help {
+            self.help = false;
+            return UxKey::Consumed;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('q')) {
+            return UxKey::Quit;
+        }
+        match key.code {
+            KeyCode::Tab => {
+                self.focus = focus_next(self.focus, overview_visible, self.inspection.is_some());
+                UxKey::Consumed
+            }
+            KeyCode::BackTab => {
+                self.focus = focus_prev(self.focus, overview_visible, self.inspection.is_some());
+                UxKey::Consumed
+            }
+            KeyCode::Esc => {
+                if self.inspection.take().is_some() {
+                    self.focus = Focus::Composer;
+                    UxKey::Consumed
+                } else {
+                    UxKey::Interrupt
+                }
+            }
+            KeyCode::Char('?') if self.focus != Focus::Composer => {
+                self.help = true;
+                UxKey::Consumed
+            }
+            KeyCode::Char('a') if self.focus != Focus::Composer && overview_visible => {
+                self.focus = Focus::Overview;
+                UxKey::Consumed
+            }
+            _ => match self.focus {
+                Focus::Overview => self.overview_key(key),
+                Focus::Inspection => self.inspection_key(key),
+                Focus::Transcript => UxKey::Transcript,
+                _ => UxKey::Composer,
+            },
+        }
+    }
+
+    fn overview_key(&mut self, key: KeyEvent) -> UxKey {
+        match key.code {
+            KeyCode::Up => {
+                self.overview.select_prev();
+                UxKey::Consumed
+            }
+            KeyCode::Down => {
+                self.overview.select_next();
+                UxKey::Consumed
+            }
+            KeyCode::Enter => match self.overview.selected() {
+                Some(row) if row.has_evidence() || row.state != AgentState::Queued => {
+                    UxKey::Inspect(row.id.clone())
+                }
+                _ => UxKey::Consumed,
+            },
+            _ => UxKey::Consumed,
+        }
+    }
+
+    fn inspection_key(&mut self, key: KeyEvent) -> UxKey {
+        match (key.code, self.inspection.as_ref()) {
+            (KeyCode::Char('f'), Some(inspection)) => {
+                UxKey::FollowUp(inspection.follow_up_target().to_string())
+            }
+            _ => UxKey::Consumed,
+        }
+    }
+
+    /// The bounded lines for the side panel at this width, already within
+    /// [`Budget::max_lines`].
+    pub fn panel_lines(&self, width: usize) -> Vec<StyledLine> {
+        let mut lines = Vec::new();
+        if self.help {
+            lines.extend(help_lines(Some(self.focus)));
+            return bound_lines(lines, self.budget.max_lines);
+        }
+        if let Some(inspection) = &self.inspection {
+            lines.extend(inspection.lines(width));
+            return bound_lines(lines, self.budget.max_lines);
+        }
+        let rows = bound_slice(&self.overview.rows, self.budget.max_rows);
+        if rows.elided > 0 {
+            lines.push(StyledLine::toned(
+                format!("\u{2026} {} more agents", rows.elided),
+                Tone::Muted,
+            ));
+        }
+        lines.extend(self.overview.lines(width));
+        bound_lines(lines, self.budget.max_lines)
     }
 }
 
@@ -3165,6 +3542,255 @@ mod tests {
         assert_eq!(bounded.items.len(), budget.max_rows);
         let lines = bound_lines(overview.lines(120), budget.max_lines);
         assert!(lines.len() <= budget.max_lines + 1);
+    }
+
+    // ---------------- the driver ----------------
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    #[test]
+    fn an_open_approval_claims_every_key_before_any_other_region() {
+        let mut ux = UxState::default();
+        ux.open_approval(approval_fixture("sess-w1"));
+        assert!(ux.blocked());
+        assert_eq!(ux.focus, Focus::Approval);
+        // Tab, '?', 'a' -- all normally meaningful -- are swallowed.
+        assert_eq!(ux.handle_key(key(KeyCode::Tab), true), UxKey::Consumed);
+        assert_eq!(ux.handle_key(key(KeyCode::Char('?')), true), UxKey::Consumed);
+        assert_eq!(ux.handle_key(key(KeyCode::Char('a')), true), UxKey::Consumed);
+        assert_eq!(ux.focus, Focus::Approval);
+        match ux.handle_key(key(KeyCode::Char('1')), true) {
+            UxKey::Decided(request, decision) => {
+                assert_eq!(decision, ApprovalDecision::Allow);
+                assert_eq!(request.tool, "Write");
+            }
+            other => panic!("expected a decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_approval_required_tool_failure_becomes_a_pending_approval() {
+        use super::super::native_pane::{ToolOutcomeView, TranscriptItem};
+        let items = vec![
+            TranscriptItem::AssistantText {
+                message_id: "m1".to_string(),
+                text: "writing".to_string(),
+            },
+            TranscriptItem::ToolCall {
+                tool_call_id: "tc-1".to_string(),
+                message_id: "m1".to_string(),
+                name: "write_file".to_string(),
+                arguments_preview: "{\"path\":\"src/journal.rs\"}".to_string(),
+                outcome: ToolOutcomeView::Error {
+                    message: "operator approval is required but this session is headless"
+                        .to_string(),
+                },
+            },
+        ];
+        let pending = detect_pending_approval(&items, "sess-1", "w1 implementer").expect("pending");
+        assert_eq!(pending.tool_call_id, "tc-1");
+        assert!(!pending.grantable);
+        assert!(pending.unavailable_reason.is_some());
+        // Nothing is invented: no directory is offered for a standing grant.
+        assert!(pending.request.scope.directory.is_none());
+
+        let dialog = ApprovalDialog::from_pending(pending);
+        assert_eq!(dialog.options().len(), 1);
+        assert_eq!(dialog.options()[0].0, ApprovalDecision::Deny);
+        let text = dialog
+            .lines(100)
+            .iter()
+            .map(StyledLine::to_plain_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("headless approval mode"));
+    }
+
+    #[test]
+    fn an_ordinary_tool_error_is_never_mistaken_for_an_approval() {
+        use super::super::native_pane::{ToolOutcomeView, TranscriptItem};
+        let items = vec![TranscriptItem::ToolCall {
+            tool_call_id: "tc-1".to_string(),
+            message_id: "m1".to_string(),
+            name: "bash".to_string(),
+            arguments_preview: "{}".to_string(),
+            outcome: ToolOutcomeView::Error {
+                message: "the script printed: operator approval is required".to_string(),
+            },
+        }];
+        assert!(detect_pending_approval(&items, "sess-1", "w1").is_none());
+    }
+
+    #[test]
+    fn an_answered_approval_never_reopens_from_the_same_transcript_entry() {
+        use super::super::native_pane::{ToolOutcomeView, TranscriptItem};
+        let items = vec![TranscriptItem::ToolCall {
+            tool_call_id: "tc-1".to_string(),
+            message_id: "m1".to_string(),
+            name: "write_file".to_string(),
+            arguments_preview: "{}".to_string(),
+            outcome: ToolOutcomeView::Error {
+                message: "operator approval is required".to_string(),
+            },
+        }];
+        let mut ux = UxState::default();
+        ux.sync_approval(detect_pending_approval(&items, "s", "w1"));
+        assert!(ux.blocked());
+        ux.close_approval();
+        // The failed call is still in the transcript, forever.
+        ux.sync_approval(detect_pending_approval(&items, "s", "w1"));
+        ux.sync_approval(detect_pending_approval(&items, "s", "w1"));
+        assert!(!ux.blocked());
+    }
+
+    #[test]
+    fn closing_an_approval_releases_what_was_deferred_while_it_was_open() {
+        let mut ux = UxState::default();
+        ux.open_approval(approval_fixture("sess-w1"));
+        ux.deferred.defer(Deferred {
+            kind: "mail",
+            id: "m1".to_string(),
+            body: "w483 finished".to_string(),
+        });
+        assert!(ux.deferred.resume(ux.blocked()).is_empty());
+        let released = ux.close_approval();
+        assert_eq!(released.len(), 1);
+        assert!(!ux.blocked());
+        assert_eq!(ux.focus, Focus::Composer);
+        assert!(
+            ux.notices
+                .recent(8)
+                .iter()
+                .any(|notice| notice.kind == NoticeKind::DeferredDelivery)
+        );
+    }
+
+    #[test]
+    fn keys_route_by_focus_and_the_composer_keeps_its_printable_characters() {
+        let mut ux = UxState::default();
+        // Composer focus: 'a' and '?' are text, not commands.
+        assert_eq!(ux.handle_key(key(KeyCode::Char('a')), true), UxKey::Composer);
+        assert_eq!(ux.handle_key(key(KeyCode::Char('?')), true), UxKey::Composer);
+        assert!(!ux.help);
+        // Transcript focus: scrolling keys go to the transcript.
+        ux.handle_key(key(KeyCode::Tab), true);
+        assert_eq!(ux.focus, Focus::Transcript);
+        assert_eq!(ux.handle_key(key(KeyCode::Up), true), UxKey::Transcript);
+        // ...and '?' is now the help list.
+        assert_eq!(ux.handle_key(key(KeyCode::Char('?')), true), UxKey::Consumed);
+        assert!(ux.help);
+        // Any key dismisses help again.
+        assert_eq!(ux.handle_key(key(KeyCode::Char('x')), true), UxKey::Consumed);
+        assert!(!ux.help);
+    }
+
+    #[test]
+    fn the_overview_is_navigable_and_enter_inspects_the_selected_agent() {
+        let mut ux = UxState::default();
+        ux.refresh(
+            &coordinator::Coordinator::default(),
+            &[
+                delegation_fixture("aa", delegation::Phase::Running),
+                delegation_fixture("bb", delegation::Phase::Running),
+            ],
+            &[],
+            &[],
+            &pool_fixture(),
+            "api",
+            300,
+        );
+        ux.focus = Focus::Overview;
+        assert_eq!(ux.handle_key(key(KeyCode::Down), true), UxKey::Consumed);
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Enter), true),
+            UxKey::Inspect("bb".to_string())
+        );
+    }
+
+    #[test]
+    fn esc_closes_an_inspection_before_it_ever_interrupts_the_turn() {
+        let mut ux = UxState::default();
+        let record = delegation_fixture("w1", delegation::Phase::Completed);
+        ux.inspection = Some(build_inspection(
+            &record,
+            &manifest_fixture(Some("done".to_string())),
+            AgentState::Done,
+        ));
+        assert_eq!(ux.handle_key(key(KeyCode::Esc), true), UxKey::Consumed);
+        assert!(ux.inspection.is_none());
+        // With nothing to close, esc is the interrupt.
+        assert_eq!(ux.handle_key(key(KeyCode::Esc), true), UxKey::Interrupt);
+    }
+
+    #[test]
+    fn a_follow_up_addresses_the_worker_not_the_pane() {
+        let mut ux = UxState::default();
+        let record = delegation_fixture("w1", delegation::Phase::Completed);
+        ux.inspection = Some(build_inspection(
+            &record,
+            &manifest_fixture(Some("done".to_string())),
+            AgentState::Done,
+        ));
+        ux.focus = Focus::Inspection;
+        assert_eq!(
+            ux.handle_key(key(KeyCode::Char('f')), true),
+            UxKey::FollowUp("w1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_agent() {
+        let mut ux = UxState::default();
+        let pool = pool_fixture();
+        ux.refresh(
+            &coordinator::Coordinator::default(),
+            &[
+                delegation_fixture("bb", delegation::Phase::Running),
+                delegation_fixture("cc", delegation::Phase::Running),
+            ],
+            &[],
+            &[],
+            &pool,
+            "api",
+            300,
+        );
+        ux.overview.select_next();
+        assert_eq!(ux.overview.selected().expect("row").id, "cc");
+        ux.refresh(
+            &coordinator::Coordinator::default(),
+            &[
+                delegation_fixture("aa", delegation::Phase::Running),
+                delegation_fixture("bb", delegation::Phase::Running),
+                delegation_fixture("cc", delegation::Phase::Running),
+            ],
+            &[],
+            &[],
+            &pool,
+            "api",
+            360,
+        );
+        assert_eq!(ux.overview.selected().expect("row").id, "cc");
+        assert_eq!(ux.refreshed_at, 360);
+    }
+
+    #[test]
+    fn the_side_panel_stays_within_its_line_budget_with_thousands_of_agents() {
+        let mut ux = UxState::default();
+        let records: Vec<delegation::Record> = (0..3_000)
+            .map(|i| delegation_fixture(&format!("w{i:04}"), delegation::Phase::Running))
+            .collect();
+        ux.refresh(
+            &coordinator::Coordinator::default(),
+            &records,
+            &[],
+            &[],
+            &pool_fixture(),
+            "api",
+            300,
+        );
+        assert!(ux.panel_lines(120).len() <= ux.budget.max_lines + 1);
     }
 
     // ---------------- item 5/6: the broker bridge and headless parity ----
