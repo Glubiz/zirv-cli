@@ -1761,7 +1761,7 @@ pub(crate) fn root_envelope(cfg: &CtxConfig) -> envelope::WorkerEnvelope {
 /// treated as unbounded by omission. A PRESENT but malformed value is
 /// refused outright rather than treated as absent: a corrupted envelope
 /// must never silently upgrade a bounded child into an unbounded root.
-fn resolve_parent_envelope(
+pub(crate) fn resolve_parent_envelope(
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
 ) -> Result<envelope::WorkerEnvelope, String> {

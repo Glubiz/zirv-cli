@@ -2666,7 +2666,6 @@ pub fn route_provider(
     role: &str,
     env: EnvLookup<'_>,
 ) -> CtxResult<(super::super::provider::RouteId, String)> {
-    use super::super::provider::RouteId;
     use super::super::provider::config::NativeConfig;
 
     let home = crate::utils::home_dir()?;
@@ -3698,7 +3697,7 @@ fn build_transport(
     use super::super::provider::openai::OpenAiResponsesAdapter;
     use super::super::provider::openai_chat::OpenAiChatAdapter;
     use super::super::provider::transport::StreamTimeouts;
-    use super::super::provider::{Protocol, RouteId, adapter::resolve_target};
+    use super::super::provider::{Protocol, adapter::resolve_target};
     use super::super::state::now_secs;
     use super::fixture::{
         FixtureProvider, FixtureScript, FixtureToolExecutor, FixtureToolScript, fixture_target,

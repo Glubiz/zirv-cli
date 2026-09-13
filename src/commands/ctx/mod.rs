@@ -20,6 +20,9 @@ pub mod context;
 pub mod context_cli;
 pub mod context_lint;
 pub mod context_status;
+/// Issue #485 (roadmap N16): the native coordinator's durable task graph and
+/// the one place a delegation's identity-decidable bounds are judged.
+pub mod coordinator;
 pub mod dash;
 pub mod delegation;
 pub mod diagnostics;
