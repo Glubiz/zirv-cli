@@ -1,0 +1,17 @@
+{
+  "shape": "anthropic",
+  "model": "fixture-anthropic-model",
+  "turns": [
+    {
+      "message_id": "msg_helper_answer",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "## Task\nDistil the session so the successor can continue.\n\n## Next step\nRun the touched module's tests."
+        }
+      ],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 64, "output_tokens": 24 }
+    }
+  ]
+}

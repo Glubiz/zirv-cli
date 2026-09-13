@@ -34,6 +34,7 @@ pub mod handoff;
 pub mod handover;
 pub mod health;
 pub mod health_store;
+pub mod helper;
 pub mod hook;
 pub(crate) mod hook_integrity;
 pub(crate) mod hook_project;
