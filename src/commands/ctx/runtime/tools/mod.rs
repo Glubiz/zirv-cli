@@ -7,8 +7,8 @@
 //! existing output store and return opaque retrieval ids. Every invocation
 //! returns a bounded receipt with an explicit retry/reconciliation contract.
 
-pub mod delegation;
 mod capability;
+pub mod delegation;
 mod files;
 mod process;
 
@@ -19,14 +19,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use self::delegation::{
-    CLOSE, DELEGATE, DelegateArgs, FOLLOW_UP, HandleArgs, INTERRUPT, MessageArgs, RESULT,
-    ResultArgs, SEND, WAIT, WaitArgs,
-};
 use self::capability::{
     ArtifactPresentArgs, ArtifactRegisterArgs, BrowserCaptureArgs, BrowserInspectArgs, EmptyArgs,
     FrontendReviewArgs, MCP_PREFIX, McpCallArgs, McpDescribeArgs, McpListArgs, WebFetchArgs,
     WebSearchArgs,
+};
+use self::delegation::{
+    CLOSE, DELEGATE, DelegateArgs, FOLLOW_UP, HandleArgs, INTERRUPT, MessageArgs, RESULT,
+    ResultArgs, SEND, WAIT, WaitArgs,
 };
 use self::files::{
     ApplyPatchArgs, DirectoryArgs, FileOutcome, GlobArgs, ReadFileArgs, SearchArgs, WriteFileArgs,
