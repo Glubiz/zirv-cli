@@ -1504,7 +1504,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Initializes, inventories, validates, or stores credentials for opt-in native provider routes |
-| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat |
+| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--runtime native` opens a structured native conversation pane instead (no coding harness, no PTY) — see [The native conversation pane](#the-native-conversation-pane) |
 | `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` delegates to a native worker instead, with the same task/ownership/receipt contracts (also `zirv agent`) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
@@ -1708,7 +1708,12 @@ score and nothing to restart. The command prints one structured JSON final
 status (`schema_version`, `status`, the actual route/provider/endpoint/account,
 the configured **and** served model, turn/request/tool counts, usage, evidence,
 and any incomplete or outcome-unknown tools) and exits on the same supervisor
-exit codes.
+exit codes. `--view json|plain` (default `json`, contract unchanged) — `plain`
+additionally renders the finished session's transcript, after that same JSON
+status, through the dashboard native pane's own non-ratatui renderer (issue
+#480): streaming text/markdown, tool calls, diffs, test outcomes, artifact
+links and errors, readable in a piped log or a terminal too small for the
+dashboard, with no `ratatui` required.
 
 `--resume <session>` does the three things a continuation owes before it may
 run, in this order: it reads the stored session (a session this journal has
@@ -1756,6 +1761,47 @@ provider/tool scripts under `tests/fixtures/runtime/native/` prove loop
 correctness for both primary provider shapes without a paid call. The contract
 is in
 [`docs/design/2026-09-13-native-agent-loop.md`](docs/design/2026-09-13-native-agent-loop.md).
+
+#### The native conversation pane
+
+`zirv chat --runtime native` opens a structured native conversation instead
+of a wrapped-harness session: a dedicated `ratatui` dashboard pane (no PTY,
+no `vt100` — the pane renders the journal's own structured events directly)
+driving an in-process, multi-turn native session on a background thread:
+
+```
+zirv chat --runtime native
+zirv chat --runtime native --route work-sonnet
+```
+
+`--runtime native` refuses every wrapped-harness-only flag (`--agent`,
+`--simple`, `--resume`, `--pin-harness`, a trailing `extra` argv) rather than
+silently ignoring them, and refuses without an interactive terminal on both
+stdin and stdout. The pane's status line shows the actual model, route,
+runtime and billing class, and one of seven states: generating, executing,
+waiting, blocked, cancelled, failed, or completed with an unread result.
+
+**Composer key contract:** `Enter` submits (or, mid-turn, steers — written
+straight to the journal and picked up at the next turn boundary, the same
+mechanism `NativeLoop::queued_input` already re-polls between turns; a
+blocked/not-yet-ready submission is queued instead, and queued input is
+**never** treated as an approval answer). `Shift+Enter`/`Alt+Enter` insert a
+newline. `Up`/`Down` browse submit history only at the first/last line of the
+draft. `Tab` swaps focus between the composer and the transcript, where
+`Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` scroll (scrolling up disengages
+auto-follow; it re-engages at the bottom) and `e`/`Enter` expands or collapses
+the most recent tool call. `Ctrl+C` interrupts the current turn without
+quitting; `Ctrl+Q` persists the draft and quits.
+
+This is a separate, single-pane dashboard mode from the wrapped-harness
+dashboard `zirv chat` opens without `--runtime native` — it does not (yet)
+mix a native pane into that dashboard's own multi-pane `Vec<Pane>`, so mail
+sweep, budget accounting, attention projection and the restore roster are
+unaffected by this flag. The view model (the reducer from the journal to a
+transcript, the composer, the renderers) is `dash::native_pane`, covered by
+deterministic tests with no terminal required; see
+[`docs/design/2026-09-13-native-pane.md`](docs/design/2026-09-13-native-pane.md)
+for the design and exactly what mixed-pane integration is still owed.
 
 #### Native workers, shared ownership and delegation receipts
 
