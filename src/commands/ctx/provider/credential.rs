@@ -287,7 +287,9 @@ fn is_harness_login_path(path: &Path) -> bool {
             && components[components.len() - 2].eq_ignore_ascii_case(directory)
             && components[components.len() - 1].eq_ignore_ascii_case(file)
     };
-    ends_with(".claude", ".credentials.json") || ends_with(".codex", "auth.json")
+    ends_with(".claude", ".credentials.json")
+        || ends_with(".codex", "auth.json")
+        || ends_with(".gemini", "oauth_creds.json")
 }
 
 fn read_secret_file(path: &Path) -> Result<String, String> {
@@ -689,6 +691,7 @@ mod tests {
             "store:Claude Code-credentials",
             "file:/tmp/.claude/.credentials.json",
             "file:/tmp/.codex/auth.json",
+            "file:/tmp/.gemini/oauth_creds.json",
         ];
         for raw in refs {
             let reference: CredentialRef = raw.parse().unwrap();
