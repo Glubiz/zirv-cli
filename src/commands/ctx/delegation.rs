@@ -235,6 +235,33 @@ fn validate_id(delegation: &str) -> CtxResult<()> {
     Ok(())
 }
 
+fn lock_path(state: &StateDir, repo: &Path, delegation: &str) -> PathBuf {
+    dir(state, repo).join(format!("{delegation}.lock"))
+}
+
+/// One advisory OS lock per delegation record, mirroring `group::lock_group`
+/// exactly (same `open_lock_file`, same per-record granularity, same "leave
+/// the file behind on drop" reasoning). Every read-modify-write below
+/// acquires this BEFORE its own [`load`] and holds it through the matching
+/// [`save`], so two concurrent mutators of the SAME record (`publish_
+/// terminal` racing `interrupt`, or two sweeps) can never lose one's update
+/// to the other's stale-read overwrite -- `task.rs`'s `lock_tasks` gives its
+/// own event log the identical guarantee.
+struct DelegationLock(std::fs::File);
+
+impl Drop for DelegationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_delegation(state: &StateDir, repo: &Path, delegation: &str) -> CtxResult<DelegationLock> {
+    create_private_dir_all(&dir(state, repo))?;
+    let file = super::group::open_lock_file(&lock_path(state, repo, delegation))?;
+    file.lock()?;
+    Ok(DelegationLock(file))
+}
+
 /// Writes `record` to disk. Mirrors `group::create`'s private-dir-then-
 /// atomic-write shape exactly.
 pub fn save(state: &StateDir, repo: &Path, record: &Record) -> CtxResult<()> {
@@ -336,6 +363,7 @@ pub fn record_ownership(
     write_claim: Option<PathBuf>,
     now: u64,
 ) -> CtxResult<()> {
+    let _lock = lock_delegation(state, repo, delegation)?;
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
@@ -383,6 +411,7 @@ pub fn publish_terminal(
     result_path: Option<PathBuf>,
     now: u64,
 ) -> CtxResult<Publication> {
+    let _lock = lock_delegation(state, repo, delegation)?;
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
@@ -419,10 +448,18 @@ pub fn publish_terminal(
         });
     }
 
+    // Only a SUCCESSFUL mail earns the identity a place in `published`: the
+    // `Publication` doc above promises a failed mail is retryable, and the
+    // only thing that makes it retryable is this exact identity staying
+    // absent from `published` so a later call (the `drain_all` sweep, or a
+    // caller retrying after a crash) takes the branch above unchanged and
+    // tries `notify_parent` again rather than treating it as already sent.
     let mailed = notify_parent(state, repo, cfg, &record, &identity).is_ok();
-    record.published.push(identity.clone());
-    record.updated_at = now;
-    save(state, repo, &record)?;
+    if mailed {
+        record.published.push(identity.clone());
+        record.updated_at = now;
+        save(state, repo, &record)?;
+    }
     Ok(Publication {
         identity,
         published: true,
@@ -481,6 +518,7 @@ pub fn consume_delivery(
     delegation: &str,
     identity: &str,
 ) -> CtxResult<bool> {
+    let _lock = lock_delegation(state, repo, delegation)?;
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
@@ -519,6 +557,7 @@ pub fn send(
     body: &str,
     now: u64,
 ) -> CtxResult<Dispatch> {
+    let _lock = lock_delegation(state, repo, delegation)?;
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
@@ -575,6 +614,7 @@ pub fn drain_queued(
     delegation: &str,
     now: u64,
 ) -> CtxResult<Vec<Dispatch>> {
+    let _lock = lock_delegation(state, repo, delegation)?;
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
@@ -782,7 +822,12 @@ pub fn follow_up(
     body: &str,
     now: u64,
 ) -> CtxResult<Continuation> {
-    let Some(mut record) = load(state, repo, delegation) else {
+    // An unlocked peek: this function only ever MUTATES the record under
+    // `lock_delegation` (the Resume branch, below), and never while `send`
+    // (which takes its own lock) is also running -- taking the lock here
+    // too, before delegating to `send`, would self-deadlock on the same
+    // non-reentrant file lock.
+    let Some(record) = load(state, repo, delegation) else {
         return Err(format!(
             "no delegation {delegation:?} in this repository; a follow-up is addressed to the \
              delegation it continues, never to whichever session ran most recently"
@@ -794,6 +839,10 @@ pub fn follow_up(
         return Ok(Continuation::Directed { dispatch });
     }
     if record.handle.runtime == RuntimeKind::Native && record.phase != Phase::Closed {
+        let _lock = lock_delegation(state, repo, delegation)?;
+        let Some(mut record) = load(state, repo, delegation) else {
+            return Err(format!("no delegation {delegation:?} in this repository").into());
+        };
         let journal_session = record.handle.worker_session.clone();
         let attempt = record.handle.attempt.saturating_add(1);
         record.handle.attempt = attempt;
@@ -836,8 +885,9 @@ pub fn follow_up(
 /// Requests cancellation. Marks the record, but never claims an already-
 /// started effect was undone: an in-flight tool that cannot be cancelled
 /// stays an unknown outcome (issue #478's own contract), which is why this
-/// only ADDS to `unknown_tool_outcomes` and never clears it.
+/// never clears `unknown_tool_outcomes`.
 pub fn interrupt(state: &StateDir, repo: &Path, delegation: &str, now: u64) -> CtxResult<Record> {
+    let _lock = lock_delegation(state, repo, delegation)?;
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
@@ -862,6 +912,7 @@ pub fn interrupt(state: &StateDir, repo: &Path, delegation: &str, now: u64) -> C
 /// though its outcome was never delivered, or as though an effect whose
 /// result nobody knows definitely did not happen.
 pub fn close(state: &StateDir, repo: &Path, delegation: &str, now: u64) -> CtxResult<Record> {
+    let _lock = lock_delegation(state, repo, delegation)?;
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
@@ -891,23 +942,44 @@ pub fn delivery_of(body: &str) -> Option<String> {
         .filter(|identity| !identity.is_empty())
 }
 
-/// Whether `identity` names a delegation outcome this repository has ALREADY
-/// consumed -- i.e. whether the message carrying it is a duplicate transport
-/// delivery of something the consumer has already acted on.
+/// A read-only PEEK at whether `identity` names a delegation outcome this
+/// repository has ALREADY consumed -- never mutates anything, unlike
+/// [`consume_delivery`]/[`mark_delivery_consumed`].
+///
+/// `mail.rs`'s inbox rendering uses this to drop a message whose delivery was
+/// consumed in an EARLIER call, while deliberately NOT consuming anything
+/// itself: consuming every candidate up front, before the byte-cap decides
+/// which of them are actually rendered, used to mark a message the cap only
+/// DEFERRED to `more_unread` as consumed anyway -- so the next call dropped
+/// it as a false duplicate, having never actually shown it (review finding
+/// on issue #479's inbox rendering).
 ///
 /// Fails open on purpose: an identity that names no delegation record here
 /// (an outcome from another repository, a hand-written line, a record swept
-/// away) is reported as new. Hiding a message nobody can account for would
-/// turn a bookkeeping gap into lost mail, which is the failure this whole
-/// mechanism exists to prevent.
-pub fn is_duplicate_delivery(state: &StateDir, repo: &Path, identity: &str) -> bool {
+/// away) is reported as not-yet-consumed. Hiding a message nobody can
+/// account for would turn a bookkeeping gap into lost mail, which is the
+/// failure this whole mechanism exists to prevent.
+pub fn is_delivery_consumed(state: &StateDir, repo: &Path, identity: &str) -> bool {
     let Some(delegation) = identity.split(':').next() else {
         return false;
     };
-    match consume_delivery(state, repo, delegation, identity) {
-        Ok(first_time) => !first_time,
-        Err(_) => false,
-    }
+    let Some(record) = load(state, repo, delegation) else {
+        return false;
+    };
+    record.consumed.iter().any(|seen| seen == identity)
+}
+
+/// The durable half of the split [`is_delivery_consumed`] started: marks
+/// `identity` consumed for a message that has actually been rendered to a
+/// caller. Never call this for a message the byte-cap deferred to
+/// `more_unread` -- only for one this call is actually handing over, or the
+/// NEXT call will wrongly drop it as a duplicate. Best-effort: a bookkeeping
+/// failure here must never fail the read that already succeeded.
+pub fn mark_delivery_consumed(state: &StateDir, repo: &Path, identity: &str) {
+    let Some(delegation) = identity.split(':').next() else {
+        return;
+    };
+    let _ = consume_delivery(state, repo, delegation, identity);
 }
 
 /// Retries every delegation's deferred messages at THIS boundary, and reports
@@ -915,17 +987,41 @@ pub fn is_duplicate_delivery(state: &StateDir, repo: &Path, identity: &str) -> b
 /// checkpoint (`zirv ctx inbox`), which is by construction a moment no
 /// approval dialog is open on the caller -- the #468 rule, applied per
 /// worker rather than per pane.
+///
+/// Also the retry path [`publish_terminal`]'s own doc comment promises: a
+/// terminal record whose current delivery identity is still absent from
+/// `published` had its mail fail (or never ran at all), and `publish_
+/// terminal` is idempotent by construction -- calling it again with the
+/// record's own already-durable terminal facts changes nothing but the
+/// delivery outcome, so a transport failure is retried here and, once it
+/// succeeds, delivered exactly once (review finding on issue #479's
+/// `publish_terminal`).
 pub fn drain_all(state: &StateDir, repo: &Path, cfg: &CtxConfig, now: u64) -> usize {
     let mut delivered = 0;
     for record in list(state, repo) {
-        if record.queued.is_empty() {
-            continue;
-        }
-        if let Ok(dispatches) = drain_queued(state, repo, cfg, &record.handle.delegation, now) {
+        if !record.queued.is_empty()
+            && let Ok(dispatches) = drain_queued(state, repo, cfg, &record.handle.delegation, now)
+        {
             delivered += dispatches
                 .iter()
                 .filter(|dispatch| matches!(dispatch, Dispatch::Delivered { .. }))
                 .count();
+        }
+        if record.phase.is_terminal() && !record.published.contains(&record.identity()) {
+            let retried = publish_terminal(
+                state,
+                repo,
+                cfg,
+                &record.handle.delegation,
+                record.phase,
+                record.exit_code,
+                record.summary.clone(),
+                record.result_path.clone(),
+                now,
+            );
+            if matches!(retried, Ok(publication) if publication.mailed) {
+                delivered += 1;
+            }
         }
     }
     delivered
@@ -1621,5 +1717,169 @@ mod tests {
                 "{bad:?} must be refused"
             );
         }
+    }
+
+    /// Review finding on `publish_terminal` (~422-425): the identity used to
+    /// be pushed into `record.published` even when `notify_parent` returned
+    /// `Err`, which broke the `Publication::mailed` doc's own promise that "a
+    /// later sweep can retry it" -- nothing ever retried, because the
+    /// identity already looked published. Blocks the parent's mailbox with a
+    /// plain file (so `create_private_dir_all` fails deterministically),
+    /// publishes, confirms the failure left the identity retryable, unblocks
+    /// the mailbox, and drives `drain_all` -- the same sweep `mail.rs`'s
+    /// inbox rendering already calls on every checkpoint -- to prove the
+    /// outcome is delivered exactly once.
+    #[test]
+    fn a_mail_transport_that_fails_once_then_succeeds_delivers_the_outcome_exactly_once() {
+        let (_dir, state, repo, cfg) = fixture();
+        record_launch(
+            &state,
+            &repo,
+            handle("delege", RuntimeKind::Native),
+            Some("parent".to_string()),
+            1,
+        )
+        .expect("launch");
+
+        let slug = repo_slug(&repo);
+        std::fs::create_dir_all(state.mail()).expect("mail root");
+        let mailbox = state.mail().join(&slug);
+        std::fs::write(&mailbox, b"blocker").expect("block the mailbox with a plain file");
+
+        let first = publish_terminal(
+            &state,
+            &repo,
+            &cfg,
+            "delege",
+            Phase::Completed,
+            Some(0),
+            Some("done".to_string()),
+            None,
+            2,
+        )
+        .expect("the terminal outcome is durable even when mail fails");
+        assert!(first.published);
+        assert!(!first.mailed, "the transport failure must be visible");
+        let record = load(&state, &repo, "delege").expect("record");
+        assert!(
+            record.published.is_empty(),
+            "a failed mail must NOT be marked published, or the sweep below has nothing to \
+             retry"
+        );
+
+        std::fs::remove_file(&mailbox).expect("unblock the mailbox");
+        let delivered = drain_all(&state, &repo, &cfg, 3);
+        assert_eq!(delivered, 1, "the sweep must retry the failed publication");
+
+        let record = load(&state, &repo, "delege").expect("record");
+        assert_eq!(record.published, vec![first.identity.clone()]);
+
+        let messages: Vec<_> = std::fs::read_dir(&mailbox)
+            .expect("mailbox dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .collect();
+        assert_eq!(messages.len(), 1, "exactly one delivery, never a duplicate");
+
+        assert_eq!(
+            drain_all(&state, &repo, &cfg, 4),
+            0,
+            "a second sweep must not re-deliver an outcome already published"
+        );
+    }
+
+    /// Review finding on `save`/`load` (~240-254): plain file I/O with no
+    /// lock, unlike `task.rs`'s `lock_tasks`/`with_task_lock`, so two
+    /// concurrent mutators of the SAME record could lose one's update to the
+    /// other's stale-read overwrite. Mirrors `group.rs`'s own `group_
+    /// mutations_wait_for_the_same_interprocess_lock` test: holds the
+    /// delegation lock externally, confirms BOTH of two independent mutators
+    /// (`interrupt` and `record_ownership`, which touch disjoint fields) wait
+    /// rather than racing ahead, releases it, and asserts both of their
+    /// changes survived -- neither was clobbered by the other's write.
+    #[test]
+    fn two_concurrent_mutators_of_the_same_delegation_record_both_persist() {
+        let (_dir, state, repo, _cfg) = fixture();
+        record_launch(
+            &state,
+            &repo,
+            handle("delege", RuntimeKind::Native),
+            None,
+            1,
+        )
+        .expect("launch");
+
+        let held = lock_delegation(&state, &repo, "delege").expect("hold delegation lock");
+
+        let (start_a_tx, start_a_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_a_tx, done_a_rx) = std::sync::mpsc::sync_channel(0);
+        let state_a = state.clone();
+        let repo_a = repo.clone();
+        let worker_a = std::thread::spawn(move || {
+            start_a_tx.send(()).expect("announce a started");
+            let result = interrupt(&state_a, &repo_a, "delege", 5).map(|_| ());
+            done_a_tx
+                .send(result.map_err(|e| e.to_string()))
+                .expect("announce a done");
+        });
+
+        let (start_b_tx, start_b_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_b_tx, done_b_rx) = std::sync::mpsc::sync_channel(0);
+        let state_b = state.clone();
+        let repo_b = repo.clone();
+        let worker_b = std::thread::spawn(move || {
+            start_b_tx.send(()).expect("announce b started");
+            let result = record_ownership(
+                &state_b,
+                &repo_b,
+                "delege",
+                Some(("anthropic".to_string(), "res-1".to_string())),
+                Some(repo_b.clone()),
+                6,
+            );
+            done_b_tx
+                .send(result.map_err(|e| e.to_string()))
+                .expect("announce b done");
+        });
+
+        start_a_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a started");
+        start_b_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("b started");
+        assert!(
+            done_a_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+                && done_b_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+            "both mutators must wait while another holder owns the delegation lock"
+        );
+
+        drop(held);
+        done_a_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a finished")
+            .expect("a succeeded");
+        done_b_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("b finished")
+            .expect("b succeeded");
+        worker_a.join().expect("a joins");
+        worker_b.join().expect("b joins");
+
+        let record = load(&state, &repo, "delege").expect("record");
+        assert!(
+            record.cancel_requested,
+            "interrupt's own change must have persisted"
+        );
+        assert_eq!(
+            record.reservation,
+            Some(("anthropic".to_string(), "res-1".to_string())),
+            "record_ownership's own change must have persisted too -- neither mutator's write \
+             may be lost to the other's stale-read overwrite"
+        );
     }
 }
