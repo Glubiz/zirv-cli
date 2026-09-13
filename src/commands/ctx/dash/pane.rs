@@ -5855,8 +5855,9 @@ pub(crate) mod tests {
         pane.shutdown("")
             .expect("first shutdown releases the guard");
         assert!(!pane.holds_writer_permit());
-        let _successor = super::super::super::permit::acquire_writer(&state, 1, "successor", &repo, None)
-            .expect("shutdown releases the permit before the pane is dropped");
+        let _successor =
+            super::super::super::permit::acquire_writer(&state, 1, "successor", &repo, None)
+                .expect("shutdown releases the permit before the pane is dropped");
         let short = pane.short().to_string();
         let record_path = state.sessions().join(format!("{short}.json"));
         assert!(

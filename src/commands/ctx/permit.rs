@@ -1394,7 +1394,8 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let _held = acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
+        let _held =
+            acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
         let err = acquire_writer(&state, 2, "worker-b", &tree, None)
             .expect_err("a second writer in the same tree must be refused");
         assert_eq!(
@@ -1666,7 +1667,8 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let _first = acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
+        let _first =
+            acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
         let err = acquire_writer(&state, 2, "worker-b", &tree, None)
             .expect_err("a second writer for the same tree must be refused");
         assert_eq!(
@@ -1703,7 +1705,8 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let first = acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
+        let first =
+            acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
         assert!(acquire_writer(&state, 2, "worker-b", &tree, None).is_err());
 
         drop(first);
