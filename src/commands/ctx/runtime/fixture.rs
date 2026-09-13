@@ -45,10 +45,10 @@ fn fixture_error(message: impl Into<String>) -> ToolError {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixtureTurn {
-    /// `anthropic` or `openai`: selects which protocol's streaming shape is
-    /// emitted into the sink. The committed response is identical either way
-    /// -- that is the point of the provider-neutral contract -- but the event
-    /// sequence a consumer observes is not.
+    /// `anthropic`, `openai`, or `google`: selects which protocol's
+    /// streaming shape is emitted into the sink. The committed response is
+    /// identical either way -- that is the point of the provider-neutral
+    /// contract -- but the event sequence a consumer observes is not.
     #[serde(default = "default_shape")]
     pub shape: String,
     #[serde(default)]
@@ -193,6 +193,7 @@ pub fn fixture_target(protocol: Protocol, model: &str) -> ProviderTarget {
         route: RouteId::new("fixture").expect("static slug"),
         provider: ProviderId::new(match protocol {
             Protocol::AnthropicMessages => "anthropic",
+            Protocol::GoogleGenerativeAi | Protocol::GoogleVertex => "google",
             _ => "openai",
         })
         .expect("static slug"),
@@ -596,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_protocol_shapes_stream_differently_but_commit_the_same_response() {
+    fn the_three_protocol_shapes_stream_differently_but_commit_the_same_response() {
         let body =
             r#"{"blocks":[{"type":"text","text":"hello","deltas":2}],"finish_reason":"end_turn"}"#;
         let anthropic = FixtureScript::from_json(&format!(
@@ -609,6 +610,11 @@ mod tests {
             &body[1..]
         ))
         .expect("openai script");
+        let google = FixtureScript::from_json(&format!(
+            r#"{{"shape":"google","turns":[{{"shape":"google",{}]}}"#,
+            &body[1..]
+        ))
+        .expect("google script");
 
         let mut anthropic_events = Vec::new();
         let anthropic_response =
@@ -622,9 +628,17 @@ mod tests {
                 .stream(&empty_request(), &NeverCancelled, &mut openai_events)
                 .expect("openai response");
 
+        let mut google_events = Vec::new();
+        let google_response =
+            FixtureProvider::new(fixture_target(Protocol::GoogleGenerativeAi, "m"), google)
+                .stream(&empty_request(), &NeverCancelled, &mut google_events)
+                .expect("google response");
+
         assert_eq!(anthropic_response.content, openai_response.content);
+        assert_eq!(anthropic_response.content, google_response.content);
         assert!(anthropic_events.contains(&ProviderStreamEvent::Ping));
         assert!(!openai_events.contains(&ProviderStreamEvent::Ping));
+        assert!(!google_events.contains(&ProviderStreamEvent::Ping));
     }
 
     #[test]
