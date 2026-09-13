@@ -32,7 +32,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ use super::super::api::wire::{
 use super::super::prompt::PromptRole;
 use super::super::runtime::{RuntimeKind, SessionSpec, UiSurface};
 use super::super::state::{self, StateDir};
-use super::super::{adapters, priority, sessions, signal, supervise, wrap};
+use super::super::{INJECTION_SUBMIT_DELAY, adapters, priority, sessions, signal, supervise, wrap};
 
 /// How long a stopped child gets to exit politely before the ladder
 /// escalates. The same 3s `dash::pane` uses for its own quit.
@@ -237,6 +237,10 @@ struct HostSession {
     /// reconnected client resumes its place rather than accumulating ghosts.
     clients: Vec<String>,
     controller: Option<String>,
+    /// Issue #489: when the deferred carriage return of an injection this
+    /// runtime typed is due. The two-phase injection a pane performs, moved
+    /// into the service so a DETACHED session can still be delivered to.
+    pending_submit: Option<Instant>,
     rows: u16,
     cols: u16,
     ended: bool,
@@ -384,6 +388,51 @@ impl HostSession {
         }
     }
 
+    /// Whether this session may be injected into right now -- the same rule
+    /// `dash::pane::Pane::injectable` applies: no turn in flight, and no
+    /// injection of our own still waiting for its submit.
+    fn injectable(&self) -> bool {
+        !self.ended && !self.working && self.pending_submit.is_none()
+    }
+
+    /// Types one labelled injection into the session's terminal and arms the
+    /// deferred submit. Two phases, exactly as a pane does it (issue #114):
+    /// the harness needs the line to settle before the carriage return, and
+    /// blocking the service's pump thread for that delay would stall every
+    /// other session.
+    fn inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Err("this session no longer holds a terminal".into());
+        };
+        super::super::dash::pane::write_injection_phase1(&mut **writer, label, body)?;
+        writer.flush()?;
+        self.pending_submit = Some(Instant::now() + INJECTION_SUBMIT_DELAY);
+        // The injection starts a turn as surely as an operator's keystroke
+        // does, so the in-flight witness is stamped here for the same reason
+        // `write_raw` stamps one.
+        if !self.working {
+            self.working = true;
+            let verb = self.guard.record().verb.as_str().to_string();
+            self.guard.stamp_in_flight(&verb, self.turns + 1);
+        }
+        Ok(())
+    }
+
+    /// Sends the deferred carriage return once its delay has elapsed.
+    fn submit_pending(&mut self, now: Instant) {
+        let Some(due) = self.pending_submit else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        if let Some(writer) = self.writer.as_mut() {
+            let _ = super::super::dash::pane::write_submit_cr(&mut **writer);
+            let _ = writer.flush();
+        }
+        self.pending_submit = None;
+    }
+
     fn screen_view(&self) -> ScreenView {
         let screen = self.parser.screen();
         let (cursor_row, cursor_col) = screen.cursor_position();
@@ -480,9 +529,14 @@ impl RuntimeHost {
     pub fn pump(&self) {
         let now = state::now_secs();
         let mut sessions = self.lock();
+        let at = Instant::now();
         for session in sessions.values_mut() {
             session.pump();
             session.drain_signals();
+            // Issue #489: the second half of an injection this runtime typed.
+            // On the pump loop rather than inline, so delivering mail never
+            // blocks the caller for the settle delay.
+            session.submit_pending(at);
             // Cheap and exact: the child's own exit is the authority on
             // whether the session ended, not the output channel alone. An
             // agent that exited on its own releases its terminal here, on the
@@ -493,6 +547,72 @@ impl RuntimeHost {
             }
         }
         prune_ended(&mut sessions, self.ended_cap());
+    }
+
+    /// Issue #489 (and issue #352's mail-injection residual): delivers mail to
+    /// the runtime's own sessions, whether or not anybody is attached.
+    ///
+    /// Before this, mail ADDRESSING worked headless (the service files the
+    /// registry record, so a sender could always reach a detached session) but
+    /// the dashboard was still what typed a delivered message into a pane --
+    /// so a detached session accumulated mail in its queue and only saw it
+    /// when a client attached. The service owns the terminal, so the service
+    /// is what should type into it, and it does so through the dashboard's own
+    /// sweep (`dash::sweep_one_pane` for a worker's body delivery,
+    /// `dash::advise_one_pane` for an orchestrator seat's one-line advisory)
+    /// rather than a second delivery path with its own trust framing, its own
+    /// caps and its own consumption rules.
+    ///
+    /// The idle gate is the same one a pane applies: a session with a turn in
+    /// flight, or one already carrying an unsubmitted injection, is left alone
+    /// until the next tick.
+    pub fn deliver_mail(
+        &self,
+        cfg: &super::super::config::CtxConfig,
+        advised: &mut std::collections::HashMap<String, super::super::mail::AdvisedIds>,
+        errors: &mut super::super::dash::ErrorLog,
+    ) {
+        if !cfg.mail.enabled {
+            return;
+        }
+        let targets: Vec<(String, String, String, String, sessions::Verb)> = self
+            .lock()
+            .values()
+            .filter(|session| !session.ended && session.injectable())
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.agent.clone(),
+                    session.short.clone(),
+                    state::repo_slug(&session.cwd),
+                    session.guard.record().verb,
+                )
+            })
+            .collect();
+        for (id, agent, short, slug, verb) in targets {
+            let mut injector = SessionInjector {
+                host: self,
+                session_id: id.clone(),
+            };
+            if super::super::dash::is_delivery_eligible(verb, true) {
+                super::super::dash::sweep_one_pane(
+                    &mut injector,
+                    &id,
+                    &self.state,
+                    &slug,
+                    &agent,
+                    &short,
+                    cfg.mail.max_delivered_bytes,
+                    errors,
+                    None,
+                    &cfg.screen.thresholds(),
+                );
+            } else if verb == sessions::Verb::Chat {
+                super::super::dash::advise_one_pane(
+                    &mut injector, &id, &self.state, &slug, &agent, &short, advised, errors,
+                );
+            }
+        }
     }
 
     /// Spawns a session whose terminal this runtime owns.
@@ -606,6 +726,7 @@ impl RuntimeHost {
             ended_at: None,
             clients: Vec::new(),
             controller: None,
+            pending_submit: None,
             rows: spec.rows,
             cols: spec.cols,
             ended: false,
@@ -643,6 +764,16 @@ impl RuntimeHost {
         self.lock()
             .get(session_id)
             .map(|session| session.screen_view().contents)
+    }
+
+    /// Test seam: whether this session is carrying an injection the runtime
+    /// typed and has not submitted yet -- the observable trace of a delivery
+    /// into a session no client is watching.
+    #[cfg(test)]
+    pub fn pending_injection_for_test(&self, session_id: &str) -> Option<bool> {
+        self.lock()
+            .get(session_id)
+            .map(|session| session.pending_submit.is_some())
     }
 
     /// The session this runtime restored `session_id` from, if any -- the
@@ -902,6 +1033,28 @@ impl SessionHost for RuntimeHost {
             self.persist_topology();
         }
         Ok(stopped)
+    }
+}
+
+/// Issue #489: the runtime's own [`dash::Injector`], so the dashboard's mail
+/// sweep can deliver into a session the SERVICE owns.
+///
+/// It holds the session id rather than the session, because the sweep borrows
+/// its injector for the whole call while the host's table has to stay
+/// unlocked between injections -- the same reason `dash::mail_sweep` hands
+/// `sweep_one_pane` a `&mut Pane` and not the whole pane list.
+struct SessionInjector<'a> {
+    host: &'a RuntimeHost,
+    session_id: String,
+}
+
+impl super::super::dash::Injector for SessionInjector<'_> {
+    fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        let mut sessions = self.host.lock();
+        let Some(session) = sessions.get_mut(&self.session_id) else {
+            return Err("this session is no longer on the runtime".into());
+        };
+        session.inject(label, body)
     }
 }
 
@@ -1544,6 +1697,88 @@ mod tests {
             conversation: conversation.map(str::to_string),
             instance: "inst-1".to_string(),
         }
+    }
+
+    /// Issue #352's mail-injection residual, closed for terminals: mail
+    /// addressed to a runtime session with NO client attached is typed into it
+    /// by the service, instead of sitting in the queue until somebody attaches.
+    ///
+    /// The observable trace is the injection the runtime typed and has not
+    /// submitted yet -- proof that something reached the terminal with nobody
+    /// watching. The advisory itself never consumes the message: only the
+    /// session's own `zirv ctx inbox` does, which is the rule
+    /// `dash::advise_one_pane` already enforces and this path reuses rather
+    /// than re-implements.
+    #[test]
+    fn mail_reaches_a_session_no_client_is_attached_to() {
+        use super::super::super::config::CtxConfig;
+        use super::super::super::mail;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "cccccccc-1111-4222-8333-444444444444";
+        let mut spec = spawn_spec(id, tmp.path(), "ZIRVMAIL");
+        spec.argv = marker_argv("ZIRVMAIL");
+        host.spawn(spec).expect("spawn");
+
+        // The same state directory `host_for` gave the runtime: mail the
+        // service can see is mail in its own state directory.
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let slug = state::repo_slug(tmp.path());
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "11111111-2222-4333-8444-555555555555".to_string(),
+                from_agent: "codex".to_string(),
+                to: "claude".to_string(),
+                to_session: Some(sessions::short_id(id)),
+                sent: state::now_secs(),
+                body: "the gate is red".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut advised = std::collections::HashMap::new();
+        let mut errors = super::super::super::dash::ErrorLog::default();
+        assert_eq!(
+            host.sessions()
+                .iter()
+                .filter(|facts| facts.surface == UiSurface::Headless)
+                .count(),
+            1,
+            "nobody is attached"
+        );
+        assert_eq!(
+            mail::list(&state, &slug, Some("claude"), Some(&sessions::short_id(id)))
+                .expect("list")
+                .len(),
+            1,
+            "the message is addressed to this session and is unread"
+        );
+        host.deliver_mail(&cfg, &mut advised, &mut errors);
+
+        assert_eq!(
+            host.pending_injection_for_test(id),
+            Some(true),
+            "the service typed into a session no client is watching"
+        );
+        assert!(
+            !mail::list(&state, &slug, None, Some(&sessions::short_id(id)))
+                .expect("list")
+                .is_empty(),
+            "an orchestrator advisory points at `zirv ctx inbox`; it never consumes the message"
+        );
+
+        // A second sweep is deduplicated, so an idle seat is not told about
+        // the same message on every heartbeat.
+        let before = host.pending_injection_for_test(id);
+        host.deliver_mail(&cfg, &mut advised, &mut errors);
+        assert_eq!(host.pending_injection_for_test(id), before);
+
+        host.shutdown(true);
     }
 
     /// Tier 2's honesty rule, as a predicate: only a session with a verified

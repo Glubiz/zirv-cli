@@ -172,6 +172,13 @@ pub struct RuntimeService {
     /// Issue #489: the native conversations. A second host on ONE server and
     /// one endpoint -- not a second service, and not a private wire.
     native: Arc<NativeSessions>,
+    /// The operator configuration this service started under, held so the
+    /// mail sweep does not reload it from disk on every heartbeat.
+    cfg: CtxConfig,
+    /// Per-session mail advisories already delivered, so an orchestrator seat
+    /// is told about one message once rather than on every heartbeat -- the
+    /// same map, and the same purpose, `dash::mail_sweep` keeps for a pane.
+    advised: std::sync::Mutex<std::collections::HashMap<String, super::super::mail::AdvisedIds>>,
     /// Dropped last: dropping it stops the accept loop and removes the
     /// endpoint.
     running: RunningServer,
@@ -262,6 +269,8 @@ impl RuntimeService {
             instance,
             host,
             native,
+            cfg: cfg.clone(),
+            advised: std::sync::Mutex::new(std::collections::HashMap::new()),
             running,
         })
     }
@@ -276,6 +285,19 @@ impl RuntimeService {
 
     pub fn native(&self) -> &Arc<NativeSessions> {
         &self.native
+    }
+
+    /// One mail sweep across everything this runtime owns. Public so a test
+    /// can drive it deterministically rather than waiting for a heartbeat.
+    pub fn deliver_mail(&self) {
+        let mut advised = match self.advised.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut errors = super::super::dash::ErrorLog::default();
+        self.host
+            .deliver_mail(&self.cfg, &mut advised, &mut errors);
+        self.native.deliver_mail(&self.cfg, &mut errors);
     }
 
     pub fn namespace(&self) -> &str {
@@ -350,6 +372,13 @@ impl RuntimeService {
     /// instead of sleeping.
     pub fn tick(&self, heartbeat: bool) {
         self.host.pump();
+        // Issue #489 (issue #352's mail-injection residual): the service
+        // delivers mail to its OWN sessions, attached or not. On the
+        // heartbeat rather than every 25 ms pump, because a mailbox scan is a
+        // directory read and a queue nobody is watching is not a hot path.
+        if heartbeat {
+            self.deliver_mail();
+        }
         if heartbeat {
             namespace::touch(&self.state, &self.namespace, state::now_secs());
             self.host.persist_topology();
