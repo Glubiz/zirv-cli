@@ -6663,6 +6663,9 @@ fn fulfill_spawn_request(
             cfg.supervise.max_writers,
             &format!("session {registry_short}: {}", req.agent),
             &tree,
+            // Issue #488: the dashboard spawns for a requester whose seat
+            // generation it does not carry; the env fence is what applies.
+            None,
         ) {
             Ok(permit) => Some(permit),
             Err(refusal) => {
@@ -21893,6 +21896,7 @@ mod tests {
             cfg.supervise.max_writers,
             "pre-held by test",
             &tree,
+            None,
         )
         .expect("hold the tree's one writer slot ahead of the request");
 

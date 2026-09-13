@@ -5849,13 +5849,13 @@ pub(crate) mod tests {
         .expect("spawn");
 
         pane.set_writer_permit(
-            super::super::super::permit::acquire_writer(&state, 1, "first", &repo)
+            super::super::super::permit::acquire_writer(&state, 1, "first", &repo, None)
                 .expect("first permit"),
         );
         pane.shutdown("")
             .expect("first shutdown releases the guard");
         assert!(!pane.holds_writer_permit());
-        let _successor = super::super::super::permit::acquire_writer(&state, 1, "successor", &repo)
+        let _successor = super::super::super::permit::acquire_writer(&state, 1, "successor", &repo, None)
             .expect("shutdown releases the permit before the pane is dropped");
         let short = pane.short().to_string();
         let record_path = state.sessions().join(format!("{short}.json"));
@@ -5872,7 +5872,7 @@ pub(crate) mod tests {
             .expect("second cleanup path is also idempotent");
         drop(pane);
         assert!(
-            super::super::super::permit::acquire_writer(&state, 1, "third", &repo).is_err(),
+            super::super::super::permit::acquire_writer(&state, 1, "third", &repo, None).is_err(),
             "old pane cleanup must not release its successor's permit"
         );
         assert!(!record_path.exists());

@@ -182,6 +182,10 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             cfg.supervise.max_writers,
             &format!("session {child_short}: native/{route_id}"),
             &tree,
+            // Issue #488: a delegated worker holds no seat of its own -- the
+            // seat belongs to whoever delegated it -- so the env fence is the
+            // only statement available here.
+            None,
         ) {
             Ok(permit) => Some(permit),
             Err(refusal) => {
@@ -595,18 +599,18 @@ mod tests {
         std::fs::create_dir_all(&tree).expect("tree");
         let tree = std::fs::canonicalize(&tree).expect("canonical");
 
-        let legacy = permit::acquire_writer(&state, 4, "session legacy: claude", &tree)
+        let legacy = permit::acquire_writer(&state, 4, "session legacy: claude", &tree, None)
             .expect("the legacy worker takes the tree");
-        let native = permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree);
+        let native = permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree, None);
         assert!(
             native.is_err(),
             "a native worker must not hold a checkout a legacy worker already writes"
         );
         drop(legacy);
-        let native = permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree)
+        let native = permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree, None)
             .expect("released");
         assert!(
-            permit::acquire_writer(&state, 4, "session legacy2: claude", &tree).is_err(),
+            permit::acquire_writer(&state, 4, "session legacy2: claude", &tree, None).is_err(),
             "and the exclusion holds in the other direction too"
         );
         drop(native);

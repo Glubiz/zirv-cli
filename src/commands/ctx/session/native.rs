@@ -202,6 +202,14 @@ impl NativeEnvironment for ProviderEnvironment {
             self.max_writers,
             &format!("session native {}: {}", turn.seat_short, turn.role),
             &turn.cwd,
+            // Issue #488 (review finding 1): the runtime handed this turn its
+            // seat short and generation, so this lease gets the STRICT
+            // verdict -- an uncommitted successor is refused a writer lease
+            // just as it is refused a delegation and a graph write.
+            Some(super::super::permit::SeatFence {
+                short: &turn.seat_short,
+                generation: turn.generation,
+            }),
         )
         .ok()
         .map(|permit| Box::new(permit) as Box<dyn super::super::runtime::enforcement::WriterLease>);

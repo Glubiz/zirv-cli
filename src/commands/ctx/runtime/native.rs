@@ -3319,6 +3319,10 @@ pub fn spawn_interactive(
             cfg.supervise.max_writers,
             "native pane",
             &tree,
+            // Issue #488: the pane's own session is being created right here,
+            // so there is no seat generation to present yet; the env fence
+            // still refuses a pane opened by a superseded orchestrator.
+            None,
         ) {
             Ok(permit) => Some(permit),
             Err(refusal) => {
