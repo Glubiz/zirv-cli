@@ -4155,13 +4155,19 @@ mod tests {
         // One board, both runtimes on it.
         let board = call(&mut fixture.client, TEAM_STATUS, json!({}));
         let board = result_of(&board);
-        let runtimes: Vec<&str> = board["nodes"]
+        // The graph is keyed by card id, and a card id is a uuid, so the
+        // assertion is about the SET of runtimes on one board, not an order.
+        let runtimes: std::collections::BTreeSet<&str> = board["nodes"]
             .as_array()
             .expect("nodes")
             .iter()
             .filter_map(|node| node["runtime"].as_str())
             .collect();
-        assert_eq!(runtimes, ["native", "harness"]);
+        assert_eq!(
+            runtimes,
+            ["harness", "native"].into_iter().collect(),
+            "one board carries both runtimes: {board}"
+        );
         assert_eq!(
             board["pending_completions"]
                 .as_array()
@@ -4302,6 +4308,202 @@ mod tests {
             manifest["summary"].as_str().unwrap_or_default().len() <= 512,
             "a manifest is bounded, not a transcript"
         );
+    }
+
+    /// Acceptance criterion 5: the whole coordinator surface -- the shared
+    /// task, group, objective, workflow and delegation services, the real
+    /// broker, the real registry -- with `PATH` scrubbed EMPTY, so there is
+    /// no `claude`, no `codex` and no other vendor CLI anywhere on it.
+    ///
+    /// The worker launch is the one seam that is stubbed, for the same reason
+    /// every N10 delegation test stubs it: starting a real worker needs a
+    /// provider endpoint, and this test is about whether zirv needs a coding
+    /// harness, not about whether a vendor answers.
+    #[test]
+    fn an_all_native_team_runs_a_workflow_with_every_coding_harness_absent() {
+        use crate::commands::ctx::testenv::VarGuard;
+        use crate::commands::workflow::engine;
+
+        let mut fixture = fixture_with(0, "coordinator", true);
+        let _path = VarGuard::set(&[("PATH", Some(""))]);
+
+        // A real workflow in the real store, for the repository this session
+        // is seated in.
+        let workflow = engine::WorkflowState::start(
+            fixture.repo.clone(),
+            "ship the native meta-orchestrator".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            crate::commands::workflow::classify::Classification {
+                intent: crate::commands::workflow::classify::Intent::Feature,
+                complexity: crate::commands::workflow::classify::Complexity::Trivial,
+                risk: crate::commands::workflow::classify::RiskBand::Low,
+                risk_score: 0,
+                changed_files: 1,
+                changed_lines: 5,
+                declared_scope: false,
+                work_domain: Default::default(),
+                risk_measurement: crate::commands::workflow::classify::RiskMeasurement::Measured,
+                reasons: vec!["small".into()],
+            },
+        );
+        engine::save(&fixture.state, &workflow, true).expect("save the workflow");
+
+        // Plan, staff and dispatch: three roles, all native.
+        let group = result_of(&call(
+            &mut fixture.client,
+            GROUP_CREATE,
+            json!({"scope":"N16","child_limit":3}),
+        ))["group"]
+            .as_str()
+            .expect("group")
+            .to_string();
+        let mut handles = Vec::new();
+        for role in ["implementer", "tester", "reviewer"] {
+            let task = result_of(&call(
+                &mut fixture.client,
+                TASK_CREATE,
+                json!({"title": role, "brief":"do the thing", "role": role, "group": group}),
+            ))["task"]
+                .as_str()
+                .expect("task")
+                .to_string();
+            handles.push(handle_from(call(
+                &mut fixture.client,
+                DELEGATE,
+                json!({"brief":"do the thing","role":role,"task":task,"group":group}),
+            )));
+        }
+        assert_eq!(handles.len(), 3);
+        assert!(
+            fixture
+                .launches
+                .lock()
+                .expect("lock")
+                .iter()
+                .all(|launch| launch.runtime == super::super::RuntimeKind::Native),
+            "every worker on this team is native"
+        );
+
+        // The workflow is read live through the same engine the CLI verb
+        // uses -- with no harness on PATH at all.
+        let status = call(&mut fixture.client, WORKFLOW_STATUS, json!({}));
+        let status = result_of(&status);
+        assert_eq!(status["task"], "ship the native meta-orchestrator");
+
+        // The coordinator restarts: every receipt is consumed exactly once
+        // and the board settles without anything being dispatched twice.
+        let mut graph = crate::commands::ctx::coordinator::load(&fixture.state, &fixture.repo);
+        let consumed = crate::commands::ctx::coordinator::consume_pending(
+            &fixture.state,
+            &fixture.repo,
+            &mut graph,
+            state::now_secs(),
+        )
+        .expect("consume");
+        assert_eq!(consumed.len(), 3);
+        crate::commands::ctx::coordinator::store(&fixture.state, &fixture.repo, &graph)
+            .expect("store");
+
+        let board = call(&mut fixture.client, TEAM_STATUS, json!({}));
+        let board = result_of(&board);
+        assert!(
+            board["pending_completions"]
+                .as_array()
+                .expect("pending")
+                .is_empty(),
+            "every receipt has been read: {board}"
+        );
+        assert!(
+            board["outstanding"]
+                .as_array()
+                .expect("outstanding")
+                .is_empty(),
+            "and nothing is waiting to be dispatched a second time: {board}"
+        );
+        let states: Vec<&str> = board["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .filter_map(|node| node["state"].as_str())
+            .collect();
+        assert_eq!(states, ["completed", "completed", "completed"]);
+    }
+
+    /// Acceptance criterion 7: the operator steers and stops the objective
+    /// through the command they already have, and the coordinator sees it.
+    #[test]
+    fn operator_steering_and_stopping_reach_the_coordinator() {
+        use crate::commands::ctx::{coordinator, objective};
+
+        let mut fixture = fixture_with(0, "coordinator", true);
+        let cfg = CtxConfig::default();
+        let mut sink: Vec<u8> = Vec::new();
+        objective::run_set(
+            &fixture.state,
+            &mut sink,
+            &fixture.repo,
+            &cfg,
+            &objective::SetArgs {
+                objective: "ship N16 without touching the release branch".to_string(),
+                budget_tokens: None,
+                deadline_secs: None,
+            },
+            10,
+        )
+        .expect("set");
+
+        let seen = call(&mut fixture.client, OBJECTIVE_STATUS, json!({}));
+        let seen = result_of(&seen);
+        assert_eq!(seen["objective"], "ship N16 without touching the release branch");
+        assert_eq!(seen["stopped"], false);
+        assert_eq!(
+            seen["constraints"][0],
+            "ship N16 without touching the release branch"
+        );
+
+        // Stopping it refuses further delegation, with the reason.
+        let mut graph = coordinator::load(&fixture.state, &fixture.repo);
+        graph.cancel(20);
+        coordinator::store(&fixture.state, &fixture.repo, &graph).expect("store");
+        let refused = call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief":"more work","role":"implementer"}),
+        );
+        assert!(
+            refused
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("cancelled")),
+            "{refused:?}"
+        );
+        assert!(fixture.launches.lock().expect("lock").is_empty());
+
+        // And setting a new objective lifts it, which is what "steering"
+        // means: the operator redirects rather than restarts.
+        objective::run_set(
+            &fixture.state,
+            &mut sink,
+            &fixture.repo,
+            &cfg,
+            &objective::SetArgs {
+                objective: "ship N16, release branch is fine now".to_string(),
+                budget_tokens: None,
+                deadline_secs: None,
+            },
+            30,
+        )
+        .expect("set again");
+        let resumed = call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief":"more work","role":"implementer"}),
+        );
+        assert_eq!(resumed.state, ToolReceiptState::Completed, "{resumed:?}");
+        let seen = call(&mut fixture.client, OBJECTIVE_STATUS, json!({}));
+        assert_eq!(result_of(&seen)["constraints"].as_array().expect("c").len(), 2);
     }
 
     #[test]
