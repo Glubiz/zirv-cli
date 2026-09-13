@@ -901,6 +901,10 @@ fn render_native_session_plain(
         blocked: false,
         unread_result: false,
         notice: None,
+        activity: None,
+        cwd: repo.display().to_string(),
+        git_branch: None,
+        context_left_pct: None,
     };
     Ok(render_plain(
         &view,
