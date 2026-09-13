@@ -3481,9 +3481,7 @@ pub fn run_with<W: Write>(
     // same-harness refusal, `adapters::select`, cross-harness rerouting --
     // is meaningless for a native worker, whose `<name>` is a provider route.
     let native = resolve_runtime(args)? == super::runtime::RuntimeKind::Native;
-    if !native
-        && let Some(message) = same_harness_refusal(args, env)
-    {
+    if !native && let Some(message) = same_harness_refusal(args, env) {
         return Err(message.into());
     }
     // Issue #318: resolved up front, before anything else in this

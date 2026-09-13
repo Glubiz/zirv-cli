@@ -35,7 +35,8 @@ use std::path::{Path, PathBuf};
 use super::CtxResult;
 use super::agent::{
     AgentArgs, DelegationMode, DelegationReceipt, DelegationState, delegation_outcome,
-    finish_task_card, print_receipt, receipt_note, requested_envelope_from_args, resolve_worker_budget,
+    finish_task_card, print_receipt, receipt_note, requested_envelope_from_args,
+    resolve_worker_budget,
 };
 use super::config::{CtxConfig, EnvLookup};
 use super::delegation;
@@ -126,8 +127,12 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     // operator configuration alone (no credential store, no network), so an
     // unconfigured route fails here -- before a task card is marked running
     // by a worker that was never going to start.
-    let (route_id, provider) =
-        super::runtime::native::route_provider(&request.launch_repo, requested_route(args), role_of(args), env)?;
+    let (route_id, provider) = super::runtime::native::route_provider(
+        &request.launch_repo,
+        requested_route(args),
+        role_of(args),
+        env,
+    )?;
 
     let (worker_budget, reserved_ceiling) = resolve_worker_budget(&env, args)?;
     let worker_session = super::event::SessionId::new_v4().to_string();
@@ -169,7 +174,8 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     // one checkout -- and the same guard is then moved into the native
     // execution broker, which refuses any repository write it does not
     // cover.
-    let tree = std::fs::canonicalize(&request.launch_repo).unwrap_or_else(|_| request.launch_repo.clone());
+    let tree =
+        std::fs::canonicalize(&request.launch_repo).unwrap_or_else(|_| request.launch_repo.clone());
     let writer_permit = if args.mode == WorkerMode::Writing {
         match permit::acquire_writer(
             state,
@@ -182,8 +188,12 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
                 if let Some((provider, id)) = &reservation {
                     let _ = super::reservation::release(state, provider, id);
                 }
-                let reason =
-                    permit::describe_writer_refusal(&refusal, state, cfg.supervise.max_writers, &tree);
+                let reason = permit::describe_writer_refusal(
+                    &refusal,
+                    state,
+                    cfg.supervise.max_writers,
+                    &tree,
+                );
                 return refuse(
                     args,
                     w,
@@ -258,8 +268,9 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             provider: None,
             fixture_tools: None,
             task: args.task.clone(),
-            writer: writer_permit
-                .map(|permit| Box::new(permit) as Box<dyn super::runtime::enforcement::WriterLease>),
+            writer: writer_permit.map(|permit| {
+                Box::new(permit) as Box<dyn super::runtime::enforcement::WriterLease>
+            }),
         },
         &mut notices,
         env,
@@ -317,8 +328,12 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         let mut attempts: Vec<Vec<String>> = Vec::new();
         match status.final_text.as_deref() {
             Some(text) => {
-                match super::agent::evaluate_report(schema, text, &request.launch_repo, &mut undeclared)
-                {
+                match super::agent::evaluate_report(
+                    schema,
+                    text,
+                    &request.launch_repo,
+                    &mut undeclared,
+                ) {
                     Ok(value) => validated = Some(value),
                     Err(errors) => attempts.push(errors),
                 }
@@ -338,8 +353,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         contract_errors = attempts.last().cloned().unwrap_or_default();
     }
 
-    let (stored_report, report_truncated) =
-        super::agent::cap_report(status.final_text.as_deref());
+    let (stored_report, report_truncated) = super::agent::cap_report(status.final_text.as_deref());
     let result_path = if request.result_schema.is_some() {
         Some(super::agent::store_result(
             state,
@@ -353,7 +367,13 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         ))
     } else {
         stored_report.as_deref().map(|text| {
-            super::agent::store_report_only(state, &worker_session, &args.name, text, report_truncated)
+            super::agent::store_report_only(
+                state,
+                &worker_session,
+                &args.name,
+                text,
+                report_truncated,
+            )
         })
     };
 
