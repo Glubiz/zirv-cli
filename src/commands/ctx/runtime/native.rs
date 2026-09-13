@@ -68,10 +68,16 @@ use super::super::provider::adapter::{
     ProviderContent, ProviderFailure, ProviderMessage, ProviderMessageRole, ProviderRequest,
     ProviderStreamEvent, ProviderUsage, journal_blocks, replayed_content,
 };
+use super::checkpoint::{self, CheckpointContext};
+use super::compaction::{
+    self, CompactionAction, CompactionDecision, CompactionPolicy, CompactionRecord, DistillBudget,
+    NativeBudget, RETAIN_RECENT_MESSAGES,
+};
 use super::journal::{
-    AssistantBlock, ContentRef, ConversationState, EventScope, ExecutionId, ExecutionRecord,
-    ExecutionState, Journal, JournalSessionId, MessageId, MessageRole, RequestAttemptId,
-    RouteIdentity, SequenceId, ToolCallId, TurnId, UsageId, UsageRecord,
+    AssistantBlock, CheckpointId, CheckpointKind, ContentRef, ConversationState, EventScope,
+    ExecutionId, ExecutionRecord, ExecutionState, Journal, JournalSessionId, MessageId,
+    MessageRole, RequestAttemptId, RouteIdentity, SequenceId, ToolCallId, TurnId, UsageId,
+    UsageRecord,
 };
 use super::tools::{
     NativeToolClient, ResourceClaimKind, RetryPolicy, ToolDefinition, ToolExecutionMode,
@@ -85,7 +91,7 @@ use super::{
 /// Bumped whenever [`NativeFinalStatus`]'s own shape changes. A consumer of
 /// `zirv ctx exec --runtime native --json` branches on this, never on field
 /// presence.
-pub const FINAL_STATUS_SCHEMA_VERSION: u32 = 1;
+pub const FINAL_STATUS_SCHEMA_VERSION: u32 = 2;
 
 /// The policy source label recorded on every tool call this loop prepares.
 /// The authoritative fingerprint comes back on the receipt from the broker
@@ -456,6 +462,12 @@ pub struct NativeFinalStatus {
     pub limit: Option<LimitKind>,
     pub failure: Option<String>,
     pub blocked_reason: Option<String>,
+    /// Issue #486: the compactions this run committed, oldest first, and the
+    /// newest compaction decision -- including one that was only advice.
+    /// Durable facts: every entry names a journal sequence a reader can go
+    /// and check.
+    pub compactions: Vec<CompactionRecord>,
+    pub compaction_decision: Option<CompactionDecision>,
     pub evidence: Vec<NativeEvidence>,
     pub exit_code: i32,
 }
@@ -479,6 +491,50 @@ pub struct NativeSessionConfig {
     /// is N15's step (#484) -- but the ladder already honours it, so that
     /// wiring cannot land without taking effect.
     pub workflow_gate: Option<String>,
+    /// Issue #486: how this session compacts itself. Default is a working
+    /// configuration -- automatic policy, unknown context window, the shared
+    /// scoring config's own thresholds -- so a caller that says nothing still
+    /// gets compaction rather than a silently unprotected session.
+    pub compaction: CompactionSettings,
+}
+
+/// Everything one session's compaction needs that is not a live borrow.
+#[derive(Clone, Debug)]
+pub struct CompactionSettings {
+    /// `false` disables compaction entirely for this loop. Observation still
+    /// runs and the decision is still reported, so a disabled session says
+    /// what it would have done.
+    pub enabled: bool,
+    pub policy: CompactionPolicy,
+    pub budget: NativeBudget,
+    /// The shared rot scoring config. Reused rather than duplicated: the
+    /// native token gate differs only in the CAPACITY it is given, never in
+    /// the thresholds an operator already configured.
+    pub score: super::super::config::ScoreConfig,
+    pub distill: DistillBudget,
+    /// How many of the newest messages a compaction always leaves verbatim.
+    pub retain_recent_messages: usize,
+    /// Operator-stated hard constraints, carried into every checkpoint from
+    /// the same typed source `runtime::context::CompileRequest` reads.
+    pub constraints: Vec<String>,
+    /// Where the portable checkpoint export is written. `None` keeps the
+    /// journal event as the only copy, which is all a resume needs.
+    pub state: Option<super::super::state::StateDir>,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            policy: CompactionPolicy::default(),
+            budget: NativeBudget::default(),
+            score: super::super::config::ScoreConfig::default(),
+            distill: DistillBudget::default(),
+            retain_recent_messages: RETAIN_RECENT_MESSAGES,
+            constraints: Vec::new(),
+            state: None,
+        }
+    }
 }
 
 /// The native agent loop itself.
@@ -506,6 +562,16 @@ pub struct NativeLoop<'a> {
     usage: ProviderUsage,
     served_model: Option<String>,
     evidence: Vec<NativeEvidence>,
+    /// Provider context-overflow refusals seen in this loop. A refused
+    /// request commits nothing, so this is not a journal fact; it is handed
+    /// to the scoring projection, which is where a non-event becomes a
+    /// scoring signal.
+    overflows: usize,
+    /// Compactions this loop committed, oldest first.
+    compactions: Vec<CompactionRecord>,
+    /// The newest decision, whatever it was. Reported even when the policy
+    /// or the `enabled` flag stopped it from being acted on.
+    last_decision: Option<CompactionDecision>,
 }
 
 impl std::fmt::Debug for NativeLoop<'_> {
@@ -550,6 +616,9 @@ impl<'a> NativeLoop<'a> {
             usage: ProviderUsage::default(),
             served_model: None,
             evidence: Vec::new(),
+            overflows: 0,
+            compactions: Vec::new(),
+            last_decision: None,
         }
     }
 
@@ -630,9 +699,27 @@ impl<'a> NativeLoop<'a> {
         let mut messages: Vec<ProviderMessage> = Vec::new();
         let mut last = self.delivered_through;
 
+        // Issue #486: the compaction in force, if any. Its summary message
+        // stands in for every journal message at or before `covers_through`;
+        // everything after it replays verbatim, including any tool call whose
+        // effect is still unsettled -- the boundary is chosen so it never
+        // crosses one. The stable prefix (`ProviderRequest::system`) is not
+        // touched at all, which is what keeps provider prompt caching valid
+        // across a compaction.
+        let active = compaction::active(self.journal, &self.config.session)?;
+        let covered = active.as_ref().map_or(SequenceId(0), |checkpoint| {
+            SequenceId(checkpoint.covers_through)
+        });
+        if let Some(checkpoint) = &active {
+            messages.push(compaction::summary_message(checkpoint));
+        }
+
         for stored in &state.messages {
             if stored.sequence > last {
                 last = stored.sequence;
+            }
+            if stored.sequence <= covered {
+                continue;
             }
             match stored.role {
                 MessageRole::User => {
@@ -717,6 +804,189 @@ impl<'a> NativeLoop<'a> {
             effort: None,
             cache: Default::default(),
         })
+    }
+
+    /// Observes this session and decides whether it should compact.
+    ///
+    /// Observation reads the journal; the decision itself is pure
+    /// ([`compaction::evaluate`]). Split deliberately, so a test can assert a
+    /// verdict without a database and a status reader can ask what the
+    /// decision WOULD be without acting on it.
+    pub fn compaction_decision(&self) -> CtxResult<CompactionDecision> {
+        let observation = compaction::observe(self.journal, &self.config.session, self.overflows)?;
+        Ok(compaction::evaluate(
+            &observation,
+            &self.config.compaction.score,
+            self.config.compaction.budget,
+            self.config.compaction.policy,
+        ))
+    }
+
+    /// Records one provider context-overflow refusal and compacts in response
+    /// to it, when the policy allows. Returns whether the request may be
+    /// re-sent.
+    ///
+    /// An advisory policy deliberately returns `false`: "zirv may not compact
+    /// this session on its own" has to mean the session stops with the
+    /// overflow, or the narrowing would be decorative.
+    fn recover_from_overflow(&mut self, scope: &EventScope) -> CtxResult<bool> {
+        self.overflows = self.overflows.saturating_add(1);
+        let decision = self.compaction_decision()?;
+        let act = decision.should_compact() && self.config.compaction.enabled;
+        let reason = decision.reason.clone();
+        self.last_decision = Some(decision);
+        if !act {
+            let policy = self.config.compaction.policy.as_str();
+            self.note(
+                "compaction_skipped",
+                "policy",
+                format!("context overflow ({reason}), but the compaction policy is {policy}"),
+            );
+            return Ok(false);
+        }
+        self.compact_now(scope, &reason)
+    }
+
+    /// Evaluates, and compacts when the decision, the policy and the enable
+    /// flag all say so. Returns whether a compaction was actually committed.
+    ///
+    /// An `Advise` decision is recorded as evidence and nothing else: that is
+    /// what an advisory policy means, and what a below-threshold session that
+    /// is merely repeating itself gets.
+    fn maybe_compact(&mut self, scope: &EventScope) -> CtxResult<bool> {
+        let decision = self.compaction_decision()?;
+        let act = decision.should_compact() && self.config.compaction.enabled;
+        let reason = decision.reason.clone();
+        if decision.action == CompactionAction::Advise {
+            self.note(
+                "compaction_advice",
+                decision.verdict.as_str(),
+                reason.clone(),
+            );
+        }
+        self.last_decision = Some(decision);
+        if !act {
+            return Ok(false);
+        }
+        self.compact_now(scope, &reason)
+    }
+
+    /// Commits one compaction.
+    ///
+    /// Returns `false` -- without writing anything -- when compacting would
+    /// settle nothing: no boundary exists (everything is either too recent or
+    /// behind an unsettled tool call), or the boundary is no further along
+    /// than the compaction already in force. That second guard is what stops
+    /// a session that is over its budget for some other reason from
+    /// compacting on every single request.
+    fn compact_now(&mut self, scope: &EventScope, reason: &str) -> CtxResult<bool> {
+        let state = self.journal.replay(&self.config.session)?;
+        let Some(boundary) =
+            checkpoint::boundary(&state, self.config.compaction.retain_recent_messages)
+        else {
+            self.note(
+                "compaction_skipped",
+                "no_boundary",
+                "nothing before the retained tail has settled",
+            );
+            return Ok(false);
+        };
+        let already = compaction::active(self.journal, &self.config.session)?
+            .map_or(0, |checkpoint| checkpoint.covers_through);
+        if boundary.0 <= already {
+            self.note(
+                "compaction_skipped",
+                "no_progress",
+                format!("already compacted through sequence {already}"),
+            );
+            return Ok(false);
+        }
+
+        // Distillation runs through this session's OWN native route, with a
+        // bounded output budget and no tool schemas at all. It cannot fail:
+        // with no provider capacity, no credential, a refusal or an attempted
+        // tool call it returns the deterministic structural summary instead.
+        let distilled = compaction::distill(
+            Some(self.provider),
+            &self.config.route.model.id,
+            self.cancel.as_ref(),
+            &state,
+            boundary,
+            self.config.compaction.distill,
+        );
+
+        let checkpoint_id = CheckpointId::new(self.mint("checkpoint"))?;
+        let now = self.secs();
+
+        // A distillation that really called the route is a real cost. It is
+        // recorded in the journal and summed into this session's usage like
+        // any other request, so compaction can never be a spend a reader
+        // cannot see.
+        if distilled.usage != ProviderUsage::default() {
+            let usage_id = UsageId::new(self.mint("usage"))?;
+            self.journal.record_usage(
+                &self.config.session,
+                self.config.generation,
+                scope,
+                UsageRecord {
+                    id: usage_id,
+                    input_tokens: distilled.usage.input_tokens,
+                    cache_creation_input_tokens: distilled.usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: distilled.usage.cache_read_input_tokens,
+                    output_tokens: distilled.usage.output_tokens,
+                    reasoning_tokens: distilled.usage.reasoning_tokens,
+                    provider_request_id: None,
+                    estimated: false,
+                },
+                now,
+            )?;
+            accumulate(&mut self.usage, &distilled.usage);
+        }
+        let summary = distilled.summary;
+        let portable = checkpoint::build(
+            &state,
+            boundary,
+            self.delivered_through,
+            &checkpoint_id,
+            &CheckpointContext {
+                hard_constraints: self.config.compaction.constraints.clone(),
+                task: self.config.task.as_ref().map(|task| task.to_string()),
+                workflow: None,
+                reason: reason.to_string(),
+            },
+            summary,
+            now,
+        );
+        let sequence = checkpoint::commit(
+            self.journal,
+            self.config.compaction.state.as_ref(),
+            self.config.generation,
+            scope,
+            CheckpointKind::Compaction,
+            &portable,
+            now,
+        )?;
+        // Every overflow seen so far has now been addressed. Leaving the
+        // count standing would make the next decision propose a compaction
+        // that has already happened.
+        self.overflows = 0;
+        self.note(
+            "compaction",
+            checkpoint_id.to_string(),
+            format!(
+                "{reason}; covered through sequence {} with a {} summary",
+                portable.covers_through, portable.summary.source
+            ),
+        );
+        self.compactions.push(CompactionRecord {
+            sequence: sequence.0,
+            kind: "compaction".to_string(),
+            reason: reason.to_string(),
+            covers_through: portable.covers_through,
+            summary_source: portable.summary.source.clone(),
+            created_at: now,
+        });
+        Ok(true)
     }
 
     /// Whether a provider failure may be retried by simply re-sending the
@@ -819,6 +1089,12 @@ impl<'a> NativeLoop<'a> {
             limit: None,
         };
 
+        // One compaction recovery per turn. A second overflow after a
+        // compaction that already committed means the remaining tail alone
+        // does not fit, and re-compacting would settle nothing -- the turn
+        // fails explicitly instead of looping.
+        let mut overflow_recoveries = 0u32;
+
         for request_index in 0..self.config.limits.max_requests_per_turn {
             if self.cancelled() {
                 outcome.state = TurnState::Interrupted;
@@ -837,6 +1113,14 @@ impl<'a> NativeLoop<'a> {
                 task: self.config.task.clone(),
             };
 
+            // Issue #486: decide BEFORE the request is built, so a compaction
+            // takes effect on the very request that needed it. Skipped on the
+            // first request of a session, where no usage has been reported
+            // and there is nothing yet to measure.
+            if self.requests > 0 {
+                self.maybe_compact(&scope)?;
+            }
+
             outcome.state = TurnState::Requesting;
             let request = self.build_request()?;
             let mut events: Vec<ProviderStreamEvent> = Vec::new();
@@ -847,12 +1131,28 @@ impl<'a> NativeLoop<'a> {
                     return Ok(outcome);
                 }
                 Err(failure) => {
+                    // A context overflow commits nothing, so recovering from
+                    // it repeats no effect: compact, then rebuild the (now
+                    // smaller) request from the journal and send it again.
+                    if failure.class == FailureClass::ContextOverflow
+                        && overflow_recoveries == 0
+                        && self.recover_from_overflow(&scope)?
+                    {
+                        overflow_recoveries += 1;
+                        continue;
+                    }
                     outcome.state = TurnState::Failed;
                     outcome.failure = Some(failure.to_string());
                     self.note("provider_failure", attempt.to_string(), failure.to_string());
                     return Ok(outcome);
                 }
             };
+            if response.finish_reason == FinishReason::ContextWindowExceeded {
+                // The provider answered but said the window was exceeded. The
+                // reply is already committed below; the count makes the next
+                // decision see the overflow.
+                self.overflows = self.overflows.saturating_add(1);
+            }
             outcome.requests += 1;
 
             // Usage first: an assistant message may reference it, and the
@@ -1367,6 +1667,8 @@ impl<'a> NativeLoop<'a> {
             limit,
             failure,
             blocked_reason,
+            compactions: self.compactions.clone(),
+            compaction_decision: self.last_decision.clone(),
             evidence: self.evidence.clone(),
             exit_code: status.exit_code(),
         })
@@ -2272,6 +2574,33 @@ pub fn run_session<W: std::io::Write>(
         .cancellation(&handle)
         .unwrap_or_else(|| std::sync::Arc::new(CancellationFlag::default()));
 
+    // Issue #486: the compaction envelope for this run. The capacity is the
+    // route model's DECLARED context window less the output reservation this
+    // run actually asked for -- an unknown window stays `None`, which the rot
+    // token gate reads as "use the absolute fallbacks", never as a guess. The
+    // policy comes from `~/.zirv/native.toml`, already narrowed by any
+    // repository layer.
+    let compaction = CompactionSettings {
+        enabled: true,
+        policy: super::super::provider::config::NativeConfig::load(&home, request.repo)?
+            .map(|native| native.compaction_policy())
+            .unwrap_or_default(),
+        budget: NativeBudget {
+            context_window_tokens: super::super::provider::capability::declared(
+                route.protocol,
+                &route.model,
+                None,
+            )
+            .context_window,
+            output_reserve_tokens: request.limits.max_output_tokens,
+        },
+        score: cfg.score.clone(),
+        distill: DistillBudget::default(),
+        retain_recent_messages: RETAIN_RECENT_MESSAGES,
+        constraints: Vec::new(),
+        state: Some(state.clone()),
+    };
+
     let status = {
         let journal = backend
             .journal_mut()
@@ -2289,6 +2618,7 @@ pub fn run_session<W: std::io::Write>(
                 // and task receipts are filed under.
                 task: task.clone(),
                 workflow_gate: None,
+                compaction,
             },
             provider.as_ref(),
             tools.as_mut(),
@@ -2601,6 +2931,7 @@ mod tests {
             limits: NativeLimits::default(),
             task: None,
             workflow_gate: None,
+            compaction: CompactionSettings::default(),
         }
     }
 
@@ -3987,5 +4318,364 @@ mod tests {
         assert_eq!(json["provider"], "openai");
         assert_eq!(json["served_model"], "fixture-openai-model");
         assert!(json["usage"]["output_tokens"].as_u64().unwrap() > 0);
+    }
+
+    // -- (n) issue #486: compaction, rot recovery and checkpoints ---------
+
+    /// A compaction run, with everything an assertion needs: the journal is
+    /// returned rather than dropped so a test can prove the ORIGINAL history
+    /// is still there, and the provider's sent requests so a test can prove
+    /// what the model actually saw after the compaction.
+    struct CompactionRun {
+        status: NativeFinalStatus,
+        calls: Vec<String>,
+        sent: Vec<ProviderRequest>,
+        journal: Journal,
+        session: JournalSessionId,
+        _dir: tempfile::TempDir,
+    }
+
+    fn run_compaction_fixture(
+        provider_fixture: &str,
+        prompt: &str,
+        mutate: impl FnOnce(&mut NativeSessionConfig),
+    ) -> CompactionRun {
+        let model = "fixture-anthropic-model";
+        let route = route_for(Protocol::AnthropicMessages, model);
+        let (dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, model),
+            script(provider_fixture),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let mut cfg = config_for(session.clone(), route);
+        mutate(&mut cfg);
+        let clock = || 1_000u64;
+        let status = {
+            let mut driver = NativeLoop::new(
+                cfg,
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge(prompt, false).expect("acknowledged");
+            driver.run_to_completion().expect("ran")
+        };
+        CompactionRun {
+            status,
+            calls: tools.calls,
+            sent: provider.sent(),
+            journal,
+            session,
+            _dir: dir,
+        }
+    }
+
+    fn first_text(request: &ProviderRequest) -> String {
+        request
+            .messages
+            .first()
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ProviderContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Acceptance criterion: a long session crosses a context window while
+    /// preserving the hard user constraints, the objective, the verification
+    /// state and the exact evidence references -- and without destroying the
+    /// original history.
+    #[test]
+    fn a_long_session_compacts_on_token_pressure_and_keeps_its_objective_constraints_and_history() {
+        let run = run_compaction_fixture(
+            "compaction-long-session.json",
+            "fix the failing test",
+            |cfg| {
+                cfg.compaction.budget = NativeBudget {
+                    context_window_tokens: Some(1_000),
+                    output_reserve_tokens: 200,
+                };
+                cfg.compaction.retain_recent_messages = 2;
+                cfg.compaction.constraints = vec!["never force-push".to_string()];
+            },
+        );
+
+        assert_eq!(run.status.status, NativeStatus::Completed);
+        assert_eq!(run.status.compactions.len(), 1);
+        assert!(
+            run.status.compactions[0].reason.contains("token_pressure"),
+            "reason was {:?}",
+            run.status.compactions[0].reason
+        );
+        // The distillation really went through the native route.
+        assert_eq!(run.status.compactions[0].summary_source, "route");
+
+        // The last request the model saw opens with the compaction briefing,
+        // carrying the objective and the operator's hard constraint.
+        let summary = first_text(run.sent.last().expect("a request was sent"));
+        assert!(summary.contains("[zirv compaction]"), "{summary}");
+        assert!(summary.contains("never force-push"), "{summary}");
+        assert!(summary.contains("fix the failing test"), "{summary}");
+        // Completed actions keep their exact tool-call identities.
+        assert!(summary.contains("call_1"), "{summary}");
+
+        // The distillation request carried NO tool schemas: read-only is
+        // enforced by giving the model nothing to call.
+        let distill = run
+            .sent
+            .iter()
+            .find(|request| {
+                request
+                    .system
+                    .iter()
+                    .any(|text| text.contains("compacting"))
+            })
+            .expect("a distillation request was sent");
+        assert!(distill.tools.is_empty());
+
+        // Nothing was destroyed: the original acknowledged input and every
+        // original event are still in the journal.
+        let events = run.journal.events(&run.session).expect("events");
+        assert!(events.iter().any(|stored| matches!(
+            &stored.event,
+            JournalEvent::InputAcknowledged { text, .. } if text == "fix the failing test"
+        )));
+        assert!(events.iter().any(|stored| matches!(
+            &stored.event,
+            JournalEvent::Checkpoint {
+                kind: CheckpointKind::Compaction,
+                ..
+            }
+        )));
+    }
+
+    /// Acceptance criterion: an overflow recovers from a valid checkpoint
+    /// without repeating any effect.
+    #[test]
+    fn a_context_overflow_recovers_through_a_compaction_without_repeating_an_effect() {
+        let run = run_compaction_fixture(
+            "compaction-overflow-recovery.json",
+            "fix the failing test",
+            |cfg| cfg.compaction.retain_recent_messages = 2,
+        );
+        assert_eq!(run.status.status, NativeStatus::Completed);
+        assert_eq!(run.status.compactions.len(), 1);
+        assert!(
+            run.status.compactions[0]
+                .reason
+                .contains("context_overflow"),
+            "reason was {:?}",
+            run.status.compactions[0].reason
+        );
+        // Every effect ran exactly once: the overflow committed nothing, so
+        // the rebuilt request replays results rather than re-running tools.
+        assert_eq!(run.calls, vec!["call_1", "call_2", "call_3"]);
+    }
+
+    /// An advisory policy reports and does nothing. The narrowing has to be
+    /// load-bearing or it is decorative.
+    #[test]
+    fn an_advisory_policy_reports_the_pressure_and_never_compacts() {
+        let run = run_compaction_fixture(
+            "compaction-long-session.json",
+            "fix the failing test",
+            |cfg| {
+                cfg.compaction.budget = NativeBudget {
+                    context_window_tokens: Some(1_000),
+                    output_reserve_tokens: 200,
+                };
+                cfg.compaction.retain_recent_messages = 2;
+                cfg.compaction.policy = CompactionPolicy::Advisory;
+            },
+        );
+        assert!(run.status.compactions.is_empty());
+        let decision = run
+            .status
+            .compaction_decision
+            .as_ref()
+            .expect("a decision was recorded");
+        assert_eq!(decision.policy, CompactionPolicy::Advisory);
+        assert!(
+            run.status
+                .evidence
+                .iter()
+                .any(|note| note.kind == "compaction_advice")
+        );
+        // Nothing was written: no checkpoint event exists at all.
+        let events = run.journal.events(&run.session).expect("events");
+        assert!(
+            !events
+                .iter()
+                .any(|stored| matches!(&stored.event, JournalEvent::Checkpoint { .. }))
+        );
+    }
+
+    /// Acceptance criterion: a crash mid-compaction resumes from the last
+    /// VALID checkpoint. A checkpoint this build cannot read is skipped in
+    /// favour of an older one it can, never repaired and never fatal.
+    #[test]
+    fn an_unreadable_newer_checkpoint_falls_back_to_the_last_valid_one() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        acknowledge_input(
+            &mut journal,
+            &session,
+            1,
+            MessageId::new("m1").expect("id"),
+            "go",
+            false,
+            1_000,
+        )
+        .expect("input");
+        let state = journal.replay(&session).expect("replay");
+        let good = checkpoint::build(
+            &state,
+            SequenceId(1),
+            SequenceId(1),
+            &CheckpointId::new("cp-good").expect("id"),
+            &checkpoint::CheckpointContext {
+                reason: "token_pressure".to_string(),
+                ..Default::default()
+            },
+            compaction::structural_summary(&state, SequenceId(1)),
+            1,
+        );
+        checkpoint::commit(
+            &mut journal,
+            None,
+            1,
+            &EventScope::default(),
+            CheckpointKind::Compaction,
+            &good,
+            1,
+        )
+        .expect("committed");
+        // A newer checkpoint written by a schema this build does not know.
+        journal
+            .record_checkpoint(
+                &session,
+                1,
+                &EventScope::default(),
+                CheckpointId::new("cp-future").expect("id"),
+                CheckpointKind::Compaction,
+                serde_json::json!({ "schema_version": 9999, "unknown": true }),
+                2,
+            )
+            .expect("recorded");
+
+        let active = compaction::active(&journal, &session)
+            .expect("active")
+            .expect("a valid checkpoint remains");
+        assert_eq!(active.checkpoint_id, "cp-good");
+        assert_eq!(active.reason, "token_pressure");
+    }
+
+    /// A crash between the portable export and the journal event leaves an
+    /// orphan file. The journal is the commit point, so the session is simply
+    /// uncompacted -- never half-compacted.
+    #[test]
+    fn a_portable_export_without_its_journal_event_is_not_a_compaction() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (dir, mut journal, session) = journal_for(&route);
+        acknowledge_input(
+            &mut journal,
+            &session,
+            1,
+            MessageId::new("m1").expect("id"),
+            "go",
+            false,
+            1_000,
+        )
+        .expect("input");
+        let state = journal.replay(&session).expect("replay");
+        let orphan = checkpoint::build(
+            &state,
+            SequenceId(1),
+            SequenceId(1),
+            &CheckpointId::new("cp-orphan").expect("id"),
+            &checkpoint::CheckpointContext::default(),
+            compaction::structural_summary(&state, SequenceId(1)),
+            1,
+        );
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(dir.path().join("state"));
+        checkpoint::export(&state_dir, &orphan).expect("exported");
+        assert!(
+            compaction::active(&journal, &session)
+                .expect("active")
+                .is_none()
+        );
+    }
+
+    /// Acceptance criterion: a same-route resume keeps the provider's opaque
+    /// continuation state; a route change rebuilds a legal semantic history
+    /// instead, with no hidden reasoning and no synthesized outcome.
+    #[test]
+    fn a_route_change_discards_the_opaque_envelope_and_rebuilds_the_history() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        acknowledge_input(
+            &mut journal,
+            &session,
+            1,
+            MessageId::new("m1").expect("id"),
+            "keep this",
+            false,
+            1_000,
+        )
+        .expect("input");
+
+        match compaction::plan_continuation(&journal, &session, &route).expect("planned") {
+            compaction::ContinuationPlan::SameRoute { .. } => {}
+            other => panic!("same route must keep the envelope, got {other:?}"),
+        }
+
+        let other = route_for(Protocol::OpenAiResponses, "fixture-openai-model");
+        match compaction::plan_continuation(&journal, &session, &other).expect("planned") {
+            compaction::ContinuationPlan::Rebuilt { messages, .. } => {
+                let rendered = format!("{messages:?}");
+                assert!(rendered.contains("keep this"), "{rendered}");
+            }
+            other => panic!("a route change must rebuild, got {other:?}"),
+        }
+    }
+
+    /// Acceptance criterion: existing rot scoring regressions keep passing,
+    /// and equivalent projected events give the same verdict. The projection
+    /// is checked here at the seam it actually runs at -- a real journal.
+    #[test]
+    fn the_journal_projection_scores_deterministically_through_the_pure_engine() {
+        let run = run_compaction_fixture(
+            "compaction-long-session.json",
+            "fix the failing test",
+            |cfg| {
+                cfg.compaction.budget = NativeBudget {
+                    context_window_tokens: Some(1_000),
+                    output_reserve_tokens: 200,
+                };
+                cfg.compaction.retain_recent_messages = 2;
+            },
+        );
+        let first = compaction::observe(&run.journal, &run.session, 0).expect("observed");
+        let second = compaction::observe(&run.journal, &run.session, 0).expect("observed");
+        assert_eq!(first, second);
+        let cfg = crate::commands::ctx::config::ScoreConfig::default();
+        let budget = NativeBudget {
+            context_window_tokens: Some(1_000),
+            output_reserve_tokens: 200,
+        };
+        assert_eq!(
+            compaction::evaluate(&first, &cfg, budget, CompactionPolicy::Automatic),
+            compaction::evaluate(&second, &cfg, budget, CompactionPolicy::Automatic)
+        );
     }
 }

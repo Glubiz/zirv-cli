@@ -229,10 +229,8 @@ pub fn boundary(state: &ConversationState, retain_recent: usize) -> Option<Seque
     let unsettled_from = first_unsettled_sequence(state);
     let keep_from = if state.messages.len() > retain_recent {
         state.messages[state.messages.len() - retain_recent].sequence
-    } else if let Some(first) = state.messages.first() {
-        first.sequence
     } else {
-        return None;
+        state.messages.first()?.sequence
     };
     let cut = match unsettled_from {
         Some(unsettled) => unsettled.min(keep_from),
@@ -243,8 +241,7 @@ pub fn boundary(state: &ConversationState, retain_recent: usize) -> Option<Seque
     let covered = state
         .messages
         .iter()
-        .filter(|message| message.sequence < cut)
-        .next_back()?;
+        .rfind(|message| message.sequence < cut)?;
     Some(covered.sequence)
 }
 
