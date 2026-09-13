@@ -1708,7 +1708,10 @@ impl NativeToolClient {
         let now = state::now_secs();
         let _ = coordinator::update(&self.state, &self.repo, |graph| {
             graph.plan(&id, &role, &args.parents, now);
-            graph.decide(&format!("planned {id} for role {role}: {}", args.title), now);
+            graph.decide(
+                &format!("planned {id} for role {role}: {}", args.title),
+                now,
+            );
         });
         Ok(json!({"task": id, "role": role, "parents": args.parents}))
     }
@@ -1768,7 +1771,7 @@ impl NativeToolClient {
                 }
             })
             .collect();
-        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        rows.sort_by_key(|card| std::cmp::Reverse(card.updated_at));
         let shown = args.bounded_limit().min(rows.len());
         let listed: Vec<Value> = rows[..shown]
             .iter()
@@ -1969,9 +1972,9 @@ impl NativeToolClient {
             && target != crate::commands::ctx::runtime::RuntimeKind::Native.as_str()
             && let Some(native) = self.native_config()
         {
-            team::authorize_route(&native, &args.role_or_default(), &target).map_err(|refusal| {
-                ToolError::new(ToolErrorCode::AuthorizationDenied, refusal.to_string())
-            })?;
+            team::authorize_route(&native, &args.role_or_default(), &target).map_err(
+                |refusal| ToolError::new(ToolErrorCode::AuthorizationDenied, refusal.to_string()),
+            )?;
         }
         let request = service::LaunchRequest {
             runtime: args.runtime.kind(),
@@ -4180,7 +4183,10 @@ mod tests {
         let cards = call(&mut fixture.client, TASK_LIST, json!({}));
         assert_eq!(result_of(&cards)["total"], 2);
         let status = call(&mut fixture.client, GROUP_STATUS, json!({"group": group}));
-        assert_eq!(result_of(&status)["tasks"].as_array().expect("tasks").len(), 2);
+        assert_eq!(
+            result_of(&status)["tasks"].as_array().expect("tasks").len(),
+            2
+        );
         assert_eq!(result_of(&status)["scope"], "ship N16");
     }
 
@@ -4264,7 +4270,11 @@ mod tests {
             (TEAM_STATUS, json!({})),
         ] {
             let receipt = call(&mut fixture.client, name, arguments);
-            assert_eq!(receipt.state, ToolReceiptState::Completed, "{name}: {receipt:?}");
+            assert_eq!(
+                receipt.state,
+                ToolReceiptState::Completed,
+                "{name}: {receipt:?}"
+            );
         }
         for (name, arguments) in [
             (TASK_CREATE, json!({"title":"t","brief":"b"})),
@@ -4456,7 +4466,10 @@ mod tests {
 
         let seen = call(&mut fixture.client, OBJECTIVE_STATUS, json!({}));
         let seen = result_of(&seen);
-        assert_eq!(seen["objective"], "ship N16 without touching the release branch");
+        assert_eq!(
+            seen["objective"],
+            "ship N16 without touching the release branch"
+        );
         assert_eq!(seen["stopped"], false);
         assert_eq!(
             seen["constraints"][0],
@@ -4503,7 +4516,10 @@ mod tests {
         );
         assert_eq!(resumed.state, ToolReceiptState::Completed, "{resumed:?}");
         let seen = call(&mut fixture.client, OBJECTIVE_STATUS, json!({}));
-        assert_eq!(result_of(&seen)["constraints"].as_array().expect("c").len(), 2);
+        assert_eq!(
+            result_of(&seen)["constraints"].as_array().expect("c").len(),
+            2
+        );
     }
 
     #[test]

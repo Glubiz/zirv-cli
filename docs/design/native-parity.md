@@ -1,6 +1,7 @@
 # Native feature parity
 
-**Issue:** #484 (roadmap N15, #469) · **Last updated:** 2026-09-13
+**Issues:** #484 (roadmap N15), #485 (roadmap N16) · **Roadmap:** #469 ·
+**Last updated:** 2026-09-13
 
 Every shipped Zirv command surface and helper-model call that touches a model
 or a workflow, with the native implementation that serves it and the test that
@@ -61,6 +62,28 @@ deferred" in
 | `workflow review package` / `add` / `dispose` / `list` / `ingest-pr-comments` | `workflow::review`, no model call | shared | existing `workflow::review::tests` |
 | `workflow stats` | `workflow::telemetry` | shared | existing `workflow::telemetry::tests` |
 
+## Team and coordination surface
+
+Added by N16 (#485): the coordinating seat itself, and the shared services a
+team runs on. Every row is reachable from a native session as a typed tool
+over the same durable state the CLI verb writes.
+
+| Surface | Native implementation | State | Test |
+|---|---|---|---|
+| The coordinating seat's role and methodology | `ctx::team::prompt_role` → `runtime::context::compile` | native | `team::tests::only_the_coordinating_roles_get_an_orchestrator_methodology` |
+| Role-to-route selection (`coordinator`, `sub-orchestrator`, `researcher`, `planner`, `implementer`, `reviewer`, `tester`) | `ctx::team::route_for_role` over `[roles]`, typed refusal when unconfigured | native | `team::tests::a_role_with_no_entry_is_a_typed_refusal_naming_the_roles_that_have_one` |
+| A route a delegating model names for a role | `ctx::team::authorize_route` → N18 `route::eligible` | native | `team::tests::a_requested_route_may_not_move_a_role_onto_different_billing`, `team::tests::operator_policy_outranks_the_role_table` |
+| Delegation bounds (role authority, depth, stopped objective) | `ctx::coordinator::check`, applied in `delegation::delegate` before the receipt | shared | `delegation::tests::a_refused_delegation_starts_nothing_and_writes_no_receipt` |
+| Child write posture from role identity | `ctx::coordinator::Grant` | shared | `delegation::tests::the_childs_mode_is_decided_by_its_role_not_by_the_request` |
+| `zirv ctx task create` / `claim` / `list` | `ctx::task`; `task_create` / `task_claim` / `task_list` tools | shared + native tools | `tools::tests::two_workers_can_never_claim_one_card` |
+| `zirv ctx group create` / `status` | `ctx::group`; `group_create` / `group_status` tools | shared + native tools | `tools::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services` |
+| `zirv ctx objective show` | `ctx::objective`; `objective_status` tool, with the operator's constraints | shared + native tool | `tools::tests::operator_steering_and_stopping_reach_the_coordinator` |
+| The coordinator's task graph, decisions, evidence refs and pending completions | `ctx::coordinator` record; `team_status` tool | native | `coordinator::tests::a_restarted_coordinator_consumes_pending_receipts_exactly_once` |
+| Coordinator restart | `coordinator::consume_pending` at the top of `native::run_session` | native | as above, plus `tools::tests::an_all_native_team_runs_a_workflow_with_every_coding_harness_absent` |
+| Operator steering / stopping (`zirv ctx objective set` / `close`) | writes the constraint and the stop onto the coordinator record | shared | `tools::tests::operator_steering_and_stopping_reach_the_coordinator` |
+| A whole team with no coding harness on `PATH` | all of the above | native | `tools::tests::an_all_native_team_runs_a_workflow_with_every_coding_harness_absent` |
+| A mixed native + wrapped team on one board | `ctx::delegation` on both runtimes, one coordinator record | native + harness | `tools::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services` |
+
 ## Verification and scripts
 
 | Surface | Native implementation | State | Test |
@@ -78,6 +101,6 @@ deferred" in
 | `zirv ctx wrap` (interactive PTY supervision) | wraps a vendor TUI process by definition; a native session has no TUI | N11 (#480) for the native interactive surface |
 | Dashboard panes hosting a native session | a pane hosts a harness TUI | N11 (#480) |
 | Transcript scoring / rot for native sessions | the native journal projects into the same scoring vocabulary; a *harness* transcript parser is still adapter-specific | N09 (#478), unchanged here |
-| Cross-harness handover (`zirv ctx handover`) | swaps one vendor CLI for another | N16 (#485) |
+| Cross-harness handover (`zirv ctx handover`) | swaps one vendor CLI for another, which a native session has none of; changing a native seat's model is `[roles]`/`--route` configuration, not a handover | roadmap #469, unassigned — N16 (#485) covers team orchestration, not vendor-CLI swapping |
 | Writable built-in agent seats on the native seat dispatcher | the dispatcher is read-only by mechanism; a writable seat must be a delegated worker with a real permit (`zirv agent --runtime native --mode writing`) | by design, #484 |
 | Live-provider validation of any row above | every test here is fixture- or service-level | N19 (#487) validation pass |

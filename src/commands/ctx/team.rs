@@ -478,7 +478,10 @@ mod tests {
             panic!("expected an unconfigured refusal, got {refusal:?}");
         };
         assert_eq!(role, REVIEWER);
-        assert_eq!(configured, &["coordinator".to_string(), "implementer".into()]);
+        assert_eq!(
+            configured,
+            &["coordinator".to_string(), "implementer".into()]
+        );
         // The refusal names what IS configured rather than silently handing
         // the reviewer somebody else's route.
         assert!(refusal.to_string().contains("coordinator"));

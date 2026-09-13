@@ -551,7 +551,12 @@ mod tests {
     /// identity is clamped however the request was spelled.
     #[test]
     fn a_read_only_role_is_clamped_however_the_request_was_spelled() {
-        for role in [team::REVIEWER, team::TESTER, team::RESEARCHER, team::PLANNER] {
+        for role in [
+            team::REVIEWER,
+            team::TESTER,
+            team::RESEARCHER,
+            team::PLANNER,
+        ] {
             let grant = check(&bounds(team::COORDINATOR, role)).expect("admitted");
             assert!(!grant.write, "{role} must never be granted a writing seat");
         }
@@ -589,7 +594,12 @@ mod tests {
             objective: Some("ship N16".to_string()),
             ..Coordinator::default()
         };
-        record.plan("task-impl", team::IMPLEMENTER, &["task-plan".to_string()], 10);
+        record.plan(
+            "task-impl",
+            team::IMPLEMENTER,
+            &["task-plan".to_string()],
+            10,
+        );
         record.dispatched("task-impl", team::IMPLEMENTER, "native", "deleg1", 11);
         record.steer("do not touch the release branch", 12);
         for n in 0..(MAX_DECISIONS + 20) {

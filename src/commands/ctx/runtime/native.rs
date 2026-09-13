@@ -2817,7 +2817,10 @@ pub fn run_session<W: std::io::Write>(
             // starting: the delegation records are still authoritative and
             // `team_status` will say what it can see.
             Err(error) => {
-                let _ = writeln!(w, "zirv ctx: could not resume the coordinator graph: {error}");
+                let _ = writeln!(
+                    w,
+                    "zirv ctx: could not resume the coordinator graph: {error}"
+                );
             }
         }
     }
