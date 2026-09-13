@@ -45,7 +45,7 @@ use super::super::config::ScoreConfig;
 use super::super::event::{Capabilities, NormalizedEvent, ProviderErrorClass};
 use super::super::provider::adapter::{
     Cancellation, ProviderAdapter, ProviderContent, ProviderMessage, ProviderMessageRole,
-    ProviderRequest,
+    ProviderRequest, ProviderUsage,
 };
 use super::super::rot::{self, Verdict};
 use super::checkpoint::{self, DistilledSummary, PortableCheckpoint};
@@ -259,23 +259,42 @@ pub fn observe(
     })
 }
 
-/// The newest usage record's total input footprint.
+/// The input footprint of the newest CONVERSATION request.
 ///
-/// Deliberately NOT `UsageRecord::input_tokens` alone: on every protocol that
-/// reports caching, the cached prefix is billed separately but still occupies
-/// the window, so scoring on fresh input only would under-read a long cached
-/// session by exactly the part that is most likely to overflow.
+/// Two deliberate choices:
+///
+/// * It is not `UsageRecord::input_tokens` alone. On every protocol that
+///   reports caching, the cached prefix is billed separately but still
+///   occupies the window, so scoring on fresh input only would under-read a
+///   long cached session by exactly the part most likely to overflow.
+/// * It is keyed off the newest committed ASSISTANT MESSAGE's usage, not off
+///   the newest usage row. A distillation records its own usage in the same
+///   journal (compaction must not be an invisible spend) and that request's
+///   input is deliberately small; reading it as "the context" would make a
+///   session look like it had just shrunk when it had not.
 fn measured_context(journal: &Journal, session: &JournalSessionId) -> CtxResult<(u64, bool)> {
+    let mut totals: std::collections::BTreeMap<super::journal::UsageId, (u64, bool)> =
+        std::collections::BTreeMap::new();
     let mut measured = (0u64, false);
     for stored in journal.events(session)? {
-        if let JournalEvent::UsageRecorded { usage } = stored.event {
-            let total = usage
-                .input_tokens
-                .saturating_add(usage.cache_creation_input_tokens)
-                .saturating_add(usage.cache_read_input_tokens);
-            if total > 0 {
-                measured = (total, usage.estimated);
+        match stored.event {
+            JournalEvent::UsageRecorded { usage } => {
+                let total = usage
+                    .input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens)
+                    .saturating_add(usage.cache_read_input_tokens);
+                totals.insert(usage.id, (total, usage.estimated));
             }
+            JournalEvent::AssistantMessageCommitted {
+                usage: Some(usage), ..
+            } => {
+                if let Some((total, estimated)) = totals.get(&usage)
+                    && *total > 0
+                {
+                    measured = (*total, *estimated);
+                }
+            }
+            _ => {}
         }
     }
     Ok(measured)
@@ -377,7 +396,11 @@ must not request any.";
 /// The deterministic rendering of the covered conversation. One function, so
 /// the structural fallback summarises exactly what a model would have been
 /// shown.
-pub fn render_covered(state: &ConversationState, covers_through: SequenceId, limit: usize) -> String {
+pub fn render_covered(
+    state: &ConversationState,
+    covers_through: SequenceId,
+    limit: usize,
+) -> String {
     let mut out = String::new();
     for message in &state.messages {
         if message.sequence > covers_through {
@@ -429,7 +452,10 @@ pub fn render_covered(state: &ConversationState, covers_through: SequenceId, lim
 /// The deterministic, no-model summary. Always available: it needs no
 /// credential, no capacity and no network, which is what makes every
 /// compaction helper work with the external harness binaries absent.
-pub fn structural_summary(state: &ConversationState, covers_through: SequenceId) -> DistilledSummary {
+pub fn structural_summary(
+    state: &ConversationState,
+    covers_through: SequenceId,
+) -> DistilledSummary {
     let mut turns = 0usize;
     let mut assistant = 0usize;
     let mut tools = 0usize;
@@ -466,6 +492,23 @@ pub fn structural_summary(state: &ConversationState, covers_through: SequenceId)
     }
 }
 
+/// A summary plus what producing it actually cost. The usage is zero for the
+/// structural fallback, which is the point of having one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DistillOutcome {
+    pub summary: DistilledSummary,
+    pub usage: ProviderUsage,
+}
+
+impl DistillOutcome {
+    fn structural(state: &ConversationState, covers_through: SequenceId) -> Self {
+        Self {
+            summary: structural_summary(state, covers_through),
+            usage: ProviderUsage::default(),
+        }
+    }
+}
+
 /// Distils the covered conversation, through the session's own native route
 /// when one is available and through the deterministic structural fallback
 /// otherwise.
@@ -481,13 +524,13 @@ pub fn distill(
     state: &ConversationState,
     covers_through: SequenceId,
     budget: DistillBudget,
-) -> DistilledSummary {
+) -> DistillOutcome {
     let Some(provider) = provider else {
-        return structural_summary(state, covers_through);
+        return DistillOutcome::structural(state, covers_through);
     };
     let transcript = render_covered(state, covers_through, budget.max_input_chars);
     if transcript.trim().is_empty() {
-        return structural_summary(state, covers_through);
+        return DistillOutcome::structural(state, covers_through);
     }
     let request = ProviderRequest {
         model: model.to_string(),
@@ -508,14 +551,21 @@ pub fn distill(
     };
     let mut sink: Vec<super::super::provider::adapter::ProviderStreamEvent> = Vec::new();
     let Ok(response) = provider.stream(&request, cancel, &mut sink) else {
-        return structural_summary(state, covers_through);
+        return DistillOutcome::structural(state, covers_through);
     };
+    // A reply that tried to call a tool is refused outright rather than
+    // partially trusted: the request carried no tool schemas, so a tool-use
+    // block means the model is not following the read-only contract this
+    // summary is produced under. The cost is still reported.
     if response
         .content
         .iter()
         .any(|block| matches!(block, ProviderContent::ToolUse { .. }))
     {
-        return structural_summary(state, covers_through);
+        return DistillOutcome {
+            summary: structural_summary(state, covers_through),
+            usage: response.usage,
+        };
     }
     let text: String = response
         .content
@@ -526,13 +576,19 @@ pub fn distill(
         })
         .collect();
     if text.trim().is_empty() {
-        return structural_summary(state, covers_through);
+        return DistillOutcome {
+            summary: structural_summary(state, covers_through),
+            usage: response.usage,
+        };
     }
-    DistilledSummary {
-        source: DistilledSummary::ROUTE.to_string(),
-        model: Some(response.model),
-        text: truncate_chars(&text, budget.max_input_chars),
-        decisions: Vec::new(),
+    DistillOutcome {
+        summary: DistilledSummary {
+            source: DistilledSummary::ROUTE.to_string(),
+            model: Some(response.model),
+            text: truncate_chars(&text, budget.max_input_chars),
+            decisions: Vec::new(),
+        },
+        usage: response.usage,
     }
 }
 
@@ -682,11 +738,13 @@ pub fn history(journal: &Journal, session: &JournalSessionId) -> CtxResult<Recov
                     created_at: stored.committed_at,
                 });
             }
-            JournalEvent::GenerationAdvanced { previous, current } => out.resumes.push(ResumeRecord {
-                sequence: stored.sequence.0,
-                previous_generation: previous,
-                generation: current,
-            }),
+            JournalEvent::GenerationAdvanced { previous, current } => {
+                out.resumes.push(ResumeRecord {
+                    sequence: stored.sequence.0,
+                    previous_generation: previous,
+                    generation: current,
+                })
+            }
             _ => {}
         }
     }
@@ -700,7 +758,9 @@ pub fn history(journal: &Journal, session: &JournalSessionId) -> CtxResult<Recov
 pub enum ContinuationPlan {
     /// The target route is byte-for-byte the route the session ran on, so the
     /// provider's own opaque envelope is still valid and is kept.
-    SameRoute { checkpoint: Option<PortableCheckpoint> },
+    SameRoute {
+        checkpoint: Option<PortableCheckpoint>,
+    },
     /// The route, model, endpoint, account or protocol changed. The opaque
     /// envelope is DISCARDED -- it belongs to a conversation the new provider
     /// never had -- and a legal semantic history is rebuilt from the
@@ -950,7 +1010,11 @@ mod tests {
             budget(),
             CompactionPolicy::Automatic,
         );
-        assert!(decision.triggers.contains(&CompactionTrigger::ContextOverflow));
+        assert!(
+            decision
+                .triggers
+                .contains(&CompactionTrigger::ContextOverflow)
+        );
         assert_eq!(decision.action, CompactionAction::Compact);
     }
 
@@ -976,7 +1040,11 @@ mod tests {
             budget(),
             CompactionPolicy::Automatic,
         );
-        assert!(decision.triggers.contains(&CompactionTrigger::LossOfProgress));
+        assert!(
+            decision
+                .triggers
+                .contains(&CompactionTrigger::LossOfProgress)
+        );
     }
 
     #[test]
@@ -1020,10 +1088,16 @@ mod tests {
     fn the_policy_fold_only_ever_narrows() {
         use CompactionPolicy::*;
         assert_eq!(CompactionPolicy::narrow(Automatic, None), Automatic);
-        assert_eq!(CompactionPolicy::narrow(Automatic, Some(Advisory)), Advisory);
+        assert_eq!(
+            CompactionPolicy::narrow(Automatic, Some(Advisory)),
+            Advisory
+        );
         // A repository asking for `automatic` cannot widen an operator's
         // `advisory`.
-        assert_eq!(CompactionPolicy::narrow(Advisory, Some(Automatic)), Advisory);
+        assert_eq!(
+            CompactionPolicy::narrow(Advisory, Some(Automatic)),
+            Advisory
+        );
     }
 
     #[test]
@@ -1066,7 +1140,7 @@ mod tests {
     #[test]
     fn distillation_without_a_provider_falls_back_structurally() {
         let state = state_with(vec![user(1, "go")]);
-        let summary = distill(
+        let outcome = distill(
             None,
             "fixture-model",
             &super::super::super::provider::adapter::NeverCancelled,
@@ -1074,7 +1148,8 @@ mod tests {
             SequenceId(1),
             DistillBudget::default(),
         );
-        assert_eq!(summary.source, DistilledSummary::STRUCTURAL);
+        assert_eq!(outcome.summary.source, DistilledSummary::STRUCTURAL);
+        assert_eq!(outcome.usage, ProviderUsage::default());
     }
 
     #[test]

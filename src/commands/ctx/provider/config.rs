@@ -8,6 +8,7 @@ use super::{
     AccountId, BillingClass, BillingPoolId, EndpointId, ProviderId, RouteId, Support, provider,
 };
 use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::runtime::compaction::CompactionPolicy;
 
 pub const NATIVE_CONFIG_FILE: &str = "native.toml";
 pub const NATIVE_SCHEMA: u32 = 1;
@@ -109,6 +110,13 @@ impl Default for RouteConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct NativePolicy {
     pub allowed_routes: Option<BTreeSet<RouteId>>,
+    /// Issue #486: whether zirv may compact a native session on its own
+    /// (`automatic`, the default) or may only report that it should be
+    /// compacted (`advisory`). The second key a repository layer may set,
+    /// and -- like `allowed_routes` -- it may only NARROW: a checkout can
+    /// turn automatic compaction off for work done in it, never turn an
+    /// operator's `advisory` back on.
+    pub compaction: Option<CompactionPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +162,12 @@ impl NativeConfig {
                     let repo_cfg: RepoConfig = toml::from_str(&repo_text)
                         .map_err(|error| format!("{}: {error}", repo_path.display()))?;
                     validate_schema(repo_cfg.schema, &repo_path)?;
+                    if let Some(repo_compaction) = repo_cfg.policy.compaction {
+                        config.policy.compaction = Some(CompactionPolicy::narrow(
+                            config.policy.compaction.unwrap_or_default(),
+                            Some(repo_compaction),
+                        ));
+                    }
                     if let Some(repo_allowed) = repo_cfg.policy.allowed_routes {
                         let operator_allowed = config
                             .policy
@@ -185,6 +199,13 @@ impl NativeConfig {
             .allowed_routes
             .as_ref()
             .expect("validated config always resolves allowed_routes")
+    }
+
+    /// The resolved compaction policy, after any repository narrowing.
+    /// Absent configuration is `automatic`: compaction is how a native
+    /// session survives a long task, so the safe default is that it happens.
+    pub fn compaction_policy(&self) -> CompactionPolicy {
+        self.policy.compaction.unwrap_or_default()
     }
 
     pub fn account_pool(&self, id: &AccountId) -> BillingPoolId {
@@ -561,7 +582,11 @@ fn reject_untrusted_keys(table: &toml::Table, path: &Path) -> CtxResult<()> {
             "policy" => {
                 if let Some(policy) = value.as_table() {
                     for policy_key in policy.keys() {
-                        if policy_key != "allowed_routes" {
+                        // The only two keys a checkout may state, and both
+                        // only ever narrow: `allowed_routes` is intersected
+                        // with the operator's set, `compaction` can turn
+                        // automatic compaction off but never back on.
+                        if policy_key != "allowed_routes" && policy_key != "compaction" {
                             return Err(repo_forbidden(path, &format!("policy.{policy_key}")));
                         }
                     }
