@@ -1,0 +1,72 @@
+{
+  "shape": "anthropic",
+  "model": "fixture-anthropic-model",
+  "turns": [
+    {
+      "message_id": "msg_investigate",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Reading the two files this change touches.",
+          "deltas": 3
+        },
+        {
+          "type": "tool_use",
+          "id": "call_read_src",
+          "name": "file_read",
+          "input": { "path": "src/lib.rs" },
+          "partial_json": ["{\"path\":", "\"src/lib.rs\"}"]
+        },
+        {
+          "type": "tool_use",
+          "id": "call_read_test",
+          "name": "file_read",
+          "input": { "path": "tests/lib.rs" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 120, "output_tokens": 40 }
+    },
+    {
+      "message_id": "msg_edit",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Applying the fix."
+        },
+        {
+          "type": "tool_use",
+          "id": "call_patch",
+          "name": "apply_patch",
+          "input": { "path": "src/lib.rs", "patch": "@@\n-old\n+new\n" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 200, "output_tokens": 60 }
+    },
+    {
+      "message_id": "msg_test",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_tests",
+          "name": "process_start",
+          "input": { "command": ["cargo", "test"] }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 260, "output_tokens": 25 }
+    },
+    {
+      "message_id": "msg_done",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Fixed src/lib.rs and the suite passes."
+        }
+      ],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 300, "output_tokens": 30 }
+    }
+  ]
+}

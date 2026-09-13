@@ -33,3 +33,9 @@
 # round-trip tests fail on any Windows checkout with core.autocrlf on.
 /tests/fixtures/protocol/v1/*.json text eol=lf
 /tests/fixtures/runtime/v1/*.json text eol=lf
+
+# Issue #478: the native agent loop's provider/tool scripts are parsed with
+# `deny_unknown_fields` and compared against recorded outcomes, so they are
+# pinned to LF for the same reason the two wire-fixture sets above are -- a
+# CRLF checkout must not be able to change what a loop-correctness test sees.
+/tests/fixtures/runtime/native/*.json text eol=lf
