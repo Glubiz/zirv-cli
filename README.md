@@ -613,6 +613,14 @@ to the section that documents it in depth.
   your instruction files](#reviewing-your-instruction-files) and
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
+- **Configured capabilities** — `capabilities` reports every non-shell
+  integration a native session can use — MCP servers, web search/fetch,
+  browser, language diagnostics, artifact and frontend rendering — as
+  `available`, `unavailable` or `unverified`, naming the missing binary,
+  credential or config key for anything absent. `--probe` contacts each
+  configured MCP server to verify it; `--require` gates a script on the same
+  admission rule the workflow engine applies. See [Native configured
+  capabilities](#native-configured-capabilities).
 - **Local runtime protocol** — `api` (`schema`/`serve`/`call`) publishes zirv's
   versioned local control surface: an owner-only unix socket or Windows named
   pipe carrying NDJSON requests, replies and event subscriptions, with a
@@ -1481,6 +1489,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx handover [--agent <name>] [--model <tier\|id>] [--dry-run] [--force]` | Swaps the orchestrator seat's harness or model in place mid-session, carrying a handoff packet across the swap — see [Cross-harness fallback and handover](#cross-harness-fallback-and-handover) below |
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
+| `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
 
 ### Runtime backends
 
@@ -1732,6 +1741,97 @@ and every model-calling call site in `src/` has a named implementation
 owner, checked on every run. The architecture decision behind all of this is
 recorded in
 [`docs/design/2026-09-11-native-runtime-contracts.md`](docs/design/2026-09-11-native-runtime-contracts.md).
+
+### Native configured capabilities
+
+A native session inherits nothing from a coding harness, so the non-shell
+capabilities a workflow needs — MCP servers, a browser, web search, language
+diagnostics, artifact presentation — are **configured**, never assumed. Zirv
+does not claim a raw model API provides any of them.
+
+```bash
+zirv ctx capabilities                       # the report, one row per integration
+zirv ctx capabilities --probe               # also contact each configured MCP server
+zirv ctx capabilities --require browser     # exit non-zero unless it would admit a step
+```
+
+Every row is exactly one of three states. `available` means zirv found the
+backend. `unavailable` means it did not, and the row names the missing binary,
+credential or config key. `unverified` means it is configured but has not been
+contacted this run — discovery reads configuration, `PATH` and the repository
+tree and contacts nothing, so a configured MCP server nobody spoke to is not
+evidence that it answers. `--probe` is what turns an unverified MCP row into a
+verified one. The workflow engine reads the same report and refuses to enter a
+step whose required integration is unavailable, quoting the diagnosis, instead
+of failing halfway through it.
+
+Zirv speaks MCP itself, over a local stdio server or a remote Streamable HTTP
+endpoint with a bearer credential from the same store the direct providers use.
+It negotiates the 2025-11-25 revision (refusing an unknown one rather than
+guessing), discovers tools and resources, calls them, cancels with
+`notifications/cancelled`, and reconnects with re-discovery. A reconnect that
+changed or removed a tool invalidates it: a call naming that tool is refused
+until its current schema is described again, so a stale call can never execute
+a different tool. Server descriptions and results are untrusted data — bounded,
+redacted, never executed, and streamed into the existing output store when
+large. A catalogue at or below `capabilities.max_inline_mcp_tools` is exposed
+as ordinary tools, namespaced `mcp__<server>__<tool>` so a server can never
+shadow a built-in name; a larger one is reachable only through a compact index
+(`mcp_list`), an on-demand schema (`mcp_describe`) and `mcp_call`, so a big
+toolset never enters every model request.
+
+MCP invocation crosses the same execution broker, canonical policy, tool
+receipts and output limits as every built-in tool, with the effects an operator
+declared for that server — never the server's own claim about itself. An MCP
+call is never blindly replayed, and a cancelled one is reported as an unknown
+outcome.
+
+Web results always carry the source URL they came from, and a row that cannot
+name one is dropped. Browser captures return the on-disk evidence path they
+actually wrote, and a capture that produced no readable file is an error rather
+than a success. A capability with no configured backend returns a typed
+unavailable result naming what is missing; there is no code path that returns
+an empty success. Outbound requests pass one interception seam
+(`EgressGuard`), which is where
+[issue #466](https://github.com/Glubiz/zirv-cli/issues/466)'s on-device
+obfuscation belongs rather than a second subsystem beside it.
+
+Configuration lives under `[capabilities]` in `~/.zirv/ctx.toml` and is off by
+default:
+
+```toml
+[capabilities]
+enabled = true
+max_inline_mcp_tools = 24        # above this, only the index plus describe
+
+[capabilities.web]
+search_endpoint = "https://search.example/api?q={query}"
+search_credential = "env:SEARCH_TOKEN"   # env:NAME, store:<item> or file:<path>
+fetch_enabled = true
+allow_hosts = ["docs.rs", ".rust-lang.org"]   # empty means nothing is reachable
+
+[capabilities.browser]
+enabled = true
+# binary = "chromium"            # discovered on PATH when unset
+
+[[capabilities.mcp]]
+name = "docs"
+enabled = true
+transport = { mode = "stdio", command = "mcp-docs", args = [] }
+effects = { network = true }     # what this server's tools may do, per the operator
+
+[[capabilities.mcp]]
+name = "remote"
+enabled = true
+transport = { mode = "http", url = "https://mcp.example/rpc", credential = "env:MCP_TOKEN" }
+```
+
+The whole `[capabilities]` table is operator-only (see [Trust
+boundary](#trust-boundary)): every key names a command zirv spawns, an endpoint
+it authenticates to, a credential, or a browser it launches, so there is no
+narrowing half a repository checkout could legitimately set. The full contract
+is documented in
+[`docs/design/2026-09-13-native-capabilities.md`](docs/design/2026-09-13-native-capabilities.md).
 
 ### Runtime protocol v1 (`zirv ctx api`)
 
