@@ -254,6 +254,20 @@ pub struct ApiServer {
     /// the attachment capability is negotiated away rather than advertised
     /// and then refused.
     host: Mutex<Option<Arc<dyn SessionHost>>>,
+    /// Issue #352. Serialises "mutate the host's attachment table, then
+    /// announce the controller it produced" into one critical section.
+    ///
+    /// The two pieces of state involved live behind two different mutexes --
+    /// the HOST's session table and this server's `controllers` cache -- and
+    /// composing two locks by taking them in sequence composes nothing: two
+    /// racing takeovers could each mutate the host in one order and publish in
+    /// the other, leaving every subscriber told about a controller that is no
+    /// longer the one holding the seat, until the next change happened to
+    /// correct it. Ordering the whole operation here is the smallest fix that
+    /// makes the announced controller always the one the host actually
+    /// granted; it is never held across a pty write, because the host's own
+    /// methods only touch its table.
+    attachment_gate: Mutex<()>,
     stopping: Arc<AtomicBool>,
     owner_uid: Option<u32>,
 }
@@ -278,6 +292,7 @@ impl ApiServer {
             backend: Mutex::new(backend),
             source,
             host: Mutex::new(None),
+            attachment_gate: Mutex::new(()),
             stopping: Arc::new(AtomicBool::new(false)),
             owner_uid: server_uid(),
         });
@@ -293,6 +308,17 @@ impl ApiServer {
         match self.host.lock() {
             Ok(mut guard) => *guard = Some(host),
             Err(poisoned) => *poisoned.into_inner() = Some(host),
+        }
+    }
+
+    /// The attachment gate, poison-tolerant for the same reason `lock` is:
+    /// the state it orders is a table, not a half-written invariant, and
+    /// refusing every later attach would turn one panic into a runtime whose
+    /// sessions can never be reattached.
+    fn attachment_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.attachment_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 
@@ -615,6 +641,12 @@ impl ApiServer {
             surface: UiSurface,
             cwd: String,
             prompt: String,
+            /// Issue #352: the operator's own trailing arguments. Defaulted,
+            /// so a caller that never sends them is unchanged -- but parsed,
+            /// because dropping them silently is how `zirv chat -- --model x`
+            /// quietly became `zirv chat`.
+            #[serde(default)]
+            extra_args: Vec<String>,
         }
         let params: Params = parse_params(params)?;
         let spec = SessionSpec {
@@ -626,7 +658,7 @@ impl ApiServer {
             surface: params.surface,
             cwd: std::path::PathBuf::from(params.cwd),
             prompt: params.prompt,
-            extra_args: Vec::new(),
+            extra_args: params.extra_args,
         };
         // Issue #352: a runtime that owns terminals answers `session.start`
         // itself. Checked before the backend, and only when a host is
@@ -873,10 +905,14 @@ impl ApiServer {
             (Some(rows), Some(cols)) => Some((rows, cols)),
             _ => None,
         };
+        // Held across both the host mutation and the announcement: see
+        // `attachment_gate`.
+        let gate = self.attachment_gate();
         let attachment = self.with_host(|host| {
             host.attach(&params.session_id, &params.client_id, params.mode, size)
         })?;
         self.publish_controller(&facts, &attachment);
+        drop(gate);
         Ok(json!({ "attachment": attachment }))
     }
 
@@ -886,18 +922,22 @@ impl ApiServer {
         // Deliberately nothing else: detaching is a CLIENT lifecycle event.
         // The session keeps its process, its pty, its supervisor and its
         // state -- `session.stop` is the only method that ends one.
+        let gate = self.attachment_gate();
         let attachment =
             self.with_host(|host| host.detach(&params.session_id, &params.client_id))?;
         self.publish_controller(&facts, &attachment);
+        drop(gate);
         Ok(json!({ "attachment": attachment }))
     }
 
     fn takeover_result(&self, params: &Value) -> Result<Value, ApiError> {
         let params: ClientParams = parse_params(params)?;
         let facts = self.pinned_facts(&params.session_id, None)?;
+        let gate = self.attachment_gate();
         let attachment =
             self.with_host(|host| host.takeover(&params.session_id, &params.client_id))?;
         self.publish_controller(&facts, &attachment);
+        drop(gate);
         Ok(json!({ "attachment": attachment }))
     }
 
@@ -1929,6 +1969,186 @@ mod tests {
                 .hello()
                 .capabilities
                 .contains(&Capability::SessionAttach)
+        );
+    }
+
+    /// A host that parks INSIDE `takeover`, after it has already moved the
+    /// seat and without holding any lock of its own -- exactly the window
+    /// between the host mutation and the announcement that the two-mutex
+    /// version left open.
+    struct BlockingHost {
+        facts: Vec<SessionFacts>,
+        controller: Mutex<Option<String>>,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl std::fmt::Debug for BlockingHost {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("BlockingHost")
+        }
+    }
+
+    impl BlockingHost {
+        fn snapshot(&self, caller: &str) -> Attachment {
+            let controller = self.controller.lock().expect("controller").clone();
+            Attachment {
+                role: if controller.as_deref() == Some(caller) {
+                    super::super::wire::AttachRole::Controller
+                } else {
+                    super::super::wire::AttachRole::Observer
+                },
+                controller,
+                clients: vec![caller.to_string()],
+                rows: 24,
+                cols: 80,
+            }
+        }
+    }
+
+    impl SessionHost for BlockingHost {
+        fn sessions(&self) -> Vec<SessionFacts> {
+            self.facts.clone()
+        }
+
+        fn start(&self, _spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+            Err(ApiError::new(ErrorCode::Unsupported, "no terminals"))
+        }
+
+        fn attach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            _mode: AttachMode,
+            _size: Option<(u16, u16)>,
+        ) -> Result<Attachment, ApiError> {
+            Ok(self.snapshot(client_id))
+        }
+
+        fn detach(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            Ok(self.snapshot(client_id))
+        }
+
+        fn takeover(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            // The seat moves first, under this host's own lock...
+            {
+                let mut controller = self.controller.lock().expect("controller");
+                *controller = Some(client_id.to_string());
+            }
+            // ...and only then does the call park, holding NOTHING of its
+            // own. Without the server's attachment gate, a second attachment
+            // call sails straight past this point and announces its own
+            // controller while this one is still on its way to announcing.
+            let parked = self.release.lock().expect("release").take();
+            if let Some(parked) = parked {
+                let _ = self.entered.send(());
+                let _ = parked.recv();
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn resize(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<Attachment, ApiError> {
+            Ok(self.snapshot(client_id))
+        }
+
+        fn screen(&self, _session_id: &str, _client_id: &str) -> Result<ScreenView, ApiError> {
+            Ok(ScreenView::default())
+        }
+
+        fn write_raw(
+            &self,
+            _session_id: &str,
+            _client_id: &str,
+            _bytes: &[u8],
+        ) -> Result<(), ApiError> {
+            Ok(())
+        }
+
+        fn stop(&self, _session_id: &str) -> Result<bool, ApiError> {
+            Ok(true)
+        }
+    }
+
+    /// Moving the controller seat and ANNOUNCING the move are one critical
+    /// section, not two.
+    ///
+    /// The host's session table and this server's announced-controller cache
+    /// are separate mutexes; taking them in sequence composes nothing, so two
+    /// racing attachment calls could mutate in one order and publish in the
+    /// other, leaving every subscriber told about a controller that is not the
+    /// one holding the seat. Proved deterministically rather than by racing:
+    /// the first call is parked inside the host with no lock of its own held,
+    /// and a second attachment call must then be unable to finish.
+    #[test]
+    fn an_attachment_change_and_its_announcement_are_one_critical_section() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let host = Arc::new(BlockingHost {
+            facts: vec![facts(HOSTED, SessionState::Idle)],
+            controller: Mutex::new(None),
+            entered: entered_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        let server = ApiServer::new(Box::new(StaticSource(host.sessions())), None);
+        server.attach_host(host.clone() as Arc<dyn SessionHost>);
+
+        let parked_server = Arc::clone(&server);
+        let parked = std::thread::spawn(move || {
+            call(
+                &parked_server,
+                Method::SessionTakeover,
+                json!({"session_id": HOSTED, "client_id": "first"}),
+            );
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first takeover reached the host");
+
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let second_server = Arc::clone(&server);
+        let second = std::thread::spawn(move || {
+            call(
+                &second_server,
+                Method::SessionDetach,
+                json!({"session_id": HOSTED, "client_id": "second"}),
+            );
+            let _ = finished_tx.send(());
+        });
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second attachment change finished while the first had moved the seat but not yet              announced it -- that is the interleaving that publishes a stale controller"
+        );
+
+        let _ = release_tx.send(());
+        parked.join().expect("first");
+        second.join().expect("second");
+
+        let read = result(&call(
+            &server,
+            Method::SessionRead,
+            json!({"session_id": HOSTED, "after_revision": 0}),
+        ));
+        let announced = read["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .rev()
+            .find(|frame| frame["payload"]["kind"] == json!("controller_changed"))
+            .map(|frame| frame["payload"]["controller"].clone())
+            .expect("at least one controller_changed");
+        let held = host.controller.lock().expect("controller").clone();
+        assert_eq!(
+            announced,
+            json!(held),
+            "the last announced controller must be the one the host is holding"
         );
     }
 
