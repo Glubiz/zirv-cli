@@ -32,6 +32,7 @@
 pub mod client;
 pub mod host;
 pub mod namespace;
+pub mod native;
 pub mod service;
 
 use std::io::{IsTerminal, Write};
@@ -232,6 +233,30 @@ fn run_serve<W: Write>(
         }
         for (short, error) in &report.failed {
             writeln!(w, "  could not resume {short}: {error}")?;
+        }
+        // Issue #489: the native half, reported with the same honesty rule.
+        // A resumed conversation is durable state read back, never a process
+        // claimed to have survived, and an execution whose outcome nobody
+        // knows is named rather than retried.
+        let native = service.restore_native();
+        for id in &native.resumed {
+            match service.native().restored_from(id) {
+                Some(previous) => writeln!(
+                    w,
+                    "  resumed native {id} from its journal (generation {previous} is fenced out)"
+                )?,
+                None => writeln!(w, "  resumed native {id} from its journal")?,
+            }
+        }
+        for execution in &native.outcome_unknown {
+            writeln!(
+                w,
+                "  outcome unknown: execution {execution} had begun when the runtime stopped -- \
+                 reconcile it before anything retries its effect; zirv will not"
+            )?;
+        }
+        for (short, error) in &native.lost {
+            writeln!(w, "  could not resume native {short}: {error}")?;
         }
     }
     w.flush()?;

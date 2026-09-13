@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::super::CtxResult;
 use super::super::api::server::{
-    ApiServer, RegistrySource, RunningServer, SessionHost, SessionSource,
+    ApiServer, NativeHost, RegistrySource, RunningServer, SessionHost, SessionSource,
 };
 use super::super::api::transport::Endpoint;
 use super::super::api::wire::SessionFacts;
@@ -36,6 +36,7 @@ use super::super::config::CtxConfig;
 use super::super::state::{self, StateDir};
 use super::host::{RuntimeHost, SpawnSpec, TopologyEntry};
 use super::namespace::{self, Liveness, Namespace, ProcessIdentity};
+use super::native::{NativeEnvironment, NativeRestoreReport, NativeSessions, ProviderEnvironment};
 
 /// How often the service drains every session's pty into its parser. Fast
 /// enough that a reattaching client sees a current screen, slow enough that an
@@ -118,13 +119,18 @@ pub fn clear_shutdown(state: &StateDir, name: &str) {
 #[derive(Debug)]
 pub struct HostSource {
     host: Arc<RuntimeHost>,
+    /// Issue #489: the native conversations this runtime owns, published from
+    /// the same source as its terminals so a client sees ONE session list
+    /// rather than one per backend.
+    native: Arc<NativeSessions>,
     registry: RegistrySource,
 }
 
 impl HostSource {
-    pub fn new(host: Arc<RuntimeHost>, state: StateDir) -> Self {
+    pub fn new(host: Arc<RuntimeHost>, native: Arc<NativeSessions>, state: StateDir) -> Self {
         Self {
             host,
+            native,
             registry: RegistrySource::new(state),
         }
     }
@@ -133,6 +139,7 @@ impl HostSource {
 impl SessionSource for HostSource {
     fn sessions(&self) -> Vec<SessionFacts> {
         let mut facts = self.host.sessions();
+        facts.extend(NativeHost::sessions(self.native.as_ref()));
         let owned: BTreeSet<String> = facts.iter().map(|entry| entry.session_id.clone()).collect();
         facts.extend(
             self.registry
@@ -162,6 +169,9 @@ pub struct RuntimeService {
     namespace: String,
     instance: String,
     host: Arc<RuntimeHost>,
+    /// Issue #489: the native conversations. A second host on ONE server and
+    /// one endpoint -- not a second service, and not a private wire.
+    native: Arc<NativeSessions>,
     /// Dropped last: dropping it stops the accept loop and removes the
     /// endpoint.
     running: RunningServer,
@@ -171,6 +181,27 @@ impl RuntimeService {
     /// Binds the endpoint and publishes the namespace record. Fails rather
     /// than steals when a live runtime already owns the namespace.
     pub fn start(state: StateDir, namespace_name: &str, cfg: &CtxConfig) -> CtxResult<Self> {
+        Self::start_with(
+            state,
+            namespace_name,
+            cfg,
+            Arc::new(ProviderEnvironment::new(
+                Default::default(),
+                cfg.supervise.max_writers,
+            )),
+        )
+    }
+
+    /// The form a test uses: the same service, with the native environment
+    /// (route resolution and turn execution) injected, so every durable and
+    /// protocol behaviour below can be proven without a provider, a credential
+    /// or a network.
+    pub fn start_with(
+        state: StateDir,
+        namespace_name: &str,
+        cfg: &CtxConfig,
+        environment: Arc<dyn NativeEnvironment>,
+    ) -> CtxResult<Self> {
         let now = state::now_secs();
         let stale_after = cfg.session.stale_after_secs_or_default();
         let existing = namespace::read(&state, namespace_name);
@@ -203,11 +234,13 @@ impl RuntimeService {
             cfg.session.scrollback_rows_or_default(),
             cfg.session.history,
         );
-        let source = HostSource::new(Arc::clone(&host), state.clone());
+        let native = NativeSessions::new(state.clone(), namespace_name, &instance, environment)?;
+        let source = HostSource::new(Arc::clone(&host), Arc::clone(&native), state.clone());
         let server = ApiServer::new(Box::new(source), None);
         // Before the listener binds, so no connection can ever be told a
         // different capability set than the one this server will honour.
         server.attach_host(Arc::clone(&host) as Arc<dyn SessionHost>);
+        server.attach_native(Arc::clone(&native) as Arc<dyn NativeHost>);
         let endpoint = super::super::api::server::endpoint_for(&state);
         let running = RunningServer::start(&endpoint, server)?;
 
@@ -228,6 +261,7 @@ impl RuntimeService {
             namespace: namespace_name.to_string(),
             instance,
             host,
+            native,
             running,
         })
     }
@@ -238,6 +272,10 @@ impl RuntimeService {
 
     pub fn host(&self) -> &Arc<RuntimeHost> {
         &self.host
+    }
+
+    pub fn native(&self) -> &Arc<NativeSessions> {
+        &self.native
     }
 
     pub fn namespace(&self) -> &str {
@@ -252,6 +290,15 @@ impl RuntimeService {
     /// conversation reference, each under a NEW session id that records the
     /// old one as its predecessor; everything else is reported, never
     /// respawned and never described as having survived.
+    /// Tier 2 for native conversations (issue #489, item 6). Separate from
+    /// [`Self::restore`] because the two restore genuinely differently: a pty
+    /// entry's process is gone and can at best be relaunched, whereas a native
+    /// conversation's whole state is in the journal and comes back by being
+    /// read -- reconciled, fenced into a new generation, and never replayed.
+    pub fn restore_native(&self) -> NativeRestoreReport {
+        self.native.restore()
+    }
+
     pub fn restore(&self, cfg: &CtxConfig) -> RestoreReport {
         let mut report = RestoreReport::default();
         let Some(topology) = super::host::read_topology(&self.state, &self.namespace) else {
@@ -306,6 +353,7 @@ impl RuntimeService {
         if heartbeat {
             namespace::touch(&self.state, &self.namespace, state::now_secs());
             self.host.persist_topology();
+            self.native.persist_topology();
         }
     }
 
@@ -337,6 +385,11 @@ impl RuntimeService {
     /// and it is reached only from an explicit operator request.
     pub fn shutdown(self, stop_sessions: bool) {
         self.host.shutdown(stop_sessions);
+        // Issue #489: the native half of the same rule. The topology is
+        // drained either way, and a conversation is only ever completed when
+        // the operator asked for that -- `--stop-sessions`, or `zirv session
+        // stop <id>` one at a time.
+        self.native.shutdown(stop_sessions);
         namespace::remove(&self.state, &self.namespace);
         clear_shutdown(&self.state, &self.namespace);
         drop(self.running);
