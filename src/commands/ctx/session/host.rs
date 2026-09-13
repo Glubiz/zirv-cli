@@ -56,6 +56,37 @@ const QUIT_GRACE: Duration = Duration::from_secs(3);
 /// `dash::pane`'s own per-tick budget discipline.
 const PUMP_BUDGET_BYTES: usize = 512 * 1024;
 
+/// How many ENDED sessions a runtime keeps in its table.
+///
+/// An ended session has already let go of its pty, its writer, its reader
+/// channel, its turn-signal endpoint and (on an explicit stop) its registry
+/// record -- see [`HostSession::retire`]. What is left is its final rendered
+/// screen, so a client that was watching can still read the last frame and
+/// `zirv session list` can still show what just happened. This cap is what
+/// stops a service that has been up for a week from remembering every session
+/// it ever ran: past it, the oldest ended entries are dropped entirely.
+pub const MAX_ENDED_SESSIONS: usize = 16;
+
+/// Drops the oldest ended sessions past `cap`. Live sessions are never
+/// touched, whatever the cap is: this bounds HISTORY, not concurrency.
+fn prune_ended(sessions: &mut BTreeMap<String, HostSession>, cap: usize) {
+    let mut ended: Vec<(u64, String)> = sessions
+        .iter()
+        .filter(|(_, session)| session.ended)
+        .map(|(id, session)| (session.ended_at.unwrap_or(0), id.clone()))
+        .collect();
+    if ended.len() <= cap {
+        return;
+    }
+    // (ended_at, id) so sessions that ended in the same second still have a
+    // total order, and pruning is deterministic.
+    ended.sort();
+    let excess = ended.len() - cap;
+    for (_, id) in ended.into_iter().take(excess) {
+        sessions.remove(&id);
+    }
+}
+
 /// What a caller must supply to have the runtime own a session's terminal.
 /// `argv` is already resolved (adapter, model flags, prompt, sandbox flags):
 /// building it is the launch path's job, and duplicating that here would be
@@ -171,9 +202,13 @@ struct HostSession {
     restored_from: Option<String>,
     started_at: u64,
     parser: vt100::Parser,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    output: Receiver<Vec<u8>>,
+    /// The pty/ConPTY handles, the writer and the reader channel: everything
+    /// a session needs only while its process is ALIVE. `None` once the
+    /// session has been retired (see [`HostSession::retire`]) -- a stopped or
+    /// exited session holds no terminal, only the screen it left behind.
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    writer: Option<Box<dyn Write + Send>>,
+    output: Option<Receiver<Vec<u8>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     lifecycle: supervise::ChildGuard,
     /// The registry record this session is filed under. Held by the SERVICE,
@@ -195,6 +230,8 @@ struct HostSession {
     /// Completed turns, for `stamp_in_flight`'s turn number -- the same
     /// counter `wrap`'s pump loop keeps.
     turns: u64,
+    /// When this session ended, for the retention order `prune_ended` uses.
+    ended_at: Option<u64>,
     /// Every attached client id, sorted. A client appears here exactly once
     /// regardless of how many times it re-attaches, so a crashed-and-
     /// reconnected client resumes its place rather than accumulating ghosts.
@@ -267,19 +304,61 @@ impl HostSession {
     /// Feeds queued pty bytes into the parser. Bounded per pass, and a closed
     /// channel marks the session ended rather than spinning on it.
     fn pump(&mut self) {
+        let Some(output) = self.output.as_ref() else {
+            // Retired: there is no channel left to drain, and the screen this
+            // session ended on is already in the parser.
+            return;
+        };
         let mut spent = 0usize;
+        let mut disconnected = false;
         while spent < PUMP_BUDGET_BYTES {
-            match self.output.try_recv() {
+            match output.try_recv() {
                 Ok(chunk) => {
                     spent += chunk.len();
                     self.parser.process(&chunk);
                 }
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.ended = true;
-                    return;
+                    disconnected = true;
+                    break;
                 }
             }
+        }
+        if disconnected {
+            self.retire(state::now_secs());
+        }
+    }
+
+    /// Lets go of everything a session needs only while its process is alive:
+    /// the pty master, the writer, the reader channel and the turn-signal
+    /// endpoint. The `vt100::Parser` is deliberately KEPT -- a client that was
+    /// watching, or one that attaches afterwards, still gets the frame the
+    /// agent ended on, which costs a screen's worth of memory rather than a
+    /// whole pseudoterminal.
+    ///
+    /// Idempotent, and it drains one last time before dropping the channel so
+    /// the retained frame is genuinely the last thing the child wrote rather
+    /// than whatever happened to be parsed at the previous tick.
+    fn retire(&mut self, now: u64) {
+        if let Some(output) = self.output.take() {
+            let mut spent = 0usize;
+            while spent < PUMP_BUDGET_BYTES {
+                match output.try_recv() {
+                    Ok(chunk) => {
+                        spent += chunk.len();
+                        self.parser.process(&chunk);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        self.master = None;
+        self.writer = None;
+        self.signal = None;
+        self.working = false;
+        self.ended = true;
+        if self.ended_at.is_none() {
+            self.ended_at = Some(now);
         }
     }
 
@@ -333,6 +412,10 @@ pub struct RuntimeHost {
     scrollback_rows: usize,
     /// Tier 3. Off by default; see [`RuntimeHost::history_warning`].
     history: bool,
+    /// How many ENDED sessions the table keeps (see [`MAX_ENDED_SESSIONS`]).
+    /// An atomic rather than a constructor parameter so a test can lower it
+    /// without every caller having to carry a knob nothing else sets.
+    ended_cap: std::sync::atomic::AtomicUsize,
     sessions: Mutex<BTreeMap<String, HostSession>>,
 }
 
@@ -369,6 +452,7 @@ impl RuntimeHost {
             instance: instance.to_string(),
             scrollback_rows,
             history,
+            ended_cap: std::sync::atomic::AtomicUsize::new(MAX_ENDED_SESSIONS),
             sessions: Mutex::new(BTreeMap::new()),
         })
     }
@@ -394,15 +478,21 @@ impl RuntimeHost {
     /// at all -- which is what makes notifications, rot scoring and attention
     /// keep working while nobody is watching.
     pub fn pump(&self) {
-        for session in self.lock().values_mut() {
+        let now = state::now_secs();
+        let mut sessions = self.lock();
+        for session in sessions.values_mut() {
             session.pump();
             session.drain_signals();
             // Cheap and exact: the child's own exit is the authority on
-            // whether the session ended, not the output channel alone.
+            // whether the session ended, not the output channel alone. An
+            // agent that exited on its own releases its terminal here, on the
+            // very next tick -- the operator never asked for it to end, so
+            // nothing else about the session changes.
             if !session.ended && matches!(session.child.try_wait(), Ok(Some(_))) {
-                session.ended = true;
+                session.retire(now);
             }
         }
+        prune_ended(&mut sessions, self.ended_cap());
     }
 
     /// Spawns a session whose terminal this runtime owns.
@@ -503,9 +593,9 @@ impl RuntimeHost {
             restored_from: spec.restored_from,
             started_at: state::now_secs(),
             parser: vt100::Parser::new(spec.rows, spec.cols, self.scrollback_rows),
-            master,
-            writer,
-            output: rx,
+            master: Some(master),
+            writer: Some(writer),
+            output: Some(rx),
             child,
             lifecycle,
             guard,
@@ -513,6 +603,7 @@ impl RuntimeHost {
             last_signal_at: None,
             working: false,
             turns: 0,
+            ended_at: None,
             clients: Vec::new(),
             controller: None,
             rows: spec.rows,
@@ -522,6 +613,26 @@ impl RuntimeHost {
         self.lock().insert(spec.session_id.clone(), session);
         self.persist_topology();
         Ok(spec.session_id)
+    }
+
+    fn ended_cap(&self) -> usize {
+        self.ended_cap.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test seam: lower the ended-session cap so pruning can be exercised
+    /// without spawning [`MAX_ENDED_SESSIONS`] real ptys.
+    #[cfg(test)]
+    pub fn set_ended_cap_for_test(&self, cap: usize) {
+        self.ended_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test seam: whether this session still holds any part of a terminal.
+    #[cfg(test)]
+    pub fn holds_terminal_for_test(&self, session_id: &str) -> Option<bool> {
+        self.lock().get(session_id).map(|session| {
+            session.master.is_some() || session.writer.is_some() || session.output.is_some()
+        })
     }
 
     /// The rendered screen of one session, with no attachment required. A
@@ -725,10 +836,15 @@ impl SessionHost for RuntimeHost {
                     "this session has ended",
                 ));
             }
-            session
-                .writer
+            let Some(writer) = session.writer.as_mut() else {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    "this session no longer holds a terminal",
+                ));
+            };
+            writer
                 .write_all(bytes)
-                .and_then(|()| session.writer.flush())
+                .and_then(|()| writer.flush())
                 .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
             // Issue #281's edge, unchanged: the operator's own keystroke is
             // what reliably starts a turn. Stamped here so a crash of the
@@ -755,10 +871,15 @@ impl SessionHost for RuntimeHost {
                 .map(|adapter| adapter.quit_sequence().to_string())
                 .unwrap_or_default();
             let quit = quit.as_str();
-            let sink: &mut dyn Write = &mut *session.writer;
+            // The harness's own quit sequence needs the writer; a session
+            // whose writer is already gone still goes through the rest of the
+            // ladder, against a sink that discards it.
+            let mut discard = std::io::sink();
+            let sink: &mut dyn Write = match session.writer.as_mut() {
+                Some(writer) => &mut **writer,
+                None => &mut discard,
+            };
             let _ = wrap::quit_child(sink, &mut session.child, quit, QUIT_GRACE);
-            session.ended = true;
-            session.working = false;
             session.lifecycle.release();
             // The registry entry goes with the process it described -- but
             // only here, on the operator's explicit stop. `detach` does not
@@ -766,12 +887,18 @@ impl SessionHost for RuntimeHost {
             // the operator asked for `--stop-sessions`.
             session.guard.release();
             wrap::unpublish_socket_path(&self.state, &session.id);
-            session.signal = None;
             session.clients.clear();
             session.controller = None;
+            // The pty master, the writer and the reader channel go here, with
+            // the process they belonged to. Without this, every stop/restart
+            // cycle on a long-lived runtime leaked a pseudoterminal and its
+            // scrollback, and `zirv session list` grew forever.
+            session.retire(state::now_secs());
             Ok(true)
         })?;
         if stopped {
+            let cap = self.ended_cap();
+            prune_ended(&mut self.lock(), cap);
             self.persist_topology();
         }
         Ok(stopped)
@@ -871,12 +998,14 @@ pub fn launch_spec(spec: &SessionSpec, session_id: &str, state: &StateDir) -> Ct
 /// disagree about the terminal's shape (the bug class `dash::pane::resize`
 /// guards against for the same reason).
 fn resize_session(session: &mut HostSession, rows: u16, cols: u16) {
-    let _ = session.master.resize(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    });
+    if let Some(master) = session.master.as_ref() {
+        let _ = master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+    }
     session.parser.screen_mut().set_size(rows, cols);
     session.rows = rows;
     session.cols = cols;
@@ -1141,6 +1270,106 @@ mod tests {
                 .any(|(record, _)| record.session == id),
             "an explicitly stopped session releases its registry record"
         );
+    }
+
+    /// The operator's trailing arguments survive the whole protocol path.
+    ///
+    /// `zirv chat -- --foo` sends them in `session.start`'s `extra_args`, and
+    /// the runtime composes the launch itself -- so if any link in that chain
+    /// drops the field, the flags an operator typed are silently gone and the
+    /// session starts anyway, which is the worst possible failure shape. This
+    /// pins the far end: whatever the client sent arrives in the argv the host
+    /// is about to spawn.
+    #[test]
+    fn the_operators_trailing_arguments_reach_the_hosts_launch_spec() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let spec = SessionSpec {
+            runtime: RuntimeKind::Harness,
+            role: "orchestrator".to_string(),
+            agent: Some("claude".to_string()),
+            provider_route: None,
+            model: None,
+            surface: UiSurface::Terminal,
+            cwd: repo.path().to_path_buf(),
+            prompt: String::new(),
+            extra_args: vec!["--zirv-test-flag".to_string(), "value-42".to_string()],
+        };
+        let launch = launch_spec(&spec, "88888888-2222-4333-8444-555555555555", &state)
+            .expect("launch spec");
+        assert!(
+            launch
+                .argv
+                .windows(2)
+                .any(|pair| pair == ["--zirv-test-flag", "value-42"]),
+            "the operator's own arguments must reach the argv, in order: {:?}",
+            launch.argv
+        );
+    }
+
+    /// A stopped session lets go of its terminal, and the table of ended
+    /// sessions is bounded. Before this, every `zirv session stop` (and so
+    /// every chat restart) on a long-lived runtime left a live pty master, its
+    /// writer and its scrollback behind forever, and `zirv session list` grew
+    /// to include every session the service had ever run.
+    ///
+    /// The cap is lowered for the test rather than spawning
+    /// `MAX_ENDED_SESSIONS` real ptys: what is being proved is that pruning
+    /// happens at the cap, not what the cap's value is.
+    #[test]
+    fn stopped_sessions_release_their_terminals_and_the_table_stays_bounded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        host.set_ended_cap_for_test(1);
+        let ids: Vec<String> = (0..3)
+            .map(|index| format!("7777777{index}-2222-4333-8444-555555555555"))
+            .collect();
+
+        for id in &ids {
+            host.spawn(spawn_spec(id, tmp.path(), "ZIRVLEAK"))
+                .expect("spawn");
+            assert_eq!(
+                host.holds_terminal_for_test(id),
+                Some(true),
+                "a live session holds its pty"
+            );
+        }
+        assert_eq!(host.sessions().len(), 3);
+
+        for id in &ids {
+            assert!(host.stop(id).expect("stop"));
+        }
+
+        // Every session that is still in the table has let go of its
+        // terminal, and only the cap's worth of ended history is kept.
+        let remaining = host.sessions();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "three stops under a cap of one must leave one ended entry, not three"
+        );
+        for facts in &remaining {
+            assert_eq!(facts.state, SessionState::Ended);
+            assert_eq!(
+                host.holds_terminal_for_test(&facts.session_id),
+                Some(false),
+                "an ended session holds no pty master, writer or reader channel"
+            );
+        }
+        // The one that survived pruning is the most recent, and its final
+        // screen is still readable -- retiring frees the terminal, not the
+        // frame the agent ended on.
+        assert_eq!(remaining[0].session_id, ids[2]);
+        assert!(
+            host.screen_for_test(&ids[2])
+                .is_some_and(|screen| screen.contains("ZIRVLEAK")),
+            "the last frame survives the terminal it was drawn on"
+        );
+        assert!(host.holds_terminal_for_test(&ids[0]).is_none());
     }
 
     /// A restored session is a NEW session that continues an old

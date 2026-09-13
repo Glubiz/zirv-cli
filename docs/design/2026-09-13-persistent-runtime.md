@@ -65,6 +65,15 @@ both intended:
   but "owner-only" is not a reason to accept an arbitrary command line over a
   socket when every launch a runtime needs to make is an adapter's own.
 
+`session.start` carries `extra_args` — what the operator wrote after `--` —
+as an optional, defaulted field. It is optional because every v1 caller that
+predates it (including the frozen request fixtures) must stay valid, and it
+is *parsed* rather than ignored because a runtime that accepted
+`zirv chat -- --model x` and quietly started a session without those flags
+would be worse than one that refused. Adding an optional parameter is not a
+wire break: the schema rendering gains a line, no existing request becomes
+invalid, and no response shape changes.
+
 The runtime opens orchestrator seats. Worker panes carry a task prompt, a
 work group, a budget and a report address that `dash::fulfill_spawn_request`
 assembles; hosting those is #489 (N20), and `launch_spec` refuses a
@@ -130,7 +139,34 @@ way to take it, announced to every client as one `controller_changed` event
 per real change. Observers may not type and may not resize somebody else's
 terminal; they render a clipped view instead.
 
-### 2.7 Shutdown signalling
+### 2.7 An ended session keeps its screen, not its terminal
+
+A session that stops — or whose agent exits on its own — is **retired**: the
+pty master, the writer, the reader channel and the turn-signal endpoint are
+dropped in the same breath as the child is reaped, after one last drain so the
+retained frame is genuinely the agent's last output. The `vt100::Parser`
+stays, so a client that was watching still sees how the session ended and
+`zirv session list` can still report it; that costs a screen, not a
+pseudoterminal.
+
+The table of ended sessions is then capped (`MAX_ENDED_SESSIONS`, 16): past
+it, the oldest ended entries are dropped entirely. Live sessions are never
+pruned — this bounds history, not concurrency. Without both halves, a runtime
+that had been up for a week leaked one pty and one scrollback per
+stop/restart cycle and listed every session it had ever run.
+
+### 2.8 One critical section for a seat change and its announcement
+
+The host's session table and the server's announced-controller cache are
+different mutexes, and taking two locks in sequence composes nothing: two
+racing attachment calls could mutate the host in one order and publish in the
+other, leaving every subscriber told about a controller that is not the one
+holding the seat. `ApiServer::attachment_gate` orders the whole operation —
+host mutation plus announcement — for `attach`, `detach` and `takeover`. It is
+never held across a pty write: the host methods it wraps only touch the
+attachment table.
+
+### 2.9 Shutdown signalling
 
 The serve loop watches for `<state>/runtime/<name>.shutdown`, which
 `zirv session stop --runtime` writes. A file rather than a new protocol
@@ -155,6 +191,21 @@ Tests are named in `session::{host,service,client,mod}` and in `chat`:
   previous holder.
 - **Stop:** `stopping_ends_the_process_and_releases_its_registry_record`, and
   a second stop reporting `false` rather than failing.
+- **Retirement and bounds (§2.7):**
+  `stopped_sessions_release_their_terminals_and_the_table_stays_bounded` —
+  three stops under a cap of one leave one ended entry, every remaining ended
+  session reports `holds_terminal_for_test == false`, and the surviving
+  entry's final frame is still readable.
+- **Seat announcement (§2.8):**
+  `an_attachment_change_and_its_announcement_are_one_critical_section` — a
+  host that parks inside `takeover` after moving the seat, holding no lock of
+  its own, must block a second attachment call. Verified to FAIL with the gate
+  removed and pass with it, so it is a regression test with teeth rather than
+  a race that happens to pass.
+- **Operator arguments:**
+  `the_operators_trailing_arguments_reach_the_hosts_launch_spec` — what a
+  client sends in `session.start`'s `extra_args` arrives, in order, in the
+  argv the host is about to spawn.
 - **Identity:** `a_recycled_pid_is_stale_even_though_the_process_is_alive`,
   `a_pid_with_no_start_identity_is_unverified_rather_than_guessed_at`,
   `a_live_runtime_is_refused_and_a_recycled_pid_is_replaceable`,
