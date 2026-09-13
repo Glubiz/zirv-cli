@@ -11,6 +11,7 @@ mod capability;
 pub mod delegation;
 mod files;
 mod process;
+mod workflow;
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -35,6 +36,7 @@ use self::process::{
     ProcessHandleArgs, ProcessLimits, ProcessManager, ProcessStartArgs, ProcessWaitArgs,
     ProcessWriteArgs,
 };
+use self::workflow::{WorkflowAdvanceArgs, WorkflowLookupArgs};
 use super::capabilities::{CapabilityError, CapabilityServices};
 use super::enforcement::{
     ApprovalGrant, ApprovalRequest, Authorization, BrokerError, ExecutionAction, ExecutionBroker,
@@ -79,6 +81,10 @@ pub const FRONTEND_REVIEW: &str = "frontend_review";
 pub const MCP_LIST: &str = "mcp_list";
 pub const MCP_DESCRIBE: &str = "mcp_describe";
 pub const MCP_CALL: &str = "mcp_call";
+pub const WORKFLOW_STATUS: &str = "workflow_status";
+pub const WORKFLOW_CONTEXT: &str = "workflow_context";
+pub const WORKFLOW_ADVANCE: &str = "workflow_advance";
+pub const WORKFLOW_APPROVE: &str = "workflow_approve";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -336,6 +342,10 @@ impl ToolRegistry {
             MCP_LIST => parse!(McpList, McpListArgs),
             MCP_DESCRIBE => parse!(McpDescribe, McpDescribeArgs),
             MCP_CALL => parse!(McpCall, McpCallArgs),
+            WORKFLOW_STATUS => parse!(WorkflowStatus, WorkflowLookupArgs),
+            WORKFLOW_CONTEXT => parse!(WorkflowContext, WorkflowLookupArgs),
+            WORKFLOW_ADVANCE => parse!(WorkflowAdvance, WorkflowAdvanceArgs),
+            WORKFLOW_APPROVE => parse!(WorkflowApprove, WorkflowLookupArgs),
             _ => unreachable!("registry membership and parser match stay in lockstep"),
         }?;
         parsed.validate()?;
@@ -454,6 +464,10 @@ enum ParsedTool {
     McpList(McpListArgs),
     McpDescribe(McpDescribeArgs),
     McpCall(McpCallArgs),
+    WorkflowStatus(WorkflowLookupArgs),
+    WorkflowContext(WorkflowLookupArgs),
+    WorkflowAdvance(WorkflowAdvanceArgs),
+    WorkflowApprove(WorkflowLookupArgs),
 }
 
 impl ParsedTool {
@@ -593,6 +607,10 @@ impl ParsedTool {
                 non_empty(&args.server, "server")?;
                 non_empty(&args.tool, "tool")
             }
+            Self::WorkflowStatus(args)
+            | Self::WorkflowContext(args)
+            | Self::WorkflowApprove(args) => workflow_id(args.id.as_deref()),
+            Self::WorkflowAdvance(args) => workflow_id(args.id.as_deref()),
             Self::McpCall(args) => {
                 non_empty(&args.server, "server")?;
                 non_empty(&args.tool, "tool")?;
@@ -806,6 +824,39 @@ impl ParsedTool {
                 arguments: args.arguments.clone(),
                 effects: ProcessEffects::default(),
             },
+            // Issue #484: the workflow store is SHARED state. Reading it is
+            // inert; advancing or approving is a write the broker prices as
+            // one, so a session with no writer permit for this worktree -- a
+            // read-only helper, a reviewer seat -- is refused at effect time
+            // rather than by a prompt it could be talked out of.
+            Self::WorkflowStatus(args) => ExecutionAction::Knowledge {
+                service: "workflow".into(),
+                operation: "status".into(),
+                scope: Some("shared".into()),
+                key: args.id.clone(),
+                write: false,
+            },
+            Self::WorkflowContext(args) => ExecutionAction::Knowledge {
+                service: "workflow".into(),
+                operation: "context".into(),
+                scope: Some("shared".into()),
+                key: args.id.clone(),
+                write: false,
+            },
+            Self::WorkflowAdvance(args) => ExecutionAction::Knowledge {
+                service: "workflow".into(),
+                operation: "advance".into(),
+                scope: Some("shared".into()),
+                key: args.id.clone(),
+                write: true,
+            },
+            Self::WorkflowApprove(args) => ExecutionAction::Knowledge {
+                service: "workflow".into(),
+                operation: "approve".into(),
+                scope: Some("shared".into()),
+                key: args.id.clone(),
+                write: true,
+            },
         })
     }
 
@@ -831,7 +882,9 @@ impl ParsedTool {
             | Self::CapabilityReport(_)
             | Self::ArtifactPresent(_)
             | Self::McpList(_)
-            | Self::McpDescribe(_) => RetryPolicy::Safe,
+            | Self::McpDescribe(_)
+            | Self::WorkflowStatus(_)
+            | Self::WorkflowContext(_) => RetryPolicy::Safe,
             // Each writes durable local evidence, so a repeat has to
             // reconcile with what is already there rather than assume a
             // clean slate.
@@ -842,6 +895,10 @@ impl ParsedTool {
             // A remote server's tool may have done anything at all; zirv
             // cannot know, so it never replays one.
             Self::McpCall(_) => RetryPolicy::NeverAfterStart,
+            // A repeated advance would move a SECOND step, not re-apply the
+            // first: the caller has to reconcile against the workflow's own
+            // current step rather than blindly retry.
+            Self::WorkflowAdvance(_) | Self::WorkflowApprove(_) => RetryPolicy::Reconcile,
             Self::WriteFile(_)
             | Self::ApplyPatch(_)
             | Self::ProcessWrite(_)
@@ -876,6 +933,27 @@ fn non_empty(value: &str, field: &str) -> Result<(), ToolError> {
     } else {
         Ok(())
     }
+}
+
+/// A workflow id is a path segment in the workflow store, so provider output
+/// can never name one outside it (issue #484). `None` is the repository's
+/// active workflow and needs no validation at all.
+fn workflow_id(id: Option<&str>) -> Result<(), ToolError> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(ToolError::new(
+            ToolErrorCode::InvalidArguments,
+            "workflow id must be 1..=128 characters of [A-Za-z0-9_-]",
+        ));
+    }
+    Ok(())
 }
 
 fn positive(value: usize, field: &str) -> Result<(), ToolError> {
@@ -1488,6 +1566,10 @@ impl NativeToolClient {
                 Ok(value)
             }
             ParsedTool::McpCall(args) => self.call_mcp(&args),
+            ParsedTool::WorkflowStatus(args) => self.workflow_status(args.id.as_deref()),
+            ParsedTool::WorkflowContext(args) => self.workflow_context(args.id.as_deref()),
+            ParsedTool::WorkflowAdvance(args) => self.workflow_advance(&args),
+            ParsedTool::WorkflowApprove(args) => self.workflow_approve(args.id.as_deref()),
         }
     }
 
@@ -1750,6 +1832,93 @@ impl NativeToolClient {
             "artifact": record,
             "plan": plan,
             "evidence_path": record.path.display().to_string(),
+        }))
+    }
+
+    // -- the workflow tools (issue #484, roadmap N15) --------------------
+    //
+    // Each is a thin adaptor over the SAME `workflow::engine` function the
+    // corresponding CLI verb calls, over the same durable state and through
+    // the same gates. None of them contains workflow logic of its own.
+
+    fn workflow_state(
+        &self,
+        id: Option<&str>,
+    ) -> Result<crate::commands::workflow::engine::WorkflowState, ToolError> {
+        use crate::commands::workflow::engine;
+
+        match id {
+            Some(id) => engine::load(&self.state, &self.repo, id).map_err(ToolError::external),
+            None => engine::load_active(&self.state, &self.repo)
+                .map_err(ToolError::external)?
+                .ok_or_else(|| {
+                    ToolError::new(
+                        ToolErrorCode::PreconditionFailed,
+                        "no active workflow in this repository; start one with `zirv workflow                          start` or name an id",
+                    )
+                }),
+        }
+    }
+
+    fn workflow_status(&self, id: Option<&str>) -> Result<Value, ToolError> {
+        let state = self.workflow_state(id)?;
+        let step = state.current();
+        Ok(json!({
+            "id": state.id,
+            "status": format!("{:?}", state.status),
+            "branch": state.branch,
+            "task": state.task,
+            "step": step.map(|step| json!({
+                "id": step.id,
+                "phase": format!("{:?}", step.phase),
+            })),
+            "completed_steps": state.completed_steps,
+            // The one fact a session most needs and can least infer: whether
+            // the workflow would let it finish right now, in the engine's own
+            // words. `None` means nothing blocks it.
+            "completion_gate": crate::commands::workflow::engine::native_completion_gate(
+                &self.state,
+                &self.repo,
+            ),
+        }))
+    }
+
+    fn workflow_context(&self, id: Option<&str>) -> Result<Value, ToolError> {
+        let state = self.workflow_state(id)?;
+        let home = crate::utils::home_dir().ok();
+        let text = crate::commands::workflow::engine::render_current_context(
+            &state,
+            &self.repo,
+            home.as_deref(),
+        )
+        .map_err(ToolError::external)?;
+        Ok(json!({ "id": state.id, "context": text }))
+    }
+
+    fn workflow_advance(&self, args: &WorkflowAdvanceArgs) -> Result<Value, ToolError> {
+        use crate::commands::workflow::engine;
+
+        let state = self.workflow_state(args.id.as_deref())?;
+        let advanced =
+            engine::advance_with_evidence(&self.state, state, args.outcome.outcome(), None, false)
+                .map_err(ToolError::external)?;
+        Ok(json!({
+            "id": advanced.id,
+            "status": format!("{:?}", advanced.status),
+            "step": advanced.current().map(|step| step.id.clone()),
+            "note": args.note,
+        }))
+    }
+
+    fn workflow_approve(&self, id: Option<&str>) -> Result<Value, ToolError> {
+        use crate::commands::workflow::engine;
+
+        let state = self.workflow_state(id)?;
+        let approved = engine::approve(&self.state, state).map_err(ToolError::external)?;
+        Ok(json!({
+            "id": approved.id,
+            "status": format!("{:?}", approved.status),
+            "step": approved.current().map(|step| step.id.clone()),
         }))
     }
 
@@ -2700,6 +2869,53 @@ fn native_definitions() -> Vec<ToolDefinition> {
                 RetryPolicy::NeverAfterStart,
             ),
         ),
+        // Issue #484 (roadmap N15): the workflow store is shared state, so
+        // every one of these carries the worktree-write claim and the two
+        // that MUTATE it declare the write capability -- a read-only session
+        // can read a workflow and cannot move it.
+        definition(
+            WORKFLOW_STATUS,
+            "Report the workflow's status, current step, branch and -- most usefully -- whether              anything currently blocks this session from finishing.",
+            object_schema(&[], json!({"id":{"type":"string","minLength":1}})),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::ReadRoot],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            WORKFLOW_CONTEXT,
+            "Return the current step's resolved methodology context: what this phase requires and              what counts as finishing it.",
+            object_schema(&[], json!({"id":{"type":"string","minLength":1}})),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::ReadRoot],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            WORKFLOW_ADVANCE,
+            "Advance the workflow past its current step with a success or failure outcome. The              step's own gates still apply: a Test or Verify step without fresh passing evidence              for this change set is refused.",
+            object_schema(
+                &["outcome"],
+                json!({
+                    "id":{"type":"string","minLength":1},
+                    "outcome":{"type":"string","enum":["success","failure"]},
+                    "note":{"type":"string"}
+                }),
+            ),
+            &write_caps,
+            ToolExecutionMode::Immediate,
+            &[ResourceClaimKind::WorktreeWrite],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
+        definition(
+            WORKFLOW_APPROVE,
+            "Approve a workflow waiting on an approval gate, after which it resumes at the next              step.",
+            object_schema(&[], json!({"id":{"type":"string","minLength":1}})),
+            &write_caps,
+            ToolExecutionMode::Immediate,
+            &[ResourceClaimKind::WorktreeWrite],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
     ]
 }
 
@@ -2755,11 +2971,11 @@ fn control_definition(name: &str, description: &str) -> ToolDefinition {
 mod tests {
     use super::*;
 
-    /// 16 coding/knowledge tools (#474-#475), the 7 delegation tools (#479),
-    /// and the 13 MCP/web/browser/diagnostics/artifact capability tools
-    /// (#483). Asserted as a number on purpose: a tool added without a
+    /// 16 coding/knowledge tools (#474-#475), the 7 delegation tools
+    /// (#479), the 13 capability tools (#483) and the 4 workflow tools
+    /// (#484). Asserted as a number on purpose: a tool added without a
     /// deliberate decision here is a tool the model was handed silently.
-    const NATIVE_TOOL_COUNT: usize = 36;
+    const NATIVE_TOOL_COUNT: usize = 40;
 
     #[test]
     fn registry_names_are_unique_and_schemas_are_closed_objects() {
@@ -3216,6 +3432,63 @@ mod tests {
             input_schema: json!({"type":"object","properties":{property:{"type":"string"}}}),
             digest: format!("digest-{name}-{property}"),
         }
+    }
+
+    /// Issue #484 (roadmap N15): the workflow tools are registered like every
+    /// other native tool, and the read/write split is the BROKER's, not the
+    /// prompt's. The fixture's session holds no writer permit -- the same
+    /// shape a read-only helper or reviewer seat runs in -- so reading the
+    /// workflow works and moving it is refused at effect time.
+    #[test]
+    fn a_session_with_no_writer_permit_can_read_a_workflow_but_never_advance_it() {
+        let registry = ToolRegistry::native();
+        for name in [
+            WORKFLOW_STATUS,
+            WORKFLOW_CONTEXT,
+            WORKFLOW_ADVANCE,
+            WORKFLOW_APPROVE,
+        ] {
+            let definition = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(definition.input_schema["additionalProperties"], false);
+            assert!(!definition.capabilities.is_empty());
+        }
+        assert!(
+            registry
+                .get(WORKFLOW_ADVANCE)
+                .expect("advance")
+                .capabilities
+                .iter()
+                .any(|capability| capability == "repo_fs_write"),
+            "moving a workflow is a write and has to declare one"
+        );
+
+        let mut fixture = delegation_fixture(0);
+        // No workflow at all: the read reaches the engine and says so, which
+        // is what proves this is the real engine and not a stub.
+        let missing = call(&mut fixture.client, WORKFLOW_STATUS, json!({}));
+        assert_eq!(
+            missing.error.as_ref().map(|error| error.code.clone()),
+            Some(ToolErrorCode::PreconditionFailed),
+            "{missing:?}"
+        );
+
+        let refused = call(
+            &mut fixture.client,
+            WORKFLOW_ADVANCE,
+            json!({"outcome":"success"}),
+        );
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.clone()),
+            Some(ToolErrorCode::ResourceBusy),
+            "an advance without a writer permit must be refused BEFORE the engine is reached,              not after: {refused:?}"
+        );
+
+        let bad_id = registry
+            .parse(WORKFLOW_STATUS, json!({"id":"../other"}))
+            .expect_err("a workflow id may not escape the store");
+        assert_eq!(bad_id.code, ToolErrorCode::InvalidArguments);
     }
 
     #[test]

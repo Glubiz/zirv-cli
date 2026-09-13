@@ -2419,6 +2419,64 @@ fn cap_workflow_context(rendered: String, max_bytes: usize) -> String {
     truncated
 }
 
+/// Why the ACTIVE workflow refuses to let a session declare itself done, or
+/// `None` when nothing blocks it (issue #484, roadmap N15).
+///
+/// The native loop consults this at every completion attempt, so the gate is
+/// read live rather than snapshotted at session start: a session that reaches
+/// the Test step after it began is gated on the evidence that exists THEN.
+/// The shared stop service outranks any model finish token with it, which is
+/// what stops a native session declaring success over a step whose evidence
+/// is stale, missing or failing.
+///
+/// Deliberately the same predicate `advance_with_evidence`'s own Test/Verify
+/// arm applies -- `verification::latest_is_fresh_and_passing` keyed by the
+/// workflow's own recorded branch (issue #467), so a workflow started in the
+/// main checkout is satisfied by a worker worktree's evidence for the same
+/// change set and by nothing else. A duplicate rule here would be a second
+/// definition of "done" that could drift from the real one.
+///
+/// Never fails the session: an unreadable state directory, an absent workflow
+/// or an unresolvable branch all mean "nothing to gate on". A gate that
+/// blocked a session because it could not read a file would be worse than no
+/// gate at all.
+pub fn native_completion_gate(state_dir: &StateDir, repo: &Path) -> Option<String> {
+    let state = load_active(state_dir, repo).ok().flatten()?;
+    if !matches!(
+        state.status,
+        WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+    ) {
+        return None;
+    }
+    let step = state.current()?;
+    if !matches!(
+        step.phase,
+        super::skill::WorkflowPhase::Test | super::skill::WorkflowPhase::Verify
+    ) {
+        return None;
+    }
+    let final_only = step.phase == super::skill::WorkflowPhase::Verify;
+    let fresh = super::verification::latest_is_fresh_and_passing(
+        state_dir,
+        &state.repo,
+        final_only,
+        Some(&state.branch),
+    )
+    .unwrap_or(true);
+    if fresh {
+        return None;
+    }
+    let command = if final_only {
+        "zirv verify"
+    } else {
+        "zirv test changed"
+    };
+    Some(format!(
+        "zirv workflow: step '{}' of workflow '{}' has no fresh passing evidence for the current          change set; run `{command}` and record the result before finishing",
+        step.id, state.id
+    ))
+}
+
 /// Current ephemeral skill context for the context compiler/session prompt.
 /// Completed steps are intentionally absent; the durable state remains in
 /// [`WorkflowState`] and is never accumulated into model context.
@@ -4944,6 +5002,165 @@ mod tests {
         let advanced = advance_with_evidence(&state_dir, loaded, StepOutcome::Success, None, false)
             .expect("evidence recorded in the linked worktree must satisfy the Test gate");
         assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Verify);
+    }
+
+    /// Issue #484 acceptance 2 (roadmap N15), standing on #467's mechanism:
+    /// a workflow STARTED IN THE MAIN CHECKOUT accepts the worker worktree's
+    /// evidence for its own change set and rejects evidence for a different
+    /// one -- proven through the gate a native session is actually stopped by
+    /// (`native_completion_gate`) as well as through `advance_with_evidence`,
+    /// so the two cannot drift apart.
+    ///
+    /// The main checkout's own report directory stays empty throughout: the
+    /// only way either assertion can pass is the widened, sibling-checkout
+    /// read, and the only thing that makes that read safe is the branch
+    /// relatedness key. Recording the same evidence against a DIFFERENT
+    /// branch -- another worker's work, in another worktree -- must leave the
+    /// gate shut.
+    #[test]
+    fn a_main_checkout_workflow_accepts_only_its_own_worktrees_evidence() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        // `evidence_branch` is what the worker's `zirv test changed` recorded
+        // its report against; the workflow itself always gates "feature".
+        let scenario = |evidence_branch: &str| {
+            let main_repo = tempdir().unwrap();
+            let root = tempdir().unwrap();
+            let state_dir = StateDir::from_root(root.path().to_path_buf());
+            git(main_repo.path(), &["init", "-q"]);
+            std::fs::write(
+                main_repo.path().join("README.md"),
+                "hello
+",
+            )
+            .unwrap();
+            git(main_repo.path(), &["add", "."]);
+            git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+            let worktree_dir = tempdir().unwrap();
+            let worktree_path = worktree_dir.path().to_path_buf();
+            std::fs::remove_dir(&worktree_path).unwrap();
+            git(
+                main_repo.path(),
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "feature",
+                    worktree_path.to_str().unwrap(),
+                ],
+            );
+            std::fs::write(
+                worktree_path.join("feature.rs"),
+                "fn feature() {}
+",
+            )
+            .unwrap();
+            git(&worktree_path, &["add", "."]);
+            git(&worktree_path, &["commit", "-q", "-m", "feature work"]);
+
+            let mut state = WorkflowState::start(
+                main_repo.path().to_path_buf(),
+                "small feature".into(),
+                WorkflowKind::Feature,
+                None,
+                true,
+                low_classification(),
+            );
+            state.branch = "feature".into();
+            let test_index = state
+                .steps
+                .iter()
+                .position(|step| step.phase == WorkflowPhase::Test)
+                .expect("fixture has a Test step");
+            state.completed_steps = state.steps[..test_index]
+                .iter()
+                .map(|step| step.id.clone())
+                .collect();
+            state.current_step = test_index;
+            state.status = WorkflowStatus::Running;
+            // `save(.., active = true)` writes the main checkout's own
+            // active-workflow pointer, which is what `native_completion_gate`
+            // resolves through.
+            save(&state_dir, &state, true).unwrap();
+
+            let fingerprint =
+                super::super::verification::change_fingerprint(&worktree_path).unwrap();
+            let report = super::super::verification::VerificationReport {
+                schema_version: super::super::verification::VERIFY_REPORT_SCHEMA_VERSION,
+                id: "worktree-evidence".into(),
+                mode: super::super::verification::VerificationMode::Changed,
+                source: "configured".into(),
+                repo: worktree_path.clone(),
+                branch: evidence_branch.to_string(),
+                change_fingerprint: fingerprint,
+                changed_paths: vec![],
+                fallback_to_full: false,
+                narrowed_to: vec![],
+                notes: vec![],
+                started_at: 0,
+                finished_at: 0,
+                checks: vec![super::super::verification::CheckResult {
+                    id: "unit".into(),
+                    kind: super::super::verification::CheckKind::Unit,
+                    command: "true".into(),
+                    source: super::super::verification::CheckSource::DiscoveredToolchain,
+                    status: super::super::verification::CheckStatus::Passed,
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                    failure_output: None,
+                    failure_test_names: Vec::new(),
+                    inconclusive_reason: None,
+                }],
+            };
+            super::super::verification::save_report(&state_dir, &report).unwrap();
+            // `root` travels with the rest: dropping it would delete the state
+            // directory `state_dir` only holds a PATH to, and every assertion
+            // below would then pass vacuously against an empty store.
+            (main_repo, worktree_dir, root, state_dir, state)
+        };
+
+        // Accepted: the worker's evidence names the workflow's own branch.
+        let (main_repo, _worktree, _root, state_dir, state) = scenario("feature");
+        assert_eq!(
+            native_completion_gate(&state_dir, main_repo.path()),
+            None,
+            "the worker worktree's evidence for this change set must open the gate evaluated              from the main checkout"
+        );
+        let loaded = load(&state_dir, main_repo.path(), &state.id).unwrap();
+        let advanced = advance_with_evidence(&state_dir, loaded, StepOutcome::Success, None, false)
+            .expect("the same evidence must satisfy the advance gate");
+        assert_eq!(advanced.current().unwrap().phase, WorkflowPhase::Verify);
+
+        // Rejected: fresh, passing, and about somebody else's change set.
+        let (main_repo, _worktree, _root, state_dir, state) = scenario("someone-elses-feature");
+        let blocked = native_completion_gate(&state_dir, main_repo.path())
+            .expect("unrelated evidence must leave the gate shut");
+        assert!(
+            blocked.contains("no fresh passing evidence"),
+            "the gate must say why: {blocked}"
+        );
+        let loaded = load(&state_dir, main_repo.path(), &state.id).unwrap();
+        assert!(
+            advance_with_evidence(&state_dir, loaded, StepOutcome::Success, None, false).is_err(),
+            "an unrelated worktree's evidence must never advance this workflow"
+        );
     }
 
     /// Issue #467, acceptance 2: `zirv workflow status|advance|review
