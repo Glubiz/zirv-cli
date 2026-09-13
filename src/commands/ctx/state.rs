@@ -183,6 +183,15 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::Directory,
         &["commands/ctx/diagnostics.rs"],
     ),
+    // Issue #483: browser evidence a native capability tool captured. The
+    // path is zirv-chosen (a slugified caller label under this bucket), never
+    // caller-supplied, which is why it lives here beside the other
+    // per-repository buckets rather than anywhere a tool argument could name.
+    (
+        "native-evidence",
+        SlugEntry::Directory,
+        &["commands/ctx/runtime/tools/capability.rs"],
+    ),
     ("outputs", SlugEntry::Directory, &["commands/ctx/output.rs"]),
     (
         "tasks",
