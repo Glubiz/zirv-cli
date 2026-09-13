@@ -1781,9 +1781,10 @@ method the CLI verb calls. `result` returns a bounded manifest (outcome,
 delivery identities, report reference, unknown tool outcomes, whether the
 summary was cut), never a transcript. `follow_up` is addressed to the
 delegation handle: directed mail while the worker is live, a journal resume
-for a finished native worker, otherwise an explicit replacement checkpoint
-that says it has none of the original's hidden context -- there is no
-"most recent session" fallback, and an unknown handle is an error. `close`
+for a finished native worker (the id it returns is what `zirv ctx exec
+--runtime native --resume` takes), otherwise an explicit replacement
+checkpoint that says it has none of the original's hidden context -- there is
+no "most recent session" fallback, and an unknown handle is an error. `close`
 releases the reservation and the write claim while preserving every receipt
 and every `outcome_unknown` effect. The contract is in
 [`docs/design/2026-09-13-native-workers.md`](docs/design/2026-09-13-native-workers.md).
