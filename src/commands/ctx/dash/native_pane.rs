@@ -1252,6 +1252,11 @@ pub struct NativePresentation {
     /// `Shift+Tab`-cycled, decorative only -- see [`ComposerMode`]'s own
     /// doc comment.
     pub mode: ComposerMode,
+    /// Issue #490: the worktree the `@` picker is allowed to offer paths
+    /// from. `None` disables the picker entirely rather than falling back to
+    /// the process's current directory -- a pane with no declared worktree
+    /// must not be able to complete a path outside one.
+    pub workdir: Option<PathBuf>,
 }
 
 impl Default for NativePresentation {
@@ -1264,6 +1269,7 @@ impl Default for NativePresentation {
             composer: ComposerState::default(),
             unread: false,
             mode: ComposerMode::default(),
+            workdir: None,
         }
     }
 }
@@ -2071,7 +2077,12 @@ pub fn render_native_pane(
         return;
     }
     let width = area.width as usize;
-    let composer_rows = composer_height(presentation, width).min(area.height.saturating_sub(1));
+    let composer = composer_block(presentation, facts, width);
+    // The in-flight activity line (spinner frame, rotating verb, elapsed
+    // time, token total, "esc to interrupt") is the head's
+    // `activity_line_text`, rendered with the transcript by
+    // `render_lines_with_activity` -- issue #490 does not add a second one.
+    let composer_rows = (composer.len() as u16).min(area.height.saturating_sub(1));
     let status_rows: u16 = 1;
     let transcript_height = area
         .height
@@ -2124,13 +2135,137 @@ pub fn render_native_pane(
             width: area.width,
             height: composer_rows,
         };
-        let lines = composer_lines(presentation, width);
-        let text: Vec<Line> = lines
-            .into_iter()
-            .map(|line| Line::from(Span::raw(line)))
-            .collect();
-        f.render_widget(Paragraph::new(text), composer_area);
+        render_styled(f, composer_area, &composer);
     }
+}
+
+fn render_styled(f: &mut Frame, area: Rect, lines: &[StyledLine]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let wrapped = wrap_all(lines, width);
+    let visible = viewport_slice(&wrapped, area.height as usize);
+    let text: Vec<Line> = visible
+        .iter()
+        .map(|line| {
+            Line::from(
+                line.0
+                    .iter()
+                    .map(|span| Span::styled(span.text.clone(), tone_to_style(span.tone)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    f.render_widget(Paragraph::new(text), area);
+}
+
+/// Issue #490: the whole native dashboard frame -- the conversation pane, the
+/// agent/task overview beside it, the usage/health provenance strip beneath
+/// it, and whichever modal (approval dialog, shortcut list, worker
+/// inspection) is open. Which of those exist at all is
+/// [`super::native_ux::resolve_layout`]'s decision, so the same code draws
+/// 40, 80, 120 and 200 columns with no size-specific branches of its own.
+pub fn render_native_dashboard(
+    f: &mut Frame,
+    area: Rect,
+    view: &TranscriptView,
+    presentation: &NativePresentation,
+    facts: &StatusFacts,
+    ux: &super::native_ux::UxState,
+) {
+    use super::native_ux::{Focus, OVERVIEW_WIDTH};
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let plan = super::native_ux::resolve_layout(area.width as usize, area.height as usize);
+    let usage_rows = (plan.usage_rows as u16).min(area.height.saturating_sub(6));
+    let body_height = area.height - usage_rows;
+    let panel_width = if plan.overview || ux.inspection.is_some() || ux.help {
+        (OVERVIEW_WIDTH as u16 + 1).min(area.width / 2)
+    } else {
+        0
+    };
+
+    let main = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width - panel_width,
+        height: body_height,
+    };
+    // An open approval takes the bottom of the conversation pane, replacing
+    // the composer: an approval is never answered from the composer, so
+    // leaving it drawn and focusable there would advertise the wrong control.
+    match &ux.approval {
+        Some(dialog) => {
+            let lines = dialog.lines(main.width as usize);
+            let dialog_rows = (lines.len() as u16 + 1).min(main.height.saturating_sub(2));
+            let transcript = Rect {
+                height: main.height - dialog_rows,
+                ..main
+            };
+            render_native_pane(f, transcript, view, presentation, facts);
+            render_styled(
+                f,
+                Rect {
+                    x: main.x,
+                    y: main.y + transcript.height,
+                    width: main.width,
+                    height: dialog_rows,
+                },
+                &lines,
+            );
+        }
+        None => render_native_pane(f, main, view, presentation, facts),
+    }
+
+    if panel_width > 0 {
+        let panel = Rect {
+            x: area.x + main.width + 1,
+            y: area.y,
+            width: panel_width - 1,
+            height: body_height,
+        };
+        let mut lines = vec![StyledLine::toned(
+            match (ux.help, ux.inspection.is_some()) {
+                (true, _) => "shortcuts".to_string(),
+                (false, true) => "worker".to_string(),
+                (false, false) => format!(
+                    "agents \u{b7} {} need you \u{b7} {} notices{}",
+                    ux.overview.needs_operator(),
+                    ux.notices.len(),
+                    if ux.deferred.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" \u{b7} {} held", ux.deferred.len())
+                    }
+                ),
+            },
+            Tone::Emphasis,
+        )];
+        lines.extend(ux.panel_lines(panel.width as usize));
+        render_styled(f, panel, &lines);
+    }
+
+    if usage_rows > 0 {
+        let mut lines = ux.usage.lines(area.width as usize);
+        if !ux.notices.is_empty() {
+            for notice in ux.notices.recent(2) {
+                lines.extend(notice.lines());
+            }
+        }
+        render_styled(
+            f,
+            Rect {
+                x: area.x,
+                y: area.y + body_height,
+                width: area.width,
+                height: usage_rows,
+            },
+            &lines,
+        );
+    }
+    let _ = Focus::Composer;
 }
 
 /// The composer's own draft rendered as plain display lines (`> ` on the
@@ -2181,8 +2316,131 @@ fn composer_hint_line(presentation: &NativePresentation) -> String {
     )
 }
 
+/// The plain composer's height, for [`render_plain`]'s own sizing. The
+/// bordered pane composer sizes itself from [`composer_block`].
+#[allow(dead_code)]
 fn composer_height(presentation: &NativePresentation, width: usize) -> u16 {
     (composer_lines(presentation, width).len() as u16).max(2)
+}
+
+/// How many completion rows the `/`, `@` and `!` entry modes may show.
+pub const COMPLETION_ROWS: usize = 6;
+
+/// Issue #490: the bordered composer, its hint line, and -- when the draft
+/// starts an entry mode -- the completion list above it. The box is drawn
+/// here rather than with a ratatui `Block` so `render_plain` and every
+/// deterministic test below see exactly the same characters a terminal does.
+pub fn composer_block(
+    presentation: &NativePresentation,
+    facts: &StatusFacts,
+    width: usize,
+) -> Vec<StyledLine> {
+    use super::native_ux::{self, EntryMode};
+    let width = width.max(8);
+    let inner = width.saturating_sub(4);
+    let mut out: Vec<StyledLine> = Vec::new();
+
+    // Completions first: they sit above the box, the way a picker does.
+    let draft = &presentation.composer.draft;
+    let completions = match native_ux::classify_entry(draft) {
+        EntryMode::Slash => native_ux::slash_completions(draft),
+        EntryMode::File => match presentation.workdir.as_deref() {
+            Some(workdir) => native_ux::file_completions(draft, workdir),
+            None => Vec::new(),
+        },
+        EntryMode::Shell => native_ux::shell_command(draft)
+            .map(|command| {
+                vec![native_ux::Completion {
+                    insert: draft.clone(),
+                    label: command.to_string(),
+                    detail: "runs through this pane's process tool, under the same policy"
+                        .to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        EntryMode::Text => Vec::new(),
+    };
+    for completion in completions.iter().take(COMPLETION_ROWS) {
+        out.push(StyledLine(vec![
+            StyledSpan {
+                text: "  ".to_string(),
+                tone: Tone::Muted,
+            },
+            StyledSpan {
+                text: format!("{:<28}", completion.label),
+                tone: Tone::Accent,
+            },
+            StyledSpan {
+                text: completion.detail.clone(),
+                tone: Tone::Muted,
+            },
+        ]));
+    }
+
+    out.push(StyledLine::toned(
+        format!("\u{256d}{}\u{256e}", "\u{2500}".repeat(width - 2)),
+        Tone::Muted,
+    ));
+    for (index, line) in draft.split('\n').enumerate() {
+        let marker = if index == 0 { ">" } else { " " };
+        let body = StyledLine::plain(line.to_string());
+        for (row, wrapped) in wrap_line(&body, inner).into_iter().enumerate() {
+            let text = wrapped.to_plain_string();
+            let pad = inner.saturating_sub(style::display_width(&text));
+            out.push(StyledLine(vec![
+                StyledSpan {
+                    text: "\u{2502} ".to_string(),
+                    tone: Tone::Muted,
+                },
+                StyledSpan {
+                    text: if index == 0 && row == 0 {
+                        format!("{marker} ")
+                    } else {
+                        "  ".to_string()
+                    },
+                    tone: Tone::Accent,
+                },
+                StyledSpan {
+                    text: format!("{text}{}", " ".repeat(pad.saturating_sub(2))),
+                    tone: Tone::Plain,
+                },
+                StyledSpan {
+                    text: " \u{2502}".to_string(),
+                    tone: Tone::Muted,
+                },
+            ]));
+        }
+    }
+    out.push(StyledLine::toned(
+        format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(width - 2)),
+        Tone::Muted,
+    ));
+
+    let queued = presentation.composer.queued.len();
+    let mode = match classify_submit_intent(facts) {
+        SubmitIntent::Immediate => "enter sends",
+        SubmitIntent::Steer => "enter steers this turn",
+        SubmitIntent::Queue => "blocked \u{2014} enter queues",
+    };
+    out.push(StyledLine(vec![
+        StyledSpan {
+            text: "  ? for shortcuts".to_string(),
+            tone: Tone::Muted,
+        },
+        StyledSpan {
+            text: format!("   {mode}"),
+            tone: Tone::Muted,
+        },
+        StyledSpan {
+            text: if queued > 0 {
+                format!("   \u{29d7} {queued} queued")
+            } else {
+                String::new()
+            },
+            tone: Tone::Warn,
+        },
+    ]));
+    out
 }
 
 /// Renders the exact same view model as plain text, for a non-TTY/headless
@@ -2361,6 +2619,28 @@ pub struct NativePaneRuntime {
     session_state: NativeSessionState,
     turn_state: Option<NativeTurnState>,
     billing: String,
+    /// Issue #490: the multi-agent/attention/rollover surfaces around this
+    /// one conversation -- the overview, the usage strip, notices, the
+    /// approval dialog and the worker inspection. All of it is a view model
+    /// over durable records; see `dash::native_ux`.
+    ux: super::native_ux::UxState,
+    repo: PathBuf,
+    state: StateDir,
+    /// Issue #490 (item 4): what must survive a compaction, a rollover or a
+    /// reconnect, and the guard that refuses a submission aimed at a retired
+    /// generation.
+    continuity: super::native_ux::Continuity,
+    /// Consecutive journal replay failures, so a recovery can be announced as
+    /// a reconnect rather than passing unnoticed.
+    replay_failures: u32,
+    /// Compactions/resumes already announced, so the same durable record is
+    /// never re-announced on the next tick.
+    announced_recoveries: usize,
+    /// The rollover record's `updated_at` as last announced.
+    announced_rollover_at: u64,
+    /// Delegations whose terminal phase has already been announced, so a
+    /// completion is surfaced exactly once.
+    announced_terminal: BTreeSet<String>,
     /// Set once an `InteractiveProgress::Ended` is observed; the dashboard
     /// loop's own cue to stop.
     pub ended: bool,
@@ -2409,9 +2689,20 @@ impl NativePaneRuntime {
         let billing = resolve_billing(&session.route, &spec.repo);
         let git_branch = git_branch(&spec.repo);
 
-        let mut presentation = NativePresentation::default();
+        // Issue #490: the `@` picker may only ever offer paths from this
+        // pane's own repository.
+        let mut presentation = NativePresentation {
+            workdir: Some(spec.repo.clone()),
+            ..NativePresentation::default()
+        };
         let draft = load_draft(state, &session.handle.short);
         draft.restore_onto(&mut presentation.composer);
+
+        let continuity = super::native_ux::Continuity::new(super::native_ux::SeatIdentity {
+            short: session.handle.short.clone(),
+            session: session.session.to_string(),
+            generation: session.handle.generation,
+        });
 
         Ok(Self {
             session,
@@ -2422,12 +2713,274 @@ impl NativePaneRuntime {
             session_state: NativeSessionState::Idle,
             turn_state: None,
             billing,
+            ux: super::native_ux::UxState::default(),
+            repo: spec.repo.clone(),
+            state: state.clone(),
+            continuity,
+            replay_failures: 0,
+            announced_recoveries: 0,
+            announced_rollover_at: 0,
+            announced_terminal: BTreeSet::new(),
             ended: false,
             notice: None,
             turn_started_at: None,
             cwd: spec.repo,
             git_branch,
         })
+    }
+
+    pub fn ux(&self) -> &super::native_ux::UxState {
+        &self.ux
+    }
+
+    pub fn ux_mut(&mut self) -> &mut super::native_ux::UxState {
+        &mut self.ux
+    }
+
+    /// Re-derives the agent/task overview and the usage strip from the
+    /// authoritative records, and carries this pane across a seat generation
+    /// change when one happened. Rate-limited by the caller (see
+    /// `UxState::refreshed_at`) because it is the one part of a tick that
+    /// touches the filesystem for anything other than this session's journal.
+    pub fn refresh_records(&mut self, cfg: &CtxConfig, env: EnvLookup<'_>, now: u64) {
+        use super::super::{coordinator, delegation, pool, seat};
+
+        let graph = coordinator::load(&self.state, &self.repo);
+        let records = delegation::list(&self.state, &self.repo);
+        // Item 8: a tick reads a BOUNDED number of seat records however large
+        // the fleet is. `fanout_plan` decides how many; the rest are picked up
+        // on a later tick rather than turning one 150 ms frame into hundreds
+        // of filesystem reads.
+        let shorts: Vec<&str> = std::iter::once(self.session.handle.short.as_str())
+            .chain(records.iter().map(|record| record.handle.short.as_str()))
+            .collect();
+        let fanout = super::native_ux::fanout_plan(shorts.len(), &self.ux.budget);
+        let seats: Vec<seat::Seat> = shorts
+            .iter()
+            .take(fanout.polled)
+            .filter_map(|short| seat::load(&self.state, short))
+            .collect();
+
+        // Item 4: the seat may have rolled over underneath this pane. Carry
+        // the draft/selection/focus/scrollback across and re-target anything
+        // queued -- never replay it into the retired session.
+        if let Some(current) = seats
+            .iter()
+            .find(|seat| seat.short == self.continuity.seat.short)
+        {
+            let next = super::native_ux::SeatIdentity::from_seat(current);
+            if let super::native_ux::Retarget::Retargeted {
+                from_session,
+                to_session,
+                generation,
+                queued,
+            } = self.continuity.carry_across(next)
+            {
+                self.ux.notices.push(super::native_ux::Notice {
+                    kind: super::native_ux::NoticeKind::Rollover,
+                    headline: format!("seat moved to generation {generation}"),
+                    detail: vec![
+                        format!("{from_session} \u{2192} {to_session}"),
+                        format!("{queued} queued line(s) re-targeted; draft and scrollback kept"),
+                    ],
+                    at: now,
+                });
+            }
+        }
+
+        // Item 4: N19's own durable rollover record, and N17's compaction/
+        // resume history -- both read straight off the durable store, so a
+        // rollover or a compaction that happened while this pane was not
+        // looking is still announced exactly once.
+        if let Some(record) =
+            super::super::rollover_runtime::load(&self.state, &self.session.handle.short)
+            && record.updated_at > self.announced_rollover_at
+        {
+            self.announced_rollover_at = record.updated_at;
+            let notice = super::native_ux::notice_from_rollover(&record);
+            self.ux.notices.push(notice);
+        }
+        if let Ok(history) =
+            super::super::runtime::compaction::history(&self.journal, &self.session.session)
+        {
+            let total = history.compactions.len() + history.resumes.len();
+            if total > self.announced_recoveries {
+                self.announced_recoveries = total;
+                if let Some(last) = history.compactions.last() {
+                    self.ux.notices.push(super::native_ux::notice_compaction(
+                        last.covers_through as usize,
+                        last.sequence,
+                        Some(&last.kind),
+                    ));
+                }
+                for resume in &history.resumes {
+                    self.ux.notices.push(super::native_ux::notice_reconnect(
+                        0,
+                        resume.sequence,
+                        0,
+                    ));
+                }
+            }
+        }
+
+        let view = pool::build(
+            &self.state,
+            cfg,
+            now,
+            Some(self.session.session.as_str()),
+            None,
+        );
+        let approvals: Vec<super::native_ux::ApprovalRequest> = self
+            .ux
+            .approval
+            .as_ref()
+            .map(|dialog| vec![dialog.request.clone()])
+            .unwrap_or_default();
+        self.ux
+            .refresh(&graph, &records, &seats, &approvals, &view, &self.billing, now);
+
+        // Criterion 2: completion notices are not lost. A worker that
+        // finishes while the operator is stuck in an approval dialog has its
+        // completion DEFERRED, not dropped and not drawn over the modal --
+        // `close_approval` releases everything held, in order.
+        let blocked = self.ux.blocked();
+        for record in &records {
+            if !record.phase.is_terminal() || !self.announced_terminal.insert(record.handle.delegation.clone()) {
+                continue;
+            }
+            let item = super::native_ux::Deferred {
+                kind: "worker",
+                id: record.handle.delegation.clone(),
+                body: format!(
+                    "{} \u{b7} {} \u{b7} exit {}",
+                    record.handle.short,
+                    record.phase.as_str(),
+                    record
+                        .exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| style::PLACEHOLDER.to_string())
+                ),
+            };
+            if blocked {
+                self.ux.deferred.defer(item);
+            } else {
+                self.ux.notices.push(super::native_ux::Notice {
+                    kind: super::native_ux::NoticeKind::DeferredDelivery,
+                    headline: format!("{} finished", record.handle.short),
+                    detail: vec![item.body],
+                    at: now,
+                });
+            }
+        }
+        let _ = env;
+    }
+
+    /// Opens a worker's BOUNDED manifest -- never its transcript.
+    pub fn open_inspection(&mut self, delegation_id: &str) {
+        use super::super::delegation;
+        let Some(record) = delegation::load(&self.state, &self.repo, delegation_id) else {
+            return;
+        };
+        let Ok(manifest) = delegation::result(
+            &self.state,
+            &self.repo,
+            delegation_id,
+            super::native_ux::INSPECTION_SUMMARY_CAP,
+        ) else {
+            return;
+        };
+        let state = self
+            .ux
+            .overview
+            .rows
+            .iter()
+            .find(|row| row.id == delegation_id)
+            .map(|row| row.state)
+            .unwrap_or(super::native_ux::AgentState::Done);
+        self.ux.inspection = Some(super::native_ux::build_inspection(
+            &record, &manifest, state,
+        ));
+        self.ux.focus = super::native_ux::Focus::Inspection;
+    }
+
+    /// Sends the composer's current draft to one worker as a bounded
+    /// follow-up. `delegation::send` is the whole mechanism: a worker that is
+    /// itself blocked has the message QUEUED and retried at its next idle
+    /// boundary rather than typed at its dialog, which is exactly the
+    /// "deferred delivery resumes when the block clears" contract.
+    pub fn follow_up(&mut self, delegation_id: &str, cfg: &CtxConfig, now: u64) {
+        use super::super::delegation;
+        let body = self.presentation.composer.draft.trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        let headline = match delegation::send(
+            &self.state,
+            &self.repo,
+            cfg,
+            delegation_id,
+            &body,
+            now,
+        ) {
+            Ok(delegation::Dispatch::Queued { reason, .. }) => {
+                format!("follow-up to {delegation_id} queued ({reason})")
+            }
+            Ok(_) => format!("follow-up delivered to {delegation_id}"),
+            Err(error) => format!("follow-up to {delegation_id} failed: {error}"),
+        };
+        self.ux.notices.push(super::native_ux::Notice {
+            kind: super::native_ux::NoticeKind::DeferredDelivery,
+            headline,
+            detail: Vec::new(),
+            at: now,
+        });
+        self.presentation.composer.draft.clear();
+        self.presentation.composer.cursor = 0;
+    }
+
+    /// Delivers the operator's approval decision. A denial is a complete,
+    /// real action: the guidance is committed to the journal as steering, so
+    /// the running loop picks it up between requests. An allow is only ever
+    /// offered when the session's broker can actually issue a grant (see
+    /// `native_ux::PendingApproval::grantable`).
+    pub fn decide_approval(
+        &mut self,
+        request: &super::native_ux::ApprovalRequest,
+        decision: super::native_ux::ApprovalDecision,
+        persistent: bool,
+    ) {
+        use super::native_ux::ApprovalDecision;
+        let released = self.ux.close_approval();
+        let route = super::native_ux::approval_route(persistent);
+        match decision {
+            ApprovalDecision::Deny => {
+                let guidance = format!(
+                    "The operator denied {}. Do not retry it; choose a different approach and say what you changed.",
+                    request.scope_text()
+                );
+                let _ = self.write_steering(&guidance);
+            }
+            ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
+                self.ux.notices.push(super::native_ux::Notice {
+                    kind: super::native_ux::NoticeKind::DeferredDelivery,
+                    headline: format!(
+                        "approval {} via {route:?} \u{2014} {}",
+                        decision.as_str(),
+                        request.scope_text()
+                    ),
+                    detail: Vec::new(),
+                    at: 0,
+                });
+            }
+        }
+        for item in released {
+            self.ux.notices.push(super::native_ux::Notice {
+                kind: super::native_ux::NoticeKind::DeferredDelivery,
+                headline: format!("{} {} delivered", item.kind, item.id),
+                detail: vec![item.body],
+                at: 0,
+            });
+        }
     }
 
     /// Drains worker progress and re-reads the journal. Called once per
@@ -2439,6 +2992,11 @@ impl NativePaneRuntime {
                 InteractiveProgress::Busy => {
                     self.session_state = NativeSessionState::Running;
                     self.turn_state = Some(NativeTurnState::Requesting);
+                    // `NativePaneRuntime::turn_started_at` is the ONE clock
+                    // for "how long has this turn been running" -- the
+                    // activity line and issue #490's spinner line both read
+                    // it through `elapsed_turn_secs`, so they can never
+                    // disagree.
                     if self.turn_started_at.is_none() {
                         self.turn_started_at = Some(std::time::Instant::now());
                     }
@@ -2454,6 +3012,15 @@ impl NativePaneRuntime {
                     self.turn_started_at = None;
                 }
                 InteractiveProgress::Notice(message) => {
+                    // Issue #490: a runtime notice is also a pane notice, so
+                    // it survives in the scrollback rather than only in the
+                    // single-slot `notice` the activity line shows.
+                    self.ux.notices.push(super::native_ux::Notice {
+                        kind: super::native_ux::NoticeKind::Reconnected,
+                        headline: message.clone(),
+                        detail: Vec::new(),
+                        at: 0,
+                    });
                     self.notice = Some(message);
                 }
                 InteractiveProgress::Ended => {
@@ -2464,6 +3031,16 @@ impl NativePaneRuntime {
             }
         }
         self.refresh_transcript();
+        // Issue #490 (item 5): `blocked` is now a fact read from what the
+        // journal recorded -- the broker's own approval refusal on a tool
+        // call -- rather than the hardcoded `false` N11 shipped.
+        let actor = format!("{} \u{b7} {}", self.session.handle.short, "orchestrator");
+        let pending = super::native_ux::detect_pending_approval(
+            &self.transcript.items,
+            &self.session.session.to_string(),
+            &actor,
+        );
+        self.ux.sync_approval(pending);
     }
 
     /// PR #531 review finding 4: this used to do a full journal replay AND a
@@ -2477,8 +3054,24 @@ impl NativePaneRuntime {
     /// the pane's own memory) stays flat rather than growing without bound.
     fn refresh_transcript(&mut self) {
         let Ok(conversation) = self.journal.replay(&self.session.session) else {
+            // Issue #490 (item 4): a replay failure is a lost connection to
+            // the durable record, not a reason to redraw a stale pane
+            // silently. Count it; the recovery emits the reconnect notice.
+            self.replay_failures = self.replay_failures.saturating_add(1);
             return;
         };
+        // Issue #490: a recovered replay is a reconnect the operator should
+        // see. Announced BEFORE the watermark check below, because a
+        // reconnect that brought no new events is still a reconnect.
+        if self.replay_failures > 0 {
+            let missed = self.replay_failures;
+            self.replay_failures = 0;
+            self.ux.notices.push(super::native_ux::notice_reconnect(
+                u64::from(missed) * 150 / 1000,
+                conversation.last_sequence.0,
+                0,
+            ));
+        }
         if conversation.last_sequence == self.conversation.last_sequence {
             return;
         }
@@ -2513,10 +3106,10 @@ impl NativePaneRuntime {
             billing: self.billing.clone(),
             session_state: self.session_state,
             turn_state: self.turn_state,
-            // Issue #480 (deferred, see design note): a live approval-
-            // pending signal needs the enforcement broker's own facts,
-            // which this pane does not yet read.
-            blocked: false,
+            // Issue #490: an approval the journal says is outstanding and
+            // the operator has not answered. One fact, one place: the same
+            // flag that opens the dialog is the one that makes Enter queue.
+            blocked: self.ux.blocked(),
             unread_result: self.presentation.unread,
             notice: self.notice.clone(),
             activity: self.activity_line(),
@@ -2587,7 +3180,31 @@ impl NativePaneRuntime {
             }
             return;
         }
-        match classify_submit_intent(&self.status_facts()) {
+        let intent = classify_submit_intent(&self.status_facts());
+        // Issue #490 (item 4, criterion 4): even an otherwise-sendable
+        // submission is refused when this pane no longer answers for the
+        // logical seat's CURRENT session -- a rollover that moved the seat on
+        // must never let a keystroke land in the retired generation.
+        let intent = match intent {
+            SubmitIntent::Queue => SubmitIntent::Queue,
+            other => match super::native_ux::resolve_submit_target(
+                &self.continuity,
+                &self.current_identity(),
+            ) {
+                super::native_ux::SubmitTarget::Send { .. } => other,
+                super::native_ux::SubmitTarget::Hold { reason } => {
+                    self.ux.notices.push(super::native_ux::Notice {
+                        kind: super::native_ux::NoticeKind::Rollover,
+                        headline: "input held: this pane no longer owns the seat's session"
+                            .to_string(),
+                        detail: vec![reason],
+                        at: 0,
+                    });
+                    SubmitIntent::Queue
+                }
+            },
+        };
+        match intent {
             SubmitIntent::Immediate => {
                 let _ = self.session.submit(text);
             }
@@ -2602,6 +3219,26 @@ impl NativePaneRuntime {
                 });
             }
         }
+        self.sync_continuity();
+    }
+
+    fn current_identity(&self) -> super::native_ux::SeatIdentity {
+        super::native_ux::SeatIdentity {
+            short: self.session.handle.short.clone(),
+            session: self.session.session.to_string(),
+            generation: self.session.handle.generation,
+        }
+    }
+
+    /// Mirrors the composer/selection/focus/scroll state into the continuity
+    /// record, so a rollover or a reconnect carries the operator's actual
+    /// draft rather than a stale copy of it.
+    fn sync_continuity(&mut self) {
+        self.continuity.draft = self.presentation.composer.draft.clone();
+        self.continuity.cursor = self.presentation.composer.cursor;
+        self.continuity.queued = self.presentation.composer.queued.clone();
+        self.continuity.selection = self.presentation.selection;
+        self.continuity.scroll = self.presentation.scroll;
     }
 
     /// Commits one steering input straight to this pane's own journal
@@ -2695,6 +3332,15 @@ pub fn run_native_dashboard(
         return Err(format!("native chat: EnterAlternateScreen failed: {error}").into());
     }
     let keyboard_enhancement_pushed = super::push_keyboard_enhancement();
+    // Mouse reporting, written as the same raw bytes the wrapped dashboard
+    // uses (`term::dash_mouse_on_bytes`) rather than crossterm's
+    // `EnableMouseCapture` -- see `dash::mod::run_dashboard`'s own comment for
+    // why `?1003` is deliberately avoided. Best-effort: a terminal that will
+    // not report mouse events still has every keyboard binding.
+    let mouse_on = cfg.dash.mouse
+        && io::Write::write_all(&mut io::stdout(), super::super::term::dash_mouse_on_bytes())
+            .and_then(|()| io::Write::flush(&mut io::stdout()))
+            .is_ok();
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
@@ -2706,12 +3352,24 @@ pub fn run_native_dashboard(
         }
     };
 
+    // Issue #490 (item 4): records are re-read on their own cadence, not on
+    // every 150 ms frame -- a fleet's coordinator graph, delegation receipts,
+    // seat records and pool view are far more expensive than this session's
+    // own journal, and none of them change between two consecutive frames.
+    const RECORD_REFRESH_SECS: u64 = 2;
+    let persistent = cfg.session.persistent;
+
     let exit_code = 'outer: loop {
         pane.tick();
+        let now = now_secs();
+        if now.saturating_sub(pane.ux().refreshed_at) >= RECORD_REFRESH_SECS {
+            pane.refresh_records(cfg, env, now);
+        }
         let _ = terminal.draw(|f| {
             let facts = pane.status_facts();
+            let area = f.area();
             let (view, presentation) = pane.view();
-            render_native_pane(f, f.area(), view, presentation, &facts);
+            render_native_dashboard(f, area, view, presentation, &facts, pane.ux());
         });
         if pane.ended {
             break 'outer 0;
@@ -2727,7 +3385,12 @@ pub fn run_native_dashboard(
                     // Operator direction (PR #531 follow-up): `Esc` owns
                     // interrupt now; `Ctrl+C` only arms/confirms a quit --
                     // see `ctrl_c_confirms_quit`'s own doc comment.
-                    if key.code == KeyCode::Esc {
+                    //
+                    // Issue #490 refines only WHEN that applies: while a
+                    // modal is open (an approval dialog, a worker inspection,
+                    // the shortcut list) `Esc` closes it first, and only a
+                    // second `Esc` reaches the turn. Nothing else changes.
+                    if key.code == KeyCode::Esc && !pane.ux().modal_open() {
                         last_ctrl_c = None;
                         pane.interrupt();
                         continue 'outer;
@@ -2775,39 +3438,121 @@ pub fn run_native_dashboard(
                         };
                         continue 'outer;
                     }
-                    if pane.presentation_mut().focus == PaneFocus::Transcript {
-                        let total = pane.view().0.items.len().max(1);
-                        match key.code {
-                            KeyCode::Up => pane.presentation_mut().scroll.scroll_up(1, total),
-                            KeyCode::Down => pane.presentation_mut().scroll.scroll_down(1),
-                            KeyCode::PageUp => pane.presentation_mut().scroll.scroll_up(10, total),
-                            KeyCode::PageDown => pane.presentation_mut().scroll.scroll_down(10),
-                            KeyCode::Home => pane.presentation_mut().scroll.scroll_up(total, total),
-                            KeyCode::End => {
-                                let presentation = pane.presentation_mut();
-                                presentation.scroll.jump_to_bottom();
-                                presentation.mark_seen();
-                            }
-                            // Expands/collapses the most recent tool call --
-                            // a minimal binding until a per-item cursor
-                            // exists to target an arbitrary one.
-                            KeyCode::Char('e') | KeyCode::Enter => {
-                                toggle_most_recent_tool_call(&mut pane);
-                            }
-                            _ => {}
+                    // Issue #490: everything the dashboard's own regions claim
+                    // -- Tab focus, `?`, `a`, the overview cursor, the open
+                    // modal -- goes through one router, which also decides
+                    // whether the key belongs to the composer or the
+                    // transcript. The pane-global bindings above (Ctrl+Q,
+                    // Esc, Ctrl+C, Ctrl+R, Shift+Tab) have already had their
+                    // say and never reach it.
+                    let overview_visible = super::native_ux::resolve_layout(
+                        terminal.size().map(|size| size.width as usize).unwrap_or(80),
+                        terminal
+                            .size()
+                            .map(|size| size.height as usize)
+                            .unwrap_or(24),
+                    )
+                    .overview;
+                    match pane.ux_mut().handle_key(key, overview_visible) {
+                        super::native_ux::UxKey::Consumed => continue 'outer,
+                        super::native_ux::UxKey::Quit => break 'outer 0,
+                        super::native_ux::UxKey::Interrupt => {
+                            pane.interrupt();
+                            continue 'outer;
                         }
-                    } else if let Some(action) = key_to_action(key) {
-                        pane.handle_composer_action(action);
+                        super::native_ux::UxKey::Inspect(id) => {
+                            pane.open_inspection(&id);
+                            continue 'outer;
+                        }
+                        super::native_ux::UxKey::FollowUp(id) => {
+                            pane.follow_up(&id, cfg, now_secs());
+                            continue 'outer;
+                        }
+                        super::native_ux::UxKey::Decided(request, decision) => {
+                            pane.decide_approval(&request, decision, persistent);
+                            continue 'outer;
+                        }
+                        super::native_ux::UxKey::Transcript => {
+                            let total = pane.view().0.items.len().max(1);
+                            match key.code {
+                                KeyCode::Up => pane.presentation_mut().scroll.scroll_up(1, total),
+                                KeyCode::Down => pane.presentation_mut().scroll.scroll_down(1),
+                                KeyCode::PageUp => {
+                                    pane.presentation_mut().scroll.scroll_up(10, total)
+                                }
+                                KeyCode::PageDown => {
+                                    pane.presentation_mut().scroll.scroll_down(10)
+                                }
+                                KeyCode::Home => {
+                                    pane.presentation_mut().scroll.scroll_up(total, total)
+                                }
+                                KeyCode::End => {
+                                    let presentation = pane.presentation_mut();
+                                    presentation.scroll.jump_to_bottom();
+                                    presentation.mark_seen();
+                                }
+                                // Expands/collapses the most recent tool call
+                                // -- the same action `Ctrl+R` reaches from
+                                // any focus, via the one helper.
+                                KeyCode::Char('e') | KeyCode::Enter => {
+                                    toggle_most_recent_tool_call(&mut pane);
+                                }
+                                _ => {}
+                            }
+                        }
+                        super::native_ux::UxKey::Composer => {
+                            // Keep the two focus models in step: `UxState`
+                            // owns the dashboard's focus, `NativePresentation`
+                            // owns the pane's own composer/transcript split.
+                            pane.presentation_mut().focus = PaneFocus::Composer;
+                            if let Some(action) = key_to_action(key) {
+                                pane.handle_composer_action(action);
+                            }
+                        }
+                    }
+                    if pane.ux().focus == super::native_ux::Focus::Transcript {
+                        pane.presentation_mut().focus = PaneFocus::Transcript;
                     }
                 }
                 Ok(Event::Paste(text)) => {
                     pane.handle_composer_action(ComposerAction::InsertText(text));
+                }
+                // #354's clickable rows, for the overview: a click inside the
+                // panel column selects the agent whose rendered lines it
+                // landed in, and never scrolls or submits anything.
+                Ok(Event::Mouse(mouse))
+                    if matches!(mouse.kind, event::MouseEventKind::Down(_)) =>
+                {
+                    let size = terminal.size().ok();
+                    let width = size.map(|size| size.width as usize).unwrap_or(80);
+                    let height = size.map(|size| size.height as usize).unwrap_or(24);
+                    let plan = super::native_ux::resolve_layout(width, height);
+                    if !plan.overview {
+                        continue 'outer;
+                    }
+                    let panel_x = width.saturating_sub(super::native_ux::OVERVIEW_WIDTH);
+                    if (mouse.column as usize) < panel_x || mouse.row == 0 {
+                        continue 'outer;
+                    }
+                    let id = pane
+                        .ux()
+                        .overview
+                        .row_at_line(mouse.row as usize - 1, super::native_ux::OVERVIEW_WIDTH)
+                        .map(|row| row.id.clone());
+                    if let Some(id) = id {
+                        pane.ux_mut().overview.reselect(&id);
+                        pane.ux_mut().focus = super::native_ux::Focus::Overview;
+                    }
                 }
                 _ => {}
             }
         }
     };
 
+    if mouse_on {
+        let _ = io::Write::write_all(&mut io::stdout(), super::super::term::dash_reset_bytes());
+        let _ = io::Write::flush(&mut io::stdout());
+    }
     super::teardown_terminal(keyboard_enhancement_pushed);
     super::restore_panic_hook(&previous_panic_hook);
     pane.shutdown(state);
