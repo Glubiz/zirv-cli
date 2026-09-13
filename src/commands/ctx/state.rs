@@ -236,7 +236,17 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
     (
         "dash",
         SlugEntry::File("roster-", ".json"),
-        &["commands/ctx/dash/mod.rs", "commands/ctx/dash/roster.rs"],
+        &[
+            "commands/ctx/dash/mod.rs",
+            "commands/ctx/dash/roster.rs",
+            // Issue #490 (roadmap N21). The native pane uses the slug for
+            // exactly one thing: asking the persistent runtime whether it
+            // already holds this repository's seat
+            // (`link::RuntimeLink::seat_for`), the same ownership question
+            // `dash::mod` asks before opening a terminal. It reads no
+            // slug-keyed state-dir entry of its own.
+            "commands/ctx/dash/native_pane.rs",
+        ],
     ),
     (
         "dash",

@@ -3001,8 +3001,7 @@ impl NativePaneRuntime {
         // resume history -- both read straight off the durable store, so a
         // rollover or a compaction that happened while this pane was not
         // looking is still announced exactly once.
-        if let Some(record) =
-            super::super::rollover_runtime::load(&self.state, &self.short)
+        if let Some(record) = super::super::rollover_runtime::load(&self.state, &self.short)
             && record.updated_at > self.announced_rollover_at
         {
             self.announced_rollover_at = record.updated_at;
@@ -3023,30 +3022,29 @@ impl NativePaneRuntime {
                     ));
                 }
                 for resume in &history.resumes {
-                    self.ux.notices.push(super::native_ux::notice_reconnect(
-                        0,
-                        resume.sequence,
-                        0,
-                    ));
+                    self.ux
+                        .notices
+                        .push(super::native_ux::notice_reconnect(0, resume.sequence, 0));
                 }
             }
         }
 
-        let view = pool::build(
-            &self.state,
-            cfg,
-            now,
-            Some(self.session_id.as_str()),
-            None,
-        );
+        let view = pool::build(&self.state, cfg, now, Some(self.session_id.as_str()), None);
         let approvals: Vec<super::native_ux::ApprovalRequest> = self
             .ux
             .approval
             .as_ref()
             .map(|dialog| vec![dialog.request.clone()])
             .unwrap_or_default();
-        self.ux
-            .refresh(&graph, &records, &seats, &approvals, &view, &self.billing, now);
+        self.ux.refresh(
+            &graph,
+            &records,
+            &seats,
+            &approvals,
+            &view,
+            &self.billing,
+            now,
+        );
 
         // Criterion 2: completion notices are not lost. A worker that
         // finishes while the operator is stuck in an approval dialog has its
@@ -3054,7 +3052,11 @@ impl NativePaneRuntime {
         // `close_approval` releases everything held, in order.
         let blocked = self.ux.blocked();
         for record in &records {
-            if !record.phase.is_terminal() || !self.announced_terminal.insert(record.handle.delegation.clone()) {
+            if !record.phase.is_terminal()
+                || !self
+                    .announced_terminal
+                    .insert(record.handle.delegation.clone())
+            {
                 continue;
             }
             let item = super::native_ux::Deferred {
@@ -3123,20 +3125,14 @@ impl NativePaneRuntime {
         if body.is_empty() {
             return;
         }
-        let headline = match delegation::send(
-            &self.state,
-            &self.repo,
-            cfg,
-            delegation_id,
-            &body,
-            now,
-        ) {
-            Ok(delegation::Dispatch::Queued { reason, .. }) => {
-                format!("follow-up to {delegation_id} queued ({reason})")
-            }
-            Ok(_) => format!("follow-up delivered to {delegation_id}"),
-            Err(error) => format!("follow-up to {delegation_id} failed: {error}"),
-        };
+        let headline =
+            match delegation::send(&self.state, &self.repo, cfg, delegation_id, &body, now) {
+                Ok(delegation::Dispatch::Queued { reason, .. }) => {
+                    format!("follow-up to {delegation_id} queued ({reason})")
+                }
+                Ok(_) => format!("follow-up delivered to {delegation_id}"),
+                Err(error) => format!("follow-up to {delegation_id} failed: {error}"),
+            };
         self.ux.notices.push(super::native_ux::Notice {
             kind: super::native_ux::NoticeKind::DeferredDelivery,
             headline,
@@ -3365,10 +3361,7 @@ impl NativePaneRuntime {
 
     pub fn status_facts(&self) -> StatusFacts {
         StatusFacts {
-            model: format!(
-                "{}/{}",
-                self.route_model_vendor(), self.route_model_id()
-            ),
+            model: format!("{}/{}", self.route_model_vendor(), self.route_model_id()),
             route: self.route_label(),
             runtime: self.runtime_label().to_string(),
             billing: self.billing.clone(),
@@ -3767,7 +3760,10 @@ pub fn run_native_dashboard(
                     // Esc, Ctrl+C, Ctrl+R, Shift+Tab) have already had their
                     // say and never reach it.
                     let overview_visible = super::native_ux::resolve_layout(
-                        terminal.size().map(|size| size.width as usize).unwrap_or(80),
+                        terminal
+                            .size()
+                            .map(|size| size.width as usize)
+                            .unwrap_or(80),
                         terminal
                             .size()
                             .map(|size| size.height as usize)
@@ -3801,9 +3797,7 @@ pub fn run_native_dashboard(
                                 KeyCode::PageUp => {
                                     pane.presentation_mut().scroll.scroll_up(10, total)
                                 }
-                                KeyCode::PageDown => {
-                                    pane.presentation_mut().scroll.scroll_down(10)
-                                }
+                                KeyCode::PageDown => pane.presentation_mut().scroll.scroll_down(10),
                                 KeyCode::Home => {
                                     pane.presentation_mut().scroll.scroll_up(total, total)
                                 }
@@ -3841,9 +3835,7 @@ pub fn run_native_dashboard(
                 // #354's clickable rows, for the overview: a click inside the
                 // panel column selects the agent whose rendered lines it
                 // landed in, and never scrolls or submits anything.
-                Ok(Event::Mouse(mouse))
-                    if matches!(mouse.kind, event::MouseEventKind::Down(_)) =>
-                {
+                Ok(Event::Mouse(mouse)) if matches!(mouse.kind, event::MouseEventKind::Down(_)) => {
                     let size = terminal.size().ok();
                     let width = size.map(|size| size.width as usize).unwrap_or(80);
                     let height = size.map(|size| size.height as usize).unwrap_or(24);
@@ -4523,7 +4515,10 @@ mod tests {
         // server; the seat half of the rule is what this pins.)
         let mut harness_seat = native_seat(SessionState::Idle, true);
         harness_seat.runtime = RuntimeKind::Harness;
-        assert_eq!(resolve_attach(None, Some(&harness_seat)), PaneAttach::InProcess);
+        assert_eq!(
+            resolve_attach(None, Some(&harness_seat)),
+            PaneAttach::InProcess
+        );
         assert_eq!(
             resolve_attach(None, Some(&native_seat(SessionState::Idle, false))),
             PaneAttach::InProcess

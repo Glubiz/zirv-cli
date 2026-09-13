@@ -4454,7 +4454,7 @@ mod tests {
                     full: false,
                     breakdown: None,
                     json: false,
-                agents: false,
+                    agents: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -4492,7 +4492,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
 
         let mut out = Vec::new();
@@ -4749,7 +4749,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
 
         ledger::record(
@@ -4820,7 +4820,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
 
         let mut out = Vec::new();
@@ -4856,7 +4856,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
 
         let mut out = Vec::new();
@@ -4921,7 +4921,7 @@ mod tests {
                     full: false,
                     breakdown: None,
                     json: false,
-                agents: false,
+                    agents: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -5797,7 +5797,7 @@ mod tests {
                         full: false,
                         breakdown: None,
                         json: false,
-                agents: false,
+                        agents: false,
                     },
                     &mut out,
                     tmp.path(),
@@ -6679,7 +6679,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
 
         let mut first = Vec::new();
@@ -6732,7 +6732,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
 
         let mut first = Vec::new();
@@ -6821,7 +6821,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
         let mut first_out = Vec::new();
         run_with(
@@ -6979,7 +6979,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
-                agents: false,
+            agents: false,
         };
 
         let mut out_a = Vec::new();

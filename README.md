@@ -1850,7 +1850,19 @@ quits. The composer itself is a bordered box with a `>` marker and a hint
 line naming what `Enter` does right now, and `/`, `@` and `!` open the
 slash-command list, the worktree-restricted file picker and a shell line
 that runs through the pane's own process tool under the same policy as any
-other tool call. See
+other tool call.
+
+**Where the conversation lives.** With `[session] persistent` on, something
+listening, a runtime that serves native conversations, and a live native seat
+for this repository, the pane **attaches** to that session over protocol v1
+instead of opening its own — submit, steer, interrupt and the approval
+decision all go out as `session.send_input` / `session.interrupt` /
+`session.approve`, closing the window is a `session.detach` rather than a
+kill, and the status line reads `native · runtime`. Anything missing falls
+back to an in-process session, which is a working mode rather than a failure.
+An attached pane's model and route show as `–`: the runtime publishes no
+route identity for a session, and a guess would be worse than an honest
+placeholder. See
 [`docs/design/2026-09-13-native-ux.md`](docs/design/2026-09-13-native-ux.md)
 and the mock in
 [`docs/design/mocks/2026-09-13-native-pane.html`](docs/design/mocks/2026-09-13-native-pane.html).
