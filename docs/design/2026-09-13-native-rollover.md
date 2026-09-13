@@ -276,6 +276,64 @@ that tunes when a rollover fires — repo-forbidden exactly as before.
   checkpoint only; spending a distiller call on a route that just failed is
   exactly what `structural_only` exists to avoid.
 
+## 5b. Review round (PR #535)
+
+Four findings, all about the gap between what §2 claims and what the wiring
+actually did.
+
+**The writer lease was fenced on the wrong question.** It mapped the
+pre-existing env-derived `seat::fence`, which is supersession-only, so it could
+never refuse an uncommitted successor the way delegation and the coordinator
+graph do. `acquire_writer` now takes an explicit `Option<SeatFence>`: a caller
+the runtime handed a seat short and generation (`session::native`'s hosted
+turn) gets the strict `seat::guard` verdict; `None` keeps the env answer for a
+legacy worker launch or a bare terminal. The env path stays deliberately
+supersession-only, and that is a decision rather than an oversight: a swap seam
+exports the PREPARED generation (`handover::build_turn_env`), so a
+legitimately launching successor carries one above the seat's for the whole
+prepare→commit window, and applying the strict rule there would stop
+successors launching at all. `WriterRefusal::StaleSeat` now carries the typed
+`seat::StaleGeneration` whole.
+
+**The boundary and the prepare were two decisions.** `reach_boundary` durably
+cancels tool calls that never began, and it ran before a `prepare_onto` that
+can still refuse a pinned or already-prepared seat — leaving a "kept the
+original session" settlement over a journal with work removed from under it.
+`seat::may_prepare` now asks first, under the seat lock and through the same
+`admissible` check `prepare_onto` applies, so the ordinary case (an operator
+pinned the seat a tick ago) is a plain skip that touches no journal. That does
+not close the race — only the lock inside `prepare_onto` does — so the residual
+race is *compensated*: `Record::restore` is the only way a `Restored`
+settlement is written after a boundary, and it carries whatever was cancelled
+into `Record::source_cancelled`, which `status_line` names. A cancellation is
+never silently "kept".
+
+**`validate` was only wired to the return path.** README said a successor is
+validated before the source is given up; only `plan_return` actually called it.
+`rollover::evaluate`'s forward branch now calls it too (`forward_refusal`),
+between the direction decision and the boundary — so a candidate that cannot
+take the work never causes a cancellation and never opens a transaction, and
+the refusal is recorded among the routes this rollover tried. Two facts the
+seam genuinely lacks are stated as unknown rather than invented: nothing has
+been launched yet (startup is judged later, at the readiness check every
+rollover already performs) and the harness snapshot carries no remaining-budget
+number. The gate stays inert for a route that declares no offer, exactly as
+`allocator::place` already leaves an undeclared offer ungated.
+
+**Native sessions now record their own conversation.** Both native start paths
+(`run_session` and `spawn_interactive`) already register a native seat with
+`agent = RuntimeKind::Native.as_str()` — the same name `session::native`'s
+registry record uses — so the marker has something that actually resolves.
+`record_seat_conversation` writes it beside that seat, which makes
+`Displaced::conversation` truthful for a native source: a rollover can park it
+honestly instead of recording a displacement with no way home. Consuming it on
+a return is still later work (a native successor is launched by
+`NativeBackend::adopt`/`resume`, not by an adapter's `resume_args`), but the
+fact is now durable rather than absent. `native_conversation`'s runtime check
+is what keeps the other direction safe: a harness successor asking for a resume
+id gets `None` and cold-launches, never a journal session id it could not
+resume.
+
 ## 6. What is deferred
 
 - **`settle_subagents` / `disposition` have no in-tree caller yet.** They need
