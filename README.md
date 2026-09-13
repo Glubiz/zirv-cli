@@ -651,10 +651,12 @@ to the section that documents it in depth.
 - **Artifacts and agent seats** — `artifacts` inspects committed
   work-product artifacts and their acceptance state, and `agents`
   (`list`/`show`/`dispatch`) inspects provider-neutral workflow seats and
-  trust provenance. See [Agent registry](#agent-registry).
+  trust provenance; `dispatch --runtime native` runs a read-only seat on
+  zirv's own runtime with no coding harness installed. See [Agent
+  registry](#agent-registry).
 - **Review** — `review` (`package`/`run`/`add`/`dispose`/`list`/
   `ingest-pr-comments`) builds compact review packages and persists finding
-  dispositions.
+  dispositions; `run --runtime native` runs the reviewer seat natively.
 - **Maintenance and telemetry** — `maintain` (`scan`) runs deterministic
   operator-configured maintenance detectors, and `stats` aggregates
   privacy-conscious local workflow telemetry. See [Maintain
@@ -1031,6 +1033,27 @@ commands:
     flags: ["--model", "sonnet"]
   - command: cargo test
 ```
+
+`runtime` selects which machinery runs the step: `harness` (the default, and
+what every existing script keeps doing) or `native` — zirv conducts the
+conversation itself over a direct provider route, with no coding harness
+installed:
+
+```yaml
+commands:
+  - agent: fast-route          # a [route] name, not an adapter name
+    runtime: native
+    prompt: "Summarise the failing checks in ${dir}"
+```
+
+Under `runtime: native` the `agent` value names a provider route from
+`~/.zirv/native.toml` (the reserved value `native` means "use the `[roles]`
+entry for the worker role"), and `flags` are refused rather than silently
+ignored — they exist to reach a vendor CLI and there is none. An unrecognised
+`runtime` fails at load time, so `--dry-run` and the real run reject the same
+script. Everything else — `${var}` substitution, secrets, `operating_system`,
+`proceed_on_failure`, `delay_ms`, `fallback` and the exit-code contract — is
+identical on both runtimes.
 
 `prompt` gets the same `${var}` substitution as `command`, including the
 unresolved-placeholder error if a variable is missing. `flags` are passed
@@ -1815,6 +1838,67 @@ owner, checked on every run. The architecture decision behind all of this is
 recorded in
 [`docs/design/2026-09-11-native-runtime-contracts.md`](docs/design/2026-09-11-native-runtime-contracts.md).
 
+### Native workflows, verification and helper calls
+
+Migrating the chat loop alone would leave hidden vendor-CLI dependencies in
+everything around it, so every zirv model call that is *not* the main
+conversation runs natively too: handoff distillation, `zirv ctx ask`, `zirv
+ctx optimize`'s judgment pass, the agent loop's objective judge, the memory
+harvest and consolidation, the independent code reviewer, the frontend visual
+reviewer and the built-in agent seats.
+
+They all go through one helper service (`ctx::helper`) rather than
+per-call-site provider code: one bounded conversation, a typed answer, typed
+failures. **There is no new configuration key.** A helper runs natively
+exactly when your own native provider configuration names a route for that
+helper's role — `distiller`, `ask`, `optimize` or `seat` under `[roles]` in
+`~/.zirv/native.toml` — and otherwise keeps its existing harness path
+unchanged. A native attempt that fails still falls back to the harness rather
+than failing the caller.
+
+The seats that are real delegated workers take `--runtime native` instead, so
+they reuse `zirv agent` end to end:
+
+```bash
+zirv workflow review run <id> --agent fast-route --runtime native
+zirv workflow agents dispatch reviewer --adapter fast-route --runtime native
+zirv workflow frontend review --runtime native
+```
+
+Read-only stays read-only by mechanism, not by prompt: a native helper and a
+`--mode read-only` native worker hold no writer permit at all, so the
+execution broker refuses every repository write, outside write, write-effect
+process and shared-scope knowledge write at effect time — and a headless
+session cannot approve its way past that. A *writable* seat is therefore
+refused by the native seat dispatcher rather than quietly downgraded; run it
+as a delegated worker (`zirv agent --runtime native --mode writing`), which
+takes a real permit.
+
+A native session drives the workflow itself with four typed tools —
+`workflow_status`, `workflow_context`, `workflow_advance`, `workflow_approve`
+— each a thin adaptor over the same `workflow::engine` function the CLI verb
+calls, over the same durable state. The two that mutate the workflow declare
+the write capability, so a read-only reviewer can read the workflow it is
+reviewing and cannot move it.
+
+Methodology and workflow adoption are automatic. The native context compiler
+puts the engineering standard, the role methodology, the model profile, your
+own and the repository's instruction files and the active workflow's current
+step into every request the session makes; nobody hand-seeds a prompt.
+Verification freshness is not advisory either: the engine's completion gate is
+re-read at every completion attempt, so a session that reaches the Test step
+after it started is gated on the evidence that exists then, and its "I am
+finished" token cannot outrank it. That gate is keyed by the workflow's own
+recorded branch, so a workflow started in the main checkout accepts its worker
+worktree's evidence for the same change set (see [Linked
+worktrees](#linked-worktrees)) and rejects a different one.
+
+The per-command parity table — every shipped command and helper, its native
+implementation and the test that pins it — is
+[`docs/design/native-parity.md`](docs/design/native-parity.md); the decisions
+behind this step are in
+[`docs/design/2026-09-13-native-workflows.md`](docs/design/2026-09-13-native-workflows.md).
+
 ### Native configured capabilities
 
 A native session inherits nothing from a coding harness, so the non-shell
@@ -2256,6 +2340,20 @@ A nested worker gets its own principal and one hop less delegation depth, so
 it inherits none of the parent's session authority. The delegation record
 itself lives under the operator-owned state directory, never in the
 repository.
+
+Native workflows, verification and helper calls add no repository-settable key
+either. Which runtime a workflow reviewer, agent seat or script `agent:` step
+runs on comes from the command line or the script the operator wrote; which
+route a helper spends comes from the operator-owned `[roles]` table in
+`~/.zirv/native.toml`, and a role with no entry has no native path at all. A
+helper session is constructed with no writer permit, so its read-only
+character is the broker's decision at effect time rather than a prompt a
+model could be talked out of, and `workflow_advance`/`workflow_approve` are
+priced as shared-scope writes for the same reason. The workflow id a tool
+call names is validated as `[A-Za-z0-9_-]{1,128}` before it can reach a file,
+so model output cannot address state outside the workflow store. The
+completion gate reads the workflow's own recorded branch and the verification
+store, never the model's account of them.
 
 The local runtime protocol ([`zirv ctx api`](#runtime-protocol-v1-zirv-ctx-api))
 adds no configuration key, and deliberately so: its endpoint is always derived

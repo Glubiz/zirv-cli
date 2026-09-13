@@ -216,13 +216,16 @@ installed binary during self-update; never spawns it).
 | Headless in-place resume/compact | `src/commands/ctx/exec.rs` | `compact_in_place` | N09 (#478) | resumes a headless session in place to compact it |
 | Agent loop headless spawn | `src/commands/ctx/run_loop.rs` | `run_with_clock` | N09 (#478) | `zirv ctx loop`'s per-cycle headless spawn |
 | Agent loop objective judge | `src/commands/ctx/run_loop.rs` | `evaluate_objective_after_cycle` | N09 (#478) | distinct helper-model call: judges the objective gate after a loop cycle |
-| Distiller/judge chokepoint | `src/commands/ctx/handoff.rs` | `run_model` | N15 (#484) | wraps `distiller_cmd`; shared by run_loop, memory, optimize, ask below |
+| Helper-model chokepoint | `src/commands/ctx/handoff.rs` | `helper_answer` | N15 (#484) | the ONE place a non-chat model call is made: native first (`ctx::helper`), harness second. Shared by the distiller, run_loop's judge, memory harvest/consolidation, optimize and ask below |
+| Harness distiller/judge child | `src/commands/ctx/handoff.rs` | `run_model` | N15 (#484) | wraps `distiller_cmd`; reached through `helper_answer` when the helper's role has no native route |
+| Native helper call | `src/commands/ctx/helper.rs` | `run` | N15 (#484) | one bounded, read-only native session per helper call; holds no writer permit, so the broker refuses every mutating effect |
+| Native workflow agent seat | `src/commands/workflow/agents.rs` | `dispatch_native_seat` | N15 (#484) | `workflow agents dispatch --runtime native`; read-only seats only |
 | Resume interactive relaunch | `src/commands/ctx/resume.rs` | `launch_command` | N17 (#486) | `zirv ctx resume` |
 | Agent delegation dispatch | `src/commands/ctx/agent.rs` | `run_with` | N10 (#479) | probes `headless_resume_cmd` before a bounded structural-result retry; `--runtime native` forks to `native_worker::run` before adapter selection |
 | Native delegated worker | `src/commands/ctx/native_worker.rs` | `run` | N10 (#479) | `zirv agent --runtime native`: takes the shared task/permit/reservation ownership, writes the durable launch receipt, drives `native::run_session` and publishes the terminal outcome |
 | Native delegation tool launch | `src/commands/ctx/delegation.rs` | `AgentLauncher` | N10 (#479) | the native `delegate` tool's production launcher -- one `agent::run_with` call, so the tool and the CLI verb are one code path |
-| Built-in seat worker dispatch | `src/commands/workflow/agents.rs` | `dispatch_agent` | N15 (#484) | synchronous `.status()` dispatch of a built-in agent seat |
-| Cross-harness review launch | `src/commands/workflow/review.rs` | `launch_reviewer` | N15 (#484) | `reviewer_argv` + self-recursion into `current_exe` |
+| Built-in seat worker dispatch | `src/commands/workflow/agents.rs` | `dispatch_agent` | N15 (#484) | synchronous `.status()` dispatch of a built-in agent seat; the harness half of `workflow agents dispatch` |
+| Cross-harness review launch | `src/commands/workflow/review.rs` | `launch_reviewer` | N15 (#484) | `reviewer_argv` + self-recursion into `current_exe`; `--runtime native` emits a `zirv agent --runtime native --mode read-only` argv with no adapter flags |
 | Frontend visual reviewer launch | `src/commands/workflow/frontend_render.rs` | `launch_visual_reviewer` | N15 (#484) | reuses `review::reviewer_argv`; self-recursion into `current_exe` |
 | Auto-spawn on workflow gate transition | `src/commands/workflow/engine.rs` | `spawn_auto_worker` | N15 (#484) | issue #242: detached self-recursion into `zirv workflow review run` / `test` / `verify` |
 | `ctx ask` helper-model call | `src/commands/ctx/ask.rs` | `run_model` | N15 (#484) |  |
@@ -256,6 +259,19 @@ MCP servers over the protocol rather than a provider. The thirteen native
 capability tools it reports on are registry entries under `runtime::tools`, not
 command verbs and not model-calling call sites, so they add no row to either
 table.
+
+N15 adds four rows and no command row. `helper_answer` is the new chokepoint
+every non-chat model call reaches (`run_model` stays, as the harness half
+behind it); `helper::run` is the native session one helper call runs as; and
+`dispatch_native_seat` is the native half of `workflow agents dispatch`. The
+`--runtime`/`--route` flags it adds to `workflow review run`, `workflow agents
+dispatch` and `workflow frontend review`, and the `runtime:` key it adds to a
+script `agent:` step, are flags and script fields on existing surfaces, so no
+`## Commands` row changes. The four native workflow tools
+(`workflow_status`/`workflow_context`/`workflow_advance`/`workflow_approve`)
+are registry entries under `runtime::tools`, not command verbs and not
+model-calling call sites, so they add no row to either table -- the same
+treatment N14's thirteen capability tools get.
 
 N09 adds the two rows that actually DRIVE a model rather than transport one
 request: `NativeLoop::stream_once`, the single place the loop reaches a
