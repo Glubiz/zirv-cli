@@ -1077,6 +1077,20 @@ impl ExecutionBroker {
                     required.push(Capability::RepoFsWrite);
                     needs_writer = true;
                 }
+                // Issue #483: not every knowledge service is inert. The
+                // frontend one starts a development server and a headless
+                // browser through zirv's own vetted `frontend_render` path,
+                // so it carries exactly the capabilities that implies --
+                // named here rather than inside the tool, so the broker stays
+                // the only place an effect is priced.
+                if service == "frontend" {
+                    required.push(Capability::ShellExec);
+                    required.push(Capability::Network);
+                    if *write {
+                        required.push(Capability::RepoFsWrite);
+                        needs_writer = true;
+                    }
+                }
             }
             ExecutionAction::WriteFile { path } => {
                 let (path, capability) = self.validate_write(path)?;

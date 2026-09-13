@@ -447,6 +447,29 @@ impl CapabilityReport {
     }
 }
 
+/// The integrations one workflow step genuinely cannot proceed without
+/// (issue #483). Deliberately short: a step is refused only where the missing
+/// backend makes the step impossible rather than merely harder. A frontend
+/// step that has to render and inspect a page needs a browser; nothing else
+/// in the ladder does.
+pub fn required_integrations(
+    phase: super::skill::WorkflowPhase,
+    frontend_domain: bool,
+) -> Vec<IntegrationId> {
+    use super::skill::WorkflowPhase;
+
+    match (phase, frontend_domain) {
+        (WorkflowPhase::Implement | WorkflowPhase::Review | WorkflowPhase::Verify, true) => {
+            vec![IntegrationId::FrontendRender]
+        }
+        (WorkflowPhase::Present, true) => {
+            vec![IntegrationId::ArtifactRender, IntegrationId::FrontendRender]
+        }
+        (WorkflowPhase::Present, false) => vec![IntegrationId::ArtifactRender],
+        _ => Vec::new(),
+    }
+}
+
 fn policy_decision(policy: &EffectivePolicy, capability: CapabilityId) -> PolicyDecision {
     let relevant: &[PolicyCapability] = match capability {
         CapabilityId::ShellExec | CapabilityId::TestRun | CapabilityId::BrowserOpen => {
@@ -508,6 +531,22 @@ mod tests {
             unknown.support(CapabilityId::RepoRead),
             SupportLevel::Unsupported
         );
+    }
+
+    #[test]
+    fn every_integration_id_round_trips_through_its_wire_name() {
+        for integration in IntegrationId::ALL {
+            assert_eq!(
+                IntegrationId::parse(integration.as_str()),
+                Some(integration)
+            );
+            assert_eq!(
+                serde_json::to_value(integration).expect("encode"),
+                serde_json::Value::String(integration.as_str().to_string()),
+                "the serde rename and as_str must agree for {integration}"
+            );
+        }
+        assert_eq!(IntegrationId::parse("browser.open"), None);
     }
 
     #[test]
