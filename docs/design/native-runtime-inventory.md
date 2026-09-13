@@ -131,6 +131,12 @@ criterion).
 | `report` | shared |  |
 | `report bug` | shared |  |
 | `report feature` | shared |  |
+| `session` | N20 (#489) | the persistent runtime (#352): a local service owns the PTYs and every UI is a protocol v1 client |
+| `session attach` | N20 (#489) | attaches a terminal as observer or controller |
+| `session detach` | N20 (#489) | releases clients; never ends a process |
+| `session list` | N20 (#489) | reads one runtime's session list over protocol v1 |
+| `session serve` | N20 (#489) | the runtime service itself: owns PTYs, supervisors and registry records |
+| `session stop` | N20 (#489) | the one verb that ends a session, or the runtime |
 | `setup` | N22 (#491) |  |
 | `setup apply` | N22 (#491) |  |
 | `setup profile` | N22 (#491) |  |

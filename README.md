@@ -528,6 +528,12 @@ to the section that documents it in depth.
   for delegated workers, worktree groups, and kill/nudge/send from the
   keyboard. See [The dashboard: multiple sessions in one
   terminal](#the-dashboard-multiple-sessions-in-one-terminal).
+- **Persistent runtime (experimental)** — `session` runs a local service that
+  owns the PTYs, so closing or crashing the client leaves the agents running:
+  `serve` starts it, `list` shows what it holds, `attach` and `detach` connect
+  and disconnect a terminal, and `stop` is the separate verb that actually
+  ends something. Off by default and operator-only. See [Persistent runtime
+  (`zirv session`)](#persistent-runtime-zirv-session).
 - **Nested sessions are refused** — a supervisor started inside another
   supervised session stops instead of sharing its outer session's registry
   and turn signals. See [Nested sessions are
@@ -1159,7 +1165,7 @@ marks it as shadowed in the listing.
 <!-- zchk-doc-reserved:start -->
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
 `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`,
-`commands`, `update`, and their short aliases `h`, `v`, `i`, `c`,
+`commands`, `update`, `session`, and their short aliases `h`, `v`, `i`, `c`,
 <!-- zchk-doc-reserved:end -->
 are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
@@ -1665,8 +1671,12 @@ vocabulary ends with an `unknown` fallback.
 **Methods** (v1 is deliberately narrow): `server.ping`,
 `server.capabilities`, `session.snapshot|list|get`, `session.start|stop`,
 `session.read|send_input`, `session.wait`, `session.report_status`,
-`events.subscribe`. Mail, memory, work-group, workflow, layout and plugin
-methods are added only when a concrete client needs them.
+`session.attach|detach|takeover|resize|screen`, `events.subscribe`. Mail,
+memory, work-group, workflow, layout and plugin methods are added only when a
+concrete client needs them. The five attachment methods need a server that
+owns terminals, so they sit behind their own `session.attach` capability: a
+server without one does not advertise it and a client disables that surface
+locally rather than calling it and being refused.
 
 **Events and gaps.** The server-wide `revision` advances by exactly one per
 emitted event, so a subscriber that sees a revision other than `last + 1` has
@@ -1695,17 +1705,89 @@ no prompt, no mail body, no terminal history, no credential and no absolute
 repository path — only the sanitised repo slug. Mutations go through the same
 narrowing-only trust model as everything else.
 
-**What v1 is not.** There is no daemon: the reference server runs in-process
-(`zirv ctx api serve`, or for the duration of one `zirv ctx api call`), and
-PTY ownership stays with the dashboard. A server with no runtime backend
-attached serves every read method off the session registry and refuses
-`session.start|stop|send_input` with a structured `unsupported` naming
-[issue #352](https://github.com/Glubiz/zirv-cli/issues/352) — never a silent
-success. Frozen request/response/event fixtures under
+**What v1 is not.** The reference server (`zirv ctx api serve`, or the
+duration of one `zirv ctx api call`) runs in-process, owns no terminals and
+holds no processes: it serves every read method off the session registry,
+refuses `session.start|stop|send_input` with a structured `unsupported`, and
+does not advertise the attachment capability at all. The daemon that does own
+terminals is `zirv session serve` — the same protocol, the same endpoint, one
+extra capability. Frozen request/response/event fixtures under
 `tests/fixtures/protocol/v1/` are replayed against the server on every test
 run, so the wire cannot change by accident. The full contract and its
 trade-offs are recorded in
 [`docs/design/2026-09-12-runtime-protocol-v1.md`](docs/design/2026-09-12-runtime-protocol-v1.md).
+
+### Persistent runtime (`zirv session`)
+
+**Experimental, operator-only, and off by default.** A local runtime service
+owns the PTY/ConPTY processes, their supervisors and their registry records,
+and every UI is a client of it. Closing the window, killing the client or
+losing the terminal then costs a repaint, not a session.
+
+```bash
+zirv session serve                 # run the runtime (owns the terminals)
+zirv session list                  # what it holds, and who is attached
+zirv session attach [name|id]      # attach this terminal (Ctrl+A d detaches)
+zirv session detach [name|id]      # release clients; the agent keeps running
+zirv session stop [name|id]        # end a session (this one asks first)
+zirv session stop --runtime        # stop the service; sessions keep running
+```
+
+Turn it on in `~/.zirv/ctx.toml` (a repository cannot):
+
+```toml
+[session]
+persistent = true       # default false
+history = false         # default false -- see the warning below
+scrollback_rows = 2000  # in memory, per session
+stale_after_secs = 120  # secondary staleness signal only
+```
+
+With `persistent = true` and a real terminal on both stdin and stdout, `zirv
+chat` attaches to this repository's runtime session (starting the runtime and
+the session if they are not there yet) instead of owning a PTY in its own
+process. `zirv chat --no-session`, a piped stdin and a redirected stdout all
+keep the previous behaviour exactly.
+
+**Clients.** Any number of observers may watch a session; at most one client
+holds the keyboard. A second controller is refused with `busy` rather than
+silently displacing the first — `zirv session attach --takeover` takes the
+seat on purpose, and every client sees the `controller_changed` event. `Ctrl+A
+d` detaches (`Ctrl+A Ctrl+A` sends a literal `Ctrl+A` to the agent), the same
+prefix the dashboard uses.
+
+**Detach is not stop.** `detach` moves an entry in the runtime's attachment
+table and touches nothing else: no confirmation, and the agent, its PTY, its
+supervisor and its registry record are all still there afterwards. `stop`
+puts the child through the existing termination ladder and asks first —
+`--yes` is required when stdin is not a terminal.
+
+**What actually survives, honestly:**
+
+| Tier | Event | Guarantee |
+|---|---|---|
+| 1 | A client detaches, crashes or closes | The original PTY and process keep running. Reattaching restores the current rendered screen and live input from the runtime's own in-memory parser. Nothing is relaunched. |
+| 2 | The runtime itself restarts | The processes are gone. Topology (which sessions, which directories, what size) is restored, and a session is **resumed** only when it carries a verified harness conversation reference; everything else is reported as not resumed. A restored session is a new session that records its predecessor — never the old identity revived. |
+| 3 | Rendered terminal history across a runtime restart | Off by default. `history = true` writes rendered terminal output — including anything an agent printed, such as API keys, tokens and file contents — to disk, and says so every time the runtime starts. |
+| 4 | Replacing the runtime binary under live sessions | Not supported. Stop the runtime, upgrade, start it again. |
+
+A detached session keeps every Zirv guarantee that reads the registry, because
+the runtime files the same registry record a dashboard pane does and holds it
+for the life of the session: usage pacing, budgets, rot scoring, mail
+addressing, writer permits and workflow policy all keep working with nobody
+watching, and the harness's turn signals keep being observed.
+
+**Identity.** Each namespace publishes a record under `<state>/runtime/` with
+its owner, version, endpoint, creation time and last-client time. Staleness is
+decided by process **start identity**, not by pid alone: a live pid whose
+start time does not match the record is a recycled pid and the namespace is
+free, while a record nothing can verify is left alone rather than seized.
+Every service start mints a fresh instance id, so a crashed runtime's session
+identities can never be republished by its successor.
+
+See
+[`docs/design/2026-09-13-persistent-runtime.md`](docs/design/2026-09-13-persistent-runtime.md)
+for the design, the measurements and what is deferred.
 
 ### Signals and verdicts
 
@@ -1863,7 +1945,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
-`handover`, or any of the five keys that feed the token gate (`score.token_floor`,
+`handover`, any `session.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
 `score.model_context_tokens`); doing so is an error
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
@@ -2002,6 +2084,10 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `fallback.health.open_after_failures` | `ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES` |
 | `fallback.health.window_secs` | `ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS` |
 | `fallback.health.cooldown_secs` | `ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS` |
+| `session.persistent` | `ZIRV_CTX_SESSION_PERSISTENT` |
+| `session.history` | `ZIRV_CTX_SESSION_HISTORY` |
+| `session.scrollback_rows` | `ZIRV_CTX_SESSION_SCROLLBACK_ROWS` |
+| `session.stale_after_secs` | `ZIRV_CTX_SESSION_STALE_AFTER_SECS` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -2014,6 +2100,11 @@ able to force that layer back on for an operator who turned it off.
 `prompt.codex_orchestrator` closes the same loop once more for codex's own
 orchestrator-conventions layer (issue #167): a repo checkout must not be
 able to re-enable it for an operator who turned it off.
+`session.*` closes a sharper version of the same hole: `session.persistent`
+decides whether cloning a repository is enough to make sessions started from
+it outlive the operator's terminal, and `session.history` decides whether
+rendered terminal output — tokens, keys and file contents included — is
+written to disk at all. Neither is a decision a checkout gets to make.
 `memory.*` closes the same hole again for the memory bank's *configuration*
 (not its content -- see below): a repo checkout must not be able to switch
 either scope's gate on or off for itself, raise its own caps, or switch
