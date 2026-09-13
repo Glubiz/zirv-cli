@@ -611,6 +611,24 @@ pub struct McpToolEntry {
     pub digest: String,
 }
 
+impl McpToolEntry {
+    /// The tool's name reduced to one safe registry segment. A server may
+    /// call its tools anything; a registry key may not contain a separator
+    /// that could make one name look like another.
+    pub fn tool_key(&self) -> String {
+        self.name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct McpResourceEntry {
     pub uri: String,

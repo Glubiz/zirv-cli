@@ -2467,7 +2467,7 @@ fn brokered_tools(
 ) -> CtxResult<Box<dyn ToolExecutor>> {
     use super::enforcement::{
         ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, ExecutionIdentity,
-        NetworkScope, PlatformIsolation, ResourceClaims, StoredSeatFence,
+        PlatformIsolation, ResourceClaims, StoredSeatFence,
     };
     use super::tools::ToolLimits;
 
@@ -2478,7 +2478,7 @@ fn brokered_tools(
             request.repo,
             state.root(),
             home,
-            NetworkScope::Denied,
+            configured_network_scope(cfg),
         )?
         .discover_linked_worktree_git()?,
         ApprovalMode::Headless,
@@ -2489,12 +2489,51 @@ fn brokered_tools(
         PlatformIsolation::detect(),
         Default::default(),
     )?;
-    Ok(Box::new(ClientToolExecutor::new(NativeToolClient::new(
-        broker,
-        state.clone(),
-        request.repo.to_path_buf(),
-        ToolLimits::from_config(cfg),
-    ))))
+    let services = super::capabilities::CapabilityServices::from_config(
+        cfg,
+        request.repo,
+        &super::super::config::env_from_process(),
+        super::super::state::now_secs(),
+    );
+    Ok(Box::new(ClientToolExecutor::new(
+        NativeToolClient::new(
+            broker,
+            state.clone(),
+            request.repo.to_path_buf(),
+            ToolLimits::from_config(cfg),
+        )
+        .with_capabilities(services),
+    )))
+}
+
+/// The task's network claim, built from the operator's own capability
+/// allowlist (issue #483). Nothing is reachable by default: a session gets a
+/// host-scoped claim only for the hosts an operator wrote down, and
+/// `NetworkScope::Only` is deliberately never `Any` -- an arbitrary process
+/// still cannot take network under it, which is exactly the asymmetry N04
+/// documents between brokered HTTP tools and shells.
+fn configured_network_scope(
+    cfg: &super::super::config::CtxConfig,
+) -> super::enforcement::NetworkScope {
+    use super::enforcement::{NetworkScope, NetworkTarget};
+
+    if !cfg.capabilities.enabled {
+        return NetworkScope::Denied;
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    for host in &cfg.capabilities.web.allow_hosts {
+        let host = host.trim().trim_start_matches('.');
+        for scheme in ["https", "http"] {
+            if let Ok(target) = NetworkTarget::new(scheme, host, None) {
+                targets.insert(target);
+            }
+        }
+    }
+    if targets.is_empty() {
+        NetworkScope::Denied
+    } else {
+        NetworkScope::Only { targets }
+    }
 }
 
 #[cfg(test)]

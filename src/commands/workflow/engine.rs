@@ -3442,6 +3442,16 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     if let Some(seat) = step.agent.as_deref() {
                         agent_registry.ensure_supported(seat, &report)?;
                     }
+                    // Issue #483: a workflow must not enter a step whose
+                    // required integration is unavailable. The refusal names
+                    // the missing binary or credential, here at start, rather
+                    // than halfway through the step.
+                    let frontend = classification.work_domain.domain == WorkDomain::Frontend;
+                    report
+                        .admit(&super::capability::required_integrations(
+                            step.phase, frontend,
+                        ))
+                        .map_err(|why| format!("step '{}': {why}", step.id))?;
                 }
             }
             let mut state = WorkflowState::start(
