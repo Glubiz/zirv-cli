@@ -110,9 +110,10 @@ impl OpenAiChatAdapter {
             .map_err(|error| config_error(format!("route `{route}` extensions: {error}")))?;
         let endpoint = match target.protocol {
             Protocol::AzureOpenAiChat => {
-                let account = config.accounts.get(&target.account).ok_or_else(|| {
-                    config_error(format!("unknown account `{}`", target.account))
-                })?;
+                let account = config
+                    .accounts
+                    .get(&target.account)
+                    .ok_or_else(|| config_error(format!("unknown account `{}`", target.account)))?;
                 ChatEndpoint::Azure {
                     deployment: route_config.deployment.clone().ok_or_else(|| {
                         config_error(format!("route `{route}` has no Azure deployment"))
@@ -167,10 +168,7 @@ impl OpenAiChatAdapter {
                     kind: FailureScopeKind::Provider,
                     id: Some(target.provider.to_string()),
                 },
-                format!(
-                    "route profile `{}` has no direct API: {reason}",
-                    profile.id
-                ),
+                format!("route profile `{}` has no direct API: {reason}", profile.id),
             ));
         }
         if timeouts.has_zero() {
@@ -245,10 +243,7 @@ impl OpenAiChatAdapter {
             body.insert("model".into(), Value::String(request.model.clone()));
         }
         body.insert("stream".into(), Value::Bool(true));
-        body.insert(
-            "stream_options".into(),
-            json!({ "include_usage": true }),
-        );
+        body.insert("stream_options".into(), json!({ "include_usage": true }));
         body.insert("max_tokens".into(), json!(request.max_output_tokens));
         body.insert("messages".into(), encode_messages(request)?);
         if !request.stop_sequences.is_empty() {
@@ -314,9 +309,8 @@ impl OpenAiChatAdapter {
             .timeout_recv_body(Some(WORKER_READ_POLL))
             .build()
             .into();
-        let payload = serde_json::to_string(body).map_err(|error| {
-            config_error(format!("failed to encode chat request: {error}"))
-        })?;
+        let payload = serde_json::to_string(body)
+            .map_err(|error| config_error(format!("failed to encode chat request: {error}")))?;
         let mut http = agent
             .post(self.request_url())
             .header("content-type", "application/json")
@@ -476,8 +470,8 @@ fn validate_request(
             "max_output_tokens must be greater than zero".into(),
         ));
     }
-    if let Some(window) = crate::commands::ctx::catalogue::vendor(&target.model.vendor)
-        .and_then(|vendor| {
+    if let Some(window) =
+        crate::commands::ctx::catalogue::vendor(&target.model.vendor).and_then(|vendor| {
             crate::commands::ctx::catalogue::context_window(vendor, Some(&request.model))
         })
         && request.max_output_tokens >= window
@@ -567,9 +561,7 @@ fn validate_content_relationships(
                 ProviderContent::Text { .. } => {}
                 ProviderContent::Refusal { .. } => {
                     if message.role != ProviderMessageRole::Assistant {
-                        return Err(config_error(
-                            "a refusal is assistant content".into(),
-                        ));
+                        return Err(config_error("a refusal is assistant content".into()));
                     }
                 }
                 ProviderContent::ToolUse { id, input, .. } => {
@@ -922,9 +914,9 @@ fn finish_response(
     let message_id = accumulator
         .id
         .ok_or_else(|| invalid_stream("the chat-completions stream had no completion id".into()))?;
-    let model = accumulator.model.ok_or_else(|| {
-        invalid_stream("the chat-completions stream had no serving model".into())
-    })?;
+    let model = accumulator
+        .model
+        .ok_or_else(|| invalid_stream("the chat-completions stream had no serving model".into()))?;
 
     let mut content = Vec::new();
     if !accumulator.text.is_empty() {
@@ -1037,7 +1029,10 @@ fn classify_transport_error(
     if matches!(error, ureq::Error::Timeout(_)) {
         return super::transport::timeout_failure(PROVIDER, saw_event, target);
     }
-    super::transport::transport_failure(format!("chat-completions transport failed: {error}"), target)
+    super::transport::transport_failure(
+        format!("chat-completions transport failed: {error}"),
+        target,
+    )
 }
 
 fn error_code(value: &Value) -> String {

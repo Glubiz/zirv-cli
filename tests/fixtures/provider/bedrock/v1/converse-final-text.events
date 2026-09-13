@@ -1,0 +1,5 @@
+messageStart	{"role":"assistant"}
+contentBlockDelta	{"contentBlockIndex":0,"delta":{"text":"Both files read."}}
+contentBlockStop	{"contentBlockIndex":0}
+messageStop	{"stopReason":"end_turn"}
+metadata	{"usage":{"inputTokens":240,"outputTokens":9}}

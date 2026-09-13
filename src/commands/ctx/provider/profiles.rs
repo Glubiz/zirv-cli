@@ -21,6 +21,11 @@
 //!    never used for "zirv has not written that adapter yet", which is
 //!    [`Support::Planned`].
 
+// The registry is data: individual rows, lookups and extension types are
+// consumed by the transports, the inventory and this module's own tests, so
+// "nothing in the default build calls this one" is not a signal here.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 
 use serde::Serialize;
