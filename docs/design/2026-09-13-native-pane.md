@@ -178,38 +178,153 @@ multiline convention in this module (`resolve_file_refs`, `wrap_line`,
 53 tests, all under `dash::native_pane::tests`, none requiring a real
 terminal, a live runtime, or a network call.
 
-## What is deferred
+## Round 2: a real, driven, launchable pane
 
-- **Wiring into `dash::mod`'s live event loop.** No `PaneKind` enum exists
-  on `dash::pane::Pane` yet, and `Vec<Pane>` is not touched. A native pane
-  is not spawnable from the dashboard today, does not appear in the
-  sidebar, and does not participate in the mail sweep, budget accounting,
-  attention projection or restore roster. This is the largest deferred
-  piece, and deliberately so: those systems are deeply PTY-shaped (the mail
-  sweep types text into a child's stdin; budget accounting reads transcript
-  usage off a `vt100::Screen`; the restore roster relaunches a child
-  process), and retrofitting all of them in the same change as the view
-  model itself would make this diff both far larger and far harder to
-  review independently of the rendering work. The roadmap's own acceptance
-  criteria agree: "this issue provides the initial usable view; integrated
-  multi-agent attention and rollover UX is completed in N21."
-- **A live keyboard/paste event loop.** `key_to_action` and
-  `coalesce_paste_chunks` are pure functions a real `crossterm::event::read`
-  loop would drive; no such loop exists yet for a native pane specifically
-  (the wrapped-pane loop in `dash::mod` is untouched, per scope).
-- **`zirv ctx exec --runtime native`'s own output.** It still prints only
-  the final JSON status (`run_headless`); this issue does not change that
-  contract. `render_plain` is available for a future interactive
-  non-ratatui surface and for tests, but nothing wires it into the exec
-  path today.
-- **Real approval-pending / billing-class facts.** `StatusFacts` is a plain
-  struct a driver assembles; this issue does not add the plumbing that
-  reads a live approval gate or resolves a route's `provider::BillingClass`
-  at render time (that resolution already exists at session-start,
-  `provider::inventory::RouteReport`, but nothing here calls it).
-- **Text selection/copy.** `NativePresentation::selection` is a
-  `(start, end)` item-index pair with `set_selection`/`clear_selection`,
-  proven to survive a render call at a different width, but no copy
-  mechanism reads it.
-- No `#[cfg(unix)]` code was added or changed; nothing here touches
-  `wrap.rs`, raw-mode handling, or PTY input routing.
+The first round shipped the view model with nothing driving it. The
+roadmap's own acceptance criteria are explicit that this issue owes more
+than that -- "a native session can complete a real read/edit/test
+conversation from the TUI" needs an actual session behind the view, opened
+from an actual command. Round 2 adds that, while keeping the change
+reviewable against a codebase whose existing wrapped-harness dashboard
+(`dash::mod::run_dashboard`) is a single ~3,000-line function threading
+`Vec<Pane>` through roughly a hundred call sites (spawn, mail sweep, budget
+accounting, attention projection, restore roster).
+
+### `runtime::native::spawn_interactive`: one submit, many turns
+
+Every existing native entry point (`run_headless`/`run_session`,
+`native_worker::run`) runs ONE submitted prompt to completion and exits --
+right for a headless run or a delegated worker, wrong for a pane an
+operator keeps typing into. `spawn_interactive` resolves transport/journal/
+seat/writer exactly like `run_session` (same `build_transport`, same
+`NativeBackend`/`NativeLoop`, same writer-permit acquisition as
+`native_worker.rs`'s `WorkerMode::Writing`), then hands the whole session to
+a background OS thread that constructs a **fresh** `NativeLoop` and calls
+`run_to_completion` once per item received on an `mpsc::Sender<String>`,
+instead of once total. `ToolExecutor` gained a `Send` bound (`ProviderAdapter`
+already had one) so a `Box<dyn ToolExecutor>` can move into that thread --
+every real implementor already was `Send`; this is a bound addition, not a
+behaviour change.
+
+Three separate paths, not one multiplexed command channel:
+
+- **Submit** (idle -> a fresh turn) goes through the channel -- it is the
+  only thing that starts a new `run_to_completion` call.
+- **Steer** (input during a turn already in flight) does **not** go through
+  the channel at all. The worker thread is synchronously blocked inside
+  `run_to_completion` while a turn runs, so a channel message would just
+  queue until that call returns -- too late to matter as "steering". Instead
+  the caller (`NativePaneRuntime::write_steering`) commits the input
+  straight to the journal, using its own separate `Journal` handle on the
+  same SQLite file (WAL mode; `journal.rs`'s own doc comment already
+  documents concurrent readers, and a second writer's committed transaction
+  is visible the same way). `NativeLoop::queued_input` already re-reads the
+  journal for exactly this between requests inside a turn and between
+  turns, so the running loop picks up the steer without either side
+  coordinating directly.
+- **Interrupt** bypasses the channel too, via the `Arc<CancellationFlag>`
+  `NativeBackend::cancellation` already hands out for "a caller that drives
+  a `NativeLoop` itself" -- `InteractiveSession::interrupt` just calls
+  `.cancel()` on the shared flag from whichever thread the operator's
+  keypress landed on.
+
+`InteractiveProgress` (the worker -> caller direction) is deliberately
+coarse (`Busy`/`Idle`/`Failed`/`Ended`): the pane never learns a turn's
+*content* from this channel, only when a re-read of the journal is worth
+doing. Today's granularity maps `Busy` to a blanket
+`PresentationStatus::Generating` -- the finer `Requesting` vs
+`ExecutingTools` distinction item 4 names needs a live protocol-event
+stream this round does not add (see "still deferred" below).
+
+### `dash::native_pane::run_native_dashboard`: its own dashboard mode
+
+Rather than adding a `PaneKind` to `dash::mod`'s existing `Vec<Pane>` --
+which would mean touching every one of those ~100 call sites, none of which
+this issue's own acceptance criteria require changing, and doing so
+concurrently with N20's own in-flight rewrite of the dashboard's ownership
+seam -- `zirv chat --runtime native` opens a **separate**, additional,
+single-pane dashboard entry point. It reuses `dash::mod`'s existing
+terminal-setup/teardown helpers **verbatim**
+(`install_panic_hook`/`enable_raw_mode`/`EnterAlternateScreen`/
+`push_keyboard_enhancement`/`teardown_terminal`/`restore_panic_hook` --
+copied nowhere, called directly via `super::`) so there is exactly one
+place in this codebase that enters or leaves raw mode and the alternate
+screen, and the wrapped-harness dashboard's existing loop, and everything
+it threads `Vec<Pane>` through, is completely untouched.
+
+`NativePaneRuntime` owns the one live thing this module now has: an
+`InteractiveSession`, a second `Journal` handle for reads and steering
+writes, and the already-tested presentation state. `tick()` drains progress
+and re-replays the journal every dashboard frame (cheap: a
+`try_recv` loop plus one SQLite read); `handle_composer_action` is the one
+path a keypress reaches the session through, applying the composer action
+and then, only on a `Submit`, consulting `classify_submit_intent` to decide
+Immediate/Steer/Queue -- so a blocked submission is held in
+`composer.queued`, never sent as an approval answer, exactly as round 1's
+own `submit_intent_never_queues_as_an_approval_and_is_queue_while_blocked`
+already proved for the classifier in isolation.
+
+### `--view plain` on the existing headless path
+
+`zirv ctx exec --runtime native --view json` (the default) is byte-for-byte
+what `run_headless` always printed -- the flag changes nothing about that
+contract. `--view plain` calls the lower-level `run_session` directly (the
+same function `run_headless` itself calls), prints the identical JSON, then
+opens the session's own journal fresh and renders it through
+`dash::native_pane::render_plain` -- the exact reducer
+(`build_transcript`) and renderer the dashboard pane draws through, so a
+headless transcript and a live pane's transcript can never disagree about
+what a tool call, a diff or a test outcome looks like.
+
+## What is still deferred
+
+- **Mixing a native pane into the wrapped-harness dashboard.** No
+  `PaneKind` was added to `dash::pane::Pane` or `dash::mod`'s `Vec<Pane>`.
+  `zirv chat --runtime native` is a genuinely separate, working, launchable
+  dashboard mode -- not a stand-in -- but an operator cannot today open one
+  native pane and one wrapped pane side by side in the same dashboard
+  process the way the issue's own mock (`docs/design/mocks/2026-09-13-
+  native-pane.html`) shows. That needs the `Vec<Pane>` retrofit round 1's
+  own note already scoped out, now additionally coordinated with N20's
+  concurrent ownership-seam rewrite (`session::client` becoming the
+  dashboard's own transport when the persistent gate is on) rather than
+  raced against it.
+- **The persistent-runtime (`session::client`) path.** The brief asks for
+  `session::client.rs` to drive the pane when `[session] persistent` is on,
+  falling back to the in-process `NativeLoop` worker thread otherwise. Only
+  the fallback is implemented; `run_native_dashboard` always uses
+  `spawn_interactive`'s in-process thread regardless of the persistent
+  gate. `session::client`'s own attach surface
+  (`client::attach_terminal`) is built around a single PTY-shaped
+  session, not a structured event stream, and reconciling that with this
+  view model is exactly the kind of ownership-seam question N20 owns;
+  wiring it here first risked the two conflicting rather than merging
+  cleanly, which the brief asked to avoid.
+- **Fine-grained turn state.** `StatusFacts.turn_state` is `Some(Requesting)`
+  for any `Busy` progress tick and `None` otherwise -- there is no live
+  distinction between "waiting on the provider" and "running a tool" without
+  a finer event stream than `InteractiveProgress` carries.
+- **Live approval-pending / a real approval control.** `StatusFacts.blocked`
+  is hardcoded `false`; nothing here reads the enforcement broker's own
+  approval-gate state, and there is no approval dialog in
+  `run_native_dashboard`'s minimal loop. A session whose tools need an
+  approval this build cannot yet grant will simply stall.
+- **`@path` hints, text selection/copy, explicit history keys, paste
+  coalescing.** `resolve_file_refs`, `NativePresentation::set_selection`/
+  `clear_selection`, and `ComposerAction::HistoryUp`/`HistoryDown` are
+  implemented and unit-tested (round 1) but not called from
+  `run_native_dashboard`'s own key handling -- showing a live `@`-hint line
+  needs `composer_lines` to take a workdir; a copy mechanism needs
+  something to copy into; explicit history keys are redundant with
+  `MoveUp`/`MoveDown`'s own cursor-position rule today.
+  `coalesce_paste_chunks` is unused because `Event::Paste` (bracketed
+  paste) already covers the one paste path this loop exercises.
+- **Task cards, group ownership, mail-to-a-native-pane.** A dashboard-
+  opened native pane is a plain orchestrator session: no `task`, no
+  `--writer` distinction beyond "always writing", and nothing here teaches
+  the existing mail sweep (which types into a wrapped pane's PTY) to reach
+  a native pane's composer instead -- there is exactly one native pane per
+  process today, opened directly, never through a spawn request.
+- No `#[cfg(unix)]` code was added or changed in either round; nothing here
+  touches `wrap.rs`, raw-mode handling, or a wrapped pane's PTY input
+  routing.
