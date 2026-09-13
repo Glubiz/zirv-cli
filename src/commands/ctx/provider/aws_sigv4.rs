@@ -24,11 +24,28 @@ pub const EMPTY_PAYLOAD_SHA256: &str =
 /// One AWS credential set. The secret and session token are held as plain
 /// `String`s only inside this module's call frame; callers pass them from a
 /// `Secret` and never log the result.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AwsCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for AwsCredentials {
+    /// The access key id is not secret (AWS itself displays it in the
+    /// `Authorization` header), but the secret key and session token are --
+    /// a derived `Debug` would print them into any log or panic message that
+    /// formats this struct, so both are redacted by hand instead.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[redacted]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl AwsCredentials {
@@ -98,7 +115,7 @@ pub fn sign(
     amz_date: &str,
     credentials: &AwsCredentials,
 ) -> Result<SignedHeaders, String> {
-    if amz_date.len() != 16 || !amz_date.ends_with('Z') {
+    if amz_date.len() != 16 || !amz_date.is_ascii() || !amz_date.ends_with('Z') {
         return Err(format!("`{amz_date}` is not an AWS YYYYMMDDTHHMMSSZ stamp"));
     }
     let date = &amz_date[..8];
@@ -419,6 +436,31 @@ mod tests {
     }
 
     #[test]
+    fn a_non_ascii_sixteen_byte_stamp_is_refused_not_a_byte_index_panic() {
+        // 16 *bytes*, ends with 'Z', but a multi-byte character straddles
+        // byte offset 8 -- exactly where `sign` used to slice `&amz_date[..8]`
+        // without checking char-boundary safety first.
+        let amz_date = "2015083\u{e9}123456Z";
+        assert_eq!(amz_date.len(), 16);
+        let error = sign(
+            &CanonicalRequest {
+                method: "GET",
+                path: "/",
+                query: "",
+                host: "h",
+                extra_headers: &[],
+                payload: b"",
+            },
+            "us-east-1",
+            "bedrock",
+            amz_date,
+            &suite_credentials(),
+        )
+        .unwrap_err();
+        assert!(error.contains("YYYYMMDDTHHMMSSZ"), "got {error}");
+    }
+
+    #[test]
     fn a_malformed_stamp_is_refused_rather_than_guessed() {
         let error = sign(
             &CanonicalRequest {
@@ -436,6 +478,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("YYYYMMDDTHHMMSSZ"));
+    }
+
+    #[test]
+    fn debug_formatting_never_prints_the_secret_or_session_token() {
+        let credentials = AwsCredentials {
+            access_key_id: "AKIDEXAMPLE".into(),
+            secret_access_key: "super-secret-key".into(),
+            session_token: Some("super-secret-token".into()),
+        };
+        let debug = format!("{credentials:?}");
+        assert!(debug.contains("AKIDEXAMPLE"), "got {debug}");
+        assert!(!debug.contains("super-secret-key"), "got {debug}");
+        assert!(!debug.contains("super-secret-token"), "got {debug}");
     }
 
     #[test]
