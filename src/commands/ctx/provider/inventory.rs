@@ -876,6 +876,92 @@ mod tests {
     }
 
     #[test]
+    fn switching_routes_never_substitutes_a_model_capability_or_billing_class() {
+        let cfg = config(
+            "schema=1
+             [endpoint.deepseek]
+provider='openai-compatible'
+vendor='deepseek'
+             [endpoint.local]
+provider='openai-compatible'
+vendor='ollama'
+             [account.api]
+provider='anthropic'
+credential='env:KEY'
+             [account.deepseek]
+provider='openai-compatible'
+credential='env:KEY'
+             [account.local]
+provider='openai-compatible'
+             [account.plan]
+provider='anthropic'
+billing='subscription'
+             [route.a]
+account='api'
+model='sonnet'
+             [route.b]
+account='deepseek'
+endpoint='deepseek'
+model='deepseek-v4-pro'
+             [route.c]
+account='local'
+endpoint='local'
+model='qwen3-coder'
+             [route.d]
+account='plan'
+model='sonnet'
+",
+        );
+        let inventory = Inventory::build(
+            &cfg,
+            &|_| Some("key".into()),
+            &FakeStore::default(),
+            0,
+            None,
+        );
+        let route = |name: &str| {
+            inventory
+                .routes
+                .iter()
+                .find(|route| route.route.as_ref() == name)
+                .unwrap_or_else(|| panic!("route {name}"))
+        };
+
+        // Each route keeps its own profile, its own exact model, and its own
+        // declared capabilities -- switching between them substitutes
+        // nothing.
+        assert_eq!(route("a").profile, Some("anthropic-messages"));
+        assert_eq!(route("a").model.id, "claude-sonnet-5");
+        assert_eq!(route("b").profile, Some("deepseek-chat"));
+        assert_eq!(route("b").model.id, "deepseek-v4-pro");
+        assert_eq!(route("c").profile, Some("ollama-openai"));
+        assert_eq!(route("c").model.id, "qwen3-coder");
+        assert_ne!(route("a").capabilities, route("b").capabilities);
+        assert_ne!(route("b").capabilities, route("c").capabilities);
+        assert!(
+            inventory
+                .routes
+                .iter()
+                .all(|route| route.profile_version == Some(1))
+        );
+
+        // Billing class travels with the account, and a subscription route
+        // never becomes an API one by being switched to.
+        assert_eq!(route("a").billing, BillingClass::Api);
+        assert_eq!(route("d").billing, BillingClass::Subscription);
+        assert!(route("d").problems[0].contains("harness backend"));
+        assert_eq!(route("d").state, RouteState::Configured);
+
+        // Every accessible route is bound; an unbound one would be a problem.
+        assert!(
+            inventory
+                .routes
+                .iter()
+                .all(|route| route.profile.is_some() && route.support == Support::Native)
+        );
+    }
+
+    #[test]
     fn inventory_never_claims_validated_in_n02() {
         let cfg = config(
             "schema=1\n[account.work]\nprovider='anthropic'\n[route.work]\naccount='work'\nmodel='sonnet'\n",
