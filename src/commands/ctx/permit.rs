@@ -570,6 +570,12 @@ pub fn tree_key(path: &Path) -> String {
 pub enum WriterRefusal {
     TreeBusy { holder_label: String },
     PoolExhausted,
+    /// Issue #488: the process asking for this lease carries a seat
+    /// generation the seat record has since moved past -- an orchestrator a
+    /// rollover superseded, or a worker it spawned. Unlike the other two this
+    /// one is NOT retryable: waiting does not change the answer, because the
+    /// session asking has been replaced.
+    StaleSeat { detail: String },
 }
 
 /// Issues #267/#338: the one diagnostic rendering shared by headless and
@@ -611,6 +617,11 @@ pub(crate) fn describe_writer_refusal(
             }
             description
         }
+        WriterRefusal::StaleSeat { detail } => format!(
+            "writer-refused: {detail}. This session no longer holds the orchestrator seat, so it \
+             may not take a writer lease on {}; the session that does holds it.",
+            tree.display()
+        ),
     }
 }
 
@@ -746,6 +757,19 @@ pub fn acquire_writer(
     label: &str,
     tree: &Path,
 ) -> Result<HeavyPermit, WriterRefusal> {
+    // Issue #488 (item 4): a writer lease is a mutable service operation, so
+    // a superseded generation may not take one. `seat::fence` is the same
+    // env-derived question `hook::run_pretool` and every mutating `zirv ctx`
+    // verb already ask -- a process with no seat env, or no seat record for
+    // it, is not fenced at all -- so this changes nothing for a bare terminal,
+    // a CI job or a worker outside any seat, and refuses the one case that
+    // matters: a harness (or a child it spawned) still holding a lease after
+    // an automatic rollover replaced it.
+    if let Err(stale) = super::seat::fence(state) {
+        return Err(WriterRefusal::StaleSeat {
+            detail: stale.to_string(),
+        });
+    }
     let dir = writer_permits_dir(state);
     let key = tree_key(tree);
     let record = PermitRecord {

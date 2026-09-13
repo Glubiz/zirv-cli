@@ -335,6 +335,34 @@ pub fn update<T>(
     Ok(out)
 }
 
+/// [`update`], fenced on the caller's seat generation (issue #488, item 4).
+///
+/// The coordinator graph is the one durable thing a coordinator OWNS rather
+/// than reads, so "exactly one write-capable coordinator generation at any
+/// time" has to be enforced here or it is not enforced at all. A rollover
+/// that is prepared but not committed leaves the seat with the SOURCE
+/// generation, so the source keeps writing its graph and the successor
+/// cannot -- and the instant `seat::commit` swaps them, under the seat lock,
+/// the answer swaps with it. An injected crash on either side of that write
+/// therefore leaves exactly one generation able to mutate the graph, never
+/// two and never none.
+pub fn update_fenced<T>(
+    state: &StateDir,
+    repo: &Path,
+    seat_short: &str,
+    generation: u64,
+    mutate: impl FnOnce(&mut Coordinator) -> T,
+) -> Result<T, super::seat::StaleGeneration> {
+    super::seat::guard(state, seat_short, generation)?;
+    let mut record = load(state, repo);
+    let out = mutate(&mut record);
+    // A store that fails is a disk fault, not a fencing verdict: the fence
+    // answered, and reporting a write failure as a stale generation would
+    // tell an operator their seat moved when it did not.
+    let _ = store(state, repo, &record);
+    Ok(out)
+}
+
 // -- pending completions (item 4/5/7) -------------------------------------
 
 /// A terminal worker outcome this coordinator has not consumed yet.
@@ -784,6 +812,69 @@ mod tests {
         assert_eq!(
             record.constraints.last().map(String::as_str),
             Some(format!("constraint {}", MAX_CONSTRAINTS + 4).as_str())
+        );
+    }
+
+    /// Issue #488 criterion 3: at both injected crash points -- after
+    /// `prepare` and after `commit` -- exactly one generation can mutate the
+    /// coordinator graph. Before the commit only the source can; after it
+    /// only the successor can. There is no instant at which both can, and
+    /// none at which neither can.
+    #[test]
+    fn exactly_one_generation_can_write_the_graph_across_a_rollover() {
+        use crate::commands::ctx::seat;
+        let (_dir, state, repo) = fixture();
+        let session = "9d8c7b6a-5555-4444-8333-222211110000";
+        let short = crate::commands::ctx::sessions::short_id(session);
+        seat::register(
+            &state, &short, session, "claude", None, "anthropic", "orchestrator", false, 1,
+        )
+        .expect("register");
+
+        let write = |generation: u64, what: &str| {
+            update_fenced(&state, &repo, &short, generation, |record| {
+                record.decide(what, 1);
+            })
+        };
+
+        assert!(write(1, "source plans").is_ok());
+        let prepared = seat::prepare_onto(
+            &state,
+            &short,
+            "native",
+            None,
+            RuntimeKind::Native,
+            seat::Cause::Manual,
+            2,
+        )
+        .expect("prepare");
+
+        // CRASH POINT 1: prepared, never committed.
+        assert!(write(1, "source keeps the seat").is_ok());
+        let refused = write(prepared, "successor jumps the gun").expect_err("fenced");
+        assert_eq!(refused.reason, seat::StaleReason::Uncommitted);
+
+        seat::commit(&state, &short, prepared, "native-session", 3).expect("commit");
+
+        // CRASH POINT 2: committed, and the swap is total.
+        assert!(write(prepared, "successor owns the graph").is_ok());
+        let refused = write(1, "source writes after being replaced").expect_err("fenced");
+        assert_eq!(refused.reason, seat::StaleReason::Superseded);
+
+        let record = load(&state, &repo);
+        let written: Vec<&str> = record
+            .decisions
+            .iter()
+            .map(|decision| decision.what.as_str())
+            .collect();
+        assert_eq!(
+            written,
+            vec![
+                "source plans",
+                "source keeps the seat",
+                "successor owns the graph"
+            ],
+            "no fenced write reached the graph"
         );
     }
 }
