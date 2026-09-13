@@ -189,25 +189,37 @@ impl BedrockAdapter {
         })
     }
 
-    fn path(&self) -> String {
-        format!(
-            "/model/{}/converse-stream",
-            uri_encode(&self.target.model.id, true)
-        )
-    }
-
-    fn host(&self) -> Result<String, ProviderFailure> {
-        let rest = self
-            .target
-            .base_url
-            .strip_prefix("https://")
-            .or_else(|| self.target.base_url.strip_prefix("http://"))
-            .ok_or_else(|| config_error("a Bedrock endpoint must be an http(s) URL".into()))?;
-        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    /// Splits `target.base_url` into the scheme, the bare host SigV4 signs
+    /// (and the HTTP client's `Host` header carries), and the absolute path
+    /// that is actually requested -- the endpoint's own path prefix, if it
+    /// has one, followed by the fixed Converse suffix. A signature is only
+    /// valid for the exact path it was computed over, so a base_url that
+    /// routes through a prefix (e.g. a proxy at `/bedrock-proxy`) must have
+    /// that prefix in the *signed* canonical URI, not just in the URL the
+    /// request is actually sent to.
+    fn request_url_parts(&self) -> Result<(&'static str, String, String), ProviderFailure> {
+        let (scheme, rest) = if let Some(rest) = self.target.base_url.strip_prefix("https://") {
+            ("https", rest)
+        } else if let Some(rest) = self.target.base_url.strip_prefix("http://") {
+            ("http", rest)
+        } else {
+            return Err(config_error(
+                "a Bedrock endpoint must be an http(s) URL".into(),
+            ));
+        };
+        let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let host = &rest[..host_end];
         if host.is_empty() {
             return Err(config_error("a Bedrock endpoint must name a host".into()));
         }
-        Ok(host.to_string())
+        let after_host = &rest[host_end..];
+        let prefix_end = after_host.find(['?', '#']).unwrap_or(after_host.len());
+        let prefix = after_host[..prefix_end].trim_end_matches('/');
+        let path = format!(
+            "{prefix}/model/{}/converse-stream",
+            uri_encode(&self.target.model.id, true)
+        );
+        Ok((scheme, host.to_string(), path))
     }
 
     fn encode_request(&self, request: &ProviderRequest) -> Result<Value, ProviderFailure> {
@@ -272,8 +284,7 @@ impl BedrockAdapter {
         }
         let payload = serde_json::to_string(body)
             .map_err(|error| config_error(format!("failed to encode Bedrock request: {error}")))?;
-        let host = self.host()?;
-        let path = self.path();
+        let (scheme, host, path) = self.request_url_parts()?;
         let signed = sign(
             &CanonicalRequest {
                 method: "POST",
@@ -298,10 +309,7 @@ impl BedrockAdapter {
             .build()
             .into();
         let mut http = agent
-            .post(format!(
-                "{}{path}",
-                self.target.base_url.trim_end_matches('/')
-            ))
+            .post(format!("{scheme}://{host}{path}"))
             .header("content-type", "application/json")
             .header("accept", "application/vnd.amazon.eventstream")
             .header("user-agent", format!("zirv/{}", env!("CARGO_PKG_VERSION")));
@@ -670,7 +678,8 @@ fn parse_headers(mut bytes: &[u8]) -> Result<BTreeMap<String, String>, ProviderF
             0 | 1 => 0,
             2 => 1,
             3 => 2,
-            4 | 9 => 4,
+            4 => 4,
+            9 => 16,
             5 | 8 => 8,
             6 | 7 => {
                 if bytes.len() < 2 {
@@ -798,7 +807,7 @@ pub(crate) fn parse_event_stream<R: Read>(
         };
         process_event(event, &value, &mut accumulator, sink, target)?;
     }
-    finish_response(accumulator, request_id)
+    finish_response(accumulator, request_id, target.model.id.clone())
 }
 
 fn process_event(
@@ -999,6 +1008,7 @@ fn finish_block(
 fn finish_response(
     accumulator: Accumulator,
     request_id: Option<String>,
+    model: String,
 ) -> Result<ProviderResponse, ProviderFailure> {
     let stop_reason = accumulator
         .stop_reason
@@ -1039,7 +1049,7 @@ fn finish_response(
         message_id: request_id
             .clone()
             .unwrap_or_else(|| "bedrock-stream".to_string()),
-        model: String::new(),
+        model,
         content,
         finish_reason,
         stop_sequence: None,
@@ -1330,6 +1340,10 @@ mod tests {
         let mut events = Vec::new();
         let response = parse(MULTI_TOOL, &mut events).unwrap();
         assert_eq!(response.finish_reason, FinishReason::ToolUse);
+        // Converse never echoes the served model id in the event stream
+        // itself, so the response's `model` is carried through from the
+        // route's own target rather than left empty.
+        assert_eq!(response.model, MODEL);
         assert!(matches!(
             &response.content[0],
             ProviderContent::Thinking { thinking, signature }
@@ -1428,6 +1442,85 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.class, FailureClass::InvalidStream);
         assert!(error.message.contains("mid-frame"));
+    }
+
+    #[test]
+    fn a_uuid_typed_header_does_not_desync_the_string_header_that_follows_it() {
+        // Header value type 9 is a 16-byte UUID, not a 4-byte int32 (type 4).
+        // Coalescing the two widths would skip only 4 of the UUID's 16 bytes,
+        // leaving 12 stray bytes that get misread as the start of the next
+        // header -- desyncing every header parsed after it, including the
+        // `:message-type` header the stream depends on.
+        let mut bytes = Vec::new();
+        let uuid_name = b":event-id";
+        bytes.push(u8::try_from(uuid_name.len()).unwrap());
+        bytes.extend_from_slice(uuid_name);
+        bytes.push(9); // uuid
+        bytes.extend_from_slice(&[0xAB; 16]);
+        let string_name = b":message-type";
+        bytes.push(u8::try_from(string_name.len()).unwrap());
+        bytes.extend_from_slice(string_name);
+        bytes.push(7); // string
+        bytes.extend_from_slice(&u16::try_from(b"event".len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(b"event");
+
+        let headers = parse_headers(&bytes).unwrap();
+        assert_eq!(
+            headers.get(":message-type").map(String::as_str),
+            Some("event")
+        );
+    }
+
+    #[test]
+    fn an_impossible_headers_len_is_a_typed_failure_not_a_panic() {
+        let mut prelude = Vec::new();
+        prelude.extend_from_slice(&20u32.to_be_bytes()); // total: in range
+        prelude.extend_from_slice(&1_000u32.to_be_bytes()); // headers_len: far past total
+        prelude.extend_from_slice(&0u32.to_be_bytes());
+        let error = read_frame(
+            &mut prelude.as_slice(),
+            &NeverCancelled,
+            &target("https://bedrock-runtime.us-east-1.amazonaws.com".into()),
+        )
+        .unwrap_err();
+        assert_eq!(error.class, FailureClass::InvalidStream);
+        assert!(error.message.contains("impossible length"), "got {error:?}");
+    }
+
+    #[test]
+    fn a_total_length_claiming_more_than_the_buffer_holds_is_a_typed_failure_not_a_panic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_000u32.to_be_bytes()); // total: far past what follows
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 10]); // much less than total - 12
+        let error = read_frame(
+            &mut bytes.as_slice(),
+            &NeverCancelled,
+            &target("https://bedrock-runtime.us-east-1.amazonaws.com".into()),
+        )
+        .unwrap_err();
+        assert_eq!(error.class, FailureClass::InvalidStream);
+        assert!(error.message.contains("mid-frame"), "got {error:?}");
+    }
+
+    #[test]
+    fn a_base_url_path_prefix_is_part_of_the_signed_canonical_uri() {
+        // A base_url that routes through a path (a proxy at
+        // `/bedrock-proxy`, say) must have that prefix in the signed
+        // canonical URI too, not just in the URL the request actually goes
+        // to -- otherwise the signature covers a path AWS never sees.
+        let bedrock = adapter("https://proxy.example.com/bedrock-proxy".into());
+        let (scheme, host, path) = bedrock.request_url_parts().unwrap();
+        assert_eq!(scheme, "https");
+        assert_eq!(host, "proxy.example.com");
+        assert_eq!(
+            path,
+            format!(
+                "/bedrock-proxy/model/{}/converse-stream",
+                uri_encode(MODEL, true)
+            )
+        );
     }
 
     #[test]

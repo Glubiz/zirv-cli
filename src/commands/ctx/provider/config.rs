@@ -298,25 +298,29 @@ impl NativeConfig {
                     )
                     .into());
                 }
-                // Plaintext is for a runtime the operator hosts, never for a
-                // public endpoint: TLS is not optional across the internet.
-                if let Some(base_url) = endpoint.base_url.as_deref()
-                    && base_url.starts_with("http://")
-                    && !super::probe::is_local_http_host(base_url)
-                {
-                    return Err(format!(
-                        "{}: `{key}.base_url` reaches a public host over plaintext http; only a \
-                         loopback or private address may be addressed without TLS",
-                        path.display()
-                    )
-                    .into());
-                }
             } else if endpoint.vendor.is_some() {
                 return Err(format!(
                     "{}: `{key}.vendor` is forbidden because provider `{}` fixes vendor `{}`",
                     path.display(),
                     spec.id,
                     spec.vendor.unwrap_or("")
+                )
+                .into());
+            }
+            // Plaintext is for a runtime the operator hosts, never for a
+            // public endpoint: TLS is not optional across the internet. This
+            // applies to every endpoint regardless of whether its provider
+            // fixes a vendor (e.g. `azure-openai`) or takes one per-endpoint
+            // (e.g. `openai-compatible`) -- a fixed-vendor provider still
+            // sends its credential in a header that plaintext http exposes.
+            if let Some(base_url) = endpoint.base_url.as_deref()
+                && base_url.starts_with("http://")
+                && !super::probe::is_local_http_host(base_url)
+            {
+                return Err(format!(
+                    "{}: `{key}.base_url` reaches a public host over plaintext http; only a \
+                     loopback or private address may be addressed without TLS",
+                    path.display()
                 )
                 .into());
             }
@@ -825,6 +829,26 @@ mod tests {
                 .base_url,
             "https://api.deepseek.com"
         );
+    }
+
+    #[test]
+    fn fixed_vendor_endpoints_are_also_refused_plaintext_public_hosts() {
+        // A fixed-vendor provider such as azure-openai still sends its
+        // credential in a header (`api-key`); the local-host-only rule for
+        // plaintext http must not be skippable just because `spec.vendor` is
+        // `Some`.
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        let path = NativeConfig::operator_path(home.path());
+        write(
+            &path,
+            "schema=1\n[endpoint.azure]\nprovider='azure-openai'\nbase_url='http://public.example.com'\n[account.work]\nprovider='azure-openai'\ncredential='env:KEY'\napi_version='2026-05-01'\n[route.work]\naccount='work'\nendpoint='azure'\nmodel='gpt-5.6-sol'\ndeployment='sol-prod'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("public host over plaintext"), "got {error}");
     }
 
     #[test]

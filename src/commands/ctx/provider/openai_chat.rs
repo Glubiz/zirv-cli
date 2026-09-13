@@ -207,6 +207,20 @@ impl OpenAiChatAdapter {
                 ));
             }
         }
+        // `from_config` runs operator-declared extensions through
+        // `validate_extensions` before they ever reach here, converting them
+        // from TOML to JSON in the process; a caller that builds an adapter
+        // directly (this constructor is `pub`, not `pub(crate)`) could hand
+        // in an already-JSON map that skipped that allow-list entirely, so
+        // every key is re-checked against the bound profile here too.
+        for key in extensions.keys() {
+            if !profile.extensions.iter().any(|spec| spec.key == key) {
+                return Err(config_error(format!(
+                    "`{key}` is not an extension of profile `{}`",
+                    profile.id
+                )));
+            }
+        }
         Ok(Self {
             target,
             credential,
@@ -1152,7 +1166,7 @@ mod tests {
     use super::*;
     use crate::commands::ctx::provider::adapter::{NeverCancelled, ProviderMessage};
     use crate::commands::ctx::provider::credential::Secret;
-    use crate::commands::ctx::provider::profiles::profile;
+    use crate::commands::ctx::provider::profiles::{ExtensionSpec, ExtensionType, profile};
     use crate::commands::ctx::provider::testhttp::one_shot_server;
     use crate::commands::ctx::provider::{
         AccountId, BillingPoolId, EndpointId, ModelId, ProviderId,
@@ -1600,6 +1614,34 @@ mod tests {
     }
 
     #[test]
+    fn new_reuses_the_profile_extension_allow_list_even_when_from_config_is_bypassed() {
+        // `from_config` runs operator-declared extensions through
+        // `validate_extensions` before this constructor ever sees them; `new`
+        // is `pub`, so a caller that builds the adapter directly must not be
+        // able to smuggle in an extension the bound profile never declared.
+        let mut extensions = BTreeMap::new();
+        extensions.insert("enable_thinking".to_string(), json!(true));
+        let error = OpenAiChatAdapter::new(
+            target(
+                "https://api.deepseek.com".into(),
+                "deepseek",
+                "deepseek-v4-pro",
+            ),
+            Some(credential()),
+            StreamTimeouts::default(),
+            profile("deepseek-chat").unwrap(),
+            ChatEndpoint::Compatible,
+            extensions,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("enable_thinking"), "got {error:?}");
+        assert!(
+            error.message.contains("is not an extension of profile"),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
     fn plaintext_and_credential_class_rules_hold_at_construction() {
         let remote_plaintext = OpenAiChatAdapter::new(
             target(
@@ -1688,6 +1730,19 @@ mod tests {
                 .contains("\"temperature\":0.2")
         );
 
+        // `new` now refuses an extension key the bound profile never
+        // declared (a route profile's own `messages` guard below), so the
+        // profile used here declares one that deliberately collides with a
+        // protocol-owned field -- exercising the *other* guard, the
+        // request-encoding check that no declared extension is ever allowed
+        // to overwrite a field the protocol itself owns.
+        const COLLIDING_EXTENSION: &[ExtensionSpec] = &[ExtensionSpec {
+            key: "messages",
+            value: ExtensionType::String,
+            note: "test-only: deliberately shadows the protocol's own field",
+        }];
+        let mut colliding_profile = *profile("deepseek-chat").unwrap();
+        colliding_profile.extensions = COLLIDING_EXTENSION;
         let colliding = OpenAiChatAdapter::new(
             target(
                 "https://api.deepseek.com".into(),
@@ -1696,7 +1751,7 @@ mod tests {
             ),
             Some(credential()),
             StreamTimeouts::default(),
-            profile("deepseek-chat").unwrap(),
+            Box::leak(Box::new(colliding_profile)),
             ChatEndpoint::Compatible,
             BTreeMap::from([("messages".to_string(), json!([]))]),
         )
