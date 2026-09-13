@@ -2237,6 +2237,7 @@ fn build_transport(
     use super::super::provider::anthropic::AnthropicMessagesAdapter;
     use super::super::provider::config::NativeConfig;
     use super::super::provider::credential::OsStore;
+    use super::super::provider::google::GoogleAdapter;
     use super::super::provider::openai::OpenAiResponsesAdapter;
     use super::super::provider::transport::StreamTimeouts;
     use super::super::provider::{Protocol, RouteId, adapter::resolve_target};
@@ -2320,10 +2321,13 @@ fn build_transport(
         Protocol::OpenAiResponses => Box::new(OpenAiResponsesAdapter::from_config(
             &native, &route_id, env, &store, now, timeouts,
         )?),
+        Protocol::GoogleGenerativeAi | Protocol::GoogleVertex => Box::new(
+            GoogleAdapter::from_config(&native, &route_id, env, &store, now, timeouts)?,
+        ),
         other => {
             return Err(format!(
                 "native runtime: route `{route_id}` speaks {other:?}, which no direct provider \
-                 implements yet (roadmap #469, steps N12-N13)"
+                 implements yet (roadmap #469, step N13)"
             )
             .into());
         }
@@ -2409,6 +2413,7 @@ mod tests {
             route: RouteId::new("fixture").unwrap(),
             provider: ProviderId::new(match protocol {
                 Protocol::AnthropicMessages => "anthropic",
+                Protocol::GoogleGenerativeAi | Protocol::GoogleVertex => "google",
                 _ => "openai",
             })
             .unwrap(),
@@ -2985,6 +2990,24 @@ mod tests {
         assert_eq!(outcome.results[1].state, ToolState::Completed);
         assert_eq!(outcome.results[2].state, ToolState::Completed);
         assert_eq!(outcome.results[3].state, ToolState::Failed);
+    }
+
+    #[test]
+    fn a_native_google_agent_completes_a_coding_task_with_no_gemini_cli_binary() {
+        // Same per-provider loop pattern as the Anthropic/OpenAI fixtures
+        // (issue #481, N12): a search, a read, an edit and a test run, then a
+        // final answer -- driven entirely through `ProviderAdapter`, with no
+        // Gemini CLI process anywhere in the path.
+        let (status, _) = run_fixture(
+            Protocol::GoogleGenerativeAi,
+            "fixture-google-model",
+            "google-investigate-edit-test.json",
+            "tools-investigate-edit-test.json",
+            "go",
+            |_| {},
+        );
+        assert_eq!(status.status, NativeStatus::Completed);
+        assert_eq!(status.exit_code, 0);
     }
 
     // -- (f) no installed coding harness, lifecycle decisions included -----
