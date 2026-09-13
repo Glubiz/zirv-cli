@@ -7,7 +7,6 @@ use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::diagnostics;
 use super::event::{NormalizedEvent, input_hash};
-use super::pathutil::canonicalize_with_missing_tail;
 use super::rot::{Score, Verdict};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::supervise::Watcher;
@@ -1249,10 +1248,6 @@ pub(crate) fn session_has_modification(
 /// verify` has anything to check in a documentation-only change. Vacuously
 /// `true` for an empty slice, the same "nothing to point to" reading
 /// `changed_paths` itself gives an untouched worktree.
-fn changes_are_doc_only(paths: &[PathBuf]) -> bool {
-    super::lifecycle::changes_are_doc_only(paths)
-}
-
 /// Issue #309: whether `phase` is a step that itself already gates on fresh
 /// verification evidence -- `engine::advance`'s own Test/Verify check prints
 /// exactly the "run `zirv test changed`/`zirv verify`" message a Stop-hook
@@ -1269,10 +1264,6 @@ fn workflow_step_covers_verification(phase: WorkflowPhase) -> bool {
 /// caller -- kept anyway as the direct mirror of `engine::advance`'s own
 /// `if final_only { "zirv verify" } else { "zirv test changed" }` naming, in
 /// case a future change narrows the suppression rule to `Test` alone.
-fn verify_on_stop_command(active_phase: Option<WorkflowPhase>) -> &'static str {
-    super::lifecycle::verification_command(active_phase == Some(WorkflowPhase::Verify))
-}
-
 /// Bumped whenever `VerifyOnStopRecord`'s own shape changes -- deliberately
 /// a separate constant from `MODIFICATION_CHECKPOINT_VERSION` even though
 /// both start at `1`: the two checkpoints have unrelated schemas and must be
@@ -1345,14 +1336,23 @@ fn verify_on_stop_nudge(
         return None;
     }
     let changed = verification::changed_paths(repo).ok()?;
-    if changes_are_doc_only(&changed) {
-        return None;
-    }
     let active_phase = engine::load_active(state, repo)
         .ok()
         .flatten()
         .and_then(|workflow| workflow.current().map(|step| step.phase));
-    if active_phase.is_some_and(workflow_step_covers_verification) {
+    // Issue #478: whether fresh evidence is owed, and which command produces
+    // it, is the shared verification service's decision -- a native session
+    // asks the same question with no transcript and no hook payload.
+    let owed = super::lifecycle::verification(
+        true,
+        &changed,
+        active_phase.is_some_and(workflow_step_covers_verification),
+        active_phase == Some(WorkflowPhase::Verify),
+    );
+    if !matches!(
+        owed,
+        super::lifecycle::VerificationDecision::Required { .. }
+    ) {
         return None;
     }
 
@@ -1365,7 +1365,9 @@ fn verify_on_stop_nudge(
     record.nudges += 1;
     save_verify_on_stop_record(&path, &record);
 
-    let command = verify_on_stop_command(active_phase);
+    let super::lifecycle::VerificationDecision::Required { command } = owed else {
+        return None;
+    };
     Some(format!(
         "zirv ctx: code changed since the last passing run; run `{command}` before relying on this session's own verification."
     ))
@@ -1662,32 +1664,26 @@ pub fn prompt_output(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> String {
-    let mut lines = Vec::new();
-    if !marker.is_empty() {
-        lines.push(per_turn_context_text(marker));
-    }
-    if let Some(nudge) = adoption_nudge {
-        lines.push(nudge.to_string());
-    }
-    if let Some(short) = super::mail::session_identity(env)
-        && let Ok(state) = StateDir::resolve(env)
-        && let Ok(messages) = super::mail::list(
-            &state,
-            &super::state::repo_slug(repo),
-            env(adapters::AGENT_ENV).as_deref(),
-            Some(&short),
-        )
-        && !messages.is_empty()
-    {
-        lines.push(format!(
-            "[zirv ▸ mail] {} unread -- run zirv ctx inbox",
-            messages.len()
-        ));
-    }
-    if lines.is_empty() {
+    let mail = super::mail::session_identity(env)
+        .and_then(|short| {
+            let state = StateDir::resolve(env).ok()?;
+            super::mail::list(
+                &state,
+                &super::state::repo_slug(repo),
+                env(adapters::AGENT_ENV).as_deref(),
+                Some(&short),
+            )
+            .ok()
+        })
+        .filter(|messages| !messages.is_empty())
+        .map(|messages| super::lifecycle::mail_note(messages.len()));
+    // Issue #478: assembled by the shared prompt service, so a native session
+    // injects the same notes in the same order with no hook in the picture.
+    let context =
+        super::lifecycle::prompt_notes(marker, &[adoption_nudge.map(str::to_string), mail]);
+    if context.is_empty() {
         return String::new();
     }
-    let context = lines.join("\n");
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -1907,12 +1903,10 @@ pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
 // orchestrator-write guard that refuses an orchestrator seat's own direct
 // edit of a repository file (issue #334) ------------------------------------
 
-/// Model-name fragments that mark a seat too expensive to inherit silently,
-/// the subagent-dispatch tool names, and the subagent types that pin no model
-/// of their own. All three now live in `lifecycle.rs` (issue #478): the same
-/// vocabulary decides a native session's dispatches, where there is no hook
-/// payload at all.
-use super::lifecycle::{EXPENSIVE_TIERS, GENERIC_SUBAGENT_TYPES, SUBAGENT_TOOLS};
+// The expensive-tier model fragments, the subagent-dispatch tool names and
+// the subagent types that pin no model of their own now live in
+// `lifecycle.rs` (issue #478): the same vocabulary decides a native session's
+// dispatches, where there is no hook payload at all.
 
 /// The PreToolUse stdin payload, narrowed to what the guard reads. Every
 /// field is optional with a zero default, the same rule the Stop payload
@@ -1997,18 +1991,10 @@ impl PreToolPayload {
     }
 }
 
-fn names_expensive_tier(model: &str) -> bool {
-    super::lifecycle::names_expensive_tier(model)
-}
-
 /// What the model is told when a dispatch is refused. The reason is the only
 /// thing it sees, so it has to carry the whole remedy: naming the seat, the
 /// cheaper models that are accepted, and the one option (a fork) that no
 /// model parameter can rescue.
-fn pretool_deny_reason(seat: &str) -> String {
-    super::lifecycle::seat_deny_reason(seat)
-}
-
 /// The whole decision, pure: `Some(reason)` denies, `None` allows.
 ///
 /// `seat` is `SEAT_MODEL_ENV`'s value, absent for any session zirv did not
@@ -2071,10 +2057,6 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// non-empty `CLAUDE_CONFIG_DIR` wins; otherwise Claude's default beneath
 /// `HOME` (or Windows' `USERPROFILE`) applies. Environment access stays
 /// injectable so both write guards remain deterministic in tests.
-fn harness_home(env: EnvLookup<'_>) -> Option<PathBuf> {
-    super::lifecycle::harness_home(env)
-}
-
 /// Whether a write target belongs to Claude Code's own configuration tree.
 /// Existing harness homes compare in canonical space so symlinked home/temp
 /// paths agree; a not-yet-created harness home uses a component-aware lexical
@@ -2827,7 +2809,10 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         // compacting once it is genuinely large.
         super::output::CompactionScope::Shape => cfg.output.compact_generic_min_bytes,
     };
-    if combined.len() < threshold {
+    // Issue #478: the size cutoff is the shared after-tool service's, so a
+    // native session replacing its own large tool result and this hook
+    // replacing claude's agree on when a result is worth compacting.
+    if !super::lifecycle::should_compact_result(combined.len(), true, threshold.saturating_sub(1)) {
         record(super::ledger::Outcome::BelowThreshold, bytes_in, None);
         return Ok(0);
     }
@@ -2927,15 +2912,22 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
     let Ok(mapped) = notify_payload_to_hook(payload) else {
         // A hook never blocks the agent, so an unmapped payload is recorded
         // rather than surfaced. The decision log is where a silent mismatch
-        // becomes visible.
+        // becomes visible. Issue #478: the shared notification service both
+        // classifies what the payload MEANT and bounds what may be written
+        // down about it (field names only, never values).
         if let Ok(state) = StateDir::resolve(env) {
+            let kind = super::lifecycle::notification_kind(payload);
             let _ = log::append(
                 &state,
                 &log::Decision {
                     ts: now_secs(),
                     session: "unknown",
                     verb: "hook",
-                    verdict: "n/a",
+                    verdict: match kind {
+                        super::lifecycle::NotificationKind::AwaitingApproval => "approval",
+                        super::lifecycle::NotificationKind::AwaitingInput => "idle",
+                        super::lifecycle::NotificationKind::Other => "n/a",
+                    },
                     score: 0,
                     action: "notify-unmapped",
                     detail: &notify_shape(payload),
@@ -3405,8 +3397,16 @@ fn run_hook_status<W: Write>(w: &mut W, heal: bool, env: EnvLookup<'_>) -> CtxRe
 #[cfg(test)]
 mod tests {
     use super::super::config::OrchestratorWrites;
+    // Issue #478: both decisions moved to `lifecycle.rs`; the tests that
+    // pinned them stay exactly as they were, now exercising the shared
+    // service that the native path also calls.
+    use super::super::lifecycle::changes_are_doc_only;
     use super::*;
     use crate::commands::ctx::rot::{Score, Signals, Verdict};
+
+    fn verify_on_stop_command(active_phase: Option<WorkflowPhase>) -> &'static str {
+        super::super::lifecycle::verification_command(active_phase == Some(WorkflowPhase::Verify))
+    }
 
     fn payload() -> HookPayload {
         HookPayload {

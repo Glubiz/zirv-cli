@@ -492,9 +492,9 @@ pub fn stop(signals: &StopSignals) -> StopDecision {
         return StopDecision::Block(gate.clone());
     }
     match &signals.verification {
-        VerificationDecision::Required { command } => {
-            StopDecision::AllowWithNote(format!("zirv: this session changed files -- run {command}"))
-        }
+        VerificationDecision::Required { command } => StopDecision::AllowWithNote(format!(
+            "zirv: this session changed files -- run {command}"
+        )),
         VerificationDecision::NotRequired | VerificationDecision::CoveredByWorkflow => {
             StopDecision::Allow
         }

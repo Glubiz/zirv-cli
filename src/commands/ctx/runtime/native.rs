@@ -60,14 +60,14 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use super::super::CtxResult;
+use super::super::config::{EnvLookup, OrchestratorWrites};
 use super::super::lifecycle;
 use super::super::provider::adapter::{
     Cancellation, CancellationFlag, EventSink, FailureClass, FinishReason, ProviderAdapter,
     ProviderContent, ProviderFailure, ProviderMessage, ProviderMessageRole, ProviderRequest,
     ProviderStreamEvent, ProviderUsage, journal_blocks, replayed_content,
 };
-use super::super::CtxResult;
-use super::super::config::{EnvLookup, OrchestratorWrites};
 use super::journal::{
     AssistantBlock, ContentRef, EventScope, ExecutionId, ExecutionState, Journal, JournalSessionId,
     MessageId, MessageRole, RequestAttemptId, RouteIdentity, SequenceId, ToolCallId, TurnId,
@@ -108,6 +108,11 @@ pub struct NativeLimits {
     pub max_tool_calls: u32,
     pub max_wall_ms: u64,
     pub max_output_tokens: u64,
+    /// How much of ONE tool result may go back to the model inline. Anything
+    /// larger is stored whole as a journal artifact and replaced with a
+    /// bounded head/tail extract naming its retrieval id, so a single huge
+    /// result can neither blow the context window nor be silently lost.
+    pub max_tool_result_bytes: usize,
     pub first_event_ms: u64,
     pub idle_ms: u64,
     /// How many times ONE request may be re-sent after a retryable provider
@@ -128,6 +133,7 @@ impl Default for NativeLimits {
             max_tool_calls: 512,
             max_wall_ms: 60 * 60 * 1000,
             max_output_tokens: 16_384,
+            max_tool_result_bytes: 64 * 1024,
             first_event_ms: 60_000,
             idle_ms: 120_000,
             response_retry_budget: 3,
@@ -644,20 +650,20 @@ impl<'a> NativeLoop<'a> {
                                     .values()
                                     .find(|e| e.tool_call == *tool_call)
                                 {
-                                    let (text, is_error) = match (&execution.result, execution.state)
-                                    {
-                                        (Some(result), ExecutionState::Completed) => {
-                                            (content_text(result), false)
-                                        }
-                                        (Some(result), _) => (content_text(result), true),
-                                        (None, _) => (
-                                            execution
-                                                .detail
-                                                .clone()
-                                                .unwrap_or_else(|| "no result".to_string()),
-                                            true,
-                                        ),
-                                    };
+                                    let (text, is_error) =
+                                        match (&execution.result, execution.state) {
+                                            (Some(result), ExecutionState::Completed) => {
+                                                (content_text(result), false)
+                                            }
+                                            (Some(result), _) => (content_text(result), true),
+                                            (None, _) => (
+                                                execution
+                                                    .detail
+                                                    .clone()
+                                                    .unwrap_or_else(|| "no result".to_string()),
+                                                true,
+                                            ),
+                                        };
                                     pending_results.push(ProviderContent::ToolResult {
                                         tool_use_id: tool_call.to_string(),
                                         content: text,
@@ -842,9 +848,8 @@ impl<'a> NativeLoop<'a> {
 
             // THE BARRIER. The assistant message -- with its complete tool
             // calls -- is committed before any preflight below can run.
-            let blocks = journal_blocks(&response.content).map_err(|failure| {
-                Box::new(failure) as Box<dyn std::error::Error>
-            })?;
+            let blocks = journal_blocks(&response.content)
+                .map_err(|failure| Box::new(failure) as Box<dyn std::error::Error>)?;
             let message_id = MessageId::new(self.mint("msg"))?;
             self.journal.record_assistant_message(
                 &self.config.session,
@@ -869,7 +874,8 @@ impl<'a> NativeLoop<'a> {
                 return Ok(outcome);
             }
 
-            if self.tool_calls.saturating_add(calls.len() as u32) > self.config.limits.max_tool_calls
+            if self.tool_calls.saturating_add(calls.len() as u32)
+                > self.config.limits.max_tool_calls
             {
                 outcome.state = TurnState::Failed;
                 outcome.limit = Some(LimitKind::ToolCalls);
@@ -1038,10 +1044,23 @@ impl<'a> NativeLoop<'a> {
             self.transition(scope, &execution, ToolState::Started, None, None)?;
             let receipt = self.tools.execute(&entry.call);
             let (state, content, is_error) = classify(&receipt);
+            // The shared after-tool service decides whether this result is
+            // worth replacing. `Replace` stores the WHOLE result as a journal
+            // artifact first, so the bounded extract the model reads can never
+            // be the only surviving copy.
+            let (content, result) = match self.disposition(&content)? {
+                (lifecycle::ResultDisposition::Keep, reference) => (content, reference),
+                (lifecycle::ResultDisposition::Replace { retrieval_id }, reference) => (
+                    bounded_extract(
+                        &content,
+                        self.config.limits.max_tool_result_bytes,
+                        &retrieval_id,
+                    ),
+                    reference,
+                ),
+            };
             let terminal_with_result = matches!(state, ToolState::Completed | ToolState::Failed);
-            let result = terminal_with_result.then(|| ContentRef::Inline {
-                text: content.clone(),
-            });
+            let result = terminal_with_result.then_some(result);
             self.transition(
                 scope,
                 &execution,
@@ -1101,6 +1120,44 @@ impl<'a> NativeLoop<'a> {
             );
             execution = retried;
         }
+    }
+
+    /// Applies the shared after-tool service to one tool result: `Keep` with
+    /// an inline reference when it is small enough, or `Replace` once the
+    /// whole text is durably stored as an artifact this journal can hand back.
+    fn disposition(
+        &mut self,
+        content: &str,
+    ) -> CtxResult<(lifecycle::ResultDisposition, ContentRef)> {
+        if !lifecycle::should_compact_result(
+            content.len(),
+            true,
+            self.config.limits.max_tool_result_bytes,
+        ) {
+            return Ok((
+                lifecycle::ResultDisposition::Keep,
+                ContentRef::Inline {
+                    text: content.to_string(),
+                },
+            ));
+        }
+        let now = self.secs();
+        let reference = self
+            .journal
+            .put_artifact("text/plain", content.as_bytes(), now)?;
+        let retrieval_id = match &reference {
+            ContentRef::Artifact { sha256, .. } => sha256.clone(),
+            ContentRef::Inline { .. } => String::new(),
+        };
+        self.note(
+            "tool_result_offloaded",
+            retrieval_id.clone(),
+            format!("{} bytes stored as an artifact", content.len()),
+        );
+        Ok((
+            lifecycle::ResultDisposition::Replace { retrieval_id },
+            reference,
+        ))
     }
 
     fn transition(
@@ -1245,7 +1302,11 @@ impl<'a> NativeLoop<'a> {
         };
 
         if status != NativeStatus::Completed {
-            self.note("status", status.as_str(), "model finish token did not decide");
+            self.note(
+                "status",
+                status.as_str(),
+                "model finish token did not decide",
+            );
         }
 
         Ok(NativeFinalStatus {
@@ -1308,6 +1369,22 @@ fn accumulate(total: &mut ProviderUsage, delta: &ProviderUsage) {
     if let Some(reasoning) = delta.reasoning_tokens {
         total.reasoning_tokens = Some(total.reasoning_tokens.unwrap_or(0) + reasoning);
     }
+}
+
+/// The bounded head/tail extract a model reads in place of an offloaded tool
+/// result, naming the artifact the whole text is retrievable from. Split on
+/// character boundaries, so this can never hand back invalid UTF-8.
+fn bounded_extract(content: &str, limit: usize, retrieval_id: &str) -> String {
+    let half = (limit / 2).max(1);
+    let head: String = content.chars().take(half).collect();
+    let tail: String = {
+        let chars: Vec<char> = content.chars().collect();
+        chars[chars.len().saturating_sub(half)..].iter().collect()
+    };
+    format!(
+        "{head}\n[... {} bytes elided; the whole result is stored as artifact {retrieval_id} ...]\n{tail}",
+        content.len()
+    )
 }
 
 fn content_text(reference: &ContentRef) -> String {
@@ -1648,6 +1725,221 @@ impl RuntimeBackend for NativeBackend {
     }
 }
 
+// -- headless execution ---------------------------------------------------
+
+/// Everything `zirv ctx exec --runtime native -- <prompt>` needs.
+///
+/// `route` is a `[route]` name from the operator's own native provider
+/// configuration; omitting it uses the `[roles]` entry for `role`. There is no
+/// adapter, no agent binary and no PATH probe anywhere on this path.
+#[derive(Debug)]
+pub struct HeadlessRequest<'a> {
+    pub repo: &'a std::path::Path,
+    pub prompt: &'a str,
+    pub route: Option<&'a str>,
+    pub role: &'a str,
+    pub limits: NativeLimits,
+}
+
+/// Runs one headless native session end to end and prints its structured
+/// final status as JSON, returning the exit code a `zirv ctx exec` consumer
+/// expects.
+///
+/// This is the native equivalent of `exec::run_with_clock_inner`'s harness
+/// spawn: same command, same structured outcome, an entirely different
+/// mechanism underneath. Everything it needs comes from operator
+/// configuration and the state directory; nothing is inherited from a harness
+/// process, because there is none.
+pub fn run_headless<W: std::io::Write>(
+    request: &HeadlessRequest<'_>,
+    w: &mut W,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    use std::time::Duration;
+
+    use super::super::provider::anthropic::AnthropicMessagesAdapter;
+    use super::super::provider::config::NativeConfig;
+    use super::super::provider::credential::OsStore;
+    use super::super::provider::openai::OpenAiResponsesAdapter;
+    use super::super::provider::transport::StreamTimeouts;
+    use super::super::provider::{Protocol, RouteId, adapter::resolve_target};
+    use super::super::state::{StateDir, now_secs};
+    use super::enforcement::{
+        ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, ExecutionIdentity,
+        NetworkScope, PlatformIsolation, ResourceClaims, StoredSeatFence,
+    };
+    use super::journal::{SeatId, SessionIdentity};
+    use super::tools::ToolLimits;
+
+    let state = StateDir::resolve(env)?;
+    let home = crate::utils::home_dir()?;
+    let cfg = super::super::config::CtxConfig::load(request.repo, env)?;
+
+    let native = NativeConfig::load(&home, request.repo)?.ok_or_else(|| {
+        format!(
+            "native runtime: no provider configuration at {}. Run `zirv ctx provider` to \
+             set up an account, endpoint and route first.",
+            NativeConfig::operator_path(&home).display()
+        )
+    })?;
+    let route_id = match request.route {
+        Some(name) => RouteId::new(name)?,
+        None => native.roles.get(request.role).cloned().ok_or_else(|| {
+            format!(
+                "native runtime: no route for role `{}`; pass --route or add a [roles] entry",
+                request.role
+            )
+        })?,
+    };
+
+    let store = OsStore::default();
+    let now = now_secs();
+    let timeouts = StreamTimeouts {
+        connect: Duration::from_secs(10),
+        first_event: Duration::from_millis(request.limits.first_event_ms.max(1)),
+        idle: Duration::from_millis(request.limits.idle_ms.max(1)),
+    };
+    let (target, _) = resolve_target(&native, &route_id, env, &store, now)?;
+    let provider: Box<dyn ProviderAdapter> = match target.protocol {
+        Protocol::AnthropicMessages => Box::new(AnthropicMessagesAdapter::from_config(
+            &native, &route_id, env, &store, now, timeouts,
+        )?),
+        Protocol::OpenAiResponses => Box::new(OpenAiResponsesAdapter::from_config(
+            &native, &route_id, env, &store, now, timeouts,
+        )?),
+        other => {
+            return Err(format!(
+                "native runtime: route `{route_id}` speaks {other:?}, which no direct provider \
+                 implements yet (roadmap #469, steps N12-N13)"
+            )
+            .into());
+        }
+    };
+
+    // Session identity first: the seat record is what the effect-time
+    // generation fence reads, so it has to exist before any tool can run.
+    let mut backend = NativeBackend::new();
+    let handle = backend.start(&SessionSpec {
+        runtime: RuntimeKind::Native,
+        role: request.role.to_string(),
+        agent: None,
+        provider_route: Some(route_id.clone()),
+        model: Some(target.model.id.clone()),
+        surface: UiSurface::Headless,
+        cwd: request.repo.to_path_buf(),
+        prompt: request.prompt.to_string(),
+        extra_args: Vec::new(),
+    })?;
+    super::super::seat::store(
+        &state,
+        &super::super::seat::Seat {
+            short: handle.short.clone(),
+            session: handle.logical_id.clone(),
+            generation: handle.generation,
+            agent: RuntimeKind::Native.as_str().to_string(),
+            model: Some(target.model.id.clone()),
+            provider: target.provider.to_string(),
+            role: request.role.to_string(),
+            pinned: false,
+            phase: Default::default(),
+            visited: Vec::new(),
+            last_rollover_at: None,
+            pending: None,
+            displaced: None,
+            created_at: now,
+            updated_at: now,
+            runtime: RuntimeKind::Native,
+        },
+    )?;
+
+    let route = RouteIdentity {
+        route: target.route.clone(),
+        provider: target.provider.clone(),
+        endpoint: target.endpoint.clone(),
+        account: target.account.clone(),
+        billing_pool: target.billing_pool.clone(),
+        protocol: target.protocol,
+        model: target.model.clone(),
+    };
+    let mut journal = Journal::open(&state)?;
+    let session = JournalSessionId::new(handle.logical_id.clone())?;
+    journal.create_session(&SessionIdentity {
+        session: session.clone(),
+        seat: SeatId::new(handle.short.clone())?,
+        generation: handle.generation,
+        task: None,
+        route: route.clone(),
+        created_at: now,
+        completed_at: None,
+    })?;
+
+    let broker = ExecutionBroker::new(
+        ExecutionIdentity::from_handle(&handle, None)?,
+        ResourceClaims::new(
+            request.repo,
+            request.repo,
+            state.root(),
+            &home,
+            NetworkScope::Denied,
+        )?
+        .discover_linked_worktree_git()?,
+        ApprovalMode::Headless,
+        std::sync::Arc::new(ConfigPolicySource::new(request.repo.to_path_buf())),
+        std::sync::Arc::new(StoredSeatFence::new(state.clone())),
+        std::sync::Arc::new(ApprovalAuthority::new()),
+        None,
+        PlatformIsolation::detect(),
+        Default::default(),
+    )?;
+    let mut tools = ClientToolExecutor::new(NativeToolClient::new(
+        broker,
+        state.clone(),
+        request.repo.to_path_buf(),
+        ToolLimits::from_config(&cfg),
+    ));
+
+    let cancel = backend
+        .cancellation(&handle)
+        .unwrap_or_else(|| std::sync::Arc::new(CancellationFlag::default()));
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    };
+    let status = {
+        let mut driver = NativeLoop::new(
+            NativeSessionConfig {
+                session: session.clone(),
+                generation: handle.generation,
+                route,
+                role: request.role.to_string(),
+                seat_model: env(super::super::adapters::SEAT_MODEL_ENV),
+                write_posture: lifecycle::orchestrator_write_posture(&cfg),
+                limits: request.limits,
+                task: None,
+            },
+            provider.as_ref(),
+            &mut tools,
+            &mut journal,
+            cancel,
+            &now_ms,
+            env,
+        );
+        driver.acknowledge(request.prompt, false)?;
+        driver.run_to_completion()?
+    };
+
+    journal.complete_session(
+        &session,
+        handle.generation,
+        status.status.as_str().to_string(),
+        now_secs(),
+    )?;
+    writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
+    Ok(status.exit_code)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1788,7 +2080,12 @@ mod tests {
         assert_eq!(status.tool_calls, 4);
         assert_eq!(
             calls,
-            vec!["call_read_src", "call_read_test", "call_patch", "call_tests"]
+            vec![
+                "call_read_src",
+                "call_read_test",
+                "call_patch",
+                "call_tests"
+            ]
         );
         assert_eq!(
             status.served_model.as_deref(),

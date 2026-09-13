@@ -533,12 +533,9 @@ impl ToolExecutor for FixtureToolExecutor {
             state,
             retry,
             result: match state {
-                ToolReceiptState::Completed => Some(
-                    outcome
-                        .result
-                        .clone()
-                        .unwrap_or(serde_json::Value::Null),
-                ),
+                ToolReceiptState::Completed => {
+                    Some(outcome.result.clone().unwrap_or(serde_json::Value::Null))
+                }
                 _ => None,
             },
             error: match state {
@@ -591,15 +588,17 @@ mod tests {
             panic!("expected a tool use");
         };
         assert!(!input.is_object());
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ProviderStreamEvent::ToolInputDelta { .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::ToolInputDelta { .. }))
+        );
     }
 
     #[test]
     fn the_two_protocol_shapes_stream_differently_but_commit_the_same_response() {
-        let body = r#"{"blocks":[{"type":"text","text":"hello","deltas":2}],"finish_reason":"end_turn"}"#;
+        let body =
+            r#"{"blocks":[{"type":"text","text":"hello","deltas":2}],"finish_reason":"end_turn"}"#;
         let anthropic = FixtureScript::from_json(&format!(
             r#"{{"shape":"anthropic","turns":[{{"shape":"anthropic",{}]}}"#,
             &body[1..]
@@ -612,12 +611,10 @@ mod tests {
         .expect("openai script");
 
         let mut anthropic_events = Vec::new();
-        let anthropic_response = FixtureProvider::new(
-            fixture_target(Protocol::AnthropicMessages, "m"),
-            anthropic,
-        )
-        .stream(&empty_request(), &NeverCancelled, &mut anthropic_events)
-        .expect("anthropic response");
+        let anthropic_response =
+            FixtureProvider::new(fixture_target(Protocol::AnthropicMessages, "m"), anthropic)
+                .stream(&empty_request(), &NeverCancelled, &mut anthropic_events)
+                .expect("anthropic response");
 
         let mut openai_events = Vec::new();
         let openai_response =
