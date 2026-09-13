@@ -1250,13 +1250,7 @@ pub(crate) fn session_has_modification(
 /// `true` for an empty slice, the same "nothing to point to" reading
 /// `changed_paths` itself gives an untouched worktree.
 fn changes_are_doc_only(paths: &[PathBuf]) -> bool {
-    paths.iter().all(|path| {
-        path.starts_with("docs")
-            || matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("md" | "txt" | "rst")
-            )
-    })
+    super::lifecycle::changes_are_doc_only(paths)
 }
 
 /// Issue #309: whether `phase` is a step that itself already gates on fresh
@@ -1276,11 +1270,7 @@ fn workflow_step_covers_verification(phase: WorkflowPhase) -> bool {
 /// `if final_only { "zirv verify" } else { "zirv test changed" }` naming, in
 /// case a future change narrows the suppression rule to `Test` alone.
 fn verify_on_stop_command(active_phase: Option<WorkflowPhase>) -> &'static str {
-    if active_phase == Some(WorkflowPhase::Verify) {
-        "zirv verify"
-    } else {
-        "zirv test changed"
-    }
+    super::lifecycle::verification_command(active_phase == Some(WorkflowPhase::Verify))
 }
 
 /// Bumped whenever `VerifyOnStopRecord`'s own shape changes -- deliberately
@@ -1663,9 +1653,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
 /// wording a second way -- the measurement and the actual injected text can
 /// never drift apart on what "the hook context" means.
 pub fn per_turn_context_text(marker: &str) -> String {
-    format!(
-        "Prefix each final answer with {marker} on line 1 (mid-turn exempt): zirv ctx health marker."
-    )
+    super::lifecycle::per_turn_context_text(marker)
 }
 
 pub fn prompt_output(
@@ -1919,23 +1907,12 @@ pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
 // orchestrator-write guard that refuses an orchestrator seat's own direct
 // edit of a repository file (issue #334) ------------------------------------
 
-/// Model-name fragments that mark a seat too expensive to inherit silently.
-/// Matched case-insensitively as substrings, so a vendor-qualified id
-/// (`us.anthropic.mythos-...`) or a suffixed one (`fable[1m]`) still lands.
-const EXPENSIVE_TIERS: [&str; 2] = ["fable", "mythos"];
-
-/// The tool names that dispatch a subagent. Both spellings are covered
-/// because the tool has been presented under either name and the guard must
-/// not turn itself off on a rename.
-const SUBAGENT_TOOLS: [&str; 2] = ["Agent", "Task"];
-
-/// Subagent types that pin no model of their own, so an omitted `model`
-/// parameter means "inherit the caller's". Matched exactly and
-/// case-sensitively: these are literal values of the tool's own
-/// `subagent_type` parameter, not free text. Any other name is a
-/// `.claude/agents/<name>.md` definition, which carries its own `model`
-/// frontmatter and is therefore none of zirv's business.
-const GENERIC_SUBAGENT_TYPES: [&str; 5] = ["fork", "claude", "general-purpose", "Explore", "Plan"];
+/// Model-name fragments that mark a seat too expensive to inherit silently,
+/// the subagent-dispatch tool names, and the subagent types that pin no model
+/// of their own. All three now live in `lifecycle.rs` (issue #478): the same
+/// vocabulary decides a native session's dispatches, where there is no hook
+/// payload at all.
+use super::lifecycle::{EXPENSIVE_TIERS, GENERIC_SUBAGENT_TYPES, SUBAGENT_TOOLS};
 
 /// The PreToolUse stdin payload, narrowed to what the guard reads. Every
 /// field is optional with a zero default, the same rule the Stop payload
@@ -2021,8 +1998,7 @@ impl PreToolPayload {
 }
 
 fn names_expensive_tier(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    EXPENSIVE_TIERS.iter().any(|tier| model.contains(tier))
+    super::lifecycle::names_expensive_tier(model)
 }
 
 /// What the model is told when a dispatch is refused. The reason is the only
@@ -2030,12 +2006,7 @@ fn names_expensive_tier(model: &str) -> bool {
 /// cheaper models that are accepted, and the one option (a fork) that no
 /// model parameter can rescue.
 fn pretool_deny_reason(seat: &str) -> String {
-    format!(
-        "zirv guard: this seat runs {seat}; re-dispatch with an explicit cheaper model \
-         parameter (haiku for mechanical work, sonnet for standard work, opus for hard \
-         work), or use an agent type that pins its own model. Forks are not allowed from \
-         this seat: a fork always inherits the seat model and ignores a model override."
-    )
+    super::lifecycle::seat_deny_reason(seat)
 }
 
 /// The whole decision, pure: `Some(reason)` denies, `None` allows.
@@ -2049,40 +2020,35 @@ fn pretool_deny_reason(seat: &str) -> String {
 /// runs in front of every tool call in the session, and the cost of a wrong
 /// deny is far higher than the cost of a missed one.
 pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<String> {
-    let seat = seat?;
-    if !names_expensive_tier(seat) {
-        return None;
-    }
-    if !SUBAGENT_TOOLS.contains(&payload.tool_name.as_str()) {
-        return None;
-    }
+    // Issue #478: the decision itself is `lifecycle::subagent_admission`, so
+    // a native session (which has no PreToolUse payload at all) reaches the
+    // same guard. This function stays exactly what it always was on the hook
+    // side -- the translator from claude's payload shape into that intent.
+    //
     // A payload with no `tool_input` at all, an empty `{}`, or one that
     // simply omits `prompt` is schema drift, not a subagent dispatch: every
     // genuine `Agent`/`Task` call carries a non-empty `prompt` (the
-    // subagent's own task text), so this guard must not deny on `#[serde(
-    // default)]`'s own zero values for a call it never actually recognised.
-    if payload.tool_input.prompt.trim().is_empty() {
-        return None;
+    // subagent's own task text), so the guard must not deny on `#[serde(
+    // default)]`'s own zero values for a call it never actually recognised --
+    // `subagent_admission` applies that same empty-prompt rule.
+    super::lifecycle::subagent_admission(seat, &pretool_intent(payload))
+}
+
+/// The neutral [`super::lifecycle::ToolIntent`] for a PreToolUse payload, as
+/// far as the subagent guard needs it. The write-guard fields are filled in
+/// separately by [`orchestrator_write_target`], which has a `cwd` to resolve
+/// the target against.
+fn pretool_intent(payload: &PreToolPayload) -> super::lifecycle::ToolIntent {
+    super::lifecycle::ToolIntent {
+        tool: payload.tool_name.clone(),
+        write_target: None,
+        subagent: Some(super::lifecycle::SubagentIntent {
+            prompt: payload.tool_input.prompt.clone(),
+            subagent_type: payload.tool_input.subagent_type.clone(),
+            model: payload.tool_input.model.clone(),
+        }),
+        delegated: !payload.agent_id.is_empty(),
     }
-
-    let subagent_type = payload.tool_input.subagent_type.trim();
-    let model = payload.tool_input.model.trim();
-
-    // A fork inherits the seat model by construction and ignores `model`
-    // outright, so naming a cheap one buys nothing and must not read as
-    // though it did.
-    let denied = if subagent_type == "fork" {
-        true
-    } else if !model.is_empty() {
-        // An explicit model is honored, unless it asks for the seat tier
-        // again by name, which is the exact spend being guarded.
-        names_expensive_tier(model)
-    } else {
-        // No model named: only a subagent type that pins its own inherits.
-        subagent_type.is_empty() || GENERIC_SUBAGENT_TYPES.contains(&subagent_type)
-    };
-
-    denied.then(|| pretool_deny_reason(seat))
 }
 
 // -- PreToolUse: the orchestrator-write guard (issues #328/#334) -----------
@@ -2090,7 +2056,7 @@ pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<
 /// Tool names that write repository files. An orchestrator seat must be
 /// technically unable to edit repository files itself -- every change goes
 /// through a dispatched worker instead.
-const FILE_MODIFICATION_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+use super::lifecycle::FILE_MODIFICATION_TOOLS;
 
 /// Resolves `path` lexically: `.` components drop, `..` pops the previous
 /// component (or is kept literally once there is nothing left to pop, so a
@@ -2098,15 +2064,7 @@ const FILE_MODIFICATION_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "Noteb
 /// Deliberately NOT `std::fs::canonicalize`: a `Write` target may not exist
 /// yet, and this must stay a pure path computation, no filesystem access.
 fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if out.pop() => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+    super::lifecycle::normalize_lexically(path)
 }
 
 /// Claude Code's operator-owned configuration directory. An explicit,
@@ -2114,15 +2072,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// `HOME` (or Windows' `USERPROFILE`) applies. Environment access stays
 /// injectable so both write guards remain deterministic in tests.
 fn harness_home(env: EnvLookup<'_>) -> Option<PathBuf> {
-    env("CLAUDE_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env("HOME")
-                .or_else(|| env("USERPROFILE"))
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
+    super::lifecycle::harness_home(env)
 }
 
 /// Whether a write target belongs to Claude Code's own configuration tree.
@@ -2130,16 +2080,7 @@ fn harness_home(env: EnvLookup<'_>) -> Option<PathBuf> {
 /// paths agree; a not-yet-created harness home uses a component-aware lexical
 /// comparison on the paths exactly as supplied.
 pub(crate) fn target_is_under_harness_home(target: &Path, env: EnvLookup<'_>) -> bool {
-    let Some(harness_home) = harness_home(env) else {
-        return false;
-    };
-    if !harness_home.exists() {
-        return target.starts_with(harness_home);
-    }
-    let Ok(harness_home) = std::fs::canonicalize(harness_home) else {
-        return false;
-    };
-    canonicalize_with_missing_tail(target).is_some_and(|target| target.starts_with(harness_home))
+    super::lifecycle::target_is_under_harness_home(target, env)
 }
 
 /// The absolute, lexically-normalized target `payload` names, or `None` when
@@ -2172,13 +2113,7 @@ fn normalized_write_target(payload: &PreToolPayload, cwd: &Path) -> Option<PathB
 /// the model can see why, and the remedy: dispatch a worker rather than
 /// retry the same tool call.
 fn orchestrator_write_deny_reason(target: &Path) -> String {
-    format!(
-        "orchestrator seat: dispatch a worker -- this seat coordinates and never edits \
-         repository files itself ({}). Delegate the change to a worker: the native Agent \
-         tool for this harness, `zirv agent <other-harness>` for another. Writes under \
-         .zirv/work and .zirv/memory stay allowed.",
-        target.display()
-    )
+    super::lifecycle::orchestrator_write_deny_reason(target)
 }
 
 /// What the model is told, non-blocking, when an orchestrator seat's own
@@ -2187,11 +2122,7 @@ fn orchestrator_write_deny_reason(target: &Path) -> String {
 /// names the target and the standing guidance to delegate anything larger
 /// than a trivial edit.
 fn orchestrator_write_advise_note(target: &Path) -> String {
-    format!(
-        "orchestrator seat wrote to {}: fine for a trivial edit; delegate substantial changes \
-         to a worker",
-        target.display()
-    )
+    super::lifecycle::orchestrator_write_advise_note(target)
 }
 
 /// This seat's own repository-write guard posture -- `cfg.supervise.
@@ -2202,7 +2133,7 @@ fn orchestrator_write_advise_note(target: &Path) -> String {
 /// PowerShell in `safety.rs`) can never read a different posture for the
 /// same session.
 pub(crate) fn orchestrator_write_posture(cfg: &CtxConfig) -> super::config::OrchestratorWrites {
-    cfg.supervise.orchestrator_writes
+    super::lifecycle::orchestrator_write_posture(cfg)
 }
 
 /// One orchestrator-write guard decision, resolved against this seat's own
@@ -2277,11 +2208,7 @@ pub(crate) fn orchestrator_advisory_should_surface(env: EnvLookup<'_>, session: 
 /// (`gitdir: ...`) -- so both shapes resolve to the same repository root.
 /// Pure apart from `Path::exists`.
 fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
-    target
-        .parent()?
-        .ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
-        .map(Path::to_path_buf)
+    super::lifecycle::repo_root_for_target(target)
 }
 
 /// The resolved write TARGET when `payload` is an orchestrator seat's own
@@ -2311,25 +2238,13 @@ fn orchestrator_write_target(
     cwd: &Path,
     env: EnvLookup<'_>,
 ) -> Option<PathBuf> {
-    if role != Some("orchestrator") {
-        return None;
-    }
-    if !payload.agent_id.is_empty() {
-        return None;
-    }
-    let target = normalized_write_target(payload, cwd)?;
-    if target_is_under_harness_home(&target, env) {
-        return None;
-    }
-    let target_repo = repo_root_for_target(&target)?;
-    let allowed_roots = [
-        target_repo.join(".zirv/work"),
-        target_repo.join(".zirv/memory"),
-    ];
-    if allowed_roots.iter().any(|root| target.starts_with(root)) {
-        return None;
-    }
-    Some(target)
+    // Issue #478: the rule itself lives in `lifecycle.rs` so a native
+    // session's own `file_write`/`apply_patch` call reaches it too; this stays
+    // the translator that resolves claude's `file_path`/`notebook_path`
+    // against `cwd`.
+    let mut intent = pretool_intent(payload);
+    intent.write_target = normalized_write_target(payload, cwd);
+    super::lifecycle::orchestrator_write_target(role, &intent, env)
 }
 
 /// The whole orchestrator-write guard decision (issue #358 T8): `None` when
@@ -2757,7 +2672,7 @@ pub struct BashToolOutput {
 /// compacting it again would summarize a truncation notice and hand back a
 /// retrieval id for text zirv never actually holds.
 fn already_offloaded(text: &str) -> bool {
-    text.contains("Output too large") && text.contains("saved to")
+    super::lifecycle::already_offloaded(text)
 }
 
 /// The `updatedToolOutput` envelope. `stderr` is emptied deliberately: the
@@ -3002,15 +2917,7 @@ pub fn notify_payload_to_hook(raw: &str) -> CtxResult<HookPayload> {
 /// carry tokens, prompts and file contents, and the decision log is a plain
 /// file that outlives the session.
 pub fn notify_shape(payload: &str) -> String {
-    const MAX_KEYS: usize = 200;
-    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(payload)
-    else {
-        return format!("unparseable notify payload, {} bytes", payload.len());
-    };
-
-    let mut keys: String = map.keys().cloned().collect::<Vec<_>>().join(", ");
-    keys.truncate(MAX_KEYS);
-    format!("notify payload fields: {keys}")
+    super::lifecycle::notification_shape(payload)
 }
 
 pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
