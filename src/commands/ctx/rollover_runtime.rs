@@ -411,14 +411,28 @@ pub enum Continuation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "refusal", rename_all = "kebab-case")]
 pub enum Refusal {
-    NotAuthenticated { route: String },
+    NotAuthenticated {
+        route: String,
+    },
     /// Capability, context room, policy or billing authority -- N18's own
     /// pre-ranking eligibility answer, reused rather than re-derived.
-    Ineligible { route: String, reason: String },
-    OverBudget { route: String, need: u64, have: u64 },
+    Ineligible {
+        route: String,
+        reason: String,
+    },
+    OverBudget {
+        route: String,
+        need: u64,
+        have: u64,
+    },
     /// No legal continuation payload could be produced for this direction.
-    NoContinuation { route: String, detail: String },
-    StartupFailed { route: String },
+    NoContinuation {
+        route: String,
+        detail: String,
+    },
+    StartupFailed {
+        route: String,
+    },
 }
 
 impl Refusal {
@@ -515,12 +529,14 @@ pub fn validate(
     if !facts.started {
         return Err(Refusal::StartupFailed { route: label });
     }
-    let continuation = continuation_for(direction, plan).ok_or_else(|| Refusal::NoContinuation {
-        route: label.clone(),
-        detail: "a same-route provider envelope cannot be handed to a different runtime, and no \
+    let continuation =
+        continuation_for(direction, plan).ok_or_else(|| Refusal::NoContinuation {
+            route: label.clone(),
+            detail:
+                "a same-route provider envelope cannot be handed to a different runtime, and no \
                  semantic history could be rebuilt"
-            .to_string(),
-    })?;
+                    .to_string(),
+        })?;
     Ok(Admission {
         direction,
         continuation,
@@ -815,7 +831,11 @@ impl Record {
             }
             None => line.push_str(" -> in flight"),
         }
-        if let Some(note) = self.boundary.as_ref().and_then(Boundary::reconciliation_note) {
+        if let Some(note) = self
+            .boundary
+            .as_ref()
+            .and_then(Boundary::reconciliation_note)
+        {
             line.push_str(&format!(" | {note}"));
         }
         line
@@ -1298,7 +1318,10 @@ mod tests {
             .expect("read back")
             .expect("a handoff checkpoint was committed");
         assert_eq!(stored.objective.as_deref(), Some("ship the release"));
-        assert_eq!(stored.hard_constraints, vec!["never force-push".to_string()]);
+        assert_eq!(
+            stored.hard_constraints,
+            vec!["never force-push".to_string()]
+        );
         assert_eq!(stored.task.as_deref(), Some("task-1"));
         assert!(
             stored
@@ -2021,7 +2044,11 @@ mod tests {
             );
             assert_eq!(
                 super::super::sessions::native_conversation(
-                    &state, &short, &after.agent, &session, wrong
+                    &state,
+                    &short,
+                    &after.agent,
+                    &session,
+                    wrong
                 ),
                 None,
                 "{moving:?}: a conversation id is never resumed under the wrong runtime"

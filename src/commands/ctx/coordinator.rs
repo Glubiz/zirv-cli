@@ -827,7 +827,15 @@ mod tests {
         let session = "9d8c7b6a-5555-4444-8333-222211110000";
         let short = crate::commands::ctx::sessions::short_id(session);
         seat::register(
-            &state, &short, session, "claude", None, "anthropic", "orchestrator", false, 1,
+            &state,
+            &short,
+            session,
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            1,
         )
         .expect("register");
 

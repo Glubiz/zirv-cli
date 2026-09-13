@@ -1229,9 +1229,8 @@ fn authorized_return(
         // A `Hold` here is the same gate the caller's own `reclaim` already
         // applied (idle, cooldown, hysteresis), so it is not a second answer:
         // this function only ever adds the authority verdict.
-        rollover_runtime::ReturnVerdict::Hold(_) | rollover_runtime::ReturnVerdict::Return { .. } => {
-            None
-        }
+        rollover_runtime::ReturnVerdict::Hold(_)
+        | rollover_runtime::ReturnVerdict::Return { .. } => None,
     }
 }
 
@@ -1242,7 +1241,10 @@ fn authorized_return(
 /// `fallback.order` can name today, and guessing `Native` for an unknown name
 /// would prepare a transaction no backend could complete.
 fn runtime_of(snapshot: &allocator::CapacitySnapshot, agent: &str) -> RuntimeKind {
-    match snapshot.harness(agent).map(|harness| harness.identity.runtime) {
+    match snapshot
+        .harness(agent)
+        .map(|harness| harness.identity.runtime)
+    {
         Some(super::route::RuntimeKind::Native) => RuntimeKind::Native,
         _ => RuntimeKind::Harness,
     }

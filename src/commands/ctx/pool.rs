@@ -966,7 +966,10 @@ mod tests {
         assert!(text.contains("successor: codex [harness]"), "got {text}");
         // Issue #488 criterion 6: the same logical seat (short, generation),
         // the backend now answering at it, where it came from, and why.
-        assert!(text.contains("seat: claude opus [native] gen 3"), "got {text}");
+        assert!(
+            text.contains("seat: claude opus [native] gen 3"),
+            "got {text}"
+        );
         assert!(
             text.contains("displaced from: claude [harness], conversation retained"),
             "got {text}"
