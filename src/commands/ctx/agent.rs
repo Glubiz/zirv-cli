@@ -436,10 +436,9 @@ pub struct DelegationReceipt {
 /// refused before any work starts, see [`resolve_runtime`]), so mapping an
 /// unparseable value onto `harness` here is only ever describing the default.
 pub(crate) fn runtime_label(args: &AgentArgs) -> &'static str {
-    match args.runtime.parse::<super::runtime::RuntimeKind>() {
-        Ok(super::runtime::RuntimeKind::Native) => super::runtime::RuntimeKind::Native.as_str(),
-        _ => super::runtime::RuntimeKind::Harness.as_str(),
-    }
+    resolve_runtime(args)
+        .unwrap_or(super::runtime::RuntimeKind::Harness)
+        .as_str()
 }
 
 /// The one place `--runtime` is turned into a decision. An unknown value is a

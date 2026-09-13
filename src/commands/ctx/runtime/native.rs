@@ -2716,7 +2716,7 @@ pub fn run_session<W: std::io::Write>(
         Err(error) => {
             writeln!(
                 w,
-                "native runtime: standing context could not be compiled ({error}); continuing                  with the conversation alone"
+                "native runtime: standing context could not be compiled ({error}); continuing with the conversation alone"
             )?;
             (Vec::new(), Vec::new())
         }
