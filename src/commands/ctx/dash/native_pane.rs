@@ -468,6 +468,29 @@ pub struct StatusFacts {
     /// [`status_line_text`]; `None` on every path that constructs
     /// `StatusFacts` without a live [`NativePaneRuntime`] behind it.
     pub notice: Option<String>,
+    /// Operator direction (PR #531 follow-up): the spinner/verb/elapsed/
+    /// token/interrupt-hint line shown while a turn runs -- see
+    /// [`activity_line_text`]. `None` while idle, and on every path that
+    /// constructs `StatusFacts` without a live [`NativePaneRuntime`] behind
+    /// it.
+    pub activity: Option<String>,
+    /// The repository this session is running in -- part of the bottom
+    /// status line (operator direction, PR #531 follow-up).
+    pub cwd: String,
+    /// The checked out branch, read once from `.git/HEAD` at spawn time --
+    /// `None` when `repo` is not a git checkout, is in a detached-HEAD
+    /// state, or on every path that constructs `StatusFacts` without a live
+    /// `NativePaneRuntime` behind it. "Unknown, not a guess", the same
+    /// convention every other status fact here follows.
+    pub git_branch: Option<String>,
+    /// Percentage of the model's declared context window still free,
+    /// estimated from the conversation's own recorded token usage --
+    /// `None` when the model's context window is not declared at all.
+    /// This is an ESTIMATE against raw usage, not the compaction budget's
+    /// own accounting (which lives inside the worker thread's
+    /// `NativeSessionConfig`, not read back by this pane) -- see the design
+    /// note.
+    pub context_left_pct: Option<u8>,
 }
 
 /// The seven states item 4 names, plus the natural eighth: "completed, and
@@ -858,6 +881,76 @@ fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Operator direction (PR #531 follow-up): `Ctrl+C` no longer interrupts a
+/// turn by itself -- `Esc` owns that now (see `run_native_dashboard`'s own
+/// key contract). A single `Ctrl+C` only arms a quit confirmation; the pane
+/// quits only when a SECOND `Ctrl+C` lands within `window` of the first.
+/// Pure so the arming/window arithmetic is unit-testable without a real
+/// terminal loop -- `run_native_dashboard` is the only caller, tracking
+/// `last_press` as its own local `Option<Instant>`, replaced with `Some(now)`
+/// on every `Ctrl+C` that does not itself confirm a quit and cleared by any
+/// other key.
+fn ctrl_c_confirms_quit(
+    last_press: Option<std::time::Instant>,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> bool {
+    last_press.is_some_and(|previous| now.saturating_duration_since(previous) <= window)
+}
+
+/// How long a first `Ctrl+C` stays armed for [`ctrl_c_confirms_quit`].
+const CTRL_C_QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `Ctrl+R`'s (and the composer's own `e`/`Enter`-while-`Transcript`-
+/// focused) shared action: toggle the most recently rendered tool call's
+/// expanded state. A no-op when the transcript has no tool call at all.
+fn toggle_most_recent_tool_call(pane: &mut NativePaneRuntime) {
+    let key = pane
+        .view()
+        .0
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| item.expand_key())
+        .map(str::to_string);
+    if let Some(key) = key {
+        pane.presentation_mut().toggle_expanded(&key);
+    }
+}
+
+/// Operator direction (PR #531 follow-up): a submission that IS a
+/// recognised slash command, handled entirely here rather than sent as a
+/// turn. `/clear` has a real effect (drops the queued backlog); `/help` is
+/// informational; `/compact` is an honest inert stub -- wiring it to the
+/// real compaction envelope needs facts (`NativeSessionConfig`'s own
+/// budget) the pane does not hold today, see the design note. `/status`
+/// needs live `StatusFacts` this pure function cannot produce, so
+/// `NativePaneRuntime::handle_composer_action` handles it directly instead
+/// of routing through here.
+///
+/// Returns `Some(notice)` for a recognised command (`notice` may be empty,
+/// e.g. `/clear`, which has nothing to report), `None` for anything else --
+/// including a `/`-prefixed line this list does not recognise, which falls
+/// through to the normal submit path as ordinary text rather than being
+/// silently swallowed.
+fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Option<String> {
+    match text.trim() {
+        "/clear" => {
+            presentation.composer.queued.clear();
+            Some(String::new())
+        }
+        "/help" => Some(
+            "commands: /clear /compact /status \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C \
+             Ctrl+C quit, Shift+Tab cycle mode, @ file ref"
+                .to_string(),
+        ),
+        "/compact" => {
+            Some("/compact is not yet wired to the native pane's compaction envelope".to_string())
+        }
+        _ => None,
+    }
+}
+
 fn leave_history_browsing(state: &mut ComposerState) {
     state.history_cursor = None;
     state.history_stash = None;
@@ -1105,6 +1198,42 @@ pub enum PaneFocus {
     Composer,
 }
 
+/// Operator direction (PR #531 follow-up): a `Shift+Tab`-cycled composer
+/// mode label, the same idea Claude Code's own CLI shows above its prompt.
+/// **Decorative only, today**: no submit path reads this back to change
+/// approval or tool-write behaviour -- an `AcceptEdits`/`Plan` mode that
+/// actually gated the execution broker would be a policy change at the
+/// enforcement layer, out of scope for a rendering/key-contract pass (see
+/// the design note). Shown on the composer's own hint line so the key
+/// binding is visibly real even while the behaviour it will eventually
+/// drive is not wired yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ComposerMode {
+    #[default]
+    Default,
+    AcceptEdits,
+    Plan,
+}
+
+impl ComposerMode {
+    /// `Shift+Tab`'s own action: the next mode in the cycle.
+    pub fn next(self) -> Self {
+        match self {
+            ComposerMode::Default => ComposerMode::AcceptEdits,
+            ComposerMode::AcceptEdits => ComposerMode::Plan,
+            ComposerMode::Plan => ComposerMode::Default,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ComposerMode::Default => "default mode",
+            ComposerMode::AcceptEdits => "accept-edits mode",
+            ComposerMode::Plan => "plan mode",
+        }
+    }
+}
+
 /// Everything a native pane needs to redraw itself identically across a
 /// resize or a streaming update, kept separate from the session/runtime
 /// object that actually owns the conversation (per this module's own scope
@@ -1120,6 +1249,9 @@ pub struct NativePresentation {
     pub expanded: BTreeSet<String>,
     pub composer: ComposerState,
     pub unread: bool,
+    /// `Shift+Tab`-cycled, decorative only -- see [`ComposerMode`]'s own
+    /// doc comment.
+    pub mode: ComposerMode,
 }
 
 impl Default for NativePresentation {
@@ -1131,6 +1263,7 @@ impl Default for NativePresentation {
             expanded: BTreeSet::new(),
             composer: ComposerState::default(),
             unread: false,
+            mode: ComposerMode::default(),
         }
     }
 }
@@ -1524,49 +1657,80 @@ fn take_columns(text: &str, budget: usize) -> (&str, &str) {
     (&text[..end], &text[end..])
 }
 
+/// The bullet operator direction (PR #531 follow-up) puts in front of every
+/// assistant text block and tool call, Claude Code style.
+const BULLET: &str = "⏺";
+/// The indented tree marker a tool call's own result line hangs off, one
+/// level under [`BULLET`].
+const TREE_MARKER: &str = "⎿";
+
+/// Prefixes `lines`' first line with `marker` (styled `tone`) and indents
+/// every continuation line by two columns to align under it -- the
+/// "`⏺ text...`" / "`  ⎿ text...`" shape used throughout this renderer.
+/// `lines.is_empty()` still produces the marker on its own line, so a caller
+/// never has to special-case an empty block.
+fn with_marker(marker: &str, tone: Tone, mut lines: Vec<StyledLine>) -> Vec<StyledLine> {
+    if lines.is_empty() {
+        return vec![StyledLine::toned(marker.to_string(), tone)];
+    }
+    let mut first = vec![StyledSpan {
+        text: format!("{marker} "),
+        tone,
+    }];
+    first.extend(lines[0].0.clone());
+    lines[0] = StyledLine(first);
+    for line in lines.iter_mut().skip(1) {
+        let mut indented = vec![StyledSpan {
+            text: "  ".to_string(),
+            tone: Tone::Plain,
+        }];
+        indented.extend(line.0.clone());
+        *line = StyledLine(indented);
+    }
+    lines
+}
+
 /// Renders one [`TranscriptItem`] as [`StyledLine`]s, collapsed or expanded
 /// per `expanded`. Collapsed tool calls show one summary line; expanded
 /// ones show the full classified outcome.
 pub fn render_item(item: &TranscriptItem, expanded: bool) -> Vec<StyledLine> {
     match item {
         TranscriptItem::User { text, steering, .. } => {
-            let mut lines = vec![StyledLine::toned(
-                if *steering {
-                    "\u{25b8} you (steering)"
-                } else {
-                    "\u{25b8} you"
-                },
-                Tone::Muted,
-            )];
-            lines.extend(markdown_lines(text));
-            lines
+            // Operator direction (PR #531 follow-up): user turns render as
+            // `>` lines. A per-line shaded background is deferred -- the
+            // shared `Tone`/`StyledSpan` model this renderer and the plain-
+            // text one both use carries no per-line background today, and
+            // adding one is a crate-wide change well past this pane's own
+            // scope (see the design note).
+            let marker = if *steering { "> (steering)" } else { ">" };
+            with_marker(marker, Tone::Muted, markdown_lines(text))
         }
         TranscriptItem::AssistantText { text, .. } => {
-            let mut lines = vec![StyledLine::toned("\u{25b8} assistant", Tone::Accent)];
-            lines.extend(markdown_lines(text));
-            lines
+            with_marker(BULLET, Tone::Accent, markdown_lines(text))
         }
-        TranscriptItem::AssistantThinking { text, .. } => {
-            let mut lines = vec![StyledLine::toned("\u{25b8} thinking", Tone::Muted)];
-            lines.extend(markdown_lines(text).into_iter().map(|line| {
-                StyledLine(
-                    line.0
-                        .into_iter()
-                        .map(|s| StyledSpan {
-                            tone: Tone::Muted,
-                            ..s
-                        })
-                        .collect(),
-                )
-            }));
-            lines
-        }
-        TranscriptItem::AssistantRefusal { text, .. } => {
-            vec![
-                StyledLine::toned("\u{25b8} assistant (refused)", Tone::Warn),
-                StyledLine::toned(text.clone(), Tone::Warn),
-            ]
-        }
+        TranscriptItem::AssistantThinking { text, .. } => with_marker(
+            BULLET,
+            Tone::Muted,
+            markdown_lines(text)
+                .into_iter()
+                .map(|line| {
+                    StyledLine(
+                        line.0
+                            .into_iter()
+                            .map(|s| StyledSpan {
+                                tone: Tone::Muted,
+                                ..s
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+        TranscriptItem::AssistantRefusal { text, .. } => with_marker(
+            BULLET,
+            Tone::Warn,
+            vec![StyledLine::toned(text.clone(), Tone::Warn)],
+        ),
         TranscriptItem::ToolCall {
             name,
             arguments_preview,
@@ -1627,6 +1791,14 @@ fn outcome_summary(outcome: &ToolOutcomeView) -> (&'static str, Tone, String) {
     }
 }
 
+/// Operator direction (PR #531 follow-up): a tool call is a `⏺ name(args)`
+/// bullet header followed by one indented `⎿` tree line summarising the
+/// result, with "(ctrl+r to expand)" on the tree line while collapsed and
+/// an outcome with more to show (a pending/running/cancelled outcome never
+/// gets more detailed by expanding it, so no hint is offered for those).
+/// Expanding replaces the hint with the full classified outcome body,
+/// indented one level further under the tree line -- unchanged from the
+/// pre-restyle layout's own column 4.
 fn render_tool_call(
     name: &str,
     arguments_preview: &str,
@@ -1634,54 +1806,129 @@ fn render_tool_call(
     expanded: bool,
 ) -> Vec<StyledLine> {
     let (glyph, tone, summary) = outcome_summary(outcome);
-    let marker = if expanded { "\u{25bc}" } else { "\u{25b6}" };
+    let args = if arguments_preview.is_empty() {
+        String::new()
+    } else {
+        format!("({arguments_preview})")
+    };
     let header = StyledLine(vec![
         StyledSpan {
-            text: format!("  {marker} tool: "),
-            tone: Tone::Muted,
+            text: format!("{BULLET} "),
+            tone: Tone::Accent,
         },
         StyledSpan {
             text: name.to_string(),
             tone: Tone::Plain,
         },
         StyledSpan {
-            text: format!(" {glyph} "),
+            text: args,
+            tone: Tone::Muted,
+        },
+    ]);
+    let mut tree_spans = vec![
+        StyledSpan {
+            text: format!("  {TREE_MARKER} "),
+            tone: Tone::Muted,
+        },
+        StyledSpan {
+            text: format!("{glyph} "),
             tone,
         },
         StyledSpan {
             text: summary,
             tone,
         },
-    ]);
-    let mut lines = vec![header];
+    ];
+    if !expanded && outcome_is_expandable(outcome) {
+        tree_spans.push(StyledSpan {
+            text: " (ctrl+r to expand)".to_string(),
+            tone: Tone::Muted,
+        });
+    }
+    let mut lines = vec![header, StyledLine(tree_spans)];
     if !expanded {
         return lines;
-    }
-    if !arguments_preview.is_empty() {
-        lines.push(StyledLine::toned(
-            format!("    args: {arguments_preview}"),
-            Tone::Muted,
-        ));
     }
     lines.extend(render_outcome_body(outcome));
     lines
 }
 
+/// Whether a collapsed tool result has anything more to show once
+/// expanded -- see [`render_tool_call`]'s own doc comment.
+fn outcome_is_expandable(outcome: &ToolOutcomeView) -> bool {
+    !matches!(
+        outcome,
+        ToolOutcomeView::Pending | ToolOutcomeView::Running | ToolOutcomeView::Cancelled
+    )
+}
+
+/// The two-column old/new line-number gutter a unified diff's `@@ -a,b +c,d
+/// @@` hunk header establishes -- `None` once a line falls outside any hunk
+/// this function has parsed a header for (malformed input, or a diff that
+/// starts mid-hunk), which callers fall back to a blank gutter for rather
+/// than guessing.
+fn parse_hunk_header(line: &str) -> Option<(u64, u64)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old_part, rest) = rest.split_once(' ')?;
+    let new_part = rest.strip_prefix('+')?;
+    let new_part = new_part.split(' ').next()?;
+    let old_start: u64 = old_part.split(',').next()?.parse().ok()?;
+    let new_start: u64 = new_part.split(',').next()?.parse().ok()?;
+    Some((old_start, new_start))
+}
+
+/// Renders a unified diff with an old/new line-number gutter and coloured
+/// +/- rows (operator direction, PR #531 follow-up). Pure and total: a line
+/// outside any parsed hunk (before the first `@@` header, or a header this
+/// parser cannot read) gets no gutter numbers rather than a guess.
+fn render_diff_lines(unified: &str) -> Vec<StyledLine> {
+    let mut old_line: Option<u64> = None;
+    let mut new_line: Option<u64> = None;
+    let mut out = Vec::new();
+    for line in unified.lines() {
+        if let Some((old_start, new_start)) = parse_hunk_header(line) {
+            old_line = Some(old_start);
+            new_line = Some(new_start);
+            out.push(StyledLine::toned(format!("    {line}"), Tone::Accent));
+            continue;
+        }
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            out.push(StyledLine::toned(format!("    {line}"), Tone::Muted));
+            continue;
+        }
+        let gutter = |old: Option<u64>, new: Option<u64>| -> String {
+            let old = old.map(|n| n.to_string()).unwrap_or_default();
+            let new = new.map(|n| n.to_string()).unwrap_or_default();
+            format!("{old:>5} {new:>5}")
+        };
+        if let Some(body) = line.strip_prefix('+') {
+            out.push(StyledLine::toned(
+                format!("    {} + {body}", gutter(None, new_line)),
+                Tone::Ok,
+            ));
+            new_line = new_line.map(|n| n + 1);
+        } else if let Some(body) = line.strip_prefix('-') {
+            out.push(StyledLine::toned(
+                format!("    {} - {body}", gutter(old_line, None)),
+                Tone::Err,
+            ));
+            old_line = old_line.map(|n| n + 1);
+        } else {
+            let body = line.strip_prefix(' ').unwrap_or(line);
+            out.push(StyledLine::toned(
+                format!("    {}   {body}", gutter(old_line, new_line)),
+                Tone::Muted,
+            ));
+            old_line = old_line.map(|n| n + 1);
+            new_line = new_line.map(|n| n + 1);
+        }
+    }
+    out
+}
+
 fn render_outcome_body(outcome: &ToolOutcomeView) -> Vec<StyledLine> {
     match outcome {
-        ToolOutcomeView::Diff { unified } => unified
-            .lines()
-            .map(|line| {
-                let tone = if line.starts_with('+') && !line.starts_with("+++") {
-                    Tone::Ok
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    Tone::Err
-                } else {
-                    Tone::Muted
-                };
-                StyledLine::toned(format!("    {line}"), tone)
-            })
-            .collect(),
+        ToolOutcomeView::Diff { unified } => render_diff_lines(unified),
         ToolOutcomeView::TestOutcome { raw, .. } => raw
             .lines()
             .map(|line| StyledLine::toned(format!("    {line}"), Tone::Plain))
@@ -1731,6 +1978,24 @@ pub fn render_lines(view: &TranscriptView, presentation: &NativePresentation) ->
     lines
 }
 
+/// [`render_lines`] plus, when `activity` is `Some`, one final line showing
+/// it -- operator direction (PR #531 follow-up): the spinner/verb/elapsed/
+/// token/interrupt-hint line shown while a turn runs. Appended to the
+/// transcript's own content rather than a separately reserved row, so it
+/// scrolls and wraps exactly like everything else and follow-mode (already
+/// "stay at the bottom") keeps it in view for free.
+pub fn render_lines_with_activity(
+    view: &TranscriptView,
+    presentation: &NativePresentation,
+    activity: Option<&str>,
+) -> Vec<StyledLine> {
+    let mut lines = render_lines(view, presentation);
+    if let Some(text) = activity {
+        lines.push(StyledLine::toned(text.to_string(), Tone::Accent));
+    }
+    lines
+}
+
 /// Word-wraps every line in `lines` to `width` columns, in order.
 pub fn wrap_all(lines: &[StyledLine], width: usize) -> Vec<StyledLine> {
     lines
@@ -1771,6 +2036,19 @@ pub fn status_line_text(facts: &StatusFacts) -> String {
         glyph = status_glyph(status),
         label = status_label(status),
     );
+    // Operator direction (PR #531 follow-up): context-left%, cwd and git
+    // branch join the bottom status line, in that order, each omitted
+    // (rather than shown as a placeholder) when unknown -- "unknown, not a
+    // guess", the same convention `resolve_billing` already documents for
+    // this same struct's other fields.
+    if let Some(pct) = facts.context_left_pct {
+        line.push_str(&format!("  context left {pct}%"));
+    }
+    line.push_str("  ");
+    line.push_str(&facts.cwd);
+    if let Some(branch) = &facts.git_branch {
+        line.push_str(&format!(" ({branch})"));
+    }
     if let Some(notice) = &facts.notice {
         line.push_str("  \u{26a0} ");
         line.push_str(notice);
@@ -1822,7 +2100,7 @@ pub fn render_native_pane(
             width: area.width,
             height: transcript_height,
         };
-        let raw = render_lines(view, presentation);
+        let raw = render_lines_with_activity(view, presentation, facts.activity.as_deref());
         let wrapped = wrap_all(&raw, width);
         let visible = viewport_slice(&wrapped, transcript_height as usize);
         let text: Vec<Line> = visible
@@ -1880,11 +2158,27 @@ pub fn composer_lines(presentation: &NativePresentation, width: usize) -> Vec<St
                 .collect::<Vec<_>>()
         })
         .collect();
-    lines.push(
-        "Enter submit \u{b7} Shift+Enter newline \u{b7} \u{2191} history \u{b7} @ file ref"
-            .to_string(),
-    );
+    lines.push(composer_hint_line(presentation));
     lines
+}
+
+/// The composer's own hint line: the key contract, the `Shift+Tab`-cycled
+/// [`ComposerMode`] (decorative -- see its own doc comment) and how many
+/// inputs are queued behind an in-flight turn, if any. Split out of
+/// [`composer_lines`] so it is directly testable without wrapping/width
+/// concerns.
+fn composer_hint_line(presentation: &NativePresentation) -> String {
+    let queued = presentation.composer.queued.len();
+    let queued_note = if queued > 0 {
+        format!(" \u{b7} {queued} queued")
+    } else {
+        String::new()
+    };
+    format!(
+        "? for shortcuts \u{b7} {mode}{queued_note} \u{b7} Enter submit \u{b7} Shift+Enter \
+         newline \u{b7} \u{2191} history \u{b7} @ file ref \u{b7} / commands \u{b7} Esc interrupt",
+        mode = presentation.mode.label(),
+    )
 }
 
 fn composer_height(presentation: &NativePresentation, width: usize) -> u16 {
@@ -1906,7 +2200,7 @@ pub fn render_plain(
     let mut out = String::new();
     out.push_str(&status_line_text(facts));
     out.push('\n');
-    let raw = render_lines(view, presentation);
+    let raw = render_lines_with_activity(view, presentation, facts.activity.as_deref());
     let wrapped = wrap_all(&raw, width.max(1));
     for line in &wrapped {
         out.push_str(&line.to_plain_string());
@@ -1970,6 +2264,90 @@ fn now_ms_u64() -> u64 {
         .unwrap_or(0)
 }
 
+/// Best-effort checked-out branch for `repo`, read directly from `.git/
+/// HEAD` rather than shelling out to `git` -- this pane polls on a ~150ms
+/// tick, and spawning a process that often is not acceptable (operator
+/// direction, PR #531 follow-up). `None` when `repo` is not a git checkout,
+/// is in a detached-HEAD state, or its `.git` is a worktree link this
+/// cannot resolve -- "unknown, not a guess", the same convention
+/// [`resolve_billing`] already documents. Called once at spawn time (the
+/// checked-out branch essentially never changes for the life of one chat
+/// session), never per-tick.
+fn git_branch(repo: &Path) -> Option<String> {
+    let git_path = repo.join(".git");
+    let head_path = if git_path.is_dir() {
+        git_path.join("HEAD")
+    } else {
+        // A linked worktree's `.git` is a file: "gitdir: <real git dir>".
+        let contents = std::fs::read_to_string(&git_path).ok()?;
+        let real = contents.trim().strip_prefix("gitdir: ")?;
+        PathBuf::from(real).join("HEAD")
+    };
+    let contents = std::fs::read_to_string(head_path).ok()?;
+    contents
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
+}
+
+/// Percentage of `route`'s declared context window still free, estimated
+/// from `conversation`'s own recorded usage so far -- `None` when the
+/// window itself is not declared, or is declared as `0` (nothing to
+/// divide by). This is an ESTIMATE against raw input+output token counts,
+/// not the compaction budget's own accounting (which also weighs
+/// distillation and lives inside the worker thread's own
+/// `NativeSessionConfig`, not read back by this pane) -- see the design
+/// note for what a truer reading would need.
+fn context_left_pct(route: &RouteIdentity, conversation: &ConversationState) -> Option<u8> {
+    let window = super::super::provider::capability::declared(route.protocol, &route.model, None)
+        .context_window?;
+    if window == 0 {
+        return None;
+    }
+    let used: u64 = conversation
+        .usage
+        .values()
+        .map(|record| record.input_tokens + record.output_tokens)
+        .sum();
+    let used_pct = used.saturating_mul(100) / window;
+    Some(100u64.saturating_sub(used_pct).min(100) as u8)
+}
+
+/// Spinner frames for [`activity_line_text`], cycled on a ~120ms cadence --
+/// fast enough to read as motion, slow enough not to flicker at this pane's
+/// own ~150ms tick.
+const ACTIVITY_SPINNER_FRAMES: [&str; 8] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+];
+
+/// Rotating verbs for [`activity_line_text`] -- purely decorative (the same
+/// convention Claude Code's own CLI uses), cycled on a slower ~2.5s cadence
+/// than the spinner so the label is still readable between changes.
+const ACTIVITY_VERBS: [&str; 6] = [
+    "Thinking",
+    "Working",
+    "Puzzling",
+    "Synthesizing",
+    "Composing",
+    "Reticulating",
+];
+
+/// Operator direction (PR #531 follow-up): the activity line shown while a
+/// turn runs -- a spinner frame, a rotating verb, real elapsed time and a
+/// running token total, ending with the interrupt hint. Pure and total:
+/// `elapsed`/`tokens` are the caller's own (`NativePaneRuntime::
+/// activity_line`), so this is directly testable without a live session or
+/// a wall clock.
+pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64) -> String {
+    let millis = elapsed.as_millis() as u64;
+    let spinner = ACTIVITY_SPINNER_FRAMES[(millis / 120) as usize % ACTIVITY_SPINNER_FRAMES.len()];
+    let verb = ACTIVITY_VERBS[(millis / 2_500) as usize % ACTIVITY_VERBS.len()];
+    format!(
+        "{spinner} {verb}\u{2026} ({secs}s \u{b7} \u{2191} {tokens} tokens \u{b7} esc to interrupt)",
+        secs = elapsed.as_secs(),
+    )
+}
+
 /// A live native pane: the one thing in this module that owns a running
 /// session. Everything else it holds is either a pure derivation of that
 /// session's journal ([`ConversationState`]/[`TranscriptView`], refreshed by
@@ -1992,6 +2370,16 @@ pub struct NativePaneRuntime {
     /// degraded session for as long as that session runs, not a one-off
     /// toast.
     notice: Option<String>,
+    /// Operator direction (PR #531 follow-up): when the current turn
+    /// started, for the activity line's elapsed-time reading -- `None`
+    /// while idle. Set the first time `tick()` observes `Busy` for a turn
+    /// and cleared on `Idle`/`Failed`/`Ended`.
+    turn_started_at: Option<std::time::Instant>,
+    /// The repo this pane is running in, for the bottom status line.
+    cwd: PathBuf,
+    /// The checked-out branch, read once at spawn time -- see `git_branch`'s
+    /// own doc comment for why this is not re-read every tick.
+    git_branch: Option<String>,
 }
 
 impl NativePaneRuntime {
@@ -2019,6 +2407,7 @@ impl NativePaneRuntime {
         let transcript =
             cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
         let billing = resolve_billing(&session.route, &spec.repo);
+        let git_branch = git_branch(&spec.repo);
 
         let mut presentation = NativePresentation::default();
         let draft = load_draft(state, &session.handle.short);
@@ -2035,6 +2424,9 @@ impl NativePaneRuntime {
             billing,
             ended: false,
             notice: None,
+            turn_started_at: None,
+            cwd: spec.repo,
+            git_branch,
         })
     }
 
@@ -2047,14 +2439,19 @@ impl NativePaneRuntime {
                 InteractiveProgress::Busy => {
                     self.session_state = NativeSessionState::Running;
                     self.turn_state = Some(NativeTurnState::Requesting);
+                    if self.turn_started_at.is_none() {
+                        self.turn_started_at = Some(std::time::Instant::now());
+                    }
                 }
                 InteractiveProgress::Idle => {
                     self.session_state = NativeSessionState::Idle;
                     self.turn_state = None;
+                    self.turn_started_at = None;
                 }
                 InteractiveProgress::Failed(_) => {
                     self.session_state = NativeSessionState::Idle;
                     self.turn_state = None;
+                    self.turn_started_at = None;
                 }
                 InteractiveProgress::Notice(message) => {
                     self.notice = Some(message);
@@ -2062,6 +2459,7 @@ impl NativePaneRuntime {
                 InteractiveProgress::Ended => {
                     self.ended = true;
                     self.session_state = NativeSessionState::Completed;
+                    self.turn_started_at = None;
                 }
             }
         }
@@ -2121,7 +2519,29 @@ impl NativePaneRuntime {
             blocked: false,
             unread_result: self.presentation.unread,
             notice: self.notice.clone(),
+            activity: self.activity_line(),
+            cwd: self.cwd.display().to_string(),
+            git_branch: self.git_branch.clone(),
+            context_left_pct: context_left_pct(&self.session.route, &self.conversation),
         }
+    }
+
+    /// Operator direction (PR #531 follow-up): the spinner/verb/elapsed/
+    /// token/interrupt-hint line for the activity area, or `None` while
+    /// idle. The token count is an approximation -- the conversation's
+    /// OWN recorded usage so far, not a per-turn count (the journal has no
+    /// "usage recorded since this turn started" read), so it only ever
+    /// grows across turns rather than resetting at each one; documented in
+    /// the design note.
+    fn activity_line(&self) -> Option<String> {
+        let started = self.turn_started_at?;
+        let tokens: u64 = self
+            .conversation
+            .usage
+            .values()
+            .map(|record| record.input_tokens + record.output_tokens)
+            .sum();
+        Some(activity_line_text(started.elapsed(), tokens))
     }
 
     pub fn view(&self) -> (&TranscriptView, &NativePresentation) {
@@ -2145,6 +2565,28 @@ impl NativePaneRuntime {
         let ComposerOutcome::Submitted(text) = outcome else {
             return;
         };
+        // Operator direction (PR #531 follow-up): a `/`-prefixed submission
+        // is a pane-local command, never a turn -- see `apply_slash_
+        // command`'s own doc comment for which ones actually do something
+        // and which are honest stubs. `/status` needs live `StatusFacts`
+        // this method alone can produce, so it stays here rather than in
+        // that pure helper.
+        if text.trim() == "/status" {
+            let facts = self.status_facts();
+            self.notice = Some(format!(
+                "{} \u{b7} {} \u{b7} {}",
+                facts.model,
+                status_label(classify_status(&facts)),
+                facts.billing
+            ));
+            return;
+        }
+        if let Some(notice) = apply_slash_command(&mut self.presentation, &text) {
+            if !notice.is_empty() {
+                self.notice = Some(notice);
+            }
+            return;
+        }
         match classify_submit_intent(&self.status_facts()) {
             SubmitIntent::Immediate => {
                 let _ = self.session.submit(text);
@@ -2211,9 +2653,25 @@ impl NativePaneRuntime {
 /// and the alternate screen.
 ///
 /// **Key contract**, beyond the composer's own (see [`key_to_action`]):
-/// `Ctrl+Q` quits (persisting the draft first); `Ctrl+C` interrupts the
-/// current turn without quitting; `Up`/`Down` scroll the transcript when no
-/// composer action claims them.
+/// `Ctrl+Q` quits immediately (persisting the draft first, kept for
+/// backward compatibility); `Esc` interrupts the current turn without
+/// quitting (operator direction, PR #531 follow-up -- Claude Code's own
+/// convention); `Ctrl+C` no longer interrupts by itself, it only arms a
+/// quit confirmation, and quits on a SECOND `Ctrl+C` within
+/// [`CTRL_C_QUIT_WINDOW`] of the first (see [`ctrl_c_confirms_quit`]);
+/// `Ctrl+R` toggles the most recent tool call's expanded state regardless
+/// of which region has focus (the composer's own `e`/`Enter`-while-
+/// `Transcript`-focused binding still works too); `Shift+Tab` cycles
+/// [`ComposerMode`] (decorative only -- see its own doc comment); `Up`/
+/// `Down` scroll the transcript when no composer action claims them.
+///
+/// Deferred (documented in the design note, not implemented by this
+/// round): an interactive `@` fuzzy file picker (`resolve_file_refs` is
+/// tested and containment-safe but still unwired into this loop, unchanged
+/// from before this round) and a `!`-prefixed shell line through the
+/// process tool (the interactive session has no direct-exec path that
+/// bypasses a model turn today; adding one is an architecture change, not
+/// a rendering/key-contract one).
 pub fn run_native_dashboard(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -2221,6 +2679,7 @@ pub fn run_native_dashboard(
     spec: NativeDashboardSpec,
 ) -> CtxResult<i32> {
     let mut pane = NativePaneRuntime::spawn(cfg, state, env, spec)?;
+    let mut last_ctrl_c: Option<std::time::Instant> = None;
 
     let previous_panic_hook = super::install_panic_hook();
     if let Err(error) = crossterm::terminal::enable_raw_mode() {
@@ -2261,19 +2720,53 @@ pub fn run_native_dashboard(
             match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                     if ctrl && key.code == KeyCode::Char('q') {
                         break 'outer 0;
                     }
-                    if ctrl && key.code == KeyCode::Char('c') {
+                    // Operator direction (PR #531 follow-up): `Esc` owns
+                    // interrupt now; `Ctrl+C` only arms/confirms a quit --
+                    // see `ctrl_c_confirms_quit`'s own doc comment.
+                    if key.code == KeyCode::Esc {
+                        last_ctrl_c = None;
                         pane.interrupt();
                         continue 'outer;
                     }
-                    // Tab swaps which region has focus; every other key's
-                    // meaning depends on that focus, exactly the split the
-                    // composer's own key contract already assumes (Up/Down
-                    // at a logical-line edge mean "browse submit history"
-                    // only when the composer itself has focus -- a
-                    // `Transcript`-focused Up/Down here means "scroll").
+                    if ctrl && key.code == KeyCode::Char('c') {
+                        let now = std::time::Instant::now();
+                        if ctrl_c_confirms_quit(last_ctrl_c, now, CTRL_C_QUIT_WINDOW) {
+                            break 'outer 0;
+                        }
+                        last_ctrl_c = Some(now);
+                        continue 'outer;
+                    }
+                    last_ctrl_c = None;
+                    // `Ctrl+R` toggles the most recent tool call's expanded
+                    // state regardless of focus -- the same action the
+                    // composer's own `e`/`Enter`-while-`Transcript`-focused
+                    // binding below reaches, just reachable from either
+                    // region (matching the "(ctrl+r to expand)" hint
+                    // `render_tool_call` shows on a collapsed result).
+                    if ctrl && key.code == KeyCode::Char('r') {
+                        toggle_most_recent_tool_call(&mut pane);
+                        continue 'outer;
+                    }
+                    // `Shift+Tab` cycles the composer's decorative mode
+                    // label; most terminals report it as `BackTab` rather
+                    // than `Tab` with the shift modifier set, so both are
+                    // accepted.
+                    if key.code == KeyCode::BackTab || (shift && key.code == KeyCode::Tab) {
+                        let presentation = pane.presentation_mut();
+                        presentation.mode = presentation.mode.next();
+                        continue 'outer;
+                    }
+                    // Plain Tab swaps which region has focus; every other
+                    // key's meaning depends on that focus, exactly the
+                    // split the composer's own key contract already
+                    // assumes (Up/Down at a logical-line edge mean "browse
+                    // submit history" only when the composer itself has
+                    // focus -- a `Transcript`-focused Up/Down here means
+                    // "scroll").
                     if key.code == KeyCode::Tab {
                         let presentation = pane.presentation_mut();
                         presentation.focus = match presentation.focus {
@@ -2299,17 +2792,7 @@ pub fn run_native_dashboard(
                             // a minimal binding until a per-item cursor
                             // exists to target an arbitrary one.
                             KeyCode::Char('e') | KeyCode::Enter => {
-                                let key = pane
-                                    .view()
-                                    .0
-                                    .items
-                                    .iter()
-                                    .rev()
-                                    .find_map(|item| item.expand_key())
-                                    .map(str::to_string);
-                                if let Some(key) = key {
-                                    pane.presentation_mut().toggle_expanded(&key);
-                                }
+                                toggle_most_recent_tool_call(&mut pane);
                             }
                             _ => {}
                         }
@@ -2863,6 +3346,10 @@ mod tests {
             blocked,
             unread_result: unread,
             notice: None,
+            activity: None,
+            cwd: "/repo".to_string(),
+            git_branch: Some("main".to_string()),
+            context_left_pct: Some(87),
         }
     }
 
@@ -3313,6 +3800,310 @@ mod tests {
         assert_eq!(composer.draft, "resume here");
         assert_eq!(composer.cursor, composer.draft.len());
         assert_eq!(composer.queued, draft.queued);
+    }
+
+    // -- operator direction (PR #531 follow-up): bullet/tree restyle ------
+
+    #[test]
+    fn render_item_prefixes_assistant_text_with_the_bullet_marker() {
+        let item = TranscriptItem::AssistantText {
+            message_id: "m1".to_string(),
+            text: "reading the file now".to_string(),
+        };
+        let lines = render_item(&item, false);
+        assert_eq!(lines[0].to_plain_string(), "⏺ reading the file now");
+        assert_eq!(lines[0].0[0].tone, Tone::Accent, "the bullet is accented");
+    }
+
+    #[test]
+    fn render_item_prefixes_user_text_with_a_gt_marker() {
+        let item = TranscriptItem::User {
+            message_id: "m1".to_string(),
+            text: "fix the bug".to_string(),
+            steering: false,
+        };
+        let lines = render_item(&item, false);
+        assert_eq!(lines[0].to_plain_string(), "> fix the bug");
+    }
+
+    #[test]
+    fn render_tool_call_shows_a_collapsed_tree_line_with_the_expand_hint() {
+        let item = TranscriptItem::ToolCall {
+            tool_call_id: "tc1".to_string(),
+            message_id: "m1".to_string(),
+            name: "read_file".to_string(),
+            arguments_preview: "{\"path\":\"src/lib.rs\"}".to_string(),
+            outcome: ToolOutcomeView::Text {
+                content: "fn main() {}".to_string(),
+            },
+        };
+        let lines = render_item(&item, false);
+        assert_eq!(
+            lines[0].to_plain_string(),
+            "⏺ read_file({\"path\":\"src/lib.rs\"})"
+        );
+        let tree = lines[1].to_plain_string();
+        assert!(tree.starts_with("  ⎿ "), "got {tree:?}");
+        assert!(
+            tree.ends_with("(ctrl+r to expand)"),
+            "a collapsed result with more to show carries the hint: {tree:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "collapsed shows only the header and tree line"
+        );
+    }
+
+    #[test]
+    fn render_tool_call_drops_the_hint_and_shows_the_body_once_expanded() {
+        let item = TranscriptItem::ToolCall {
+            tool_call_id: "tc1".to_string(),
+            message_id: "m1".to_string(),
+            name: "read_file".to_string(),
+            arguments_preview: String::new(),
+            outcome: ToolOutcomeView::Text {
+                content: "fn main() {}".to_string(),
+            },
+        };
+        let lines = render_item(&item, true);
+        assert!(
+            !lines[1].to_plain_string().contains("ctrl+r"),
+            "an expanded result no longer offers to expand it: {:?}",
+            lines[1].to_plain_string()
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_plain_string().contains("fn main()")),
+            "the full body is shown once expanded"
+        );
+    }
+
+    #[test]
+    fn render_tool_call_offers_no_hint_for_a_pending_or_running_outcome() {
+        for outcome in [ToolOutcomeView::Pending, ToolOutcomeView::Running] {
+            let item = TranscriptItem::ToolCall {
+                tool_call_id: "tc1".to_string(),
+                message_id: "m1".to_string(),
+                name: "run_tests".to_string(),
+                arguments_preview: String::new(),
+                outcome,
+            };
+            let lines = render_item(&item, false);
+            assert!(
+                !lines[1].to_plain_string().contains("ctrl+r"),
+                "nothing more to show yet: {:?}",
+                lines[1].to_plain_string()
+            );
+        }
+    }
+
+    #[test]
+    fn render_diff_lines_numbers_old_and_new_lines_and_colours_added_removed_rows() {
+        let unified = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,4 @@\n context\n-old line\n+new line\n+another new line\n";
+        let lines = render_diff_lines(unified);
+        // header, ---, +++, @@, context(10/10), -(10), +(11), +(12)
+        let texts: Vec<String> = lines.iter().map(StyledLine::to_plain_string).collect();
+        assert!(texts[2].contains("@@ -10,3 +10,4 @@"), "{texts:?}");
+        let context = &texts[3];
+        assert!(
+            context.contains("10") && context.contains("context"),
+            "{context:?}"
+        );
+        let removed = &texts[4];
+        // The hunk's first (context) line is old/new line 10; the removed
+        // line that follows is the NEXT old line, 11 -- it consumes no new
+        // line number at all.
+        assert!(
+            removed.contains("11") && removed.contains("- old line"),
+            "{removed:?}"
+        );
+        assert_eq!(lines[4].0[0].tone, Tone::Err);
+        let added = &texts[5];
+        assert!(
+            added.contains("11") && added.contains("+ new line"),
+            "{added:?}"
+        );
+        assert_eq!(lines[5].0[0].tone, Tone::Ok);
+        let added2 = &texts[6];
+        assert!(
+            added2.contains("12") && added2.contains("+ another new line"),
+            "{added2:?}"
+        );
+    }
+
+    // -- operator direction (PR #531 follow-up): activity line, status ----
+    // -- bar, key contract, slash commands ---------------------------------
+
+    #[test]
+    fn activity_line_text_carries_real_elapsed_seconds_tokens_and_the_interrupt_hint() {
+        let text = activity_line_text(std::time::Duration::from_secs(12), 1_234);
+        assert!(text.contains("12s"), "{text:?}");
+        assert!(text.contains("1234 tokens"), "{text:?}");
+        assert!(text.contains("esc to interrupt"), "{text:?}");
+    }
+
+    #[test]
+    fn activity_line_text_is_a_pure_function_of_elapsed_time() {
+        let a = activity_line_text(std::time::Duration::from_millis(500), 0);
+        let b = activity_line_text(std::time::Duration::from_millis(500), 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn status_line_text_shows_context_left_cwd_and_git_branch() {
+        let mut f = facts(NativeSessionState::Idle, None, false, false);
+        f.context_left_pct = Some(42);
+        f.cwd = "/repo/zirv".to_string();
+        f.git_branch = Some("native/480".to_string());
+        let text = status_line_text(&f);
+        assert!(text.contains("context left 42%"), "{text:?}");
+        assert!(text.contains("/repo/zirv"), "{text:?}");
+        assert!(text.contains("(native/480)"), "{text:?}");
+    }
+
+    #[test]
+    fn status_line_text_omits_unknown_context_and_branch_rather_than_guessing() {
+        let mut f = facts(NativeSessionState::Idle, None, false, false);
+        f.context_left_pct = None;
+        f.git_branch = None;
+        let text = status_line_text(&f);
+        assert!(!text.contains("context left"), "{text:?}");
+        assert!(!text.contains('('), "{text:?}");
+    }
+
+    #[test]
+    fn context_left_pct_estimates_from_recorded_usage_against_the_declared_window() {
+        use crate::commands::ctx::runtime::journal::{UsageId, UsageRecord};
+
+        let route = sample_identity().route;
+        let mut state = empty_state();
+        let window =
+            super::super::super::provider::capability::declared(route.protocol, &route.model, None)
+                .context_window
+                .expect("a real vendor/model pair declares a context window");
+        state.usage.insert(
+            UsageId::new("u1").unwrap(),
+            UsageRecord {
+                id: UsageId::new("u1").unwrap(),
+                input_tokens: window / 4,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: None,
+                provider_request_id: None,
+                estimated: false,
+            },
+        );
+        let pct = context_left_pct(&route, &state).expect("declared window");
+        assert_eq!(pct, 75, "a quarter of the window used leaves 75% free");
+    }
+
+    #[test]
+    fn git_branch_reads_the_checked_out_branch_from_dot_git_head() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/native/480\n").unwrap();
+        assert_eq!(git_branch(dir.path()), Some("native/480".to_string()));
+    }
+
+    #[test]
+    fn git_branch_is_none_for_a_detached_head_or_a_non_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_branch(dir.path()), None, "not a git checkout at all");
+
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git/HEAD"),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_branch(dir.path()),
+            None,
+            "a detached HEAD names no branch"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_confirms_quit_only_within_the_window_of_a_prior_press() {
+        let t0 = std::time::Instant::now();
+        assert!(
+            !ctrl_c_confirms_quit(None, t0, CTRL_C_QUIT_WINDOW),
+            "a first press never confirms by itself"
+        );
+        let soon = t0 + std::time::Duration::from_millis(500);
+        assert!(
+            ctrl_c_confirms_quit(Some(t0), soon, CTRL_C_QUIT_WINDOW),
+            "a second press inside the window confirms"
+        );
+        let late = t0 + CTRL_C_QUIT_WINDOW + std::time::Duration::from_secs(1);
+        assert!(
+            !ctrl_c_confirms_quit(Some(t0), late, CTRL_C_QUIT_WINDOW),
+            "a second press outside the window does not confirm"
+        );
+    }
+
+    #[test]
+    fn composer_mode_cycles_through_all_three_and_back() {
+        let m = ComposerMode::default();
+        assert_eq!(m, ComposerMode::Default);
+        let m = m.next();
+        assert_eq!(m, ComposerMode::AcceptEdits);
+        let m = m.next();
+        assert_eq!(m, ComposerMode::Plan);
+        let m = m.next();
+        assert_eq!(m, ComposerMode::Default, "the cycle wraps back around");
+    }
+
+    #[test]
+    fn composer_hint_line_shows_shortcuts_hint_mode_and_queued_count() {
+        let mut presentation = NativePresentation::default();
+        let hint = composer_hint_line(&presentation);
+        assert!(hint.contains("? for shortcuts"), "{hint:?}");
+        assert!(hint.contains(ComposerMode::Default.label()), "{hint:?}");
+        assert!(!hint.contains("queued"), "nothing queued yet: {hint:?}");
+
+        presentation.composer.queued.push(QueuedInput {
+            text: "later".to_string(),
+            steering: false,
+            queued_at_ms: 0,
+        });
+        presentation.mode = ComposerMode::Plan;
+        let hint = composer_hint_line(&presentation);
+        assert!(hint.contains("1 queued"), "{hint:?}");
+        assert!(hint.contains(ComposerMode::Plan.label()), "{hint:?}");
+    }
+
+    #[test]
+    fn apply_slash_command_clear_drops_the_queued_backlog() {
+        let mut presentation = NativePresentation::default();
+        presentation.composer.queued.push(QueuedInput {
+            text: "later".to_string(),
+            steering: false,
+            queued_at_ms: 0,
+        });
+        let notice = apply_slash_command(&mut presentation, "/clear");
+        assert_eq!(notice, Some(String::new()));
+        assert!(presentation.composer.queued.is_empty());
+    }
+
+    #[test]
+    fn apply_slash_command_help_names_the_key_contract() {
+        let mut presentation = NativePresentation::default();
+        let notice = apply_slash_command(&mut presentation, "/help").expect("recognised");
+        assert!(notice.contains("Esc interrupt"), "{notice:?}");
+    }
+
+    #[test]
+    fn apply_slash_command_ignores_unrecognised_and_ordinary_text() {
+        let mut presentation = NativePresentation::default();
+        assert_eq!(apply_slash_command(&mut presentation, "/nope"), None);
+        assert_eq!(
+            apply_slash_command(&mut presentation, "not a command"),
+            None
+        );
     }
 
     // -- markdown / wrapping -------------------------------------------

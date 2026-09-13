@@ -1777,9 +1777,18 @@ zirv chat --runtime native --route work-sonnet
 `--runtime native` refuses every wrapped-harness-only flag (`--agent`,
 `--simple`, `--resume`, `--pin-harness`, a trailing `extra` argv) rather than
 silently ignoring them, and refuses without an interactive terminal on both
-stdin and stdout. The pane's status line shows the actual model, route,
-runtime and billing class, and one of seven states: generating, executing,
-waiting, blocked, cancelled, failed, or completed with an unread result.
+stdin and stdout. The transcript renders Claude Code-style: assistant text
+and tool calls as `⏺` bullets, each tool result as an indented `⎿` line
+("(ctrl+r to expand)" while collapsed), user turns as `>` lines, and diffs
+with an old/new line-number gutter. While a turn runs, an activity line
+(spinner, a rotating verb, real elapsed time, a running token count, "esc to
+interrupt") appears at the tail of the transcript. The bottom status line
+shows the actual model, route, runtime and billing class, one of seven
+states (generating, executing, waiting, blocked, cancelled, failed, or
+completed with an unread result), an estimated "context left N%" (recorded
+usage against the route's declared context window — not the compaction
+budget's own accounting), the repo path and, when known, the checked-out
+git branch.
 
 **Composer key contract:** `Enter` submits (or, mid-turn, steers — written
 straight to the journal and picked up at the next turn boundary, the same
@@ -1787,11 +1796,22 @@ mechanism `NativeLoop::queued_input` already re-polls between turns; a
 blocked/not-yet-ready submission is queued instead, and queued input is
 **never** treated as an approval answer). `Shift+Enter`/`Alt+Enter` insert a
 newline. `Up`/`Down` browse submit history only at the first/last line of the
-draft. `Tab` swaps focus between the composer and the transcript, where
-`Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` scroll (scrolling up disengages
-auto-follow; it re-engages at the bottom) and `e`/`Enter` expands or collapses
-the most recent tool call. `Ctrl+C` interrupts the current turn without
-quitting; `Ctrl+Q` persists the draft and quits.
+draft. `Esc` interrupts the current turn without quitting. `Ctrl+C` no
+longer interrupts by itself — one press arms a quit confirmation, and a
+second `Ctrl+C` within 2 seconds of the first quits; `Ctrl+Q` still quits
+immediately (persisting the draft first). `Ctrl+R` toggles the most
+recently rendered tool call's expanded state from either region. `Shift+Tab`
+cycles a composer mode label (`default`/`accept-edits`/`plan`) shown on the
+hint line — **decorative only**: no submit path reads it back to change
+approval or write behaviour yet. `Tab` swaps focus between the composer and
+the transcript, where `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` scroll
+(scrolling up disengages auto-follow; it re-engages at the bottom) and
+`e`/`Enter` expands or collapses the most recent tool call. A `/`-prefixed
+submission is a pane-local command, never a turn: `/clear` drops the queued
+backlog, `/help` and `/status` report the key contract and the live session
+facts, `/compact` is an honest inert stub. `@` file references
+(`resolve_file_refs`, containment-checked against the workdir) and a
+`!`-prefixed shell line are not wired into this loop yet.
 
 This is a separate, single-pane dashboard mode from the wrapped-harness
 dashboard `zirv chat` opens without `--runtime native` — it does not (yet)
