@@ -55,7 +55,8 @@ use super::native_pane::{QueuedInput, ScrollState, StyledLine, StyledSpan};
 /// Where a fact came from. The whole point of carrying this alongside a
 /// value is that "we measured 0" and "we have no idea" must never render the
 /// same way -- see [`Measure::text`] and [`AgentRow::model_text`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Provenance {
     /// The provider (or the record) told us this value.
     Measured,
@@ -80,7 +81,8 @@ impl Provenance {
 /// separate from `Blocked`: both stop the worker, but only one of them is
 /// waiting on the OPERATOR, and conflating them is exactly how a fleet
 /// wedges unnoticed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum AgentState {
     /// Waiting for the operator to answer an approval. Ranks first.
     ApprovalNeeded,
@@ -149,7 +151,7 @@ impl AgentState {
 
 /// Bounded access to a finished worker's result -- a pointer, never the
 /// content. Opening it is [`build_inspection`]'s job.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct ResultRef {
     pub delegation: String,
     pub path: Option<PathBuf>,
@@ -161,7 +163,7 @@ pub struct ResultRef {
 /// One agent in the overview. Everything here comes from a durable record:
 /// the coordinator graph (role/task/state), the delegation receipt (runtime,
 /// worktree, result, ownership) or the seat (model, generation, phase).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct AgentRow {
     /// The delegation id for a worker, `seat:<short>` for the operator's own
     /// seat, `task:<id>` for a planned task nobody has taken yet.
@@ -760,7 +762,7 @@ fn bounded_summary_lines(width: usize) -> usize {
 
 /// One number with its provenance. `value: None` renders as "unknown", never
 /// as `0` -- the distinction criterion 5 and issue #490 item 3 both call for.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Measure {
     pub label: String,
     pub value: Option<u64>,
@@ -788,7 +790,7 @@ impl Measure {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct RouteRow {
     pub route: String,
     pub ready: bool,
@@ -801,7 +803,7 @@ pub struct RouteRow {
     pub provenance: Provenance,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct SeatHealth {
     pub active: usize,
     pub parked: usize,
@@ -809,7 +811,7 @@ pub struct SeatHealth {
     pub billing: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct UsageStrip {
     pub measures: Vec<Measure>,
     pub routes: Vec<RouteRow>,
@@ -989,7 +991,8 @@ fn route_rows_for(width: usize) -> usize {
 // Item 4: compaction / rollover / reconnect notices, and continuity
 // =========================================================================
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NoticeKind {
     Compacted,
     Rollover,
@@ -1019,7 +1022,7 @@ impl NoticeKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Notice {
     pub kind: NoticeKind,
     pub headline: String,
@@ -1365,6 +1368,66 @@ pub const APPROVAL_PREVIEW_LINES: usize = 8;
 impl ApprovalRequest {
     pub fn scope_text(&self) -> String {
         format!("{}: {}", self.tool, self.scope.text())
+    }
+
+    /// Builds the dialog's request from the enforcement broker's OWN request
+    /// -- the one whose `scope_digest` the grant is signed against. Nothing
+    /// here re-derives or widens the scope: the tool name and the paths come
+    /// straight off `ExecutionAction`/`resolved_paths`, so the dialog can
+    /// never describe less authority than the grant actually carries.
+    /// `widen_to` is what the operator's "don't ask again" would cover,
+    /// supplied by the caller (normally the session's own workdir) and `None`
+    /// when no such standing grant is offered at all.
+    pub fn from_enforcement(
+        request: &super::super::runtime::enforcement::ApprovalRequest,
+        actor: impl Into<String>,
+        session: impl Into<String>,
+        widen_to: Option<PathBuf>,
+        preview: Vec<String>,
+    ) -> Self {
+        use super::super::runtime::enforcement::ExecutionAction;
+        let (tool, verb) = match &request.action {
+            ExecutionAction::ReadFile { .. } => ("Read", "read"),
+            ExecutionAction::WriteFile { .. } => ("Write", "write"),
+            ExecutionAction::Process { .. } => ("Bash", "run"),
+            ExecutionAction::ProcessControl { .. } => ("Process", "control"),
+            ExecutionAction::OutputRead { .. } => ("Output", "read"),
+            ExecutionAction::Knowledge { write: true, .. } => ("Knowledge", "write"),
+            ExecutionAction::Knowledge { .. } => ("Knowledge", "read"),
+            ExecutionAction::Network { .. } => ("Network", "reach"),
+            ExecutionAction::Mcp { .. } => ("Mcp", "call"),
+            ExecutionAction::ArtifactRead { .. } => ("Artifact", "read"),
+            ExecutionAction::ArtifactWrite { .. } => ("Artifact", "write"),
+            ExecutionAction::Delegate { .. } => ("Task", "delegate"),
+        };
+        let detail = match &request.action {
+            ExecutionAction::Process { invocation, .. } => format!("{invocation:?}"),
+            ExecutionAction::Network { target } => format!("{target:?}"),
+            ExecutionAction::Mcp { server, tool, .. } => format!("{server}/{tool}"),
+            ExecutionAction::Delegate { role, task } => format!("{role}: {task}"),
+            ExecutionAction::Knowledge {
+                service, operation, ..
+            } => format!("{service}.{operation}"),
+            _ => String::new(),
+        };
+        Self {
+            id: request.scope_digest.clone(),
+            session: session.into(),
+            tool: tool.to_string(),
+            scope: Scope {
+                verb: verb.to_string(),
+                paths: request.resolved_paths.clone(),
+                directory: widen_to,
+            },
+            actor: actor.into(),
+            reason: if detail.is_empty() {
+                format!("policy {}", request.policy_fingerprint)
+            } else {
+                detail
+            },
+            preview,
+            asked_at: request.created_at,
+        }
     }
 }
 
@@ -2082,6 +2145,52 @@ pub fn fanout_plan(sessions: usize, budget: &Budget) -> FanoutPlan {
     FanoutPlan {
         polled,
         deferred: sessions - polled,
+    }
+}
+
+// =========================================================================
+// Item 6: headless parity
+// =========================================================================
+
+/// The truthful limitations item 6 demands be stated rather than papered
+/// over. Each line names a fact the TUI and this report BOTH cannot know, so
+/// a headless consumer is never misled into treating a gap as a zero.
+pub const LEGACY_LIMITATIONS: &[&str] = &[
+    "a wrapped (PTY) adapter reports the model it was configured with, not the one the provider billed: its model provenance is 'estimated'",
+    "approval state is known only for sessions this process owns or can reach over the runtime protocol; a wrapped adapter's own in-terminal prompt is invisible here",
+    "a route with no usage signal is reported as headroom 'unknown', never as 0%",
+    "notices are this process's own observations: a rollover that happened while no dashboard was running is in the seat/rollover records, not in this list",
+];
+
+/// Exactly the facts the TUI renders, as one serializable document -- the
+/// same `Overview`, `UsageStrip` and `Notice` values the panes are drawn
+/// from, not a parallel re-derivation. That is what makes "headless status
+/// agrees with the TUI" a structural property rather than a promise.
+#[derive(Debug, serde::Serialize)]
+pub struct HeadlessAgents<'a> {
+    pub taken_at: u64,
+    pub needs_operator: usize,
+    pub selected: Option<&'a str>,
+    pub agents: &'a [AgentRow],
+    pub usage: &'a UsageStrip,
+    pub notices: Vec<&'a Notice>,
+    pub limitations: &'static [&'static str],
+}
+
+pub fn headless_report<'a>(
+    overview: &'a Overview,
+    usage: &'a UsageStrip,
+    notices: &'a NoticeLog,
+    taken_at: u64,
+) -> HeadlessAgents<'a> {
+    HeadlessAgents {
+        taken_at,
+        needs_operator: overview.needs_operator(),
+        selected: overview.selected().map(|row| row.id.as_str()),
+        agents: &overview.rows,
+        usage,
+        notices: notices.recent(NOTICE_LOG_CAP),
+        limitations: LEGACY_LIMITATIONS,
     }
 }
 
@@ -3056,6 +3165,91 @@ mod tests {
         assert_eq!(bounded.items.len(), budget.max_rows);
         let lines = bound_lines(overview.lines(120), budget.max_lines);
         assert!(lines.len() <= budget.max_lines + 1);
+    }
+
+    // ---------------- item 5/6: the broker bridge and headless parity ----
+
+    #[test]
+    fn the_dialog_scope_comes_from_the_brokers_own_request() {
+        use crate::commands::ctx::runtime::enforcement::{
+            ApprovalRequest as BrokerRequest, ExecutionAction, ExecutionIdentity,
+        };
+        let broker = BrokerRequest {
+            scope_digest: "digest-1".to_string(),
+            identity: ExecutionIdentity {
+                session: "sess-w1".to_string(),
+                short: "s7".to_string(),
+                generation: 2,
+                role: "implementer".to_string(),
+                task: Some("T2".to_string()),
+            },
+            action: ExecutionAction::WriteFile {
+                path: PathBuf::from("/repo/wt/src/journal.rs"),
+            },
+            policy_fingerprint: "pf".to_string(),
+            claims_fingerprint: "cf".to_string(),
+            resolved_paths: vec![PathBuf::from("/repo/wt/src/journal.rs")],
+            execution_scope_fingerprint: "ef".to_string(),
+            created_at: 140,
+        };
+        let request = ApprovalRequest::from_enforcement(
+            &broker,
+            "w1 implementer",
+            "sess-w1",
+            Some(PathBuf::from("/repo/wt")),
+            vec!["+ let cursor = committed;".to_string()],
+        );
+        assert_eq!(request.id, "digest-1");
+        assert_eq!(request.tool, "Write");
+        // The dialog's paths are the broker's RESOLVED paths, verbatim.
+        assert_eq!(request.scope.paths, broker.resolved_paths);
+        let dialog = ApprovalDialog::new(request);
+        let text = dialog
+            .lines(100)
+            .iter()
+            .map(StyledLine::to_plain_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("/repo/wt/src/journal.rs"));
+    }
+
+    #[test]
+    fn the_headless_report_carries_the_same_values_the_panes_render() {
+        let overview = build_overview(
+            &coordinator::Coordinator::default(),
+            &[delegation_fixture("w1", delegation::Phase::Running)],
+            &[],
+            &[approval_fixture("sess-w1")],
+            300,
+        );
+        let usage = build_usage(&pool_fixture(), "subscription");
+        let mut log = NoticeLog::new(NOTICE_LOG_CAP);
+        log.push(notice_compaction(142, 8100, Some("cp-19")));
+        let report = headless_report(&overview, &usage, &log, 300);
+
+        assert_eq!(report.needs_operator, overview.needs_operator());
+        assert_eq!(report.agents.len(), overview.rows.len());
+        let json = serde_json::to_value(&report).expect("serialize");
+        // The facts the overview row renders are all addressable headlessly.
+        let agent = &json["agents"][0];
+        assert_eq!(agent["state"], "approval-needed");
+        assert!(agent["pending_decision"].as_str().is_some_and(|text| {
+            text.contains("src/journal.rs") && text.contains("/repo/wt")
+        }));
+        assert_eq!(agent["model_provenance"], "measured");
+        assert!(json["usage"]["routes"].as_array().is_some_and(|routes| {
+            routes
+                .iter()
+                .any(|route| route["reason"] == "429 cooldown 4m")
+        }));
+        assert!(!json["limitations"].as_array().expect("limitations").is_empty());
+    }
+
+    #[test]
+    fn the_headless_report_states_its_legacy_limitations() {
+        let joined = LEGACY_LIMITATIONS.join(" ");
+        assert!(joined.contains("wrapped"));
+        assert!(joined.contains("never as 0%"));
     }
 
     #[test]
