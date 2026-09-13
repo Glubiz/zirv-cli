@@ -200,7 +200,6 @@ impl Record {
     pub fn identity(&self) -> String {
         delivery_identity(&self.handle.delegation, self.handle.attempt, self.revision)
     }
-
 }
 
 /// `<delegation>:<attempt>:<revision>`. The only identity a consumer
@@ -242,10 +241,7 @@ pub fn save(state: &StateDir, repo: &Path, record: &Record) -> CtxResult<()> {
     validate_id(&record.handle.delegation)?;
     create_private_dir_all(&dir(state, repo))?;
     let json = serde_json::to_string_pretty(record)?;
-    write_private(
-        &record_path(state, repo, &record.handle.delegation),
-        &json,
-    )?;
+    write_private(&record_path(state, repo, &record.handle.delegation), &json)?;
     Ok(())
 }
 
@@ -369,6 +365,13 @@ pub struct Publication {
 /// already in `published` neither bumps the revision again nor sends a second
 /// mail. A caller that crashed between the durable write and the mail calls
 /// this again and gets the mail without a second outcome.
+/// Nine arguments, over clippy's default seven: each is an independent fact
+/// about one publication (where state lives, which repository, the operator
+/// config the mail service needs, which delegation, and the four terminal
+/// facts plus the clock). Bundling them into a struct would move the same
+/// list one level down without making any call site clearer -- the same
+/// reasoning `agent::append_execution_segments` already records.
+#[allow(clippy::too_many_arguments)]
 pub fn publish_terminal(
     state: &StateDir,
     repo: &Path,
@@ -492,12 +495,17 @@ pub fn consume_delivery(
 /// What [`send`] did with one message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dispatch {
-    Delivered { path: PathBuf },
+    Delivered {
+        path: PathBuf,
+    },
     /// The target session has an attention latch open -- a permission dialog,
     /// a question, a quota park. The message is durably queued and
     /// [`drain_queued`] retries it at the next boundary where the latch is
     /// gone. It is NEVER typed at the dialog (issue #468).
-    Queued { id: String, reason: String },
+    Queued {
+        id: String,
+        reason: String,
+    },
 }
 
 /// Directed message to a delegation's current worker, through the shared mail
@@ -1031,7 +1039,10 @@ impl WorkerLauncher for RecordingLauncher {
             exit_code: self.exit_code,
             session: "fixture-worker".to_string(),
             short: "fixture1".to_string(),
-            receipt: Some(format!("{{\"state\":\"reported\",\"exit_code\":{}}}", self.exit_code)),
+            receipt: Some(format!(
+                "{{\"state\":\"reported\",\"exit_code\":{}}}",
+                self.exit_code
+            )),
         })
     }
 }
@@ -1043,6 +1054,9 @@ impl WorkerLauncher for RecordingLauncher {
 /// started -- the opposite order would lose it. The terminal outcome is then
 /// published through [`publish_terminal`], which is where the delivery
 /// identity a consumer deduplicates on comes from.
+/// Eight arguments, over clippy's default seven, for the same reason
+/// [`publish_terminal`] documents just above.
+#[allow(clippy::too_many_arguments)]
 pub fn delegate(
     state: &StateDir,
     repo: &Path,
@@ -1190,8 +1204,14 @@ mod tests {
     #[test]
     fn duplicate_transport_delivery_is_idempotent_at_the_consumer() {
         let (_dir, state, repo, cfg) = fixture();
-        record_launch(&state, &repo, handle("deleg3", RuntimeKind::Native), None, 1)
-            .expect("launch");
+        record_launch(
+            &state,
+            &repo,
+            handle("deleg3", RuntimeKind::Native),
+            None,
+            1,
+        )
+        .expect("launch");
         let publication = publish_terminal(
             &state,
             &repo,
@@ -1204,9 +1224,7 @@ mod tests {
             2,
         )
         .expect("publish");
-        assert!(
-            consume_delivery(&state, &repo, "deleg3", &publication.identity).expect("consume")
-        );
+        assert!(consume_delivery(&state, &repo, "deleg3", &publication.identity).expect("consume"));
         assert!(
             !consume_delivery(&state, &repo, "deleg3", &publication.identity).expect("replay"),
             "the same delivery identity must be consumed only once"
@@ -1216,8 +1234,14 @@ mod tests {
     #[test]
     fn a_later_revision_is_a_new_delivery_not_a_duplicate() {
         let (_dir, state, repo, cfg) = fixture();
-        record_launch(&state, &repo, handle("deleg4", RuntimeKind::Native), None, 1)
-            .expect("launch");
+        record_launch(
+            &state,
+            &repo,
+            handle("deleg4", RuntimeKind::Native),
+            None,
+            1,
+        )
+        .expect("launch");
         let first = publish_terminal(
             &state,
             &repo,
@@ -1250,8 +1274,14 @@ mod tests {
     #[test]
     fn a_crash_between_persistence_and_delivery_republishes_the_same_outcome() {
         let (_dir, state, repo, cfg) = fixture();
-        record_launch(&state, &repo, handle("deleg5", RuntimeKind::Native), None, 1)
-            .expect("launch");
+        record_launch(
+            &state,
+            &repo,
+            handle("deleg5", RuntimeKind::Native),
+            None,
+            1,
+        )
+        .expect("launch");
         // Model the crash: the outcome is durable, but `published` never got
         // the identity because the process died before the mail step.
         let mut record = load(&state, &repo, "deleg5").expect("record");
@@ -1283,8 +1313,14 @@ mod tests {
     #[test]
     fn a_message_blocked_by_an_open_approval_is_queued_then_delivered_once() {
         let (_dir, state, repo, cfg) = fixture();
-        record_launch(&state, &repo, handle("deleg6", RuntimeKind::Native), None, 1)
-            .expect("launch");
+        record_launch(
+            &state,
+            &repo,
+            handle("deleg6", RuntimeKind::Native),
+            None,
+            1,
+        )
+        .expect("launch");
         let short = "deleg6short";
         super::super::attention::record(
             &state,
@@ -1339,10 +1375,22 @@ mod tests {
     #[test]
     fn follow_up_targets_the_original_delegation_and_never_a_recent_session() {
         let (_dir, state, repo, cfg) = fixture();
-        record_launch(&state, &repo, handle("deleg7", RuntimeKind::Native), None, 1)
-            .expect("launch");
-        record_launch(&state, &repo, handle("deleg8", RuntimeKind::Native), None, 9)
-            .expect("launch");
+        record_launch(
+            &state,
+            &repo,
+            handle("deleg7", RuntimeKind::Native),
+            None,
+            1,
+        )
+        .expect("launch");
+        record_launch(
+            &state,
+            &repo,
+            handle("deleg8", RuntimeKind::Native),
+            None,
+            9,
+        )
+        .expect("launch");
         publish_terminal(
             &state,
             &repo,

@@ -813,9 +813,8 @@ impl NativeToolClient {
         limits: ToolLimits,
     ) -> Self {
         let processes = ProcessManager::new(state.clone(), repo.clone(), limits.process.clone());
-        let launcher = Box::new(crate::commands::ctx::delegation::AgentLauncher {
-            repo: repo.clone(),
-        });
+        let launcher =
+            Box::new(crate::commands::ctx::delegation::AgentLauncher { repo: repo.clone() });
         Self {
             registry: ToolRegistry::native(),
             broker,
@@ -2250,7 +2249,11 @@ mod tests {
     fn follow_up_interrupt_and_close_all_address_the_original_delegation() {
         // Acceptance criteria (d) and (e), through the tools.
         let mut fixture = delegation_fixture(0);
-        let handle = handle_from(call(&mut fixture.client, DELEGATE, json!({"brief": "look"})));
+        let handle = handle_from(call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief": "look"}),
+        ));
 
         let follow_up = call(
             &mut fixture.client,
@@ -2344,4 +2347,3 @@ mod tests {
         );
     }
 }
-
