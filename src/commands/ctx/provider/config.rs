@@ -51,6 +51,10 @@ pub struct AccountConfig {
     pub credential: Option<CredentialRef>,
     pub billing: BillingClass,
     pub pool: Option<BillingPoolId>,
+    /// Required, and only meaningful, for the `google-vertex` profile: Vertex
+    /// AI addresses a model by project and location, not by a bare API key.
+    pub project: Option<String>,
+    pub location: Option<String>,
 }
 
 impl Default for AccountConfig {
@@ -60,6 +64,8 @@ impl Default for AccountConfig {
             credential: None,
             billing: BillingClass::Api,
             pool: None,
+            project: None,
+            location: None,
         }
     }
 }
@@ -287,6 +293,29 @@ impl NativeConfig {
             {
                 return Err(format!(
                     "{}: `account.{id}.credential` is required for provider `{}`",
+                    path.display(),
+                    account.provider
+                )
+                .into());
+            }
+            if spec.id == "google-vertex" {
+                if account.project.as_deref().is_none_or(str::is_empty) {
+                    return Err(format!(
+                        "{}: `account.{id}.project` is required for provider `google-vertex`",
+                        path.display()
+                    )
+                    .into());
+                }
+                if account.location.as_deref().is_none_or(str::is_empty) {
+                    return Err(format!(
+                        "{}: `account.{id}.location` is required for provider `google-vertex`",
+                        path.display()
+                    )
+                    .into());
+                }
+            } else if account.project.is_some() || account.location.is_some() {
+                return Err(format!(
+                    "{}: `account.{id}.project`/`location` are forbidden because provider `{}` is not google-vertex",
                     path.display(),
                     account.provider
                 )
@@ -530,15 +559,70 @@ mod tests {
 
     #[test]
     fn planned_provider_route_names_its_roadmap_step() {
+        // aws-bedrock (N13, #482) is still the generic "route uses a planned
+        // provider" case now that google-vertex (N12, #481) is native.
         let home = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(home.path());
         let repo = repo();
         write(
             &NativeConfig::operator_path(home.path()),
-            "schema=1\n[account.work]\nprovider='google-vertex'\ncredential='env:KEY'\n[route.work]\naccount='work'\nmodel='gemini-2.5-pro'\n",
+            "schema=1\n[endpoint.bedrock]\nprovider='aws-bedrock'\nbase_url='https://bedrock-runtime.us-east-1.amazonaws.com'\n[account.work]\nprovider='aws-bedrock'\ncredential='env:KEY'\n[route.work]\naccount='work'\nendpoint='bedrock'\nmodel='claude-sonnet-5'\n",
         );
         let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
-        assert!(error.to_string().contains("N12 (#481)"), "got {error}");
+        assert!(error.to_string().contains("N13 (#482)"), "got {error}");
+    }
+
+    #[test]
+    fn google_vertex_requires_project_and_location() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        let path = NativeConfig::operator_path(home.path());
+        write(
+            &path,
+            "schema=1\n[endpoint.vertex]\nprovider='google-vertex'\nbase_url='https://us-central1-aiplatform.googleapis.com'\n[account.work]\nprovider='google-vertex'\ncredential='env:VERTEX_TOKEN'\n[route.work]\naccount='work'\nendpoint='vertex'\nmodel='gemini-3.1-pro-preview'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`account.work.project`"),
+            "got {error}"
+        );
+
+        write(
+            &path,
+            "schema=1\n[endpoint.vertex]\nprovider='google-vertex'\nbase_url='https://us-central1-aiplatform.googleapis.com'\n[account.work]\nprovider='google-vertex'\ncredential='env:VERTEX_TOKEN'\nproject='proj-1'\n[route.work]\naccount='work'\nendpoint='vertex'\nmodel='gemini-3.1-pro-preview'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`account.work.location`"),
+            "got {error}"
+        );
+
+        write(
+            &path,
+            "schema=1\n[endpoint.vertex]\nprovider='google-vertex'\nbase_url='https://us-central1-aiplatform.googleapis.com'\n[account.work]\nprovider='google-vertex'\ncredential='env:VERTEX_TOKEN'\nproject='proj-1'\nlocation='us-central1'\n[route.work]\naccount='work'\nendpoint='vertex'\nmodel='gemini-3.1-pro-preview'\n",
+        );
+        let cfg = NativeConfig::load(home.path(), repo.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.accounts
+                .get(&AccountId::new("work").unwrap())
+                .unwrap()
+                .project
+                .as_deref(),
+            Some("proj-1")
+        );
+
+        write(
+            &path,
+            "schema=1\n[account.plain]\nprovider='anthropic'\ncredential='env:KEY'\nproject='proj-1'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("forbidden because provider"),
+            "got {error}"
+        );
     }
 
     #[test]

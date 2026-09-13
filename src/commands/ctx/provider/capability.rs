@@ -103,11 +103,18 @@ pub fn declared(protocol: Protocol, model: &ModelId) -> ModelCapabilities {
             capabilities.reasoning_controls = Capability::declared(true);
             capabilities.continuation = Capability::declared(true);
         }
-        Protocol::GoogleGenerativeAi if id.starts_with("gemini-") => {
+        Protocol::GoogleGenerativeAi | Protocol::GoogleVertex if id.starts_with("gemini-") => {
             capabilities.tools = Capability::declared(true);
             capabilities.streaming = Capability::declared(true);
             capabilities.vision = Capability::declared(true);
             capabilities.structured_output = Capability::declared(true);
+            capabilities.prompt_caching = Capability::declared(false);
+            // Thinking controls and thought-signature continuation are
+            // declared only for the 2.5+ family that actually emits them;
+            // see `google::thinking_supported`.
+            let thinking_family = id.starts_with("gemini-2.5") || id.starts_with("gemini-3");
+            capabilities.reasoning_controls = Capability::declared(thinking_family);
+            capabilities.continuation = Capability::declared(thinking_family);
         }
         Protocol::OpenAiChatCompatible => {
             capabilities.streaming = Capability::declared(true);

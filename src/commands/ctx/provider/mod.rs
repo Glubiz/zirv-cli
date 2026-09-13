@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod capability;
 pub mod config;
 pub mod credential;
+pub mod google;
 pub mod inventory;
 pub mod openai;
 pub mod probe;
@@ -238,7 +239,7 @@ pub static PROVIDERS: &[ProviderSpec] = &[
             extra_headers: &[],
         },
         models_list_path: None,
-        support: Support::Planned("N12 (#481)"),
+        support: Support::Native,
         entitlement_note: SUBSCRIPTION_NOTE,
     },
     ProviderSpec {
