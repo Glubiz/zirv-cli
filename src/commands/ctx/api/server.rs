@@ -196,8 +196,12 @@ pub trait NativeHost: Send + Sync + std::fmt::Debug {
         outcome: TaskOutcome,
         receipt: &Value,
     ) -> Result<bool, ApiError>;
-    fn history(&self, session_id: &str, after: u64, limit: usize)
-    -> Result<NativeHistory, ApiError>;
+    fn history(
+        &self,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<NativeHistory, ApiError>;
     fn journal(&self, session_id: &str, after: u64, limit: usize) -> Result<NativePage, ApiError>;
     fn attach(
         &self,
@@ -865,11 +869,7 @@ impl ApiServer {
         // a session -- `session.detach` and a dropped connection never reach
         // it, which is what "client disconnection never terminates an agent"
         // means in code rather than in prose.
-        match (
-            self.native_owner(&facts.session_id),
-            self.host(),
-            handle,
-        ) {
+        match (self.native_owner(&facts.session_id), self.host(), handle) {
             // Issue #489: a native conversation ends through its own host, so
             // its journal is completed and its registry record released by the
             // same code that filed them.
@@ -3004,11 +3004,9 @@ mod tests {
                     duplicate: true,
                 });
             }
-            state.inputs.push((
-                input.to_string(),
-                steering,
-                idempotency.map(str::to_string),
-            ));
+            state
+                .inputs
+                .push((input.to_string(), steering, idempotency.map(str::to_string)));
             Ok(InputAck {
                 message_id: idempotency
                     .map(|key| format!("idem-{key}"))
@@ -3256,7 +3254,11 @@ mod tests {
         assert_eq!(value["interrupted"], json!(true));
         assert_eq!(native.lock().interrupted, 1);
         assert!(native.lock().stopped.is_empty(), "interrupt is not stop");
-        let get = result(&call(&server, Method::SessionGet, json!({"session_id": id})));
+        let get = result(&call(
+            &server,
+            Method::SessionGet,
+            json!({"session_id": id}),
+        ));
         assert_eq!(get["session"]["state"], json!("idle"));
 
         let _ = call(&server, Method::SessionStop, json!({"session_id": id}));

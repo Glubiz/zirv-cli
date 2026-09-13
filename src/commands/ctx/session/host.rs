@@ -609,7 +609,14 @@ impl RuntimeHost {
                 );
             } else if verb == sessions::Verb::Chat {
                 super::super::dash::advise_one_pane(
-                    &mut injector, &id, &self.state, &slug, &agent, &short, advised, errors,
+                    &mut injector,
+                    &id,
+                    &self.state,
+                    &slug,
+                    &agent,
+                    &short,
+                    advised,
+                    errors,
                 );
             }
         }

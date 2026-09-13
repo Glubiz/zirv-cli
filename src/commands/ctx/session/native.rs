@@ -204,9 +204,7 @@ impl NativeEnvironment for ProviderEnvironment {
             &turn.cwd,
         )
         .ok()
-        .map(|permit| {
-            Box::new(permit) as Box<dyn super::super::runtime::enforcement::WriterLease>
-        });
+        .map(|permit| Box::new(permit) as Box<dyn super::super::runtime::enforcement::WriterLease>);
         let mut hosted = HostedTurn {
             repo: &turn.cwd,
             session: &session,
@@ -540,11 +538,7 @@ impl NativeSessions {
             let journal = backend
                 .journal_mut()
                 .ok_or("native runtime: the journal was not attached")?;
-            resume_journal(
-                journal,
-                &session,
-                state::now_secs().saturating_mul(1000),
-            )?
+            resume_journal(journal, &session, state::now_secs().saturating_mul(1000))?
         };
         let handle = SessionHandle {
             runtime: RuntimeKind::Native,
@@ -561,11 +555,7 @@ impl NativeSessions {
         self.backend().adopt(&handle, session.clone())?;
         let cwd = restore_cwd(entry, &std::env::current_dir()?);
         let record = self.register(&handle, &entry.role, &cwd);
-        let unknown: Vec<String> = resumed
-            .reconciled
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let unknown: Vec<String> = resumed.reconciled.iter().map(ToString::to_string).collect();
         self.lock().insert(
             entry.session_id.clone(),
             NativeSession {
@@ -791,18 +781,16 @@ impl NativeHost for NativeSessions {
         note: Option<&str>,
     ) -> Result<bool, ApiError> {
         let journal_session = self.with_session(session_id, |session| {
-            session
-                .approvals
-                .insert(request_id.to_string(), decision);
+            session.approvals.insert(request_id.to_string(), decision);
             Ok(session.journal_session.clone())
         })?;
         // Durable as well as in memory: an approval is an authority decision,
         // and an authority decision that existed only in a process's memory
         // would be unauditable the moment that process went away.
         let mut backend = self.backend();
-        let journal = backend.journal_mut().ok_or_else(|| {
-            ApiError::new(ErrorCode::Internal, "the journal was not attached")
-        })?;
+        let journal = backend
+            .journal_mut()
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the journal was not attached"))?;
         let task = TaskId::new(format!("approval-{request_id}"))
             .map_err(|error| ApiError::new(ErrorCode::InvalidParams, error.to_string()))?;
         let identity = journal
@@ -840,9 +828,9 @@ impl NativeHost for NativeSessions {
         let journal_session =
             self.with_session(session_id, |session| Ok(session.journal_session.clone()))?;
         let mut backend = self.backend();
-        let journal = backend.journal_mut().ok_or_else(|| {
-            ApiError::new(ErrorCode::Internal, "the journal was not attached")
-        })?;
+        let journal = backend
+            .journal_mut()
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the journal was not attached"))?;
         let identity = journal
             .session(&journal_session)
             .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
@@ -879,10 +867,7 @@ impl NativeHost for NativeSessions {
             .sequence_bounds(&journal_session)
             .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
         let entries = history_entries(&state, after, limit);
-        let cursor = entries
-            .last()
-            .map(|entry| entry.sequence)
-            .unwrap_or(after);
+        let cursor = entries.last().map(|entry| entry.sequence).unwrap_or(after);
         Ok(NativeHistory {
             session_id: session_id.to_string(),
             generation: state.identity.generation,
@@ -1010,10 +995,7 @@ impl NativeHost for NativeSessions {
             // this, and neither does the service's own shutdown unless the
             // operator asked for `--stop-sessions`.
             session.guard.release();
-            (
-                session.journal_session.clone(),
-                session.handle.generation,
-            )
+            (session.journal_session.clone(), session.handle.generation)
         };
         {
             let mut backend = self.backend();
@@ -1259,10 +1241,9 @@ fn backend_error(error: &(dyn std::error::Error + 'static)) -> ApiError {
 
     match error.downcast_ref::<RuntimeError>() {
         Some(RuntimeError::Unsupported(what)) => ApiError::new(ErrorCode::Unsupported, what),
-        Some(RuntimeError::UnknownSession(id)) => ApiError::new(
-            ErrorCode::UnknownSession,
-            format!("unknown session: {id}"),
-        ),
+        Some(RuntimeError::UnknownSession(id)) => {
+            ApiError::new(ErrorCode::UnknownSession, format!("unknown session: {id}"))
+        }
         Some(RuntimeError::Busy(id)) => ApiError::new(
             ErrorCode::Busy,
             format!("a turn is already in flight for {id}"),
@@ -1416,7 +1397,10 @@ mod tests {
             .expect("retry");
 
         assert!(!first.duplicate);
-        assert!(second.duplicate, "the retry must be reported as a duplicate");
+        assert!(
+            second.duplicate,
+            "the retry must be reported as a duplicate"
+        );
         assert_eq!(
             first.message_id, second.message_id,
             "and under the same durable identity"
@@ -1604,13 +1588,19 @@ mod tests {
             !gap_at(0, 5, 9),
             "starting from the beginning is never a gap"
         );
-        assert!(!gap_at(5, 5, 9), "a cursor inside the retained range is fine");
+        assert!(
+            !gap_at(5, 5, 9),
+            "a cursor inside the retained range is fine"
+        );
         assert!(!gap_at(4, 5, 9), "and so is the one immediately before it");
         assert!(
             gap_at(2, 5, 9),
             "a cursor below the oldest retained event is a gap"
         );
-        assert!(gap_at(11, 5, 9), "and so is one ahead of the journal itself");
+        assert!(
+            gap_at(11, 5, 9),
+            "and so is one ahead of the journal itself"
+        );
     }
 
     /// Issue #489, item 4: many observers, one controller -- the same rule the

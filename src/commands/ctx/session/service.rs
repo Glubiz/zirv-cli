@@ -295,8 +295,7 @@ impl RuntimeService {
             Err(poisoned) => poisoned.into_inner(),
         };
         let mut errors = super::super::dash::ErrorLog::default();
-        self.host
-            .deliver_mail(&self.cfg, &mut advised, &mut errors);
+        self.host.deliver_mail(&self.cfg, &mut advised, &mut errors);
         self.native.deliver_mail(&self.cfg, &mut errors);
     }
 

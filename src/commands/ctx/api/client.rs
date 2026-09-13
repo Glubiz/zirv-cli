@@ -522,7 +522,10 @@ mod tests {
             downlevel.client_only.contains(&Capability::SessionNative),
             "the client knows it is the one giving the feature up: {downlevel:?}"
         );
-        assert!(downlevel.has(Capability::SessionRead), "the rest still works");
+        assert!(
+            downlevel.has(Capability::SessionRead),
+            "the rest still works"
+        );
 
         // And both ends agreeing is what turns it on.
         let both = Negotiated::from_hello(&hello(ADVERTISED.to_vec()), &native_client);
