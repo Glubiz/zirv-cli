@@ -79,7 +79,7 @@ over the same durable state the CLI verb writes.
 | `zirv ctx group create` / `status` | `ctx::group`; `group_create` / `group_status` tools | shared + native tools | `tools::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services` |
 | `zirv ctx objective show` | `ctx::objective`; `objective_status` tool, with the operator's constraints | shared + native tool | `tools::tests::operator_steering_and_stopping_reach_the_coordinator` |
 | The coordinator's task graph, decisions, evidence refs and pending completions | `ctx::coordinator` record; `team_status` tool | native | `coordinator::tests::a_restarted_coordinator_consumes_pending_receipts_exactly_once` |
-| Coordinator restart | `coordinator::consume_pending` at the top of `native::run_session` | native | as above, plus `tools::tests::an_all_native_team_runs_a_workflow_with_every_coding_harness_absent` |
+| Coordinator restart | `coordinator::consume_pending` at the top of `native::run_session` | native | as above, plus `native::tests::a_coordinator_session_resumes_its_graph_and_settles_a_node_exactly_once` (drives `run_session` itself, not just `consume_pending`) |
 | Operator steering / stopping (`zirv ctx objective set` / `close`) | writes the constraint and the stop onto the coordinator record | shared | `tools::tests::operator_steering_and_stopping_reach_the_coordinator` |
 | A whole team with no coding harness on `PATH` | all of the above | native | `tools::tests::an_all_native_team_runs_a_workflow_with_every_coding_harness_absent` |
 | A mixed native + wrapped team on one board | `ctx::delegation` on both runtimes, one coordinator record | native + harness | `tools::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services` |

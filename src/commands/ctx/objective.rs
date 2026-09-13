@@ -263,12 +263,14 @@ pub fn run_set<W: Write>(
     // as a constraint the native coordinator reads (`objective_status`,
     // `team_status`), and a previously stopped coordinator starts dispatching
     // again -- a new objective is exactly the instruction to continue.
-    let _ = super::coordinator::update(state, repo, |graph| {
+    if let Err(error) = super::coordinator::update(state, repo, |graph| {
         graph.objective = Some(args.objective.clone());
         graph.steer(&args.objective, now);
         graph.cancelled = false;
         graph.decide("operator set the objective", now);
-    });
+    }) {
+        log_coordinator_store_error(state, &key, &*error, now);
+    }
     writeln!(
         w,
         "zirv ctx objective: set for {} (budget: {}, deadline: {})",
@@ -337,14 +339,45 @@ pub fn record_completion(state: &StateDir, repo: &Path, evidence: Vec<String>) -
     // running and its receipt still has to be consumed -- while anything only
     // planned is stopped. Setting a new objective lifts this.
     let now = super::state::now_secs();
-    let _ = super::coordinator::update(state, repo, |graph| {
+    if let Err(error) = super::coordinator::update(state, repo, |graph| {
         graph.cancel(now);
         graph.decide(
             "the objective was closed; no further work is dispatched",
             now,
         );
-    });
+    }) {
+        log_coordinator_store_error(state, &key, &*error, now);
+    }
     Ok(true)
+}
+
+/// Review finding on issue #485: `run_set` and `record_completion` above
+/// both fold operator intent into the coordinator's durable graph as a
+/// best-effort side effect of the authoritative objective write, which must
+/// never fail or roll back because the graph could not be stored. A store
+/// failure must not vanish silently either, so it gets one decision-log
+/// line -- the same idiom `delegation::log_boundary`/`compile::
+/// log_truncation_decisions` use for their own best-effort writes.
+fn log_coordinator_store_error(
+    state: &StateDir,
+    key: &str,
+    error: &dyn std::error::Error,
+    now: u64,
+) {
+    let detail = format!("objective {key}: {error}");
+    let _ = super::log::append(
+        state,
+        &super::log::Decision {
+            ts: now,
+            session: "",
+            verb: "objective",
+            verdict: "error",
+            score: 0,
+            action: "coordinator-store-failed",
+            detail: &detail,
+            observed_at: None,
+        },
+    );
 }
 
 pub fn run_close<W: Write>(state: &StateDir, w: &mut W, repo: &Path) -> CtxResult<i32> {

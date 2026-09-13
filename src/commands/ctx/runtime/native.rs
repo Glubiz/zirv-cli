@@ -6077,4 +6077,137 @@ mod tests {
             compaction::evaluate(&second, &cfg, budget, CompactionPolicy::Automatic)
         );
     }
+    /// Review finding on issue #485: `run_session`'s coordinator auto-resume
+    /// block (right after `now` is minted, ahead of `build_transport`) has
+    /// never been driven end to end -- every existing coordinator-resume
+    /// test calls `coordinator::consume_pending` directly. Pre-seeds a graph
+    /// with one node dispatched to a delegation, publishes that delegation's
+    /// terminal receipt, then runs a real `role: "coordinator"` session
+    /// through `run_session` and asserts (a) the writer carries the "resumed
+    /// the coordinator graph" notice and (b) the node settles exactly once:
+    /// a second session against the same repository finds nothing pending
+    /// and never re-settles it.
+    #[test]
+    fn a_coordinator_session_resumes_its_graph_and_settles_a_node_exactly_once() {
+        use crate::commands::ctx::config::CtxConfig;
+        use crate::commands::ctx::state::StateDir;
+        use crate::commands::ctx::{coordinator, delegation, team};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+
+        // Seed the plan: one node dispatched to a delegation that already
+        // finished -- exactly the shape a coordinator that restarted
+        // mid-flight would find.
+        let mut graph = coordinator::Coordinator::default();
+        graph.plan("task-1", team::IMPLEMENTER, &[], 1);
+        graph.dispatched("task-1", team::IMPLEMENTER, "native", "deleg-1", 2);
+        coordinator::store(&state, repo.path(), &graph).expect("seed the graph");
+
+        delegation::record_launch(
+            &state,
+            repo.path(),
+            delegation::WorkerHandle {
+                delegation: "deleg-1".to_string(),
+                attempt: 1,
+                runtime: RuntimeKind::Native,
+                worker_session: "deleg-1-session".to_string(),
+                short: "short1".to_string(),
+                role: team::IMPLEMENTER.to_string(),
+                task: Some("task-1".to_string()),
+                group: None,
+                objective: None,
+                workdir: repo.path().to_path_buf(),
+            },
+            Some("coord-session".to_string()),
+            10,
+        )
+        .expect("launch receipt");
+        delegation::publish_terminal(
+            &state,
+            repo.path(),
+            &CtxConfig::default(),
+            "deleg-1",
+            delegation::Phase::Completed,
+            Some(0),
+            Some("done".to_string()),
+            Some(std::path::PathBuf::from("results/task-1.json")),
+            20,
+        )
+        .expect("publish the receipt");
+
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        let fixtures = fixture_root();
+        let provider = format!(
+            "fixture:{}",
+            fixtures.join("resume-continue.json").display()
+        );
+
+        // First run: the coordinator picks its graph back up.
+        let mut request = HeadlessRequest {
+            repo: repo.path(),
+            prompt: "carry on",
+            route: None,
+            role: team::COORDINATOR,
+            limits: NativeLimits::default(),
+            resume: None,
+            provider: Some(&provider),
+            fixture_tools: None,
+            task: None,
+            writer: None,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        run_session(&mut request, &mut out, &lookup).expect("first coordinator session");
+        assert!(
+            String::from_utf8_lossy(&out)
+                .contains("resumed the coordinator graph -- consumed 1 pending worker receipt(s)"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let resumed = coordinator::load(&state, repo.path());
+        assert_eq!(
+            resumed.nodes["task-1"].state,
+            coordinator::NodeState::Completed,
+            "the pending receipt must settle the node"
+        );
+
+        // Second run, a fresh session against the same repository: nothing
+        // is pending anymore, so the node is never re-settled and no notice
+        // is written.
+        let mut request2 = HeadlessRequest {
+            repo: repo.path(),
+            prompt: "carry on again",
+            route: None,
+            role: team::COORDINATOR,
+            limits: NativeLimits::default(),
+            resume: None,
+            provider: Some(&provider),
+            fixture_tools: None,
+            task: None,
+            writer: None,
+        };
+        let mut out2: Vec<u8> = Vec::new();
+        run_session(&mut request2, &mut out2, &lookup).expect("second coordinator session");
+        assert!(
+            !String::from_utf8_lossy(&out2).contains("resumed the coordinator graph"),
+            "a second run must not find anything pending: {}",
+            String::from_utf8_lossy(&out2)
+        );
+
+        let again = coordinator::load(&state, repo.path());
+        assert_eq!(
+            again.nodes["task-1"].state,
+            coordinator::NodeState::Completed,
+            "a second run must not re-settle the already-settled node"
+        );
+    }
 }
