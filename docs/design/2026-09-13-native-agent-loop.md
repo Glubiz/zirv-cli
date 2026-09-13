@@ -16,7 +16,8 @@ this session stop -- was reachable only by feeding harness-shaped JSON to
 
 ## Decision
 
-Two new modules, one extraction, one flag.
+Two new modules, one extraction, and a small set of operator-only flags on an
+existing verb.
 
 ### `ctx::lifecycle` -- the shared decision services
 
@@ -65,7 +66,11 @@ are always rebuilt in the provider's declared order keyed by call id, so
 completing out of order is invisible on the wire.
 
 **Input, steering, interruption.** Every accepted input is durably
-acknowledged before anything else can happen to it. Delivery boundaries are
+acknowledged before anything else can happen to it, through one
+`acknowledge_input` shared by the loop's own `acknowledge` and by
+`NativeBackend`'s `submit`/`steer`/`resume` -- written *before* the caller is
+told the input was accepted, so a crash immediately after `Ok` still finds it.
+Delivery boundaries are
 explicit: an acknowledged input joins the conversation at the next request
 built for the session -- between requests inside a turn, or between turns --
 never mid-stream and never mid-tool. `delivered_through` is a journal sequence,
@@ -84,10 +89,22 @@ ever re-run, each attempt gets its own execution record (reusing the id would
 both be rejected by the journal's state machine and hide that a second effect
 happened), and an `OutcomeUnknown` result is never replayed at any budget.
 
+**A turn is a real unit.** One turn is one acknowledged input driven to the
+point where the model stops asking for tools, so `max_turns` bounds how many
+separate things a session was told to do. The bound is enforced in `run_turn`
+itself rather than in `run_to_completion`, so it holds for any driver -- an
+interactive surface stepping turns by hand is bounded exactly as the headless
+loop is -- and `run_to_completion` runs another turn when input was queued
+during the last one, which is the delivery boundary that makes the count
+meaningful.
+
 **The finish token does not decide.** `NativeFinalStatus::status` is
 `Completed` only when the model finished AND no execution is non-terminal AND
 none is outcome-unknown AND no acknowledged input is undelivered AND nothing
-was interrupted or limited AND the shared stop service does not block. It
+was interrupted or limited AND the shared stop service does not block. A
+blocking stop decision -- today reachable through
+`NativeSessionConfig::workflow_gate`, which N15 will populate -- outranks the
+token outright, so that wiring cannot land without taking effect. It
 carries the actual route, the configured *and* served model (a route alias and
 the model that answered are two different facts), usage, and evidence rows a
 reader can go and check.
@@ -104,6 +121,22 @@ fallback. The harness-only flags (`--agent`, `--transcript`, `--session-id`,
 `--max-restarts`) are refused rather than ignored, because a native session
 supervises no process, has no transcript to score and nothing to restart. The
 output is one structured JSON final status and the same supervisor exit codes.
+
+`--resume <session>` continues a stored session through `resume_journal`,
+which is the only correct order and the reason N03 shipped
+`reconcile_started_as_unknown` and `advance_generation`: read the stored
+identity, reconcile every durably-`started` execution as `outcome_unknown`
+(written as the OLD generation, which is the one those effects belong to), then
+advance the generation so the previous one is fenced out of the journal and the
+broker. A resumed loop's minted ids are namespaced by generation -- its own
+counter restarts at zero, and the journal rejects a duplicate usage or
+execution id, which the first real resume surfaced immediately.
+
+`--provider fixture:<path>` and `--fixture-tools <path>` make the deterministic
+fixtures reachable from the shipped command rather than only from
+`#[cfg(test)]`, so a whole native session runs end to end with no provider
+configured, no credential and no installed harness. Operator-only by
+construction: command-line flags, settable by no configuration layer.
 
 ### `runtime::fixture`
 
@@ -136,6 +169,16 @@ Deterministic, no network, no paid call, no filesystem effect:
   `Incomplete` final status over the model's own `end_turn`.
 - A whole session running under an env lookup that answers PATH as empty and
   everything else as absent.
+- A continuation request replaying each call's LATEST execution, so a
+  successful retry's result is what the model sees.
+- A crash fixture: an execution left durably `started`, resumed, reconciled as
+  outcome-unknown, never re-run, with the old generation fenced out.
+- Backend-accepted input (`submit`/`steer`/`resume`) landing in the journal in
+  order, with the resume's own input against the new generation.
+- A blocking workflow gate producing `Incomplete` over an `end_turn` token.
+- An unclassifiable tool never retried.
+- The whole fixture path driven through `exec::run_with` -- `--provider
+  fixture:` with `--fixture-tools`, and the same command resumed.
 - The tool-call and wall-clock ceilings each stopping the loop and naming
   themselves.
 
@@ -153,9 +196,10 @@ Deterministic, no network, no paid call, no filesystem effect:
   time, and the loop drains at its delivery boundaries, but the headless entry
   point drives one loop synchronously on one thread; the interactive surface
   that would exercise cross-thread steering is N11's.
-- **Workflow gates in the stop decision.** `StopSignals::workflow_gate` exists
-  and outranks the finish token, but nothing populates it yet -- wiring the
-  workflow engine into a native session's stop is N15's.
+- **Workflow gates in the stop decision.** `StopSignals::workflow_gate` exists,
+  is carried on `NativeSessionConfig` and outranks the finish token in the
+  status ladder, but nothing populates it yet -- wiring the workflow engine
+  into a native session's stop is N15's.
 - **Tasks, mail and delegation.** `NativeSessionConfig::task` is carried into
   every journal scope, but a native session does not yet accept or dispatch
   work; that is N10.
