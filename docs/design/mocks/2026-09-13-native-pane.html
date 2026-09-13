@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Native pane mock (#480)</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #101318;
+    --panel-border: #2a2f37;
+    --divider: #1c2026;
+    --text: #d7dbe0;
+    --muted: #767f8c;
+    --dim: #4b5561;
+    --cyan: #4fd7e0;
+    --cyan-bold: #6be3ea;
+    --green: #57c785;
+    --yellow: #e0c15c;
+    --red: #e2685f;
+    --magenta: #c77ee0;
+    --chip-bg: #4fd7e0;
+    --chip-fg: #06181a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    padding: 24px 20px 64px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 40px 0 4px; color: var(--cyan-bold); border-bottom: 1px solid var(--panel-border); padding-bottom: 6px; }
+  h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  p.lede { color: var(--muted); font-size: 13px; max-width: 900px; line-height: 1.5; }
+  .legend { font-size: 12px; color: var(--muted); max-width: 900px; line-height: 1.6; margin-bottom: 8px; }
+  .legend code { color: var(--cyan); }
+  .row {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  .col { flex: 0 0 auto; }
+  .col-label { font-size: 11px; color: var(--dim); text-align: center; margin-bottom: 6px; letter-spacing: .03em; text-transform: uppercase; }
+  .term {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 6px 18px rgba(0,0,0,.35);
+  }
+  .term-bar {
+    background: #14181e;
+    border-bottom: 1px solid var(--panel-border);
+    padding: 4px 10px;
+    font-size: 10px;
+    color: var(--dim);
+    display: flex;
+    justify-content: space-between;
+  }
+  .term pre {
+    margin: 0;
+    padding: 6px 8px;
+    font-size: 12px;
+    line-height: 1.32;
+    white-space: pre;
+  }
+  .w80 pre { font-size: 12.4px; }
+  .w120 pre { font-size: 10.6px; }
+  .w200 pre { font-size: 8.4px; }
+  .dim { color: var(--dim); }
+  .muted { color: var(--muted); }
+  .cyan { color: var(--cyan); }
+  .cyan-b { color: var(--cyan-bold); font-weight: 700; }
+  .green { color: var(--green); }
+  .yellow { color: var(--yellow); }
+  .red { color: var(--red); font-weight: 700; }
+  .magenta { color: var(--magenta); }
+  .bold { font-weight: 700; }
+  .rev { background: var(--text); color: var(--panel); }
+  .chip { background: var(--chip-bg); color: var(--chip-fg); font-weight: 700; padding: 0 3px; border-radius: 2px; }
+  .divider-note { color: var(--dim); }
+  .callouts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+  .callout {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: var(--muted);
+    max-width: 320px;
+    line-height: 1.5;
+  }
+  .callout b { color: var(--text); }
+  .states-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px; }
+  .state-pill {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    white-space: nowrap;
+  }
+  footer { margin-top: 48px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--panel-border); padding-top: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Native conversation pane — visual mock (#480, N11)</h1>
+<p class="lede">
+  Proposed native-session view rendered inside the existing ratatui dashboard, next to the
+  current PTY-only pane it does not replace. Chrome (header chip, sidebar, footer, dialog
+  frames, key-hint style) is unchanged from the current dashboard — see
+  <code>src/style.rs</code>'s <code>tui::*</code> tokens and <code>dash/ui.rs</code>'s
+  divider/footer conventions. Only the pane content area gains a second renderer for panes
+  whose kind is <code>Native</code>; a wrapped terminal pane keeps rendering through
+  <code>vt100</code>/<code>render_grid</code> exactly as it does today.
+</p>
+<div class="legend">
+  Legend: <span class="cyan-b">cyan bold</span> = accent/focus &middot;
+  <span class="green">green</span> = ok/completed &middot;
+  <span class="yellow">yellow</span> = warning/waiting &middot;
+  <span class="red">red</span> = error/failed &middot;
+  <span class="magenta">magenta</span> = completed-with-unread-result &middot;
+  <span class="dim">dim</span> = muted/secondary &middot;
+  <span class="rev">&nbsp;reverse&nbsp;</span> = selected/focused row
+</div>
+
+<div class="states-strip">
+  <span class="state-pill">generating <span class="cyan-b">●</span></span>
+  <span class="state-pill">executing <span class="yellow">⟳</span></span>
+  <span class="state-pill">waiting <span class="yellow">…</span></span>
+  <span class="state-pill">blocked <span class="red">▲</span></span>
+  <span class="state-pill">cancelled <span class="dim">⊘</span></span>
+  <span class="state-pill">failed <span class="red">✗</span></span>
+  <span class="state-pill">completed — unread <span class="magenta">◆</span></span>
+</div>
+
+<!-- =========================================================== -->
+<h2>80×24 — narrow terminal</h2>
+<div class="row">
+
+  <div class="col">
+    <div class="col-label">current dashboard (terminal pane only)</div>
+    <div class="term w80" style="width:640px"><div class="term-bar"><span>zirv ctx dash — 80×24</span><span>current</span></div><pre><span class="chip"> zirv </span> <span class="cyan-b">wrk claude</span>  <span class="dim">02:14</span>                          <span class="yellow">⟳ working</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────</span>
+$ cargo test dash::pane -- --nocapture
+   Compiling zirv v4.14.0 (D:\GitHub\zirv-480)
+    Finished test [unoptimized + debuginfo] target(s) in 21.4s
+     Running unittests src\main.rs
+
+running 3 tests
+test dash::pane::tests::spawns_and_drains ... ok
+test dash::pane::tests::idle_after_quiet_window ... ok
+<span class="dim">█</span>
+
+
+<span class="dim">────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">a</span> attach  <span class="dim">n</span> nudge  <span class="dim">m</span> mail  <span class="dim">?</span> help                          <span class="dim">1 pane · spend $0.42</span></pre></div>
+  </div>
+
+  <div class="col">
+    <div class="col-label">proposed: native pane</div>
+    <div class="term w80" style="width:640px"><div class="term-bar"><span>zirv ctx dash — 80×24</span><span>native</span></div><pre><span class="chip"> zirv </span> <span class="cyan-b">native chat</span> claude-opus-4  route:default  api  <span class="cyan-b">● generating</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">▸ you</span>  add a retry to the poll loop and cover it with a test
+<span class="cyan-b">▸ assistant</span>
+  <span class="bold">## Plan</span>
+  I'll wrap the poll call in a bounded retry and add a focused
+  <span class="dim">`</span>tests<span class="dim">`</span> case for the timeout path.
+
+  <span class="dim">▶ tool:</span> edit_file <span class="dim">src/poll.rs (collapsed — enter to expand)</span>
+  <span class="green">✓ tool:</span> run_tests <span class="dim">3 passed, 0 failed (collapsed)</span>
+<span class="dim">┊</span> <span class="dim">more above — scrolled, follow paused</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">┃</span> retry three times then <span class="dim">▏</span><span class="rev"> </span>
+<span class="dim">┊ Enter submit · Shift+Enter newline · ↑ history · @ file ref</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">a</span> attach  <span class="dim">n</span> nudge  <span class="dim">m</span> mail  <span class="dim">?</span> help                          <span class="dim">1 pane · spend $0.42</span></pre></div>
+  </div>
+
+</div>
+
+<!-- =========================================================== -->
+<h2>120×40 — standard terminal</h2>
+<div class="row">
+
+  <div class="col">
+    <div class="col-label">current dashboard</div>
+    <div class="term w120" style="width:900px"><div class="term-bar"><span>zirv ctx dash — 120×40</span><span>current</span></div><pre><span class="chip"> zirv </span>  <span class="cyan-b">orch</span> <span class="dim">·</span> <span class="cyan-b">wrk claude</span> <span class="dim">·</span> <span class="cyan-b">wrk codex</span>                                    <span class="dim">02:14</span>              <span class="yellow">⟳ working</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">wrk claude</span>                                              <span class="dim">│</span> $ cargo nextest run dash:: --no-fail-fast
+                                                        <span class="dim">│</span> Starting 214 tests across 1 binary
+> implement the retry helper                            <span class="dim">│</span>      PASS [   0.041s] zirv::dash::pane::tests::spawns
+Sure — adding `with_retry` around the poll call...       <span class="dim">│</span>      PASS [   0.038s] zirv::dash::pane::tests::idle_quiet
+                                                          <span class="dim">│</span>      PASS [   0.052s] zirv::dash::ui::tests::renders_sidebar
+[edited src/poll.rs]                                     <span class="dim">│</span> <span class="dim">█</span>
+[ran cargo test — 3 passed]                              <span class="dim">│</span>
+                                                          <span class="dim">│</span>
+<span class="dim">█</span>                                                        <span class="dim">│</span>
+                                                          <span class="dim">│</span>
+                                                          <span class="dim">│</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">a</span> attach  <span class="dim">n</span> nudge  <span class="dim">m</span> mail  <span class="dim">g</span> group  <span class="dim">?</span> help                                             <span class="dim">2 panes · spend $1.86 · 5h 41% · 7d 12%</span></pre></div>
+  </div>
+
+  <div class="col">
+    <div class="col-label">proposed: native pane alongside a wrapped pane</div>
+    <div class="term w120" style="width:900px"><div class="term-bar"><span>zirv ctx dash — 120×40</span><span>native + wrapped</span></div><pre><span class="chip"> zirv </span>  <span class="cyan-b">native chat</span> <span class="dim">·</span> <span class="cyan-b">wrk claude</span>                                                <span class="dim">02:14</span>          <span class="yellow">⟳ working</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="cyan-b">native chat</span>  claude-opus-4  route:default  api  <span class="yellow">⟳ executing</span>       <span class="dim">│</span> <span class="dim">wrk claude (wrapped, PTY)</span>
+<span class="dim">▸ you</span>  fix the flaky retry test and show me the diff              <span class="dim">│</span> $ cargo test wrap:: -- --test-threads=1
+<span class="cyan-b">▸ assistant</span>                                                      <span class="dim">│</span> running 12 tests
+  Found it — the sleep was outside the retry loop.                <span class="dim">│</span> test wrap::tests::nesting_guard ... FAILED
+                                                                    <span class="dim">│</span> test wrap::tests::echo_suppressed ... ok
+  <span class="dim">▼ tool:</span> edit_file <span class="dim">src/poll.rs</span> <span class="dim">(expanded)</span>                                <span class="dim">│</span>
+  <span class="dim">──── diff ────────────────────────────</span>                     <span class="dim">│</span> failures:
+  <span class="dim">--- a/src/poll.rs</span>                                          <span class="dim">│</span>     wrap::tests::nesting_guard
+  <span class="dim">+++ b/src/poll.rs</span>                                          <span class="dim">│</span>
+  <span class="dim">@@ -12,8 +12,8 @@ fn poll_once</span>                               <span class="dim">│</span> test result: <span class="red">FAILED</span>. 11 passed; 1 failed
+  <span class="red">-        std::thread::sleep(backoff);</span>                       <span class="dim">│</span>
+  <span class="green">+    std::thread::sleep(backoff);</span>                          <span class="dim">│</span> <span class="dim">█</span>
+  <span class="green">+</span>                                                              <span class="dim">│</span>
+  <span class="dim">▶ tool:</span> run_tests <span class="dim">(running…)</span>                                        <span class="dim">│</span>
+<span class="dim">────────────────────────────────────────────────────────────</span>                        <span class="dim">│</span>
+<span class="dim">┃</span> <span class="dim">▏</span><span class="rev"> </span>                                                             <span class="dim">│</span>
+<span class="dim">┊ Enter submit · Shift+Enter newline · ↑ history · @ file ref</span>                        <span class="dim">│</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">a</span> attach  <span class="dim">n</span> nudge  <span class="dim">m</span> mail  <span class="dim">g</span> group  <span class="dim">?</span> help  <span class="dim">(native controls hidden on the wrapped pane)</span>          <span class="dim">2 panes · spend $1.86</span></pre></div>
+  </div>
+
+</div>
+
+<h3>120×40 — additional native states (composer, blocked, failed, artifact, unread)</h3>
+<div class="row">
+
+  <div class="col">
+    <div class="col-label">blocked (approval required)</div>
+    <div class="term w120" style="width:440px"><div class="term-bar"><span>native chat</span><span>blocked</span></div><pre><span class="cyan-b">native chat</span>  claude-opus-4  route:default  api  <span class="red">▲ blocked</span>
+<span class="dim">────────────────────────────────────────</span>
+<span class="cyan-b">▸ assistant</span>
+  This will overwrite <span class="dim">`</span>Cargo.lock<span class="dim">`</span>. I need approval
+  before running it.
+
+  <span class="red">▲ blocked:</span> approval required for
+    <span class="dim">write_file Cargo.lock</span>
+  <span class="dim">approve in the Approval dialog (A) — never</span>
+  <span class="dim">answered from this composer</span>
+<span class="dim">────────────────────────────────────────</span>
+<span class="dim">┃</span> <span class="dim">queued: "also update the changelog"</span>
+<span class="dim">┊ queued input is held, not sent as approval</span>
+<span class="dim">────────────────────────────────────────</span></pre></div>
+  </div>
+
+  <div class="col">
+    <div class="col-label">failed / cancelled / artifact / unread</div>
+    <div class="term w120" style="width:440px"><div class="term-bar"><span>native chat</span><span>failed</span></div><pre><span class="cyan-b">native chat</span>  claude-opus-4  route:default  api  <span class="red">✗ failed</span>
+<span class="dim">────────────────────────────────────────</span>
+  <span class="dim">▶ tool:</span> run_tests <span class="red">(1 failed, collapsed)</span>
+  <span class="red">✗ error:</span> provider request failed
+    <span class="dim">rate_limited: retry after 30s</span>
+
+  <span class="dim">▶ tool:</span> run_build <span class="dim">⊘ cancelled (interrupted)</span>
+
+  <span class="dim">▶ artifact:</span> coverage.html
+    <span class="dim">text/html · 18.2 KB · sha256:9f2a1c…</span>
+<span class="dim">────────────────────────────────────────</span>
+<span class="magenta">◆ completed — unread result below, scroll ↓</span>
+<span class="dim">────────────────────────────────────────</span>
+<span class="dim">┃</span> <span class="dim">▏</span><span class="rev"> </span>
+<span class="dim">────────────────────────────────────────</span></pre></div>
+  </div>
+
+</div>
+
+<!-- =========================================================== -->
+<h2>200×50 — wide terminal</h2>
+<div class="row">
+
+  <div class="col">
+    <div class="col-label">current dashboard (three wrapped panes)</div>
+    <div class="term w200" style="width:1200px"><div class="term-bar"><span>zirv ctx dash — 200×50</span><span>current</span></div><pre><span class="chip"> zirv </span>  <span class="cyan-b">orch</span> <span class="dim">·</span> <span class="cyan-b">wrk claude</span> <span class="dim">·</span> <span class="cyan-b">wrk codex</span> <span class="dim">·</span> <span class="cyan-b">wrk gemini</span>                                                                       <span class="dim">02:14</span>                                                <span class="yellow">⟳ working</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">wrk claude</span>                                        <span class="dim">│</span> <span class="dim">wrk codex</span>                                          <span class="dim">│</span> <span class="dim">wrk gemini</span>
+$ cargo build                                              <span class="dim">│</span> reviewing diff for src/poll.rs...                        <span class="dim">│</span> running lint pass over src/dash/
+   Compiling zirv v4.14.0                                   <span class="dim">│</span> finding: retry sleeps outside the loop                   <span class="dim">│</span> 0 issues found in ui.rs
+    Finished dev [unoptimized] in 18.2s                      <span class="dim">│</span> severity: medium                                          <span class="dim">│</span> checking pane.rs...
+<span class="dim">█</span>                                                          <span class="dim">│</span> <span class="dim">█</span>                                                          <span class="dim">│</span> <span class="dim">█</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">a</span> attach  <span class="dim">n</span> nudge  <span class="dim">m</span> mail  <span class="dim">g</span> group  <span class="dim">?</span> help                                                                                         <span class="dim">3 panes · spend $3.40 · 5h 58% · 7d 22%</span></pre></div>
+  </div>
+
+  <div class="col">
+    <div class="col-label">proposed: two native panes + one wrapped</div>
+    <div class="term w200" style="width:1200px"><div class="term-bar"><span>zirv ctx dash — 200×50</span><span>native ×2 + wrapped</span></div><pre><span class="chip"> zirv </span>  <span class="cyan-b">native chat</span> <span class="dim">·</span> <span class="cyan-b">native wrk</span> <span class="dim">·</span> <span class="cyan-b">wrk codex</span>                                                                                     <span class="dim">02:14</span>                                                <span class="yellow">⟳ working</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="cyan-b">native chat</span>  claude-opus-4  default  api  <span class="cyan-b">● generating</span>       <span class="dim">│</span> <span class="cyan-b">native wrk</span>  gpt-5.1  worker-route  subscription  <span class="yellow">⟳ executing</span>  <span class="dim">│</span> <span class="dim">wrk codex (wrapped, PTY)</span>
+<span class="dim">▸ you</span>  summarize the failing tests and propose a fix     <span class="dim">│</span> <span class="dim">▸ task</span>  lint pass over dash/                          <span class="dim">│</span> reviewing diff for src/poll.rs...
+<span class="cyan-b">▸ assistant</span>                                                <span class="dim">│</span> <span class="cyan-b">▸ assistant</span>                                            <span class="dim">│</span> finding: retry sleeps outside loop
+  <span class="bold">### Failing tests</span>                                       <span class="dim">│</span>   <span class="dim">▶ tool:</span> run_lint <span class="dim">(running…)</span>                         <span class="dim">│</span> severity: medium
+  1. <span class="dim">`</span>wrap::tests::nesting_guard<span class="dim">`</span> — sleep leaks          <span class="dim">│</span>                                                      <span class="dim">│</span> <span class="dim">█</span>
+     outside the retry loop                                  <span class="dim">│</span>                                                      <span class="dim">│</span>
+  2. <span class="dim">`</span>wrap::tests::echo_suppressed<span class="dim">`</span> — flaky under      <span class="dim">│</span>                                                      <span class="dim">│</span>
+     `--test-threads=1`                                       <span class="dim">│</span>                                                      <span class="dim">│</span>
+<span class="dim">┊</span> streaming…                                              <span class="dim">│</span>                                                      <span class="dim">│</span>
+<span class="dim">────────────────────────────────────────────────────</span>                <span class="dim">│</span> <span class="dim">──────────────────────────────────────────────────</span>          <span class="dim">│</span>
+<span class="dim">┃</span> <span class="dim">▏</span><span class="rev"> </span>                                                       <span class="dim">│</span> <span class="dim">(native worker pane — queue/steer only, no composer)</span>       <span class="dim">│</span>
+<span class="dim">┊ Enter submit · Shift+Enter newline · ↑ history · @ file ref</span>       <span class="dim">│</span>                                                      <span class="dim">│</span>
+<span class="dim">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="dim">a</span> attach  <span class="dim">n</span> nudge  <span class="dim">m</span> mail  <span class="dim">g</span> group  <span class="dim">?</span> help  <span class="dim">(native controls only on native panes)</span>                                                       <span class="dim">3 panes · spend $3.40</span></pre></div>
+  </div>
+
+</div>
+
+<div class="callouts">
+  <div class="callout"><b>Composer key contract.</b> <code>Enter</code> submits (or queues, mid-turn). <code>Shift+Enter</code> / <code>Alt+Enter</code> inserts a newline. <code>↑</code>/<code>↓</code> walk submit history only at the first/last visual line of the draft (so mid-draft cursoring never fights history). <code>@</code> opens an inline repository file-reference hint resolved against the workdir. Bracketed paste — or, on a terminal without it, large same-tick input coalescing — inserts as one block, never one <code>Enter</code> per pasted line.</div>
+  <div class="callout"><b>Follow mode.</b> The transcript auto-scrolls to the newest event while <code>follow</code> is on. Any scroll-up disengages it — new tool output no longer yanks the viewport — and it silently re-engages once the operator scrolls back to the bottom. Focus, selection, expanded tool calls and the draft all survive a resize and continued streaming.</div>
+  <div class="callout"><b>Approvals stay separate.</b> A blocked/approval-required state is shown in the transcript and status line, but the composer never doubles as the approval control — queued composer input is held (and persisted) rather than ever being submitted as an approval answer.</div>
+  <div class="callout"><b>Mixed panes.</b> A wrapped harness pane keeps its PTY/vt100 rendering and raw-mode input path unchanged. Native controls (composer, expand/collapse, queue/steer/interrupt) are offered only when the focused pane's kind is <code>Native</code>; a wrapped pane's key hints and input routing are untouched.</div>
+</div>
+
+<footer>
+  Native pane mock — issue #480 (roadmap N11). Non-interactive HTML for operator review; the
+  same view model renders through ratatui (interactive) and a plain-text mode (headless /
+  non-TTY), see <code>docs/design/2026-09-13-native-pane.md</code>.
+</footer>
+
+</body>
+</html>
