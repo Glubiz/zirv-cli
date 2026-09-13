@@ -19,14 +19,43 @@ pub trait Probe {
 }
 
 pub(crate) fn is_plaintext_non_loopback(endpoint_url: &str) -> bool {
-    let Some(rest) = endpoint_url.strip_prefix("http://") else {
+    let Some(host) = plain_http_host(endpoint_url) else {
         return false;
     };
+    !host.eq_ignore_ascii_case("localhost") && host != "127.0.0.1" && host != "::1"
+}
+
+/// Whether a plain-HTTP URL points at a host a self-hosted model runtime may
+/// legitimately live on: loopback, an RFC 1918 private range, IPv4
+/// link-local, or a unique-local/link-local IPv6 address. A name that is not
+/// a literal address is never assumed local -- `models.example.com`
+/// resolving to a private address today says nothing about tomorrow. This is
+/// strictly weaker than [`is_plaintext_non_loopback`], which still governs
+/// whether a *credential* may cross the wire.
+pub(crate) fn is_local_http_host(endpoint_url: &str) -> bool {
+    let Some(host) = plain_http_host(endpoint_url) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let first = v6.segments()[0];
+            v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
+fn plain_http_host(endpoint_url: &str) -> Option<&str> {
+    let rest = endpoint_url.strip_prefix("http://")?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let host_and_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+    Some(if let Some(bracketed) = host_and_port.strip_prefix('[') {
         bracketed
             .split_once(']')
             .map_or(bracketed, |(host, _)| host)
@@ -36,8 +65,7 @@ pub(crate) fn is_plaintext_non_loopback(endpoint_url: &str) -> bool {
         host_and_port
             .split_once(':')
             .map_or(host_and_port, |(host, _)| host)
-    };
-    !host.eq_ignore_ascii_case("localhost") && host != "127.0.0.1" && host != "::1"
+    })
 }
 
 pub struct HttpProbe {

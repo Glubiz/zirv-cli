@@ -2226,6 +2226,7 @@ fn protocol_name(protocol: Protocol) -> &'static str {
         Protocol::GoogleGenerativeAi => "google_generative_ai",
         Protocol::GoogleVertex => "google_vertex",
         Protocol::AwsBedrock => "aws_bedrock",
+        Protocol::AzureOpenAiChat => "azure_openai_chat",
     }
 }
 
@@ -2237,6 +2238,7 @@ fn parse_protocol(value: &str) -> JournalResult<Protocol> {
         "google_generative_ai" => Ok(Protocol::GoogleGenerativeAi),
         "google_vertex" => Ok(Protocol::GoogleVertex),
         "aws_bedrock" => Ok(Protocol::AwsBedrock),
+        "azure_openai_chat" => Ok(Protocol::AzureOpenAiChat),
         other => Err(JournalError::Corrupt(format!(
             "unknown provider protocol {other:?}"
         ))),

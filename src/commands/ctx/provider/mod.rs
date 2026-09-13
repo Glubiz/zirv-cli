@@ -9,6 +9,7 @@ pub mod google;
 pub mod inventory;
 pub mod openai;
 pub mod probe;
+pub mod profiles;
 pub mod transport;
 
 use serde::{Deserialize, Serialize};
@@ -130,6 +131,7 @@ pub enum Protocol {
     GoogleGenerativeAi,
     GoogleVertex,
     AwsBedrock,
+    AzureOpenAiChat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -144,11 +146,26 @@ pub enum AuthScheme {
     Query { name: &'static str },
 }
 
+/// How a route is served today.
+///
+/// `Planned` is zirv's own gap -- an adapter nobody has written yet.
+/// `LegacyOnly` is an *upstream* one: the route exists, but there is no
+/// documented, separately authorized direct API a third-party client may
+/// authenticate against, so the coding-harness backend stays the only honest
+/// way to spend it. The two are never interchangeable: conflating them would
+/// let an unimplemented adapter masquerade as an entitlement problem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Support {
     Native,
+    // Kept even while no built-in row uses it: the distinction between "zirv
+    // has not written this adapter" and "upstream does not offer one" is the
+    // contract, and collapsing the enum to whatever is unimplemented today
+    // would erase it.
+    #[allow(dead_code)]
     Planned(&'static str),
+    #[serde(rename = "legacy-only")]
+    LegacyOnly(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -245,7 +262,10 @@ pub static PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
         id: "aws-bedrock",
         protocol: Protocol::AwsBedrock,
-        vendor: Some("amazon"),
+        // Bedrock serves several vendors' models behind one account, so the
+        // endpoint declares which one it is pointed at -- exactly as an
+        // openai-compatible endpoint does.
+        vendor: None,
         default_base_url: None,
         default_credential_env: &[],
         auth: AuthScheme::Header {
@@ -254,7 +274,24 @@ pub static PROVIDERS: &[ProviderSpec] = &[
             extra_headers: &[],
         },
         models_list_path: None,
-        support: Support::Planned("N13 (#482)"),
+        support: Support::Native,
+        entitlement_note: SUBSCRIPTION_NOTE,
+    },
+    ProviderSpec {
+        id: "azure-openai",
+        protocol: Protocol::AzureOpenAiChat,
+        vendor: Some("openai"),
+        default_base_url: None,
+        default_credential_env: &["AZURE_OPENAI_API_KEY"],
+        auth: AuthScheme::Header {
+            name: "api-key",
+            scheme: None,
+            extra_headers: &[],
+        },
+        // The deployment listing is an ARM/management call, not a data-plane
+        // one; there is no `/v1/models` to probe here.
+        models_list_path: None,
+        support: Support::Native,
         entitlement_note: SUBSCRIPTION_NOTE,
     },
 ];

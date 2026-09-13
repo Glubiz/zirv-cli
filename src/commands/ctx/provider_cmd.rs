@@ -206,14 +206,34 @@ fn print_inventory(inventory: &Inventory, json: bool, w: &mut dyn Write) -> CtxR
             .join(",");
         writeln!(w, "{}\t{accounts}", pool.pool)?;
     }
-    writeln!(w, "\nROUTE\tMODEL\tSTATE\tCAPABILITIES\tALLOWED\tPROBLEM")?;
+    writeln!(
+        w,
+        "\nPROFILE (schema {})\tVENDOR\tPROTOCOL\tCREDENTIAL\tSUPPORT",
+        super::provider::profiles::PROFILE_SCHEMA
+    )?;
+    for profile in super::provider::profiles::profiles() {
+        writeln!(
+            w,
+            "{}\t{}\t{:?}\t{:?}\t{}",
+            profile.id,
+            profile.vendor.unwrap_or("*"),
+            profile.protocol,
+            profile.credential,
+            support_text(profile.support)
+        )?;
+    }
+    writeln!(
+        w,
+        "\nROUTE\tMODEL\tPROFILE\tSTATE\tCAPABILITIES\tALLOWED\tPROBLEM"
+    )?;
     for route in &inventory.routes {
         writeln!(
             w,
-            "{}\t{}/{}\t{}\t{}\t{}\t{}",
+            "{}\t{}/{}\t{}\t{}\t{}\t{}\t{}",
             route.route,
             route.model.vendor,
             route.model.id,
+            route.profile.unwrap_or("unbound"),
             state_text(route.state),
             capability_summary(&route.capabilities),
             route.allowed,
@@ -221,6 +241,14 @@ fn print_inventory(inventory: &Inventory, json: bool, w: &mut dyn Write) -> CtxR
         )?;
     }
     Ok(())
+}
+
+fn support_text(support: super::provider::Support) -> String {
+    match support {
+        super::provider::Support::Native => "native".into(),
+        super::provider::Support::Planned(tracking) => format!("planned ({tracking})"),
+        super::provider::Support::LegacyOnly(_) => "legacy-only (harness backend)".into(),
+    }
 }
 
 fn capability_summary(capabilities: &super::provider::capability::ModelCapabilities) -> String {

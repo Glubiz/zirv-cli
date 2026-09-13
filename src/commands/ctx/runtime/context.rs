@@ -1037,6 +1037,7 @@ mod tests {
                 vendor: "openai".into(),
                 id: "gpt-5".into(),
             },
+            None,
         )));
         CompileRequest {
             home,
@@ -1328,6 +1329,7 @@ mod tests {
                 vendor: "compatible".into(),
                 id: "plain-chat".into(),
             },
+            None,
         );
         capabilities.tools = Capability::Declared { declared: false };
         let mut req = request(None, repo.path(), &state, &cfg, "answer", ample_budget());
