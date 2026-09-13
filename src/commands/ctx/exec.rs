@@ -180,6 +180,24 @@ pub struct ExecArgs {
     /// route and the repository-write posture applied to its tools.
     #[arg(long, default_value = "worker")]
     pub role: String,
+    /// Native runtime only: continue an existing native journal session
+    /// instead of starting a new one. Every execution that was still running
+    /// when that session stopped is reconciled as outcome-unknown (never
+    /// silently retried) and the generation is advanced, fencing out anything
+    /// still holding the old one.
+    #[arg(long)]
+    pub resume: Option<String>,
+    /// Native runtime only, operator-only: replace the live provider with a
+    /// deterministic fixture script. The only accepted value is
+    /// `fixture:<path>`. No configuration layer can set this -- least of all
+    /// a repository's -- because it is a command-line flag and nothing else.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Native runtime only: the fixture tool script a `--provider fixture:`
+    /// run executes against. Without it every tool call reports a fixture
+    /// failure rather than touching the machine.
+    #[arg(long)]
+    pub fixture_tools: Option<PathBuf>,
     /// The headless agent command, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
@@ -220,6 +238,9 @@ impl Default for ExecArgs {
             runtime: super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
             role: "worker".to_string(),
+            resume: None,
+            provider: None,
+            fixture_tools: None,
             command: Vec::new(),
             simple: false,
             reservation_id: None,
@@ -769,8 +790,13 @@ fn run_native<W: Write>(
         Some(prompt) => prompt.to_string(),
         None => args.command.join(" "),
     };
-    if prompt.trim().is_empty() {
+    // A resume continues a conversation that already has everything it needs,
+    // so a fresh prompt is optional there and mandatory everywhere else.
+    if prompt.trim().is_empty() && args.resume.is_none() {
         return Err("native runtime: pass a prompt with --prompt or after `--`".into());
+    }
+    if args.fixture_tools.is_some() && args.provider.is_none() {
+        return Err("--fixture-tools needs --provider fixture:<path>".into());
     }
 
     let mut limits = super::runtime::native::NativeLimits::default();
@@ -783,10 +809,13 @@ fn run_native<W: Write>(
     super::runtime::native::run_headless(
         &super::runtime::native::HeadlessRequest {
             repo,
-            prompt: &prompt,
+            prompt: prompt.trim(),
             route: args.route.as_deref(),
             role: &args.role,
             limits,
+            resume: args.resume.as_deref(),
+            provider: args.provider.as_deref(),
+            fixture_tools: args.fixture_tools.as_deref(),
         },
         w,
         env,
@@ -3799,6 +3828,139 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // -- issue #478: the native runtime through the shipped CLI path -------
+
+    /// Issue #478 item 7: the deterministic fixtures must be reachable from
+    /// the shipped command, not only from `#[cfg(test)]`. This drives a whole
+    /// native session -- request, tool call, continuation, structured final
+    /// status -- through `exec::run_with` with NO provider configured, no
+    /// credential, and no coding harness installed.
+    #[test]
+    fn native_runtime_runs_a_whole_fixture_session_through_exec() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+
+        let fixtures = super::super::runtime::fixture::fixture_root();
+        let args = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("fix the failing test".to_string()),
+            provider: Some(format!(
+                "fixture:{}",
+                fixtures
+                    .join("anthropic-investigate-edit-test.json")
+                    .display()
+            )),
+            fixture_tools: Some(fixtures.join("tools-investigate-edit-test.json")),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, repo.path(), &lookup).expect("native run");
+        let text = String::from_utf8(out).expect("utf8");
+        let status: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|error| panic!("{error}: {text}"));
+
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(status["runtime"], "native");
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["requests"], 4);
+        assert_eq!(status["tool_calls"], 4);
+        assert_eq!(status["served_model"], "fixture-anthropic-model");
+    }
+
+    /// The same command, resumed: `--resume` continues the stored session
+    /// rather than starting a new one, and says so by reusing its id.
+    #[test]
+    fn native_runtime_resumes_a_stored_session_through_exec() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let fixtures = super::super::runtime::fixture::fixture_root();
+
+        let first = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("start".to_string()),
+            provider: Some(format!(
+                "fixture:{}",
+                fixtures
+                    .join("anthropic-investigate-edit-test.json")
+                    .display()
+            )),
+            fixture_tools: Some(fixtures.join("tools-investigate-edit-test.json")),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        run_with(&first, &mut out, repo.path(), &lookup).expect("first run");
+        let started: serde_json::Value =
+            serde_json::from_slice(&out).expect("first status is json");
+        let session = started["session"].as_str().expect("session id").to_string();
+
+        // A different script for the continuation: a provider never reissues
+        // a tool-call id it has already used, and the journal would refuse it
+        // if one did.
+        let resumed = ExecArgs {
+            runtime: "native".to_string(),
+            resume: Some(session.clone()),
+            provider: Some(format!(
+                "fixture:{}",
+                fixtures.join("resume-continue.json").display()
+            )),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        // No prompt at all: a resume continues a conversation that already
+        // has one.
+        run_with(&resumed, &mut out, repo.path(), &lookup)
+            .unwrap_or_else(|error| panic!("resumed run: {error}"));
+        let status: serde_json::Value =
+            serde_json::from_slice(&out).expect("resumed status is json");
+        assert_eq!(status["session"], session);
+        assert_eq!(status["runtime"], "native");
+    }
+
+    #[test]
+    fn native_runtime_refuses_an_unsupported_provider_override() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = tempfile::tempdir().expect("tempdir");
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let args = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("go".to_string()),
+            provider: Some("https://example.invalid".to_string()),
+            ..Default::default()
+        };
+        let error = run_with(&args, &mut Vec::new(), repo.path(), &lookup).expect_err("refused");
+        assert!(error.to_string().contains("fixture:"), "{error}");
+    }
+
+    #[test]
+    fn fixture_tools_without_a_fixture_provider_is_refused() {
+        let repo = tempfile::tempdir().expect("repo");
+        let args = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("go".to_string()),
+            fixture_tools: Some(PathBuf::from("tools.json")),
+            ..Default::default()
+        };
+        let error = run_with(&args, &mut Vec::new(), repo.path(), &|_| None).expect_err("refused");
+        assert!(error.to_string().contains("--fixture-tools"), "{error}");
+    }
 
     #[test]
     fn every_declared_exit_constant_is_in_exit_codes() {

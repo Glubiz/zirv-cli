@@ -539,9 +539,34 @@ pub enum NotificationKind {
     Other,
 }
 
-/// Classifies a notification message. Deliberately substring-based and
-/// fail-soft: an unrecognised message is `Other`, never a guess.
-pub fn notification_kind(message: &str) -> NotificationKind {
+/// The payload fields that actually carry a notification's human-readable
+/// text, most specific first. Everything else in a notification payload --
+/// session ids, transcript paths, tool names, cwd -- is metadata, and matching
+/// on it is how an unrelated path like `.../permissions/cache` gets logged as
+/// an approval request.
+const NOTIFICATION_MESSAGE_KEYS: [&str; 3] = ["message", "title", "reason"];
+
+/// Classifies one notification payload by its MESSAGE field, never by the raw
+/// JSON. Deliberately substring-based within that field and fail-soft: a
+/// payload that is not an object, carries none of
+/// [`NOTIFICATION_MESSAGE_KEYS`], or says nothing this build recognises is
+/// `Other`, never a guess.
+pub fn notification_kind(payload: &str) -> NotificationKind {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(payload)
+    else {
+        return NotificationKind::Other;
+    };
+    let Some(message) = NOTIFICATION_MESSAGE_KEYS
+        .iter()
+        .find_map(|key| map.get(*key).and_then(serde_json::Value::as_str))
+    else {
+        return NotificationKind::Other;
+    };
+    classify_notification_message(message)
+}
+
+/// The classification itself, over one already-extracted message.
+pub fn classify_notification_message(message: &str) -> NotificationKind {
     let message = message.to_ascii_lowercase();
     if message.contains("permission") || message.contains("approval") {
         NotificationKind::AwaitingApproval
@@ -710,6 +735,33 @@ mod tests {
                 command: "zirv verify"
             }
         );
+    }
+
+    #[test]
+    fn notification_kind_reads_the_message_field_not_the_whole_payload() {
+        // A transcript path that merely CONTAINS "permission" is metadata,
+        // not an approval request.
+        assert_eq!(
+            notification_kind(
+                r#"{"transcript_path":"/tmp/permissions/cache.jsonl","message":"Claude is done"}"#
+            ),
+            NotificationKind::Other
+        );
+        assert_eq!(
+            notification_kind(r#"{"message":"Claude needs your permission to use Bash"}"#),
+            NotificationKind::AwaitingApproval
+        );
+        assert_eq!(
+            notification_kind(r#"{"title":"Waiting for your input"}"#),
+            NotificationKind::AwaitingInput
+        );
+        // No message-bearing field at all, and a non-object payload, are both
+        // unclassified rather than guessed.
+        assert_eq!(
+            notification_kind(r#"{"session_id":"permission-denied"}"#),
+            NotificationKind::Other
+        );
+        assert_eq!(notification_kind("not json"), NotificationKind::Other);
     }
 
     #[test]
