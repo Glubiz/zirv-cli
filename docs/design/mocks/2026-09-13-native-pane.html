@@ -143,7 +143,7 @@
 <span class="d">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
  <span class="cb">AGENTS</span>        <span class="mu">4/6</span>      <span class="d">│</span> <span class="cb">native</span><span class="d"> ▸ orchestrator · opus-5 · native/anthropic · seat s-7 gen 2</span>                                 <span class="g">⏵ running</span>  <span class="d">│</span> <span class="cb">AGENT &amp; TASK OVERVIEW</span>                <span class="d">↑↓ select  ⏎ inspect</span>     
 <span class="d">────────────────────────</span><span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────────────────────────────────────────────────────</span><span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────</span>
-<span class="sel">▸⏵ orch    native   </span>    <span class="d">│</span><span class="cb">⏺</span> <span class="d">⤓</span> Rollover: opus-5 5h window exhausted → <span class="b">sonnet-4.6</span> <span class="d">(seat s-7 gen 1→2 · draft kept · 0 input lost)</span>           <span class="d">│</span><span class="sel"> {g|⏵ RUNNING</span>     coordinator · orchestrator            }      
+<span class="sel">▸⏵ orch    native   </span>    <span class="d">│</span><span class="cb">⏺</span> <span class="d">⤓</span> Rollover: opus-5 5h window exhausted → <span class="b">sonnet-4.6</span> <span class="d">(seat s-7 gen 1→2 · draft kept · 0 input lost)</span>           <span class="d">│</span><span class="sel"> <span class="g">⏵ RUNNING</span>     coordinator · orchestrator            </span>      
  <span class="y">⏸</span> w/482   native   <span class="r">⚑</span>   <span class="d">│</span><span class="cb">⏺</span> <span class="d">⇄</span> Reconnected to the persistent runtime after 12s <span class="d">(journal cursor 4182 · 0 events lost)</span>                      <span class="d">│</span>    <span class="mu">model</span>   opus-5 <span class="g">(measured)</span>                                  
  <span class="g">✔</span> w/483   claude   <span class="y">•1</span>  <span class="d">│</span>                                                                                                               <span class="d">│</span>    <span class="mu">backend</span> native/anthropic   <span class="mu">owns</span> ~\zirv-490                 
  <span class="r">✖</span> w/484   codex        <span class="d">│</span><span class="u">&gt; refactor the writer lease onto the seat generation fence</span>                                                     <span class="d">│</span>    <span class="mu">task</span>    T1 seat fence      <span class="mu">since</span> 4m 20s                    
@@ -211,7 +211,7 @@ composer and the status facts survive with elided paths. Nothing becomes colour-
 <span class="d">│</span> <span class="cb">&gt;</span> deprecated shim<span class="cb">▌</span>                   <span class="d">│</span>
 <span class="d">╰──────────────────────────────────────╯</span>
   <span class="d">?</span>           <span class="mu">accept edits</span>            <span class="y">⧗1</span>
-<span class="d">opus-5 · native · ctx {g|62%</span>}
+<span class="d">opus-5 · native · ctx </span><span class="g">62%</span>
 <span class="d">native/490</span></pre></div></div>
 
 <h2>N21 surfaces</h2>
@@ -223,7 +223,7 @@ ownership/worktree, running / blocked / done-unread / failed / queued / draining
 decision, and bounded result access. Rows are clickable and keyboard-navigable.</p>
 <div class="term w96"><pre> <span class="cb">AGENT &amp; TASK OVERVIEW</span>                <span class="d">↑↓ select  ⏎ inspect</span>
 <span class="d">───────────────────────────────────────────────────────────────</span>
-<span class="sel"> {g|⏵ RUNNING</span>     coordinator · orchestrator            }
+<span class="sel"> <span class="g">⏵ RUNNING</span>     coordinator · orchestrator            </span>
     <span class="mu">model</span>   opus-5 <span class="g">(measured)</span>
     <span class="mu">backend</span> native/anthropic   <span class="mu">owns</span> ~\zirv-490
     <span class="mu">task</span>    T1 seat fence      <span class="mu">since</span> 4m 20s
