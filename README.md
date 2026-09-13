@@ -1500,7 +1500,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
-| `zirv ctx status [--json]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON |
+| `zirv ctx status [--json] [--agents]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Initializes, inventories, validates, or stores credentials for opt-in native provider routes |
@@ -1822,6 +1822,38 @@ transcript, the composer, the renderers) is `dash::native_pane`, covered by
 deterministic tests with no terminal required; see
 [`docs/design/2026-09-13-native-pane.md`](docs/design/2026-09-13-native-pane.md)
 for the design and exactly what mixed-pane integration is still owed.
+
+**The pane's own surfaces (issue #490).** Beside the conversation the pane
+draws an **agent & task overview** built from the coordinator graph, the
+delegation receipts and the seat records — role, the *actual* model and
+backend with its provenance, ownership and worktree, and one of
+running / blocked / approval-needed / done-unread / failed / queued /
+draining, each with its own glyph as well as its own colour. Rows are
+navigable with `Up`/`Down` and clickable; `Enter` opens that worker's
+**bounded manifest** — its diff, test and artifact evidence — and never its
+transcript, and `f` sends a bounded follow-up to it (queued automatically if
+that worker is itself blocked, and retried at its next idle boundary).
+Underneath sits the **usage and health provenance strip**: measured,
+estimated and unknown are labelled and never summed, a route that is
+excluded keeps its reason verbatim, and an unknown figure is never rendered
+as a zero. Compaction, rollover and reconnect appear as ordinary notices
+that scroll with the conversation, each announced once; drafts, selection,
+focus, scrollback and acknowledged input survive all three, and a
+submission is refused outright when the logical seat has moved on
+underneath the pane. An approval is rendered as a numbered dialog carrying
+the exact scope, answered only with `1`–`3`, the arrows, `Enter` or `Esc` —
+never from the composer, which queues while blocked. A native session whose
+broker runs in headless approval mode is shown the deny option only, rather
+than a "Yes" that would quietly fail. `?` lists every binding, `Tab` moves
+focus, `Esc` interrupts (or closes a dialog first), and a double `Ctrl+C`
+quits. The composer itself is a bordered box with a `>` marker and a hint
+line naming what `Enter` does right now, and `/`, `@` and `!` open the
+slash-command list, the worktree-restricted file picker and a shell line
+that runs through the pane's own process tool under the same policy as any
+other tool call. See
+[`docs/design/2026-09-13-native-ux.md`](docs/design/2026-09-13-native-ux.md)
+and the mock in
+[`docs/design/mocks/2026-09-13-native-pane.html`](docs/design/mocks/2026-09-13-native-pane.html).
 
 #### Native workers, shared ownership and delegation receipts
 
