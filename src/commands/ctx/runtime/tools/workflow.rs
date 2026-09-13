@@ -51,3 +51,33 @@ pub(super) struct WorkflowAdvanceArgs {
     #[serde(default)]
     pub note: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::workflow::engine::StepOutcome;
+
+    #[test]
+    fn advance_arguments_are_closed_and_map_onto_the_engines_outcomes() {
+        let ok: WorkflowAdvanceArgs =
+            serde_json::from_str(r#"{"outcome":"success","note":"tests green"}"#)
+                .expect("a minimal advance parses");
+        assert_eq!(ok.id, None);
+        assert_eq!(ok.outcome.outcome(), StepOutcome::Success);
+        assert_eq!(ok.note.as_deref(), Some("tests green"));
+
+        let failed: WorkflowAdvanceArgs =
+            serde_json::from_str(r#"{"id":"wf-1","outcome":"failure"}"#).expect("failure parses");
+        assert_eq!(failed.outcome.outcome(), StepOutcome::Failure);
+
+        // A key the schema does not declare is refused rather than ignored, so
+        // a model cannot smuggle an "evidence" field past the verification store.
+        assert!(
+            serde_json::from_str::<WorkflowAdvanceArgs>(
+                r#"{"outcome":"success","evidence":"trust me"}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<WorkflowLookupArgs>(r#"{"branch":"main"}"#).is_err());
+    }
+}
