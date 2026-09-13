@@ -269,7 +269,14 @@ pub struct NativeToolCall {
 /// action at effect time). A deterministic fixture implementation lets every
 /// loop-correctness property below be proven without a filesystem, a
 /// subprocess or a paid provider call.
-pub trait ToolExecutor: std::fmt::Debug {
+///
+/// Issue #480 (roadmap N11): `Send` so a `Box<dyn ToolExecutor>` can move
+/// into the background thread [`spawn_interactive`] drives a dashboard
+/// native pane's turns on -- an unbounded trait object is not `Send`
+/// automatically, only a trait declared with the bound is, and every real
+/// implementor (`ClientToolExecutor`, `fixture::FixtureToolExecutor`) already
+/// was.
+pub trait ToolExecutor: std::fmt::Debug + Send {
     /// The tool definitions the provider is told about.
     fn definitions(&self) -> Vec<ToolDefinition>;
     /// Performs one call. Returning a receipt is not an admission that the
