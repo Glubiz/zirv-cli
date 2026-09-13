@@ -1157,6 +1157,13 @@ pub struct Parent<'a> {
     pub short: &'a str,
     pub role: &'a str,
     pub depth: u8,
+    /// Issue #488: the seat generation this delegator believes it holds,
+    /// from the same trusted runtime state `role` comes from
+    /// (`ExecutionIdentity::generation`). `None` for a caller with no seat
+    /// generation to present at all -- a manual CLI delegation, a worker
+    /// running outside any seat -- which is not fenced, exactly as
+    /// `seat::fence` leaves an unseated process alone.
+    pub generation: Option<u64>,
 }
 
 /// Registers one delegation and starts its worker, in that order.
@@ -1183,6 +1190,17 @@ pub fn delegate(
     parent: &Parent<'_>,
     now: u64,
 ) -> CtxResult<(Record, Publication)> {
+    // Issue #488 (item 4): a superseded generation may not start work, and a
+    // successor whose rollover is prepared but not yet committed may not
+    // either. This is FIRST -- ahead of the bounds check and far ahead of the
+    // durable launch receipt -- because a stale delegator that gets as far as
+    // a receipt has already named work the live generation knows nothing
+    // about. The refusal is `seat::StaleGeneration`, so a caller can tell
+    // "you were replaced" from "your transaction has not committed yet"
+    // without matching on prose.
+    if let Some(generation) = parent.generation {
+        super::seat::guard(state, parent.short, generation)?;
+    }
     let mut graph = super::coordinator::load(state, repo);
     let grant = super::coordinator::check(&super::coordinator::Bounds {
         parent_role: parent.role,
@@ -1981,6 +1999,7 @@ mod tests {
             short: "coord001",
             role: super::super::team::COORDINATOR,
             depth: 2,
+            generation: None,
         }
     }
 
@@ -2170,5 +2189,98 @@ mod tests {
         .expect_err("cancelled");
         assert!(error.to_string().contains("cancelled"), "{error}");
         assert!(list(&state, &repo).is_empty());
+    }
+
+    /// Issue #488 item 4: the delegation service is generation-fenced. A
+    /// delegator whose seat a rollover superseded starts nothing and leaves
+    /// no launch receipt, and the successor of a rollover that is only
+    /// PREPARED is refused for the other reason -- it does not hold the seat
+    /// yet.
+    #[test]
+    fn a_stale_or_uncommitted_generation_may_not_delegate() {
+        use super::super::seat;
+        let (_dir, state, repo, cfg) = fixture();
+        let session = "1c2d3e4f-aaaa-4bbb-8ccc-0123456789ab";
+        let short = super::super::sessions::short_id(session);
+        seat::register(
+            &state,
+            &short,
+            session,
+            "native",
+            None,
+            "anthropic",
+            super::super::team::COORDINATOR,
+            false,
+            1,
+        )
+        .expect("register");
+        let prepared = seat::prepare_onto(
+            &state,
+            &short,
+            "claude",
+            None,
+            RuntimeKind::Harness,
+            seat::Cause::Manual,
+            2,
+        )
+        .expect("prepare");
+
+        let mut launcher = RecordingLauncher::default();
+        let launches = launcher.launches.clone();
+        let parent = Parent {
+            short: &short,
+            generation: Some(prepared),
+            ..coordinator_parent()
+        };
+        let error = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &parent,
+            10,
+        )
+        .expect_err("a successor that has not committed may not delegate");
+        assert!(error.to_string().contains("uncommitted"), "{error}");
+        assert!(launches.lock().expect("lock").is_empty());
+        assert!(list(&state, &repo).is_empty(), "no receipt was written");
+
+        seat::commit(&state, &short, prepared, "successor-session", 3).expect("commit");
+        let superseded = Parent {
+            short: &short,
+            generation: Some(1),
+            ..coordinator_parent()
+        };
+        let error = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &superseded,
+            11,
+        )
+        .expect_err("the superseded source may not delegate");
+        assert!(error.to_string().contains("superseded"), "{error}");
+        assert!(list(&state, &repo).is_empty());
+
+        // And the live generation still delegates normally.
+        let live = Parent {
+            short: &short,
+            generation: Some(prepared),
+            ..coordinator_parent()
+        };
+        delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &live,
+            12,
+        )
+        .expect("the committed generation delegates");
+        assert_eq!(list(&state, &repo).len(), 1);
     }
 }

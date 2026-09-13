@@ -2031,6 +2031,11 @@ impl NativeToolClient {
                 short: &identity.short,
                 role: &identity.role,
                 depth,
+                // Issue #488: the generation the broker is already fenced on.
+                // A delegating session an automatic rollover superseded is
+                // refused here, before a durable launch receipt names work
+                // the live generation knows nothing about.
+                generation: Some(identity.generation),
             },
             state::now_secs(),
         )
