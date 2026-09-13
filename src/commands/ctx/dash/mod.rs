@@ -4880,7 +4880,7 @@ fn turn_signal_capable_for(cfg: &CtxConfig, agent_name: &str) -> bool {
 /// not a silently-headless pane; `LaunchMode::Headless` already reads as
 /// "no pin" through `launch_mode_pin_env`, so no separate `Option` is
 /// needed to make "no pin" explicit -- the enum already has that variant.
-fn build_turn_env(
+pub(crate) fn build_turn_env(
     cfg: &CtxConfig,
     state: &StateDir,
     repo: &Path,
@@ -5139,7 +5139,7 @@ pub(crate) fn select_live_dash_dir(candidates: &[DashCandidate]) -> Option<&Dash
 /// `AgentAdapter::interactive_cmd`'s output exactly (duplicated rather than
 /// shared: pulling in `chat` here for one helper would make `dash` and
 /// `chat` depend on each other in both directions).
-fn flatten_command(command: std::process::Command) -> Vec<String> {
+pub(crate) fn flatten_command(command: std::process::Command) -> Vec<String> {
     let mut argv = vec![command.get_program().to_string_lossy().to_string()];
     argv.extend(command.get_args().map(|a| a.to_string_lossy().to_string()));
     argv

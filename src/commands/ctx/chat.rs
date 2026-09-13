@@ -175,7 +175,7 @@ fn orchestrator_initial_prompt(
 /// Also returns the `HarnessRule` that picked the adapter, for the launch
 /// banner: an explicit `--agent` never reaches `resolve_default`, so that
 /// rule cannot come from `DefaultOrigin` alone.
-fn resolve_adapter(
+pub(crate) fn resolve_adapter(
     cfg: &CtxConfig,
     requested: Option<&str>,
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {

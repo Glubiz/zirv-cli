@@ -80,6 +80,9 @@ pub mod screen;
 pub mod search;
 pub mod search_index;
 pub mod seat;
+/// Issue #352: the persistent runtime service -- the process that owns
+/// pty/ConPTY sessions so they outlive the client looking at them.
+pub mod session;
 pub mod session_spend;
 pub mod sessions;
 pub mod signal;

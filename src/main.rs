@@ -68,6 +68,15 @@ fn is_top_level_memory(argv: &[String]) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("memory"))
 }
 
+/// True when argv[1] names the `session` built-in (issue #352): the
+/// persistent runtime's own verb tree, intercepted here for the same reason
+/// `memory` and `context` are -- it is a command family of its own, not a
+/// verb under `ctx`, and a repo `.zirv/Session.yaml` must never shadow it.
+fn is_top_level_session(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|s| s.eq_ignore_ascii_case("session"))
+}
+
 fn is_top_level_setup(argv: &[String]) -> bool {
     argv.get(1)
         .is_some_and(|name| name.eq_ignore_ascii_case("setup"))
@@ -323,6 +332,10 @@ async fn main() {
 
     if is_top_level_memory(&argv) {
         std::process::exit(ctx::memory_cli::dispatch(&argv[1..]));
+    }
+
+    if is_top_level_session(&argv) {
+        std::process::exit(ctx::session::dispatch(&argv[1..]));
     }
 
     if is_top_level_setup(&argv) {
