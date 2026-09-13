@@ -772,6 +772,17 @@ impl StateDir {
         self.0.join("dash")
     }
 
+    /// Issue #480 (roadmap N11): a native pane's persisted composer draft and
+    /// queued input, one file per pane session id
+    /// (`<state>/native-panes/<session>.json`), mirroring `adoption()`'s own
+    /// per-session layout above. Transient presentation (scroll, selection,
+    /// focus, expanded tool calls) is never written here -- only what must
+    /// survive a reconnect/resume: the in-progress draft and anything queued
+    /// but not yet submitted. See `super::dash::native_pane`.
+    pub fn native_panes(&self) -> PathBuf {
+        self.0.join("native-panes")
+    }
+
     /// Short on purpose: unix socket paths are capped near 104 bytes on macOS.
     pub fn sockets(&self) -> PathBuf {
         self.0.join("s")

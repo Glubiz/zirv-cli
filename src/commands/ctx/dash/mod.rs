@@ -14,6 +14,7 @@
 pub mod actions;
 pub mod hit;
 pub mod link;
+pub mod native_pane;
 pub mod notify;
 pub mod pane;
 pub mod roster;
