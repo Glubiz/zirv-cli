@@ -2042,7 +2042,13 @@ pub fn run_with<W: Write>(
                 let prompt = judgment_prompt(&surfaces, &evidence, DEFAULT_EXCERPT_LINES);
                 // Issue #89.
                 adapters::announce_sandbox_residual_once(adapter.as_ref(), cfg.chrome.events);
-                match handoff::run_model(adapter.as_ref(), &model, &prompt, JUDGMENT_TIMEOUT) {
+                match handoff::helper_answer(
+                    crate::commands::ctx::helper::ROLE_OPTIMIZE,
+                    adapter.as_ref(),
+                    &model,
+                    &prompt,
+                    JUDGMENT_TIMEOUT,
+                ) {
                     Ok(answer) => {
                         findings.extend(validate_judgment_findings(
                             parse_judgment(&answer),
