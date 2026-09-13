@@ -187,6 +187,16 @@ pub struct ExecArgs {
     /// still holding the old one.
     #[arg(long)]
     pub resume: Option<String>,
+    /// Issue #480 (roadmap N11): native runtime only. `json` (the default)
+    /// prints exactly the structured final status this flag's absence
+    /// always printed -- the JSON contract is unchanged. `plain` ADDITIONALLY
+    /// renders the session's transcript through `dash::native_pane`'s own
+    /// non-ratatui renderer (the same view model the dashboard pane draws,
+    /// with no terminal required) after the JSON status line, so a native
+    /// session is inspectable without ratatui at all -- piped output, a CI
+    /// log, or a terminal too small for the dashboard.
+    #[arg(long, default_value = "json")]
+    pub view: String,
     /// Native runtime only, operator-only: replace the live provider with a
     /// deterministic fixture script. The only accepted value is
     /// `fixture:<path>`. No configuration layer can set this -- least of all
@@ -238,6 +248,7 @@ impl Default for ExecArgs {
             runtime: super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
             role: "worker".to_string(),
+            view: "json".to_string(),
             resume: None,
             provider: None,
             fixture_tools: None,
@@ -799,6 +810,10 @@ fn run_native<W: Write>(
         return Err("--fixture-tools needs --provider fixture:<path>".into());
     }
 
+    if !matches!(args.view.as_str(), "json" | "plain") {
+        return Err(format!("--view '{}': expected `json` or `plain`", args.view).into());
+    }
+
     let mut limits = super::runtime::native::NativeLimits::default();
     if let Some(max_tool_calls) = args.max_tool_calls {
         limits.max_tool_calls = max_tool_calls;
@@ -806,26 +821,92 @@ fn run_native<W: Write>(
     if let Some(timeout_secs) = args.timeout_secs {
         limits.max_wall_ms = timeout_secs.saturating_mul(1000);
     }
-    super::runtime::native::run_headless(
-        &mut super::runtime::native::HeadlessRequest {
-            repo,
-            prompt: prompt.trim(),
-            route: args.route.as_deref(),
-            role: &args.role,
-            limits,
-            resume: args.resume.as_deref(),
-            provider: args.provider.as_deref(),
-            fixture_tools: args.fixture_tools.as_deref(),
-            // Issue #479: a plain `zirv ctx exec --runtime native` is not a
-            // delegation. It holds no task card and no writer permit, so its
-            // repository writes are refused rather than silently unbacked --
-            // `zirv agent --runtime native` is the surface that grants both.
-            task: None,
-            writer: None,
-        },
-        w,
-        env,
-    )
+    let mut request = super::runtime::native::HeadlessRequest {
+        repo,
+        prompt: prompt.trim(),
+        route: args.route.as_deref(),
+        role: &args.role,
+        limits,
+        resume: args.resume.as_deref(),
+        provider: args.provider.as_deref(),
+        fixture_tools: args.fixture_tools.as_deref(),
+        // Issue #479: a plain `zirv ctx exec --runtime native` is not a
+        // delegation. It holds no task card and no writer permit, so its
+        // repository writes are refused rather than silently unbacked --
+        // `zirv agent --runtime native` is the surface that grants both.
+        task: None,
+        writer: None,
+    };
+
+    if args.view != "plain" {
+        return super::runtime::native::run_headless(&mut request, w, env);
+    }
+
+    // `--view plain`: the exact same JSON status `run_headless` always
+    // printed (the contract is unchanged), followed by the same view model
+    // `dash::native_pane`'s ratatui renderer draws, rendered as plain text
+    // -- no terminal, no ratatui, required to read it.
+    let mut notices: Vec<u8> = Vec::new();
+    let status = super::runtime::native::run_session(&mut request, &mut notices, env)?;
+    if !notices.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&notices));
+    }
+    writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
+
+    let state = super::state::StateDir::resolve(env)?;
+    let plain = render_native_session_plain(&state, &status.session, repo);
+    match plain {
+        Ok(text) => {
+            writeln!(w)?;
+            write!(w, "{text}")?;
+        }
+        Err(error) => {
+            eprintln!("--view plain: could not render the transcript: {error}");
+        }
+    }
+    Ok(status.exit_code)
+}
+
+/// Replays `session`'s journal and renders it through `dash::native_pane`'s
+/// own plain-text renderer -- exactly the view model a dashboard native pane
+/// draws, over the SAME reducer (`build_transcript`) both surfaces share, so
+/// this headless view and the dashboard's live one never diverge in what a
+/// tool call, a diff or a test outcome looks like.
+fn render_native_session_plain(
+    state: &super::state::StateDir,
+    session: &str,
+    repo: &Path,
+) -> CtxResult<String> {
+    use super::dash::native_pane::{
+        NativePresentation, StatusFacts, build_transcript, render_plain, resolve_billing,
+    };
+    use super::runtime::journal::{Journal, JournalSessionId};
+    use super::runtime::native::SessionState;
+
+    let journal = Journal::open(state)?;
+    let session_id = JournalSessionId::new(session)?;
+    let identity = journal.session(&session_id)?;
+    let conversation = journal.replay(&session_id)?;
+    let view = build_transcript(&conversation);
+    let facts = StatusFacts {
+        model: format!(
+            "{}/{}",
+            identity.route.model.vendor, identity.route.model.id
+        ),
+        route: identity.route.route.to_string(),
+        runtime: "native".to_string(),
+        billing: resolve_billing(&identity.route, repo),
+        session_state: SessionState::Completed,
+        turn_state: None,
+        blocked: false,
+        unread_result: false,
+    };
+    Ok(render_plain(
+        &view,
+        &NativePresentation::default(),
+        &facts,
+        100,
+    ))
 }
 
 /// Same supervised execution as [run_with], plus the per-harness accounting

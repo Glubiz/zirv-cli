@@ -8,21 +8,25 @@
 //!
 //! Presentation state (scroll, selection, focus, draft, expanded tool calls)
 //! is a separate struct ([`NativePresentation`]) from runtime/session
-//! ownership: nothing in this module opens a socket, spawns a process, holds
-//! a [`super::super::session::client::Client`], or touches raw mode. A
-//! future dashboard event loop drives a real native session (N09's queue/
-//! steer/interrupt semantics through the session client) and feeds this
-//! module the facts it already has -- a replayed [`journal::ConversationState`]
-//! and a small [`StatusFacts`] snapshot -- rather than this module ever
-//! reaching for them itself. That is also why this file wires no `PaneKind`
-//! into `dash::mod`'s `Vec<Pane>` today: the issue's own acceptance criteria
-//! ask for "the initial usable view" with deterministic, no-terminal-needed
-//! coverage over the view model, and name N21 as the step that finishes
-//! integrated multi-agent attention/rollover UX. Wiring this view model into
-//! the live event loop's pane list, mail sweep and budget accounting is a
-//! second, separably reviewable change; see this module's own design note
-//! (`docs/design/2026-09-13-native-pane.md`) for the honest list of what is
-//! deferred.
+//! ownership: [`NativePaneRuntime`] is the one thing in this module that
+//! owns a live session (`runtime::native::InteractiveSession`, itself a
+//! thin handle onto a background thread -- no PTY, no vt100 -- see that
+//! module's own doc comment), and it never touches raw mode itself, only
+//! the same `dash::mod` terminal-setup helpers a wrapped dashboard already
+//! calls (`install_panic_hook`/`enable_raw_mode`/`push_keyboard_
+//! enhancement`/`teardown_terminal`/`restore_panic_hook`, reused verbatim by
+//! [`run_native_dashboard`], never modified).
+//!
+//! [`run_native_dashboard`] is a SEPARATE, additional entry point from
+//! `dash::mod::run_dashboard`: it does not add a `PaneKind` to `dash::mod`'s
+//! existing `Vec<Pane>` (that list, and the ~100 call sites that thread it
+//! through mail sweep/budget accounting/attention projection/restore
+//! roster, stay untouched, so nothing about a wrapped-harness dashboard's
+//! existing behaviour changes). Today a native pane is its own dedicated,
+//! single-pane dashboard mode, opened by `zirv chat --runtime native`
+//! rather than mixed into a multi-pane wrapped dashboard; see the design
+//! note (`docs/design/2026-09-13-native-pane.md`) for exactly what mixed-
+//! pane integration this still owes and why it was scoped out here.
 //!
 //! [`build_transcript`] is the reducer: pure, total, and free of I/O, the
 //! clock or randomness, so replaying the same
@@ -34,14 +38,15 @@
 //! every rendering behaviour below (unicode/CJK/emoji width, wrapping, a
 //! narrow pane, follow-mode scrolling) is covered by tests that construct a
 //! view model directly and never touch a terminal.
-#![allow(dead_code)] // not yet wired into `dash::mod`'s live event loop; see the module doc above.
-
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -49,13 +54,17 @@ use ratatui::widgets::Paragraph;
 
 use crate::style::{self, Tone};
 
+use super::super::CtxResult;
+use super::super::config::{CtxConfig, EnvLookup};
 use super::super::runtime::journal::{
-    AssistantBlock, ContentRef, ConversationState, ExecutionRecord, ExecutionState, MessageRole,
-    ToolCallId,
+    AssistantBlock, ContentRef, ConversationState, EventScope, ExecutionRecord, ExecutionState,
+    Journal, MessageId, MessageRole, RouteIdentity, ToolCallId,
 };
 use super::super::runtime::native::{
+    self, InteractiveProgress, InteractiveRequest, InteractiveSession,
     SessionState as NativeSessionState, TurnState as NativeTurnState,
 };
+use super::super::state::{StateDir, now_secs};
 
 // =========================================================================
 // Transcript view model -- pure reduction of `ConversationState`
@@ -590,7 +599,16 @@ pub enum ComposerAction {
     MoveDown,
     Home,
     End,
+    /// Explicit history navigation, independent of cursor position.
+    /// `key_to_action`'s own contract never emits these -- `MoveUp`/
+    /// `MoveDown` already decide history-vs-cursor from where the cursor
+    /// is (see their own handling in `apply_composer_action`) -- so no
+    /// caller constructs these today; kept as an explicit action a future
+    /// dedicated key binding (or a non-keyboard UI, e.g. a history picker)
+    /// can reach without duplicating that cursor-position logic.
+    #[allow(dead_code)]
     HistoryUp,
+    #[allow(dead_code)]
     HistoryDown,
     Submit,
     ClearLine,
@@ -861,6 +879,13 @@ fn history_down(state: &mut ComposerState) {
 /// an untracked new file is still a legitimate reference), so a caller
 /// deciding whether to *attach* the file still owes its own read/size
 /// policy; this is purely "does this token look like a real path".
+///
+/// Tested (`resolve_file_refs_finds_existing_and_missing_paths`,
+/// `resolve_file_refs_finds_a_unicode_path`) but not yet called from
+/// `run_native_dashboard`'s own minimal loop -- rendering a live `@`-hint
+/// line needs `composer_lines`/`render_native_pane` to take a workdir,
+/// which is scoped out of this round; see the design note.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileRef {
     /// The raw token including the leading `@`.
@@ -876,6 +901,7 @@ pub struct FileRef {
 /// `exists` check, which is why this is a plain function rather than part
 /// of [`apply_composer_action`] -- a caller re-runs it on demand (e.g. on
 /// every draft change) rather than this module owning a debounce policy.
+#[allow(dead_code)] // see `FileRef`'s own doc comment
 pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
     let mut refs = Vec::new();
     let mut idx = 0usize;
@@ -914,6 +940,13 @@ pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
 /// needs this coalescing at all. Pure and deterministic given the recorded
 /// gaps, so a large paste's actual arrival timing can be fixture data
 /// rather than a real terminal.
+/// Tested (`coalesce_paste_chunks_joins_only_chunks_within_the_gap`) but not
+/// yet called: `run_native_dashboard`'s loop only ever sees `Event::Paste`
+/// (bracketed paste, the path this function's own doc comment says makes it
+/// unnecessary) or single key presses -- no terminal-capability probe/
+/// fallback path exists yet to decide when a rapid run of `Event::Key`
+/// presses should be coalesced instead.
+#[allow(dead_code)]
 pub fn coalesce_paste_chunks(chunks: &[(String, Duration)], gap: Duration) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (text, elapsed) in chunks {
@@ -1041,6 +1074,10 @@ impl NativePresentation {
         }
     }
 
+    /// Tested (`selection_and_expanded_survive_a_resize_no_op`) but not yet
+    /// called from `run_native_dashboard`'s loop -- no copy mechanism reads
+    /// `selection` yet; see the design note.
+    #[allow(dead_code)]
     pub fn set_selection(&mut self, start: usize, end: usize) {
         let (start, end) = if start <= end {
             (start, end)
@@ -1050,6 +1087,7 @@ impl NativePresentation {
         self.selection = Some((start, end));
     }
 
+    #[allow(dead_code)] // see `set_selection`'s own doc comment
     pub fn clear_selection(&mut self) {
         self.selection = None;
     }
@@ -1800,6 +1838,392 @@ pub fn render_plain(
         out.push('\n');
     }
     out
+}
+
+// =========================================================================
+// The live pane: an interactive native session driving this module's own
+// reducer/composer/renderer, and a dedicated dashboard loop that opens one.
+// =========================================================================
+
+/// What `zirv chat --runtime native` needs to open one.
+pub struct NativeDashboardSpec {
+    pub repo: PathBuf,
+    pub role: String,
+    pub route: Option<String>,
+    /// Whether this session should hold a writer permit for `repo` -- see
+    /// `runtime::native::InteractiveRequest::writing`. A plain `zirv chat
+    /// --runtime native` is the operator's own seat, the same as the
+    /// orchestrator pane of a wrapped dashboard, so it is always `true`
+    /// from `chat.rs`'s own call; a future read-only spawn path (a native
+    /// reviewer pane, say) would pass `false`.
+    pub writing: bool,
+}
+
+/// The billing label (`"api"`/`"subscription"`) for `route`'s own account,
+/// read from the operator's native provider configuration. `style::
+/// PLACEHOLDER` when nothing resolves (no configuration, an account the
+/// config no longer names) -- the same "unknown, not a guess" convention
+/// every other status fact in this module uses.
+pub fn resolve_billing(route: &RouteIdentity, repo: &Path) -> String {
+    use super::super::provider::BillingClass;
+    use super::super::provider::config::NativeConfig;
+    let Ok(home) = crate::utils::home_dir() else {
+        return style::PLACEHOLDER.to_string();
+    };
+    let Ok(Some(native)) = NativeConfig::load(&home, repo) else {
+        return style::PLACEHOLDER.to_string();
+    };
+    match native
+        .accounts
+        .get(&route.account)
+        .map(|account| account.billing)
+    {
+        Some(BillingClass::Api) => "api".to_string(),
+        Some(BillingClass::Subscription) => "subscription".to_string(),
+        None => style::PLACEHOLDER.to_string(),
+    }
+}
+
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A live native pane: the one thing in this module that owns a running
+/// session. Everything else it holds is either a pure derivation of that
+/// session's journal ([`ConversationState`]/[`TranscriptView`], refreshed by
+/// [`Self::tick`]) or this module's own already-tested presentation state.
+pub struct NativePaneRuntime {
+    session: InteractiveSession,
+    journal: Journal,
+    presentation: NativePresentation,
+    conversation: ConversationState,
+    transcript: TranscriptView,
+    session_state: NativeSessionState,
+    turn_state: Option<NativeTurnState>,
+    billing: String,
+    /// Set once an `InteractiveProgress::Ended` is observed; the dashboard
+    /// loop's own cue to stop.
+    pub ended: bool,
+}
+
+impl NativePaneRuntime {
+    pub fn spawn(
+        cfg: &CtxConfig,
+        state: &StateDir,
+        env: EnvLookup<'_>,
+        spec: NativeDashboardSpec,
+    ) -> CtxResult<Self> {
+        let _ = cfg;
+        let session = native::spawn_interactive(
+            InteractiveRequest {
+                repo: spec.repo.clone(),
+                role: spec.role.clone(),
+                route: spec.route.clone(),
+                limits: native::NativeLimits::default(),
+                task: None,
+                writing: spec.writing,
+            },
+            env,
+        )?;
+        let journal = Journal::open(state)?;
+        let conversation = journal.replay(&session.session)?;
+        let transcript = build_transcript(&conversation);
+        let billing = resolve_billing(&session.route, &spec.repo);
+
+        let mut presentation = NativePresentation::default();
+        let draft = load_draft(state, &session.handle.short);
+        draft.restore_onto(&mut presentation.composer);
+
+        Ok(Self {
+            session,
+            journal,
+            presentation,
+            conversation,
+            transcript,
+            session_state: NativeSessionState::Idle,
+            turn_state: None,
+            billing,
+            ended: false,
+        })
+    }
+
+    /// Drains worker progress and re-reads the journal. Called once per
+    /// dashboard tick; cheap (a `try_recv` loop plus one SQLite read) so a
+    /// short poll interval costs nothing while the session is idle.
+    pub fn tick(&mut self) {
+        for progress in self.session.drain_progress() {
+            match progress {
+                InteractiveProgress::Busy => {
+                    self.session_state = NativeSessionState::Running;
+                    self.turn_state = Some(NativeTurnState::Requesting);
+                }
+                InteractiveProgress::Idle => {
+                    self.session_state = NativeSessionState::Idle;
+                    self.turn_state = None;
+                }
+                InteractiveProgress::Failed(_) => {
+                    self.session_state = NativeSessionState::Idle;
+                    self.turn_state = None;
+                }
+                InteractiveProgress::Ended => {
+                    self.ended = true;
+                    self.session_state = NativeSessionState::Completed;
+                }
+            }
+        }
+        self.refresh_transcript();
+    }
+
+    fn refresh_transcript(&mut self) {
+        let Ok(conversation) = self.journal.replay(&self.session.session) else {
+            return;
+        };
+        let before = self.transcript.items.len();
+        self.conversation = conversation;
+        self.transcript = build_transcript(&self.conversation);
+        let grown = self.transcript.items.len().saturating_sub(before);
+        if grown > 0 {
+            self.presentation.scroll.on_items_appended(grown);
+            let terminal = matches!(
+                self.session_state,
+                NativeSessionState::Idle
+                    | NativeSessionState::Completed
+                    | NativeSessionState::Failed
+                    | NativeSessionState::Interrupted
+            );
+            if terminal {
+                self.presentation.note_terminal_reached();
+            }
+        }
+    }
+
+    pub fn status_facts(&self) -> StatusFacts {
+        StatusFacts {
+            model: format!(
+                "{}/{}",
+                self.session.route.model.vendor, self.session.route.model.id
+            ),
+            route: self.session.route.route.to_string(),
+            runtime: "native".to_string(),
+            billing: self.billing.clone(),
+            session_state: self.session_state,
+            turn_state: self.turn_state,
+            // Issue #480 (deferred, see design note): a live approval-
+            // pending signal needs the enforcement broker's own facts,
+            // which this pane does not yet read.
+            blocked: false,
+            unread_result: self.presentation.unread,
+        }
+    }
+
+    pub fn view(&self) -> (&TranscriptView, &NativePresentation) {
+        (&self.transcript, &self.presentation)
+    }
+
+    pub fn presentation_mut(&mut self) -> &mut NativePresentation {
+        &mut self.presentation
+    }
+
+    /// Applies one composer action, and -- when it was a `Submit` -- routes
+    /// the submitted text per [`classify_submit_intent`]. A blocked/mid-turn
+    /// submission is never sent through `InteractiveSession::submit`
+    /// (`Queue`) or treated as an approval answer; it is either queued in
+    /// the composer's own `queued` list or, mid-turn, written straight to
+    /// the journal as steering (`Steer`) -- see `InteractiveSession::submit`
+    /// and `write_steering`'s own doc comments for why those are two
+    /// different paths.
+    pub fn handle_composer_action(&mut self, action: ComposerAction) {
+        let outcome = apply_composer_action(&mut self.presentation.composer, action);
+        let ComposerOutcome::Submitted(text) = outcome else {
+            return;
+        };
+        match classify_submit_intent(&self.status_facts()) {
+            SubmitIntent::Immediate => {
+                let _ = self.session.submit(text);
+            }
+            SubmitIntent::Steer => {
+                let _ = self.write_steering(&text);
+            }
+            SubmitIntent::Queue => {
+                self.presentation.composer.queued.push(QueuedInput {
+                    text,
+                    steering: false,
+                    queued_at_ms: now_ms_u64(),
+                });
+            }
+        }
+    }
+
+    /// Commits one steering input straight to this pane's own journal
+    /// handle, bypassing the busy worker thread entirely -- see `runtime::
+    /// native::InteractiveSession::submit`'s own doc comment for why a
+    /// turn already in flight cannot be reached through that channel, and
+    /// `runtime::native::NativeLoop::queued_input`'s doc comment for how the
+    /// running turn picks this up between requests without either side
+    /// coordinating directly.
+    fn write_steering(&mut self, text: &str) -> CtxResult<()> {
+        let message_id = MessageId::new(format!("steer-{}", uuid::Uuid::new_v4().simple()))?;
+        self.journal.acknowledge_input(
+            &self.session.session,
+            self.session.handle.generation,
+            &EventScope::default(),
+            message_id,
+            text.to_string(),
+            true,
+            None,
+            now_secs(),
+        )?;
+        Ok(())
+    }
+
+    pub fn interrupt(&self) {
+        self.session.interrupt();
+    }
+
+    /// Persists the draft/queued input and stops the worker thread. Takes
+    /// `self` by value: there is nothing left to drive afterward.
+    pub fn shutdown(self, state: &StateDir) {
+        let short = self.session.handle.short.clone();
+        persist_draft(
+            state,
+            &short,
+            &PersistedDraft::from_composer(&self.presentation.composer),
+        );
+        self.session.shutdown();
+    }
+}
+
+/// A dedicated, single-pane dashboard loop for a native session -- `zirv
+/// chat --runtime native`'s own entry point. Reuses `dash::mod`'s existing
+/// terminal-setup/teardown helpers verbatim (same `install_panic_hook`/
+/// `enable_raw_mode`/`EnterAlternateScreen`/`push_keyboard_enhancement`/
+/// `teardown_terminal`/`restore_panic_hook` sequence `run_dashboard` itself
+/// uses) rather than reimplementing raw-mode handling a second time, so
+/// there is exactly one place in this codebase that enters/leaves raw mode
+/// and the alternate screen.
+///
+/// **Key contract**, beyond the composer's own (see [`key_to_action`]):
+/// `Ctrl+Q` quits (persisting the draft first); `Ctrl+C` interrupts the
+/// current turn without quitting; `Up`/`Down` scroll the transcript when no
+/// composer action claims them.
+pub fn run_native_dashboard(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    env: EnvLookup<'_>,
+    spec: NativeDashboardSpec,
+) -> CtxResult<i32> {
+    let mut pane = NativePaneRuntime::spawn(cfg, state, env, spec)?;
+
+    let previous_panic_hook = super::install_panic_hook();
+    if let Err(error) = crossterm::terminal::enable_raw_mode() {
+        super::restore_panic_hook(&previous_panic_hook);
+        pane.shutdown(state);
+        return Err(format!("native chat: enable_raw_mode failed: {error}").into());
+    }
+    if let Err(error) = crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)
+    {
+        super::teardown_terminal(false);
+        super::restore_panic_hook(&previous_panic_hook);
+        pane.shutdown(state);
+        return Err(format!("native chat: EnterAlternateScreen failed: {error}").into());
+    }
+    let keyboard_enhancement_pushed = super::push_keyboard_enhancement();
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            super::teardown_terminal(keyboard_enhancement_pushed);
+            super::restore_panic_hook(&previous_panic_hook);
+            pane.shutdown(state);
+            return Err(format!("native chat: terminal init failed: {error}").into());
+        }
+    };
+
+    let exit_code = 'outer: loop {
+        pane.tick();
+        let _ = terminal.draw(|f| {
+            let facts = pane.status_facts();
+            let (view, presentation) = pane.view();
+            render_native_pane(f, f.area(), view, presentation, &facts);
+        });
+        if pane.ended {
+            break 'outer 0;
+        }
+        if matches!(event::poll(Duration::from_millis(150)), Ok(true)) {
+            match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    if ctrl && key.code == KeyCode::Char('q') {
+                        break 'outer 0;
+                    }
+                    if ctrl && key.code == KeyCode::Char('c') {
+                        pane.interrupt();
+                        continue 'outer;
+                    }
+                    // Tab swaps which region has focus; every other key's
+                    // meaning depends on that focus, exactly the split the
+                    // composer's own key contract already assumes (Up/Down
+                    // at a logical-line edge mean "browse submit history"
+                    // only when the composer itself has focus -- a
+                    // `Transcript`-focused Up/Down here means "scroll").
+                    if key.code == KeyCode::Tab {
+                        let presentation = pane.presentation_mut();
+                        presentation.focus = match presentation.focus {
+                            PaneFocus::Composer => PaneFocus::Transcript,
+                            PaneFocus::Transcript => PaneFocus::Composer,
+                        };
+                        continue 'outer;
+                    }
+                    if pane.presentation_mut().focus == PaneFocus::Transcript {
+                        let total = pane.view().0.items.len().max(1);
+                        match key.code {
+                            KeyCode::Up => pane.presentation_mut().scroll.scroll_up(1, total),
+                            KeyCode::Down => pane.presentation_mut().scroll.scroll_down(1),
+                            KeyCode::PageUp => pane.presentation_mut().scroll.scroll_up(10, total),
+                            KeyCode::PageDown => pane.presentation_mut().scroll.scroll_down(10),
+                            KeyCode::Home => pane.presentation_mut().scroll.scroll_up(total, total),
+                            KeyCode::End => {
+                                let presentation = pane.presentation_mut();
+                                presentation.scroll.jump_to_bottom();
+                                presentation.mark_seen();
+                            }
+                            // Expands/collapses the most recent tool call --
+                            // a minimal binding until a per-item cursor
+                            // exists to target an arbitrary one.
+                            KeyCode::Char('e') | KeyCode::Enter => {
+                                let key = pane
+                                    .view()
+                                    .0
+                                    .items
+                                    .iter()
+                                    .rev()
+                                    .find_map(|item| item.expand_key())
+                                    .map(str::to_string);
+                                if let Some(key) = key {
+                                    pane.presentation_mut().toggle_expanded(&key);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(action) = key_to_action(key) {
+                        pane.handle_composer_action(action);
+                    }
+                }
+                Ok(Event::Paste(text)) => {
+                    pane.handle_composer_action(ComposerAction::InsertText(text));
+                }
+                _ => {}
+            }
+        }
+    };
+
+    super::teardown_terminal(keyboard_enhancement_pushed);
+    super::restore_panic_hook(&previous_panic_hook);
+    pane.shutdown(state);
+    Ok(exit_code)
 }
 
 #[cfg(test)]
