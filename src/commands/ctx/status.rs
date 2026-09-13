@@ -3957,7 +3957,8 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let same = permit::acquire_writer(&state, 0, "same-repo", &repo, None).expect("granted");
-        let other = permit::acquire_writer(&state, 0, "other-repo", &other_repo, None).expect("granted");
+        let other =
+            permit::acquire_writer(&state, 0, "other-repo", &other_repo, None).expect("granted");
 
         let mut out = Vec::new();
         run_with(

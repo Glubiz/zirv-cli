@@ -601,14 +601,16 @@ mod tests {
 
         let legacy = permit::acquire_writer(&state, 4, "session legacy: claude", &tree, None)
             .expect("the legacy worker takes the tree");
-        let native = permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree, None);
+        let native =
+            permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree, None);
         assert!(
             native.is_err(),
             "a native worker must not hold a checkout a legacy worker already writes"
         );
         drop(legacy);
-        let native = permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree, None)
-            .expect("released");
+        let native =
+            permit::acquire_writer(&state, 4, "session nativeone: native/fast", &tree, None)
+                .expect("released");
         assert!(
             permit::acquire_writer(&state, 4, "session legacy2: claude", &tree, None).is_err(),
             "and the exclusion holds in the other direction too"
