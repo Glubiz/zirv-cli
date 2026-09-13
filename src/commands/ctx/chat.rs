@@ -64,6 +64,15 @@ pub struct ChatArgs {
     /// every `zirv chat` did before the runtime existed.
     #[arg(long, default_value_t = false)]
     pub no_session: bool,
+    /// Issue #480 (roadmap N11): `native` opens a structured native
+    /// conversation pane (N09's in-process agent loop, no coding harness
+    /// installed, no PTY) instead of a wrapped-harness session. Every other
+    /// value, and the default (unset), is today's wrapped-harness dashboard.
+    /// A native pane never accepts `--agent`, `--simple`, `--resume` or
+    /// `extra` -- see `run_with`'s own refusal for a value combined with any
+    /// of those.
+    #[arg(long)]
+    pub runtime: Option<String>,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -300,6 +309,67 @@ fn probe_terminal() -> (bool, bool, bool, (u16, u16), Option<term::VtGuard>) {
     (stdout_is_tty, stdin_is_tty, vt_ok, size, vt_guard)
 }
 
+/// `zirv chat --runtime native`'s own refusal/dispatch, split out of
+/// `run_with` so the wrapped-harness path above it never has to know this
+/// branch exists. Refuses a runtime value this build does not recognize and
+/// every wrapped-harness-only flag (`--agent`, `--simple`, `--resume`, a
+/// trailing `extra` argv) rather than silently ignoring them -- a flag that
+/// looks accepted but does nothing is worse than a refusal that says why.
+#[allow(clippy::too_many_arguments)]
+fn run_native_chat<E: Write>(
+    runtime: &str,
+    cfg: &CtxConfig,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    stderr: &mut E,
+    args: &ChatArgs,
+    stdout_is_tty: bool,
+    stdin_is_tty: bool,
+    vt_ok: bool,
+) -> CtxResult<i32> {
+    if runtime != "native" {
+        writeln!(
+            stderr,
+            "--runtime '{runtime}': expected `native` (omit --runtime for a wrapped harness)"
+        )?;
+        return Ok(1);
+    }
+    if args.agent.is_some()
+        || args.simple
+        || args.resume
+        || args.pin_harness
+        || !args.extra.is_empty()
+    {
+        writeln!(
+            stderr,
+            "--runtime native accepts no --agent, --simple, --resume, --pin-harness or trailing \
+             arguments -- those are wrapped-harness-only"
+        )?;
+        return Ok(1);
+    }
+    if !(stdout_is_tty && stdin_is_tty && vt_ok) {
+        writeln!(
+            stderr,
+            "zirv chat --runtime native needs an interactive terminal on both stdin and stdout"
+        )?;
+        return Ok(1);
+    }
+    // `run_with`'s own nesting refusal (F2) already ran, before `cfg` was
+    // even loaded, and covers this branch too -- not repeated here.
+    let state = StateDir::resolve(env)?;
+    dash::native_pane::run_native_dashboard(
+        cfg,
+        &state,
+        env,
+        dash::native_pane::NativeDashboardSpec {
+            repo: repo.to_path_buf(),
+            role: "orchestrator".to_string(),
+            route: None,
+            writing: true,
+        },
+    )
+}
+
 /// `stderr` is a second, explicit writer -- not `std::io::stderr()` reached
 /// for directly -- so the one diagnostic this function ever prints on its
 /// own (the no-adapter/config error below) stays testable the same way
@@ -335,6 +405,29 @@ pub fn run_with<W: Write, E: Write>(
     // the console's original VT mode before `wrap`'s own raw-mode session
     // (which relies on VT already being on) even opens.
     let (stdout_is_tty, stdin_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
+
+    // Issue #480 (roadmap N11): `--runtime native` branches out to the
+    // structured native pane before any of the wrapped-harness setup below
+    // (adapter resolution, `ChromeCaps`, `dash_eligible`) -- none of it
+    // applies to a session with no coding harness and no PTY. `_vt_guard`
+    // stays in scope across this call (it is a `let`-bound local of this
+    // same function, not dropped until `run_with` itself returns), so the
+    // native pane's own `ratatui`/`crossterm` setup sees the same VT mode
+    // `wrap`'s raw-mode session would have.
+    if let Some(runtime) = args.runtime.as_deref() {
+        return run_native_chat(
+            runtime,
+            &cfg,
+            repo,
+            env,
+            stderr,
+            args,
+            stdout_is_tty,
+            stdin_is_tty,
+            vt_ok,
+        );
+    }
+
     let chrome = ChromeCaps::probe(stdout_is_tty, vt_ok, size, &cfg.chrome, args.simple, false);
 
     let (adapter, rule) = match resolve_adapter(&cfg, args.agent.as_deref()) {
@@ -1800,6 +1893,7 @@ mod tests {
             force_pace: false,
             pin_harness: false,
             no_session: false,
+            runtime: None,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1846,6 +1940,7 @@ mod tests {
             force_pace: false,
             pin_harness: false,
             no_session: false,
+            runtime: None,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1905,6 +2000,7 @@ mod tests {
             force_pace: false,
             pin_harness: false,
             no_session: false,
+            runtime: None,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1959,6 +2055,7 @@ mod tests {
             force_pace: false,
             pin_harness: false,
             no_session: false,
+            runtime: None,
             extra: Vec::new(),
         }
     }
