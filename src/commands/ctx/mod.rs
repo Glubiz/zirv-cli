@@ -20,6 +20,7 @@ pub mod context_cli;
 pub mod context_lint;
 pub mod context_status;
 pub mod dash;
+pub mod delegation;
 pub mod diagnostics;
 pub mod discover;
 pub mod drift;
