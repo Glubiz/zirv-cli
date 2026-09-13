@@ -173,20 +173,41 @@ fn apply_probe(rows: &mut [IntegrationStatus], probes: &[serde_json::Value]) {
     if probes.is_empty() || row.state == IntegrationState::Unavailable {
         return;
     }
-    let reachable = probes
+    let reached: Vec<&str> = probes
         .iter()
         .filter(|probe| probe["state"] == "available")
-        .count();
+        .filter_map(|probe| probe["server"].as_str())
+        .collect();
+    let unreached: Vec<&str> = probes
+        .iter()
+        .filter(|probe| probe["state"] != "available")
+        .filter_map(|probe| probe["server"].as_str())
+        .collect();
+    let reachable = reached.len();
     if reachable == probes.len() {
         row.state = IntegrationState::Available;
-        row.detail = format!("{reachable} server(s) answered");
+        row.detail = format!("{reachable} server(s) answered: {}", reached.join(", "));
         row.diagnosis = None;
     } else {
+        // The admission rule is unchanged (anything short of every configured
+        // server answering is Unavailable); only the detail changes, so a
+        // mixed probe names both halves instead of collapsing them into an
+        // undifferentiated count.
         row.state = IntegrationState::Unavailable;
         row.diagnosis = Some(format!(
-            "{} of {} configured server(s) did not answer",
+            "{} of {} configured server(s) did not answer: {} (reached: {})",
             probes.len() - reachable,
-            probes.len()
+            probes.len(),
+            if unreached.is_empty() {
+                "none".to_string()
+            } else {
+                unreached.join(", ")
+            },
+            if reached.is_empty() {
+                "none".to_string()
+            } else {
+                reached.join(", ")
+            },
         ));
     }
 }
@@ -317,5 +338,29 @@ mod tests {
         );
         assert_eq!(rows[0].state, IntegrationState::Available);
         assert!(rows[0].diagnosis.is_none());
+    }
+
+    #[test]
+    fn a_mixed_probe_names_both_the_reached_and_the_unreached_servers() {
+        let mut rows = vec![IntegrationStatus::unverified(
+            IntegrationId::Mcp,
+            "2 configured server(s): docs, ghost",
+            "not contacted",
+        )];
+        apply_probe(
+            &mut rows,
+            &[
+                json!({"server": "docs", "state": "available", "detail": "3 tool(s)"}),
+                json!({"server": "ghost", "state": "unavailable", "detail": "no such binary"}),
+            ],
+        );
+        // The admission rule does not change on a mixed probe: anything
+        // short of every configured server answering is still Unavailable.
+        assert_eq!(rows[0].state, IntegrationState::Unavailable);
+        let diagnosis = rows[0].diagnosis.as_deref().unwrap_or_default();
+        assert!(
+            diagnosis.contains("docs") && diagnosis.contains("ghost"),
+            "a mixed probe must name both the reached and unreached servers: {diagnosis}"
+        );
     }
 }

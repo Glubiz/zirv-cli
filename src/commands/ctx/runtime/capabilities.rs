@@ -388,8 +388,23 @@ pub fn host_of(url: &str) -> Option<String> {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     let authority = rest.split(['/', '?', '#']).next()?;
+    // Userinfo (`user:pass@host`) sits before the LAST `@`: an attacker who
+    // wants a hostile host to be trusted stuffs a real-looking name into the
+    // userinfo slot (`https://allowed.example@evil.example/`), so taking
+    // anything but the last segment would be exactly the bug that enables it.
     let authority = authority.rsplit('@').next()?;
-    let host = authority.split(':').next()?.trim_end_matches('.');
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        // A bracketed IPv6 literal (`[::1]:8080`): the address itself is full
+        // of colons, so the closing bracket is the only reliable boundary --
+        // splitting on `:` first (as a bare host:port would) mistakes the
+        // first colon of the address for a port separator. No closing
+        // bracket is malformed input, not a host: fail closed.
+        let (host, _after) = bracketed.split_once(']')?;
+        host
+    } else {
+        authority.split(':').next()?
+    };
+    let host = host.trim_end_matches('.');
     if host.is_empty() {
         None
     } else {
@@ -1196,6 +1211,31 @@ mod tests {
             closed.fetch("https://docs.example/page").is_err(),
             "an empty allowlist must reach nothing"
         );
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_host_matches_its_allowlist_entry_and_userinfo_cannot_launder_a_host() {
+        let backend = web(
+            WebCapabilityConfig {
+                fetch_enabled: true,
+                allow_hosts: vec!["::1".into(), "allowed.example".into()],
+                ..WebCapabilityConfig::default()
+            },
+            ScriptedGetter::json("{}"),
+        );
+        assert!(
+            backend.fetch("https://[::1]:8080/status").is_ok(),
+            "a bracketed IPv6 authority must resolve to host `::1`, not `[`"
+        );
+
+        // Userinfo sits before the LAST `@`; the real host here is
+        // evil.example, with the trusted-looking name stuffed into the
+        // userinfo slot. Letting that host through would be exactly the kind
+        // of allowlist bypass a fixed hostname check exists to prevent.
+        let denied = backend
+            .fetch("https://allowed.example@evil.example/page")
+            .expect_err("the real host is evil.example, not allowed.example");
+        assert!(matches!(denied, CapabilityError::Denied(_)), "{denied:?}");
     }
 
     #[test]
