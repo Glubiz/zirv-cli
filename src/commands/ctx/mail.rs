@@ -2357,6 +2357,25 @@ pub fn run_inbox_with<W: Write>(
         });
     }
 
+    // Issue #479 (roadmap N10): a consuming inbox read is an orchestrator
+    // checkpoint -- by construction a moment this caller has no approval
+    // dialog open -- so it is the right boundary to retry every delegation
+    // message a worker's own attention latch deferred (#468), and the right
+    // place to drop a DUPLICATE transport delivery of a delegation outcome
+    // this session has already consumed. Mail is at-least-once: the same
+    // terminal outcome can legitimately arrive twice, and showing it twice
+    // would have an orchestrator act on one completion as if it were two.
+    // Only exact repeats of an already-consumed delivery identity are
+    // dropped; anything this repository cannot account for is still shown.
+    if !args.peek {
+        let _ = super::delegation::drain_all(&state, repo, &cfg, now_secs());
+        messages.retain(|(_, msg)| {
+            super::delegation::delivery_of(&msg.body).is_none_or(|identity| {
+                !super::delegation::is_duplicate_delivery(&state, repo, &identity)
+            })
+        });
+    }
+
     // Issue #249: this reading session's own supervising session, if any --
     // read once, from `env` alone (`agent::parent_identity`, never anything
     // in `messages` itself), and reused for every message in this listing.
@@ -4963,6 +4982,105 @@ This is part of the body too.\n";
             env.insert(SESSION_ENV.to_string(), id.to_string());
         }
         env
+    }
+
+    /// Issue #479 (roadmap N10), acceptance criteria (a) and (c): an
+    /// UNCHANGED legacy orchestrator -- a plain `zirv ctx inbox`, no new flag,
+    /// no new verb -- consumes a native worker's terminal outcome, and a
+    /// duplicated transport delivery of that same outcome is dropped rather
+    /// than acted on twice.
+    #[test]
+    fn a_legacy_inbox_consumes_a_native_workers_outcome_once_despite_a_duplicate_delivery() {
+        use crate::commands::ctx::delegation;
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path();
+        let cfg = CtxConfig::default();
+
+        delegation::record_launch(
+            &state,
+            repo,
+            delegation::WorkerHandle {
+                delegation: "nativedeleg1".to_string(),
+                attempt: 1,
+                runtime: RuntimeKind::Native,
+                worker_session: "native-worker-session".to_string(),
+                short: "natv0001".to_string(),
+                role: "worker".to_string(),
+                task: Some("task-12".to_string()),
+                group: None,
+                objective: None,
+                workdir: repo.to_path_buf(),
+            },
+            Some("orch1234".to_string()),
+            10,
+        )
+        .expect("launch receipt");
+
+        let publication = delegation::publish_terminal(
+            &state,
+            repo,
+            &cfg,
+            "nativedeleg1",
+            delegation::Phase::Completed,
+            Some(0),
+            Some("entry point is src/main.rs".to_string()),
+            Some(repo.join("report.md")),
+            20,
+        )
+        .expect("publish");
+        assert!(publication.published && publication.mailed);
+
+        // At-least-once transport: the identical notification arrives twice.
+        let duplicate = Message {
+            from_session: "native-worker-session".to_string(),
+            from_agent: "native".to_string(),
+            to: "any".to_string(),
+            to_session: Some("orch1234".to_string()),
+            sent: 21,
+            body: format!(
+                "zirv delegation nativedeleg1 (native runtime) completed (exit 0)\ndelivery: {}",
+                publication.identity
+            ),
+        };
+        store(&state, &repo_slug(repo), &duplicate, &cfg).expect("duplicate delivery");
+        assert_eq!(
+            list(&state, &repo_slug(repo), None, Some("orch1234"))
+                .expect("list")
+                .len(),
+            2,
+            "both copies really are sitting in the mailbox"
+        );
+
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "orch1234"),
+        ]);
+        let mut out = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut out, repo, &|k| env.get(k).cloned())
+            .expect("inbox");
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(
+            rendered.contains("nativedeleg1"),
+            "the legacy orchestrator reads the native worker's outcome: {rendered}"
+        );
+        assert!(
+            rendered.contains("full report:"),
+            "and the bounded evidence reference that comes with it: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches(&publication.identity).count(),
+            1,
+            "the duplicate transport delivery is dropped, not shown twice: {rendered}"
+        );
     }
 
     #[test]

@@ -2051,6 +2051,67 @@ pub struct HeadlessRequest<'a> {
     /// none, every tool call reports a fixture failure rather than touching
     /// the machine.
     pub fixture_tools: Option<&'a std::path::Path>,
+    /// Issue #479 (roadmap N10): the SHARED task-card id this session is
+    /// working (`zirv ctx task`), carried onto the journal's own session
+    /// identity, onto the loop's config and onto every tool call's execution
+    /// identity, so a native worker's durable record names the same task a
+    /// legacy worker's does. `None` for a plain `zirv ctx exec --runtime
+    /// native` with no card behind it.
+    pub task: Option<String>,
+    /// Issue #479: the live writer permit this session's repository writes are
+    /// backed by (`permit::acquire_writer`). Moved into the execution broker
+    /// ([`brokered_tools`]), which refuses every repository write that is not
+    /// covered by a permit for this exact worktree -- so a native worker and a
+    /// legacy worker can never both hold one checkout. `None` is a session
+    /// nobody granted a tree to: its file writes are refused, which is the
+    /// honest answer rather than an unbacked write.
+    pub writer: Option<Box<dyn super::enforcement::WriterLease>>,
+}
+
+/// The route this request will spend, and the PROVIDER whose reservation
+/// ledger it spends against -- resolved from operator configuration alone.
+///
+/// Issue #479 (roadmap N10): a delegated native worker has to reserve its
+/// token ceiling against the same per-provider ledger a legacy delegation
+/// reserves against (`ctx::reservation`), and that reservation is taken
+/// BEFORE the run, so it cannot wait for the route resolution
+/// [`build_transport`] performs. This deliberately touches no credential
+/// store and no network: it reads `[route]`/`[account]` and answers, so a
+/// missing or expired credential fails where it should -- at the actual
+/// request -- and not at accounting time.
+pub fn route_provider(
+    repo: &std::path::Path,
+    route: Option<&str>,
+    role: &str,
+    env: EnvLookup<'_>,
+) -> CtxResult<(super::super::provider::RouteId, String)> {
+    use super::super::provider::RouteId;
+    use super::super::provider::config::NativeConfig;
+
+    let home = crate::utils::home_dir()?;
+    let native = NativeConfig::load(&home, repo)?.ok_or_else(|| {
+        format!(
+            "native runtime: no provider configuration at {}. Run `zirv ctx provider` to set up \
+             an account, endpoint and route first.",
+            NativeConfig::operator_path(&home).display()
+        )
+    })?;
+    let _ = env;
+    let route_id = match route {
+        Some(name) => RouteId::new(name)?,
+        None => native.roles.get(role).cloned().ok_or_else(|| {
+            format!(
+                "native runtime: no route for role `{role}`; pass --route or add a [roles] entry"
+            )
+        })?,
+    };
+    let provider = native
+        .routes
+        .get(&route_id)
+        .and_then(|route| native.accounts.get(&route.account))
+        .map(|account| account.provider.to_string())
+        .ok_or_else(|| format!("native runtime: route `{route_id}` names no configured account"))?;
+    Ok((route_id, provider))
 }
 
 /// Runs one headless native session end to end and prints its structured
@@ -2063,17 +2124,39 @@ pub struct HeadlessRequest<'a> {
 /// configuration and the state directory; nothing is inherited from a harness
 /// process, because there is none.
 pub fn run_headless<W: std::io::Write>(
-    request: &HeadlessRequest<'_>,
+    request: &mut HeadlessRequest<'_>,
     w: &mut W,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    let status = run_session(request, w, env)?;
+    writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
+    Ok(status.exit_code)
+}
+
+/// The session itself, without the final JSON print. Split out of
+/// [`run_headless`] for issue #479 (roadmap N10): a delegated native worker
+/// needs the structured status back as a VALUE -- to hold to a `--result-
+/// schema` contract, to store as its result, to publish as its terminal
+/// outcome and to fold into a delegation receipt -- not written to a stream.
+///
+/// `w` still carries the one human line a run can owe before its status
+/// exists (a resume's outcome-unknown reconcile notice), which a `--json`
+/// caller routes somewhere other than its own single-object stdout.
+pub fn run_session<W: std::io::Write>(
+    request: &mut HeadlessRequest<'_>,
+    w: &mut W,
+    env: EnvLookup<'_>,
+) -> CtxResult<NativeFinalStatus> {
     use super::super::state::{StateDir, now_secs};
-    use super::journal::{SeatId, SessionIdentity};
+    use super::journal::{SeatId, SessionIdentity, TaskId};
 
     let state = StateDir::resolve(env)?;
     let home = crate::utils::home_dir()?;
     let cfg = super::super::config::CtxConfig::load(request.repo, env)?;
     let now = now_secs();
+    // Issue #479: the shared task card, validated once here so a malformed id
+    // fails before any seat, journal session or effect exists.
+    let task = request.task.clone().map(TaskId::new).transpose()?;
 
     let (provider, mut tools, route, brokered) =
         build_transport(request, &state, &home, &cfg, env)?;
@@ -2126,7 +2209,9 @@ pub fn run_headless<W: std::io::Write>(
                 session: session.clone(),
                 seat: SeatId::new(handle.short.clone())?,
                 generation: handle.generation,
-                task: None,
+                // Issue #479: the SHARED card, so a native worker's journal
+                // session and a legacy worker's task card name one task.
+                task: task.clone(),
                 route: route.clone(),
                 created_at: now,
                 completed_at: None,
@@ -2189,7 +2274,9 @@ pub fn run_headless<W: std::io::Write>(
                 seat_model: env(super::super::adapters::SEAT_MODEL_ENV),
                 write_posture: lifecycle::orchestrator_write_posture(&cfg),
                 limits: request.limits,
-                task: None,
+                // Issue #479: the shared card the loop's own tool-call scopes
+                // and task receipts are filed under.
+                task: task.clone(),
                 workflow_gate: None,
             },
             provider.as_ref(),
@@ -2210,8 +2297,7 @@ pub fn run_headless<W: std::io::Write>(
             now_secs(),
         )?;
     }
-    writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
-    Ok(status.exit_code)
+    Ok(status)
 }
 
 /// Resolves the provider transport, the tool executor and the route identity
@@ -2353,8 +2439,12 @@ fn build_transport(
 
 /// The production tool executor: N05's client behind N04's broker, fenced on
 /// the persisted native seat record this run just wrote.
+/// Issue #479: takes `request` by `&mut` so the live writer permit can be
+/// MOVED into the broker rather than cloned -- a lease is the right to write
+/// one tree, and duplicating it would be exactly the thing the per-tree claim
+/// exists to prevent.
 fn brokered_tools(
-    request: &HeadlessRequest<'_>,
+    request: &mut HeadlessRequest<'_>,
     state: &super::super::state::StateDir,
     home: &std::path::Path,
     cfg: &super::super::config::CtxConfig,
@@ -2367,7 +2457,7 @@ fn brokered_tools(
     use super::tools::ToolLimits;
 
     let broker = ExecutionBroker::new(
-        ExecutionIdentity::from_handle(handle, None)?,
+        ExecutionIdentity::from_handle(handle, request.task.clone())?,
         ResourceClaims::new(
             request.repo,
             request.repo,
@@ -2380,7 +2470,7 @@ fn brokered_tools(
         std::sync::Arc::new(ConfigPolicySource::new(request.repo.to_path_buf())),
         std::sync::Arc::new(StoredSeatFence::new(state.clone())),
         std::sync::Arc::new(ApprovalAuthority::new()),
-        None,
+        request.writer.take(),
         PlatformIsolation::detect(),
         Default::default(),
     )?;

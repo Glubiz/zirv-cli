@@ -51,7 +51,7 @@ criterion).
 
 | Verb | Owner | Notes |
 |---|---|---|
-| `agent` | N10 (#479) |  |
+| `agent` | N10 (#479) | `--runtime harness\|native` picks the WORKER's backend; both forks share one task claim, writer permit, reservation, envelope and receipt (`ctx::delegation`) |
 | `artifact` | shared |  |
 | `artifact list` | shared |  |
 | `artifact present` | shared |  |
@@ -65,7 +65,7 @@ criterion).
 | `context sync` | N06 (#475) |  |
 | `create` | shared |  |
 | `ctx` | shared | command-group umbrella; each subcommand owned individually below |
-| `ctx agent` | N10 (#479) |  |
+| `ctx agent` | N10 (#479) | same surface as `agent`; `--runtime native` forks to `ctx::native_worker` after everything both runtimes share has already happened |
 | `ctx api` | N20 (#489) | the versioned local runtime protocol (issue #353): `schema`/`serve`/`call`. Backend-neutral by construction -- it publishes redacted session facts and a narrow method set over whichever `RuntimeBackend` is attached -- but the persistent runtime it exists to front is N20's, so the verb is owned there rather than marked `shared` |
 | `ctx ask` | N15 (#484) |  |
 | `ctx chat` | N11 (#480) |  |
@@ -75,16 +75,16 @@ criterion).
 | `ctx exec` | N09 (#478) |  |
 | `ctx explain-status` | shared |  |
 | `ctx forget` | N06 (#475) | native `memory_forget` reuses the same locked store and journal semantics |
-| `ctx group` | N10 (#479) |  |
+| `ctx group` | N10 (#479) | group ids are shared: a native worker's delegation record carries the same `group` a legacy worker's does |
 | `ctx handoff` | N17 (#486) |  |
 | `ctx handover` | N16 (#485) |  |
 | `ctx hook` | N22 (#491) |  |
-| `ctx inbox` | N10 (#479) |  |
+| `ctx inbox` | N10 (#479) | a consuming read is an orchestrator checkpoint: it drains delegation messages an attention latch deferred (#468) and drops a duplicate delivery identity (#452) |
 | `ctx kill` | harness-backend | terminates a supervised OS process; a native session is interrupted via the runtime protocol instead |
 | `ctx learn` | N06 (#475) |  |
 | `ctx loop` | N09 (#478) |  |
 | `ctx measure` | N18 (#487) | transcript-derived proportionality/health metrics with a committed baseline |
-| `ctx nudge` | N10 (#479) |  |
+| `ctx nudge` | N10 (#479) | pane-typing surface; the runtime-neutral equivalent for a native worker is `delegation::send`, which queues rather than types at an open dialog |
 | `ctx objective` | N09 (#478) |  |
 | `ctx optimize` | N15 (#484) |  |
 | `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
@@ -98,14 +98,14 @@ criterion).
 | `ctx savings` | N18 (#487) |  |
 | `ctx score` | N17 (#486) |  |
 | `ctx search` | N06 (#475) | explicitly zero-model cross-session recall, also exposed as typed native `context_search` |
-| `ctx send` | N10 (#479) |  |
+| `ctx send` | N10 (#479) | the mail service the native `send`/`follow_up` tools reach through `ctx::delegation` |
 | `ctx snapshot` | N14 (#483) | redacted diagnostic-state summary |
 | `ctx spend` | N18 (#487) |  |
 | `ctx status` | N17 (#486) |  |
-| `ctx swarm` | N10 (#479) |  |
-| `ctx task` | N10 (#479) |  |
+| `ctx swarm` | N10 (#479) | mints shared task cards; a native worker claims one through the same `task::claim_locked` |
+| `ctx task` | N10 (#479) | the one exclusive-ownership store for work, shared by both runtimes |
 | `ctx usage` | N18 (#487) |  |
-| `ctx wait` | N10 (#479) |  |
+| `ctx wait` | N10 (#479) | bounded wait; the native `wait` tool answers from the same durable delegation record with no model call |
 | `ctx worktree` | shared |  |
 | `ctx wrap` | harness-backend | PTY-supervised interactive session; the example case for this bucket |
 | `frontend` | shared |  |
@@ -214,7 +214,9 @@ installed binary during self-update; never spawns it).
 | Agent loop objective judge | `src/commands/ctx/run_loop.rs` | `evaluate_objective_after_cycle` | N09 (#478) | distinct helper-model call: judges the objective gate after a loop cycle |
 | Distiller/judge chokepoint | `src/commands/ctx/handoff.rs` | `run_model` | N15 (#484) | wraps `distiller_cmd`; shared by run_loop, memory, optimize, ask below |
 | Resume interactive relaunch | `src/commands/ctx/resume.rs` | `launch_command` | N17 (#486) | `zirv ctx resume` |
-| Agent delegation dispatch | `src/commands/ctx/agent.rs` | `run_with` | N10 (#479) | probes `headless_resume_cmd` before a bounded structural-result retry |
+| Agent delegation dispatch | `src/commands/ctx/agent.rs` | `run_with` | N10 (#479) | probes `headless_resume_cmd` before a bounded structural-result retry; `--runtime native` forks to `native_worker::run` before adapter selection |
+| Native delegated worker | `src/commands/ctx/native_worker.rs` | `run` | N10 (#479) | `zirv agent --runtime native`: takes the shared task/permit/reservation ownership, writes the durable launch receipt, drives `native::run_session` and publishes the terminal outcome |
+| Native delegation tool launch | `src/commands/ctx/delegation.rs` | `AgentLauncher` | N10 (#479) | the native `delegate` tool's production launcher -- one `agent::run_with` call, so the tool and the CLI verb are one code path |
 | Built-in seat worker dispatch | `src/commands/workflow/agents.rs` | `dispatch_agent` | N15 (#484) | synchronous `.status()` dispatch of a built-in agent seat |
 | Cross-harness review launch | `src/commands/workflow/review.rs` | `launch_reviewer` | N15 (#484) | `reviewer_argv` + self-recursion into `current_exe` |
 | Frontend visual reviewer launch | `src/commands/workflow/frontend_render.rs` | `launch_visual_reviewer` | N15 (#484) | reuses `review::reviewer_argv`; self-recursion into `current_exe` |

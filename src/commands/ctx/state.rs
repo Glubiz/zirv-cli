@@ -886,6 +886,18 @@ impl StateDir {
         self.0.join("tasks")
     }
 
+    /// `<state>/delegations/<repo-slug>/<delegation-id>.json` -- one durable
+    /// record per delegation (issue #479, roadmap N10), keyed by
+    /// `state::repo_slug` the same way `tasks()` is. A delegation record
+    /// outlives the worker it launched and the process that launched it: it
+    /// carries the launch receipt written BEFORE anything ran, the stable
+    /// worker handle, and every terminal outcome already published, so a
+    /// consumer that saw a completion twice can tell the second copy apart
+    /// from a genuinely new one.
+    pub fn delegations(&self) -> PathBuf {
+        self.0.join("delegations")
+    }
+
     /// Issue #178: captured operator-approved permission prompts, ready for
     /// `permissions::propose`'s safe-list classifier -- `<state>/approvals/
     /// *.jsonl`, one file per day (see `log::append_safety`'s own doc

@@ -807,7 +807,7 @@ fn run_native<W: Write>(
         limits.max_wall_ms = timeout_secs.saturating_mul(1000);
     }
     super::runtime::native::run_headless(
-        &super::runtime::native::HeadlessRequest {
+        &mut super::runtime::native::HeadlessRequest {
             repo,
             prompt: prompt.trim(),
             route: args.route.as_deref(),
@@ -816,6 +816,12 @@ fn run_native<W: Write>(
             resume: args.resume.as_deref(),
             provider: args.provider.as_deref(),
             fixture_tools: args.fixture_tools.as_deref(),
+            // Issue #479: a plain `zirv ctx exec --runtime native` is not a
+            // delegation. It holds no task card and no writer permit, so its
+            // repository writes are refused rather than silently unbacked --
+            // `zirv agent --runtime native` is the surface that grants both.
+            task: None,
+            writer: None,
         },
         w,
         env,
