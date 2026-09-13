@@ -213,6 +213,7 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
         // only place issue #358's reservation ledger is written for a
         // launch), so there is nothing to carry.
         reservation_id: None,
+        ..Default::default()
     };
 
     let mut out = std::io::stdout();
