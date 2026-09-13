@@ -2196,6 +2196,12 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `session.history` | `ZIRV_CTX_SESSION_HISTORY` |
 | `session.scrollback_rows` | `ZIRV_CTX_SESSION_SCROLLBACK_ROWS` |
 | `session.stale_after_secs` | `ZIRV_CTX_SESSION_STALE_AFTER_SECS` |
+| `capabilities` | `ZIRV_CTX_CAPABILITIES` |
+
+`capabilities` is listed as a whole table rather than key by key: every key
+under it names an MCP server command zirv spawns, a remote endpoint it
+authenticates to, a credential reference, or a browser binary it launches, so
+there is no narrowing half a repository checkout could legitimately set.
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
