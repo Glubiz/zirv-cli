@@ -2103,6 +2103,7 @@ mod tests {
             model: None,
             session: "6c967beb-0b72-46e9-9d3e-504a03f741b3".to_string(),
             conversation: Some("49195b07-217f-4401-8681-c857fcea294e".to_string()),
+            runtime: super::super::runtime::RuntimeKind::Harness,
             since: NOW,
         });
         seat::store(&state, &parked).expect("store the displacement");

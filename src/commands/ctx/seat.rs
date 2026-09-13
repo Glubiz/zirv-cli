@@ -132,6 +132,15 @@ pub struct Displaced {
     pub session: String,
     #[serde(default)]
     pub conversation: Option<String>,
+    /// Issue #488: WHICH backend the displaced conversation belongs to.
+    /// `conversation` is an opaque reference whose meaning is the backend's
+    /// -- a coding harness's own resume id for `Harness`, a native journal
+    /// session id for `Native` -- so a return that does not know the runtime
+    /// cannot know what it is holding. `#[serde(default)]` reads a record
+    /// written before this field existed as `Harness`, the only runtime any
+    /// such build could have displaced a seat from.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
     pub since: u64,
 }
 
@@ -149,6 +158,15 @@ pub enum Phase {
     Prepared {
         successor_agent: String,
         successor_model: Option<String>,
+        /// Issue #488: which backend the successor will run on. The seat
+        /// transaction is what carries a session across a RUNTIME change as
+        /// well as a harness one, and the direction (`harness->native`,
+        /// `native->harness`, ...) decides what a legal continuation payload
+        /// even is. `#[serde(default)]` makes a record written before this
+        /// field existed read as `Harness`, which is exactly what every
+        /// rollover such a build could have prepared actually targeted.
+        #[serde(default)]
+        successor_runtime: RuntimeKind,
         generation: u64,
         since: u64,
         cause: Cause,
@@ -381,6 +399,34 @@ pub fn prepare(
     cause: Cause,
     now: u64,
 ) -> CtxResult<u64> {
+    prepare_onto(
+        state,
+        short,
+        successor_agent,
+        successor_model,
+        RuntimeKind::Harness,
+        cause,
+        now,
+    )
+}
+
+/// [`prepare`], naming the successor's own BACKEND as well as its adapter and
+/// model (issue #488).
+///
+/// `prepare` is this function with `RuntimeKind::Harness`, which is what
+/// every wrapped->wrapped rollover has always prepared and what every caller
+/// predating this issue means -- so the existing swap seams, their acks and
+/// their tests are untouched by the runtime dimension existing.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_onto(
+    state: &StateDir,
+    short: &str,
+    successor_agent: &str,
+    successor_model: Option<&str>,
+    successor_runtime: RuntimeKind,
+    cause: Cause,
+    now: u64,
+) -> CtxResult<u64> {
     let _lock = lock_seat(state, short)?;
     let mut seat = load(state, short).ok_or_else(|| no_seat(short))?;
     if seat.pinned {
@@ -395,6 +441,7 @@ pub fn prepare(
     seat.phase = Phase::Prepared {
         successor_agent: successor_agent.to_string(),
         successor_model: successor_model.map(str::to_string),
+        successor_runtime,
         generation,
         since: now,
         cause,
@@ -430,6 +477,7 @@ pub fn commit(
     let Phase::Prepared {
         successor_agent,
         successor_model,
+        successor_runtime,
         generation: prepared_generation,
         cause,
         ..
@@ -447,6 +495,7 @@ pub fn commit(
     let old_agent = seat.agent.clone();
     let old_model = seat.model.clone();
     let old_session = seat.session.clone();
+    let old_runtime = seat.runtime;
     let previously_displaced = seat.displaced.clone();
     seat.visited.push(Visit {
         agent: old_agent.clone(),
@@ -458,6 +507,13 @@ pub fn commit(
     seat.agent = successor_agent;
     seat.model = successor_model;
     seat.session = session_of_successor.to_string();
+    // Issue #488: the seat's own backend follows the successor that just took
+    // it. This is the single place a logical seat changes runtime, and it is
+    // inside the same locked, generation-checked write that adopts the
+    // successor's agent/model/session -- so a reader can never observe a seat
+    // whose runtime and whose generation disagree about which session is
+    // sitting in it.
+    seat.runtime = successor_runtime;
     // The source harness is parked, not closed: the seat remembers which
     // harness it left and which conversation that harness was in, so a later
     // return resumes it rather than starting the operator over. Coming home
@@ -474,14 +530,21 @@ pub fn commit(
             Some(Displaced {
                 agent: old_agent.clone(),
                 model: old_model,
+                // Issue #488: the displaced conversation is looked up under
+                // the runtime it actually ran on, not under a hard-coded
+                // `Harness`. `native_conversation` already refuses a marker
+                // whose runtime does not match, so asking with the wrong one
+                // silently returned `None` and a return to a native
+                // predecessor degraded to a cold launch it never needed.
                 conversation: super::sessions::native_conversation(
                     state,
                     short,
                     &old_agent,
                     &old_session,
-                    RuntimeKind::Harness,
+                    old_runtime,
                 ),
                 session: old_session,
+                runtime: old_runtime,
                 since: now,
             })
         })
@@ -659,6 +722,100 @@ pub fn fence(state: &StateDir) -> CtxResult<()> {
 
 fn load_short(state: &StateDir, session: &str) -> Option<Seat> {
     load(state, &super::sessions::short_id(session))
+}
+
+/// Why [`authority`] refused a caller's generation. Two distinct facts, kept
+/// apart because the operator-facing answer differs: a `Superseded` caller
+/// has already been replaced and must stop, while an `Uncommitted` caller is
+/// the *successor* of a rollover that has only been PREPARED -- it is about
+/// to be legitimate and must simply not write yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleReason {
+    Superseded,
+    Uncommitted,
+}
+
+/// The typed refusal every generation-fenced service returns (issue #488).
+///
+/// A `String` error is enough for a supervisor writing a log line and not
+/// enough for a service that has to decide whether to retry, refuse or halt:
+/// `delegation::delegate`, the coordinator's own graph writes and the writer
+/// permit all need to distinguish "you were replaced" from "your transaction
+/// has not committed yet" without matching on prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleGeneration {
+    pub short: String,
+    /// The generation that currently owns the seat.
+    pub current: u64,
+    /// The generation the caller presented.
+    pub presented: u64,
+    pub reason: StaleReason,
+}
+
+impl std::fmt::Display for StaleGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            StaleReason::Superseded => write!(
+                f,
+                "stale seat generation {} for {} (current {}): this session was superseded by a \
+                 rollover; stop coordinating",
+                self.presented, self.short, self.current
+            ),
+            StaleReason::Uncommitted => write!(
+                f,
+                "uncommitted seat generation {} for {} (current {}): a rollover onto this \
+                 successor is prepared but not committed; it may not write until it holds the seat",
+                self.presented, self.short, self.current
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StaleGeneration {}
+
+/// Whether `generation` may perform a WRITE-CAPABLE operation on `seat`.
+///
+/// Pure, and the single definition of "exactly one write-capable coordinator
+/// generation at a time" that every fenced service shares:
+///
+/// - a generation BELOW the seat's own was superseded by a committed
+///   rollover, and is refused;
+/// - a generation ABOVE the seat's own has not taken the seat yet. During a
+///   [`Phase::Prepared`] window that is precisely the successor, which is
+///   allowed to start, authenticate and validate but must not write before
+///   the atomic commit; outside one it is a caller holding a generation this
+///   seat never issued. Both are refused, and for the same reason: the seat
+///   is not theirs yet.
+///
+/// So during a prepared transaction NEITHER the source (still current, still
+/// allowed) nor the successor can be joined by a second writer: the source's
+/// generation is the only one that passes, and `commit` swaps which one that
+/// is in a single locked write.
+pub fn authority(seat: &Seat, generation: u64) -> Result<(), StaleGeneration> {
+    if generation == seat.generation {
+        return Ok(());
+    }
+    Err(StaleGeneration {
+        short: seat.short.clone(),
+        current: seat.generation,
+        presented: generation,
+        reason: if generation < seat.generation {
+            StaleReason::Superseded
+        } else {
+            StaleReason::Uncommitted
+        },
+    })
+}
+
+/// [`authority`] against the seat record on disk. A seat that does not exist
+/// is not a refusal -- exactly [`fence`]'s own convention, so a headless verb
+/// run outside any seat (a bare terminal, a CI job, a worker with no seat of
+/// its own) is unaffected by a fence existing.
+pub fn guard(state: &StateDir, short: &str, generation: u64) -> Result<(), StaleGeneration> {
+    match load(state, short) {
+        Some(seat) => authority(&seat, generation),
+        None => Ok(()),
+    }
 }
 
 /// The pure half of [`fence`]: given the seat record (if any) for the
@@ -2018,6 +2175,7 @@ mod tests {
             Phase::Prepared {
                 successor_agent: "codex".to_string(),
                 successor_model: Some("gpt5".to_string()),
+                successor_runtime: RuntimeKind::Harness,
                 generation: 2,
                 since: 10,
                 cause: Cause::Proactive {
@@ -2028,6 +2186,7 @@ mod tests {
             Phase::Prepared {
                 successor_agent: "codex".to_string(),
                 successor_model: None,
+                successor_runtime: RuntimeKind::Harness,
                 generation: 2,
                 since: 10,
                 cause: Cause::Reactive {
@@ -2038,6 +2197,15 @@ mod tests {
             Phase::Prepared {
                 successor_agent: "codex".to_string(),
                 successor_model: None,
+                successor_runtime: RuntimeKind::Harness,
+                generation: 2,
+                since: 10,
+                cause: Cause::Manual,
+            },
+            Phase::Prepared {
+                successor_agent: "native".to_string(),
+                successor_model: Some("claude-sonnet-4-5".to_string()),
+                successor_runtime: RuntimeKind::Native,
                 generation: 2,
                 since: 10,
                 cause: Cause::Manual,
@@ -2212,5 +2380,208 @@ mod tests {
              rather than roll onto a worse harness (issue #337's class): {:?}",
             decide(&usage_blocked, &cfg)
         );
+    }
+
+    // -- issue #488: the runtime dimension of the transaction --------------
+
+    fn registered(state: &StateDir, short: &str, session: &str, agent: &str) {
+        register(
+            state,
+            short,
+            session,
+            agent,
+            Some("standard"),
+            "anthropic",
+            "orchestrator",
+            false,
+            1_700_000_000,
+        )
+        .expect("register");
+    }
+
+    /// The seat transaction carries the successor's BACKEND, not just its
+    /// adapter: a harness->native commit leaves the seat running native, and
+    /// the harness it left is parked with its own conversation reference AND
+    /// the runtime that reference belongs to.
+    #[test]
+    fn a_cross_runtime_commit_moves_the_seat_backend_and_parks_the_source_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "0f2b3f21-1111-4a3c-9ccb-4e9b1f0a1001";
+        let short = super::super::sessions::short_id(session);
+        registered(&state, &short, session, "claude");
+        super::super::sessions::record_native_conversation(
+            &state, &short, "claude", session, "conv-harness",
+        );
+
+        let generation = prepare_onto(
+            &state,
+            &short,
+            "native",
+            Some("claude-sonnet-4-5"),
+            RuntimeKind::Native,
+            Cause::Reactive {
+                detail: "provider=anthropic hard-blocked".to_string(),
+                observed_at: 1_700_000_000,
+            },
+            1_700_000_000,
+        )
+        .expect("prepare onto a native successor");
+        let rolled = commit(&state, &short, generation, "native-session", 1_700_000_100)
+            .expect("commit");
+
+        assert_eq!(rolled.runtime, RuntimeKind::Native);
+        let displaced = rolled.displaced.expect("the source harness is parked");
+        assert_eq!(displaced.agent, "claude");
+        assert_eq!(displaced.runtime, RuntimeKind::Harness);
+        assert_eq!(
+            displaced.conversation.as_deref(),
+            Some("conv-harness"),
+            "the parked harness's own conversation is retained for a verified return"
+        );
+    }
+
+    /// The reverse direction, and the half that keeps a return honest: a
+    /// native predecessor's conversation reference is only resolvable when the
+    /// marker was recorded under the native runtime. A harness marker must
+    /// never be handed back as a native conversation id.
+    #[test]
+    fn a_native_source_is_parked_with_its_own_conversation_and_never_a_harness_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "0f2b3f21-2222-4a3c-9ccb-4e9b1f0a1002";
+        let short = super::super::sessions::short_id(session);
+        registered(&state, &short, session, "native");
+        let mut seat = load(&state, &short).expect("seat");
+        seat.runtime = RuntimeKind::Native;
+        store(&state, &seat).expect("store a native seat");
+
+        // A marker recorded as a HARNESS conversation is not this native
+        // session's conversation, however well the agent and session match.
+        super::super::sessions::record_native_conversation(
+            &state, &short, "native", session, "conv-harness",
+        );
+        let generation = prepare_onto(
+            &state,
+            &short,
+            "claude",
+            Some("opus"),
+            RuntimeKind::Harness,
+            Cause::Reactive {
+                detail: "native route endpoint failure".to_string(),
+                observed_at: 1_700_000_000,
+            },
+            1_700_000_000,
+        )
+        .expect("prepare");
+        let rolled =
+            commit(&state, &short, generation, "claude-session", 1_700_000_050).expect("commit");
+        let displaced = rolled.displaced.expect("the native source is parked");
+        assert_eq!(displaced.runtime, RuntimeKind::Native);
+        assert_eq!(
+            displaced.conversation, None,
+            "a harness marker may not be resumed as a native conversation id"
+        );
+
+        // Recorded honestly, the same return resolves.
+        let session2 = "3a7c9d15-3333-4a3c-9ccb-4e9b1f0a1003";
+        let short2 = super::super::sessions::short_id(session2);
+        registered(&state, &short2, session2, "native");
+        let mut seat2 = load(&state, &short2).expect("seat");
+        seat2.runtime = RuntimeKind::Native;
+        store(&state, &seat2).expect("store");
+        super::super::sessions::record_conversation_on(
+            &state,
+            &short2,
+            "native",
+            session2,
+            "journal-session-1",
+            RuntimeKind::Native,
+        );
+        let generation = prepare_onto(
+            &state,
+            &short2,
+            "claude",
+            Some("opus"),
+            RuntimeKind::Harness,
+            Cause::Reactive {
+                detail: "native route endpoint failure".to_string(),
+                observed_at: 1_700_000_000,
+            },
+            1_700_000_000,
+        )
+        .expect("prepare");
+        let rolled =
+            commit(&state, &short2, generation, "claude-session", 1_700_000_050).expect("commit");
+        assert_eq!(
+            rolled
+                .displaced
+                .expect("parked")
+                .conversation
+                .as_deref(),
+            Some("journal-session-1")
+        );
+    }
+
+    /// `prepare` is `prepare_onto(.., Harness, ..)`: wrapped->wrapped keeps
+    /// exactly the behaviour it had, including the seat's own runtime.
+    #[test]
+    fn a_wrapped_to_wrapped_rollover_keeps_the_seat_on_the_harness_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "0f2b3f21-4444-4a3c-9ccb-4e9b1f0a1004";
+        let short = super::super::sessions::short_id(session);
+        registered(&state, &short, session, "claude");
+        let generation = prepare(&state, &short, "codex", Some("gpt5"), Cause::Manual, 1)
+            .expect("prepare");
+        let rolled = commit(&state, &short, generation, "codex-session", 2).expect("commit");
+        assert_eq!(rolled.runtime, RuntimeKind::Harness);
+        assert_eq!(rolled.agent, "codex");
+    }
+
+    /// The fence: exactly one generation may write, a superseded one is
+    /// refused as superseded, and the successor of a PREPARED (not yet
+    /// committed) rollover is refused as uncommitted -- so a crash between
+    /// prepare and commit can never leave two write-capable generations.
+    #[test]
+    fn only_the_committed_generation_is_write_capable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "0f2b3f21-5555-4a3c-9ccb-4e9b1f0a1005";
+        let short = super::super::sessions::short_id(session);
+        registered(&state, &short, session, "claude");
+
+        assert!(guard(&state, &short, 1).is_ok(), "the seat's own generation");
+
+        let generation = prepare_onto(
+            &state,
+            &short,
+            "native",
+            None,
+            RuntimeKind::Native,
+            Cause::Manual,
+            1,
+        )
+        .expect("prepare");
+        // The crash point: a supervisor dies here. The source still holds the
+        // seat and the successor does not.
+        assert!(guard(&state, &short, 1).is_ok());
+        let refused = guard(&state, &short, generation).expect_err("successor may not write yet");
+        assert_eq!(refused.reason, StaleReason::Uncommitted);
+
+        commit(&state, &short, generation, "native-session", 2).expect("commit");
+        // The other crash point: a supervisor dies right after the commit.
+        assert!(guard(&state, &short, generation).is_ok());
+        let superseded = guard(&state, &short, 1).expect_err("the source is superseded");
+        assert_eq!(superseded.reason, StaleReason::Superseded);
+    }
+
+    /// A caller with no seat at all is never fenced -- a headless verb, a CI
+    /// job and a worker with no seat of its own all keep working.
+    #[test]
+    fn a_caller_with_no_seat_record_is_not_fenced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        assert!(guard(&state, "nosuchseat", 7).is_ok());
     }
 }
