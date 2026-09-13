@@ -813,19 +813,34 @@ pub fn plan_continuation(
 /// statements of what was requested and what actually happened, so the new
 /// provider is told the truth without being handed a tool-use block it never
 /// issued.
+///
+/// The rebuilt tail always OPENS ON A USER TURN. `covered` can legally land
+/// right before an assistant message that still holds an unsettled tool call
+/// -- `checkpoint::boundary` places it exactly there so that message stays
+/// verbatim -- and handing a provider a history that starts on an assistant
+/// turn is not a legal request. Any assistant activity ahead of the first
+/// retained user turn is dropped here; it is already named in the
+/// checkpoint's own outstanding-tool section (see `summary_message`).
 pub fn semantic_history(state: &ConversationState, covered: SequenceId) -> Vec<ProviderMessage> {
     let mut messages = Vec::new();
+    let mut seen_user = false;
     for message in &state.messages {
         if message.sequence <= covered {
             continue;
         }
+        if !seen_user && message.role != MessageRole::User {
+            continue;
+        }
         match message.role {
-            MessageRole::User => messages.push(ProviderMessage {
-                role: ProviderMessageRole::User,
-                content: vec![ProviderContent::Text {
-                    text: message.text.clone().unwrap_or_default(),
-                }],
-            }),
+            MessageRole::User => {
+                seen_user = true;
+                messages.push(ProviderMessage {
+                    role: ProviderMessageRole::User,
+                    content: vec![ProviderContent::Text {
+                        text: message.text.clone().unwrap_or_default(),
+                    }],
+                });
+            }
             MessageRole::Assistant => {
                 let mut text = String::new();
                 for block in &message.blocks {
@@ -889,6 +904,9 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::provider::Protocol;
+    use super::super::super::provider::adapter::NeverCancelled;
+    use super::super::fixture::{FixtureProvider, FixtureScript, fixture_target};
     use super::*;
     use crate::commands::ctx::event::NormalizedEvent;
     use crate::commands::ctx::runtime::journal::{
@@ -1153,6 +1171,66 @@ mod tests {
     }
 
     #[test]
+    fn distill_sends_the_configured_output_budget_and_no_tool_schema() {
+        let state = state_with(vec![user(1, "investigate the timeout")]);
+        let script = FixtureScript::from_json(
+            r#"{"turns":[{"blocks":[{"type":"text","text":"Investigated the timeout."}],
+               "finish_reason":"end_turn"}]}"#,
+        )
+        .expect("script");
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-model"),
+            script,
+        );
+        let outcome = distill(
+            Some(&provider),
+            "fixture-model",
+            &NeverCancelled,
+            &state,
+            SequenceId(1),
+            DistillBudget::default(),
+        );
+        assert_eq!(outcome.summary.source, DistilledSummary::ROUTE);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].tools.is_empty());
+        assert_eq!(
+            sent[0].max_output_tokens,
+            DistillBudget::default().max_output_tokens
+        );
+        assert_eq!(sent[0].max_output_tokens, 1_024);
+    }
+
+    #[test]
+    fn distill_discards_a_reply_that_tries_to_call_a_tool_and_falls_back_structurally() {
+        let state = state_with(vec![user(1, "investigate the timeout")]);
+        let script = FixtureScript::from_json(
+            r#"{"turns":[{"blocks":[{"type":"tool_use","id":"call_1","name":"bash",
+               "input":{"cmd":"ls"}}],"finish_reason":"tool_use"}]}"#,
+        )
+        .expect("script");
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-model"),
+            script,
+        );
+        let outcome = distill(
+            Some(&provider),
+            "fixture-model",
+            &NeverCancelled,
+            &state,
+            SequenceId(1),
+            DistillBudget::default(),
+        );
+        // The reply is discarded: no route-sourced summary is produced even
+        // though the provider answered, because it tried to call a tool the
+        // request never offered it.
+        assert_eq!(outcome.summary.source, DistilledSummary::STRUCTURAL);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].tools.is_empty());
+    }
+
+    #[test]
     fn a_route_change_rebuilds_history_without_hidden_reasoning() {
         let mut state = state_with(vec![
             user(1, "go"),
@@ -1207,6 +1285,69 @@ mod tests {
         assert!(!rendered.contains("secret chain of thought"));
         assert!(rendered.contains("outcome_unknown"));
         assert!(!rendered.contains("ToolUse"));
+    }
+
+    #[test]
+    fn semantic_history_never_leads_with_an_assistant_turn_and_carries_no_tool_blocks() {
+        let mut state = state_with(vec![
+            user(1, "objective"),
+            StoredMessage {
+                sequence: SequenceId(2),
+                message_id: MessageId::new("m2").expect("id"),
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    AssistantBlock::Thinking {
+                        text: "weighing options".to_string(),
+                        signature: None,
+                    },
+                    AssistantBlock::ToolCall {
+                        tool_call: ToolCallId::new("call-a").expect("id"),
+                    },
+                ],
+                text: None,
+                steering: false,
+                usage: None,
+            },
+            user(5, "still waiting"),
+        ]);
+        state.tool_calls.insert(
+            ToolCallId::new("call-a").expect("id"),
+            ToolCallRecord {
+                sequence: SequenceId(3),
+                name: "bash".to_string(),
+                arguments: serde_json::json!({}),
+                policy: super::super::journal::PolicyProvenance {
+                    fingerprint: String::new(),
+                    source: "test".to_string(),
+                    decision: "allow".to_string(),
+                    scope: "worker".to_string(),
+                },
+            },
+        );
+        state.executions.insert(
+            super::super::journal::ExecutionId::new("exec-a").expect("id"),
+            ExecutionRecord {
+                sequence: SequenceId(3),
+                tool_call: ToolCallId::new("call-a").expect("id"),
+                state: ExecutionState::OutcomeUnknown,
+                result: None,
+                detail: None,
+            },
+        );
+
+        // `covered` stops right before the assistant turn that still holds
+        // an open tool call -- exactly what `boundary()` produces for a
+        // pending call -- so that turn is the first one the tail retains.
+        let messages = semantic_history(&state, SequenceId(1));
+
+        assert!(!messages.is_empty());
+        assert_eq!(messages[0].role, ProviderMessageRole::User);
+        for message in &messages {
+            for block in &message.content {
+                assert!(!matches!(block, ProviderContent::ToolUse { .. }));
+                assert!(!matches!(block, ProviderContent::ToolResult { .. }));
+            }
+        }
     }
 
     #[test]
