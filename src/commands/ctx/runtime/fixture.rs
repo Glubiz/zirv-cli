@@ -169,6 +169,7 @@ pub struct FixtureProvider {
     target: ProviderTarget,
     script: FixtureScript,
     next: AtomicUsize,
+    sent: std::sync::Mutex<Vec<ProviderRequest>>,
 }
 
 impl FixtureProvider {
@@ -177,12 +178,23 @@ impl FixtureProvider {
             target,
             script,
             next: AtomicUsize::new(0),
+            sent: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// How many scripted turns have been consumed so far.
     pub fn consumed(&self) -> usize {
         self.next.load(Ordering::Acquire)
+    }
+
+    /// Every request the loop actually sent, in order. This is the only way
+    /// to assert what a CONTINUATION request carried -- which tool results it
+    /// replayed, and which attempt's result each one was.
+    pub fn sent(&self) -> Vec<ProviderRequest> {
+        self.sent
+            .lock()
+            .map(|sent| sent.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -219,10 +231,13 @@ impl ProviderAdapter for FixtureProvider {
 
     fn stream(
         &self,
-        _request: &ProviderRequest,
+        request: &ProviderRequest,
         cancellation: &dyn Cancellation,
         sink: &mut dyn EventSink,
     ) -> Result<ProviderResponse, ProviderFailure> {
+        if let Ok(mut sent) = self.sent.lock() {
+            sent.push(request.clone());
+        }
         if cancellation.is_cancelled() {
             return Err(ProviderFailure::new(
                 FailureClass::Cancelled,
