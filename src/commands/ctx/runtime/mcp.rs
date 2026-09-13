@@ -38,6 +38,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::config::{CapabilityEffectsConfig, McpServerConfig, McpTransportConfig};
 use super::super::pace::redact_for_log;
+use super::super::provider::adapter::{Cancellation, NeverCancelled};
 use super::enforcement::ProcessEffects;
 
 /// The protocol revision this client negotiates.
@@ -95,14 +96,17 @@ impl std::error::Error for McpError {}
 /// for framing only; every protocol rule lives in [`McpClient`].
 pub trait McpTransport: std::fmt::Debug + Send {
     /// Sends one request and waits for its matching response, giving up at
-    /// `deadline` or when `cancel` fires. A cancelled call must leave the
-    /// transport usable.
+    /// `deadline` or when `cancel` fires. `cancel` is polled while this call
+    /// is blocked waiting on the server, not only before it starts, so a
+    /// cancellation that fires mid-flight is observed promptly rather than
+    /// at the deadline. A cancelled call must leave the transport usable.
     fn request(
         &mut self,
         id: u64,
         method: &str,
         params: Value,
         deadline: Instant,
+        cancel: &dyn Cancellation,
     ) -> Result<Value, McpError>;
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), McpError>;
@@ -133,7 +137,15 @@ pub struct StdioTransport {
     frames: Receiver<Result<Value, String>>,
     pending: Vec<Value>,
     label: String,
+    /// The child's stderr, drained on a background thread into a bounded
+    /// tail so a transport error can explain itself instead of just "closed
+    /// its output stream".
+    stderr_tail: Arc<std::sync::Mutex<Vec<u8>>>,
 }
+
+/// How much of a child's stderr is kept for error messages. Bounded so a
+/// chatty or hostile server cannot grow zirv's memory or its log lines.
+const MAX_STDERR_TAIL_BYTES: usize = 4 * 1024;
 
 impl StdioTransport {
     pub fn spawn(config: &McpServerConfig) -> Result<Self, McpError> {
@@ -160,7 +172,7 @@ impl StdioTransport {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(cwd) = cwd {
             process.current_dir(cwd);
         }
@@ -179,13 +191,34 @@ impl StdioTransport {
         })?;
         let (sender, frames) = sync_channel(64);
         std::thread::spawn(move || pump_frames(stdout, &sender));
+        let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let tail = Arc::clone(&stderr_tail);
+            std::thread::spawn(move || pump_stderr(stderr, &tail));
+        }
         Ok(Self {
             child,
             stdin,
             frames,
             pending: Vec::new(),
             label: format!("stdio:{command}"),
+            stderr_tail,
         })
+    }
+
+    /// The last [`MAX_STDERR_TAIL_BYTES`] of the child's stderr, redacted the
+    /// same way any other untrusted server text is before it can reach an
+    /// error message or a log line. Empty when the server wrote nothing.
+    fn stderr_snippet(&self) -> String {
+        let bytes = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.clone())
+            .unwrap_or_default();
+        if bytes.is_empty() {
+            return String::new();
+        }
+        redact_for_log(&String::from_utf8_lossy(&bytes))
     }
 
     fn write_frame(&mut self, frame: &Value) -> Result<(), McpError> {
@@ -202,10 +235,30 @@ impl StdioTransport {
             .map_err(|error| McpError::Transport(format!("could not write to MCP server: {error}")))
     }
 
+    /// Appends the child's redacted stderr tail to a transport error, so a
+    /// server that explains its own failure on stderr is not reduced to
+    /// "closed its output stream".
+    fn with_stderr(&self, message: String) -> McpError {
+        let snippet = self.stderr_snippet();
+        if snippet.is_empty() {
+            McpError::Transport(message)
+        } else {
+            McpError::Transport(format!("{message} (stderr: {snippet})"))
+        }
+    }
+
     /// Returns the response for `id`, parking every other frame (a
     /// notification, a server-initiated request, a stale response) so it can
-    /// be drained later instead of being mistaken for this answer.
-    fn await_response(&mut self, id: u64, deadline: Instant) -> Result<Value, McpError> {
+    /// be drained later instead of being mistaken for this answer. `cancel`
+    /// is polled every [`READ_POLL`] tick, not only before this call starts,
+    /// so a cancellation that fires while this is blocked waiting on the
+    /// server is observed within one poll tick instead of at `deadline`.
+    fn await_response(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        cancel: &dyn Cancellation,
+    ) -> Result<Value, McpError> {
         if let Some(index) = self
             .pending
             .iter()
@@ -214,6 +267,9 @@ impl StdioTransport {
             return Ok(self.pending.remove(index));
         }
         loop {
+            if cancel.is_cancelled() {
+                return Err(McpError::Cancelled);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(McpError::Timeout(format!("no response to request {id}")));
@@ -227,12 +283,36 @@ impl StdioTransport {
                         self.pending.push(frame);
                     }
                 }
-                Ok(Err(why)) => return Err(McpError::Transport(why)),
+                Ok(Err(why)) => return Err(self.with_stderr(why)),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(McpError::Transport(
-                        "MCP server closed its output stream".into(),
-                    ));
+                    // The stdout pipe can close a beat before the child's
+                    // already-buffered stderr bytes are drained into the
+                    // tail by the background reader; give it a moment so the
+                    // error is not missing a diagnostic that was in fact
+                    // written.
+                    std::thread::sleep(Duration::from_millis(50));
+                    return Err(self.with_stderr("MCP server closed its output stream".into()));
+                }
+            }
+        }
+    }
+}
+
+fn pump_stderr(stderr: std::process::ChildStderr, tail: &std::sync::Mutex<Vec<u8>>) {
+    use std::io::Read;
+    let mut reader = BufReader::new(stderr);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => {
+                if let Ok(mut buffer) = tail.lock() {
+                    buffer.extend_from_slice(&chunk[..count]);
+                    if buffer.len() > MAX_STDERR_TAIL_BYTES {
+                        let overflow = buffer.len() - MAX_STDERR_TAIL_BYTES;
+                        buffer.drain(0..overflow);
+                    }
                 }
             }
         }
@@ -246,6 +326,7 @@ impl McpTransport for StdioTransport {
         method: &str,
         params: Value,
         deadline: Instant,
+        cancel: &dyn Cancellation,
     ) -> Result<Value, McpError> {
         self.write_frame(&json!({
             "jsonrpc": "2.0",
@@ -253,7 +334,7 @@ impl McpTransport for StdioTransport {
             "method": method,
             "params": params,
         }))?;
-        self.await_response(id, deadline)
+        self.await_response(id, deadline, cancel)
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), McpError> {
@@ -474,12 +555,56 @@ impl HttpTransport {
         headers
     }
 
-    fn send(&mut self, frame: &Value, deadline: Instant) -> Result<Option<Value>, McpError> {
+    /// Runs the poster's blocking POST on a background thread and polls
+    /// `cancel` while waiting for it, so a cancellation that fires while this
+    /// call is blocked inside the poster is observed within one poll tick
+    /// instead of only once the poster itself gives up at `deadline`. The
+    /// background thread is left to finish (or hit its own deadline) on its
+    /// own; a cancelled request never reads its answer.
+    fn post_cancellable(
+        &self,
+        body: String,
+        deadline: Instant,
+        cancel: &dyn Cancellation,
+    ) -> Result<HttpReply, McpError> {
+        let poster = Arc::clone(&self.poster);
+        let url = self.url.clone();
+        let headers = self.headers();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = poster.post(&url, &headers, body, deadline);
+            let _ = sender.send(result);
+        });
+        loop {
+            if cancel.is_cancelled() {
+                return Err(McpError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining.min(READ_POLL)) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) => {
+                    if remaining.is_zero() {
+                        return Err(McpError::Timeout("no response to the MCP request".into()));
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(McpError::Transport(
+                        "the MCP HTTP request thread vanished without answering".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn send(
+        &mut self,
+        frame: &Value,
+        deadline: Instant,
+        cancel: &dyn Cancellation,
+    ) -> Result<Option<Value>, McpError> {
         let body = serde_json::to_string(frame)
             .map_err(|error| McpError::Protocol(format!("could not encode request: {error}")))?;
-        let reply = self
-            .poster
-            .post(&self.url, &self.headers(), body, deadline)?;
+        let reply = self.post_cancellable(body, deadline, cancel)?;
         if let Some(session) = reply.session_id.clone() {
             self.session_id = Some(session);
         }
@@ -544,6 +669,7 @@ impl McpTransport for HttpTransport {
         method: &str,
         params: Value,
         deadline: Instant,
+        cancel: &dyn Cancellation,
     ) -> Result<Value, McpError> {
         let frame = json!({
             "jsonrpc": "2.0",
@@ -551,7 +677,7 @@ impl McpTransport for HttpTransport {
             "method": method,
             "params": params,
         });
-        self.send(&frame, deadline)?.ok_or_else(|| {
+        self.send(&frame, deadline, cancel)?.ok_or_else(|| {
             McpError::Protocol(format!("remote MCP server sent no response to {method}"))
         })
     }
@@ -562,8 +688,12 @@ impl McpTransport for HttpTransport {
             "method": method,
             "params": params,
         });
-        self.send(&frame, Instant::now() + Duration::from_secs(10))
-            .map(|_| ())
+        self.send(
+            &frame,
+            Instant::now() + Duration::from_secs(10),
+            &NeverCancelled,
+        )
+        .map(|_| ())
     }
 
     fn shutdown(&mut self) {
@@ -937,6 +1067,7 @@ impl McpClient {
                 },
             }),
             deadline,
+            &NeverCancelled,
         )?;
         let result = unwrap_result(result)?;
         let negotiated = result
@@ -1104,7 +1235,7 @@ impl McpClient {
             );
             return Err(McpError::Cancelled);
         }
-        match transport.request(id, method, params, deadline) {
+        match transport.request(id, method, params, deadline, cancel) {
             Ok(value) => Ok(value),
             Err(error) => {
                 if cancel.is_cancelled() {
@@ -1299,6 +1430,7 @@ impl McpTransport for FixtureTransport {
         method: &str,
         params: Value,
         _deadline: Instant,
+        _cancel: &dyn Cancellation,
     ) -> Result<Value, McpError> {
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut server = self
@@ -1653,6 +1785,160 @@ mod tests {
             sent.iter()
                 .any(|(method, _)| method == "notifications/cancelled"),
             "the server must be told the request was cancelled"
+        );
+    }
+
+    /// Spawns the given fixture script (`.sh` on unix, `.cmd` on Windows)
+    /// through a real child process, with `environment` set on it.
+    fn spawn_fixture_stdio(
+        stem: &str,
+        environment: BTreeMap<String, String>,
+    ) -> Result<StdioTransport, McpError> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let transport = if cfg!(windows) {
+            McpTransportConfig::Stdio {
+                command: "cmd".into(),
+                args: vec![
+                    "/D".into(),
+                    "/S".into(),
+                    "/C".into(),
+                    root.join(format!("{stem}.cmd")).display().to_string(),
+                ],
+                cwd: None,
+                environment,
+            }
+        } else {
+            McpTransportConfig::Stdio {
+                command: "sh".into(),
+                args: vec![root.join(format!("{stem}.sh")).display().to_string()],
+                cwd: None,
+                environment,
+            }
+        };
+        StdioTransport::spawn(&McpServerConfig {
+            name: stem.into(),
+            transport,
+            ..McpServerConfig::default()
+        })
+    }
+
+    #[test]
+    fn a_mid_flight_cancellation_of_a_stdio_call_is_observed_promptly_and_still_notifies_the_server()
+     {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let marker = std::env::temp_dir().join(format!(
+            "zirv-mcp-hang-marker-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let mut environment = BTreeMap::new();
+        environment.insert(
+            "MCP_HANG_MARKER".to_string(),
+            marker.to_string_lossy().into_owned(),
+        );
+        let mut transport =
+            spawn_fixture_stdio("mcp-hang-server", environment).expect("spawn the hang fixture");
+
+        // The server never replies to anything; only a cancellation fired
+        // WHILE `request` is blocked waiting on it proves the poll loop
+        // observes cancellation mid-flight rather than only at the deadline
+        // or only before the call starts.
+        let cancel = Arc::new(CancellationFlag::default());
+        let cancel_thread = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel_thread.cancel();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
+        let error = transport
+            .request(
+                1,
+                "tools/call",
+                json!({"name": "slow"}),
+                deadline,
+                cancel.as_ref(),
+            )
+            .expect_err("a request stuck on a non-responding server must be cancellable");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error, McpError::Cancelled);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a mid-flight cancellation must be observed within a poll tick, \
+             not only at the 30s request deadline: {elapsed:?}"
+        );
+
+        // Mirrors what `McpClient::call_raw_cancellable` does once `request`
+        // reports `Cancelled`: tell the server, so its outcome is UNKNOWN
+        // rather than silently abandoned.
+        transport
+            .notify(
+                "notifications/cancelled",
+                json!({"requestId": 1, "reason": "zirv cancelled the session"}),
+            )
+            .expect("notify must still work: a cancelled call leaves the transport usable");
+
+        let notify_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::read_to_string(&marker).is_ok_and(|body| body.contains("cancelled")) {
+                break;
+            }
+            assert!(
+                Instant::now() < notify_deadline,
+                "the server never observed notifications/cancelled"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn a_stdio_servers_stderr_diagnostic_is_bounded_redacted_and_reaches_the_transport_error() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let transport = if cfg!(windows) {
+            McpTransportConfig::Stdio {
+                command: "cmd".into(),
+                args: vec!["/C".into(), format!("echo token={secret} diagnostic 1>&2")],
+                cwd: None,
+                environment: BTreeMap::new(),
+            }
+        } else {
+            McpTransportConfig::Stdio {
+                command: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!("echo 'token={secret} diagnostic' 1>&2"),
+                ],
+                cwd: None,
+                environment: BTreeMap::new(),
+            }
+        };
+        let mut transport = StdioTransport::spawn(&McpServerConfig {
+            name: "diagnostic".into(),
+            transport,
+            ..McpServerConfig::default()
+        })
+        .expect("spawn the diagnostic fixture");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let error = transport
+            .request(1, "initialize", json!({}), deadline, &NeverCancelled)
+            .expect_err("a server that only writes to stderr and exits never answers");
+        let McpError::Transport(message) = error else {
+            panic!("expected a transport error carrying the stderr diagnostic: {error:?}");
+        };
+        assert!(
+            message.contains("diagnostic"),
+            "the stderr diagnostic must reach the transport error: {message}"
+        );
+        assert!(
+            !message.contains(secret),
+            "the secret-shaped token must be redacted: {message}"
         );
     }
 

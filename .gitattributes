@@ -39,3 +39,8 @@
 # pinned to LF for the same reason the two wire-fixture sets above are -- a
 # CRLF checkout must not be able to change what a loop-correctness test sees.
 /tests/fixtures/runtime/native/*.json text eol=lf
+
+# Issue #483 review finding 1: the MCP stdio-cancellation test fixtures are
+# executed by `sh`/`cmd` verbatim, same reason as noisy-output.sh/.cmd above.
+/tests/fixtures/mcp-hang-server.sh text eol=lf
+/tests/fixtures/mcp-hang-server.cmd text eol=crlf
