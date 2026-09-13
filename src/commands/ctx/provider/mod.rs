@@ -8,6 +8,7 @@ pub mod credential;
 pub mod google;
 pub mod inventory;
 pub mod openai;
+pub mod openai_chat;
 pub mod probe;
 pub mod profiles;
 pub mod transport;
@@ -295,6 +296,82 @@ pub static PROVIDERS: &[ProviderSpec] = &[
         entitlement_note: SUBSCRIPTION_NOTE,
     },
 ];
+
+/// A one-request loopback HTTP server, shared by the direct transports'
+/// tests so each of them proves its real wire request instead of trusting an
+/// encoder unit test.
+#[cfg(test)]
+pub(crate) mod testhttp {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Answers exactly one request with `status` and `body`, handing the
+    /// caller the raw request text it received.
+    pub(crate) fn one_shot_server(
+        status: u16,
+        body: &'static str,
+        content_type: &'static str,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let request = read_http_request(&mut stream);
+            let _ = sender.send(request);
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let content_type = if status == 200 {
+                content_type
+            } else {
+                "application/json"
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let mut expected = None;
+        loop {
+            let Ok(count) = stream.read(&mut buffer) else {
+                break;
+            };
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if expected.is_none()
+                && let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                expected = Some(end + 4 + length);
+            }
+            if expected.is_some_and(|expected| bytes.len() >= expected) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
 
 pub fn provider(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|spec| spec.id == id)
