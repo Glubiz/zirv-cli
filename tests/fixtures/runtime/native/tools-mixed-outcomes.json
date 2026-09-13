@@ -1,0 +1,19 @@
+{
+  "tools": {
+    "file_read": [
+      { "state": "failed", "message": "transient read error" },
+      { "state": "completed", "result": { "text": "second attempt worked" } }
+    ],
+    "apply_patch": [
+      {
+        "state": "outcome_unknown",
+        "message": "the patch write began and its outcome is unknown"
+      }
+    ],
+    "process_start": [
+      { "state": "failed", "message": "the process could not be launched" }
+    ],
+    "text_search": [{ "state": "completed", "result": { "matches": 0 } }],
+    "file_write": [{ "state": "completed", "result": { "bytes": 1 } }]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "tools": {
+    "file_read": [
+      { "state": "completed", "result": { "text": "pub fn broken() {}" } }
+    ],
+    "text_search": [
+      { "state": "completed", "result": { "matches": 2 } }
+    ],
+    "apply_patch": [
+      { "state": "completed", "result": { "applied": true } }
+    ],
+    "file_write": [
+      { "state": "completed", "result": { "bytes": 15 } }
+    ],
+    "process_start": [
+      { "state": "completed", "result": { "exit_code": 0, "handle": "p1" } }
+    ]
+  }
+}

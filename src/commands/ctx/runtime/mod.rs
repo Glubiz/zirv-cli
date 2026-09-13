@@ -33,8 +33,10 @@
 pub mod context;
 pub mod enforcement;
 pub mod fake;
+pub mod fixture;
 pub mod harness;
 pub mod journal;
+pub mod native;
 pub mod protocol;
 pub mod tools;
 
@@ -267,12 +269,14 @@ impl std::fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 /// Picks the backend for `kind`. `Harness` needs a real adapter (this is
-/// where the existing harness code is actually reached); `Native` and
-/// `Unknown` both fail closed today -- issue #469's later roadmap steps
-/// (N02-N09) are what will make `Native` succeed.
+/// where the existing harness code is actually reached); `Native` is
+/// [`native::NativeBackend`], the real agent loop issue #478 (N09) shipped,
+/// and needs no adapter at all -- a native session never spawns a coding
+/// harness. `Unknown` still fails closed: guessing `Harness` would let a
+/// native-only session be treated as one a harness process can be spawned for.
 ///
 /// [`fake::FakeNativeBackend`] is deliberately not reachable through this
-/// function: it exists for tests and for later roadmap steps that want a
+/// function: it exists for tests and for roadmap steps that want a
 /// deterministic stand-in, and both select it directly as a
 /// `Box<dyn RuntimeBackend>`.
 pub fn select(
@@ -288,10 +292,7 @@ pub fn select(
             })?;
             Ok(Box::new(harness::HarnessBackend::new(adapter)))
         }
-        RuntimeKind::Native => Err(RuntimeError::Unsupported(
-            "native runtime is not available yet (roadmap #469, steps N02-N09)".to_string(),
-        )
-        .into()),
+        RuntimeKind::Native => Ok(Box::new(native::NativeBackend::new())),
         RuntimeKind::Unknown => {
             Err(RuntimeError::Unsupported("unknown runtime kind".to_string()).into())
         }
@@ -354,9 +355,14 @@ mod tests {
     }
 
     #[test]
-    fn select_native_names_the_roadmap_issue() {
-        let error = select(RuntimeKind::Native, None).expect_err("native not ready");
-        assert!(error.to_string().contains("#469"));
+    fn select_native_needs_no_adapter_at_all() {
+        // Acceptance criterion (f) of issue #478 at the seam: selecting the
+        // native backend must not require -- or probe for -- an installed
+        // coding harness.
+        let backend = select(RuntimeKind::Native, None).expect("native backend");
+        assert_eq!(backend.kind(), RuntimeKind::Native);
+        assert!(backend.capabilities().steer);
+        assert!(backend.capabilities().interrupt);
     }
 
     #[test]
