@@ -452,6 +452,84 @@ mod tests {
         );
     }
 
+    /// Issue #489's half of the same rule, in both directions, against two
+    /// committed client fixtures.
+    ///
+    /// A previous-supported client -- one that shipped before native sessions
+    /// existed -- meets a native-capable server and disables the surface
+    /// LOCALLY: it never calls the five native methods, rather than calling
+    /// them and being refused. A native-capable client meets a server that
+    /// owns no conversations and does the same thing in reverse, reporting
+    /// `session.native` as a capability only IT has.
+    #[test]
+    fn a_native_capable_client_and_a_previous_one_each_degrade_explicitly() {
+        fn client_fixture(name: &str) -> Vec<Capability> {
+            serde_json::from_str(
+                &std::fs::read_to_string(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/protocol/v1")
+                        .join(name),
+                )
+                .unwrap_or_else(|error| panic!("read {name}: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("parse {name}: {error}"))
+        }
+        fn hello(capabilities: Vec<Capability>) -> Hello {
+            Hello {
+                version: PROTOCOL_VERSION,
+                server: SERVER_NAME.to_string(),
+                server_version: "99.0.0".to_string(),
+                revision: 0,
+                capabilities,
+            }
+        }
+
+        let older = client_fixture("client-previous-minor.json");
+        let native_client = client_fixture("client-native.json");
+        assert!(
+            !older.contains(&Capability::SessionNative),
+            "the previous-minor fixture predates native sessions"
+        );
+
+        // Old client, new server.
+        let negotiated = Negotiated::from_hello(&hello(ADVERTISED.to_vec()), &older);
+        assert!(!negotiated.has(Capability::SessionNative));
+        assert!(
+            negotiated.server_only.contains(&Capability::SessionNative),
+            "and it is reported as the server's, not silently dropped: {negotiated:?}"
+        );
+        for method in [
+            Method::SessionInterrupt,
+            Method::SessionApprove,
+            Method::SessionTaskResult,
+            Method::SessionHistory,
+            Method::SessionJournal,
+        ] {
+            assert!(
+                !negotiated.allows(method),
+                "{method} must be refused locally, without a round trip"
+            );
+        }
+
+        // New client, old server -- the direction that proves the client
+        // disables its own feature rather than assuming the server has it.
+        let downlevel = Negotiated::from_hello(
+            &hello(super::super::wire::ADVERTISED_WITHOUT_HOST.to_vec()),
+            &native_client,
+        );
+        assert!(!downlevel.has(Capability::SessionNative));
+        assert!(
+            downlevel.client_only.contains(&Capability::SessionNative),
+            "the client knows it is the one giving the feature up: {downlevel:?}"
+        );
+        assert!(downlevel.has(Capability::SessionRead), "the rest still works");
+
+        // And both ends agreeing is what turns it on.
+        let both = Negotiated::from_hello(&hello(ADVERTISED.to_vec()), &native_client);
+        assert!(both.has(Capability::SessionNative));
+        assert!(both.allows(Method::SessionHistory));
+    }
+
     /// End to end over the real platform transport: connect, negotiate,
     /// call, and prove the CLI-facing client and the server agree.
     #[test]
