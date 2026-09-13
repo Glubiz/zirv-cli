@@ -3358,6 +3358,52 @@ cold launch carrying the packet — because resuming a conversation without
 telling it what happened in its absence would silently drop the interim's
 work.
 
+**A rollover can cross runtimes, and the seat keeps its identity.** The same
+prepare/commit/abort transaction moves a seat between backends as well as
+between harnesses — `harness→harness`, `harness→native`, `native→harness`,
+`native→native` — and the seat's short id and generation lineage are exactly
+what does not change. What changes is which backend answers at that address,
+which `zirv ctx status` names inline (`seat: claude opus [native] gen 3`)
+alongside the harness or route the seat was displaced from and a one-line
+rollover record: trigger, direction, every route tried with why it was
+refused, and whether the seat committed, **kept the original session**
+(preparation failed, so the seat never moved), or **parked** honestly with all
+its durable state intact. The record lives at
+`<state>/sessions/<short>.rollover.json`.
+
+Before a successor is prepared at all, a native source reaches a safe
+boundary: in-flight work is drained or explicitly cancelled, any tool effect
+that *began and never reported* is carried as outcome-unknown (never retried,
+never called failed), and one portable checkpoint — acknowledged input with
+whatever is still owed, task claims, completion receipts, outstanding tools,
+evidence — is committed to the journal. An outcome-unknown effect **halts the
+successor** until it is reconciled: the whole point is that a fresh model must
+not re-run it. Portable checkpoints stay strictly separate from a provider's
+own continuation envelope, and only a native successor on the *identical*
+route may keep that envelope; every other direction rebuilds a legal semantic
+history, and a coding-harness successor never sees another vendor's envelope
+at all.
+
+Two rules are worth stating because they are refusals rather than fallbacks.
+A successor is validated — policy, capabilities, context room, billing
+authority, authentication, budget, startup — *before* the source is given up,
+and a failure keeps the original session. And a rollover is only authorized to
+move work onto the billing posture the seat **already** spends (plus local
+runtimes, which have no credential and no invoice): moving subscription work
+onto metered API credit is a decision an operator makes, never a silent
+consequence of capacity. Native subagents a rolling seat owns are finished,
+stopped, or retained under recorded ownership — zirv has no mechanism that
+migrates a running worker to another seat, so it never claims one.
+
+Only one seat generation is write-capable at a time, and that is enforced
+rather than assumed: a stale generation is refused at native tool effects (the
+journal's own fence), at wrapped tool effects (the pre-tool hook), at
+`zirv agent` delegation, at the coordinator's plan graph and at the per-tree
+writer lease. In the window between prepare and commit the *source* still
+holds the seat, so a successor that has been validated but not committed
+cannot write either — which is what makes a crash at either boundary
+incapable of producing two writers.
+
 **Cross-harness capacity, at a glance.** `zirv ctx status` (and `zirv ctx
 status --json` for machine-readable output) reports a pool section built on
 the same pure allocator: each harness's scheduling state (`ready` /
