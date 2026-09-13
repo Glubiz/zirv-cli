@@ -2882,29 +2882,16 @@ fn brokered_tools(
     cfg: &super::super::config::CtxConfig,
     handle: &SessionHandle,
 ) -> CtxResult<Box<dyn ToolExecutor>> {
-    use super::enforcement::{
-        ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, ExecutionIdentity,
-        PlatformIsolation, ResourceClaims, StoredSeatFence,
-    };
+    use super::enforcement::ExecutionIdentity;
     use super::tools::ToolLimits;
 
-    let broker = ExecutionBroker::new(
+    let broker = session_broker(
+        request.repo,
+        state,
+        home,
+        cfg,
         ExecutionIdentity::from_handle(handle, request.task.clone())?,
-        ResourceClaims::new(
-            request.repo,
-            request.repo,
-            state.root(),
-            home,
-            configured_network_scope(cfg),
-        )?
-        .discover_linked_worktree_git()?,
-        ApprovalMode::Headless,
-        std::sync::Arc::new(ConfigPolicySource::new(request.repo.to_path_buf())),
-        std::sync::Arc::new(StoredSeatFence::new(state.clone())),
-        std::sync::Arc::new(ApprovalAuthority::new()),
         request.writer.take(),
-        PlatformIsolation::detect(),
-        Default::default(),
     )?;
     let services = super::capabilities::CapabilityServices::from_config(
         cfg,
@@ -2921,6 +2908,61 @@ fn brokered_tools(
         )
         .with_capabilities(services),
     )))
+}
+
+/// The execution broker one native session runs behind.
+///
+/// Extracted from [`brokered_tools`] for issue #484 (roadmap N15) so the
+/// read-only helper contract can be asserted against the SAME construction a
+/// real session gets, rather than against a test-local copy of it that could
+/// drift. `writer` is the whole of that contract: a `None` lease means every
+/// repository write, outside write, write-effect process and shared-scope
+/// knowledge write is refused here, at effect time, with
+/// `BrokerError::WriterPermit` -- and `ApprovalMode::Headless` means the
+/// refusal cannot be approved away either.
+pub(crate) fn session_broker(
+    repo: &std::path::Path,
+    state: &super::super::state::StateDir,
+    home: &std::path::Path,
+    cfg: &super::super::config::CtxConfig,
+    identity: super::enforcement::ExecutionIdentity,
+    writer: Option<Box<dyn super::enforcement::WriterLease>>,
+) -> Result<super::enforcement::ExecutionBroker, super::enforcement::BrokerError> {
+    use super::enforcement::{
+        ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, PlatformIsolation,
+        ResourceClaims, StoredSeatFence,
+    };
+
+    let claims = ResourceClaims::new(
+        repo,
+        repo,
+        state.root(),
+        home,
+        configured_network_scope(cfg),
+    )?;
+    // Only a session that actually holds a writer lease claims git metadata
+    // roots. `discover_linked_worktree_git` refuses a MAIN checkout outright
+    // ("native writers require a linked worktree"), which is the right answer
+    // for a worker that was granted a tree -- and the wrong one for a
+    // read-only helper or a plain `zirv ctx exec --runtime native`, neither of
+    // which can write anything at all: without this, an inspection session in
+    // an ordinary checkout could not even construct its broker.
+    let claims = match writer {
+        Some(_) => claims.discover_linked_worktree_git()?,
+        None => claims,
+    };
+
+    ExecutionBroker::new(
+        identity,
+        claims,
+        ApprovalMode::Headless,
+        std::sync::Arc::new(ConfigPolicySource::new(repo.to_path_buf())),
+        std::sync::Arc::new(StoredSeatFence::new(state.clone())),
+        std::sync::Arc::new(ApprovalAuthority::new()),
+        writer,
+        PlatformIsolation::detect(),
+        Default::default(),
+    )
 }
 
 /// The task's network claim, built from the operator's own capability

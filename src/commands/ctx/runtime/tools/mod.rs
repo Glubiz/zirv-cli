@@ -1130,7 +1130,7 @@ impl ToolLimits {
     }
 
     #[cfg(test)]
-    fn testing() -> Self {
+    pub(crate) fn testing() -> Self {
         Self {
             max_inline_bytes: 1024,
             max_output_read_bytes: 2048,
