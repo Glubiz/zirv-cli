@@ -133,10 +133,7 @@ impl HostSource {
 impl SessionSource for HostSource {
     fn sessions(&self) -> Vec<SessionFacts> {
         let mut facts = self.host.sessions();
-        let owned: BTreeSet<String> = facts
-            .iter()
-            .map(|entry| entry.session_id.clone())
-            .collect();
+        let owned: BTreeSet<String> = facts.iter().map(|entry| entry.session_id.clone()).collect();
         facts.extend(
             self.registry
                 .sessions()
@@ -272,8 +269,8 @@ impl RuntimeService {
     }
 
     fn resume_entry(&self, entry: &TopologyEntry, cfg: &CtxConfig) -> CtxResult<String> {
-        let argv = super::host::resume_argv(entry)
-            .ok_or("no verified resume command for this agent")?;
+        let argv =
+            super::host::resume_argv(entry).ok_or("no verified resume command for this agent")?;
         let cwd = super::host::restore_cwd(entry, &std::env::current_dir()?);
         let session_id = uuid::Uuid::new_v4().to_string();
         let (env, _) = super::super::dash::build_turn_env(
@@ -391,7 +388,10 @@ mod tests {
             claim_for(Some(&live), &probe(false, None), 1_100, 120),
             Claim::Replace(Liveness::Gone)
         );
-        assert_eq!(claim_for(None, &probe(false, None), 1_100, 120), Claim::Free);
+        assert_eq!(
+            claim_for(None, &probe(false, None), 1_100, 120),
+            Claim::Free
+        );
     }
 
     /// A record with no start identity and a quiet heartbeat is `Unverified`,
@@ -504,7 +504,10 @@ mod tests {
                 json!({"session_id": id, "client_id": "c1"}),
             )
             .expect("detach");
-        assert_eq!(detached["attachment"]["controller"], serde_json::Value::Null);
+        assert_eq!(
+            detached["attachment"]["controller"],
+            serde_json::Value::Null
+        );
         assert!(
             service
                 .host()
@@ -558,7 +561,10 @@ mod tests {
                 json!({"session_id": "x", "client_id": "c1"}),
             )
             .expect_err("disabled locally");
-        assert!(refusal.to_string().contains("disabled locally"), "{refusal}");
+        assert!(
+            refusal.to_string().contains("disabled locally"),
+            "{refusal}"
+        );
         // The read surface both ends DO share still works.
         assert!(older.call(Method::SessionSnapshot, json!({})).is_ok());
 

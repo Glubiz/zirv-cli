@@ -132,10 +132,8 @@ pub struct Topology {
 }
 
 pub fn topology_path(state: &StateDir, namespace: &str) -> PathBuf {
-    super::namespace::runtime_dir(state).join(format!(
-        "{}-topology.json",
-        state::provider_slug(namespace)
-    ))
+    super::namespace::runtime_dir(state)
+        .join(format!("{}-topology.json", state::provider_slug(namespace)))
 }
 
 pub fn write_topology(state: &StateDir, namespace: &str, topology: &Topology) -> CtxResult<()> {
@@ -353,8 +351,7 @@ impl std::fmt::Debug for HostSession {
 /// The one-line warning an operator sees whenever tier-3 history is enabled.
 /// A constant rather than an inline string so `zirv session serve`, `zirv
 /// session list` and the design note cannot word it differently.
-pub const HISTORY_WARNING: &str =
-    "[session] history = true: this runtime writes each session's rendered terminal output to \
+pub const HISTORY_WARNING: &str = "[session] history = true: this runtime writes each session's rendered terminal output to \
      disk, including anything an agent printed -- API keys, tokens, file contents. It is off by \
      default for that reason; turn it off again with `ZIRV_CTX_SESSION_HISTORY=false`.";
 
@@ -852,8 +849,8 @@ pub fn launch_spec(spec: &SessionSpec, session_id: &str, state: &StateDir) -> Ct
         session_id,
         adapters::LaunchMode::Interactive,
     );
-    let conversation = (!adapter.session_pin_args(session_id).is_empty())
-        .then(|| session_id.to_string());
+    let conversation =
+        (!adapter.session_pin_args(session_id).is_empty()).then(|| session_id.to_string());
     Ok(SpawnSpec {
         session_id: session_id.to_string(),
         agent: pane.agent_name,
@@ -1024,7 +1021,10 @@ mod tests {
         host.detach(id, "dash-1").expect("detach");
 
         // The whole point: the client is gone and nothing else moved.
-        assert!(sessions::is_alive(pid), "detaching must not end the process");
+        assert!(
+            sessions::is_alive(pid),
+            "detaching must not end the process"
+        );
         let facts = host.sessions();
         let facts = facts.first().expect("still one session");
         assert_ne!(facts.state, SessionState::Ended);
