@@ -3069,7 +3069,8 @@ fn harvest_durable_with_tool_errors(
     let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
     // Issue #89.
     super::adapters::announce_sandbox_residual_once(adapter, cfg.chrome.events);
-    let answer = super::handoff::run_model(
+    let answer = super::handoff::helper_answer(
+        super::helper::ROLE_DISTILLER,
         adapter,
         model,
         &durable_harvest_prompt(handoff, tool_errors),

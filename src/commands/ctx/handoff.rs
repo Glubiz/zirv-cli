@@ -1120,13 +1120,73 @@ pub fn resolve_distiller_model(explicit: Option<&str>, adapter: &dyn AgentAdapte
         .to_string()
 }
 
-/// Runs one fresh model call and returns its stdout. The child is bounded on
+/// The ONE chokepoint every zirv helper-model call goes through (issue #484,
+/// roadmap N15): the distiller, `ctx ask`, `ctx optimize`'s judgment, the
+/// loop's objective judge and the memory harvest all reach a model here and
+/// nowhere else.
+///
+/// Native first, harness second, and the order is the whole point. A helper
+/// runs natively exactly when the operator's own native `[roles]` table names
+/// a route for `role` -- no new configuration key, and no silent migration of
+/// a machine that configured none. With a route, the call needs no coding
+/// harness on PATH at all; without one, this is exactly [`run_model`] and
+/// nothing about the legacy path changes.
+///
+/// A native attempt that FAILS (rather than being unconfigured) still falls
+/// back to the harness rather than failing the caller: a distiller call is
+/// best-effort by construction -- `distill_or_structural` degrades to a
+/// mechanical extraction anyway -- and refusing to try the path that is known
+/// to work would make the native route strictly worse than none.
+pub fn helper_answer(
+    role: &str,
+    adapter: &dyn AgentAdapter,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> CtxResult<String> {
+    use super::helper::{self, HelperBudget, HelperRequest};
+
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let env = super::config::env_from_process();
+    if helper::available(&repo, role, None, &env) {
+        match helper::run(
+            &HelperRequest {
+                repo: &repo,
+                prompt,
+                role,
+                route: None,
+                // A helper answers from the prompt it was handed. No tools at
+                // all is what keeps a "cheap" judgment call cheap.
+                budget: HelperBudget::one_shot(timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+                provider: None,
+            },
+            &env,
+        ) {
+            Ok(answer) => return Ok(answer.text),
+            Err(helper::HelperError::Unconfigured(_)) => {}
+            Err(error) => {
+                crate::output::warn(&format!(
+                    "native {role} helper failed ({error}); falling back to the harness distiller"
+                ));
+            }
+        }
+    }
+    run_model(adapter, model, prompt, timeout)
+}
+
+/// Runs one fresh model call through the resolved coding harness and returns
+/// its stdout. The child is bounded on
 /// every axis that can hang a supervisor: stdin and stdout are each serviced
 /// on their own thread, started before either side has exchanged a byte, so
 /// a model that starts answering before it has consumed all of stdin cannot
 /// deadlock this call -- it would otherwise block writing a full stdout pipe
 /// while this thread blocks writing an stdin pipe nothing is reading. The
 /// wait below then has a deadline after which the child is killed.
+///
+/// Callers reach this through [`helper_answer`], which tries the native
+/// runtime first; it stays public because the harness behaviour it pins
+/// (argv-shim guard, supervision-env scrub, tree-kill at the deadline) is
+/// tested directly.
 pub fn run_model(
     adapter: &dyn AgentAdapter,
     model: &str,
@@ -1271,7 +1331,13 @@ pub fn distill(
         )
         .into());
     }
-    let answer = run_model(adapter, model, &distill_prompt(ctx, previous), timeout)?;
+    let answer = helper_answer(
+        super::helper::ROLE_DISTILLER,
+        adapter,
+        model,
+        &distill_prompt(ctx, previous),
+        timeout,
+    )?;
     let mut handoff = parse_markdown(&answer);
     if !handoff.is_usable() {
         return Err("distiller produced no usable Task and Next step".into());
@@ -2173,6 +2239,31 @@ mod tests {
         assert!(
             handoff.is_usable(),
             "a restart still has something to stand on"
+        );
+    }
+
+    /// Issue #484: the helper chokepoint is native-first, harness-second --
+    /// and on a machine with no native `[roles]` route for the helper's role
+    /// (every machine that has not configured one, including this test's) the
+    /// second half is reached with exactly the behaviour it always had. A
+    /// regression that made the native attempt fatal instead of a fall back
+    /// would take every distiller, ask, optimize and harvest call with it.
+    #[test]
+    fn helper_answer_falls_back_to_the_harness_when_no_native_route_exists() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let adapter = fake_model_adapter();
+        let answer = helper_answer(
+            super::super::helper::ROLE_DISTILLER,
+            &adapter,
+            "haiku",
+            "anything",
+            Duration::from_secs(30),
+        )
+        .expect("the harness fall back answers");
+        assert!(
+            answer.contains("## Task"),
+            "the harness distiller's own raw answer: {answer}"
         );
     }
 

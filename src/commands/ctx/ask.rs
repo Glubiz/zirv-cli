@@ -25,7 +25,7 @@ use super::CtxResult;
 use super::adapters;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{SessionId, SessionRef, StructuralContext};
-use super::handoff::{bullets, render_verification, resolve_distiller_model, run_model};
+use super::handoff::{bullets, helper_answer, render_verification, resolve_distiller_model};
 use super::sessions::{resolve_error_with_diagnostics, resolve_prefix};
 use super::state::StateDir;
 
@@ -132,8 +132,14 @@ pub fn run_with<W: Write>(
     // a mechanical fallback -- there is no structural equivalent of "answer
     // a free-form question," so the operator sees exactly why the distiller
     // could not answer instead of a misleadingly confident guess.
-    let answer = run_model(adapter.as_ref(), &model, &prompt, timeout)
-        .map_err(|e| format!("zirv ctx ask: distiller failed: {e}"))?;
+    let answer = helper_answer(
+        crate::commands::ctx::helper::ROLE_ASK,
+        adapter.as_ref(),
+        &model,
+        &prompt,
+        timeout,
+    )
+    .map_err(|e| format!("zirv ctx ask: distiller failed: {e}"))?;
     let answer = answer.trim().to_string();
 
     if args.json {
