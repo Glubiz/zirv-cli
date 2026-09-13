@@ -1622,6 +1622,30 @@ routes are fixture-verified with live validation still pending; the contract
 is in
 [`docs/design/2026-09-12-native-openai-provider.md`](docs/design/2026-09-12-native-openai-provider.md).
 
+The third direct-model adapter speaks Google's Gemini `generateContent`/
+`streamGenerateContent` API over the same raw HTTPS/SSE transport, behind two
+explicitly versioned protocol profiles: the Gemini Developer API (API key,
+`generativelanguage.googleapis.com`, `v1beta`, where thinking and
+function-calling controls live) and Vertex AI (an OAuth access-token
+credential plus an explicit project and location, addressed at
+`.../v1/projects/{project}/locations/{location}/publishers/google/models/
+{model}`). Token acquisition for the Vertex profile is a separate
+credential-class concern from payload transformation. Parallel function calls
+and `thoughtSignature` continuation metadata -- including signature-only
+reasoning with no visible thought text -- are preserved verbatim as opaque
+data and rejected before transport if they carry another provider's shape.
+Safety blocks (`SAFETY`/`RECITATION`/`PROHIBITED_CONTENT`/...) commit as a
+typed refusal outcome, never prose; quota errors, invalid project/location,
+authentication, model access, transport and context-overflow failures map
+onto the same typed failure classes the other two providers use. A Gemini CLI
+OAuth login (`~/.gemini`) is refused outright, by path and by credential
+shape, with an actionable `Entitlement` failure -- the same posture as
+OpenAI's subscription refusal. The Vertex profile is declared but only just
+promoted from `Support::Planned` to `Support::Native` in N02's capability
+table; both routes are fixture-verified with live validation still pending.
+The contract, and how to add or retire a protocol profile, is in
+[`docs/design/2026-09-13-native-google-provider.md`](docs/design/2026-09-13-native-google-provider.md).
+
 #### The native agent loop
 
 `zirv ctx exec --runtime native` runs a whole session without a coding

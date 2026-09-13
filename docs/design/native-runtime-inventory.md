@@ -192,6 +192,7 @@ installed binary during self-update; never spawns it).
 |---|---|---|---|---|
 | Native Anthropic Messages request | `src/commands/ctx/provider/anthropic.rs` | `perform_blocking` | N07 (#476) | direct HTTPS/SSE transport behind `ProviderAdapter`; no vendor CLI or SDK agent loop |
 | Native OpenAI Responses request | `src/commands/ctx/provider/openai.rs` | `perform_blocking` | N08 (#477) | direct HTTPS/SSE transport behind `ProviderAdapter`; no Codex binary, SDK, or App Server |
+| Native Google Gemini request | `src/commands/ctx/provider/google.rs` | `perform_blocking` | N12 (#481) | direct HTTPS/SSE transport behind `ProviderAdapter`; explicit Developer/Vertex protocol profiles, no Gemini CLI |
 | Native agent loop | `src/commands/ctx/runtime/native.rs` | `stream_once` | N09 (#478) | the one place the loop calls a `ProviderAdapter`; owns retries, the durable barrier and tool scheduling. No vendor CLI, SDK or agent framework |
 | Native headless session | `src/commands/ctx/runtime/native.rs` | `run_headless` | N09 (#478) | `zirv ctx exec --runtime native`: resolves the route, builds the direct provider adapter and drives `NativeLoop` to a structured final status |
 | Interactive orchestrator launch | `src/commands/ctx/chat.rs` | `build_launch` | N11 (#480) | backs `zirv ctx chat` / `zirv chat` |
@@ -227,8 +228,9 @@ after_cycle`, distinct from its main headless spawn),
 `src/commands/workflow/frontend_render.rs` (`launch_visual_reviewer`), and
 `src/commands/workflow/engine.rs` (`spawn_auto_worker`). N07 adds the first
 native direct-model call in `src/commands/ctx/provider/anthropic.rs`
-(`perform_blocking`), and N08 the second in
-`src/commands/ctx/provider/openai.rs` (`perform_blocking`).
+(`perform_blocking`), N08 the second in
+`src/commands/ctx/provider/openai.rs` (`perform_blocking`), and N12 the third
+in `src/commands/ctx/provider/google.rs` (`perform_blocking`).
 
 N09 adds the two rows that actually DRIVE a model rather than transport one
 request: `NativeLoop::stream_once`, the single place the loop reaches a
