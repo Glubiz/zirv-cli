@@ -706,4 +706,189 @@ mod tests {
         clear_shutdown(&state, "default");
         assert!(!shutdown_requested(&state, "default"));
     }
+
+    /// The native environment a served-runtime test injects: a fixed route
+    /// identity and a turn runner that records rather than calls a model.
+    /// Everything the test asserts -- the transport, the negotiation, the
+    /// seats, the durable cursor -- is real.
+    #[derive(Debug, Default)]
+    struct RecordingEnvironment {
+        runs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl NativeEnvironment for RecordingEnvironment {
+        fn route_identity(
+            &self,
+            _repo: &std::path::Path,
+            _route: Option<&str>,
+            _role: &str,
+        ) -> CtxResult<crate::commands::ctx::runtime::journal::RouteIdentity> {
+            use crate::commands::ctx::provider::Protocol;
+            use crate::commands::ctx::runtime::fixture::fixture_target;
+
+            let target = fixture_target(Protocol::AnthropicMessages, "test-model");
+            Ok(crate::commands::ctx::runtime::journal::RouteIdentity {
+                route: target.route.clone(),
+                provider: target.provider.clone(),
+                endpoint: target.endpoint.clone(),
+                account: target.account.clone(),
+                billing_pool: target.billing_pool.clone(),
+                protocol: target.protocol,
+                model: target.model.clone(),
+            })
+        }
+
+        fn run(&self, turn: &crate::commands::ctx::session::native::QueuedTurn) -> CtxResult<()> {
+            match self.runs.lock() {
+                Ok(mut runs) => runs.push(turn.session.clone()),
+                Err(poisoned) => poisoned.into_inner().push(turn.session.clone()),
+            }
+            Ok(())
+        }
+    }
+
+    /// Issue #489, criteria 1, 2, 3 and 6, end to end over the REAL transport
+    /// (a named pipe on Windows, a unix domain socket elsewhere): one runtime,
+    /// one endpoint, one protocol, carrying a NATIVE conversation.
+    ///
+    /// Start it, negotiate the native capability, submit twice with one
+    /// idempotency key, page the durable journal by cursor, attach an observer
+    /// and prove it cannot drive the session, then detach and prove the
+    /// conversation and its registry record survive that.
+    #[test]
+    fn a_served_runtime_serves_the_native_surface_over_the_real_transport() {
+        use crate::commands::ctx::api::client::Client;
+        use crate::commands::ctx::api::wire::{Capability, Method};
+        use serde_json::json;
+
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = config(tmp.path());
+        let environment = Arc::new(RecordingEnvironment::default());
+        let service = RuntimeService::start_with(
+            state,
+            "default",
+            &cfg,
+            Arc::clone(&environment) as Arc<dyn NativeEnvironment>,
+        )
+        .expect("start");
+        service.native().run_turns_inline_for_test();
+
+        let mut client = Client::connect(service.endpoint()).expect("connect");
+        assert!(
+            client.negotiated().has(Capability::SessionNative),
+            "a runtime that owns conversations advertises the native surface"
+        );
+
+        let started = client
+            .call(
+                Method::SessionStart,
+                json!({
+                    "runtime": "native",
+                    "role": "orchestrator",
+                    "cwd": tmp.path().to_string_lossy(),
+                    "prompt": "first"
+                }),
+            )
+            .expect("start a native session");
+        let id = started["session"]["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        assert_eq!(started["session"]["runtime"], json!("native"));
+
+        // The session list a client sees is ONE list: the native conversation
+        // is in it alongside whatever terminals the runtime holds.
+        let snapshot = client
+            .call(Method::SessionSnapshot, json!({}))
+            .expect("snapshot");
+        assert!(
+            snapshot["sessions"]
+                .as_array()
+                .expect("sessions")
+                .iter()
+                .any(|facts| facts["session_id"] == json!(id)),
+            "{snapshot}"
+        );
+
+        // Durable idempotency across a retry, proven by the journal rather
+        // than by the reply.
+        let first = client
+            .call_with_key(
+                Method::SessionSendInput,
+                json!({"session_id": id, "input": "again"}),
+                Some("wire-key-1"),
+            )
+            .expect("submit");
+        assert_eq!(first["duplicate"], json!(false));
+        let retry = client
+            .call_with_key(
+                Method::SessionSendInput,
+                json!({"session_id": id, "input": "again"}),
+                Some("wire-key-1"),
+            )
+            .expect("retry");
+        assert_eq!(retry["message_id"], first["message_id"]);
+
+        let history = client
+            .call(Method::SessionHistory, json!({"session_id": id}))
+            .expect("history");
+        let inputs = history["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|entry| entry["role"] == json!("user"))
+            .count();
+        assert_eq!(inputs, 2, "the launch prompt and one input: {history}");
+
+        // The durable cursor, over the wire.
+        let page = client
+            .call(
+                Method::SessionJournal,
+                json!({"session_id": id, "after_sequence": 0, "limit": 1}),
+            )
+            .expect("journal");
+        assert_eq!(page["page"]["events"].as_array().expect("events").len(), 1);
+        assert_eq!(page["page"]["gap"], json!(false));
+        let cursor = page["page"]["cursor"].as_u64().expect("cursor");
+        assert!(cursor > 0);
+
+        // An observer attaches and is refused every mutation.
+        client
+            .call(
+                Method::SessionAttach,
+                json!({"session_id": id, "client_id": "watcher", "mode": "observer"}),
+            )
+            .expect("attach as observer");
+        let denied = client
+            .call(
+                Method::SessionSendInput,
+                json!({"session_id": id, "input": "no", "client_id": "watcher"}),
+            )
+            .expect_err("an observer may not drive the session");
+        assert!(denied.to_string().contains("denied"), "{denied}");
+
+        // Detaching is not stopping: the conversation and the registry record
+        // the service holds for it both survive.
+        client
+            .call(
+                Method::SessionDetach,
+                json!({"session_id": id, "client_id": "watcher"}),
+            )
+            .expect("detach");
+        assert!(
+            crate::commands::ctx::sessions::list(&StateDir::from_root(tmp.path().to_path_buf()))
+                .iter()
+                .any(|(record, _)| record.session == id),
+            "a detached native conversation keeps the registry record every policy reads"
+        );
+        let after_detach = client
+            .call(Method::SessionGet, json!({"session_id": id}))
+            .expect("get");
+        assert_eq!(after_detach["session"]["state"], json!("idle"));
+
+        service.shutdown(false);
+    }
 }

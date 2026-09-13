@@ -978,7 +978,13 @@ impl ApiServer {
             )?;
             let ack = native.submit(&facts.session_id, &params.input, steering, idempotency)?;
             if !ack.duplicate {
-                self.mark_working(&facts);
+                // Refreshed rather than stamped `working`: the native host
+                // knows whether a turn is actually in flight (it is what
+                // spawned the runner), so recording a state the server merely
+                // ASSUMES would leave a conversation reading "working" after
+                // its turn had already finished. The refresh emits whatever
+                // really changed.
+                self.refresh_from_source();
             }
             return Ok(json!({
                 "accepted": true,
