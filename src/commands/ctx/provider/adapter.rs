@@ -542,10 +542,20 @@ pub(crate) fn resolve_target(
             )
         })?)
     } else {
-        spec.default_credential_env.iter().find_map(|name| {
-            let reference = CredentialRef::Env((*name).to_string());
-            resolve(&reference, env, store, now).ok()
-        })
+        // With no declared reference, the documented environment variables
+        // are tried in order: the provider's own first, then the bound route
+        // profile's (`DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, ...), which is
+        // where a compatible vendor's variable is recorded. A local profile
+        // that documents none simply resolves to no credential.
+        let profile_env = super::profiles::profile_for(spec.id, &endpoint.vendor)
+            .map_or(&[][..], |profile| profile.credential_env);
+        spec.default_credential_env
+            .iter()
+            .chain(profile_env.iter())
+            .find_map(|name| {
+                let reference = CredentialRef::Env((*name).to_string());
+                resolve(&reference, env, store, now).ok()
+            })
     };
 
     Ok((
@@ -612,6 +622,51 @@ mod tests {
         assert!(!flag.is_cancelled());
         flag.cancel();
         assert!(flag.is_cancelled());
+    }
+
+    #[test]
+    fn a_compatible_vendor_resolves_its_own_documented_environment_variable() {
+        let config: NativeConfig = toml::from_str(
+            "schema=1
+[policy]
+allowed_routes=['work']
+             [endpoint.deepseek]
+provider='openai-compatible'
+vendor='deepseek'
+             [account.work]
+provider='openai-compatible'
+             [route.work]
+account='work'
+endpoint='deepseek'
+model='deepseek-v4-pro'
+",
+        )
+        .unwrap();
+        let route = RouteId::new("work").unwrap();
+        let (target, credential) = resolve_target(
+            &config,
+            &route,
+            &|name| (name == "DEEPSEEK_API_KEY").then(|| "vendor-key".to_string()),
+            &FakeStore::default(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(target.base_url, "https://api.deepseek.com");
+        assert_eq!(
+            credential.map(|credential| credential.secret.expose().to_string()),
+            Some("vendor-key".to_string())
+        );
+
+        // Another vendor's variable is never borrowed for this route.
+        let (_, none) = resolve_target(
+            &config,
+            &route,
+            &|name| (name == "MISTRAL_API_KEY").then(|| "other-key".to_string()),
+            &FakeStore::default(),
+            0,
+        )
+        .unwrap();
+        assert!(none.is_none());
     }
 
     #[test]
