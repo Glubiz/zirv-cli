@@ -58,6 +58,12 @@ pub struct ChatArgs {
     /// be threaded through `WrapArgs`/`PaneSpec` by hand.
     #[arg(long, default_value_t = false)]
     pub pin_harness: bool,
+    /// Issue #352: never use the persistent runtime, even when the operator
+    /// has turned it on. The compatibility and debugging escape hatch -- this
+    /// process owns the pty, and the session ends when it does, exactly as
+    /// every `zirv chat` did before the runtime existed.
+    #[arg(long, default_value_t = false)]
+    pub no_session: bool,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -430,6 +436,39 @@ pub fn run_with<W: Write, E: Write>(
     // dashboard branch and the `wrap` fallback disclose identically, and
     // independently of whether a banner was printed at all.
     announce_model_choice(stderr, &cfg, args.quiet);
+
+    // Issue #352: the persistent runtime, when the operator has turned it on
+    // and there is a terminal to attach. Checked before the dashboard branch
+    // because it replaces BOTH launch paths below -- the session is opened on
+    // the runtime and this process becomes a client of it.
+    //
+    // A failure here falls back to the ordinary in-process launch with one
+    // line on stderr rather than failing the invocation: the runtime is
+    // experimental, and an experiment must not be able to stop an operator
+    // from getting a session.
+    if super::session::chat_route(
+        cfg.session.persistent,
+        args.no_session,
+        stdin_is_tty,
+        stdout_is_tty,
+    ) == super::session::ChatRoute::Runtime
+    {
+        match super::session::chat_via_runtime(
+            &state,
+            adapter.name(),
+            initial_prompt.as_deref(),
+            &extra,
+            repo,
+            w,
+        ) {
+            Ok(code) => return Ok(code),
+            Err(error) => writeln!(
+                stderr,
+                "zirv chat: the persistent runtime is unavailable ({error}); \
+                 starting a session in this process instead"
+            )?,
+        }
+    }
 
     if chrome::dash_eligible(
         stdout_is_tty,
@@ -1760,6 +1799,7 @@ mod tests {
             allow_nested: false,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1805,6 +1845,7 @@ mod tests {
             allow_nested: false,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1863,6 +1904,7 @@ mod tests {
             allow_nested: false,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1882,6 +1924,29 @@ mod tests {
         assert!(printed.contains("disabled"), "got {printed}");
     }
 
+    /// Issue #352: the escape hatch exists on the command line and is OFF
+    /// unless it is typed. A `zirv chat` that quietly opted into an
+    /// experimental runtime would be the opposite of staging it behind a
+    /// flag.
+    #[test]
+    fn no_session_is_an_explicit_opt_out_that_defaults_to_off() {
+        use clap::Parser;
+        let cli = crate::commands::ctx::CtxCli::try_parse_from(["zirv ctx", "chat"])
+            .expect("plain chat parses");
+        let crate::commands::ctx::CtxVerb::Chat(args) = cli.verb else {
+            panic!("expected chat");
+        };
+        assert!(!args.no_session);
+
+        let cli =
+            crate::commands::ctx::CtxCli::try_parse_from(["zirv ctx", "chat", "--no-session"])
+                .expect("--no-session parses");
+        let crate::commands::ctx::CtxVerb::Chat(args) = cli.verb else {
+            panic!("expected chat");
+        };
+        assert!(args.no_session);
+    }
+
     // F2: the nesting guard, checked before anything touches the terminal.
 
     fn chat_args(allow_nested: bool) -> ChatArgs {
@@ -1893,6 +1958,7 @@ mod tests {
             allow_nested,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
             extra: Vec::new(),
         }
     }

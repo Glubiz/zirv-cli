@@ -484,6 +484,158 @@ fn run_stop<W: Write>(args: &StopArgs, state: &StateDir, w: &mut W) -> CtxResult
     }
 }
 
+// ---------------------------------------------------------------------------
+// `zirv chat`'s route into the runtime
+// ---------------------------------------------------------------------------
+
+/// Where a `zirv chat` invocation's session is going to live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRoute {
+    /// The persistent runtime owns the pty; this process is only a client.
+    Runtime,
+    /// Today's behaviour exactly: this process owns the pty and the session
+    /// ends with it.
+    InProcess,
+}
+
+/// Pure: which route a chat launch takes. Three ways to stay on the old path,
+/// and every one of them is deliberate -- the gate is off (the default), the
+/// operator asked for the escape hatch, or there is no terminal to attach,
+/// which is the case every script and CI job is in.
+pub fn chat_route(
+    persistent: bool,
+    no_session: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> ChatRoute {
+    if persistent && !no_session && stdin_is_tty && stdout_is_tty {
+        ChatRoute::Runtime
+    } else {
+        ChatRoute::InProcess
+    }
+}
+
+/// How long a freshly-spawned runtime gets to bind its endpoint before the
+/// caller gives up and takes the in-process path instead.
+const SERVICE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Attaches this terminal to the default runtime, starting the runtime and/or
+/// the session if they are not there yet. Returns the process exit code.
+///
+/// Every step is an ordinary protocol v1 call: `session.snapshot` to find an
+/// existing seat for this repository, `session.start` to open one, then the
+/// attachment surface. Nothing about this path is private to `zirv chat`.
+pub fn chat_via_runtime<W: Write>(
+    state: &StateDir,
+    agent: &str,
+    prompt: Option<&str>,
+    extra: &[String],
+    repo: &std::path::Path,
+    w: &mut W,
+) -> CtxResult<i32> {
+    let endpoint = endpoint_for(state);
+    if !super::api::transport::probe(&endpoint) {
+        spawn_service(state)?;
+        wait_for_endpoint(&endpoint, SERVICE_START_TIMEOUT)?;
+    }
+    let mut client = client::connect(&endpoint)?;
+    if !client::can_attach(&client) {
+        return Err(client::NO_TERMINALS.into());
+    }
+    let slug = super::state::repo_slug(repo);
+    let existing = client::snapshot(&mut client)?.into_iter().find(|facts| {
+        facts.state != SessionState::Ended
+            && facts.repo_slug.as_deref() == Some(slug.as_str())
+            && facts.agent.as_deref() == Some(agent)
+    });
+    let session_id = match existing {
+        Some(facts) => {
+            writeln!(w, "zirv chat: attaching to {} on the runtime", facts.short)?;
+            facts.session_id
+        }
+        None => {
+            let started = client.call(
+                Method::SessionStart,
+                json!({
+                    "runtime": "harness",
+                    "role": "orchestrator",
+                    "agent": agent,
+                    "cwd": repo.to_string_lossy(),
+                    "prompt": prompt.unwrap_or_default(),
+                    "extra_args": extra,
+                }),
+            )?;
+            serde_json::from_value::<String>(started["session"]["session_id"].clone())?
+        }
+    };
+    let name = client::client_id("chat");
+    let outcome = client::attach_terminal(&mut client, &session_id, &name, true, false, w)?;
+    match outcome {
+        client::AttachOutcome::Detached => writeln!(
+            w,
+            "detached; the session keeps running -- `zirv session attach` comes back to it, \
+             `zirv session stop` ends it"
+        )?,
+        client::AttachOutcome::SessionEnded => writeln!(w, "the session ended")?,
+    }
+    Ok(0)
+}
+
+/// Starts `zirv session serve` as a detached process. Detached in the same
+/// two ways `workflow::engine` already detaches a background worker -- its own
+/// process group off unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on
+/// Windows -- because a runtime that died with the terminal that happened to
+/// start it would defeat the entire feature.
+fn spawn_service(state: &StateDir) -> CtxResult<()> {
+    let exe = std::env::current_exe()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("session")
+        .arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Explicit rather than inherited: the client resolved this state
+        // directory, and the runtime it starts has to be the one it is about
+        // to connect to.
+        .env("ZIRV_CTX_STATE_DIR", state.root());
+    detach(&mut command);
+    command.spawn()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+fn wait_for_endpoint(
+    endpoint: &super::api::transport::Endpoint,
+    timeout: std::time::Duration,
+) -> CtxResult<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if super::api::transport::probe(endpoint) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err(format!(
+        "the runtime did not start listening on {} within {timeout:?}",
+        endpoint.display()
+    )
+    .into())
+}
+
 /// The one confirmation rule: an interactive operator is asked, a
 /// non-interactive one must have said `--yes` in advance. Never assumes yes
 /// from a pipe -- a scripted `zirv session stop` that silently killed an
@@ -583,6 +735,37 @@ mod tests {
             assert!(text.contains("experimental"), "{argv:?}: {text}");
             assert!(text.contains("ZIRV_CTX_SESSION_PERSISTENT"), "{text}");
         }
+    }
+
+    /// `zirv chat` reaches the runtime only when the operator opted in AND
+    /// there is a terminal to attach. Every other combination -- the gate off
+    /// (the default), `--no-session`, a piped stdin, a redirected stdout --
+    /// keeps today's in-process launch, which is what "non-TTY and
+    /// `--no-session` behaviour remain supported" means as a decision rather
+    /// than as a hope.
+    #[test]
+    fn chat_uses_the_runtime_only_with_the_gate_on_and_a_real_terminal() {
+        assert_eq!(chat_route(true, false, true, true), ChatRoute::Runtime);
+        assert_eq!(
+            chat_route(false, false, true, true),
+            ChatRoute::InProcess,
+            "the gate is off by default"
+        );
+        assert_eq!(
+            chat_route(true, true, true, true),
+            ChatRoute::InProcess,
+            "--no-session is the escape hatch"
+        );
+        assert_eq!(
+            chat_route(true, false, false, true),
+            ChatRoute::InProcess,
+            "a piped stdin has nothing to attach"
+        );
+        assert_eq!(
+            chat_route(true, false, true, false),
+            ChatRoute::InProcess,
+            "a redirected stdout has nowhere to paint"
+        );
     }
 
     /// With the gate ON but no runtime listening, a client verb says how to

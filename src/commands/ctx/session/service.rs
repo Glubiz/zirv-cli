@@ -407,6 +407,236 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn marker_argv(marker: &str) -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            format!("echo {marker} & ping -n 60 127.0.0.1 >nul"),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn marker_argv(marker: &str) -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo {marker}; sleep 60"),
+        ]
+    }
+
+    fn spec(id: &str, cwd: &std::path::Path) -> SpawnSpec {
+        SpawnSpec {
+            session_id: id.to_string(),
+            agent: "claude".to_string(),
+            role: "orchestrator".to_string(),
+            cwd: cwd.to_path_buf(),
+            repo: cwd.to_path_buf(),
+            verb: super::super::super::sessions::Verb::Chat,
+            argv: marker_argv("ZIRVSERVED"),
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            conversation: Some("conv-1".to_string()),
+            restored_from: None,
+        }
+    }
+
+    fn config(repo: &std::path::Path) -> CtxConfig {
+        CtxConfig::load(repo, &|_| None).expect("config")
+    }
+
+    /// End to end over the REAL transport: a served runtime advertises the
+    /// attachment capability, and a client that negotiated it can attach,
+    /// read the screen, detach and stop -- all through protocol v1 methods,
+    /// with no private message anywhere.
+    #[test]
+    fn a_served_runtime_serves_the_attachment_surface_over_the_real_transport() {
+        use super::super::super::api::client::Client;
+        use super::super::super::api::wire::{Capability, Method};
+        use serde_json::json;
+
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = config(tmp.path());
+        let service = RuntimeService::start(state, "default", &cfg).expect("start");
+
+        let id = "aaaaaaaa-2222-4333-8444-555555555555";
+        service.host().spawn(spec(id, tmp.path())).expect("spawn");
+        service.tick(false);
+
+        let mut client = Client::connect(service.endpoint()).expect("connect");
+        assert!(
+            client.negotiated().has(Capability::SessionAttach),
+            "a server that owns terminals advertises the attachment surface"
+        );
+        let snapshot = client
+            .call(Method::SessionSnapshot, json!({}))
+            .expect("snapshot");
+        let sessions = snapshot["sessions"].as_array().expect("sessions");
+        assert!(
+            sessions.iter().any(|facts| facts["session_id"] == id),
+            "the runtime's own sessions are in the protocol's session list: {snapshot}"
+        );
+
+        let attached = client
+            .call(
+                Method::SessionAttach,
+                json!({"session_id": id, "client_id": "c1", "mode": "controller",
+                       "rows": 30, "cols": 100}),
+            )
+            .expect("attach");
+        assert_eq!(attached["attachment"]["controller"], json!("c1"));
+
+        let screen = client
+            .call(
+                Method::SessionScreen,
+                json!({"session_id": id, "client_id": "c1"}),
+            )
+            .expect("screen");
+        assert_eq!(screen["screen"]["rows"], json!(30));
+
+        let detached = client
+            .call(
+                Method::SessionDetach,
+                json!({"session_id": id, "client_id": "c1"}),
+            )
+            .expect("detach");
+        assert_eq!(detached["attachment"]["controller"], serde_json::Value::Null);
+        assert!(
+            service
+                .host()
+                .sessions()
+                .iter()
+                .all(|facts| facts.state != super::super::super::api::wire::SessionState::Ended),
+            "detaching over the wire ends nothing"
+        );
+
+        let stopped = client
+            .call(Method::SessionStop, json!({"session_id": id}))
+            .expect("stop");
+        assert_eq!(stopped["stopped"], json!(true));
+
+        service.shutdown(true);
+    }
+
+    /// The negotiation rule from the client's side: a build that does not
+    /// support the attachment capability disables it LOCALLY -- the call is
+    /// refused here, without a round trip -- which is what lets a
+    /// previous-minor client talk to this runtime at all.
+    #[test]
+    fn a_client_that_never_heard_of_attachment_disables_it_locally() {
+        use super::super::super::api::client::Client;
+        use super::super::super::api::wire::{Capability, Method};
+        use serde_json::json;
+
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = config(tmp.path());
+        let service = RuntimeService::start(state, "default", &cfg).expect("start");
+
+        let mut older = Client::connect_as(
+            service.endpoint(),
+            &[Capability::SessionRead, Capability::SessionControl],
+        )
+        .expect("connect");
+        assert!(!older.negotiated().has(Capability::SessionAttach));
+        assert!(
+            older
+                .negotiated()
+                .server_only
+                .contains(&Capability::SessionAttach),
+            "and it can say WHY: the server offered something it does not know"
+        );
+        let refusal = older
+            .call(
+                Method::SessionAttach,
+                json!({"session_id": "x", "client_id": "c1"}),
+            )
+            .expect_err("disabled locally");
+        assert!(refusal.to_string().contains("disabled locally"), "{refusal}");
+        // The read surface both ends DO share still works.
+        assert!(older.call(Method::SessionSnapshot, json!({})).is_ok());
+
+        service.shutdown(false);
+    }
+
+    /// Tier 2's honesty rule at the service level: a stored topology restores
+    /// LAYOUT for everything and RESUMES only what carries a verified
+    /// conversation reference. The resumable half is exercised through
+    /// `host::resume_argv` rather than by launching a harness -- a test never
+    /// starts a real agent.
+    #[test]
+    fn a_restore_reports_what_it_cannot_resume_instead_of_respawning_it() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = config(tmp.path());
+        super::super::host::write_topology(
+            &state,
+            "default",
+            &super::super::host::Topology {
+                written: 10,
+                instance: "an-older-instance".to_string(),
+                sessions: vec![TopologyEntry {
+                    session_id: "gone-1".to_string(),
+                    short: "gone1111".to_string(),
+                    agent: "bash".to_string(),
+                    role: "orchestrator".to_string(),
+                    cwd: tmp.path().to_string_lossy().into_owned(),
+                    rows: 40,
+                    cols: 120,
+                    conversation: None,
+                    instance: "an-older-instance".to_string(),
+                }],
+            },
+        )
+        .expect("topology");
+
+        let service = RuntimeService::start(state, "default", &cfg).expect("start");
+        let report = service.restore(&cfg);
+        assert!(
+            report.resumed.is_empty(),
+            "an arbitrary process is never claimed to survive"
+        );
+        assert_eq!(report.skipped.len(), 1);
+        // The layout is still there to report and to restore from: rows,
+        // cols and cwd all survived the restart.
+        assert_eq!((report.skipped[0].rows, report.skipped[0].cols), (40, 120));
+        assert_eq!(report.skipped[0].cwd, tmp.path().to_string_lossy());
+        assert!(service.host().sessions().is_empty());
+        assert_ne!(
+            service.instance(),
+            "an-older-instance",
+            "a new service is a new instance, whatever it restored"
+        );
+        assert_eq!(service.namespace(), "default");
+        service.shutdown(false);
+    }
+
+    /// A second service must not take a namespace its owner is still serving.
+    #[test]
+    fn a_second_service_refuses_a_namespace_the_first_still_owns() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = config(tmp.path());
+        let first = RuntimeService::start(state.clone(), "default", &cfg).expect("first");
+        let error = RuntimeService::start(state.clone(), "default", &cfg)
+            .expect_err("the namespace is taken");
+        assert!(error.to_string().contains("already serving"), "{error}");
+        first.shutdown(false);
+        // Once the owner has let go, the namespace is free again.
+        let second = RuntimeService::start(state, "default", &cfg).expect("second");
+        second.shutdown(false);
+    }
+
     #[test]
     fn a_shutdown_request_round_trips_through_the_state_directory() {
         let tmp = tempfile::tempdir().expect("tempdir");
