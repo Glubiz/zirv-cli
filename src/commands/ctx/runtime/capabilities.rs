@@ -869,8 +869,19 @@ pub fn resolve_credential(
 pub struct CapabilityServices {
     pub web: Option<WebBackend>,
     pub browser: Option<BrowserBackend>,
-    pub mcp: BTreeMap<String, super::mcp::McpClient>,
     pub integrations: Vec<IntegrationStatus>,
+    config: super::super::config::CapabilitiesConfig,
+    /// Resolved bearer credentials per remote server. Resolved once, at
+    /// session start, so a credential rotation is picked up by a reconnect
+    /// through a fresh session rather than mid-call from a changing file.
+    bearers: BTreeMap<String, String>,
+    /// Lazily connected clients. A session that never calls an MCP tool never
+    /// spawns a server, so starting one does not depend on a server being up.
+    clients: BTreeMap<String, super::mcp::McpClient>,
+    /// Test seam: a factory injected here replaces the configured transport
+    /// for that server, which is how the registry path is exercised against
+    /// the in-process fixture server.
+    pub transport_overrides: BTreeMap<String, Arc<dyn super::mcp::TransportFactory>>,
 }
 
 impl CapabilityServices {
@@ -885,6 +896,17 @@ impl CapabilityServices {
                 integrations,
                 ..Self::default()
             };
+        }
+        let mut bearers = BTreeMap::new();
+        for server in cfg.capabilities.active_servers() {
+            if let super::super::config::McpTransportConfig::Http {
+                credential: Some(reference),
+                ..
+            } = &server.transport
+                && let Ok(Some(secret)) = resolve_credential(Some(reference), env, now)
+            {
+                bearers.insert(server.name.clone(), secret);
+            }
         }
         let credential = resolve_credential(
             cfg.capabilities.web.search_credential.as_deref(),
@@ -912,8 +934,21 @@ impl CapabilityServices {
         Self {
             web,
             browser,
-            mcp: BTreeMap::new(),
             integrations,
+            config: cfg.capabilities.clone(),
+            bearers,
+            clients: BTreeMap::new(),
+            transport_overrides: BTreeMap::new(),
+        }
+    }
+
+    /// A services bundle for a test or a caller that supplies its own
+    /// backends, with discovery already run against `cfg`.
+    pub fn for_servers(cfg: &CtxConfig, repo: &Path) -> Self {
+        Self {
+            integrations: discover(cfg, repo),
+            config: cfg.capabilities.clone(),
+            ..Self::default()
         }
     }
 
@@ -922,6 +957,101 @@ impl CapabilityServices {
             .iter()
             .find(|status| status.integration == integration)
             .map_or(IntegrationState::Unavailable, |status| status.state)
+    }
+
+    pub fn server_names(&self) -> Vec<String> {
+        self.config
+            .active_servers()
+            .map(|server| server.name.clone())
+            .collect()
+    }
+
+    pub fn max_inline_mcp_tools(&self) -> usize {
+        self.config.max_inline_mcp_tools_or_default()
+    }
+
+    fn factory(
+        &self,
+        server: &super::super::config::McpServerConfig,
+    ) -> Result<Arc<dyn super::mcp::TransportFactory>, CapabilityError> {
+        if let Some(override_factory) = self.transport_overrides.get(&server.name) {
+            return Ok(Arc::clone(override_factory));
+        }
+        Ok(match &server.transport {
+            super::super::config::McpTransportConfig::Stdio { command, .. } => {
+                if command.trim().is_empty() {
+                    return Err(CapabilityError::Unavailable(CapabilityUnavailable::new(
+                        IntegrationId::Mcp,
+                        format!("server `{}` has an empty stdio command", server.name),
+                    )));
+                }
+                Arc::new(super::mcp::StdioFactory::new(server.clone()))
+            }
+            super::super::config::McpTransportConfig::Http { url, credential } => {
+                if credential.is_some() && !self.bearers.contains_key(&server.name) {
+                    return Err(CapabilityError::Unavailable(CapabilityUnavailable::new(
+                        IntegrationId::Mcp,
+                        format!(
+                            "server `{}` names credential {:?}, which did not resolve",
+                            server.name,
+                            credential.as_deref().unwrap_or_default()
+                        ),
+                    )));
+                }
+                Arc::new(super::mcp::HttpFactory::new(
+                    url.clone(),
+                    self.bearers.get(&server.name).cloned(),
+                    Arc::new(super::mcp::UreqPoster),
+                ))
+            }
+        })
+    }
+
+    /// The connected client for `name`, connecting on first use. A server
+    /// that is not configured, not enabled, or whose credential did not
+    /// resolve is a typed `Unavailable`, never a client that looks connected.
+    pub fn client(&mut self, name: &str) -> Result<&mut super::mcp::McpClient, CapabilityError> {
+        if !self.clients.contains_key(name) {
+            let server = self
+                .config
+                .active_servers()
+                .find(|server| server.name == name)
+                .cloned()
+                .ok_or_else(|| {
+                    CapabilityError::Unavailable(CapabilityUnavailable::new(
+                        IntegrationId::Mcp,
+                        format!("no enabled [[capabilities.mcp]] entry is named `{name}`"),
+                    ))
+                })?;
+            let factory = self.factory(&server)?;
+            let client = super::mcp::McpClient::connect(
+                &server.name,
+                factory,
+                super::enforcement::ProcessEffects::from(&server.effects),
+                Duration::from_millis(server.request_timeout_ms_or_default()),
+            )
+            .map_err(|error| CapabilityError::Backend(error.to_string()))?;
+            self.clients.insert(name.to_string(), client);
+        }
+        self.clients
+            .get_mut(name)
+            .ok_or_else(|| CapabilityError::Backend("MCP client vanished".into()))
+    }
+
+    /// The declared effects for one configured server. Trusted operator
+    /// config, never a server's own claim about itself.
+    pub fn server_effects(&self, name: &str) -> Option<super::enforcement::ProcessEffects> {
+        self.config
+            .active_servers()
+            .find(|server| server.name == name)
+            .map(|server| super::enforcement::ProcessEffects::from(&server.effects))
+    }
+
+    pub fn shutdown(&mut self) {
+        for client in self.clients.values_mut() {
+            client.shutdown();
+        }
+        self.clients.clear();
     }
 }
 

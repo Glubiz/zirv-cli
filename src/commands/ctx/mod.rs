@@ -8,6 +8,7 @@ pub mod api;
 pub mod ask;
 pub mod attention;
 pub mod breakdown;
+pub mod capabilities_cmd;
 pub mod catalogue;
 pub mod chain;
 pub mod chat;
@@ -558,6 +559,11 @@ pub enum CtxVerb {
     /// the v1 contract, `serve` binds the local endpoint, `call` invokes one
     /// method over it.
     Api(api::ApiArgs),
+    /// Report every configured integration -- MCP servers, web search/fetch,
+    /// browser, diagnostics, artifact and frontend rendering -- as available,
+    /// unavailable or unverified, with the diagnosis for anything missing
+    /// (issue #483). `--probe` contacts each MCP server to verify it.
+    Capabilities(capabilities_cmd::CapabilitiesArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -688,6 +694,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Discover(a) => discover::run(a, &mut out),
         CtxVerb::Learn(a) => learn::run(a, &mut out),
         CtxVerb::Api(a) => api::run(a, &mut out),
+        CtxVerb::Capabilities(a) => capabilities_cmd::run(a, &mut out),
     };
 
     match result {
