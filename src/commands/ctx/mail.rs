@@ -5058,7 +5058,10 @@ This is part of the body too.\n";
         );
 
         let env = env_map(&[
-            (super::super::state::STATE_ENV, state_dir.to_str().expect("utf8")),
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
             (SESSION_ENV, "orch1234"),
         ]);
         let mut out = Vec::new();
