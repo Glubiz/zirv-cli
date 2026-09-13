@@ -4330,6 +4330,11 @@ pub fn run_with<W: Write>(
                 args.name
             ),
             &tree,
+            // Issue #488: a legacy worker launch is driven from a process
+            // whose only statement about a seat is its own environment, so
+            // the env-derived (supersession-only) fence is the honest answer
+            // here -- see `permit::SeatFence`.
+            None,
         ) {
             Ok(writer_permit) => Some(writer_permit),
             Err(refusal) => {
@@ -8362,7 +8367,7 @@ mod tests {
         // The SAME canonicalisation `run_with`'s own writer-permit check
         // applies to `launch_repo` (here, `repo` itself -- no `--workdir`).
         let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree, None)
             .expect("writer permit pre-held for the test");
 
         let args = args_for("claude", "go");
@@ -8402,7 +8407,7 @@ mod tests {
         let state = StateDir::from_root(state_path);
 
         let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree, None)
             .expect("writer permit pre-held for the test");
 
         let args = args_for("claude", "go");
@@ -8434,7 +8439,7 @@ mod tests {
         let state = StateDir::from_root(state_path);
 
         let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree, None)
             .expect("writer permit pre-held for the test");
 
         let mut args = args_for("claude", "go");
@@ -8498,7 +8503,7 @@ mod tests {
         let elsewhere = tmp.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).expect("mkdir");
         let elsewhere = std::fs::canonicalize(&elsewhere).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &elsewhere)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &elsewhere, None)
             .expect("writer permit pre-held for the test");
 
         let mut args = args_for("claude", "go");

@@ -572,14 +572,33 @@ pub enum WriterRefusal {
         holder_label: String,
     },
     PoolExhausted,
-    /// Issue #488: the process asking for this lease carries a seat
-    /// generation the seat record has since moved past -- an orchestrator a
-    /// rollover superseded, or a worker it spawned. Unlike the other two this
-    /// one is NOT retryable: waiting does not change the answer, because the
-    /// session asking has been replaced.
+    /// Issue #488: the caller does not hold the seat it is asking on behalf
+    /// of -- it was superseded by a rollover, or it is the successor of one
+    /// that is prepared but not committed. Unlike the other two this is NOT
+    /// retryable: waiting does not change the answer, because the answer is
+    /// about which session owns the seat, not about contention. The typed
+    /// `seat::StaleGeneration` is carried whole so a caller can tell
+    /// "you were replaced" from "your transaction has not committed yet"
+    /// without matching on prose.
     StaleSeat {
-        detail: String,
+        stale: super::seat::StaleGeneration,
     },
+}
+
+/// Which seat generation a writer lease is being taken on behalf of (issue
+/// #488 review, finding 1).
+///
+/// Explicit rather than env-derived wherever a caller actually knows: a
+/// native turn is handed its seat short and generation by the runtime
+/// (`session::native::QueuedTurn`), and passing them gets the STRICT
+/// `seat::guard` verdict -- which refuses an uncommitted successor as well as
+/// a superseded predecessor. `None` keeps the env-derived answer
+/// (`seat::guard_from_env`), which is the only thing a legacy worker launch or
+/// a bare terminal could ask, and which is deliberately supersession-only.
+#[derive(Debug, Clone, Copy)]
+pub struct SeatFence<'a> {
+    pub short: &'a str,
+    pub generation: u64,
 }
 
 /// Issues #267/#338: the one diagnostic rendering shared by headless and
@@ -621,9 +640,9 @@ pub(crate) fn describe_writer_refusal(
             }
             description
         }
-        WriterRefusal::StaleSeat { detail } => format!(
-            "writer-refused: {detail}. This session no longer holds the orchestrator seat, so it \
-             may not take a writer lease on {}; the session that does holds it.",
+        WriterRefusal::StaleSeat { stale } => format!(
+            "writer-refused: {stale}. This session does not hold the orchestrator seat, so it may \
+             not take a writer lease on {}; retrying will not change that.",
             tree.display()
         ),
     }
@@ -760,19 +779,27 @@ pub fn acquire_writer(
     limit: usize,
     label: &str,
     tree: &Path,
+    fence: Option<SeatFence<'_>>,
 ) -> Result<HeavyPermit, WriterRefusal> {
     // Issue #488 (item 4): a writer lease is a mutable service operation, so
-    // a superseded generation may not take one. `seat::fence` is the same
-    // env-derived question `hook::run_pretool` and every mutating `zirv ctx`
-    // verb already ask -- a process with no seat env, or no seat record for
-    // it, is not fenced at all -- so this changes nothing for a bare terminal,
-    // a CI job or a worker outside any seat, and refuses the one case that
-    // matters: a harness (or a child it spawned) still holding a lease after
-    // an automatic rollover replaced it.
-    if let Err(stale) = super::seat::fence(state) {
-        return Err(WriterRefusal::StaleSeat {
-            detail: stale.to_string(),
-        });
+    // a caller that does not hold the seat may not take one.
+    //
+    // With an explicit `fence` -- a caller the runtime actually handed a seat
+    // short and generation -- this is `seat::guard`, the same strict verdict
+    // `delegation::delegate` and `coordinator::update_fenced` apply: a
+    // superseded predecessor AND an uncommitted successor are both refused.
+    // Without one it is `seat::guard_from_env`, which is supersession-only
+    // for the reason that function documents (a swap seam exports the
+    // PREPARED generation, so a legitimately launching successor carries one
+    // above the seat's for the whole prepare->commit window). Either way, a
+    // process with no seat env and no seat record is not fenced at all, so a
+    // bare terminal, a CI job and a worker outside any seat are unaffected.
+    let verdict = match fence {
+        Some(fence) => super::seat::guard(state, fence.short, fence.generation),
+        None => super::seat::guard_from_env(state),
+    };
+    if let Err(stale) = verdict {
+        return Err(WriterRefusal::StaleSeat { stale });
     }
     let dir = writer_permits_dir(state);
     let key = tree_key(tree);
@@ -1367,8 +1394,8 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let _held = acquire_writer(&state, 2, "worker-a", &tree).expect("first writer granted");
-        let err = acquire_writer(&state, 2, "worker-b", &tree)
+        let _held = acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
+        let err = acquire_writer(&state, 2, "worker-b", &tree, None)
             .expect_err("a second writer in the same tree must be refused");
         assert_eq!(
             err,
@@ -1376,6 +1403,96 @@ mod tests {
                 holder_label: "worker-a".to_string()
             }
         );
+    }
+
+    /// Issue #488 (review finding 1): a writer lease is a mutable service
+    /// operation, so it is fenced on the seat generation exactly as
+    /// `delegation::delegate` and `coordinator::update_fenced` are -- a
+    /// superseded predecessor AND an uncommitted successor are both refused,
+    /// non-retryably, and only the committed generation is granted.
+    #[test]
+    fn a_stale_or_uncommitted_generation_may_not_take_a_writer_lease() {
+        use super::super::runtime::RuntimeKind;
+        use super::super::seat;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+        let session = "7b1a2c3d-9999-4000-8000-000000000488";
+        let short = super::super::sessions::short_id(session);
+        seat::register(
+            &state,
+            &short,
+            session,
+            "native",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            1,
+        )
+        .expect("register");
+
+        let fence = |generation: u64| SeatFence {
+            short: &short,
+            generation,
+        };
+        // The seat's own generation is granted.
+        let held = acquire_writer(&state, 2, "seat", &tree, Some(fence(1)))
+            .expect("the committed generation holds the seat");
+        drop(held);
+
+        let prepared = seat::prepare_onto(
+            &state,
+            &short,
+            "claude",
+            None,
+            RuntimeKind::Harness,
+            seat::Cause::Manual,
+            2,
+        )
+        .expect("prepare");
+
+        // The successor of a prepared-but-uncommitted rollover may not write.
+        let refusal = acquire_writer(&state, 2, "successor", &tree, Some(fence(prepared)))
+            .expect_err("an uncommitted successor may not take a writer lease");
+        let WriterRefusal::StaleSeat { stale } = &refusal else {
+            panic!("expected a stale-seat refusal, got {refusal:?}");
+        };
+        assert_eq!(stale.reason, seat::StaleReason::Uncommitted);
+        // Non-retryable: the diagnostic says so rather than pointing at
+        // contention or `--worktree`.
+        let description = describe_writer_refusal(&refusal, &state, 2, &tree);
+        assert!(
+            description.contains("retrying will not change that"),
+            "{description}"
+        );
+        // ...and the source still holds the seat while the transaction is open.
+        let source = acquire_writer(&state, 2, "source", &tree, Some(fence(1)))
+            .expect("the source keeps the seat until the commit");
+        drop(source);
+
+        seat::commit(&state, &short, prepared, "successor-session", 3).expect("commit");
+
+        // After the commit the answer swaps, and the predecessor is refused
+        // as superseded rather than as uncommitted.
+        let refusal = acquire_writer(&state, 2, "source", &tree, Some(fence(1)))
+            .expect_err("a superseded predecessor may not take a writer lease");
+        let WriterRefusal::StaleSeat { stale } = &refusal else {
+            panic!("expected a stale-seat refusal, got {refusal:?}");
+        };
+        assert_eq!(stale.reason, seat::StaleReason::Superseded);
+        let successor = acquire_writer(&state, 2, "successor", &tree, Some(fence(prepared)))
+            .expect("the committed successor holds the seat");
+        drop(successor);
+
+        // And a caller that presents no fence at all, with no seat env set,
+        // is not fenced: a bare terminal and a CI job keep working.
+        let elsewhere = tmp.path().join("other");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        acquire_writer(&state, 2, "unseated", &elsewhere, None)
+            .expect("a caller outside any seat is never fenced");
     }
 
     /// The other half of the same rule: a DIFFERENT tree must never be
@@ -1389,9 +1506,9 @@ mod tests {
         std::fs::create_dir_all(&tree_a).expect("mkdir");
         std::fs::create_dir_all(&tree_b).expect("mkdir");
 
-        let _held_a = acquire_writer(&state, 2, "worker-a", &tree_a).expect("granted");
+        let _held_a = acquire_writer(&state, 2, "worker-a", &tree_a, None).expect("granted");
         assert!(
-            acquire_writer(&state, 2, "worker-b", &tree_b).is_ok(),
+            acquire_writer(&state, 2, "worker-b", &tree_b, None).is_ok(),
             "a different tree must not be refused by another tree's writer"
         );
     }
@@ -1408,9 +1525,9 @@ mod tests {
         std::fs::create_dir_all(&tree_a).expect("mkdir");
         std::fs::create_dir_all(&tree_b).expect("mkdir");
 
-        let _held_a = acquire_writer(&state, 0, "worker-a", &tree_a).expect("first granted");
-        let _held_b = acquire_writer(&state, 0, "worker-b", &tree_b).expect("second granted");
-        let err = acquire_writer(&state, 0, "worker-c", &tree_a)
+        let _held_a = acquire_writer(&state, 0, "worker-a", &tree_a, None).expect("first granted");
+        let _held_b = acquire_writer(&state, 0, "worker-b", &tree_b, None).expect("second granted");
+        let err = acquire_writer(&state, 0, "worker-c", &tree_a, None)
             .expect_err("the occupied tree must still be exclusive");
         assert_eq!(
             err,
@@ -1437,8 +1554,8 @@ mod tests {
         std::fs::create_dir_all(&tree_a).expect("mkdir");
         std::fs::create_dir_all(&tree_b).expect("mkdir");
 
-        let _held = acquire_writer(&state, 1, "worker-a", &tree_a).expect("first granted");
-        let err = acquire_writer(&state, 1, "worker-b", &tree_b)
+        let _held = acquire_writer(&state, 1, "worker-a", &tree_a, None).expect("first granted");
+        let err = acquire_writer(&state, 1, "worker-b", &tree_b, None)
             .expect_err("the configured machine-wide bound must be enforced");
         assert_eq!(err, WriterRefusal::PoolExhausted);
     }
@@ -1455,7 +1572,7 @@ mod tests {
         std::fs::create_dir_all(&tree_a).expect("mkdir");
         std::fs::create_dir_all(&tree_b).expect("mkdir");
 
-        let _held = acquire_writer(&state, 1, "worker-a", &tree_a).expect("first granted");
+        let _held = acquire_writer(&state, 1, "worker-a", &tree_a, None).expect("first granted");
         let description =
             describe_writer_refusal(&WriterRefusal::PoolExhausted, &state, 1, &tree_b);
 
@@ -1483,8 +1600,8 @@ mod tests {
         std::fs::create_dir_all(&tree_a).expect("mkdir");
         std::fs::create_dir_all(&tree_b).expect("mkdir");
 
-        let _held_a = acquire_writer(&state, 1, "worker-a", &tree_a).expect("granted");
-        let err = acquire_writer(&state, 1, "worker-b", &tree_b)
+        let _held_a = acquire_writer(&state, 1, "worker-a", &tree_a, None).expect("granted");
+        let err = acquire_writer(&state, 1, "worker-b", &tree_b, None)
             .expect_err("a writer pool of 1 is exhausted by the first writer");
         assert_eq!(err, WriterRefusal::PoolExhausted);
 
@@ -1531,7 +1648,7 @@ mod tests {
             "a dead owner's writer permit does not count"
         );
         assert!(
-            acquire_writer(&state, 1, "worker-b", &tree).is_ok(),
+            acquire_writer(&state, 1, "worker-b", &tree, None).is_ok(),
             "the tree is free again once the dead owner's permit is swept"
         );
     }
@@ -1549,8 +1666,8 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let _first = acquire_writer(&state, 2, "worker-a", &tree).expect("first writer granted");
-        let err = acquire_writer(&state, 2, "worker-b", &tree)
+        let _first = acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
+        let err = acquire_writer(&state, 2, "worker-b", &tree, None)
             .expect_err("a second writer for the same tree must be refused");
         assert_eq!(
             err,
@@ -1572,8 +1689,8 @@ mod tests {
         std::fs::create_dir_all(&tree_a).expect("mkdir");
         std::fs::create_dir_all(&tree_b).expect("mkdir");
 
-        let _a = acquire_writer(&state, 2, "worker-a", &tree_a).expect("granted");
-        let _b = acquire_writer(&state, 2, "worker-b", &tree_b).expect("granted");
+        let _a = acquire_writer(&state, 2, "worker-a", &tree_a, None).expect("granted");
+        let _b = acquire_writer(&state, 2, "worker-b", &tree_b, None).expect("granted");
     }
 
     /// Dropping the first writer frees the tree claim for a third caller --
@@ -1586,12 +1703,12 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let first = acquire_writer(&state, 2, "worker-a", &tree).expect("first writer granted");
-        assert!(acquire_writer(&state, 2, "worker-b", &tree).is_err());
+        let first = acquire_writer(&state, 2, "worker-a", &tree, None).expect("first writer granted");
+        assert!(acquire_writer(&state, 2, "worker-b", &tree, None).is_err());
 
         drop(first);
 
-        let third = acquire_writer(&state, 2, "worker-c", &tree)
+        let third = acquire_writer(&state, 2, "worker-c", &tree, None)
             .expect("dropping the first writer must free the tree claim too, not just the slot");
         drop(third);
     }
@@ -1626,7 +1743,7 @@ mod tests {
         create_new_private(&tree_claim_path(&dir, &key), &json).expect("write stale claim");
 
         assert!(
-            acquire_writer(&state, 1, "worker-b", &tree).is_ok(),
+            acquire_writer(&state, 1, "worker-b", &tree, None).is_ok(),
             "a dead owner's tree claim must be swept, freeing the tree"
         );
     }
@@ -1642,7 +1759,7 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let _held = acquire_writer(&state, 2, "worker-a", &tree).expect("granted");
+        let _held = acquire_writer(&state, 2, "worker-a", &tree, None).expect("granted");
         assert_eq!(
             live_writer_records(&state).len(),
             1,
@@ -1663,7 +1780,7 @@ mod tests {
         let tree = tmp.path().join("repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
 
-        let permit = acquire_writer(&state, 1, "worker-a", &tree).expect("granted");
+        let permit = acquire_writer(&state, 1, "worker-a", &tree, None).expect("granted");
         permit.set_child_pid(4242);
 
         let key = tree_key(&tree);
@@ -1709,7 +1826,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&record).expect("serialize");
         create_new_private(&tree_claim_path(&dir, &key), &json).expect("write");
 
-        let err = acquire_writer(&state, 2, "worker-b", &tree)
+        let err = acquire_writer(&state, 2, "worker-b", &tree, None)
             .expect_err("a live child must keep the tree claim even though the parent pid is dead");
         assert_eq!(
             err,

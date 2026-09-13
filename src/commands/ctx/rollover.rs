@@ -707,6 +707,52 @@ pub fn evaluate(
                 Ok(direction) => direction,
                 Err(e) => return Evaluation::Skip(e.to_string()),
             };
+            // Issue #488 review, finding 3: the successor is VALIDATED before
+            // the source is given up -- policy, capability, context room and
+            // billing authority -- which is what README states and what makes
+            // item 7's restore possible. A candidate that cannot take the work
+            // must never reach the boundary, let alone `prepare_onto`. Inert
+            // for a route that declares no offer (every harness row today),
+            // exactly as `allocator::place` already treats an undeclared
+            // offer.
+            if let Some(refusal) = forward_refusal(&snapshot, &current, &agent, direction) {
+                let mut ledger = rollover_runtime::Record::open(
+                    &current,
+                    Trigger::from_cause(&cause, source_unreachable),
+                    &format!("roll onto {agent} ({})", direction.as_str()),
+                    now,
+                );
+                ledger.direction = Some(direction);
+                ledger.refused(&refusal, successor_runtime, now);
+                let reason = format!(
+                    "the successor was refused before the source was given up: {}",
+                    refusal.label()
+                );
+                ledger.restore(&reason, now);
+                let _ = rollover_runtime::store(state, &ledger);
+                record(
+                    state,
+                    &current.session,
+                    verb,
+                    REFUSED,
+                    &PoolEvent {
+                        target_agent: Some(agent),
+                        reason: reason.clone(),
+                        ..base
+                    },
+                );
+                return Evaluation::Skip(reason);
+            }
+            // Issue #488 review, finding 2: the boundary durably cancels tool
+            // calls that never began, so asking whether a prepare is even
+            // admissible comes FIRST. This does not close the race -- only the
+            // lock inside `prepare_onto` does -- but it turns the ordinary
+            // case (an operator pinned the seat a tick ago, a manual handover
+            // already holds the transaction) into a plain skip that touches no
+            // journal. The residual race is compensated below.
+            if let Err(e) = seat::may_prepare(state, seat_short) {
+                return Evaluation::Skip(e.to_string());
+            }
             let drain = if idle { Drain::Quiesced } else { Drain::Forced };
             let boundary = match source_boundary(state, &current, drain, &cause, now) {
                 Ok(boundary) => boundary,
@@ -837,15 +883,14 @@ pub fn evaluate(
                     } else {
                         format!("{e} ({})", dropped.join("; "))
                     };
-                    // Item 7: a preparation that failed leaves the ORIGINAL
-                    // session holding the seat, and the record says exactly
-                    // that rather than implying a move happened.
-                    ledger.settle(
-                        Settlement::Restored {
-                            reason: reason.clone(),
-                        },
-                        now,
-                    );
+                    // Item 7, plus finding 2's compensation: a preparation
+                    // that failed leaves the ORIGINAL session holding the
+                    // seat, and the record says exactly that rather than
+                    // implying a move happened -- carrying whatever the
+                    // boundary already cancelled, so the retained source is
+                    // told about work that was removed from under it instead
+                    // of being handed a journal that quietly changed.
+                    ledger.restore(&reason, now);
                     let _ = rollover_runtime::store(state, &ledger);
                     record(
                         state,
@@ -1167,6 +1212,55 @@ fn return_resume(current: &seat::Seat, target: &str) -> Option<String> {
         .as_ref()
         .filter(|displaced| displaced.agent.eq_ignore_ascii_case(target))
         .and_then(|displaced| displaced.conversation.clone())
+}
+
+/// Issue #488 item 3 (review finding 3): whether the chosen FORWARD successor
+/// clears `rollover_runtime::validate` before the source is given up.
+///
+/// `None` -- the ordinary answer -- means nothing objects: either the
+/// candidate declares no offer to judge (every harness row today, the same
+/// way `allocator::place` leaves an undeclared offer ungated), or every gate
+/// passed. `Some` is a typed refusal that must stop the rollover before the
+/// boundary cancels anything and before `seat::prepare_onto` opens a
+/// transaction.
+///
+/// `started`/`budget_tokens` are the two facts this seam genuinely does not
+/// have: nothing has been launched yet (startup is judged later, at the
+/// readiness check every rollover already performs) and the successor's
+/// remaining ceiling is not a number the harness snapshot carries. Stating
+/// them as "unknown, therefore not an objection" is the honest reading --
+/// inventing a budget here would refuse candidates on a guess.
+fn forward_refusal(
+    snapshot: &allocator::CapacitySnapshot,
+    current: &seat::Seat,
+    agent: &str,
+    direction: rollover_runtime::Direction,
+) -> Option<rollover_runtime::Refusal> {
+    let offer = snapshot.harness(agent)?.offer.clone()?;
+    let facts = rollover_runtime::SuccessorFacts {
+        offer: &offer,
+        authenticated: true,
+        budget_tokens: None,
+        started: true,
+    };
+    let demand = super::route::Demand {
+        authorized_billing: rollover_runtime::default_authorized_billing(
+            snapshot
+                .harness(&current.agent)
+                .and_then(|harness| harness.offer.as_ref())
+                .map(|offer| offer.billing)
+                .unwrap_or_default(),
+        ),
+        ..super::route::Demand::default()
+    };
+    // A forward rollover is a route change by construction, so the
+    // continuation is always a rebuild -- the same-route envelope case is
+    // `rollover_runtime::plan_continuation`'s, and it cannot arise here.
+    let plan = super::runtime::compaction::ContinuationPlan::Rebuilt {
+        checkpoint: None,
+        messages: Vec::new(),
+    };
+    rollover_runtime::validate(&facts, &demand, &plan, direction).err()
 }
 
 /// Issue #488 item 8: whether the seat's own return to `target` clears the

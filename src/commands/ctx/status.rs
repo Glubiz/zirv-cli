@@ -3868,7 +3868,7 @@ mod tests {
 
         let tree = tmp.path().join("worktree-repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
-        let held = permit::acquire_writer(&state, 2, "session ab12cd34: claude", &tree)
+        let held = permit::acquire_writer(&state, 2, "session ab12cd34: claude", &tree, None)
             .expect("writer permit granted");
 
         let mut out = Vec::new();
@@ -3956,8 +3956,8 @@ mod tests {
         let env = env_for(state.root());
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-        let same = permit::acquire_writer(&state, 0, "same-repo", &repo).expect("granted");
-        let other = permit::acquire_writer(&state, 0, "other-repo", &other_repo).expect("granted");
+        let same = permit::acquire_writer(&state, 0, "same-repo", &repo, None).expect("granted");
+        let other = permit::acquire_writer(&state, 0, "other-repo", &other_repo, None).expect("granted");
 
         let mut out = Vec::new();
         run_with(

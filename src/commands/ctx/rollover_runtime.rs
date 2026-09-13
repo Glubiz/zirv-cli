@@ -740,6 +740,18 @@ pub struct Record {
     pub boundary: Option<Boundary>,
     #[serde(default)]
     pub subagents: Vec<(String, Disposition)>,
+    /// Issue #488 review, finding 2: tool calls this rollover's own safe
+    /// boundary durably CANCELLED on a run that then failed to prepare a
+    /// successor, and therefore kept the original session.
+    ///
+    /// Cancelling a call that never began is honest at a boundary the seat
+    /// actually crosses. When the seat does NOT cross it, the retained source
+    /// is a session with work removed from under it, so the fact is recorded
+    /// here rather than dropped: a "kept the original session" settlement with
+    /// a non-empty list is something the source's next turn has to be told,
+    /// not a footnote. Empty on every rollover that commits.
+    #[serde(default)]
+    pub source_cancelled: Vec<String>,
     #[serde(default)]
     pub settlement: Option<Settlement>,
     pub started_at: u64,
@@ -764,6 +776,7 @@ impl Record {
             attempts: Vec::new(),
             boundary: None,
             subagents: Vec::new(),
+            source_cancelled: Vec::new(),
             settlement: None,
             started_at: now,
             updated_at: now,
@@ -803,6 +816,54 @@ impl Record {
         self.updated_at = now;
     }
 
+    /// Item 7's failure half, with finding 2's compensation (issue #488
+    /// review): the seat never moved, so the ORIGINAL session is retained --
+    /// and anything this rollover's own safe boundary already cancelled is
+    /// carried into [`Record::source_cancelled`] so the retained source is
+    /// told, rather than being handed a journal with work quietly removed
+    /// from under it.
+    ///
+    /// The one place a `Restored` settlement is written on a run that reached
+    /// a boundary, so there is no path on which the cancellation is silently
+    /// "kept".
+    pub fn restore(&mut self, reason: &str, now: u64) {
+        if let Some(cancelled) = self
+            .boundary
+            .as_ref()
+            .map(|boundary| boundary.cancelled.clone())
+            .filter(|cancelled| !cancelled.is_empty())
+        {
+            for tool_call in cancelled {
+                if !self.source_cancelled.contains(&tool_call) {
+                    self.source_cancelled.push(tool_call);
+                }
+            }
+        }
+        self.settle(
+            Settlement::Restored {
+                reason: reason.to_string(),
+            },
+            now,
+        );
+    }
+
+    /// The sentence a retained source's next turn has to see, or `None` when
+    /// this rollover cancelled nothing. Separate from
+    /// [`Boundary::reconciliation_note`] because it is a different fact: that
+    /// one is about effects that MAY have happened, this one about calls that
+    /// certainly did not, on a seat that then stayed where it was.
+    pub fn cancellation_note(&self) -> Option<String> {
+        if self.source_cancelled.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} admitted tool call(s) were cancelled at a rollover boundary this session then \
+             kept the seat through ({}); nothing ran, and they must be re-issued if still wanted.",
+            self.source_cancelled.len(),
+            self.source_cancelled.join(", ")
+        ))
+    }
+
     /// The status line an operator reads: the same logical seat, the new
     /// backend and model, and why. Criterion 6's text half -- the identity
     /// never changes, only what is answering at it.
@@ -836,6 +897,9 @@ impl Record {
             .as_ref()
             .and_then(Boundary::reconciliation_note)
         {
+            line.push_str(&format!(" | {note}"));
+        }
+        if let Some(note) = self.cancellation_note() {
             line.push_str(&format!(" | {note}"));
         }
         line
@@ -2056,6 +2120,271 @@ mod tests {
 
             let line = load(&state, &short).expect("record").status_line();
             assert!(line.contains("kept the original session"), "{line}");
+        }
+    }
+
+    // -- review round: findings 2 and 3 ------------------------------------
+
+    /// Review finding 2: the safe boundary durably cancels tool calls that
+    /// never began, and it happens BEFORE the successor is prepared. When the
+    /// prepare then fails -- the seat was pinned, or a concurrent manual
+    /// rollover took the transaction between the pre-check and the lock --
+    /// the seat legitimately keeps the original session, but the cancellation
+    /// already happened. The record must therefore say the source was
+    /// retained WITH the cancelled ids, never just "kept", and the journal
+    /// must be internally consistent about them.
+    #[test]
+    fn a_boundary_whose_prepare_fails_records_the_cancelled_calls_against_the_retained_source() {
+        use super::super::runtime::journal::{
+            ExecutionId, MessageId, PolicyProvenance, ToolCallId,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "5ca11ed0-4444-4000-8000-000000000488";
+        let short = super::super::sessions::short_id(session);
+        seat::register(
+            &state,
+            &short,
+            session,
+            "native",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            400,
+        )
+        .expect("register");
+        let mut record = seat::load(&state, &short).expect("seat");
+        record.runtime = RuntimeKind::Native;
+        seat::store(&state, &record).expect("store");
+
+        let mut journal = Journal::open(&state).expect("journal");
+        let identity = testsupport::session_identity(session, testsupport::route_identity());
+        let journal_session = identity.session.clone();
+        journal.create_session(&identity).expect("create");
+        let scope = Default::default();
+        journal
+            .acknowledge_input(
+                &journal_session,
+                1,
+                &scope,
+                MessageId::new("m1").expect("id"),
+                "do the thing".to_string(),
+                false,
+                None,
+                401,
+            )
+            .expect("input");
+        journal
+            .prepare_tool_call(
+                &journal_session,
+                1,
+                &scope,
+                ToolCallId::new("never-ran").expect("id"),
+                "write_file".to_string(),
+                serde_json::json!({ "path": "x.rs" }),
+                PolicyProvenance {
+                    fingerprint: "fp".to_string(),
+                    source: "test".to_string(),
+                    decision: "allow".to_string(),
+                    scope: "repo".to_string(),
+                },
+                None,
+                402,
+            )
+            .expect("call");
+        journal
+            .prepare_execution(
+                &journal_session,
+                1,
+                &scope,
+                ExecutionId::new("exec-never-ran").expect("id"),
+                ToolCallId::new("never-ran").expect("id"),
+                None,
+                403,
+            )
+            .expect("execution");
+
+        // The boundary is reached and the call that never began is cancelled.
+        let before = seat::load(&state, &short).expect("seat");
+        let boundary = reach_boundary(
+            &mut journal,
+            &journal_session,
+            1,
+            Drain::Forced,
+            &CheckpointContext::default(),
+            500,
+        )
+        .expect("boundary");
+        assert_eq!(boundary.cancelled, vec!["never-ran".to_string()]);
+
+        let mut ledger = Record::open(&before, Trigger::UsageExhaustion, "roll over", 500);
+        ledger.direction = Some(Direction::NativeToHarness);
+        ledger.boundary = Some(boundary);
+
+        // ...and only now does the prepare fail, exactly as the residual race
+        // would have it: someone pinned the seat under us.
+        let mut pinned = seat::load(&state, &short).expect("seat");
+        pinned.pinned = true;
+        seat::store(&state, &pinned).expect("store");
+        let error = seat::prepare_onto(
+            &state,
+            &short,
+            "claude",
+            None,
+            RuntimeKind::Harness,
+            seat::Cause::Manual,
+            501,
+        )
+        .expect_err("a pinned seat refuses the transaction");
+        ledger.restore(&error.to_string(), 501);
+        store(&state, &ledger).expect("store");
+
+        // The seat never moved.
+        let after = seat::load(&state, &short).expect("seat");
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.agent, before.agent);
+        assert!(matches!(after.phase, seat::Phase::Idle));
+
+        // The record says the original session was retained AND names what
+        // was cancelled out from under it.
+        let reread = load(&state, &short).expect("durable");
+        assert!(matches!(
+            reread.settlement,
+            Some(Settlement::Restored { .. })
+        ));
+        assert_eq!(reread.source_cancelled, vec!["never-ran".to_string()]);
+        let line = reread.status_line();
+        assert!(line.contains("kept the original session"), "{line}");
+        assert!(
+            line.contains("never-ran") && line.contains("nothing ran"),
+            "the retained source is told, not left to infer it: {line}"
+        );
+
+        // And the journal is consistent: the call is durably Cancelled, which
+        // is honest (it never began) rather than lost or left prepared.
+        let replayed = journal.replay(&journal_session).expect("replay");
+        let execution = replayed
+            .executions
+            .get(&ExecutionId::new("exec-never-ran").expect("id"))
+            .expect("the execution is still in the journal");
+        assert_eq!(execution.state, ExecutionState::Cancelled);
+        assert_eq!(
+            replayed.messages.len(),
+            1,
+            "the acknowledged input is untouched"
+        );
+    }
+
+    /// Review finding 2, the other half: [`Record::restore`] is the only way a
+    /// `Restored` settlement is written after a boundary, so there is no path
+    /// on which a cancellation is silently "kept". A rollover that cancelled
+    /// nothing carries nothing.
+    #[test]
+    fn a_restore_that_cancelled_nothing_carries_nothing() {
+        let seat = seat_at("seatshrt", RuntimeKind::Harness);
+        let mut record = Record::open(&seat, Trigger::ManualHandover, "swap", 100);
+        record.restore("the successor never started", 101);
+        assert!(record.source_cancelled.is_empty());
+        assert!(record.cancellation_note().is_none());
+        assert!(!record.status_line().contains("nothing ran"));
+    }
+
+    /// Review finding 3: a forward candidate that fails validation never
+    /// reaches `seat::prepare_onto`, and the record names the refusal among
+    /// the routes this rollover tried. Budget, billing and startup each stop
+    /// it, and each stops it BEFORE the source is given up.
+    #[test]
+    fn a_forward_candidate_that_fails_validation_never_opens_the_transaction() {
+        let route = offer(
+            "anthropic",
+            "claude-sonnet-4-5",
+            BillingPosture::Api,
+            route::RuntimeKind::Native,
+        );
+        let plan = ContinuationPlan::Rebuilt {
+            checkpoint: None,
+            messages: Vec::new(),
+        };
+        let mut subscription_only = demand();
+        subscription_only.authorized_billing =
+            default_authorized_billing(BillingPosture::Subscription);
+
+        let cases: Vec<(&str, SuccessorFacts<'_>, Demand)> = vec![
+            (
+                "budget",
+                SuccessorFacts {
+                    budget_tokens: Some(100),
+                    ..facts(&route)
+                },
+                demand(),
+            ),
+            ("billing", facts(&route), subscription_only),
+            (
+                "startup",
+                SuccessorFacts {
+                    started: false,
+                    ..facts(&route)
+                },
+                demand(),
+            ),
+        ];
+
+        for (label, successor, wanted) in cases {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let session = format!("f0{:06x}-3333-4000-8000-000000000488", label.len());
+            let short = super::super::sessions::short_id(&session);
+            seat::register(
+                &state,
+                &short,
+                &session,
+                "claude",
+                None,
+                "anthropic",
+                "orchestrator",
+                false,
+                400,
+            )
+            .expect("register");
+            let before = seat::load(&state, &short).expect("seat");
+
+            let refusal = validate(&successor, &wanted, &plan, Direction::HarnessToNative)
+                .expect_err("{label} must refuse");
+            let mut ledger = Record::open(&before, Trigger::UsageExhaustion, "roll over", 500);
+            ledger.direction = Some(Direction::HarnessToNative);
+            ledger.refused(&refusal, RuntimeKind::Native, 500);
+            ledger.restore(
+                &format!(
+                    "the successor was refused before the source was given up: {}",
+                    refusal.label()
+                ),
+                500,
+            );
+            store(&state, &ledger).expect("store");
+
+            // No transaction was opened: the seat is exactly as it was, and it
+            // is still free to prepare a different successor.
+            let after = seat::load(&state, &short).expect("seat");
+            assert_eq!(after.generation, before.generation, "{label}");
+            assert!(matches!(after.phase, seat::Phase::Idle), "{label}");
+            assert!(seat::may_prepare(&state, &short).is_ok(), "{label}");
+
+            // And the record names the route it tried and why it was refused.
+            let reread = load(&state, &short).expect("durable");
+            assert_eq!(reread.attempts.len(), 1, "{label}");
+            assert_eq!(reread.attempts[0].outcome, "refused", "{label}");
+            assert!(
+                reread.attempts[0].detail.contains(&route.identity.label()),
+                "{label}: {}",
+                reread.attempts[0].detail
+            );
+            assert!(
+                reread.status_line().contains("kept the original session"),
+                "{label}: {}",
+                reread.status_line()
+            );
         }
     }
 }

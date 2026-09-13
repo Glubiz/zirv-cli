@@ -419,6 +419,44 @@ pub fn prepare(
     )
 }
 
+/// The two reasons [`prepare_onto`] refuses, as a check a caller can make
+/// BEFORE doing irreversible work of its own (issue #488 review, finding 2).
+///
+/// A rollover's safe boundary durably cancels tool calls that never began and
+/// commits a checkpoint, and it has to happen before a successor is prepared.
+/// Discovering only afterwards that the seat was pinned, or that a concurrent
+/// manual rollover already holds the transaction, means having cancelled work
+/// for a swap that never happens. Asking first does not close the race -- only
+/// the lock inside `prepare_onto` does that -- but it turns the ordinary case
+/// (an operator pinned the seat a tick ago) from a compensating path into a
+/// plain skip. `rollover::evaluate` calls this immediately before reaching the
+/// boundary, and still handles the residual race by recording what it
+/// cancelled (`rollover_runtime::Record::restore`).
+pub fn may_prepare(state: &StateDir, short: &str) -> CtxResult<()> {
+    let _lock = lock_seat(state, short)?;
+    admissible(&load(state, short).ok_or_else(|| no_seat(short))?)
+}
+
+/// The shared refusal both [`may_prepare`] and [`prepare_onto`] apply, so the
+/// pre-check and the transaction can never disagree about what is admissible.
+fn admissible(seat: &Seat) -> CtxResult<()> {
+    if seat.pinned {
+        return Err(format!(
+            "zirv ctx seat: {} is pinned; refusing to prepare a rollover",
+            seat.short
+        )
+        .into());
+    }
+    if matches!(seat.phase, Phase::Prepared { .. }) {
+        return Err(format!(
+            "zirv ctx seat: {} already has a rollover prepared",
+            seat.short
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// [`prepare`], naming the successor's own BACKEND as well as its adapter and
 /// model (issue #488).
 ///
@@ -438,14 +476,7 @@ pub fn prepare_onto(
 ) -> CtxResult<u64> {
     let _lock = lock_seat(state, short)?;
     let mut seat = load(state, short).ok_or_else(|| no_seat(short))?;
-    if seat.pinned {
-        return Err(
-            format!("zirv ctx seat: {short} is pinned; refusing to prepare a rollover").into(),
-        );
-    }
-    if matches!(seat.phase, Phase::Prepared { .. }) {
-        return Err(format!("zirv ctx seat: {short} already has a rollover prepared").into());
-    }
+    admissible(&seat)?;
     let generation = seat.generation + 1;
     seat.phase = Phase::Prepared {
         successor_agent: successor_agent.to_string(),
@@ -718,9 +749,25 @@ pub fn recover(
 /// refusal: a plain headless verb run outside any seat (a bare terminal, a
 /// CI job) must be unaffected.
 pub fn fence(state: &StateDir) -> CtxResult<()> {
+    guard_from_env(state).map_err(|stale| stale.to_string().into())
+}
+
+/// [`fence`] as a TYPED verdict (issue #488 review, finding 1), so a service
+/// that fences on the process environment can report the same
+/// [`StaleGeneration`] one that fences on an explicit generation does.
+///
+/// Deliberately NARROWER than [`guard`]: it refuses only supersession. The
+/// environment a swap seam exports names the PREPARED generation
+/// (`handover::build_turn_env`), so a successor and everything it spawns
+/// legitimately carry a generation above the seat's for the whole window
+/// between `prepare` and `commit`. Refusing that here would stop a successor
+/// from launching at all, which is a different and much larger rule than the
+/// one item 4 states. A caller that genuinely knows its own generation --
+/// because a broker handed it one -- gets the strict answer from [`guard`].
+pub fn guard_from_env(state: &StateDir) -> Result<(), StaleGeneration> {
     let session = std::env::var(super::adapters::SESSION_ENV).ok();
     let generation = std::env::var(GENERATION_ENV).ok();
-    fence_with(
+    superseded_only(
         session
             .as_deref()
             .and_then(|s| load_short(state, s))
@@ -827,13 +874,16 @@ pub fn guard(state: &StateDir, short: &str, generation: u64) -> Result<(), Stale
     }
 }
 
-/// The pure half of [`fence`]: given the seat record (if any) for the
+/// The pure half of [`guard_from_env`]: given the seat record (if any) for the
 /// session named in the environment and the raw `ZIRV_CTX_SEAT_GENERATION`
 /// string (if any), decides whether to refuse. Split out so this module's
 /// own tests never have to mutate real process environment variables (a
 /// documented hazard under a threaded, non-nextest `cargo test` run -- see
 /// this repo's own working instructions on why nextest is preferred).
-fn fence_with(seat: Option<&Seat>, env_generation: Option<&str>) -> CtxResult<()> {
+fn superseded_only(
+    seat: Option<&Seat>,
+    env_generation: Option<&str>,
+) -> Result<(), StaleGeneration> {
     let (Some(seat), Some(raw)) = (seat, env_generation) else {
         return Ok(());
     };
@@ -841,12 +891,12 @@ fn fence_with(seat: Option<&Seat>, env_generation: Option<&str>) -> CtxResult<()
         return Ok(());
     };
     if seat.generation > env_generation {
-        return Err(format!(
-            "stale seat generation {env_generation} (current {}): this session was superseded by \
-             an automatic rollover; stop coordinating",
-            seat.generation
-        )
-        .into());
+        return Err(StaleGeneration {
+            short: seat.short.clone(),
+            current: seat.generation,
+            presented: env_generation,
+            reason: StaleReason::Superseded,
+        });
     }
     Ok(())
 }
@@ -1625,7 +1675,7 @@ mod tests {
     fn fence_errors_on_a_stale_generation() {
         let mut seat = base_seat();
         seat.generation = 3;
-        let err = fence_with(Some(&seat), Some("1")).expect_err("stale generation must refuse");
+        let err = superseded_only(Some(&seat), Some("1")).expect_err("stale generation must refuse");
         let message = err.to_string();
         assert!(message.contains("stale seat generation 1"), "{message}");
         assert!(message.contains("current 3"), "{message}");
@@ -1635,16 +1685,17 @@ mod tests {
     fn fence_passes_on_the_current_generation() {
         let mut seat = base_seat();
         seat.generation = 3;
-        fence_with(Some(&seat), Some("3")).expect("current generation must pass");
-        fence_with(Some(&seat), Some("4")).expect("a generation ahead of the record must pass");
+        superseded_only(Some(&seat), Some("3")).expect("current generation must pass");
+        superseded_only(Some(&seat), Some("4"))
+            .expect("a generation ahead of the record must pass");
     }
 
     #[test]
     fn fence_passes_with_no_env_or_no_seat() {
         let seat = base_seat();
-        fence_with(None, Some("1")).expect("no seat record passes");
-        fence_with(Some(&seat), None).expect("no env passes");
-        fence_with(None, None).expect("neither present passes");
+        superseded_only(None, Some("1")).expect("no seat record passes");
+        superseded_only(Some(&seat), None).expect("no env passes");
+        superseded_only(None, None).expect("neither present passes");
     }
 
     fn candidate(agent: &str, projected: f64) -> CandidateHeadroom {
@@ -2599,5 +2650,45 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         assert!(guard(&state, "nosuchseat", 7).is_ok());
+    }
+
+    /// Review finding 2: `may_prepare` answers the same two questions
+    /// `prepare_onto` refuses on, so a caller with irreversible work to do
+    /// first (a rollover's safe boundary) can ask before doing it -- and the
+    /// two can never disagree, because they share `admissible`.
+    #[test]
+    fn may_prepare_answers_exactly_what_prepare_would_refuse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "2b3c4d5e-7777-4000-8000-000000000488";
+        let short = super::super::sessions::short_id(session);
+        registered(&state, &short, session, "claude");
+
+        assert!(may_prepare(&state, &short).is_ok(), "an idle seat admits one");
+
+        // Pinned: both refuse, with the same wording.
+        let mut pinned = load(&state, &short).expect("seat");
+        pinned.pinned = true;
+        store(&state, &pinned).expect("store");
+        let checked = may_prepare(&state, &short).expect_err("pinned");
+        let attempted = prepare(&state, &short, "codex", None, Cause::Manual, 2).expect_err("pinned");
+        assert!(checked.to_string().contains("is pinned"), "{checked}");
+        assert_eq!(checked.to_string(), attempted.to_string());
+
+        // Already prepared: likewise, and this is the state the residual race
+        // leaves behind when another caller wins.
+        let mut unpinned = load(&state, &short).expect("seat");
+        unpinned.pinned = false;
+        store(&state, &unpinned).expect("store");
+        prepare(&state, &short, "codex", None, Cause::Manual, 2).expect("prepare");
+        let checked = may_prepare(&state, &short).expect_err("already prepared");
+        assert!(
+            checked.to_string().contains("already has a rollover prepared"),
+            "{checked}"
+        );
+
+        // And a seat that does not exist is an error either way, never a
+        // silent pass: there is nothing to prepare a rollover on.
+        assert!(may_prepare(&state, "nosuchseat").is_err());
     }
 }
