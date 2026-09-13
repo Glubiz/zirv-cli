@@ -2420,7 +2420,11 @@ mod tests {
         let short = super::super::sessions::short_id(session);
         registered(&state, &short, session, "claude");
         super::super::sessions::record_native_conversation(
-            &state, &short, "claude", session, "conv-harness",
+            &state,
+            &short,
+            "claude",
+            session,
+            "conv-harness",
         );
 
         let generation = prepare_onto(
@@ -2436,8 +2440,8 @@ mod tests {
             1_700_000_000,
         )
         .expect("prepare onto a native successor");
-        let rolled = commit(&state, &short, generation, "native-session", 1_700_000_100)
-            .expect("commit");
+        let rolled =
+            commit(&state, &short, generation, "native-session", 1_700_000_100).expect("commit");
 
         assert_eq!(rolled.runtime, RuntimeKind::Native);
         let displaced = rolled.displaced.expect("the source harness is parked");
@@ -2468,7 +2472,11 @@ mod tests {
         // A marker recorded as a HARNESS conversation is not this native
         // session's conversation, however well the agent and session match.
         super::super::sessions::record_native_conversation(
-            &state, &short, "native", session, "conv-harness",
+            &state,
+            &short,
+            "native",
+            session,
+            "conv-harness",
         );
         let generation = prepare_onto(
             &state,
@@ -2523,11 +2531,7 @@ mod tests {
         let rolled =
             commit(&state, &short2, generation, "claude-session", 1_700_000_050).expect("commit");
         assert_eq!(
-            rolled
-                .displaced
-                .expect("parked")
-                .conversation
-                .as_deref(),
+            rolled.displaced.expect("parked").conversation.as_deref(),
             Some("journal-session-1")
         );
     }
@@ -2541,8 +2545,8 @@ mod tests {
         let session = "0f2b3f21-4444-4a3c-9ccb-4e9b1f0a1004";
         let short = super::super::sessions::short_id(session);
         registered(&state, &short, session, "claude");
-        let generation = prepare(&state, &short, "codex", Some("gpt5"), Cause::Manual, 1)
-            .expect("prepare");
+        let generation =
+            prepare(&state, &short, "codex", Some("gpt5"), Cause::Manual, 1).expect("prepare");
         let rolled = commit(&state, &short, generation, "codex-session", 2).expect("commit");
         assert_eq!(rolled.runtime, RuntimeKind::Harness);
         assert_eq!(rolled.agent, "codex");
@@ -2560,7 +2564,10 @@ mod tests {
         let short = super::super::sessions::short_id(session);
         registered(&state, &short, session, "claude");
 
-        assert!(guard(&state, &short, 1).is_ok(), "the seat's own generation");
+        assert!(
+            guard(&state, &short, 1).is_ok(),
+            "the seat's own generation"
+        );
 
         let generation = prepare_onto(
             &state,

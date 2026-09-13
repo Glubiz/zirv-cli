@@ -568,14 +568,18 @@ pub fn tree_key(path: &Path) -> String {
 /// other writer finishes, or immediately with a fresh `--worktree`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterRefusal {
-    TreeBusy { holder_label: String },
+    TreeBusy {
+        holder_label: String,
+    },
     PoolExhausted,
     /// Issue #488: the process asking for this lease carries a seat
     /// generation the seat record has since moved past -- an orchestrator a
     /// rollover superseded, or a worker it spawned. Unlike the other two this
     /// one is NOT retryable: waiting does not change the answer, because the
     /// session asking has been replaced.
-    StaleSeat { detail: String },
+    StaleSeat {
+        detail: String,
+    },
 }
 
 /// Issues #267/#338: the one diagnostic rendering shared by headless and
