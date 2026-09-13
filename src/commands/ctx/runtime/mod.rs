@@ -30,6 +30,8 @@
 //! same thing as code that should be deleted.
 #![allow(dead_code)]
 
+pub mod checkpoint;
+pub mod compaction;
 pub mod context;
 pub mod enforcement;
 pub mod fake;
@@ -38,6 +40,8 @@ pub mod harness;
 pub mod journal;
 pub mod native;
 pub mod protocol;
+#[cfg(test)]
+pub mod testsupport;
 pub mod tools;
 
 use std::path::PathBuf;

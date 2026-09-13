@@ -652,6 +652,16 @@ impl StateDir {
         self.0.join("native-journal.sqlite")
     }
 
+    /// Portable native checkpoints (`<state>/native-checkpoints/`, issue
+    /// #486). One JSON export per committed checkpoint. The journal's own
+    /// `Checkpoint` event is the AUTHORITY -- these files are the portable,
+    /// inspectable copy a cross-provider continuation or an operator can
+    /// read without opening the database, so a missing or corrupt export is
+    /// never a reason to refuse a resume.
+    pub fn native_checkpoints(&self) -> PathBuf {
+        self.0.join("native-checkpoints")
+    }
+
     pub fn handoffs(&self) -> PathBuf {
         self.0.join("handoffs")
     }
