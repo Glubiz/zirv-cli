@@ -241,6 +241,24 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::File("", ".sqlite"),
         &["commands/ctx/ledger.rs"],
     ),
+    // Issue #352. The persistent runtime's own durable state --
+    // `<state>/runtime/<namespace>.json`, its topology and its shutdown
+    // sentinel -- is keyed by NAMESPACE, not by repository slug, so there is
+    // no slug-keyed directory here for `adopt_legacy_slug_state` to move (the
+    // rename it attempts always no-ops as `NotFound`, exactly like the
+    // `ledger` row above). The row exists to keep this consumer audit
+    // complete: both files below only *read* a slug computed elsewhere --
+    // `session/host.rs` publishes it in the redacted protocol facts a session
+    // projects to, and `session/mod.rs` compares it against those facts to
+    // find this repository's existing seat on a runtime.
+    (
+        "runtime",
+        SlugEntry::Directory,
+        &[
+            "commands/ctx/session/host.rs",
+            "commands/ctx/session/mod.rs",
+        ],
+    ),
 ];
 
 // The existence check is only a fast path: another process can create the
