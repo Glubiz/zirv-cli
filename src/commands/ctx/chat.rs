@@ -17,6 +17,7 @@ use super::dash;
 use super::dash::pane::PaneSpec;
 use super::event::SessionId;
 use super::prompt::PromptRole;
+use super::runtime::{self as runtime_kind, RuntimeKind};
 use super::state::StateDir;
 use super::term;
 use super::wrap::{self, WrapArgs};
@@ -327,12 +328,23 @@ fn run_native_chat<E: Write>(
     stdin_is_tty: bool,
     vt_ok: bool,
 ) -> CtxResult<i32> {
-    if runtime != "native" {
-        writeln!(
-            stderr,
-            "--runtime '{runtime}': expected `native` (omit --runtime for a wrapped harness)"
-        )?;
-        return Ok(1);
+    // Issue #531 review: this used to reimplement the harness/native decision
+    // inline. Routing through `runtime::selected()` makes it the one place a
+    // `--runtime` flag is turned into a decision, and reusing its own error
+    // text for a value it has never heard of keeps the two from drifting.
+    match runtime_kind::selected(runtime) {
+        Ok(RuntimeKind::Native) => {}
+        Ok(_) => {
+            writeln!(
+                stderr,
+                "--runtime '{runtime}': expected `native` (omit --runtime for a wrapped harness)"
+            )?;
+            return Ok(1);
+        }
+        Err(error) => {
+            writeln!(stderr, "{error}")?;
+            return Ok(1);
+        }
     }
     if args.agent.is_some()
         || args.simple
@@ -1953,6 +1965,45 @@ mod tests {
         let msg = String::from_utf8(err_out).expect("utf8");
         assert!(msg.contains("claude"), "got {msg}");
         assert!(msg.contains("disabled"), "got {msg}");
+    }
+
+    /// PR #531 review finding 3: `--runtime` used to reimplement the
+    /// harness/native decision inline instead of calling
+    /// `runtime::selected()`, the one place that decision is supposed to be
+    /// made. An unrecognised value must be refused with THAT function's own
+    /// wording, not a bespoke message this module drifted from it.
+    #[test]
+    fn an_unknown_runtime_value_is_refused_with_runtime_selected_s_own_error() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("bogus".to_string()),
+            extra: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_with(&args, &mut out, &mut err_out, repo.path(), &|k| {
+            empty.get(k).cloned()
+        })
+        .expect("prints and exits 1 rather than propagating an Err");
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        let msg = String::from_utf8(err_out).expect("utf8");
+        let expected = runtime_kind::selected("bogus")
+            .expect_err("bogus is not a known runtime")
+            .to_string();
+        assert_eq!(msg.trim_end(), expected);
     }
 
     #[test]

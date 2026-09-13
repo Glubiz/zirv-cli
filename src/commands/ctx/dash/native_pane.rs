@@ -147,6 +147,13 @@ pub enum TranscriptItem {
     SessionEnded {
         reason: String,
     },
+    /// PR #531 review finding 4: a marker standing in for `hidden` older
+    /// items dropped by [`cap_transcript_items`] once a transcript grows
+    /// past [`MAX_TRANSCRIPT_ITEMS`]. Always the first item in a capped
+    /// view, never produced by [`build_transcript`] itself.
+    Elided {
+        hidden: usize,
+    },
 }
 
 impl TranscriptItem {
@@ -237,6 +244,37 @@ pub fn build_transcript(state: &ConversationState) -> TranscriptView {
     }
     TranscriptView { items }
 }
+
+/// PR #531 review finding 4: an unbounded transcript re-rendered from a full
+/// journal replay on every ~150ms dashboard tick eventually re-lays out
+/// (and re-allocates) an ever-growing item list even though only the tail
+/// is ever new. This is the bound: displayed items are capped at
+/// `max_items`, keeping the NEWEST ones (a live conversation cares about
+/// what just happened, not the start), with a single [`TranscriptItem::
+/// Elided`] marker standing in for however many older items were dropped.
+/// A no-op when `view` is already at or under the cap. Pure, so it is
+/// tested directly against a hand-built [`TranscriptView`] rather than
+/// through a live session.
+pub fn cap_transcript_items(view: TranscriptView, max_items: usize) -> TranscriptView {
+    if view.items.len() <= max_items || max_items == 0 {
+        return view;
+    }
+    // One slot of the cap is spent on the marker itself, so the visible
+    // window plus the marker never exceeds `max_items`.
+    let keep = max_items.saturating_sub(1);
+    let hidden = view.items.len() - keep;
+    let mut items = Vec::with_capacity(max_items);
+    items.push(TranscriptItem::Elided { hidden });
+    items.extend(view.items.into_iter().skip(hidden));
+    TranscriptView { items }
+}
+
+/// The documented cap [`cap_transcript_items`] enforces on a live pane's
+/// displayed transcript (see [`NativePaneRuntime::refresh_transcript`]).
+/// Generous enough that an ordinary session never hits it in practice, but
+/// bounded so a very long-running pane's per-tick rebuild cost stays flat
+/// rather than growing without limit.
+pub const MAX_TRANSCRIPT_ITEMS: usize = 500;
 
 fn build_tool_call_item(
     state: &ConversationState,
@@ -423,6 +461,13 @@ pub struct StatusFacts {
     /// Presentation-layer bookkeeping, not a journal fact -- see
     /// [`NativePresentation::note_terminal_reached`].
     pub unread_result: bool,
+    /// PR #531 review finding 5: a non-fatal condition the worker thread
+    /// wants the operator to see (today, only a standing-context compile
+    /// failure -- `runtime::native::InteractiveProgress::Notice`) rather
+    /// than swallowing it silently. Rendered on the status line by
+    /// [`status_line_text`]; `None` on every path that constructs
+    /// `StatusFacts` without a live [`NativePaneRuntime`] behind it.
+    pub notice: Option<String>,
 }
 
 /// The seven states item 4 names, plus the natural eighth: "completed, and
@@ -901,8 +946,18 @@ pub struct FileRef {
 /// `exists` check, which is why this is a plain function rather than part
 /// of [`apply_composer_action`] -- a caller re-runs it on demand (e.g. on
 /// every draft change) rather than this module owning a debounce policy.
+///
+/// PR #531 review finding 2: `workdir.join(path).exists()` alone answers
+/// "does something exist at this joined path", never "does it stay inside
+/// `workdir`" -- `@../../secret` joins and exists just fine while pointing
+/// somewhere the caller never meant to expose. Both sides are canonicalized
+/// (resolving `..`, `.` and symlinks) and the candidate must fall under the
+/// canonical workdir; anything that escapes it -- or that cannot be
+/// canonicalized at all, e.g. because it does not exist -- reads as
+/// `exists: false` rather than being trusted.
 #[allow(dead_code)] // see `FileRef`'s own doc comment
 pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
+    let workdir_canonical = std::fs::canonicalize(workdir).ok();
     let mut refs = Vec::new();
     let mut idx = 0usize;
     while let Some(rel) = text[idx..].find('@') {
@@ -917,7 +972,10 @@ pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
         }
         if end > start + 1 {
             let path = text[start + 1..end].to_string();
-            let exists = workdir.join(&path).exists();
+            let exists = workdir_canonical
+                .as_deref()
+                .map(|root| path_resolves_under(root, &workdir.join(&path)))
+                .unwrap_or(false);
             refs.push(FileRef {
                 token: text[start..end].to_string(),
                 path,
@@ -929,6 +987,16 @@ pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
         idx = end.max(start + 1);
     }
     refs
+}
+
+/// Whether `candidate` canonicalizes to a path under the already-canonical
+/// `root`. A candidate that fails to canonicalize (missing, a dangling
+/// symlink, a permissions error) is never treated as inside `root` --
+/// refusing is the safe default, not a guess.
+fn path_resolves_under(root: &Path, candidate: &Path) -> bool {
+    std::fs::canonicalize(candidate)
+        .map(|resolved| resolved.starts_with(root))
+        .unwrap_or(false)
 }
 
 /// Groups a sequence of input chunks (each with the [`Duration`] elapsed
@@ -1511,6 +1579,12 @@ pub fn render_item(item: &TranscriptItem, expanded: bool) -> Vec<StyledLine> {
                 Tone::Muted,
             )]
         }
+        TranscriptItem::Elided { hidden } => {
+            vec![StyledLine::toned(
+                format!("\u{22ef} {hidden} older item(s) elided"),
+                Tone::Muted,
+            )]
+        }
     }
 }
 
@@ -1688,7 +1762,7 @@ fn tone_to_style(tone: Tone) -> Style {
 /// [`render_plain`] so the ratatui and headless renderers can never drift.
 pub fn status_line_text(facts: &StatusFacts) -> String {
     let status = classify_status(facts);
-    format!(
+    let mut line = format!(
         "{model}  {route}  {runtime}  {billing}  {glyph} {label}",
         model = facts.model,
         route = facts.route,
@@ -1696,7 +1770,12 @@ pub fn status_line_text(facts: &StatusFacts) -> String {
         billing = facts.billing,
         glyph = status_glyph(status),
         label = status_label(status),
-    )
+    );
+    if let Some(notice) = &facts.notice {
+        line.push_str("  \u{26a0} ");
+        line.push_str(notice);
+    }
+    line
 }
 
 /// Draws the native pane's content -- status line, transcript, composer --
@@ -1907,6 +1986,12 @@ pub struct NativePaneRuntime {
     /// Set once an `InteractiveProgress::Ended` is observed; the dashboard
     /// loop's own cue to stop.
     pub ended: bool,
+    /// PR #531 review finding 5: the most recent `InteractiveProgress::
+    /// Notice`, surfaced on the status line. `None` until the worker thread
+    /// sends one; never cleared automatically -- a notice describes a
+    /// degraded session for as long as that session runs, not a one-off
+    /// toast.
+    notice: Option<String>,
 }
 
 impl NativePaneRuntime {
@@ -1925,12 +2010,14 @@ impl NativePaneRuntime {
                 limits: native::NativeLimits::default(),
                 task: None,
                 writing: spec.writing,
+                provider: None,
             },
             env,
         )?;
         let journal = Journal::open(state)?;
         let conversation = journal.replay(&session.session)?;
-        let transcript = build_transcript(&conversation);
+        let transcript =
+            cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
         let billing = resolve_billing(&session.route, &spec.repo);
 
         let mut presentation = NativePresentation::default();
@@ -1947,6 +2034,7 @@ impl NativePaneRuntime {
             turn_state: None,
             billing,
             ended: false,
+            notice: None,
         })
     }
 
@@ -1968,6 +2056,9 @@ impl NativePaneRuntime {
                     self.session_state = NativeSessionState::Idle;
                     self.turn_state = None;
                 }
+                InteractiveProgress::Notice(message) => {
+                    self.notice = Some(message);
+                }
                 InteractiveProgress::Ended => {
                     self.ended = true;
                     self.session_state = NativeSessionState::Completed;
@@ -1977,13 +2068,26 @@ impl NativePaneRuntime {
         self.refresh_transcript();
     }
 
+    /// PR #531 review finding 4: this used to do a full journal replay AND a
+    /// full `build_transcript` rebuild on every ~150ms tick regardless of
+    /// whether anything changed. The journal exposes no cursor read (a
+    /// "replay since sequence N" call), so the replay itself stays
+    /// unavoidable -- but the (heavier, allocation-per-item) transcript
+    /// rebuild is now skipped whenever `last_sequence` has not moved since
+    /// the last one, and the rebuilt view is capped at
+    /// [`MAX_TRANSCRIPT_ITEMS`] so a very long session's per-tick cost (and
+    /// the pane's own memory) stays flat rather than growing without bound.
     fn refresh_transcript(&mut self) {
         let Ok(conversation) = self.journal.replay(&self.session.session) else {
             return;
         };
+        if conversation.last_sequence == self.conversation.last_sequence {
+            return;
+        }
         let before = self.transcript.items.len();
         self.conversation = conversation;
-        self.transcript = build_transcript(&self.conversation);
+        self.transcript =
+            cap_transcript_items(build_transcript(&self.conversation), MAX_TRANSCRIPT_ITEMS);
         let grown = self.transcript.items.len().saturating_sub(before);
         if grown > 0 {
             self.presentation.scroll.on_items_appended(grown);
@@ -2016,6 +2120,7 @@ impl NativePaneRuntime {
             // which this pane does not yet read.
             blocked: false,
             unread_result: self.presentation.unread,
+            notice: self.notice.clone(),
         }
     }
 
@@ -2418,6 +2523,46 @@ mod tests {
         );
     }
 
+    /// PR #531 review finding 4: appending events beyond the cap must keep
+    /// the displayed view bounded, with the newest items still visible and
+    /// an `Elided` marker standing in for however many were dropped.
+    #[test]
+    fn cap_transcript_items_keeps_the_newest_and_marks_the_rest_elided() {
+        let items: Vec<TranscriptItem> = (0..12)
+            .map(|i| TranscriptItem::AssistantText {
+                message_id: format!("m{i}"),
+                text: format!("turn {i}"),
+            })
+            .collect();
+        let capped = cap_transcript_items(TranscriptView { items }, 5);
+        assert_eq!(capped.items.len(), 5, "bounded to the cap");
+        assert!(matches!(
+            capped.items[0],
+            TranscriptItem::Elided { hidden: 8 }
+        ));
+        for (offset, item) in capped.items[1..].iter().enumerate() {
+            let expected = 8 + offset;
+            match item {
+                TranscriptItem::AssistantText { text, .. } => {
+                    assert_eq!(text, &format!("turn {expected}"), "newest items kept");
+                }
+                other => panic!("expected assistant text, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cap_transcript_items_is_a_no_op_under_the_cap() {
+        let view = TranscriptView {
+            items: vec![TranscriptItem::AssistantText {
+                message_id: "m0".to_string(),
+                text: "hi".to_string(),
+            }],
+        };
+        let capped = cap_transcript_items(view.clone(), MAX_TRANSCRIPT_ITEMS);
+        assert_eq!(capped, view);
+    }
+
     #[test]
     fn replaying_the_same_journal_events_twice_yields_an_identical_transcript() {
         // Exercises the REAL N03 reducer (`Journal::replay`), not a hand-built
@@ -2717,6 +2862,7 @@ mod tests {
             turn_state,
             blocked,
             unread_result: unread,
+            notice: None,
         }
     }
 
@@ -2982,6 +3128,33 @@ mod tests {
         let refs = resolve_file_refs(text, dir.path());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].path, "src/\u{65e5}\u{672c}\u{8a9e}.rs");
+    }
+
+    /// PR #531 review finding 2: a `@path` that escapes the workdir via `..`
+    /// must never be trusted as "exists", even when it genuinely resolves to
+    /// a real file outside the tree -- and an ordinary in-tree path must
+    /// still resolve.
+    #[test]
+    fn resolve_file_refs_refuses_a_path_that_escapes_the_workdir() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"top secret").unwrap();
+
+        let workdir = root.path().join("work");
+        std::fs::create_dir_all(workdir.join("src")).unwrap();
+        std::fs::write(workdir.join("src/lib.rs"), b"fn lib() {}").unwrap();
+
+        let text = "@../outside/secret and @src/lib.rs";
+        let refs = resolve_file_refs(text, &workdir);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "../outside/secret");
+        assert!(
+            !refs[0].exists,
+            "a path that escapes the workdir must never resolve"
+        );
+        assert_eq!(refs[1].path, "src/lib.rs");
+        assert!(refs[1].exists, "an ordinary in-tree path must resolve");
     }
 
     // -- scroll / follow mode --------------------------------------------
@@ -3293,5 +3466,20 @@ mod tests {
         assert!(text.contains("native"));
         assert!(text.contains("api"));
         assert!(text.contains("generating"));
+    }
+
+    /// PR #531 review finding 5: `spawn_interactive` used to swallow a
+    /// standing-context compile failure with `.unwrap_or_default()` --
+    /// silently, with no trace an operator could see. Once surfaced through
+    /// `InteractiveProgress::Notice`, the pane's status line must show it.
+    #[test]
+    fn status_line_text_shows_a_notice_when_one_is_set() {
+        let mut f = facts(NativeSessionState::Idle, None, false, false);
+        f.notice = Some("standing context could not be compiled".to_string());
+        let text = status_line_text(&f);
+        assert!(
+            text.contains("standing context could not be compiled"),
+            "got {text}"
+        );
     }
 }

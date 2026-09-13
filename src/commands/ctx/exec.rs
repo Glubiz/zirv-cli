@@ -900,6 +900,7 @@ fn render_native_session_plain(
         turn_state: None,
         blocked: false,
         unread_result: false,
+        notice: None,
     };
     Ok(render_plain(
         &view,
