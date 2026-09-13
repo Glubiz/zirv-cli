@@ -591,4 +591,67 @@ mod tests {
         );
         drop(native);
     }
+
+    #[test]
+    fn a_native_and_a_legacy_worker_cannot_both_claim_one_task_card() {
+        // Acceptance criterion (b), the task half: a native delegation claims
+        // its card through the SAME `task::claim_locked` a legacy delegation
+        // uses, so the second claimant -- whichever runtime it is -- is
+        // refused rather than paid to redo the first one's work.
+        use super::super::task;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let slug = "repo-under-test";
+        task::append_event(
+            &state,
+            slug,
+            &task::Event::Created {
+                id: "task-1".to_string(),
+                repo_slug: slug.to_string(),
+                title: "investigate".to_string(),
+                brief: "read and report".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("created");
+
+        let live_pid = std::process::id();
+        let start = super::super::sessions::process_start_secs(live_pid);
+        let first = task::claim_locked(
+            &state,
+            slug,
+            "task-1",
+            "legacy-session",
+            live_pid,
+            start,
+            "host",
+            2,
+            task::DEFAULT_CLAIM_TTL_SECS,
+        )
+        .expect("claim")
+        .expect("card exists");
+        assert!(first.is_ok(), "the first claimant takes the card");
+
+        let second = task::claim_locked(
+            &state,
+            slug,
+            "task-1",
+            "native-session",
+            live_pid,
+            start,
+            "host",
+            3,
+            task::DEFAULT_CLAIM_TTL_SECS,
+        )
+        .expect("claim")
+        .expect("card exists");
+        assert!(
+            second.is_err(),
+            "a native worker must not claim a card a live legacy claimant already holds"
+        );
+    }
 }
