@@ -339,7 +339,10 @@ pub fn record_completion(state: &StateDir, repo: &Path, evidence: Vec<String>) -
     let now = super::state::now_secs();
     let _ = super::coordinator::update(state, repo, |graph| {
         graph.cancel(now);
-        graph.decide("the objective was closed; no further work is dispatched", now);
+        graph.decide(
+            "the objective was closed; no further work is dispatched",
+            now,
+        );
     });
     Ok(true)
 }

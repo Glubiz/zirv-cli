@@ -1225,7 +1225,10 @@ pub fn delegate(
     // runtime. A crash between here and the outcome leaves a node a resumed
     // coordinator can still address, which is the whole point of persisting
     // it.
-    let node = request.task.clone().unwrap_or_else(|| delegation_id.clone());
+    let node = request
+        .task
+        .clone()
+        .unwrap_or_else(|| delegation_id.clone());
     graph.dispatched(
         &node,
         &request.role,
@@ -2068,7 +2071,10 @@ mod tests {
 
         let graph = super::super::coordinator::load(&state, &repo);
         let node = graph.nodes.get("task-implementer").expect("node");
-        assert_eq!(node.delegation.as_deref(), Some(record.handle.delegation.as_str()));
+        assert_eq!(
+            node.delegation.as_deref(),
+            Some(record.handle.delegation.as_str())
+        );
         assert_eq!(node.runtime.as_deref(), Some("native"));
         assert_eq!(node.role, super::super::team::IMPLEMENTER);
         assert_eq!(

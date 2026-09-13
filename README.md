@@ -1965,6 +1965,72 @@ implementation and the test that pins it — is
 behind this step are in
 [`docs/design/2026-09-13-native-workflows.md`](docs/design/2026-09-13-native-workflows.md).
 
+### Native teams and the coordinating seat
+
+Zirv can run the coordinator itself. A native session seated as
+`--role coordinator` (or `sub-orchestrator`) plans the work, staffs it and
+delegates it across native *and* wrapped workers, over the same shared task
+cards, work groups, objective and workflow every other surface uses.
+
+Seven team roles are recognised — `coordinator`, `sub-orchestrator`,
+`researcher`, `planner`, `implementer`, `reviewer`, `tester` — and each one
+spends the route **you** configured for it under `[roles]` in
+`~/.zirv/native.toml`:
+
+```toml
+[roles]
+coordinator   = "sonnet-seat"
+implementer   = "sonnet-seat"
+reviewer      = "haiku-metered"
+tester        = "haiku-metered"
+```
+
+A role with no entry has no native path at all: the refusal names the role and
+lists the roles that *are* configured, rather than quietly spending another
+role's route. Nothing is inferred, and nothing changes provider on its own —
+a route a model asks for is admitted only if it clears your policy and keeps
+the same billing posture you seated that role on.
+
+```bash
+zirv ctx exec --runtime native --role coordinator --prompt "ship issue #123"
+```
+
+Seven typed tools give that seat the board: `task_create`, `task_claim`,
+`task_list`, `group_create`, `group_status`, `objective_status` and
+`team_status`. Each is a thin adaptor over the same `zirv ctx task|group|
+objective` service the CLI verb calls, so there is one definition of "this
+card is claimed" and one of "this group is full". The three that change shared
+state need a writer permit; the four that read do not.
+
+**Who may do what comes from the seat, not from the request.** A reviewer or
+tester is read-only by identity, however the delegation was spelled; a
+coordinator that is itself read-only can still dispatch a writing implementer;
+a reviewer seat may not delegate at all. Delegation depth, task ownership,
+checkout ownership, group admission and the provider token ceiling are the
+same limits the rest of zirv already enforces — there is no second counter,
+and a delegation that fails any of them starts nothing and leaves no receipt
+behind.
+
+**A coordinator survives a restart.** Its task graph, decisions, evidence
+references and your standing constraints are durable. On restart it consumes
+every worker receipt published while it was away, exactly once, and never
+re-dispatches work that already settled. A worker's outcome is a bounded
+manifest and a reference to its result, never a replay of its transcript, and
+until the receipt is actually read `team_status` reports it as pending rather
+than assuming it:
+
+```bash
+zirv ctx objective set "ship issue #123 without touching the release branch"
+zirv ctx objective close      # stops further dispatch; work already running still reports
+```
+
+Setting an objective is how you steer — it redirects the coordinator and lifts
+a previous stop. Closing it stops further dispatch while leaving work already
+delegated answerable, so its results are still collected.
+
+The decisions behind this step are in
+[`docs/design/2026-09-13-native-orchestrator.md`](docs/design/2026-09-13-native-orchestrator.md).
+
 ### Native configured capabilities
 
 A native session inherits nothing from a coding harness, so the non-shell
@@ -2472,6 +2538,21 @@ call names is validated as `[A-Za-z0-9_-]{1,128}` before it can reach a file,
 so model output cannot address state outside the workflow store. The
 completion gate reads the workflow's own recorded branch and the verification
 store, never the model's account of them.
+
+The native meta-orchestrator adds no repository-settable key either. A seat's
+**role** comes from the persisted seat record zirv itself minted, never from
+model output, and that role alone decides whether the seat may delegate and
+whether a child it delegates may write — so a read-only coordinator can still
+dispatch a writing implementer, and a reviewer stays read-only however the
+request was spelled. A route a delegating model names for a role is admitted
+only when it clears operator policy and stays on the billing posture the
+operator seated that role on; an operator's own `--route` is the operator
+speaking and is untouched. Task and group ids a tool call names are validated
+as `[A-Za-z0-9_-]{1,128}` before they can reach a file, and
+`task_create`/`task_claim`/`group_create` are priced as shared-scope writes,
+so a seat with no writer permit reads the board and cannot move a piece on
+it. The coordinator's own record lives under the operator-owned state
+directory, never in the repository.
 
 The local runtime protocol ([`zirv ctx api`](#runtime-protocol-v1-zirv-ctx-api))
 adds no configuration key, and deliberately so: its endpoint is always derived
