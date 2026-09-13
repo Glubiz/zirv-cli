@@ -3074,6 +3074,14 @@ pub struct InteractiveRequest {
     /// mirrors a read-only session: every write this session's tools
     /// attempt is refused by the execution broker, on purpose.
     pub writing: bool,
+    /// `HeadlessRequest::provider`'s own escape hatch, threaded through for
+    /// PR #531 review finding 1's own test: a `Some("fixture:<path>")`
+    /// opens the session against `fixture::FixtureProvider` instead of the
+    /// operator's real native provider configuration, the same way a
+    /// headless run's `--provider` flag does. `None` (every production
+    /// caller today) resolves the real configuration exactly as before this
+    /// field existed.
+    pub provider: Option<String>,
 }
 
 /// One update from the worker thread, coarse on purpose: `dash::
@@ -3094,6 +3102,13 @@ pub enum InteractiveProgress {
     /// provider failure -- a provider failure is a normal journaled
     /// `Failed` turn and reaches `Idle` instead).
     Failed(String),
+    /// PR #531 review finding 5: a non-fatal condition worth telling the
+    /// operator about even though the session keeps running -- today, only
+    /// a standing-context compile failure at [`spawn_interactive`] time
+    /// (previously swallowed by `.unwrap_or_default()`). `dash::native_pane`
+    /// renders it on the status line rather than the journal, since it
+    /// describes the SESSION, not any one turn.
+    Notice(String),
     /// The worker thread's loop has exited; no more progress will ever
     /// follow. Sent once, always last.
     Ended,
@@ -3154,17 +3169,76 @@ impl InteractiveSession {
         self.cancel.cancel();
     }
 
-    /// Ends the session: drops the submit channel (the worker's `for text in
-    /// submit_rx` loop exits on the next iteration since a disconnected
-    /// channel reads as "no more messages" rather than blocking forever),
-    /// then joins the thread so a quitting dashboard never leaves an orphan
-    /// running. Consumes `self` -- there is nothing left to submit to
-    /// afterward.
+    /// Ends the session: cancels any turn currently in flight, drops the
+    /// submit channel (the worker's `for text in submit_rx` loop exits on
+    /// its next iteration since a disconnected channel reads as "no more
+    /// messages" rather than blocking forever), then joins the thread so a
+    /// quitting dashboard never leaves an orphan running -- bounded, so a
+    /// provider that never returns cannot hang the caller forever either.
+    /// Consumes `self` -- there is nothing left to submit to afterward.
+    ///
+    /// PR #531 review finding 1 (blocker): this used to join unconditionally,
+    /// with no cancellation at all -- quitting the pane mid-turn blocked on
+    /// `worker.join()` for however long the in-flight turn's own provider
+    /// call took, holding the writer permit and the seat record open the
+    /// whole time. Two changes fix it:
+    ///
+    /// 1. `self.cancel.cancel()` runs FIRST, before the channel is even
+    ///    dropped -- the exact mechanism [`Self::interrupt`] already uses,
+    ///    so a turn that is mid-request winds down the same bounded way a
+    ///    live `Ctrl+C` does, rather than running to its own natural
+    ///    completion.
+    /// 2. The join itself is bounded ([`SHUTDOWN_JOIN_TIMEOUT`]). A worker
+    ///    that still has not exited after cancellation -- a provider bug
+    ///    that never checks cancellation at all -- is detached rather than
+    ///    waited on forever: a logged warning, and the `JoinHandle` is
+    ///    simply dropped (which does not kill the OS thread, only stops
+    ///    tracking it; it keeps running to whatever end it eventually
+    ///    reaches, still holding its own writer permit and seat record
+    ///    until then). The two ordinary paths this session ever actually
+    ///    takes -- a turn already idle, or a turn cancelled and winding down
+    ///    promptly -- both finish well inside the bound, so in practice this
+    ///    always takes the fast path: the worker's own end-of-loop cleanup
+    ///    (`journal.complete_session`, then dropping `tools`/the writer
+    ///    permit as the closure returns) runs before `shutdown` returns.
     pub fn shutdown(mut self) {
+        self.cancel.cancel();
         drop(std::mem::replace(&mut self.submit_tx, mpsc::channel().0));
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            join_worker_with_timeout(worker, SHUTDOWN_JOIN_TIMEOUT);
         }
+    }
+}
+
+/// How long [`InteractiveSession::shutdown`] waits for the worker thread to
+/// exit, once cancelled, before giving up and detaching it. Generous enough
+/// that a turn genuinely winding down (a provider finishing its current
+/// chunk, a tool call being abandoned mid-flight) has time to, but bounded
+/// so a caller tearing down a dashboard pane is never held hostage by a
+/// provider bug that ignores cancellation outright.
+const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Joins `worker`, polling rather than blocking so the wait can be bounded
+/// (`std::thread::JoinHandle` has no built-in timed join). A worker still
+/// running once `timeout` elapses is left detached -- dropping the handle
+/// stops tracking it without killing it, the only safe option in std Rust --
+/// with a warning on stderr, the same "log to stderr" convention this
+/// module's own callers already use for a degraded-but-not-fatal condition.
+fn join_worker_with_timeout(worker: std::thread::JoinHandle<()>, timeout: std::time::Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        if worker.is_finished() {
+            let _ = worker.join();
+            return;
+        }
+        if start.elapsed() >= timeout {
+            eprintln!(
+                "native pane: the worker thread did not exit within {timeout:?} of shutdown \
+                 (cancellation was requested); detaching it rather than waiting indefinitely"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -3214,7 +3288,7 @@ pub fn spawn_interactive(
         role: &request.role,
         limits: request.limits,
         resume: None,
-        provider: None,
+        provider: request.provider.as_deref(),
         fixture_tools: None,
         task: request.task.clone(),
         writer: writer_permit
@@ -3283,10 +3357,23 @@ pub fn spawn_interactive(
         .unwrap_or_else(|| Arc::new(CancellationFlag::default()));
 
     // Issue #484: the same standing context a headless session compiles,
-    // degraded to none rather than refusing to open the pane.
-    let (system, preamble) =
-        compile_standing_context(&state, &home, &cfg, &headless, &route, &session, now)
-            .unwrap_or_default();
+    // degraded to none rather than refusing to open the pane. PR #531
+    // review finding 5: a compile failure used to be swallowed here by
+    // `.unwrap_or_default()` with no trace at all -- it is now carried
+    // forward as a `Notice` so the pane can tell the operator the session
+    // is running without it, rather than silently doing less.
+    let (system, preamble, standing_context_notice) =
+        match compile_standing_context(&state, &home, &cfg, &headless, &route, &session, now) {
+            Ok((system, preamble)) => (system, preamble, None),
+            Err(error) => (
+                Vec::new(),
+                Vec::new(),
+                Some(format!(
+                    "standing context could not be compiled ({error}); continuing with the \
+                     conversation alone"
+                )),
+            ),
+        };
 
     // Issue #486: the same compaction envelope `run_session` builds.
     let compaction = CompactionSettings {
@@ -3328,6 +3415,12 @@ pub fn spawn_interactive(
 
     let (submit_tx, submit_rx) = mpsc::channel::<String>();
     let (progress_tx, progress_rx) = mpsc::channel::<InteractiveProgress>();
+    if let Some(notice) = standing_context_notice {
+        // Queued before the worker thread even starts, so the FIRST
+        // `drain_progress()` a caller makes already sees it -- never
+        // dependent on the worker reaching its first turn.
+        let _ = progress_tx.send(InteractiveProgress::Notice(notice));
+    }
     let worker_cancel = Arc::clone(&cancel);
     let worker_handle = handle.clone();
     let worker_session = session.clone();
@@ -5329,6 +5422,157 @@ mod tests {
                 .map(|record| record.state),
             Some(ExecutionState::OutcomeUnknown),
             "the resume must have reconciled the started execution"
+        );
+    }
+
+    // -- PR #531 review finding 1 / finding 7: `spawn_interactive` +
+    // `InteractiveSession::shutdown` -------------------------------------
+
+    /// Shared setup for the two `spawn_interactive` shutdown tests below:
+    /// a `StateDir` rooted at a fresh temp dir, an `env` that resolves it
+    /// via `ZIRV_CTX_STATE_DIR` (the same pattern `a_resume_with_a_
+    /// reconcile_notice_writes_exactly_one_json_object_to_stdout` above
+    /// uses for `run_headless`), a real-but-empty repo tree for the writer
+    /// permit to claim, and an `InteractiveRequest` pointed at the
+    /// `helper-answer.json` fixture -- one short text-only turn, so a test
+    /// never depends on tool-call machinery to exercise shutdown itself.
+    fn interactive_shutdown_fixture() -> (
+        tempfile::TempDir,
+        super::super::super::state::StateDir,
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tmp.path().join("state");
+        let state = super::super::super::state::StateDir::from_root(state_dir.clone());
+        let tree = std::fs::canonicalize(repo.path()).expect("canonicalize repo");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        (repo, state, tree, env)
+    }
+
+    fn spawn_fixture_interactive_session(
+        repo: &std::path::Path,
+        env: &std::collections::HashMap<String, String>,
+    ) -> InteractiveSession {
+        let provider = format!(
+            "fixture:{}",
+            fixture_root().join("helper-answer.json").display()
+        );
+        let lookup = |k: &str| env.get(k).cloned();
+        spawn_interactive(
+            InteractiveRequest {
+                repo: repo.to_path_buf(),
+                role: "worker".to_string(),
+                route: None,
+                limits: NativeLimits::default(),
+                task: None,
+                writing: true,
+                provider: Some(provider),
+            },
+            &lookup,
+        )
+        .expect("interactive session opens")
+    }
+
+    /// Blocks (bounded) until `session` has reported at least one
+    /// `InteractiveProgress::Idle`, i.e. its one submitted turn finished.
+    fn wait_for_idle(session: &InteractiveSession) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if session
+                .drain_progress()
+                .iter()
+                .any(|progress| matches!(progress, InteractiveProgress::Idle))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the one submitted turn never reported Idle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// PR #531 review finding 7's first case: submit a turn, let it finish
+    /// on its own, then shut down. `shutdown`'s new cancel-first behaviour
+    /// (finding 1) must not change the ordinary, already-idle outcome: the
+    /// writer permit this session held for `repo` is gone, and the
+    /// journal's own session record is finalised (`ended_reason` set),
+    /// once `shutdown` returns.
+    #[test]
+    fn shutdown_after_a_completed_turn_releases_the_writer_permit_and_finalises_the_session() {
+        let (repo, state, tree, env) = interactive_shutdown_fixture();
+        let session = spawn_fixture_interactive_session(repo.path(), &env);
+        let session_id = session.session.clone();
+        session.submit("go".to_string()).expect("submit");
+        wait_for_idle(&session);
+
+        session.shutdown();
+
+        let held = crate::commands::ctx::permit::live_writer_records(&state)
+            .into_iter()
+            .any(|record| record.tree.as_deref() == Some(tree.as_path()));
+        assert!(
+            !held,
+            "the writer permit must be released once shutdown returns"
+        );
+
+        let journal = Journal::open(&state).expect("reopen journal");
+        let replayed = journal.replay(&session_id).expect("replay");
+        assert!(
+            replayed.ended_reason.is_some(),
+            "the journal session must be finalised (SessionEnded) by shutdown"
+        );
+    }
+
+    /// PR #531 review finding 7's second case: interrupt a turn and shut
+    /// down without ever waiting for it to finish on its own -- the "busy"
+    /// case the blocker (finding 1) is actually about. Before that fix,
+    /// `shutdown` never cancelled anything and simply joined, so this path
+    /// was only ever as fast as the in-flight turn's own natural
+    /// completion; now `shutdown` cancels first, so it must return quickly
+    /// (well inside `SHUTDOWN_JOIN_TIMEOUT`, the bounded-wait fallback's own
+    /// ceiling) and the writer permit and journal must still both be
+    /// cleaned up -- "released regardless" of which of the two paths inside
+    /// `shutdown` actually ran.
+    #[test]
+    fn shutdown_while_a_turn_is_in_flight_does_not_hang_and_still_releases_resources() {
+        let (repo, state, tree, env) = interactive_shutdown_fixture();
+        let session = spawn_fixture_interactive_session(repo.path(), &env);
+        let session_id = session.session.clone();
+        session.submit("go".to_string()).expect("submit");
+        // Deliberately no wait: interrupt and shut down while the turn may
+        // still be in flight (or, on a fast fixture, may have already
+        // finished -- either way `shutdown` must behave the same).
+        session.interrupt();
+
+        let started = std::time::Instant::now();
+        session.shutdown();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SHUTDOWN_JOIN_TIMEOUT,
+            "shutdown must not hang waiting on a cancelled/finished turn: took {elapsed:?}"
+        );
+
+        let held = crate::commands::ctx::permit::live_writer_records(&state)
+            .into_iter()
+            .any(|record| record.tree.as_deref() == Some(tree.as_path()));
+        assert!(
+            !held,
+            "the writer permit must be released regardless of the interrupt race"
+        );
+
+        let journal = Journal::open(&state).expect("reopen journal");
+        let replayed = journal.replay(&session_id).expect("replay");
+        assert!(
+            replayed.ended_reason.is_some(),
+            "the journal session must still be finalised even when shutdown raced a busy turn"
         );
     }
 
