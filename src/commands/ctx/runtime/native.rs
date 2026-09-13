@@ -2250,6 +2250,14 @@ impl NativeBackend {
     ///
     /// Without a key the id is minted fresh, exactly as `submit`/`steer` do:
     /// a caller that did not ask for deduplication does not get it silently.
+    ///
+    /// Unlike [`RuntimeBackend::submit`] this does NOT refuse a session with a
+    /// turn in flight. A hosted conversation queues input the way the agent
+    /// loop is built to take it -- `run_to_completion` drains everything
+    /// unconsumed at the next delivery boundary -- so refusing here would
+    /// reject a message the loop was about to deliver anyway. Whether a turn
+    /// is running is the HOST's fact, not this table's; `session::native`
+    /// owns it, because the host is what spawned the runner.
     pub fn accept_input(
         &mut self,
         session: &SessionHandle,
@@ -2258,12 +2266,8 @@ impl NativeBackend {
         key: Option<&str>,
     ) -> CtxResult<AcceptedInput> {
         let logical_id = session.logical_id.clone();
-        {
-            let entry = self.resolve_current_mut(session)?;
-            if !steering && entry.state == SessionState::Running {
-                return Err(RuntimeError::Busy(logical_id).into());
-            }
-        }
+        // Fences on generation before anything is written.
+        self.resolve_current_mut(session)?;
         let Some(entry) = self.sessions.get(&logical_id) else {
             return Err(RuntimeError::UnknownSession(logical_id).into());
         };
@@ -2294,17 +2298,10 @@ impl NativeBackend {
             Some(at_ms),
             at_ms / 1000,
         ) {
-            Ok(_) => {
-                let entry = self.resolve_current_mut(session)?;
-                if !steering {
-                    entry.state = SessionState::Running;
-                    entry.push(&session.logical_id, super::protocol::RuntimeEvent::TurnStarted);
-                }
-                Ok(AcceptedInput {
-                    message_id,
-                    duplicate: false,
-                })
-            }
+            Ok(_) => Ok(AcceptedInput {
+                message_id,
+                duplicate: false,
+            }),
             // The one error that is not a failure: this exact input is already
             // on disk under this exact identity, so the first attempt won and
             // nothing else may happen.

@@ -1196,3 +1196,400 @@ fn backend_error(error: &(dyn std::error::Error + 'static)) -> ApiError {
         None => ApiError::new(ErrorCode::Internal, error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::ctx::provider::Protocol;
+    use crate::commands::ctx::runtime::fixture::fixture_target;
+    use crate::commands::ctx::runtime::journal::{
+        EventScope, ExecutionId, PolicyProvenance, ToolCallId,
+    };
+
+    /// A native environment with no provider, no credential and no network: a
+    /// fixed route identity, and a turn runner that only records that it was
+    /// asked to run. Everything this module actually owns -- identity,
+    /// durability, seats, cursors, reconciliation -- is then exercised for
+    /// real, against a real journal and a real session registry.
+    #[derive(Debug, Default)]
+    struct TestEnvironment {
+        runs: Mutex<Vec<QueuedTurn>>,
+    }
+
+    impl NativeEnvironment for TestEnvironment {
+        fn route_identity(
+            &self,
+            _repo: &Path,
+            _route: Option<&str>,
+            _role: &str,
+        ) -> CtxResult<RouteIdentity> {
+            let target = fixture_target(Protocol::AnthropicMessages, "test-model");
+            Ok(RouteIdentity {
+                route: target.route.clone(),
+                provider: target.provider.clone(),
+                endpoint: target.endpoint.clone(),
+                account: target.account.clone(),
+                billing_pool: target.billing_pool.clone(),
+                protocol: target.protocol,
+                model: target.model.clone(),
+            })
+        }
+
+        fn run(&self, turn: &QueuedTurn) -> CtxResult<()> {
+            match self.runs.lock() {
+                Ok(mut runs) => runs.push(turn.clone()),
+                Err(poisoned) => poisoned.into_inner().push(turn.clone()),
+            }
+            Ok(())
+        }
+    }
+
+    impl TestEnvironment {
+        fn runs(&self) -> Vec<QueuedTurn> {
+            match self.runs.lock() {
+                Ok(runs) => runs.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
+    }
+
+    fn host_for(root: &Path) -> (Arc<NativeSessions>, Arc<TestEnvironment>) {
+        let state = StateDir::from_root(root.join("state"));
+        let environment = Arc::new(TestEnvironment::default());
+        let host = NativeSessions::new(
+            state,
+            "default",
+            "instance-1",
+            Arc::clone(&environment) as Arc<dyn NativeEnvironment>,
+        )
+        .expect("native host");
+        host.run_turns_inline_for_test();
+        (host, environment)
+    }
+
+    fn spec(cwd: &Path, prompt: &str) -> SessionSpec {
+        SessionSpec {
+            runtime: RuntimeKind::Native,
+            role: "orchestrator".to_string(),
+            agent: None,
+            provider_route: None,
+            model: None,
+            surface: UiSurface::Headless,
+            cwd: cwd.to_path_buf(),
+            prompt: prompt.to_string(),
+            extra_args: Vec::new(),
+        }
+    }
+
+    /// Issue #489, criterion 1, for the half this module owns: a client going
+    /// away is a CLIENT lifecycle event. The conversation keeps its registry
+    /// record -- the mechanical reason pacing, budgets, rot scoring, mail
+    /// addressing and writer permits keep seeing it -- and nothing is
+    /// relaunched, because there was never a process to relaunch.
+    #[test]
+    fn detaching_every_client_leaves_the_conversation_and_its_registry_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, _) = host_for(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+
+        host.attach(&facts.session_id, "client-1", AttachMode::Controller)
+            .expect("attach");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == facts.session_id),
+            "a runtime-owned native session files a registry record"
+        );
+
+        let attachment = host.detach(&facts.session_id, "client-1").expect("detach");
+        assert_eq!(attachment.role, AttachRole::Detached);
+        assert!(
+            host.owns(&facts.session_id),
+            "the conversation is still here"
+        );
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == facts.session_id),
+            "and so is its registry record: detach is not stop"
+        );
+        assert_eq!(
+            NativeHost::sessions(host.as_ref())[0].state,
+            SessionState::Idle
+        );
+    }
+
+    /// Issue #489, criterion 2: a retried input carrying the same idempotency
+    /// key is deduplicated by the JOURNAL, not by a cache -- so the guarantee
+    /// survives the reconnect (and the service restart) that loses every cache
+    /// there is. Proven by the durable message count, never by the reply.
+    #[test]
+    fn a_retried_input_with_the_same_key_is_recorded_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, environment) = host_for(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+
+        let first = host
+            .submit(&facts.session_id, "do the thing", false, Some("retry-1"))
+            .expect("submit");
+        let second = host
+            .submit(&facts.session_id, "do the thing", false, Some("retry-1"))
+            .expect("retry");
+
+        assert!(!first.duplicate);
+        assert!(second.duplicate, "the retry must be reported as a duplicate");
+        assert_eq!(
+            first.message_id, second.message_id,
+            "and under the same durable identity"
+        );
+
+        let history = host.history(&facts.session_id, 0, 64).expect("history");
+        let inputs = history
+            .entries
+            .iter()
+            .filter(|entry| entry.role == HistoryRole::User)
+            .count();
+        assert_eq!(
+            inputs, 1,
+            "one input on disk, not two: {:?}",
+            history.entries
+        );
+        assert_eq!(
+            environment.runs().len(),
+            1,
+            "and exactly one turn was queued"
+        );
+    }
+
+    /// Issue #489, item 5 and criterion 1: cancel and stop are different
+    /// verbs. An interrupt ends the turn; the conversation, its journal and
+    /// its registry record survive it, and only `stop` releases them.
+    #[test]
+    fn an_interrupt_cancels_the_turn_and_a_stop_ends_the_conversation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, _) = host_for(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+
+        // No turn in flight (the inline runner already returned), so there is
+        // nothing to cancel -- reported honestly rather than as a success.
+        assert!(!host.interrupt(&facts.session_id).expect("interrupt"));
+        assert!(host.owns(&facts.session_id));
+
+        assert!(host.stop(&facts.session_id).expect("stop"));
+        let state = StateDir::from_root(tmp.path().join("state"));
+        assert!(
+            !sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == facts.session_id),
+            "stop releases the registry record; detach never does"
+        );
+        assert!(
+            !host.stop(&facts.session_id).expect("second stop"),
+            "a second stop reports false rather than failing"
+        );
+    }
+
+    /// Issue #489, criterion 4 and item 6: after a service restart the
+    /// conversation comes back from durable state, every execution that was
+    /// merely `Started` becomes outcome-unknown, and NOTHING is replayed.
+    #[test]
+    fn a_restart_reconciles_started_executions_instead_of_replaying_them() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, environment) = host_for(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+        host.submit(&facts.session_id, "run a tool", false, None)
+            .expect("submit");
+
+        // An effect that began and never reported: exactly the shape a killed
+        // runtime leaves behind.
+        {
+            let mut backend = host.backend();
+            let journal = backend.journal_mut().expect("journal");
+            let session = JournalSessionId::new(facts.session_id.clone()).expect("id");
+            let call = ToolCallId::new("call-1").expect("id");
+            let execution = ExecutionId::new("exec-1").expect("id");
+            journal
+                .prepare_tool_call(
+                    &session,
+                    1,
+                    &EventScope::default(),
+                    call.clone(),
+                    "shell".to_string(),
+                    serde_json::json!({"command": "echo hi"}),
+                    PolicyProvenance {
+                        fingerprint: "fp".to_string(),
+                        source: "test".to_string(),
+                        decision: "allow".to_string(),
+                        scope: "repo".to_string(),
+                    },
+                    None,
+                    1,
+                )
+                .expect("prepare call");
+            journal
+                .prepare_execution(
+                    &session,
+                    1,
+                    &EventScope::default(),
+                    execution.clone(),
+                    call,
+                    None,
+                    1,
+                )
+                .expect("prepare execution");
+            journal
+                .transition_execution(
+                    &session,
+                    1,
+                    &EventScope::default(),
+                    &execution,
+                    ExecutionState::Started,
+                    None,
+                    None,
+                    None,
+                    1,
+                )
+                .expect("start execution");
+        }
+        let before = environment.runs().len();
+
+        // A successor service over the same state directory and the same
+        // journal: a restart, without killing the test's own process.
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let successor = NativeSessions::new(
+            state,
+            "default",
+            "instance-2",
+            Arc::clone(&environment) as Arc<dyn NativeEnvironment>,
+        )
+        .expect("successor");
+        let report = successor.restore();
+
+        assert_eq!(report.resumed, vec![facts.session_id.clone()]);
+        assert_eq!(
+            report.outcome_unknown,
+            vec!["exec-1".to_string()],
+            "a started execution is reported outcome-unknown, never retried"
+        );
+        assert!(report.lost.is_empty(), "{:?}", report.lost);
+        assert_eq!(
+            environment.runs().len(),
+            before,
+            "a restore submits nothing: it reconciles durable state, it does not replay commands"
+        );
+        assert_eq!(
+            successor.restored_from(&facts.session_id),
+            Some(1),
+            "and the predecessor generation is recorded, never republished"
+        );
+    }
+
+    /// Issue #489, item 3: the cursor contract. A page starts strictly after
+    /// the caller's cursor, carries the next one, and never carries a payload.
+    #[test]
+    fn a_journal_page_pages_by_cursor_and_publishes_no_payloads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, _) = host_for(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+        for n in 0..4 {
+            host.submit(&facts.session_id, &format!("input {n}"), false, None)
+                .expect("submit");
+        }
+
+        let first = host.journal(&facts.session_id, 0, 2).expect("page");
+        assert_eq!(first.events.len(), 2);
+        assert!(!first.gap);
+        assert_eq!(first.cursor, first.events[1].sequence);
+        let second = host
+            .journal(&facts.session_id, first.cursor, 2)
+            .expect("page");
+        assert!(
+            second
+                .events
+                .iter()
+                .all(|event| event.sequence > first.cursor),
+            "a page starts strictly after the cursor"
+        );
+        assert_eq!(second.last_sequence, first.last_sequence);
+        for event in first.events.iter().chain(second.events.iter()) {
+            assert_eq!(event.kind, "input_acknowledged");
+            assert_eq!(event.detail.as_deref(), Some("submit"));
+        }
+    }
+
+    /// The gap rule, pure: a cursor the journal can no longer start from is a
+    /// resynchronization signal, not a page.
+    #[test]
+    fn a_cursor_the_journal_cannot_continue_from_is_a_gap() {
+        assert!(
+            !gap_at(0, 5, 9),
+            "starting from the beginning is never a gap"
+        );
+        assert!(!gap_at(5, 5, 9), "a cursor inside the retained range is fine");
+        assert!(!gap_at(4, 5, 9), "and so is the one immediately before it");
+        assert!(
+            gap_at(2, 5, 9),
+            "a cursor below the oldest retained event is a gap"
+        );
+        assert!(gap_at(11, 5, 9), "and so is one ahead of the journal itself");
+    }
+
+    /// Issue #489, item 4: many observers, one controller -- the same rule the
+    /// pty host enforces, for a session that has no terminal.
+    #[test]
+    fn many_clients_may_observe_a_conversation_but_only_one_may_drive_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, _) = host_for(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+
+        host.attach(&facts.session_id, "driver", AttachMode::Controller)
+            .expect("controller");
+        for observer in ["watch-1", "watch-2"] {
+            let attachment = host
+                .attach(&facts.session_id, observer, AttachMode::Observer)
+                .expect("observer");
+            assert_eq!(attachment.role, AttachRole::Observer);
+        }
+        let busy = host
+            .attach(&facts.session_id, "usurper", AttachMode::Controller)
+            .expect_err("a second controller is refused");
+        assert_eq!(busy.code, ErrorCode::Busy);
+
+        let (attached, controller) = host.seat(&facts.session_id).expect("seat");
+        assert!(attached);
+        assert_eq!(controller.as_deref(), Some("driver"));
+
+        let taken = host
+            .takeover(&facts.session_id, "usurper")
+            .expect("takeover");
+        assert_eq!(taken.controller.as_deref(), Some("usurper"));
+    }
+
+    /// A stopped conversation stays visible for a bounded while and then goes.
+    /// Live ones are never pruned: this bounds history, not concurrency.
+    #[test]
+    fn stopped_conversations_are_kept_bounded_and_live_ones_are_never_pruned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, _) = host_for(tmp.path());
+        host.set_ended_cap_for_test(1);
+        for _ in 0..3 {
+            let facts = host.start(&spec(tmp.path(), "")).expect("start");
+            host.stop(&facts.session_id).expect("stop");
+        }
+        let live = host.start(&spec(tmp.path(), "")).expect("start");
+
+        let held = NativeHost::sessions(host.as_ref());
+        assert_eq!(
+            held.iter()
+                .filter(|facts| facts.state == SessionState::Ended)
+                .count(),
+            1,
+            "the ended table is capped"
+        );
+        assert!(
+            held.iter().any(|facts| facts.session_id == live.session_id),
+            "a live conversation is never pruned"
+        );
+    }
+}
