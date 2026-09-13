@@ -182,9 +182,22 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             cfg.supervise.max_writers,
             &format!("session {child_short}: native/{route_id}"),
             &tree,
-            // Issue #488: a delegated worker holds no seat of its own -- the
-            // seat belongs to whoever delegated it -- so the env fence is the
-            // only statement available here.
+            // Issue #488 (review finding 1 follow-up, PR #535): a delegated
+            // worker holds no seat of its own at this point -- the eventual
+            // native session's own seat is created and stored later, inside
+            // `runtime::native::run_session`, under a session identity
+            // `NativeBackend::start` mints fresh (a random uuid/short,
+            // generation 1) and never derived from `child_short`/
+            // `worker_session` above. `seat::register`, the only reusable
+            // registration primitive, also hardcodes `runtime:
+            // RuntimeKind::Harness` for a brand-new record (issue #470), so
+            // it cannot even correctly stand in for one. Pre-registering a
+            // seat for `child_short` here would therefore be a seat this
+            // delegated worker's own real native session never uses, orphaned
+            // in state forever rather than swept the way a real seat is --
+            // worse than the honest answer this env fence already gives (see
+            // `seat::guard_from_env`'s own doc comment for the full list of
+            // callers this reasoning applies to).
             None,
         ) {
             Ok(permit) => Some(permit),

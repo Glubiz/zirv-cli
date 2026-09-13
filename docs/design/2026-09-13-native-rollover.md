@@ -334,6 +334,38 @@ is what keeps the other direction safe: a harness successor asking for a resume
 id gets `None` and cold-launches, never a journal session id it could not
 resume.
 
+**Follow-up (PR #535): the strict fence reaches a second native call site, not
+a third.** `runtime::native::spawn_interactive` now stores its own seat
+(`backend.start` + `seat::store`) before acquiring its writer lease -- reordered
+so the identity exists first, since `build_transport` never reads
+`HeadlessRequest::writer` and so does not need it acquired up front -- and
+fences that lease with `Some(SeatFence { short: &handle.short, generation:
+handle.generation })`, joining `session::native`'s hosted turn on the strict
+`seat::guard` verdict (`permit::WriterRefusal::StaleSeat`'s own doc comment,
+and `seat::guard_from_env`'s, now name every `acquire_writer` caller and which
+verdict it gets, rather than leaving that list implicit). `native_worker.rs`'s
+delegated native worker launch stays on the env-derived, supersession-only
+verdict alongside the two harness call sites below -- not because it launches
+a subprocess (it does not; a delegated native worker runs in-process), but
+because its own eventual native session seat is created and stored later,
+inside `run_session`, under a session identity `NativeBackend::start` mints
+fresh and never derived from the `child_short`/`worker_session` `native_
+worker.rs` already computes ahead of the lease. Giving it a real strict fence
+would need `HeadlessRequest`/`SessionSpec` to accept a pre-chosen session
+identity, so a seat registered ahead of the lease is the SAME seat `run_
+session` goes on to use rather than an unrelated one orphaned in state
+forever -- a signature change touching every native session-start path, left
+as follow-up rather than done here. The two call sites that remain env-fenced
+because they are genuinely harness launches are unchanged: `agent.rs`'s legacy
+(subprocess) worker launch and `dash/mod.rs`'s dashboard pane spawn, both
+driven from a process that does not itself hold the seat generation it is
+launching on behalf of. Separately, `rollover::evaluate`'s `forward_refusal`
+(finding 3 above) stays inert for every harness candidate today: the gate only
+fires once a route/candidate snapshot row actually carries an `.offer` (N18's
+own per-minute capacity reading), and `route::offers_from_config` is not yet
+fed into the harness snapshot (§5's own "what is NOT claimed") -- also
+follow-up work, not a defect in this round's wiring.
+
 ## 6. What is deferred
 
 - **`settle_subagents` / `disposition` have no in-tree caller yet.** They need
