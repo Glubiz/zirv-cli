@@ -2,6 +2,8 @@
 
 pub mod adapter;
 pub mod anthropic;
+pub mod aws_sigv4;
+pub mod bedrock;
 pub mod capability;
 pub mod config;
 pub mod credential;
@@ -314,6 +316,16 @@ pub(crate) mod testhttp {
         body: &'static str,
         content_type: &'static str,
     ) -> (String, mpsc::Receiver<String>) {
+        one_shot_bytes_server(status, body.as_bytes().to_vec(), content_type)
+    }
+
+    /// The same, for a body that is not valid UTF-8: AWS event-stream frames
+    /// carry binary length and CRC fields.
+    pub(crate) fn one_shot_bytes_server(
+        status: u16,
+        body: Vec<u8>,
+        content_type: &'static str,
+    ) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("addr");
         let (sender, receiver) = mpsc::channel();
@@ -331,9 +343,10 @@ pub(crate) mod testhttp {
             };
             let _ = write!(
                 stream,
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
+            let _ = stream.write_all(&body);
         });
         (format!("http://{address}"), receiver)
     }
@@ -343,10 +356,7 @@ pub(crate) mod testhttp {
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 4096];
         let mut expected = None;
-        loop {
-            let Ok(count) = stream.read(&mut buffer) else {
-                break;
-            };
+        while let Ok(count) = stream.read(&mut buffer) {
             if count == 0 {
                 break;
             }

@@ -2235,10 +2235,12 @@ fn build_transport(
     use std::time::Duration;
 
     use super::super::provider::anthropic::AnthropicMessagesAdapter;
+    use super::super::provider::bedrock::BedrockAdapter;
     use super::super::provider::config::NativeConfig;
     use super::super::provider::credential::OsStore;
     use super::super::provider::google::GoogleAdapter;
     use super::super::provider::openai::OpenAiResponsesAdapter;
+    use super::super::provider::openai_chat::OpenAiChatAdapter;
     use super::super::provider::transport::StreamTimeouts;
     use super::super::provider::{Protocol, RouteId, adapter::resolve_target};
     use super::super::state::now_secs;
@@ -2324,13 +2326,15 @@ fn build_transport(
         Protocol::GoogleGenerativeAi | Protocol::GoogleVertex => Box::new(
             GoogleAdapter::from_config(&native, &route_id, env, &store, now, timeouts)?,
         ),
-        other => {
-            return Err(format!(
-                "native runtime: route `{route_id}` speaks {other:?}, which no direct provider \
-                 implements yet (roadmap #469, step N13)"
-            )
-            .into());
-        }
+        // One transport serves every chat-completions-compatible vendor,
+        // every local runtime and Azure; the bound route profile is what
+        // decides the address, the auth header and the caveats (N13).
+        Protocol::OpenAiChatCompatible | Protocol::AzureOpenAiChat => Box::new(
+            OpenAiChatAdapter::from_config(&native, &route_id, env, &store, now, timeouts)?,
+        ),
+        Protocol::AwsBedrock => Box::new(BedrockAdapter::from_config(
+            &native, &route_id, env, &store, now, timeouts,
+        )?),
     };
     let route = RouteIdentity {
         route: target.route.clone(),
@@ -2546,6 +2550,139 @@ mod tests {
         );
         assert_eq!(status.usage.input_tokens, 120 + 200 + 260 + 300);
         assert_eq!(status.exit_code, 0);
+    }
+
+    /// The N13 compatibility suite: the same investigate/edit/test script
+    /// has to drive the loop to the same four effects through *every* route
+    /// profile's adapter shape, not just the three primary ones. The table
+    /// is checked for completeness against the registry itself, so adding a
+    /// profile without proving its shape fails here rather than shipping an
+    /// untested route.
+    #[test]
+    fn every_route_profile_shape_completes_the_investigate_edit_test_script() {
+        use crate::commands::ctx::provider::Support;
+        use crate::commands::ctx::provider::profiles::profiles;
+
+        let table: &[(&str, Protocol, &str, &str)] = &[
+            (
+                "anthropic-messages",
+                Protocol::AnthropicMessages,
+                "fixture-anthropic-model",
+                "anthropic-investigate-edit-test.json",
+            ),
+            (
+                "openai-responses",
+                Protocol::OpenAiResponses,
+                "fixture-openai-model",
+                "openai-investigate-edit-test.json",
+            ),
+            (
+                "google-developer",
+                Protocol::GoogleGenerativeAi,
+                "fixture-google-model",
+                "google-investigate-edit-test.json",
+            ),
+            (
+                "google-vertex",
+                Protocol::GoogleVertex,
+                "fixture-google-model",
+                "google-investigate-edit-test.json",
+            ),
+            (
+                "azure-openai-chat",
+                Protocol::AzureOpenAiChat,
+                "fixture-chat-model",
+                "chat-investigate-edit-test.json",
+            ),
+            (
+                "aws-bedrock-anthropic",
+                Protocol::AwsBedrock,
+                "fixture-bedrock-model",
+                "bedrock-investigate-edit-test.json",
+            ),
+            (
+                "aws-bedrock-converse",
+                Protocol::AwsBedrock,
+                "fixture-bedrock-model",
+                "bedrock-investigate-edit-test.json",
+            ),
+        ];
+        let chat_profiles: Vec<&'static str> = profiles()
+            .iter()
+            .filter(|profile| {
+                profile.protocol == Protocol::OpenAiChatCompatible
+                    && profile.support == Support::Native
+            })
+            .map(|profile| profile.id)
+            .collect();
+        assert!(
+            chat_profiles.len() >= 10,
+            "the compatible-vendor family should be the largest one: {chat_profiles:?}"
+        );
+
+        let covered: Vec<&str> = table
+            .iter()
+            .map(|(id, ..)| *id)
+            .chain(chat_profiles.iter().copied())
+            .collect();
+        for profile in profiles() {
+            if profile.support != Support::Native {
+                continue;
+            }
+            assert!(
+                covered.contains(&profile.id),
+                "route profile `{}` has no compatibility-suite row",
+                profile.id
+            );
+        }
+
+        // The expected effects come from each script itself, so a shape's
+        // own call ids stay its own while the *order* stays the contract.
+        let expected_calls = |fixture: &str| -> Vec<String> {
+            script(fixture)
+                .turns
+                .iter()
+                .flat_map(|turn| {
+                    turn.blocks.iter().filter_map(|block| match block {
+                        super::super::fixture::FixtureBlock::ToolUse { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                })
+                .collect()
+        };
+        let rows = table.iter().copied().chain(
+            chat_profiles
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        Protocol::OpenAiChatCompatible,
+                        "fixture-chat-model",
+                        "chat-investigate-edit-test.json",
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        for (profile_id, protocol, model, fixture) in rows {
+            let (status, calls) = run_fixture(
+                protocol,
+                model,
+                fixture,
+                "tools-investigate-edit-test.json",
+                "fix the failing test",
+                |_| {},
+            );
+            assert_eq!(
+                status.status,
+                NativeStatus::Completed,
+                "profile `{profile_id}`"
+            );
+            assert_eq!(status.requests, 4, "profile `{profile_id}`");
+            assert_eq!(status.tool_calls, 4, "profile `{profile_id}`");
+            assert_eq!(calls, expected_calls(fixture), "profile `{profile_id}`");
+            assert_eq!(status.served_model.as_deref(), Some(model));
+            assert_eq!(status.exit_code, 0, "profile `{profile_id}`");
+        }
     }
 
     #[test]

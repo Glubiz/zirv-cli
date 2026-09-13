@@ -206,7 +206,10 @@ pub fn fixture_target(protocol: Protocol, model: &str) -> ProviderTarget {
         provider: ProviderId::new(match protocol {
             Protocol::AnthropicMessages => "anthropic",
             Protocol::GoogleGenerativeAi | Protocol::GoogleVertex => "google",
-            _ => "openai",
+            Protocol::OpenAiChatCompatible => "openai-compatible",
+            Protocol::AzureOpenAiChat => "azure-openai",
+            Protocol::AwsBedrock => "aws-bedrock",
+            Protocol::OpenAiResponses => "openai",
         })
         .expect("static slug"),
         endpoint: EndpointId::new("fixture").expect("static slug"),
