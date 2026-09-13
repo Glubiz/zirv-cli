@@ -2357,6 +2357,25 @@ pub fn run_inbox_with<W: Write>(
         });
     }
 
+    // Issue #479 (roadmap N10): a consuming inbox read is an orchestrator
+    // checkpoint -- by construction a moment this caller has no approval
+    // dialog open -- so it is the right boundary to retry every delegation
+    // message a worker's own attention latch deferred (#468), and the right
+    // place to drop a DUPLICATE transport delivery of a delegation outcome
+    // this session has already consumed. Mail is at-least-once: the same
+    // terminal outcome can legitimately arrive twice, and showing it twice
+    // would have an orchestrator act on one completion as if it were two.
+    // Only exact repeats of an already-consumed delivery identity are
+    // dropped; anything this repository cannot account for is still shown.
+    if !args.peek {
+        let _ = super::delegation::drain_all(&state, repo, &cfg, now_secs());
+        messages.retain(|(_, msg)| {
+            super::delegation::delivery_of(&msg.body).is_none_or(|identity| {
+                !super::delegation::is_duplicate_delivery(&state, repo, &identity)
+            })
+        });
+    }
+
     // Issue #249: this reading session's own supervising session, if any --
     // read once, from `env` alone (`agent::parent_identity`, never anything
     // in `messages` itself), and reused for every message in this listing.

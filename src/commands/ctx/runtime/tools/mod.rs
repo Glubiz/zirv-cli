@@ -7,6 +7,7 @@
 //! existing output store and return opaque retrieval ids. Every invocation
 //! returns a bounded receipt with an explicit retry/reconciliation contract.
 
+pub mod delegation;
 mod files;
 mod process;
 
@@ -17,6 +18,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use self::delegation::{
+    CLOSE, DELEGATE, DelegateArgs, FOLLOW_UP, HandleArgs, INTERRUPT, MessageArgs, RESULT,
+    ResultArgs, SEND, WAIT, WaitArgs,
+};
 use self::files::{
     ApplyPatchArgs, DirectoryArgs, FileOutcome, GlobArgs, ReadFileArgs, SearchArgs, WriteFileArgs,
 };
@@ -75,6 +80,11 @@ pub enum ResourceClaimKind {
     OutputStore,
     MemoryStore,
     SearchIndex,
+    /// Issue #479: the shared delegation store -- task cards, worktree write
+    /// claims, provider reservations and the durable delegation records
+    /// themselves. Named separately from `WorktreeWrite` because owning a
+    /// delegation is not the same claim as holding a checkout.
+    DelegationStore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -180,6 +190,13 @@ impl ToolRegistry {
             MEMORY_REMEMBER => parse!(MemoryRemember, MemoryRememberArgs),
             MEMORY_FORGET => parse!(MemoryForget, MemoryForgetArgs),
             CONTEXT_SEARCH => parse!(ContextSearch, ContextSearchArgs),
+            DELEGATE => parse!(Delegate, DelegateArgs),
+            SEND => parse!(Send, MessageArgs),
+            WAIT => parse!(Wait, WaitArgs),
+            RESULT => parse!(Result, ResultArgs),
+            FOLLOW_UP => parse!(FollowUp, MessageArgs),
+            INTERRUPT => parse!(Interrupt, HandleArgs),
+            CLOSE => parse!(Close, HandleArgs),
             _ => unreachable!("registry membership and parser match stay in lockstep"),
         }?;
         parsed.validate()?;
@@ -278,6 +295,13 @@ enum ParsedTool {
     MemoryRemember(MemoryRememberArgs),
     MemoryForget(MemoryForgetArgs),
     ContextSearch(ContextSearchArgs),
+    Delegate(DelegateArgs),
+    Send(MessageArgs),
+    Wait(WaitArgs),
+    Result(ResultArgs),
+    FollowUp(MessageArgs),
+    Interrupt(HandleArgs),
+    Close(HandleArgs),
 }
 
 impl ParsedTool {
@@ -374,6 +398,16 @@ impl ParsedTool {
             }
             Self::MemoryForget(args) => non_empty(&args.key, "key"),
             Self::ContextSearch(args) => non_empty(&args.query, "query"),
+            Self::Delegate(args) => args.validate(),
+            Self::Send(args) | Self::FollowUp(args) => {
+                delegation::validate_handle(&args.delegation)?;
+                non_empty(&args.message, "message")
+            }
+            Self::Wait(args) => delegation::validate_handle(&args.delegation),
+            Self::Result(args) => delegation::validate_handle(&args.delegation),
+            Self::Interrupt(args) | Self::Close(args) => {
+                delegation::validate_handle(&args.delegation)
+            }
         }
     }
 
@@ -453,6 +487,41 @@ impl ParsedTool {
                 key: Some(args.query.clone()),
                 write: false,
             },
+            // Issue #479: every delegation tool crosses the broker's own
+            // `Delegate` action, so a native session cannot delegate around
+            // the seat fence and policy its other tools run behind. `role`
+            // names the operation for the six that address an existing
+            // delegation, and the requested worker role for `delegate`
+            // itself; `task` is the shared card (or the handle being acted
+            // on) the broker requires to be non-empty.
+            Self::Delegate(args) => ExecutionAction::Delegate {
+                role: args.role_or_default(),
+                task: args.action_task(),
+            },
+            Self::Send(args) => ExecutionAction::Delegate {
+                role: SEND.into(),
+                task: args.delegation.clone(),
+            },
+            Self::Wait(args) => ExecutionAction::Delegate {
+                role: WAIT.into(),
+                task: args.delegation.clone(),
+            },
+            Self::Result(args) => ExecutionAction::Delegate {
+                role: RESULT.into(),
+                task: args.delegation.clone(),
+            },
+            Self::FollowUp(args) => ExecutionAction::Delegate {
+                role: FOLLOW_UP.into(),
+                task: args.delegation.clone(),
+            },
+            Self::Interrupt(args) => ExecutionAction::Delegate {
+                role: INTERRUPT.into(),
+                task: args.delegation.clone(),
+            },
+            Self::Close(args) => ExecutionAction::Delegate {
+                role: CLOSE.into(),
+                task: args.delegation.clone(),
+            },
         }
     }
 
@@ -466,13 +535,25 @@ impl ParsedTool {
             | Self::ProcessWait(_)
             | Self::OutputRead(_)
             | Self::MemoryRecall(_)
-            | Self::ContextSearch(_) => RetryPolicy::Safe,
+            | Self::ContextSearch(_)
+            // Reading a delegation's own durable state changes nothing.
+            | Self::Wait(_)
+            | Self::Result(_) => RetryPolicy::Safe,
             Self::WriteFile(_)
             | Self::ApplyPatch(_)
             | Self::ProcessWrite(_)
             | Self::ProcessTerminate(_)
             | Self::MemoryRemember(_)
-            | Self::MemoryForget(_) => RetryPolicy::Reconcile,
+            | Self::MemoryForget(_)
+            // A repeated send/follow-up/interrupt/close must be reconciled
+            // against the durable record rather than blindly replayed.
+            | Self::Send(_)
+            | Self::FollowUp(_)
+            | Self::Interrupt(_)
+            | Self::Close(_) => RetryPolicy::Reconcile,
+            // A worker that may already be running cannot be re-dispatched
+            // on a retry: that is how one task gets paid for twice.
+            Self::Delegate(_) => RetryPolicy::NeverAfterStart,
             Self::ProcessStart(args)
                 if args.network || args.outside_write || args.git_push_or_destructive =>
             {
@@ -705,6 +786,12 @@ pub struct NativeToolClient {
     repo: PathBuf,
     limits: ToolLimits,
     processes: ProcessManager,
+    /// Issue #479: how the `delegate` tool actually starts a worker. The
+    /// production value is `delegation::AgentLauncher`, i.e. one
+    /// `agent::run_with` call -- the exact function `zirv agent` runs -- so
+    /// the tool and the CLI verb are one code path with one set of gates. A
+    /// test substitutes a launcher that starts nothing.
+    launcher: Box<dyn crate::commands::ctx::delegation::WorkerLauncher>,
 }
 
 impl std::fmt::Debug for NativeToolClient {
@@ -726,6 +813,9 @@ impl NativeToolClient {
         limits: ToolLimits,
     ) -> Self {
         let processes = ProcessManager::new(state.clone(), repo.clone(), limits.process.clone());
+        let launcher = Box::new(crate::commands::ctx::delegation::AgentLauncher {
+            repo: repo.clone(),
+        });
         Self {
             registry: ToolRegistry::native(),
             broker,
@@ -733,7 +823,20 @@ impl NativeToolClient {
             repo,
             limits,
             processes,
+            launcher,
         }
+    }
+
+    /// Replaces the worker launcher the `delegate` tool uses. Exists so a
+    /// deterministic test can drive the whole delegation tool surface without
+    /// starting a real worker; production always keeps the default.
+    #[cfg(test)]
+    pub fn with_launcher(
+        mut self,
+        launcher: Box<dyn crate::commands::ctx::delegation::WorkerLauncher>,
+    ) -> Self {
+        self.launcher = launcher;
+        self
     }
 
     pub fn registry(&self) -> &ToolRegistry {
@@ -879,7 +982,181 @@ impl NativeToolClient {
             ParsedTool::MemoryRemember(args) => self.remember_memory(args),
             ParsedTool::MemoryForget(args) => self.forget_memory(args),
             ParsedTool::ContextSearch(args) => self.search_context(args),
+            ParsedTool::Delegate(args) => self.delegate(args),
+            ParsedTool::Send(args) => self.send_to_worker(args),
+            ParsedTool::Wait(args) => self.wait_for_worker(args),
+            ParsedTool::Result(args) => self.worker_result(args),
+            ParsedTool::FollowUp(args) => self.follow_up(args),
+            ParsedTool::Interrupt(args) => self.interrupt_worker(args),
+            ParsedTool::Close(args) => self.close_worker(args),
         }
+    }
+
+    // -- the delegation tools (issue #479, roadmap N10) -------------------
+    //
+    // Every one of these is a thin adaptor over the SAME `ctx::delegation`
+    // service method the corresponding CLI verb calls. None of them contains
+    // delegation logic of its own; that is the point.
+
+    fn ctx_config(&self) -> Result<CtxConfig, ToolError> {
+        CtxConfig::load(&self.repo, &|key| std::env::var(key).ok()).map_err(ToolError::external)
+    }
+
+    fn delegate(&mut self, args: DelegateArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::delegation as service;
+
+        let cfg = self.ctx_config()?;
+        let request = service::LaunchRequest {
+            runtime: args.runtime.kind(),
+            target: args.target_or_default(),
+            brief: args.brief.clone(),
+            role: args.role_or_default(),
+            task: args.task.clone(),
+            group: args.group.clone(),
+            workdir: args.workdir.as_ref().map(PathBuf::from),
+            read_only: args.mode == delegation::ToolMode::ReadOnly,
+            budget_tokens: args.budget_tokens,
+            max_tool_calls: args.max_tool_calls,
+        };
+        let identity = self.broker.identity().clone();
+        let (record, publication) = service::delegate(
+            &self.state,
+            &self.repo,
+            &cfg,
+            self.launcher.as_mut(),
+            &request,
+            Some(identity.session.clone()),
+            &identity.short,
+            state::now_secs(),
+        )
+        .map_err(ToolError::external)?;
+        Ok(json!({
+            "delegation": record.handle.delegation,
+            "attempt": record.handle.attempt,
+            "runtime": record.handle.runtime.as_str(),
+            "phase": record.phase.as_str(),
+            "task": record.handle.task,
+            "exit_code": record.exit_code,
+            "delivery": publication.identity,
+            "mailed": publication.mailed,
+        }))
+    }
+
+    fn send_to_worker(&mut self, args: MessageArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::delegation as service;
+
+        let cfg = self.ctx_config()?;
+        let dispatch = service::send(
+            &self.state,
+            &self.repo,
+            &cfg,
+            &args.delegation,
+            &args.message,
+            state::now_secs(),
+        )
+        .map_err(ToolError::external)?;
+        Ok(match dispatch {
+            service::Dispatch::Delivered { .. } => json!({"delivered": true}),
+            service::Dispatch::Queued { id, reason } => json!({
+                "delivered": false,
+                "queued": id,
+                "reason": reason,
+                "retry": "the message is durable and is delivered at the worker's next idle \
+                          boundary; it is never typed into an open dialog",
+            }),
+        })
+    }
+
+    fn wait_for_worker(&mut self, args: WaitArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::delegation as service;
+
+        let now = state::now_secs();
+        let deadline = now.saturating_add(args.bounded_secs());
+        let outcome = service::wait(&self.state, &self.repo, &args.delegation, now, deadline)
+            .map_err(ToolError::external)?;
+        Ok(match outcome {
+            service::WaitOutcome::Ready(record) => json!({
+                "ready": true,
+                "phase": record.phase.as_str(),
+                "exit_code": record.exit_code,
+            }),
+            service::WaitOutcome::Pending => {
+                json!({"ready": false, "deadline_secs": args.bounded_secs()})
+            }
+            service::WaitOutcome::TimedOut => json!({"ready": false, "timed_out": true}),
+        })
+    }
+
+    fn worker_result(&mut self, args: ResultArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::delegation as service;
+
+        let manifest = service::result(
+            &self.state,
+            &self.repo,
+            &args.delegation,
+            args.bounded_bytes(),
+        )
+        .map_err(ToolError::external)?;
+        serde_json::to_value(manifest).map_err(ToolError::external)
+    }
+
+    fn follow_up(&mut self, args: MessageArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::delegation as service;
+
+        let cfg = self.ctx_config()?;
+        let continuation = service::follow_up(
+            &self.state,
+            &self.repo,
+            &cfg,
+            &args.delegation,
+            &args.message,
+            state::now_secs(),
+        )
+        .map_err(ToolError::external)?;
+        Ok(match continuation {
+            service::Continuation::Directed { dispatch } => json!({
+                "route": "directed",
+                "delivered": matches!(dispatch, service::Dispatch::Delivered { .. }),
+            }),
+            service::Continuation::Resume {
+                journal_session,
+                attempt,
+            } => json!({
+                "route": "resume",
+                "session": journal_session,
+                "attempt": attempt,
+            }),
+            service::Continuation::Checkpoint { handoff } => json!({
+                "route": "checkpoint",
+                "handoff": handoff,
+                "note": "no verified resume path; this is a replacement worker with none of the \
+                         original's hidden context",
+            }),
+        })
+    }
+
+    fn interrupt_worker(&mut self, args: HandleArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::delegation as service;
+
+        let record =
+            service::interrupt(&self.state, &self.repo, &args.delegation, state::now_secs())
+                .map_err(ToolError::external)?;
+        Ok(json!({
+            "phase": record.phase.as_str(),
+            "unknown_tool_outcomes": record.unknown_tool_outcomes,
+        }))
+    }
+
+    fn close_worker(&mut self, args: HandleArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::delegation as service;
+
+        let record = service::close(&self.state, &self.repo, &args.delegation, state::now_secs())
+            .map_err(ToolError::external)?;
+        Ok(json!({
+            "phase": record.phase.as_str(),
+            "receipts": record.published,
+            "unknown_tool_outcomes": record.unknown_tool_outcomes,
+        }))
     }
 
     fn recall_memory(&self, args: MemoryRecallArgs) -> Result<Value, ToolError> {
@@ -1224,6 +1501,9 @@ fn object_schema(required: &[&str], properties: Value) -> Value {
 fn native_definitions() -> Vec<ToolDefinition> {
     let read_caps = ["tool_access"];
     let write_caps = ["tool_access", "repo_fs_write"];
+    // Delegating spends another worker's budget and may hand it a checkout,
+    // so it declares the write capability as well as tool access.
+    let delegate_caps = ["tool_access", "delegation", "repo_fs_write"];
     let process_caps = [
         "tool_access",
         "shell_exec",
@@ -1492,7 +1772,104 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &[ResourceClaimKind::SearchIndex],
             (CancellationContract::NotApplicable, RetryPolicy::Safe),
         ),
+        definition(
+            DELEGATE,
+            "Start one worker on a shared task card, on the native or the legacy runtime, and              return its durable launch receipt and stable delegation handle.",
+            object_schema(
+                &["brief"],
+                json!({
+                    "brief":{"type":"string","minLength":1},
+                    "target":{"type":"string","minLength":1},
+                    "runtime":{"type":"string","enum":["native","harness"],"default":"native"},
+                    "role":{"type":"string","minLength":1},
+                    "task":{"type":"string","minLength":1},
+                    "group":{"type":"string","minLength":1},
+                    "workdir":{"type":"string","minLength":1},
+                    "mode":{"type":"string","enum":["writing","read_only"],"default":"writing"},
+                    "budget_tokens":{"type":"integer","minimum":1},
+                    "max_tool_calls":{"type":"integer","minimum":1}
+                }),
+            ),
+            &delegate_caps,
+            ToolExecutionMode::BackgroundProcess,
+            &[
+                ResourceClaimKind::DelegationStore,
+                ResourceClaimKind::WorktreeWrite,
+            ],
+            (
+                CancellationContract::AtomicCommit,
+                RetryPolicy::NeverAfterStart,
+            ),
+        ),
+        handle_definition(
+            SEND,
+            "Send a directed message to a live delegated worker. A message that arrives while              the worker has an approval or other attention latch open is queued and retried at              the next idle boundary, never typed at the dialog.",
+            json!({"message":{"type":"string","minLength":1}}),
+            &["delegation", "message"],
+            RetryPolicy::Reconcile,
+        ),
+        handle_definition(
+            WAIT,
+            "Bounded wait on one delegation's durable state. Answers from the record and a              deadline; makes no model call and wakes no worker.",
+            json!({"timeout_secs":{"type":"integer","minimum":1}}),
+            &["delegation"],
+            RetryPolicy::Safe,
+        ),
+        handle_definition(
+            RESULT,
+            "Bounded result manifest for one delegation: outcome, delivery identities, report              reference and unknown tool outcomes. Never the worker's transcript.",
+            json!({"max_bytes":{"type":"integer","minimum":256}}),
+            &["delegation"],
+            RetryPolicy::Safe,
+        ),
+        handle_definition(
+            FOLLOW_UP,
+            "Continue the ORIGINAL worker of one delegation: directed while it is live, a              journal resume for a finished native worker, otherwise a transparent replacement              checkpoint. Never falls back to a most-recent session.",
+            json!({"message":{"type":"string","minLength":1}}),
+            &["delegation", "message"],
+            RetryPolicy::Reconcile,
+        ),
+        handle_definition(
+            INTERRUPT,
+            "Request cancellation of one delegation. An effect that already started stays an              unknown outcome and must be reconciled before any retry.",
+            json!({}),
+            &["delegation"],
+            RetryPolicy::Reconcile,
+        ),
+        handle_definition(
+            CLOSE,
+            "Release one delegation's reservations and write claims and retire it, preserving              every receipt it published and every unknown tool outcome.",
+            json!({}),
+            &["delegation"],
+            RetryPolicy::Reconcile,
+        ),
     ]
+}
+
+/// The six delegation tools that address an EXISTING delegation all share one
+/// shape: a validated `delegation` handle plus at most one extra field.
+fn handle_definition(
+    name: &str,
+    description: &str,
+    extra: Value,
+    required: &[&str],
+    retry: RetryPolicy,
+) -> ToolDefinition {
+    let mut properties = json!({"delegation":{"type":"string","minLength":1,"maxLength":128}});
+    if let (Some(target), Some(extra)) = (properties.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    definition(
+        name,
+        description,
+        object_schema(required, properties),
+        &["tool_access", "delegation"],
+        ToolExecutionMode::Immediate,
+        &[ResourceClaimKind::DelegationStore],
+        (CancellationContract::AtomicCommit, retry),
+    )
 }
 
 fn control_definition(name: &str, description: &str) -> ToolDefinition {
@@ -1521,6 +1898,11 @@ fn control_definition(name: &str, description: &str) -> ToolDefinition {
 mod tests {
     use super::*;
 
+    /// 16 coding/knowledge tools (#474-#475) plus the 7 delegation tools
+    /// (#479). Asserted as a number on purpose: a tool added without a
+    /// deliberate decision here is a tool the model was handed silently.
+    const NATIVE_TOOL_COUNT: usize = 23;
+
     #[test]
     fn registry_names_are_unique_and_schemas_are_closed_objects() {
         let registry = ToolRegistry::native();
@@ -1528,14 +1910,14 @@ mod tests {
             .definitions()
             .map(|definition| definition.name.as_str())
             .collect();
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), NATIVE_TOOL_COUNT);
         assert_eq!(
             names
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            16
+            NATIVE_TOOL_COUNT
         );
         for definition in registry.definitions() {
             assert_eq!(definition.input_schema["type"], "object");
@@ -1633,4 +2015,333 @@ mod tests {
         assert_eq!(limits.max_processes, 4);
         assert_eq!(limits.process.max_inline_bytes, 1024);
     }
+
+    // -- the delegation tools (issue #479, roadmap N10) -------------------
+
+    use crate::commands::ctx::attention;
+    use crate::commands::ctx::delegation as service;
+    use crate::commands::ctx::runtime::enforcement::{
+        ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionIdentity, NetworkScope,
+        PlatformIsolation, ResourceClaims, StoredSeatFence,
+    };
+    use crate::commands::ctx::seat;
+
+    struct DelegationFixture {
+        _root: tempfile::TempDir,
+        state: StateDir,
+        repo: PathBuf,
+        client: NativeToolClient,
+        launches: std::sync::Arc<std::sync::Mutex<Vec<service::LaunchRequest>>>,
+    }
+
+    /// A real `NativeToolClient` -- real registry, real broker, real seat
+    /// fence -- with only the WORKER LAUNCH replaced, so the delegation tools
+    /// are exercised through their production path without starting anything.
+    fn delegation_fixture(exit_code: i32) -> DelegationFixture {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        let home = root.path().join("home");
+        let state_root = root.path().join("state");
+        for path in [&repo, &home, &state_root] {
+            std::fs::create_dir_all(path).expect("dir");
+        }
+        let repo = std::fs::canonicalize(&repo).expect("canonical repo");
+        let state = StateDir::from_root(state_root);
+
+        // The seat record the native session's own generation fence reads.
+        seat::store(
+            &state,
+            &seat::Seat {
+                short: "nativ001".to_string(),
+                session: "native-session-1".to_string(),
+                generation: 1,
+                agent: "native".to_string(),
+                model: None,
+                provider: "fixture".to_string(),
+                role: "orchestrator".to_string(),
+                pinned: false,
+                phase: Default::default(),
+                visited: Vec::new(),
+                last_rollover_at: None,
+                pending: None,
+                displaced: None,
+                created_at: 1,
+                updated_at: 1,
+                runtime: super::super::RuntimeKind::Native,
+            },
+        )
+        .expect("seat");
+
+        let broker = ExecutionBroker::new(
+            ExecutionIdentity {
+                session: "native-session-1".to_string(),
+                short: "nativ001".to_string(),
+                generation: 1,
+                role: "orchestrator".to_string(),
+                task: None,
+            },
+            ResourceClaims::new(&repo, &repo, state.root(), &home, NetworkScope::Denied)
+                .expect("claims"),
+            ApprovalMode::Headless,
+            std::sync::Arc::new(ConfigPolicySource::new(repo.clone())),
+            std::sync::Arc::new(StoredSeatFence::new(state.clone())),
+            std::sync::Arc::new(ApprovalAuthority::new()),
+            None,
+            PlatformIsolation::detect(),
+            Default::default(),
+        )
+        .expect("broker");
+
+        let launcher = service::RecordingLauncher {
+            exit_code,
+            ..Default::default()
+        };
+        let launches = launcher.launches.clone();
+        let client =
+            NativeToolClient::new(broker, state.clone(), repo.clone(), ToolLimits::testing())
+                .with_launcher(Box::new(launcher));
+        DelegationFixture {
+            _root: root,
+            state,
+            repo,
+            client,
+            launches,
+        }
+    }
+
+    fn call(client: &mut NativeToolClient, name: &str, arguments: Value) -> ToolReceipt {
+        client.execute(name, arguments, None, None)
+    }
+
+    fn handle_from(receipt: ToolReceipt) -> String {
+        receipt.result.expect("result")["delegation"]
+            .as_str()
+            .expect("delegation handle")
+            .to_string()
+    }
+
+    #[test]
+    fn every_delegation_tool_is_registered_with_a_closed_schema_and_a_delegation_claim() {
+        let registry = ToolRegistry::native();
+        for name in delegation::ALL {
+            let definition = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(definition.input_schema["additionalProperties"], false);
+            assert!(
+                definition
+                    .resource_claims
+                    .contains(&ResourceClaimKind::DelegationStore),
+                "{name} must declare the delegation store it touches"
+            );
+        }
+        assert_eq!(
+            registry.get(DELEGATE).map(|definition| definition.retry),
+            Some(RetryPolicy::NeverAfterStart),
+            "a dispatched worker must never be re-dispatched by a blind retry"
+        );
+    }
+
+    #[test]
+    fn a_native_orchestrator_delegates_to_either_runtime_through_one_service() {
+        // Acceptance criteria (a) and (f): the same tool, the same durable
+        // record and the same bounded manifest whichever runtime ran the
+        // worker -- a mixed fleet is one ownership view, not two.
+        for runtime in ["native", "harness"] {
+            let mut fixture = delegation_fixture(0);
+            let receipt = call(
+                &mut fixture.client,
+                DELEGATE,
+                json!({
+                    "brief": "read src/main.rs and report the entry point",
+                    "runtime": runtime,
+                    "target": "claude",
+                    "task": "task-7",
+                }),
+            );
+            assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+            let result = receipt.result.clone().expect("result");
+            assert_eq!(result["runtime"], runtime);
+            assert_eq!(result["task"], "task-7");
+            assert_eq!(result["phase"], "completed");
+            let handle = handle_from(receipt);
+            assert!(
+                result["delivery"]
+                    .as_str()
+                    .is_some_and(|identity| identity.starts_with(&handle)),
+                "the terminal outcome carries a delivery identity"
+            );
+            assert_eq!(
+                fixture.launches.lock().expect("launches").len(),
+                1,
+                "exactly one worker was started"
+            );
+
+            // The bounded manifest an unchanged orchestrator consumes.
+            let manifest = call(
+                &mut fixture.client,
+                RESULT,
+                json!({ "delegation": handle.clone() }),
+            )
+            .result
+            .expect("manifest");
+            assert_eq!(manifest["phase"], "completed");
+            assert_eq!(manifest["runtime"], runtime);
+            assert_eq!(manifest["deliveries"].as_array().map(Vec::len), Some(1));
+
+            // And the durable record behind it says the same thing.
+            let record = service::load(&fixture.state, &fixture.repo, &handle).expect("record");
+            assert_eq!(record.handle.task.as_deref(), Some("task-7"));
+            assert_eq!(record.attempts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_failed_worker_is_never_reported_as_a_completed_delegation() {
+        let mut fixture = delegation_fixture(2);
+        let result = call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief": "do the thing"}),
+        )
+        .result
+        .expect("result");
+        assert_eq!(result["phase"], "failed");
+        assert_eq!(result["exit_code"], 2);
+    }
+
+    #[test]
+    fn a_message_to_a_worker_with_an_approval_open_is_queued_not_typed() {
+        // Acceptance criterion (f): #468's rule, reached through the native
+        // tool surface rather than the dashboard pane sweep.
+        let mut fixture = delegation_fixture(0);
+        let handle = handle_from(call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief": "investigate"}),
+        ));
+
+        let record = service::load(&fixture.state, &fixture.repo, &handle).expect("record");
+        attention::record(
+            &fixture.state,
+            &record.handle.short,
+            attention::Observation::new(
+                attention::Authority::AdapterHook,
+                "permission prompt open",
+                90,
+                1,
+            )
+            .with_attention(attention::Attention::Approval),
+            1,
+        );
+
+        let queued = call(
+            &mut fixture.client,
+            SEND,
+            json!({"delegation": handle, "message": "status?"}),
+        )
+        .result
+        .expect("result");
+        assert_eq!(queued["delivered"], false);
+        assert_eq!(queued["reason"], "approval-open");
+    }
+
+    #[test]
+    fn follow_up_interrupt_and_close_all_address_the_original_delegation() {
+        // Acceptance criteria (d) and (e), through the tools.
+        let mut fixture = delegation_fixture(0);
+        let handle = handle_from(call(&mut fixture.client, DELEGATE, json!({"brief": "look"})));
+
+        let follow_up = call(
+            &mut fixture.client,
+            FOLLOW_UP,
+            json!({"delegation": handle.clone(), "message": "and the tests?"}),
+        )
+        .result
+        .expect("result");
+        assert_eq!(follow_up["route"], "resume");
+        assert_eq!(follow_up["attempt"], 2);
+
+        let unknown = call(
+            &mut fixture.client,
+            FOLLOW_UP,
+            json!({"delegation": "nosuchdelegation", "message": "hi"}),
+        );
+        assert_eq!(
+            unknown.state,
+            ToolReceiptState::Failed,
+            "an unknown handle must fail, never fall back to a recent session"
+        );
+
+        let interrupted = call(
+            &mut fixture.client,
+            INTERRUPT,
+            json!({ "delegation": handle.clone() }),
+        )
+        .result
+        .expect("result");
+        assert_eq!(interrupted["phase"], "cancelled");
+
+        let closed = call(&mut fixture.client, CLOSE, json!({ "delegation": handle }))
+            .result
+            .expect("result");
+        assert_eq!(closed["phase"], "closed");
+        assert!(
+            closed["receipts"]
+                .as_array()
+                .is_some_and(|receipts| !receipts.is_empty()),
+            "closing preserves the receipts already published"
+        );
+    }
+
+    #[test]
+    fn a_bounded_wait_on_a_live_delegation_reports_pending_without_waking_anything() {
+        let mut fixture = delegation_fixture(0);
+        let handle = service::record_launch(
+            &fixture.state,
+            &fixture.repo,
+            service::WorkerHandle {
+                delegation: "livedelegation".to_string(),
+                attempt: 1,
+                runtime: super::super::RuntimeKind::Native,
+                worker_session: "w".to_string(),
+                short: "wshort".to_string(),
+                role: "worker".to_string(),
+                task: None,
+                group: None,
+                objective: None,
+                workdir: fixture.repo.clone(),
+            },
+            None,
+            1,
+        )
+        .expect("launch")
+        .handle
+        .delegation;
+        let waited = call(
+            &mut fixture.client,
+            WAIT,
+            json!({"delegation": handle, "timeout_secs": 99999}),
+        )
+        .result
+        .expect("result");
+        assert_eq!(waited["ready"], false);
+        assert_eq!(waited["deadline_secs"], delegation::MAX_WAIT_SECS);
+    }
+
+    #[test]
+    fn a_malformed_handle_from_provider_output_never_reaches_the_store() {
+        let mut fixture = delegation_fixture(0);
+        let receipt = call(
+            &mut fixture.client,
+            RESULT,
+            json!({"delegation": "../../etc/passwd"}),
+        );
+        assert_eq!(receipt.state, ToolReceiptState::Failed);
+        assert_eq!(
+            receipt.error.map(|error| error.code),
+            Some(ToolErrorCode::InvalidArguments)
+        );
+    }
 }
+

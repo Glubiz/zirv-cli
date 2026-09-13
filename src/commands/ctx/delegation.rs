@@ -201,9 +201,6 @@ impl Record {
         delivery_identity(&self.handle.delegation, self.handle.attempt, self.revision)
     }
 
-    pub fn latest_attempt(&self) -> Option<&Attempt> {
-        self.attempts.last()
-    }
 }
 
 /// `<delegation>:<attempt>:<revision>`. The only identity a consumer
@@ -871,6 +868,236 @@ pub fn close(state: &StateDir, repo: &Path, delegation: &str, now: u64) -> CtxRe
     record.updated_at = now;
     save(state, repo, &record)?;
     Ok(record)
+}
+
+/// The marker line [`notify_parent`] writes into every terminal
+/// notification. A consumer reads the delivery identity back out of it
+/// structurally rather than parsing prose.
+pub const DELIVERY_LINE_PREFIX: &str = "delivery: ";
+
+/// The delivery identity carried by `body`, if any.
+pub fn delivery_of(body: &str) -> Option<String> {
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix(DELIVERY_LINE_PREFIX))
+        .map(|identity| identity.trim().to_string())
+        .filter(|identity| !identity.is_empty())
+}
+
+/// Whether `identity` names a delegation outcome this repository has ALREADY
+/// consumed -- i.e. whether the message carrying it is a duplicate transport
+/// delivery of something the consumer has already acted on.
+///
+/// Fails open on purpose: an identity that names no delegation record here
+/// (an outcome from another repository, a hand-written line, a record swept
+/// away) is reported as new. Hiding a message nobody can account for would
+/// turn a bookkeeping gap into lost mail, which is the failure this whole
+/// mechanism exists to prevent.
+pub fn is_duplicate_delivery(state: &StateDir, repo: &Path, identity: &str) -> bool {
+    let Some(delegation) = identity.split(':').next() else {
+        return false;
+    };
+    match consume_delivery(state, repo, delegation, identity) {
+        Ok(first_time) => !first_time,
+        Err(_) => false,
+    }
+}
+
+/// Retries every delegation's deferred messages at THIS boundary, and reports
+/// how many were actually delivered. Called from the orchestrator-side
+/// checkpoint (`zirv ctx inbox`), which is by construction a moment no
+/// approval dialog is open on the caller -- the #468 rule, applied per
+/// worker rather than per pane.
+pub fn drain_all(state: &StateDir, repo: &Path, cfg: &CtxConfig, now: u64) -> usize {
+    let mut delivered = 0;
+    for record in list(state, repo) {
+        if record.queued.is_empty() {
+            continue;
+        }
+        if let Ok(dispatches) = drain_queued(state, repo, cfg, &record.handle.delegation, now) {
+            delivered += dispatches
+                .iter()
+                .filter(|dispatch| matches!(dispatch, Dispatch::Delivered { .. }))
+                .count();
+        }
+    }
+    delivered
+}
+
+// -- the launch seam -----------------------------------------------------
+
+/// One request to actually START a worker, independent of which runtime will
+/// run it. Everything here is data a parent can legitimately ask for; nothing
+/// is a grant (`mode`, `path_scope` and the rest are narrowed against the
+/// parent's own envelope by `agent::run_with`, never widened by asking).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchRequest {
+    pub runtime: RuntimeKind,
+    /// The harness name (harness runtime) or the provider route (native).
+    pub target: String,
+    pub brief: String,
+    pub role: String,
+    pub task: Option<String>,
+    pub group: Option<String>,
+    pub workdir: Option<PathBuf>,
+    pub read_only: bool,
+    pub budget_tokens: Option<u64>,
+    pub max_tool_calls: Option<u32>,
+}
+
+/// What a launcher observed. `receipt` is the delegating command's own
+/// `--json` [`crate::commands::ctx::agent::DelegationReceipt`] text when one
+/// was produced -- never the worker's transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchedWorker {
+    pub exit_code: i32,
+    pub session: String,
+    pub short: String,
+    pub receipt: Option<String>,
+}
+
+/// How a native session actually starts a worker.
+///
+/// The production implementation is [`AgentLauncher`], which calls
+/// `agent::run_with` -- the exact function `zirv agent` itself runs, so the
+/// native `delegate` tool and the CLI verb are one code path with one set of
+/// gates, not two that can drift. The seam exists so a deterministic test can
+/// substitute a launcher that starts nothing.
+pub trait WorkerLauncher: std::fmt::Debug + Send {
+    fn launch(&mut self, request: &LaunchRequest) -> CtxResult<LaunchedWorker>;
+}
+
+/// The production launcher: one `agent::run_with` call, under `--json` so the
+/// receipt comes back structured rather than scraped out of human lines.
+#[derive(Debug, Default)]
+pub struct AgentLauncher {
+    pub repo: PathBuf,
+}
+
+impl WorkerLauncher for AgentLauncher {
+    fn launch(&mut self, request: &LaunchRequest) -> CtxResult<LaunchedWorker> {
+        let args = super::agent::AgentArgs {
+            name: request.target.clone(),
+            prompt: request.brief.clone(),
+            role: Some(request.role.clone()),
+            group: request.group.clone(),
+            task: request.task.clone(),
+            workdir: request.workdir.clone(),
+            budget_tokens: request.budget_tokens,
+            max_tool_calls: request.max_tool_calls,
+            mode: if request.read_only {
+                super::permit::WorkerMode::ReadOnly
+            } else {
+                super::permit::WorkerMode::Writing
+            },
+            json: true,
+            runtime: request.runtime.to_string(),
+            ..Default::default()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let code = super::agent::run_with(
+            &args,
+            &mut out,
+            &self.repo,
+            &super::config::env_from_process(),
+        )?;
+        let receipt = String::from_utf8_lossy(&out).trim().to_string();
+        Ok(LaunchedWorker {
+            exit_code: code,
+            session: String::new(),
+            short: String::new(),
+            receipt: (!receipt.is_empty()).then_some(receipt),
+        })
+    }
+}
+
+/// A [`WorkerLauncher`] that starts nothing and records what it was asked
+/// for. Lets the whole delegation tool surface be driven deterministically --
+/// no provider, no harness, no child process -- while still going through the
+/// real service methods.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct RecordingLauncher {
+    pub launches: std::sync::Arc<std::sync::Mutex<Vec<LaunchRequest>>>,
+    pub exit_code: i32,
+}
+
+#[cfg(test)]
+impl WorkerLauncher for RecordingLauncher {
+    fn launch(&mut self, request: &LaunchRequest) -> CtxResult<LaunchedWorker> {
+        if let Ok(mut launches) = self.launches.lock() {
+            launches.push(request.clone());
+        }
+        Ok(LaunchedWorker {
+            exit_code: self.exit_code,
+            session: "fixture-worker".to_string(),
+            short: "fixture1".to_string(),
+            receipt: Some(format!("{{\"state\":\"reported\",\"exit_code\":{}}}", self.exit_code)),
+        })
+    }
+}
+
+/// Registers one delegation and starts its worker, in that order.
+///
+/// The launch receipt is durable BEFORE `launcher` is called, so a crash
+/// inside the launch still leaves a record naming the work that may have
+/// started -- the opposite order would lose it. The terminal outcome is then
+/// published through [`publish_terminal`], which is where the delivery
+/// identity a consumer deduplicates on comes from.
+pub fn delegate(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    launcher: &mut dyn WorkerLauncher,
+    request: &LaunchRequest,
+    parent_session: Option<String>,
+    parent_short: &str,
+    now: u64,
+) -> CtxResult<(Record, Publication)> {
+    let delegation_id = uuid::Uuid::new_v4().simple().to_string();
+    let worker_session = format!("{delegation_id}-worker");
+    let handle = WorkerHandle {
+        delegation: delegation_id.clone(),
+        attempt: 1,
+        runtime: request.runtime,
+        worker_session: worker_session.clone(),
+        short: parent_short.to_string(),
+        role: request.role.clone(),
+        task: request.task.clone(),
+        group: request.group.clone(),
+        objective: None,
+        workdir: request
+            .workdir
+            .clone()
+            .unwrap_or_else(|| repo.to_path_buf()),
+    };
+    let launched = record_launch(state, repo, handle, parent_session, now)?;
+
+    let outcome = launcher.launch(request);
+    let (phase, exit_code, summary) = match &outcome {
+        Ok(worker) => (
+            if worker.exit_code == 0 {
+                Phase::Completed
+            } else {
+                Phase::Failed
+            },
+            Some(worker.exit_code),
+            worker.receipt.clone(),
+        ),
+        Err(error) => (Phase::Failed, None, Some(error.to_string())),
+    };
+    let publication = publish_terminal(
+        state,
+        repo,
+        cfg,
+        &delegation_id,
+        phase,
+        exit_code,
+        summary,
+        None,
+        now,
+    )?;
+    let record = load(state, repo, &delegation_id).unwrap_or(launched);
+    Ok((record, publication))
 }
 
 #[cfg(test)]
