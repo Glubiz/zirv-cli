@@ -59,10 +59,6 @@ impl AgentCommand {
         )
     }
 
-    /// Everything wrong with the step that can be seen without running it.
-    /// Called at load time, so `--dry-run` and the real run reject the same
-    /// scripts: a dry run that reports success for a script that can never
-    /// execute is worse than no dry run.
     /// Which runtime this step selects, refusing an unrecognised value rather
     /// than falling back to a harness the script did not ask for.
     fn runtime(&self) -> Result<crate::commands::ctx::runtime::RuntimeKind, String> {
@@ -74,6 +70,10 @@ impl AgentCommand {
         }
     }
 
+    /// Everything wrong with the step that can be seen without running it.
+    /// Called at load time, so `--dry-run` and the real run reject the same
+    /// scripts: a dry run that reports success for a script that can never
+    /// execute is worse than no dry run.
     pub fn validate(&self) -> Result<(), String> {
         if self.capture.is_some() {
             return Err("agent steps do not support 'capture'".to_string());

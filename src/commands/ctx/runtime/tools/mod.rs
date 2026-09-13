@@ -1854,7 +1854,7 @@ impl NativeToolClient {
                 .ok_or_else(|| {
                     ToolError::new(
                         ToolErrorCode::PreconditionFailed,
-                        "no active workflow in this repository; start one with `zirv workflow                          start` or name an id",
+                        "no active workflow in this repository; start one with `zirv workflow start` or name an id",
                     )
                 }),
         }
@@ -2620,7 +2620,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
         ),
         definition(
             DELEGATE,
-            "Start one worker on a shared task card, on the native or the legacy runtime, and              return its durable launch receipt and stable delegation handle.",
+            "Start one worker on a shared task card, on the native or the legacy runtime, and return its durable launch receipt and stable delegation handle.",
             object_schema(
                 &["brief"],
                 json!({
@@ -2649,42 +2649,42 @@ fn native_definitions() -> Vec<ToolDefinition> {
         ),
         handle_definition(
             SEND,
-            "Send a directed message to a live delegated worker. A message that arrives while              the worker has an approval or other attention latch open is queued and retried at              the next idle boundary, never typed at the dialog.",
+            "Send a directed message to a live delegated worker. A message that arrives while the worker has an approval or other attention latch open is queued and retried at the next idle boundary, never typed at the dialog.",
             json!({"message":{"type":"string","minLength":1}}),
             &["delegation", "message"],
             RetryPolicy::Reconcile,
         ),
         handle_definition(
             WAIT,
-            "Bounded wait on one delegation's durable state. Answers from the record and a              deadline; makes no model call and wakes no worker.",
+            "Bounded wait on one delegation's durable state. Answers from the record and a deadline; makes no model call and wakes no worker.",
             json!({"timeout_secs":{"type":"integer","minimum":1}}),
             &["delegation"],
             RetryPolicy::Safe,
         ),
         handle_definition(
             RESULT,
-            "Bounded result manifest for one delegation: outcome, delivery identities, report              reference and unknown tool outcomes. Never the worker's transcript.",
+            "Bounded result manifest for one delegation: outcome, delivery identities, report reference and unknown tool outcomes. Never the worker's transcript.",
             json!({"max_bytes":{"type":"integer","minimum":256}}),
             &["delegation"],
             RetryPolicy::Safe,
         ),
         handle_definition(
             FOLLOW_UP,
-            "Continue the ORIGINAL worker of one delegation: directed while it is live, a              journal resume for a finished native worker, otherwise a transparent replacement              checkpoint. Never falls back to a most-recent session.",
+            "Continue the ORIGINAL worker of one delegation: directed while it is live, a journal resume for a finished native worker, otherwise a transparent replacement checkpoint. Never falls back to a most-recent session.",
             json!({"message":{"type":"string","minLength":1}}),
             &["delegation", "message"],
             RetryPolicy::Reconcile,
         ),
         handle_definition(
             INTERRUPT,
-            "Request cancellation of one delegation. An effect that already started stays an              unknown outcome and must be reconciled before any retry.",
+            "Request cancellation of one delegation. An effect that already started stays an unknown outcome and must be reconciled before any retry.",
             json!({}),
             &["delegation"],
             RetryPolicy::Reconcile,
         ),
         handle_definition(
             CLOSE,
-            "Release one delegation's reservations and write claims and retire it, preserving              every receipt it published and every unknown tool outcome.",
+            "Release one delegation's reservations and write claims and retire it, preserving every receipt it published and every unknown tool outcome.",
             json!({}),
             &["delegation"],
             RetryPolicy::Reconcile,
@@ -2875,7 +2875,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
         // can read a workflow and cannot move it.
         definition(
             WORKFLOW_STATUS,
-            "Report the workflow's status, current step, branch and -- most usefully -- whether              anything currently blocks this session from finishing.",
+            "Report the workflow's status, current step, branch and -- most usefully -- whether anything currently blocks this session from finishing.",
             object_schema(&[], json!({"id":{"type":"string","minLength":1}})),
             &read_caps,
             ToolExecutionMode::Retrieval,
@@ -2884,7 +2884,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
         ),
         definition(
             WORKFLOW_CONTEXT,
-            "Return the current step's resolved methodology context: what this phase requires and              what counts as finishing it.",
+            "Return the current step's resolved methodology context: what this phase requires and what counts as finishing it.",
             object_schema(&[], json!({"id":{"type":"string","minLength":1}})),
             &read_caps,
             ToolExecutionMode::Retrieval,
@@ -2893,7 +2893,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
         ),
         definition(
             WORKFLOW_ADVANCE,
-            "Advance the workflow past its current step with a success or failure outcome. The              step's own gates still apply: a Test or Verify step without fresh passing evidence              for this change set is refused.",
+            "Advance the workflow past its current step with a success or failure outcome. The step's own gates still apply: a Test or Verify step without fresh passing evidence for this change set is refused.",
             object_schema(
                 &["outcome"],
                 json!({
@@ -2909,7 +2909,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
         ),
         definition(
             WORKFLOW_APPROVE,
-            "Approve a workflow waiting on an approval gate, after which it resumes at the next              step.",
+            "Approve a workflow waiting on an approval gate, after which it resumes at the next step.",
             object_schema(&[], json!({"id":{"type":"string","minLength":1}})),
             &write_caps,
             ToolExecutionMode::Immediate,
@@ -3482,7 +3482,7 @@ mod tests {
         assert_eq!(
             refused.error.as_ref().map(|error| error.code.clone()),
             Some(ToolErrorCode::ResourceBusy),
-            "an advance without a writer permit must be refused BEFORE the engine is reached,              not after: {refused:?}"
+            "an advance without a writer permit must be refused BEFORE the engine is reached, not after: {refused:?}"
         );
 
         let bad_id = registry

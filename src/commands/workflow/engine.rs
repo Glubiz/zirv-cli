@@ -2472,7 +2472,7 @@ pub fn native_completion_gate(state_dir: &StateDir, repo: &Path) -> Option<Strin
         "zirv test changed"
     };
     Some(format!(
-        "zirv workflow: step '{}' of workflow '{}' has no fresh passing evidence for the current          change set; run `{command}` and record the result before finishing",
+        "zirv workflow: step '{}' of workflow '{}' has no fresh passing evidence for the current change set; run `{command}` and record the result before finishing",
         step.id, state.id
     ))
 }
@@ -5141,7 +5141,7 @@ mod tests {
         assert_eq!(
             native_completion_gate(&state_dir, main_repo.path()),
             None,
-            "the worker worktree's evidence for this change set must open the gate evaluated              from the main checkout"
+            "the worker worktree's evidence for this change set must open the gate evaluated from the main checkout"
         );
         let loaded = load(&state_dir, main_repo.path(), &state.id).unwrap();
         let advanced = advance_with_evidence(&state_dir, loaded, StepOutcome::Success, None, false)
