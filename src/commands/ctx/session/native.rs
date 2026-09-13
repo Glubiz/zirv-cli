@@ -432,6 +432,58 @@ impl NativeSessions {
         let _ = write_topology(&self.state, &self.namespace, &topology);
     }
 
+    /// Issue #489 (issue #352's mail-injection residual), for conversations.
+    ///
+    /// A native session has no terminal to type into, so delivery here is
+    /// what it should always have been: the message becomes an ordinary
+    /// durable input, recorded in the journal and queued as a turn. Its
+    /// idempotency identity is the delivered text itself, so a delivery
+    /// re-attempted after a crash between the injection and the consume
+    /// records nothing twice.
+    ///
+    /// Delivery goes through the dashboard's OWN sweep -- the same trust
+    /// framing, the same budget cap, the same "consume only if the injection
+    /// succeeded" rule -- rather than a second delivery path.
+    pub fn deliver_mail(
+        &self,
+        cfg: &super::super::config::CtxConfig,
+        errors: &mut super::super::dash::ErrorLog,
+    ) {
+        if !cfg.mail.enabled {
+            return;
+        }
+        let targets: Vec<(String, String, String)> = self
+            .lock()
+            .values()
+            .filter(|session| !session.ended && !session.running.load(Ordering::Acquire))
+            .map(|session| {
+                (
+                    session.handle.logical_id.clone(),
+                    session.handle.short.clone(),
+                    state::repo_slug(&session.cwd),
+                )
+            })
+            .collect();
+        for (id, short, slug) in targets {
+            let mut injector = ConversationInjector {
+                host: self,
+                session_id: id.clone(),
+            };
+            super::super::dash::sweep_one_pane(
+                &mut injector,
+                &id,
+                &self.state,
+                &slug,
+                RuntimeKind::Native.as_str(),
+                &short,
+                cfg.mail.max_delivered_bytes,
+                errors,
+                None,
+                &cfg.screen.thresholds(),
+            );
+        }
+    }
+
     /// The operator's explicit shutdown: the topology is drained first, and
     /// only the conversations named are completed. `stop_all = false` is the
     /// ordinary case -- the service exits, the conversations do not.
@@ -1041,6 +1093,32 @@ impl NativeSessions {
     }
 }
 
+/// Issue #489: the runtime's own [`dash::Injector`] for a conversation.
+///
+/// "Injecting" into a native session means recording a durable input, so the
+/// message is in the journal before the mail file is consumed -- the ordering
+/// the dashboard's `deliver_and_consume` already relies on, with a stronger
+/// guarantee behind it than a pty write has.
+struct ConversationInjector<'a> {
+    host: &'a NativeSessions,
+    session_id: String,
+}
+
+impl super::super::dash::Injector for ConversationInjector<'_> {
+    fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        let text = format!("{label}\n{body}");
+        // The delivered text IS the idempotency identity: a re-delivery of the
+        // same message after a crash between the injection and the consume
+        // hits the journal's uniqueness constraint instead of queueing a
+        // second turn about the same mail.
+        let key = format!("mail:{}:{}", self.session_id, text);
+        self.host
+            .submit(&self.session_id, &text, false, Some(&key))
+            .map(|_| ())
+            .map_err(|error| error.to_string().into())
+    }
+}
+
 fn journal_of(backend: &NativeBackend) -> Result<&Journal, ApiError> {
     backend
         .journal()
@@ -1590,6 +1668,104 @@ mod tests {
         assert!(
             held.iter().any(|facts| facts.session_id == live.session_id),
             "a live conversation is never pruned"
+        );
+    }
+
+    /// Issue #352's mail-injection residual, closed for conversations: mail
+    /// addressed to a session NOBODY is attached to is delivered by the
+    /// SERVICE, not left in the queue until a client shows up.
+    ///
+    /// Delivery is durable and idempotent: the message becomes a journalled
+    /// input, the mail file is consumed only because that succeeded, and a
+    /// second sweep of the same body records nothing twice.
+    #[test]
+    fn mail_for_a_detached_conversation_is_delivered_rather_than_queued() {
+        use crate::commands::ctx::config::CtxConfig;
+        use crate::commands::ctx::mail;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, _) = host_for(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let slug = state::repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "11111111-2222-4333-8444-555555555555".to_string(),
+                from_agent: "claude".to_string(),
+                to: RuntimeKind::Native.as_str().to_string(),
+                to_session: Some(facts.short.clone()),
+                sent: state::now_secs(),
+                body: "the build is red".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+        assert_eq!(
+            mail::list(&state, &slug, None, Some(&facts.short))
+                .expect("list")
+                .len(),
+            1,
+            "the message starts out queued, with nobody attached"
+        );
+
+        let mut errors = crate::commands::ctx::dash::ErrorLog::default();
+        host.deliver_mail(&cfg, &mut errors);
+
+        assert!(
+            mail::list(&state, &slug, None, Some(&facts.short))
+                .expect("list")
+                .is_empty(),
+            "the service delivered it; a message is consumed only when the delivery succeeded"
+        );
+        let history = host.history(&facts.session_id, 0, 64).expect("history");
+        assert!(
+            history
+                .entries
+                .iter()
+                .any(|entry| entry.role == HistoryRole::User
+                    && entry.text.contains("the build is red")),
+            "and it is a durable input on the conversation: {:?}",
+            history.entries
+        );
+
+        // A re-delivery of the same body -- what a crash between the injection
+        // and the consume leaves behind -- records nothing twice.
+        let before = history.entries.len();
+        let injected = host
+            .submit(
+                &facts.session_id,
+                &history
+                    .entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.role == HistoryRole::User)
+                    .map(|entry| entry.text.clone())
+                    .expect("the delivered text"),
+                false,
+                Some(&format!(
+                    "mail:{}:{}",
+                    facts.session_id,
+                    history
+                        .entries
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.role == HistoryRole::User)
+                        .map(|entry| entry.text.clone())
+                        .expect("the delivered text")
+                )),
+            )
+            .expect("redeliver");
+        assert!(injected.duplicate, "a re-delivery is a duplicate");
+        assert_eq!(
+            host.history(&facts.session_id, 0, 64)
+                .expect("history")
+                .entries
+                .len(),
+            before
         );
     }
 }

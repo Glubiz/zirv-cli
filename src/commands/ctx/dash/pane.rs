@@ -429,7 +429,11 @@ pub(crate) use super::super::INJECTION_SUBMIT_DELAY;
 /// [`INJECTION_SUBMIT_DELAY`] -- see that constant's own doc comment for why
 /// (issue #114) and for why the spacing is now enforced by a deadline the
 /// caller polls rather than a blocking sleep here (review F1/F2).
-fn write_injection_phase1(writer: &mut dyn Write, label: &str, body: &str) -> std::io::Result<()> {
+pub(crate) fn write_injection_phase1(
+    writer: &mut dyn Write,
+    label: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let line = visible_injection_line(&scrub_controls(label), &scrub_controls(body));
     writer.write_all(line.as_bytes())?;
     writer.flush()?;

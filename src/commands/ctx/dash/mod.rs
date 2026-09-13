@@ -3733,7 +3733,7 @@ struct ErrorEntry {
 /// `push_error` is the thin impure wrapper the hot path calls, so the collapse
 /// and acknowledgement rules are testable without a terminal.
 #[derive(Debug, Default)]
-struct ErrorLog {
+pub(crate) struct ErrorLog {
     entries: Vec<ErrorEntry>,
     next_id: u64,
 }
@@ -9205,7 +9205,7 @@ fn deliver_and_consume<I: Injector>(
 ///
 /// G1: takes `injectable` rather than a `&PaneState` -- see `deliverable_now`'s
 /// own doc comment for why `state == Idle` alone is no longer the right gate.
-fn is_delivery_eligible(verb: sessions::Verb, injectable: bool) -> bool {
+pub(crate) fn is_delivery_eligible(verb: sessions::Verb, injectable: bool) -> bool {
     verb == sessions::Verb::Dash && injectable
 }
 
@@ -9340,7 +9340,7 @@ fn log_mail_attention_event(
 /// resolved `[screen]` config, threaded straight through to
 /// `mail::message_with_delivery_envelope` below.
 #[allow(clippy::too_many_arguments)]
-fn sweep_one_pane<I: Injector>(
+pub(crate) fn sweep_one_pane<I: Injector>(
     injector: &mut I,
     // Issue #468: this pane's own zirv session id, for the attention-block
     // decision-log rows below -- the same value `advise_one_pane` already
@@ -9493,7 +9493,7 @@ fn orchestrator_mail_advisory_body(count: usize, from_agent: &str, from_session:
 /// already uses, so the dedup/formatting logic is testable without a real
 /// pty.
 #[allow(clippy::too_many_arguments)]
-fn advise_one_pane<I: Injector>(
+pub(crate) fn advise_one_pane<I: Injector>(
     injector: &mut I,
     session_id: &str,
     state: &StateDir,
