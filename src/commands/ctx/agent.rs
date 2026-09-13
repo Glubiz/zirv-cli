@@ -446,16 +446,7 @@ pub(crate) fn runtime_label(args: &AgentArgs) -> &'static str {
 /// hard error, never a silent fall back to the harness -- exactly the rule
 /// `exec::run_with` already applies to its own identical flag.
 pub(crate) fn resolve_runtime(args: &AgentArgs) -> CtxResult<super::runtime::RuntimeKind> {
-    match args.runtime.parse::<super::runtime::RuntimeKind>() {
-        Ok(kind @ (super::runtime::RuntimeKind::Harness | super::runtime::RuntimeKind::Native)) => {
-            Ok(kind)
-        }
-        _ => Err(format!(
-            "--runtime '{}': expected `harness` or `native`",
-            args.runtime
-        )
-        .into()),
-    }
+    super::runtime::selected(&args.runtime)
 }
 
 /// One sentence of orchestrator guidance derived purely from `state` --

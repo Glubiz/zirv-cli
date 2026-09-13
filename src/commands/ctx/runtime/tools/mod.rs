@@ -1466,6 +1466,10 @@ impl NativeToolClient {
                         repo: Some(self.repo.clone()),
                         agent: args.agent.clone(),
                         model: args.model.clone(),
+                        // Issue #484: a native session's own frontend review
+                        // stays on the native runtime; it has no vendor CLI to
+                        // fall back to.
+                        runtime: super::RuntimeKind::Native.as_str().to_string(),
                         json: true,
                     },
                 )

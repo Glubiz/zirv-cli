@@ -48,7 +48,10 @@ use super::runtime::native::{self, NativeLimits, NativeStatus};
 pub const ROLE_DISTILLER: &str = "distiller";
 pub const ROLE_ASK: &str = "ask";
 pub const ROLE_OPTIMIZE: &str = "optimize";
-pub const ROLE_REVIEWER: &str = "reviewer";
+/// A built-in workflow agent seat (`zirv workflow agents dispatch --runtime
+/// native`). The independent code reviewer is NOT here: it runs as a real
+/// delegated worker through `zirv agent --runtime native`, so its route comes
+/// from that command's own positional or the `worker` role.
 pub const ROLE_SEAT: &str = "seat";
 
 /// How much of a session a helper may spend. Deliberately far below
@@ -389,7 +392,7 @@ mod tests {
                 agent: "native".to_string(),
                 model: None,
                 provider: "fixture".to_string(),
-                role: ROLE_REVIEWER.to_string(),
+                role: ROLE_SEAT.to_string(),
                 pinned: false,
                 phase: Default::default(),
                 visited: Vec::new(),
@@ -412,7 +415,7 @@ mod tests {
                 session: "native-helper-1".to_string(),
                 short: "helper01".to_string(),
                 generation: 1,
-                role: ROLE_REVIEWER.to_string(),
+                role: ROLE_SEAT.to_string(),
                 task: None,
             },
             // The read-only mechanism, verbatim from `run`.

@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::policy::{Capability as PolicyCapability, EffectivePolicy, Stance};
 
+/// The adapter name a NATIVE seat host reports under (issue #484, roadmap
+/// N15). Not a vendor CLI: it names zirv's own runtime, so a report built for
+/// it describes what the execution broker and the native tool registry
+/// provide.
+pub const NATIVE_ADAPTER: &str = "native";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CapabilityId {
     #[serde(rename = "shell.exec")]
@@ -267,7 +273,14 @@ impl CapabilityReport {
     /// them. Zirv-owned operations can be reported as supported independently
     /// of a vendor's native tool vocabulary.
     pub fn for_adapter(adapter: &str) -> Self {
-        let known = matches!(adapter, "claude" | "codex");
+        // Issue #484 (roadmap N15): the native runtime is a first-class
+        // seat host, not an unknown adapter. Its logical capabilities are the
+        // same ones a harness seat has -- zirv owns agent spawn, test running
+        // and artifact rendering either way, and shell/filesystem/network stay
+        // operator-controlled because the execution broker, not markdown,
+        // decides them. Without this row a native reviewer or agent seat is
+        // refused by `ensure_supported` before it ever runs.
+        let known = matches!(adapter, "claude" | "codex" | NATIVE_ADAPTER);
         let status = |capability, support, reason: &'static str| CapabilityStatus {
             capability,
             support,
@@ -314,7 +327,8 @@ impl CapabilityReport {
                 status(
                     CapabilityId::BrowserOpen,
                     SupportLevel::Degraded,
-                    "available only when a browser-capable harness is configured",
+                    "available only when a browser-capable harness or an operator-configured \
+                     browser capability is present",
                 ),
                 status(
                     CapabilityId::NetworkAccess,
