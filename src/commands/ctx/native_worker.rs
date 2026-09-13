@@ -98,7 +98,7 @@ fn requested_route(args: &AgentArgs) -> Option<&str> {
 }
 
 fn role_of(args: &AgentArgs) -> &str {
-    args.role.as_deref().unwrap_or("worker")
+    args.role.as_deref().unwrap_or(super::team::DEFAULT_ROLE)
 }
 
 /// Maps the native loop's own final status onto the delegation vocabulary an

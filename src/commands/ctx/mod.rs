@@ -100,6 +100,9 @@ pub mod status;
 pub mod supervise;
 pub mod surface;
 pub mod task;
+/// Issue #485 (roadmap N16): the native team's roles, the operator-configured
+/// route each one spends, and the authority a role carries on its own.
+pub mod team;
 pub mod term;
 pub(crate) mod testrun;
 pub mod transcript_source;
