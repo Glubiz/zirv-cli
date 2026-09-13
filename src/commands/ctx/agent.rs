@@ -248,6 +248,67 @@ pub struct AgentArgs {
     /// unchanged; this only changes what reaches stdout.
     #[arg(long)]
     pub json: bool,
+    /// Issue #479 (roadmap N10): which runtime drives this WORKER's own
+    /// conversation -- `harness` (the default: zirv supervises an external
+    /// coding-agent process, byte for byte today's behaviour) or `native`
+    /// (zirv conducts the model/tool conversation itself over a direct
+    /// provider route, with no coding harness installed at all). Same flag
+    /// shape and same two values as `zirv ctx exec --runtime`, and equally
+    /// explicit: native is never selected by detection.
+    ///
+    /// `--runtime native` re-reads the positional `<name>` as the native
+    /// ROUTE to spend rather than a harness to launch -- a native worker has
+    /// no harness to name -- with the reserved value `native` meaning "the
+    /// `[roles]` entry for `--role`". [`AgentArgs::route`] overrides it.
+    /// Everything else about the delegation is unchanged: the same task
+    /// claim, worktree allocation, writer permit, envelope narrowing, token
+    /// reservation, result contract, receipt and report-back mail.
+    #[arg(long, default_value = "harness")]
+    pub runtime: String,
+    /// Native runtime only: which `[route]` from the operator's own native
+    /// provider configuration this worker spends, overriding the positional
+    /// `<name>`. Mirrors `zirv ctx exec --route`.
+    #[arg(long)]
+    pub route: Option<String>,
+}
+
+/// The same defaults clap itself applies, so the many call sites that build
+/// an `AgentArgs` in code (the workflow engine's auto-spawn, the review
+/// launcher, tests) keep getting the harness runtime without restating it --
+/// and a field added here later cannot silently become `""` at those sites.
+impl Default for AgentArgs {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            prompt: String::new(),
+            flags: Vec::new(),
+            system_prompt: None,
+            max_restarts: None,
+            timeout_secs: None,
+            quiet: false,
+            role: None,
+            group: None,
+            scope: None,
+            budget_tokens: None,
+            max_tool_calls: None,
+            force: false,
+            workdir: None,
+            mode: WorkerMode::Writing,
+            worktree: false,
+            attach_artifact: None,
+            workflow: None,
+            task_class: None,
+            result_schema: None,
+            result_kind: None,
+            path_scope: Vec::new(),
+            no_network: false,
+            depth: None,
+            task: None,
+            json: false,
+            runtime: super::runtime::RuntimeKind::Harness.to_string(),
+            route: None,
+        }
+    }
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -333,6 +394,18 @@ pub enum DelegationState {
 pub struct DelegationReceipt {
     pub schema_version: u32,
     pub harness: String,
+    /// Issue #479 (roadmap N10): which backend actually drove this worker's
+    /// conversation -- `harness` or `native`. Additive: a pre-#479 consumer
+    /// that ignores the field reads exactly what it read before, and one that
+    /// reads it never has to infer the backend from `harness`, which names a
+    /// route rather than an adapter for a native worker.
+    pub runtime: &'static str,
+    /// Issue #479: the STABLE delegation handle every follow-up, status,
+    /// result and cancel is addressed to -- independent of the worker's
+    /// provider conversation id, which a resume changes. `None` for the two
+    /// pre-launch receipts, where no delegation record exists yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub mode: DelegationMode,
@@ -358,10 +431,37 @@ pub struct DelegationReceipt {
     pub note: String,
 }
 
+/// Issue #479: the label a receipt carries for the backend this delegation
+/// asked for. An unrecognised `--runtime` never reaches a receipt (it is
+/// refused before any work starts, see [`resolve_runtime`]), so mapping an
+/// unparseable value onto `harness` here is only ever describing the default.
+pub(crate) fn runtime_label(args: &AgentArgs) -> &'static str {
+    match args.runtime.parse::<super::runtime::RuntimeKind>() {
+        Ok(super::runtime::RuntimeKind::Native) => super::runtime::RuntimeKind::Native.as_str(),
+        _ => super::runtime::RuntimeKind::Harness.as_str(),
+    }
+}
+
+/// The one place `--runtime` is turned into a decision. An unknown value is a
+/// hard error, never a silent fall back to the harness -- exactly the rule
+/// `exec::run_with` already applies to its own identical flag.
+pub(crate) fn resolve_runtime(args: &AgentArgs) -> CtxResult<super::runtime::RuntimeKind> {
+    match args.runtime.parse::<super::runtime::RuntimeKind>() {
+        Ok(kind @ (super::runtime::RuntimeKind::Harness | super::runtime::RuntimeKind::Native)) => {
+            Ok(kind)
+        }
+        _ => Err(format!(
+            "--runtime '{}': expected `harness` or `native`",
+            args.runtime
+        )
+        .into()),
+    }
+}
+
 /// One sentence of orchestrator guidance derived purely from `state` --
 /// short and factual, never repeating fields the receipt already carries
 /// structurally.
-fn receipt_note(state: DelegationState) -> String {
+pub(crate) fn receipt_note(state: DelegationState) -> String {
     match state {
         DelegationState::Launched => {
             "nothing has run yet; the worker's report arrives as mail -- run `zirv ctx inbox` \
@@ -398,7 +498,7 @@ pub(crate) fn capability_warning_lines(warnings: &[policy::CapabilityWarning]) -
 
 /// Prints exactly one pretty JSON object -- `receipt` -- to `w`, the sole
 /// stdout output a `--json` delegation ever produces.
-fn print_receipt<W: Write>(w: &mut W, receipt: &DelegationReceipt) -> CtxResult<()> {
+pub(crate) fn print_receipt<W: Write>(w: &mut W, receipt: &DelegationReceipt) -> CtxResult<()> {
     let json = serde_json::to_string_pretty(receipt)?;
     writeln!(w, "{json}")?;
     Ok(())
@@ -429,6 +529,8 @@ fn launch_failure_receipt(
     DelegationReceipt {
         schema_version: 1,
         harness: args.name.clone(),
+        runtime: runtime_label(args),
+        delegation: None,
         model: model.map(str::to_string),
         mode: DelegationMode::Inline,
         state: DelegationState::LaunchFailed,
@@ -468,6 +570,8 @@ fn dashboard_answer_receipt(
     DelegationReceipt {
         schema_version: 1,
         harness: args.name.clone(),
+        runtime: runtime_label(args),
+        delegation: None,
         model: model.map(str::to_string),
         mode: DelegationMode::DashboardPane,
         state,
@@ -900,7 +1004,7 @@ impl Drop for WorktreeReclaimGuard<'_> {
 /// and canonicalised by [`validate_workdir`]), else `repo` (today's
 /// behaviour, byte for byte unchanged). Pure so the "workdir wins when
 /// given" invariant is directly testable without spawning anything.
-fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
+pub(crate) fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
     workdir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.to_path_buf())
@@ -1694,7 +1798,7 @@ fn resolve_parent_envelope(
 /// own `network`/`destructive` forward UNCHANGED (never re-requests `true`),
 /// so an ordinary `--mode writing` delegation under an already-restricted
 /// parent never spuriously hits `CannotGrow` merely by existing.
-fn requested_envelope_from_args(
+pub(crate) fn requested_envelope_from_args(
     args: &AgentArgs,
     parent: &envelope::WorkerEnvelope,
     principal: String,
@@ -1797,7 +1901,7 @@ pub(crate) fn automatic_route_message(route: &super::fallback::Route, seat: pace
 /// `run_with` carries it forward to release it via `group::rollback_
 /// admission` on a spawn that never happens, or settle it via `group::
 /// settle_reservation` once the delegation actually completes.
-fn resolve_worker_budget(
+pub(crate) fn resolve_worker_budget(
     env: EnvLookup<'_>,
     args: &AgentArgs,
 ) -> CtxResult<(WorkerBudget, Option<u64>)> {
@@ -2158,7 +2262,7 @@ fn attach_artifact_to_prompt(
 /// returns). `Err` when `--task` names a card this repository has no record
 /// of: a worker sent off with no idea what its own card actually asked for
 /// would burn a whole run on a typo.
-fn attach_task_context_to_prompt(
+pub(crate) fn attach_task_context_to_prompt(
     args: &AgentArgs,
     state: &super::state::StateDir,
     repo: &Path,
@@ -2230,7 +2334,7 @@ fn claim_task_for_delegation(
 /// its verdict, so a crash or an unvalidated report-back returns the card to
 /// `Ready` for a fresh delegation to pick up, or auto-blocks it once the
 /// retry ceiling is reached -- NEVER a silent `Done`.
-fn finish_task_card(
+pub(crate) fn finish_task_card(
     state: &super::state::StateDir,
     repo: &Path,
     args: &AgentArgs,
@@ -3371,7 +3475,15 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
-    if let Some(message) = same_harness_refusal(args, env) {
+    // Issue #479 (roadmap N10): resolved first, and an unknown value is a
+    // hard error here rather than a silent fall back to the harness. Every
+    // check below that reads `args.name` as an ADAPTER name -- the
+    // same-harness refusal, `adapters::select`, cross-harness rerouting --
+    // is meaningless for a native worker, whose `<name>` is a provider route.
+    let native = resolve_runtime(args)? == super::runtime::RuntimeKind::Native;
+    if !native
+        && let Some(message) = same_harness_refusal(args, env)
+    {
         return Err(message.into());
     }
     // Issue #318: resolved up front, before anything else in this
@@ -3583,6 +3695,41 @@ pub fn run_with<W: Write>(
         }
         return Ok(2);
     }
+
+    // Issue #479 (roadmap N10): the runtime fork. Everything above this line
+    // -- `--workdir`/`--worktree` allocation, the prompt assembly, the
+    // delegation envelope, the task-card claim -- is shared by both
+    // runtimes and has already happened exactly once. Everything below it is
+    // harness-specific: adapter selection, cross-harness rerouting, the
+    // spawn gate and the dashboard pane fork all assume there is a vendor
+    // CLI to launch, and a native worker has none. `worktree_guard` is
+    // disarmed because the native fork owns the reclaim from here on (it
+    // runs the checkout itself and returns through this same call).
+    if native {
+        worktree_guard.disarm();
+        let launch_repo = effective_launch_repo(canonical_workdir.as_deref(), repo);
+        let code = super::native_worker::run(
+            super::native_worker::Request {
+                args,
+                prompt,
+                repo,
+                launch_repo,
+                state: &state,
+                cfg: &cfg,
+                parent_envelope: &parent_envelope,
+                result_schema: result_schema.as_ref(),
+            },
+            w,
+            env,
+        );
+        if args.worktree
+            && let Some(path) = canonical_workdir.as_deref()
+        {
+            reclaim_worktree_and_report(&state, repo, path);
+        }
+        return code;
+    }
+
     let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
     let live_inherited_dashboard = env(spawnreq::DASH_REQUESTS_ENV)
         .map(PathBuf::from)
@@ -4767,6 +4914,8 @@ pub fn run_with<W: Write>(
         let receipt = DelegationReceipt {
             schema_version: 1,
             harness: args.name.clone(),
+            runtime: super::runtime::RuntimeKind::Harness.as_str(),
+            delegation: None,
             model,
             mode: DelegationMode::Inline,
             state: delegation_state,
@@ -6928,6 +7077,8 @@ mod tests {
         let launched = DelegationReceipt {
             schema_version: 1,
             harness: "codex".to_string(),
+            runtime: "harness",
+            delegation: None,
             model: None,
             mode: DelegationMode::DashboardPane,
             state: DelegationState::Launched,
@@ -6962,6 +7113,8 @@ mod tests {
         let failed = DelegationReceipt {
             schema_version: 1,
             harness: "claude".to_string(),
+            runtime: "harness",
+            delegation: None,
             model: Some("sonnet".to_string()),
             mode: DelegationMode::Inline,
             state: DelegationState::ReportedContractFailed,
@@ -7227,6 +7380,8 @@ mod tests {
             depth: None,
             task: None,
             json: false,
+            runtime: super::super::runtime::RuntimeKind::Harness.to_string(),
+            route: None,
         }
     }
 
