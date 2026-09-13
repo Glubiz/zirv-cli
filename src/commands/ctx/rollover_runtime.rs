@@ -1632,4 +1632,403 @@ mod tests {
             "only the route-health answer separates an outage from an exhausted account"
         );
     }
+
+    // -- the four directions x four triggers -------------------------------
+
+    /// The four causes the acceptance criteria name, with the seat inputs
+    /// that produce each.
+    fn triggers() -> Vec<(&'static str, seat::Cause, bool)> {
+        vec![
+            (
+                "usage exhaustion",
+                seat::Cause::Proactive {
+                    headroom_pct: 3.0,
+                    observed_at: 500,
+                },
+                false,
+            ),
+            (
+                "endpoint failure",
+                seat::Cause::Reactive {
+                    detail: "the route's endpoint refused every connection".to_string(),
+                    observed_at: 500,
+                },
+                true,
+            ),
+            ("manual handover", seat::Cause::Manual, false),
+            (
+                // The startup-failure case shares the reactive cause; what
+                // makes it different is that the successor never comes up,
+                // which is `SuccessorFacts::started`.
+                "successor startup failure",
+                seat::Cause::Reactive {
+                    detail: "the account is out of capacity".to_string(),
+                    observed_at: 500,
+                },
+                false,
+            ),
+        ]
+    }
+
+    fn runtimes() -> [(RuntimeKind, RuntimeKind); 4] {
+        [
+            (RuntimeKind::Harness, RuntimeKind::Harness),
+            (RuntimeKind::Harness, RuntimeKind::Native),
+            (RuntimeKind::Native, RuntimeKind::Harness),
+            (RuntimeKind::Native, RuntimeKind::Native),
+        ]
+    }
+
+    /// Registers a seat at `source`, and -- for a native source -- a real
+    /// journal session holding one acknowledged input, one completed action
+    /// with a receipt, one held task claim and one effect that began and never
+    /// reported.
+    fn source_session(
+        state: &StateDir,
+        session: &str,
+        source: RuntimeKind,
+    ) -> (String, Option<JournalSessionId>) {
+        use super::super::runtime::journal::{
+            ContentRef, ExecutionId, MessageId, PolicyProvenance, TaskId, TaskReceiptState,
+            ToolCallId,
+        };
+        let short = super::super::sessions::short_id(session);
+        seat::register(
+            state,
+            &short,
+            session,
+            if source == RuntimeKind::Native {
+                "native"
+            } else {
+                "claude"
+            },
+            Some("standard"),
+            "anthropic",
+            "orchestrator",
+            false,
+            400,
+        )
+        .expect("register");
+        let mut record = seat::load(state, &short).expect("seat");
+        record.runtime = source;
+        seat::store(state, &record).expect("store");
+        super::super::sessions::record_conversation_on(
+            state,
+            &short,
+            &record.agent,
+            session,
+            "source-conversation",
+            source,
+        );
+        if source != RuntimeKind::Native {
+            return (short, None);
+        }
+
+        let mut journal = Journal::open(state).expect("journal");
+        let identity = testsupport::session_identity(session, testsupport::route_identity());
+        let journal_session = identity.session.clone();
+        journal.create_session(&identity).expect("create");
+        let scope = Default::default();
+        let policy = PolicyProvenance {
+            fingerprint: "fp".to_string(),
+            source: "test".to_string(),
+            decision: "allow".to_string(),
+            scope: "repo".to_string(),
+        };
+        journal
+            .acknowledge_input(
+                &journal_session,
+                1,
+                &scope,
+                MessageId::new("m1").expect("id"),
+                "cut the release".to_string(),
+                false,
+                None,
+                401,
+            )
+            .expect("input");
+        journal
+            .record_task_receipt(
+                &journal_session,
+                1,
+                &scope,
+                TaskId::new("task-1").expect("id"),
+                TaskReceiptState::Started,
+                serde_json::json!({ "note": "claimed" }),
+                402,
+            )
+            .expect("claim");
+        for (call, execution, finished) in [("done", "exec-done", true), ("mid", "exec-mid", false)]
+        {
+            journal
+                .prepare_tool_call(
+                    &journal_session,
+                    1,
+                    &scope,
+                    ToolCallId::new(call).expect("id"),
+                    "write_file".to_string(),
+                    serde_json::json!({ "path": "x.rs" }),
+                    policy.clone(),
+                    None,
+                    403,
+                )
+                .expect("call");
+            journal
+                .prepare_execution(
+                    &journal_session,
+                    1,
+                    &scope,
+                    ExecutionId::new(execution).expect("id"),
+                    ToolCallId::new(call).expect("id"),
+                    None,
+                    404,
+                )
+                .expect("execution");
+            journal
+                .transition_execution(
+                    &journal_session,
+                    1,
+                    &scope,
+                    &ExecutionId::new(execution).expect("id"),
+                    ExecutionState::Started,
+                    None,
+                    None,
+                    None,
+                    405,
+                )
+                .expect("started");
+            if finished {
+                journal
+                    .transition_execution(
+                        &journal_session,
+                        1,
+                        &scope,
+                        &ExecutionId::new(execution).expect("id"),
+                        ExecutionState::Completed,
+                        Some(ContentRef::Inline {
+                            text: "ok".to_string(),
+                        }),
+                        None,
+                        None,
+                        406,
+                    )
+                    .expect("completed");
+            }
+        }
+        (short, Some(journal_session))
+    }
+
+    /// Criteria 1 and 2, for every direction and every trigger that moves the
+    /// seat: the transaction commits onto the successor's runtime, the seat
+    /// keeps its logical identity, the source is parked with its own
+    /// conversation, and nothing acknowledged, claimed or receipted is lost.
+    #[test]
+    fn every_direction_and_trigger_commits_without_losing_acknowledged_state() {
+        let route = offer(
+            "anthropic",
+            "claude-sonnet-4-5",
+            BillingPosture::Api,
+            route::RuntimeKind::Native,
+        );
+        let plan = ContinuationPlan::Rebuilt {
+            checkpoint: None,
+            messages: Vec::new(),
+        };
+        for (index, (source, target)) in runtimes().into_iter().enumerate() {
+            for (slot, (label, cause, unreachable)) in triggers().into_iter().enumerate() {
+                if label == "successor startup failure" {
+                    continue; // its own test, below
+                }
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let state = StateDir::from_root(tmp.path().join("state"));
+                let session = format!("{index:04x}{slot:04x}-1111-4000-8000-000000000000");
+                let (short, journal_session) = source_session(&state, &session, source);
+
+                let drain = if matches!(cause, seat::Cause::Reactive { .. }) {
+                    Drain::Forced
+                } else {
+                    Drain::Quiesced
+                };
+                let boundary = journal_session.as_ref().map(|journal_session| {
+                    let mut journal = Journal::open(&state).expect("journal");
+                    reach_boundary(
+                        &mut journal,
+                        journal_session,
+                        1,
+                        drain,
+                        &CheckpointContext {
+                            hard_constraints: vec!["never force-push".to_string()],
+                            task: Some("task-1".to_string()),
+                            workflow: None,
+                            reason: "rollover".to_string(),
+                        },
+                        500,
+                    )
+                    .expect("boundary")
+                });
+
+                let seat_before = seat::load(&state, &short).expect("seat");
+                let moving = direction(source, target).expect("direction");
+                let mut ledger = Record::open(
+                    &seat_before,
+                    Trigger::from_cause(&cause, unreachable),
+                    label,
+                    500,
+                );
+                ledger.direction = Some(moving);
+                ledger.boundary = boundary.clone();
+
+                let admitted = validate(&facts(&route), &demand(), &plan, moving)
+                    .expect("the successor clears every gate");
+                assert_eq!(admitted.direction, moving);
+                let generation = seat::prepare_onto(
+                    &state,
+                    &short,
+                    "successor",
+                    Some("standard"),
+                    target,
+                    cause.clone(),
+                    500,
+                )
+                .expect("prepare");
+                // Item 3: the successor may not write before the commit, and
+                // the fence is what says so.
+                assert!(seat::guard(&state, &short, generation).is_err());
+                let committed = seat::commit(&state, &short, generation, "successor-session", 501)
+                    .expect("commit");
+                ledger.admitted("successor", target, label, 501);
+                ledger.settle(
+                    Settlement::Committed {
+                        route: "successor".to_string(),
+                        generation: committed.generation,
+                    },
+                    501,
+                );
+                store(&state, &ledger).expect("store");
+
+                // Criterion 6: the LOGICAL seat is the same, and the record
+                // says what answers at it now and why.
+                assert_eq!(committed.short, seat_before.short, "{label} {moving:?}");
+                assert_eq!(committed.runtime, target, "{label} {moving:?}");
+                let line = load(&state, &short).expect("record").status_line();
+                assert!(line.contains(&short), "{line}");
+                assert!(line.contains(moving.as_str()), "{line}");
+
+                // Criterion 2: for a native source, the checkpoint carries the
+                // acknowledged input, the claim and the receipt across, and
+                // criterion 4 halts the successor on the unsettled effect.
+                if let Some(boundary) = boundary {
+                    assert_eq!(
+                        boundary.pending_input,
+                        vec!["m1".to_string()],
+                        "{label} {moving:?}: acknowledged input is never lost"
+                    );
+                    assert_eq!(boundary.claims, vec!["task-1".to_string()]);
+                    assert_eq!(boundary.receipts, 1);
+                    assert_eq!(boundary.outcome_unknown, vec!["mid".to_string()]);
+                    assert!(boundary.halts_successor());
+                }
+
+                // Item 5: a displaced source keeps its OWN conversation
+                // reference, under the runtime that reference belongs to. A
+                // manual swap is the operator's own decision to move and is
+                // owed no return, which is existing behaviour.
+                match committed.displaced {
+                    Some(displaced) => {
+                        assert!(!matches!(cause, seat::Cause::Manual), "{label}");
+                        assert_eq!(displaced.runtime, source, "{label} {moving:?}");
+                        assert_eq!(
+                            displaced.conversation.as_deref(),
+                            Some("source-conversation"),
+                            "{label} {moving:?}"
+                        );
+                    }
+                    None => assert!(matches!(cause, seat::Cause::Manual), "{label}"),
+                }
+            }
+        }
+    }
+
+    /// Criterion 5, for every direction: a successor that never comes up is
+    /// refused BEFORE the seat moves, the source keeps the seat and its own
+    /// conversation, and no conversation id is ever resumed under the wrong
+    /// runtime.
+    #[test]
+    fn an_inaccessible_successor_never_takes_the_seat_or_the_wrong_conversation() {
+        let route = offer(
+            "anthropic",
+            "claude-sonnet-4-5",
+            BillingPosture::Api,
+            route::RuntimeKind::Native,
+        );
+        let dead = SuccessorFacts {
+            started: false,
+            ..facts(&route)
+        };
+        let plan = ContinuationPlan::Rebuilt {
+            checkpoint: None,
+            messages: Vec::new(),
+        };
+        for (index, (source, target)) in runtimes().into_iter().enumerate() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let session = format!("{index:04x}dead-2222-4000-8000-000000000000");
+            let (short, _) = source_session(&state, &session, source);
+            let before = seat::load(&state, &short).expect("seat");
+
+            let moving = direction(source, target).expect("direction");
+            let refusal = validate(&dead, &demand(), &plan, moving).expect_err("did not start");
+            assert!(matches!(refusal, Refusal::StartupFailed { .. }));
+
+            let mut ledger = Record::open(&before, Trigger::UsageExhaustion, "roll over", 500);
+            ledger.direction = Some(moving);
+            ledger.refused(&refusal, target, 501);
+            ledger.settle(
+                Settlement::Restored {
+                    reason: "the successor never started".to_string(),
+                },
+                501,
+            );
+            store(&state, &ledger).expect("store");
+
+            // The seat never moved: same generation, same agent, same runtime,
+            // still idle and still able to prepare again.
+            let after = seat::load(&state, &short).expect("seat");
+            assert_eq!(after.generation, before.generation, "{moving:?}");
+            assert_eq!(after.agent, before.agent, "{moving:?}");
+            assert_eq!(after.runtime, source, "{moving:?}");
+            assert!(matches!(after.phase, seat::Phase::Idle), "{moving:?}");
+            assert!(after.displaced.is_none(), "{moving:?}");
+
+            // And the source's own conversation is still resolvable under the
+            // runtime it belongs to -- and under no other.
+            let wrong = if source == RuntimeKind::Native {
+                RuntimeKind::Harness
+            } else {
+                RuntimeKind::Native
+            };
+            assert_eq!(
+                super::super::sessions::native_conversation(
+                    &state,
+                    &short,
+                    &after.agent,
+                    &session,
+                    source
+                )
+                .as_deref(),
+                Some("source-conversation"),
+                "{moving:?}: the source session's recoverable state survives"
+            );
+            assert_eq!(
+                super::super::sessions::native_conversation(
+                    &state, &short, &after.agent, &session, wrong
+                ),
+                None,
+                "{moving:?}: a conversation id is never resumed under the wrong runtime"
+            );
+
+            let line = load(&state, &short).expect("record").status_line();
+            assert!(line.contains("kept the original session"), "{line}");
+        }
+    }
 }
