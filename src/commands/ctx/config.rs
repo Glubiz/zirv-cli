@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -2268,6 +2269,202 @@ pub struct HarnessLimits {
     pub reserve_headroom_pct: Option<f64>,
 }
 
+/// Issue #483 (roadmap N14): the non-shell capabilities a native session has
+/// no host harness to inherit -- MCP servers, web search/fetch, browser
+/// automation.
+///
+/// The WHOLE `[capabilities]` table is `REPO_FORBIDDEN`. Every key in it
+/// names something zirv then runs, reaches over the network, or authenticates
+/// with: an MCP server command, a remote endpoint, a credential reference, a
+/// browser binary. A checked-out repository adding any of them is pure
+/// widening -- exactly what the repo layer may never do -- so only
+/// `~/.zirv/ctx.toml` or `ZIRV_CTX_CAPABILITIES` may set them.
+///
+/// Everything here is off by default. An unconfigured capability is reported
+/// as `unavailable` with a diagnosis naming what is missing; it never
+/// degrades into an empty success.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapabilitiesConfig {
+    /// Master switch. With this off, no MCP server is contacted, no outbound
+    /// web call is made and no browser is launched, whatever else is set.
+    pub enabled: bool,
+    pub web: WebCapabilityConfig,
+    pub browser: BrowserCapabilityConfig,
+    /// Configured MCP servers, in declaration order.
+    pub mcp: Vec<McpServerConfig>,
+    /// At or below this many discovered MCP tools, each one is registered as
+    /// its own native tool definition. Above it, the catalogue is reachable
+    /// only through the compact index plus an on-demand describe, so a large
+    /// toolset never forces every schema into every model request.
+    pub max_inline_mcp_tools: usize,
+}
+
+impl CapabilitiesConfig {
+    pub const DEFAULT_MAX_INLINE_MCP_TOOLS: usize = 24;
+
+    pub fn max_inline_mcp_tools_or_default(&self) -> usize {
+        if self.max_inline_mcp_tools == 0 {
+            Self::DEFAULT_MAX_INLINE_MCP_TOOLS
+        } else {
+            self.max_inline_mcp_tools
+        }
+    }
+
+    /// Servers an operator actually turned on. A disabled entry stays in the
+    /// file and out of every session.
+    pub fn active_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
+        let enabled = self.enabled;
+        self.mcp
+            .iter()
+            .filter(move |server| enabled && server.enabled && !server.name.trim().is_empty())
+    }
+}
+
+/// Configured web search and fetch. Both are *configured* capabilities: a raw
+/// model provides neither, and zirv never claims otherwise.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebCapabilityConfig {
+    /// A search endpoint taking `{query}` in its URL template and answering
+    /// JSON. Unset means web search is unavailable, not silently empty.
+    pub search_endpoint: Option<String>,
+    /// `env:NAME`, `store:<item>` or `file:<path>`, resolved through the same
+    /// credential store the direct providers use. Never logged.
+    pub search_credential: Option<String>,
+    /// Whether `web_fetch` may retrieve a URL at all.
+    pub fetch_enabled: bool,
+    /// Hosts the web capabilities may reach. Empty means none: an allowlist
+    /// with no entries is a closed door, not an open one.
+    pub allow_hosts: Vec<String>,
+    /// Ceiling on one fetched body before it is stored as bounded evidence.
+    pub max_fetch_bytes: usize,
+    pub timeout_ms: u64,
+}
+
+impl WebCapabilityConfig {
+    pub const DEFAULT_MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
+    pub const DEFAULT_TIMEOUT_MS: u64 = 20_000;
+
+    pub fn max_fetch_bytes_or_default(&self) -> usize {
+        if self.max_fetch_bytes == 0 {
+            Self::DEFAULT_MAX_FETCH_BYTES
+        } else {
+            self.max_fetch_bytes
+        }
+    }
+
+    pub fn timeout_ms_or_default(&self) -> u64 {
+        if self.timeout_ms == 0 {
+            Self::DEFAULT_TIMEOUT_MS
+        } else {
+            self.timeout_ms
+        }
+    }
+}
+
+/// Configured browser automation. The backend is the same headless
+/// Chromium-family binary `frontend render` already drives, so a machine that
+/// can capture a frontend render can inspect a page natively too.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserCapabilityConfig {
+    pub enabled: bool,
+    /// An explicit binary, overriding discovery. Absent means "discover a
+    /// Chromium-family browser on PATH, and report unavailable if there is
+    /// none".
+    pub binary: Option<String>,
+    pub timeout_ms: u64,
+}
+
+impl BrowserCapabilityConfig {
+    pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+    pub fn timeout_ms_or_default(&self) -> u64 {
+        if self.timeout_ms == 0 {
+            Self::DEFAULT_TIMEOUT_MS
+        } else {
+            self.timeout_ms
+        }
+    }
+}
+
+/// One configured MCP server. `effects` is the *trusted* declaration of what
+/// this server's tools may do: it comes from the operator's own config and is
+/// what the N04 broker admits against. Server-supplied descriptions never
+/// influence it.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub transport: McpTransportConfig,
+    pub effects: CapabilityEffectsConfig,
+    pub request_timeout_ms: u64,
+}
+
+impl McpServerConfig {
+    pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+    pub fn request_timeout_ms_or_default(&self) -> u64 {
+        if self.request_timeout_ms == 0 {
+            Self::DEFAULT_REQUEST_TIMEOUT_MS
+        } else {
+            self.request_timeout_ms
+        }
+    }
+}
+
+/// How to reach one MCP server. `mode` is explicit: a server is local or
+/// remote because the operator said so, never because a URL happened to parse.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpTransportConfig {
+    /// A child process speaking newline-delimited JSON-RPC on stdin/stdout.
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
+    },
+    /// A remote Streamable HTTP endpoint, optionally bearer-authenticated
+    /// from the shared credential store.
+    Http {
+        url: String,
+        #[serde(default)]
+        credential: Option<String>,
+    },
+}
+
+impl Default for McpTransportConfig {
+    fn default() -> Self {
+        Self::Stdio {
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            environment: BTreeMap::new(),
+        }
+    }
+}
+
+/// The operator's declaration of what a configured integration's tools may
+/// do. Mirrors `runtime::enforcement::ProcessEffects` one field at a time so
+/// the config surface and the broker's own vocabulary cannot drift; every
+/// field defaults to `false`, so an undeclared effect is unavailable rather
+/// than assumed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapabilityEffectsConfig {
+    pub repo_write: bool,
+    pub outside_write: bool,
+    pub network: bool,
+    pub git_metadata_write: bool,
+    pub git_push_or_destructive: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -2308,6 +2505,9 @@ pub struct CtxConfig {
     /// Issue #352's experimental persistent-runtime gate. Every key is
     /// `REPO_FORBIDDEN`; see [`SessionConfig`].
     pub session: SessionConfig,
+    /// Issue #483's configured MCP/web/browser integrations. The whole table
+    /// is `REPO_FORBIDDEN`; see [`CapabilitiesConfig`].
+    pub capabilities: CapabilitiesConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -3078,6 +3278,14 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
         &["session", "stale_after_secs"],
         EnvKind::Int,
+    ),
+    // Issue #483: the operator's master switch for the configured MCP/web/
+    // browser integrations, and the spelling `REPO_FORBIDDEN` names when it
+    // rejects a repo layer's `[capabilities]` table.
+    (
+        "ZIRV_CTX_CAPABILITIES",
+        &["capabilities", "enabled"],
+        EnvKind::Bool,
     ),
 ];
 
@@ -4220,6 +4428,16 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["session", "stale_after_secs"],
         "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
     ),
+    // Issue #483: the WHOLE `[capabilities]` table, as one prefix entry
+    // rather than a leaf per key -- `value_at` matches a prefix, so a repo
+    // layer that sets anything at all under it is rejected by name. Unlike
+    // every table where only some keys are operator-only, there is no
+    // narrowing half here: each key names an MCP server command zirv then
+    // spawns, a remote endpoint it authenticates to, a credential reference,
+    // or a browser binary it launches. A checked-out repository adding one is
+    // pure widening, and "repo-owned config may only narrow" leaves nothing
+    // for it to legitimately say.
+    (&["capabilities"], "ZIRV_CTX_CAPABILITIES"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {

@@ -36,6 +36,7 @@ pub mod fake;
 pub mod fixture;
 pub mod harness;
 pub mod journal;
+pub mod mcp;
 pub mod native;
 pub mod protocol;
 pub mod tools;
