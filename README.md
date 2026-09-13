@@ -1630,20 +1630,43 @@ harness installed:
 ```
 zirv ctx exec --runtime native --prompt "fix the failing test"
 zirv ctx exec --runtime native --route work-sonnet --role worker -- fix the failing test
+zirv ctx exec --runtime native --resume 9d2f… --prompt "now update the docs"
 ```
 
 Flags: `--runtime harness|native` (default `harness`), `--route <id>` (a
 `[route]` from the operator's native provider configuration; defaults to the
 `[roles]` entry for `--role`), `--role <role>` (default `worker`; selects
-that default route and the repository-write posture its tools run under).
-`--max-tool-calls` and `--timeout-secs` apply as the loop's own ceilings.
-`--agent`, `--transcript`, `--session-id` and `--max-restarts` are
-harness-runtime flags and are **refused** here, not ignored: a native session
-supervises no external process, has no transcript to score and nothing to
-restart. The command prints one structured JSON final status (`schema_version`,
-`status`, the actual route/provider/endpoint/account, the configured **and**
-served model, turn/request/tool counts, usage, evidence, and any incomplete or
-outcome-unknown tools) and exits on the same supervisor exit codes.
+that default route and the repository-write posture its tools run under),
+`--resume <session>` (continue a stored native session — see below; a resume
+needs no fresh prompt). `--max-tool-calls` and `--timeout-secs` apply as the
+loop's own ceilings. `--agent`, `--transcript`, `--session-id` and
+`--max-restarts` are harness-runtime flags and are **refused** here, not
+ignored: a native session supervises no external process, has no transcript to
+score and nothing to restart. The command prints one structured JSON final
+status (`schema_version`, `status`, the actual route/provider/endpoint/account,
+the configured **and** served model, turn/request/tool counts, usage, evidence,
+and any incomplete or outcome-unknown tools) and exits on the same supervisor
+exit codes.
+
+`--resume <session>` does the three things a continuation owes before it may
+run, in this order: it reads the stored session (a session this journal has
+never heard of is an error, never an invented one), converts every execution
+whose last durable state is `started` to `outcome_unknown` — an effect that
+began and never reported is **never** silently retried — and then advances the
+generation, which fences the previous one out of both the journal and the
+execution broker. Anything still holding the old generation (a half-dead
+process, a stale handle) is refused from that point on.
+
+Two operator-only flags make a whole native session runnable with no provider
+configured at all: `--provider fixture:<path>` replays a deterministic
+provider script instead of calling a model, and `--fixture-tools <path>`
+supplies the tool receipts it runs against (without it every tool call reports
+a fixture failure rather than touching the machine). Both are command-line
+flags and nothing else — no configuration layer, least of all a repository's,
+can set them. This is the same fixture machinery the loop's own tests use, so
+`zirv ctx exec --runtime native --provider fixture:…` exercises the shipped
+code path end to end without a credential, a network call or an installed
+harness.
 
 Inside, an explicit session/turn/request/tool state machine drives the cycle.
 The assistant message and its complete tool calls are committed to the journal
@@ -1929,9 +1952,10 @@ request additional sandbox access; under-declaring an effect leaves that
 resource read-only or disconnected rather than bypassing policy.
 
 The native agent loop adds no repository-settable key either. Which runtime
-runs, which provider route it spends and which role it holds come from the
-command line and from the operator-owned native provider configuration in
-`~/.zirv/native.toml` — never from a checkout. Model output is untrusted
+runs, which provider route it spends, which role it holds, which session it
+resumes and whether a fixture transport stands in for a real provider all come
+from the command line and from the operator-owned native provider
+configuration in `~/.zirv/native.toml` — never from a checkout. Model output is untrusted
 input throughout: a tool call it emits is admitted by the shared before-tool
 service and the N04 broker before anything runs, and its "I am finished"
 token is one input to the final status rather than the answer. A repository
