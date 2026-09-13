@@ -2621,6 +2621,34 @@ pub struct HeadlessRequest<'a> {
     pub writer: Option<Box<dyn super::enforcement::WriterLease>>,
 }
 
+/// The route a `--route`/`--role` pair names, from operator configuration
+/// alone.
+///
+/// Issue #485 (roadmap N16) item 2: role-to-route selection is
+/// `ctx::team`'s one lookup in the operator's `[roles]` table, with a typed
+/// refusal when the role has no entry -- never a fallback onto another
+/// role's route, which would be inferring an entitlement nobody granted.
+/// An explicit `--route` is the OPERATOR naming a route and is taken as
+/// given; a route a delegating MODEL names goes through
+/// `team::authorize_route` instead, at the delegation seam.
+///
+/// Shared by [`route_provider`] (which reserves before the loop resolves a
+/// transport) and by `build_transport` itself, so the two can never disagree
+/// about which route a role spends.
+fn resolve_role_route(
+    native: &super::super::provider::config::NativeConfig,
+    route: Option<&str>,
+    role: &str,
+) -> CtxResult<super::super::provider::RouteId> {
+    use super::super::provider::RouteId;
+
+    match route {
+        Some(name) => Ok(RouteId::new(name)?),
+        None => super::super::team::route_for_role(native, role)
+            .map_err(|refusal| format!("native runtime: {refusal}; or pass --route").into()),
+    }
+}
+
 /// The route this request will spend, and the PROVIDER whose reservation
 /// ledger it spends against -- resolved from operator configuration alone.
 ///
@@ -2650,14 +2678,7 @@ pub fn route_provider(
         )
     })?;
     let _ = env;
-    let route_id = match route {
-        Some(name) => RouteId::new(name)?,
-        None => native.roles.get(role).cloned().ok_or_else(|| {
-            format!(
-                "native runtime: no route for role `{role}`; pass --route or add a [roles] entry"
-            )
-        })?,
-    };
+    let route_id = resolve_role_route(&native, route, role)?;
     let provider = native
         .routes
         .get(&route_id)
@@ -3032,14 +3053,12 @@ fn compile_standing_context(
 /// workers: the least-privileged methodology is the safe default, and an
 /// orchestrator layer handed to a worker would tell it to delegate work
 /// nobody asked it to delegate.
+/// Issue #485 (roadmap N16): the mapping itself moved to `ctx::team`, which
+/// is where the closed team-role set lives, so `coordinator` (the roadmap's
+/// own name for the seat) and `orchestrator` (the name the prompt layer and
+/// every seat record already use) resolve to one methodology rather than two.
 fn prompt_role(role: &str) -> super::super::prompt::PromptRole {
-    use super::super::prompt::PromptRole;
-
-    match role {
-        "orchestrator" => PromptRole::Orchestrator,
-        "sub-orchestrator" => PromptRole::SubOrchestrator,
-        _ => PromptRole::Worker,
-    }
+    super::super::team::prompt_role(role)
 }
 
 // -- an interactive, multi-turn session for a dashboard native pane --------
@@ -3735,15 +3754,7 @@ fn build_transport(
             NativeConfig::operator_path(home).display()
         )
     })?;
-    let route_id = match request.route {
-        Some(name) => RouteId::new(name)?,
-        None => native.roles.get(request.role).cloned().ok_or_else(|| {
-            format!(
-                "native runtime: no route for role `{}`; pass --route or add a [roles] entry",
-                request.role
-            )
-        })?,
-    };
+    let route_id = resolve_role_route(&native, request.route, request.role)?;
 
     let store = OsStore::default();
     let now = now_secs();
