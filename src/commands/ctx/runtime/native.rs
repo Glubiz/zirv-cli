@@ -1886,6 +1886,28 @@ pub fn acknowledge_input(
     Ok(())
 }
 
+/// What [`NativeBackend::accept_input`] recorded: the durable identity the
+/// input now has, and whether it was already there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedInput {
+    pub message_id: MessageId,
+    pub duplicate: bool,
+}
+
+/// The journal identity one caller-chosen idempotency key maps to.
+///
+/// Hashed rather than used verbatim: a key is caller text, and a `MessageId`
+/// is bounded, NUL-free and compared for equality. A cryptographic digest
+/// keeps distinct keys distinct -- a cheap hash's collision would silently
+/// drop a genuinely different input as a duplicate, which is the one failure
+/// mode this whole mechanism exists to prevent.
+pub fn idempotent_message_id(key: &str) -> CtxResult<MessageId> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(MessageId::new(format!("idem-{hex}"))?)
+}
+
 /// What a resume owed the journal before the session may run again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeOutcome {
@@ -2166,6 +2188,14 @@ impl NativeBackend {
         self.journal.as_mut()
     }
 
+    /// The journal for a read-only caller -- history and cursor pages
+    /// (issue #489) need no write access, and asking for `&mut` to run a
+    /// `SELECT` would force every reader to take the writer's place in the
+    /// queue.
+    pub fn journal(&self) -> Option<&Journal> {
+        self.journal.as_ref()
+    }
+
     fn mint_message_id(&mut self) -> CtxResult<MessageId> {
         self.minted += 1;
         Ok(MessageId::new(format!(
@@ -2206,6 +2236,84 @@ impl NativeBackend {
             steering,
             at_ms,
         )
+    }
+
+    /// Issue #489: the durable acknowledgement a PROTOCOL caller's input goes
+    /// through, carrying that caller's own idempotency key.
+    ///
+    /// The key becomes the journal's own `MessageId`, so the deduplication is
+    /// a uniqueness constraint on disk rather than a cache in a process's
+    /// memory. A retry after a reconnect -- or after the service itself
+    /// restarted, which loses every in-memory idempotency cache there is --
+    /// hits that constraint, records nothing a second time, and is reported
+    /// back as a duplicate so the caller knows no second turn was queued.
+    ///
+    /// Without a key the id is minted fresh, exactly as `submit`/`steer` do:
+    /// a caller that did not ask for deduplication does not get it silently.
+    pub fn accept_input(
+        &mut self,
+        session: &SessionHandle,
+        input: &str,
+        steering: bool,
+        key: Option<&str>,
+    ) -> CtxResult<AcceptedInput> {
+        let logical_id = session.logical_id.clone();
+        {
+            let entry = self.resolve_current_mut(session)?;
+            if !steering && entry.state == SessionState::Running {
+                return Err(RuntimeError::Busy(logical_id).into());
+            }
+        }
+        let Some(entry) = self.sessions.get(&logical_id) else {
+            return Err(RuntimeError::UnknownSession(logical_id).into());
+        };
+        let journal_session = entry.journal_session.clone();
+        let generation = entry.generation;
+        let message_id = match key {
+            Some(key) => idempotent_message_id(key)?,
+            None => self.mint_message_id()?,
+        };
+        let (Some(journal_session), Some(journal)) = (journal_session, self.journal.as_mut())
+        else {
+            // No durable store bound: the in-memory protocol surface has
+            // nothing to deduplicate against, and says so by reporting the id
+            // it would have used rather than pretending to a guarantee.
+            return Ok(AcceptedInput {
+                message_id,
+                duplicate: false,
+            });
+        };
+        let at_ms = now_ms();
+        match journal.acknowledge_input(
+            &journal_session,
+            generation,
+            &EventScope::default(),
+            message_id.clone(),
+            input.to_string(),
+            steering,
+            Some(at_ms),
+            at_ms / 1000,
+        ) {
+            Ok(_) => {
+                let entry = self.resolve_current_mut(session)?;
+                if !steering {
+                    entry.state = SessionState::Running;
+                    entry.push(&session.logical_id, super::protocol::RuntimeEvent::TurnStarted);
+                }
+                Ok(AcceptedInput {
+                    message_id,
+                    duplicate: false,
+                })
+            }
+            // The one error that is not a failure: this exact input is already
+            // on disk under this exact identity, so the first attempt won and
+            // nothing else may happen.
+            Err(super::journal::JournalError::DuplicateId { .. }) => Ok(AcceptedInput {
+                message_id,
+                duplicate: true,
+            }),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn resolve_current_mut(
@@ -2555,6 +2663,53 @@ pub fn route_provider(
     Ok((route_id, provider))
 }
 
+/// The durable route identity a new native conversation is filed under
+/// (issue #489).
+///
+/// The persistent runtime has to create the journal session when the client
+/// asks for it, and a journal session carries the route it will spend. This
+/// resolves that route through the SAME `resolve_target` the transport uses,
+/// so the identity written at creation is the identity the first request
+/// spends -- rather than a second, hopeful derivation that could disagree with
+/// it. A route the operator has not configured fails here, loudly, instead of
+/// producing a conversation pinned to a route that does not exist.
+pub fn journal_route_identity(
+    repo: &std::path::Path,
+    route: Option<&str>,
+    role: &str,
+    env: EnvLookup<'_>,
+) -> CtxResult<RouteIdentity> {
+    use super::super::provider::config::NativeConfig;
+    use super::super::provider::credential::OsStore;
+    use super::super::provider::{RouteId, adapter::resolve_target};
+    use super::super::state::now_secs;
+
+    let home = crate::utils::home_dir()?;
+    let native = NativeConfig::load(&home, repo)?.ok_or_else(|| {
+        format!(
+            "native runtime: no provider configuration at {}. Run `zirv ctx provider` to set up \
+             an account, endpoint and route first.",
+            NativeConfig::operator_path(&home).display()
+        )
+    })?;
+    let route_id = match route {
+        Some(name) => RouteId::new(name)?,
+        None => native.roles.get(role).cloned().ok_or_else(|| {
+            format!("native runtime: no route for role `{role}`; add a [roles] entry")
+        })?,
+    };
+    let (target, _) = resolve_target(&native, &route_id, env, &OsStore::default(), now_secs())?;
+    Ok(RouteIdentity {
+        route: target.route.clone(),
+        provider: target.provider.clone(),
+        endpoint: target.endpoint.clone(),
+        account: target.account.clone(),
+        billing_pool: target.billing_pool.clone(),
+        protocol: target.protocol,
+        model: target.model.clone(),
+    })
+}
+
 /// Runs one headless native session end to end and prints its structured
 /// final status as JSON, returning the exit code a `zirv ctx exec` consumer
 /// expects.
@@ -2881,6 +3036,161 @@ fn prompt_role(role: &str) -> super::super::prompt::PromptRole {
         "sub-orchestrator" => PromptRole::SubOrchestrator,
         _ => PromptRole::Worker,
     }
+}
+
+/// Everything the persistent runtime needs to run the turns already queued on
+/// an EXISTING native conversation (issue #489, step N20).
+///
+/// The difference from [`HeadlessRequest`] is the whole point: a hosted turn
+/// neither creates the journal session nor resumes it nor completes it. The
+/// service created it when the client asked for the session, the generation is
+/// the one the service is holding, and the conversation outlives this turn --
+/// so advancing a generation here (what a resume does) would fence the service
+/// out of its own session, and completing it here would end a conversation the
+/// operator never asked to end.
+#[derive(Debug)]
+pub struct HostedTurn<'a> {
+    pub repo: &'a std::path::Path,
+    /// The journal session whose queued input this runs.
+    pub session: &'a JournalSessionId,
+    /// The seat short id, so the loop's identity matches the registry record
+    /// the service already filed for this session.
+    pub seat_short: &'a str,
+    pub generation: u64,
+    pub role: &'a str,
+    pub route: Option<&'a str>,
+    pub limits: NativeLimits,
+    pub provider: Option<&'a str>,
+    pub fixture_tools: Option<&'a std::path::Path>,
+    pub task: Option<String>,
+    /// The writer permit this session's repository writes are backed by, or
+    /// `None` for a session nobody granted a tree to -- whose file writes are
+    /// then refused, which is the honest answer rather than an unbacked write.
+    pub writer: Option<Box<dyn super::enforcement::WriterLease>>,
+    /// Shared with the host, so `session.interrupt` cancels the turn this
+    /// call is running rather than the next one.
+    pub cancel: Arc<CancellationFlag>,
+}
+
+/// Drives every turn already queued on a hosted native session to completion.
+///
+/// Returns when the conversation has no unconsumed input left, the turn was
+/// interrupted, or a limit was hit -- i.e. when the session is idle again. The
+/// session itself stays open: the caller (`session::native`) keeps its
+/// journal, its registry record and its identity, and calls this again the
+/// next time input arrives.
+pub fn run_hosted_turns<W: std::io::Write>(
+    turn: &mut HostedTurn<'_>,
+    w: &mut W,
+    env: EnvLookup<'_>,
+) -> CtxResult<NativeFinalStatus> {
+    use super::super::state::StateDir;
+
+    let _ = w;
+    let state = StateDir::resolve(env)?;
+    let home = crate::utils::home_dir()?;
+    let cfg = super::super::config::CtxConfig::load(turn.repo, env)?;
+    let task = turn
+        .task
+        .clone()
+        .map(super::journal::TaskId::new)
+        .transpose()?;
+
+    // The SAME transport, route resolution and broker assembly a headless run
+    // uses. A second way to build either would be a second place for a native
+    // launch to drift, which is exactly what issue #489 says not to do.
+    let mut request = HeadlessRequest {
+        repo: turn.repo,
+        prompt: "",
+        route: turn.route,
+        role: turn.role,
+        limits: turn.limits,
+        resume: None,
+        provider: turn.provider,
+        fixture_tools: turn.fixture_tools,
+        task: turn.task.clone(),
+        writer: turn.writer.take(),
+    };
+    let (provider, mut tools, route, brokered) =
+        build_transport(&request, &state, &home, &cfg, env)?;
+
+    let handle = SessionHandle {
+        runtime: RuntimeKind::Native,
+        logical_id: turn.session.to_string(),
+        short: turn.seat_short.to_string(),
+        generation: turn.generation,
+        role: turn.role.to_string(),
+        surface: UiSurface::Headless,
+        conversation: Some(BackendConversationRef {
+            agent: RuntimeKind::Native.as_str().to_string(),
+            conversation: turn.session.to_string(),
+        }),
+    };
+    if brokered {
+        tools = brokered_tools(&mut request, &state, &home, &cfg, &handle)?;
+    }
+
+    let compaction = CompactionSettings {
+        enabled: true,
+        policy: super::super::provider::config::NativeConfig::load(&home, turn.repo)?
+            .map(|native| native.compaction_policy())
+            .unwrap_or_default(),
+        budget: NativeBudget {
+            context_window_tokens: super::super::provider::capability::declared(
+                route.protocol,
+                &route.model,
+                None,
+            )
+            .context_window,
+            output_reserve_tokens: turn.limits.max_output_tokens,
+        },
+        score: cfg.score.clone(),
+        distill: DistillBudget::default(),
+        retain_recent_messages: RETAIN_RECENT_MESSAGES,
+        constraints: Vec::new(),
+        state: Some(state.clone()),
+    };
+
+    // Issue #484 (N15): the SAME standing context a headless run compiles --
+    // the engineering standard, the role methodology, the model profile and
+    // the operator's and repository's own instruction files. A hosted turn
+    // that skipped it would be a session told less than every other one.
+    let (system, preamble) = compile_standing_context(
+        &state,
+        &home,
+        &cfg,
+        &request,
+        &route,
+        turn.session,
+        super::super::state::now_secs(),
+    )?;
+    let mut journal = Journal::open(&state)?;
+    let mut driver = NativeLoop::new(
+        NativeSessionConfig {
+            session: turn.session.clone(),
+            generation: turn.generation,
+            route,
+            role: turn.role.to_string(),
+            seat_model: env(super::super::adapters::SEAT_MODEL_ENV),
+            write_posture: lifecycle::orchestrator_write_posture(&cfg),
+            limits: turn.limits,
+            task,
+            workflow_gate: None,
+            compaction,
+            // Issue #484: gated by the repository this session actually works
+            // whenever it performs real effects, exactly as a headless run is.
+            workflow_repo: brokered.then(|| turn.repo.to_path_buf()),
+            system,
+            preamble,
+        },
+        provider.as_ref(),
+        tools.as_mut(),
+        &mut journal,
+        Arc::clone(&turn.cancel),
+        &now_ms,
+        env,
+    );
+    driver.run_to_completion()
 }
 
 /// Resolves the provider transport, the tool executor and the route identity

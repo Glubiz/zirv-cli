@@ -30,9 +30,10 @@ use serde_json::{Value, json};
 
 use super::transport::{Connection, Endpoint, Listener, server_uid};
 use super::wire::{
-    ADVERTISED, ADVERTISED_WITHOUT_HOST, ApiError, ApiEvent, AttachMode, Attachment, Capability,
-    ErrorCode, EventFrame, Hello, InputMode, Method, Outcome, PROTOCOL_VERSION, Request, Response,
-    SERVER_NAME, ScreenView, SessionFacts, SessionState, WaitUntil, spec_for,
+    ADVERTISED, ADVERTISED_WITHOUT_HOST, ApiError, ApiEvent, ApprovalDecision, AttachMode,
+    Attachment, Capability, ErrorCode, EventFrame, Hello, InputAck, InputMode, Method,
+    NativeHistory, NativePage, Outcome, PROTOCOL_VERSION, Request, Response, SERVER_NAME,
+    ScreenView, SessionFacts, SessionState, TaskOutcome, WaitUntil, spec_for,
 };
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::runtime::{
@@ -50,6 +51,12 @@ const MAX_EVENTS: usize = 512;
 
 /// How many idempotency keys the server remembers, evicted oldest-first.
 const MAX_IDEMPOTENCY: usize = 256;
+
+/// Issue #489: the hard bound on one `session.history` or `session.journal`
+/// page. Fan-out has to be bounded at the server, not by a client's own
+/// politeness: a cursor read of an hour-long conversation would otherwise
+/// serialize the whole journal into one frame.
+const MAX_PAGE: usize = 256;
 
 const DEFAULT_WAIT_MS: u64 = 30_000;
 const MAX_WAIT_MS: u64 = 600_000;
@@ -135,6 +142,76 @@ pub trait SessionHost: Send + Sync + std::fmt::Debug {
     fn write_raw(&self, session_id: &str, client_id: &str, bytes: &[u8]) -> Result<(), ApiError>;
     /// The operator's explicit `zirv session stop`: terminate the child
     /// through the existing ladder. Detaching a client never reaches this.
+    fn stop(&self, session_id: &str) -> Result<bool, ApiError>;
+}
+
+/// Issue #489: the seam to the runtime that owns the NATIVE conversations,
+/// the exact counterpart of [`SessionHost`] for sessions that have a journal
+/// instead of a pseudoterminal.
+///
+/// It is a second trait rather than more methods on [`SessionHost`] because
+/// the two own genuinely different things: a pty host can be resized, typed
+/// into and screen-read, and none of those verbs mean anything for a native
+/// conversation; a native host can be interrupted mid-turn, have an approval
+/// decided and have its journal paged by durable cursor, and none of those
+/// mean anything for a supervised harness process. One server can hold both,
+/// and `zirv session serve` does -- which is what makes "one versioned local
+/// runtime" true rather than two daemons wearing one endpoint.
+///
+/// `&self` throughout for the same reason [`SessionHost`] uses it: the host is
+/// shared by every connection thread and does its own interior locking.
+pub trait NativeHost: Send + Sync + std::fmt::Debug {
+    /// Facts for the native sessions this host owns.
+    fn sessions(&self) -> Vec<SessionFacts>;
+    /// Whether this host is the owner of `session_id`. The routing predicate:
+    /// a server holding both hosts asks this before it reaches for either.
+    fn owns(&self, session_id: &str) -> bool;
+    /// Opens a new native conversation. Reached from `session.start` when the
+    /// spec names `runtime: native`.
+    fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError>;
+    /// Records one input durably and queues the turn it belongs to.
+    /// `idempotency` is the caller's own key: a retry carrying the same one
+    /// returns the first acknowledgement's identity and queues nothing.
+    fn submit(
+        &self,
+        session_id: &str,
+        input: &str,
+        steering: bool,
+        idempotency: Option<&str>,
+    ) -> Result<InputAck, ApiError>;
+    /// Cancels the turn in flight. The session is untouched otherwise -- this
+    /// is the "cancel" that issue #489 separates from "stop".
+    fn interrupt(&self, session_id: &str) -> Result<bool, ApiError>;
+    fn approve(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+        note: Option<&str>,
+    ) -> Result<bool, ApiError>;
+    fn task_result(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        outcome: TaskOutcome,
+        receipt: &Value,
+    ) -> Result<bool, ApiError>;
+    fn history(&self, session_id: &str, after: u64, limit: usize)
+    -> Result<NativeHistory, ApiError>;
+    fn journal(&self, session_id: &str, after: u64, limit: usize) -> Result<NativePage, ApiError>;
+    fn attach(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        mode: AttachMode,
+    ) -> Result<Attachment, ApiError>;
+    fn detach(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    fn takeover(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    /// The seat as it stands: whether ANY client is attached, and who holds
+    /// the controller. The server asks this before every native mutation --
+    /// see [`ApiServer::native_controller_check`].
+    fn seat(&self, session_id: &str) -> Result<(bool, Option<String>), ApiError>;
+    /// Ends the conversation. The one verb that does.
     fn stop(&self, session_id: &str) -> Result<bool, ApiError>;
 }
 
@@ -254,6 +331,10 @@ pub struct ApiServer {
     /// the attachment capability is negotiated away rather than advertised
     /// and then refused.
     host: Mutex<Option<Arc<dyn SessionHost>>>,
+    /// Issue #489. `None` for every server that owns no native conversations,
+    /// which is why the native capability is negotiated away rather than
+    /// advertised and then refused.
+    native: Mutex<Option<Arc<dyn NativeHost>>>,
     /// Issue #352. Serialises "mutate the host's attachment table, then
     /// announce the controller it produced" into one critical section.
     ///
@@ -292,6 +373,7 @@ impl ApiServer {
             backend: Mutex::new(backend),
             source,
             host: Mutex::new(None),
+            native: Mutex::new(None),
             attachment_gate: Mutex::new(()),
             stopping: Arc::new(AtomicBool::new(false)),
             owner_uid: server_uid(),
@@ -322,6 +404,16 @@ impl ApiServer {
         }
     }
 
+    /// Issue #489: hands this server the runtime that owns the native
+    /// conversations. Called once, by `session::service`, before the listener
+    /// binds -- same rule, and same reason, as [`Self::attach_host`].
+    pub fn attach_native(&self, native: Arc<dyn NativeHost>) {
+        match self.native.lock() {
+            Ok(mut guard) => *guard = Some(native),
+            Err(poisoned) => *poisoned.into_inner() = Some(native),
+        }
+    }
+
     fn host(&self) -> Option<Arc<dyn SessionHost>> {
         match self.host.lock() {
             Ok(guard) => guard.clone(),
@@ -329,16 +421,40 @@ impl ApiServer {
         }
     }
 
+    fn native(&self) -> Option<Arc<dyn NativeHost>> {
+        match self.native.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// The native host, but only when it actually owns `session_id`. The
+    /// routing predicate for every method a server holding both hosts has to
+    /// dispatch: nothing is guessed from the session's `runtime` field, which
+    /// a registry record could carry for a session this process does not own.
+    fn native_owner(&self, session_id: &str) -> Option<Arc<dyn NativeHost>> {
+        self.native().filter(|native| native.owns(session_id))
+    }
+
     /// What THIS server advertises, as opposed to what the protocol defines:
-    /// the attachment surface only when there is a runtime host behind it.
-    /// The filtering is here rather than at the call sites so `hello`,
+    /// the attachment surface only when some host owns sessions to attach to,
+    /// and the native surface only when a native host is behind it. The
+    /// filtering is here rather than at the call sites so `hello`,
     /// `server.capabilities` and any future advertiser cannot disagree.
     pub fn advertised(&self) -> Vec<Capability> {
-        if self.host().is_some() {
-            ADVERTISED.to_vec()
-        } else {
-            ADVERTISED_WITHOUT_HOST.to_vec()
+        let attachable = self.host().is_some() || self.native().is_some();
+        let native = self.native().is_some();
+        if !attachable {
+            return ADVERTISED_WITHOUT_HOST.to_vec();
         }
+        ADVERTISED
+            .iter()
+            .copied()
+            .filter(|capability| match capability {
+                Capability::SessionNative => native,
+                _ => true,
+            })
+            .collect()
     }
 
     fn with_host<T>(
@@ -501,7 +617,9 @@ impl ApiServer {
             Method::SessionStart => self.start_result(&request.params),
             Method::SessionStop => self.stop_result(&request.params),
             Method::SessionRead => self.read_result(&request.params),
-            Method::SessionSendInput => self.send_input_result(&request.params),
+            Method::SessionSendInput => {
+                self.send_input_result(&request.params, request.idempotency_key.as_deref())
+            }
             Method::SessionWait => self.wait_result(&request.params),
             Method::SessionReportStatus => self.report_status_result(&request.params),
             Method::SessionAttach => self.attach_result(&request.params),
@@ -509,6 +627,11 @@ impl ApiServer {
             Method::SessionTakeover => self.takeover_result(&request.params),
             Method::SessionResize => self.resize_result(&request.params),
             Method::SessionScreen => self.screen_result(&request.params),
+            Method::SessionInterrupt => self.interrupt_result(&request.params),
+            Method::SessionApprove => self.approve_result(&request.params),
+            Method::SessionTaskResult => self.task_result_result(&request.params),
+            Method::SessionHistory => self.history_result(&request.params),
+            Method::SessionJournal => self.journal_result(&request.params),
             // The reply is produced here; the streaming half lives in
             // `serve_connection`, which is the only place that owns a
             // connection to stream on.
@@ -660,6 +783,28 @@ impl ApiServer {
             prompt: params.prompt,
             extra_args: params.extra_args,
         };
+        // Issue #489: a native spec goes to the native host when there is one.
+        // Checked BEFORE the pty host, because `session.start` is one verb for
+        // both kinds of session -- a client that had to know which runtime it
+        // was talking to before it could ask for a session would not be
+        // speaking one protocol.
+        if spec.runtime == RuntimeKind::Native
+            && let Some(native) = self.native()
+        {
+            let facts = native.start(&spec)?;
+            let mut inner = self.lock();
+            inner
+                .sessions
+                .insert(facts.session_id.clone(), facts.clone());
+            inner.emit(
+                Some(facts.session_id.clone()),
+                Some(facts.generation),
+                ApiEvent::SessionStarted {
+                    session: facts.clone(),
+                },
+            );
+            return Ok(json!({ "session": facts }));
+        }
         // Issue #352: a runtime that owns terminals answers `session.start`
         // itself. Checked before the backend, and only when a host is
         // attached at all, so the server issue #353 shipped is unaffected.
@@ -720,8 +865,18 @@ impl ApiServer {
         // a session -- `session.detach` and a dropped connection never reach
         // it, which is what "client disconnection never terminates an agent"
         // means in code rather than in prose.
-        match (self.host(), handle) {
-            (Some(host), _)
+        match (
+            self.native_owner(&facts.session_id),
+            self.host(),
+            handle,
+        ) {
+            // Issue #489: a native conversation ends through its own host, so
+            // its journal is completed and its registry record released by the
+            // same code that filed them.
+            (Some(native), _, _) => {
+                native.stop(&facts.session_id)?;
+            }
+            (_, Some(host), _)
                 if host
                     .sessions()
                     .iter()
@@ -729,8 +884,8 @@ impl ApiServer {
             {
                 host.stop(&facts.session_id)?;
             }
-            (_, Some(handle)) => self.with_backend(|backend| backend.interrupt(&handle))?,
-            (_, None) => return Err(not_this_servers_session(&facts.session_id)),
+            (_, _, Some(handle)) => self.with_backend(|backend| backend.interrupt(&handle))?,
+            (_, _, None) => return Err(not_this_servers_session(&facts.session_id)),
         }
         let mut inner = self.lock();
         if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
@@ -773,7 +928,11 @@ impl ApiServer {
         Ok(json!({ "revision": inner.revision, "events": events }))
     }
 
-    fn send_input_result(&self, params: &Value) -> Result<Value, ApiError> {
+    fn send_input_result(
+        &self,
+        params: &Value,
+        idempotency: Option<&str>,
+    ) -> Result<Value, ApiError> {
         #[derive(Debug, Deserialize)]
         struct Params {
             session_id: String,
@@ -791,6 +950,42 @@ impl ApiServer {
             generation: params.generation,
         };
         let (facts, handle) = self.resolve(&target)?;
+        // Issue #489: a native conversation's input is recorded durably by its
+        // own host, under the caller's idempotency key, before this method can
+        // report it accepted.
+        if let Some(native) = self.native_owner(&facts.session_id) {
+            let steering = match params.mode {
+                InputMode::Submit => false,
+                InputMode::Steer => true,
+                InputMode::Raw => {
+                    return Err(ApiError::new(
+                        ErrorCode::Unsupported,
+                        "a native session has no terminal to type raw bytes into; use mode=submit \
+                         or mode=steer",
+                    ));
+                }
+                InputMode::Unknown => {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParams,
+                        "mode must be submit, steer or raw",
+                    ));
+                }
+            };
+            self.native_controller_check(
+                native.as_ref(),
+                &facts.session_id,
+                params.client_id.as_deref(),
+            )?;
+            let ack = native.submit(&facts.session_id, &params.input, steering, idempotency)?;
+            if !ack.duplicate {
+                self.mark_working(&facts);
+            }
+            return Ok(json!({
+                "accepted": true,
+                "message_id": ack.message_id,
+                "duplicate": ack.duplicate,
+            }));
+        }
         // Issue #352: raw bytes belong to the terminal, so they go to the
         // runtime host and never to a `RuntimeBackend` -- a backend has no
         // keyboard. Handled before the handle lookup below, because a
@@ -821,6 +1016,15 @@ impl ApiServer {
                 "mode must be submit, steer or raw",
             )),
         }?;
+        self.mark_working(&facts);
+        Ok(json!({ "accepted": true }))
+    }
+
+    /// Records that a session has a turn in flight and announces it. Factored
+    /// out because both the backend path and issue #489's native path owe the
+    /// same state change, and two copies would be two chances to forget the
+    /// `reported` entry that keeps a refresh from undoing it.
+    fn mark_working(&self, facts: &SessionFacts) {
         let mut inner = self.lock();
         if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
             entry.state = SessionState::Working;
@@ -834,7 +1038,6 @@ impl ApiServer {
                 ApiEvent::SessionUpdated { session: updated },
             );
         }
-        Ok(json!({ "accepted": true }))
     }
 
     fn report_status_result(&self, params: &Value) -> Result<Value, ApiError> {
@@ -866,6 +1069,219 @@ impl ApiServer {
             ApiEvent::SessionUpdated { session: updated },
         );
         Ok(json!({ "recorded": true }))
+    }
+
+    // -----------------------------------------------------------------
+    // Native sessions (issue #489)
+    // -----------------------------------------------------------------
+
+    /// Issue #489's controller rule, in one place so all five native
+    /// mutations cannot enforce it five different ways.
+    ///
+    /// A session NOBODY has attached to is driven by whoever can reach the
+    /// owner-only endpoint -- which is exactly the rule that applied before
+    /// this issue, and the rule a headless `zirv ctx exec` needs. The moment
+    /// any client attaches, seats exist to arbitrate between them, and every
+    /// mutation must name a `client_id` holding the controller seat. That
+    /// closes both halves of "observers cannot mutate state": an observer
+    /// naming itself is refused because it is not the controller, and an
+    /// observer omitting the field is refused because a session with clients
+    /// requires one.
+    fn native_controller_check(
+        &self,
+        native: &dyn NativeHost,
+        session_id: &str,
+        client_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let (attached, controller) = native.seat(session_id)?;
+        if !attached {
+            return Ok(());
+        }
+        let Some(client_id) = client_id else {
+            return Err(ApiError::new(
+                ErrorCode::Denied,
+                "this session has attached clients: name your client_id, and it must be the one \
+                 holding the controller seat",
+            ));
+        };
+        if controller.as_deref() == Some(client_id) {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ErrorCode::Denied,
+            match controller {
+                Some(current) => format!(
+                    "{current} holds this session's controller seat; an observer may watch but not \
+                     drive it -- `session.takeover` takes the seat explicitly"
+                ),
+                None => "no client holds this session's controller seat; attach as controller \
+                         before driving it"
+                    .to_string(),
+            },
+        ))
+    }
+
+    /// Resolves a native session, enforces the generation pin, and hands back
+    /// the host that owns it. Every native method starts here, so a call
+    /// naming a pty session or one this server merely read out of the registry
+    /// is refused by code rather than by coincidence.
+    fn native_for(
+        &self,
+        session_id: &str,
+        generation: Option<u64>,
+    ) -> Result<(SessionFacts, Arc<dyn NativeHost>), ApiError> {
+        if self.native().is_none() {
+            return Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "this server owns no native conversations: interrupt, approve, task_result, \
+                 history and journal need the persistent runtime's native integration (issue \
+                 #489), started with `zirv session serve`",
+            ));
+        }
+        let facts = self.pinned_facts(session_id, generation)?;
+        let native = self.native_owner(&facts.session_id).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Unsupported,
+                format!("session {session_id} is not a native conversation this runtime owns"),
+            )
+        })?;
+        Ok((facts, native))
+    }
+
+    fn interrupt_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: NativeParams = parse_params(params)?;
+        let (facts, native) = self.native_for(&params.session_id, params.generation)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let interrupted = native.interrupt(&facts.session_id)?;
+        if interrupted {
+            // An interrupt ends the TURN, never the session: the facts move to
+            // idle and the session stays reachable. `session.stop` is still
+            // the only method that ends one.
+            let mut inner = self.lock();
+            if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
+                entry.state = SessionState::Idle;
+                let updated = entry.clone();
+                inner
+                    .reported
+                    .insert(facts.session_id.clone(), SessionState::Idle);
+                inner.emit(
+                    Some(facts.session_id.clone()),
+                    Some(facts.generation),
+                    ApiEvent::SessionUpdated { session: updated },
+                );
+            }
+        }
+        Ok(json!({ "interrupted": interrupted }))
+    }
+
+    fn approve_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            #[serde(default)]
+            client_id: Option<String>,
+            request_id: String,
+            decision: ApprovalDecision,
+            #[serde(default)]
+            note: Option<String>,
+        }
+        let params: Params = parse_params(params)?;
+        if params.decision == ApprovalDecision::Unknown {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "decision must be allow or deny",
+            ));
+        }
+        let (facts, native) = self.native_for(&params.session_id, params.generation)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let recorded = native.approve(
+            &facts.session_id,
+            &params.request_id,
+            params.decision,
+            params.note.as_deref(),
+        )?;
+        Ok(json!({ "recorded": recorded }))
+    }
+
+    fn task_result_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            #[serde(default)]
+            client_id: Option<String>,
+            task_id: String,
+            outcome: TaskOutcome,
+            #[serde(default)]
+            receipt: Value,
+        }
+        let params: Params = parse_params(params)?;
+        if params.outcome == TaskOutcome::Unknown {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "outcome must be one of the published task_outcome values",
+            ));
+        }
+        let (facts, native) = self.native_for(&params.session_id, params.generation)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let receipt = if params.receipt.is_null() {
+            json!({})
+        } else {
+            params.receipt
+        };
+        let recorded =
+            native.task_result(&facts.session_id, &params.task_id, params.outcome, &receipt)?;
+        Ok(json!({ "recorded": recorded }))
+    }
+
+    fn history_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: CursorParams = parse_params(params)?;
+        let (facts, native) = self.native_for(&params.session_id, None)?;
+        // A read, but the same seat rule: conversation text is the one thing
+        // this protocol publishes that a bystander must not simply ask for.
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let history = native.history(
+            &facts.session_id,
+            params.after_sequence,
+            params.limit.unwrap_or(MAX_PAGE).min(MAX_PAGE),
+        )?;
+        serde_json::to_value(history)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))
+    }
+
+    fn journal_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: CursorParams = parse_params(params)?;
+        let (facts, native) = self.native_for(&params.session_id, None)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let page = native.journal(
+            &facts.session_id,
+            params.after_sequence,
+            params.limit.unwrap_or(MAX_PAGE).min(MAX_PAGE),
+        )?;
+        Ok(json!({ "page": page }))
     }
 
     // -----------------------------------------------------------------
@@ -908,9 +1324,15 @@ impl ApiServer {
         // Held across both the host mutation and the announcement: see
         // `attachment_gate`.
         let gate = self.attachment_gate();
-        let attachment = self.with_host(|host| {
-            host.attach(&params.session_id, &params.client_id, params.mode, size)
-        })?;
+        // Issue #489: the attachment surface is one surface for both kinds of
+        // session. A native conversation has seats and no terminal, so the
+        // size is simply not passed on -- there is nothing to resize.
+        let attachment = match self.native_owner(&params.session_id) {
+            Some(native) => native.attach(&params.session_id, &params.client_id, params.mode)?,
+            None => self.with_host(|host| {
+                host.attach(&params.session_id, &params.client_id, params.mode, size)
+            })?,
+        };
         self.publish_controller(&facts, &attachment);
         drop(gate);
         Ok(json!({ "attachment": attachment }))
@@ -920,11 +1342,14 @@ impl ApiServer {
         let params: ClientParams = parse_params(params)?;
         let facts = self.pinned_facts(&params.session_id, None)?;
         // Deliberately nothing else: detaching is a CLIENT lifecycle event.
-        // The session keeps its process, its pty, its supervisor and its
-        // state -- `session.stop` is the only method that ends one.
+        // The session keeps its process, its pty or its journal, its
+        // supervisor and its state -- `session.stop` is the only method that
+        // ends one, and `session.interrupt` the only one that cancels a turn.
         let gate = self.attachment_gate();
-        let attachment =
-            self.with_host(|host| host.detach(&params.session_id, &params.client_id))?;
+        let attachment = match self.native_owner(&params.session_id) {
+            Some(native) => native.detach(&params.session_id, &params.client_id)?,
+            None => self.with_host(|host| host.detach(&params.session_id, &params.client_id))?,
+        };
         self.publish_controller(&facts, &attachment);
         drop(gate);
         Ok(json!({ "attachment": attachment }))
@@ -934,8 +1359,10 @@ impl ApiServer {
         let params: ClientParams = parse_params(params)?;
         let facts = self.pinned_facts(&params.session_id, None)?;
         let gate = self.attachment_gate();
-        let attachment =
-            self.with_host(|host| host.takeover(&params.session_id, &params.client_id))?;
+        let attachment = match self.native_owner(&params.session_id) {
+            Some(native) => native.takeover(&params.session_id, &params.client_id)?,
+            None => self.with_host(|host| host.takeover(&params.session_id, &params.client_id))?,
+        };
         self.publish_controller(&facts, &attachment);
         drop(gate);
         Ok(json!({ "attachment": attachment }))
@@ -951,6 +1378,7 @@ impl ApiServer {
         }
         let params: Params = parse_params(params)?;
         self.pinned_facts(&params.session_id, None)?;
+        no_terminal_here(self.native_owner(&params.session_id).is_some(), "resize")?;
         let attachment = self.with_host(|host| {
             host.resize(
                 &params.session_id,
@@ -965,6 +1393,7 @@ impl ApiServer {
     fn screen_result(&self, params: &Value) -> Result<Value, ApiError> {
         let params: ClientParams = parse_params(params)?;
         self.pinned_facts(&params.session_id, None)?;
+        no_terminal_here(self.native_owner(&params.session_id).is_some(), "screen")?;
         let screen = self.with_host(|host| host.screen(&params.session_id, &params.client_id))?;
         Ok(json!({ "revision": self.revision(), "screen": screen }))
     }
@@ -1237,6 +1666,46 @@ struct TargetParams {
 struct ClientParams {
     session_id: String,
     client_id: String,
+}
+
+/// Issue #489: what a native mutation that carries no payload of its own
+/// takes. `client_id` is optional on the wire and enforced conditionally --
+/// see [`ApiServer::native_controller_check`].
+#[derive(Debug, Deserialize)]
+struct NativeParams {
+    session_id: String,
+    #[serde(default)]
+    generation: Option<u64>,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+/// Issue #489: what the two cursor reads take.
+#[derive(Debug, Deserialize)]
+struct CursorParams {
+    session_id: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    after_sequence: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Issue #489: the two terminal-shaped attachment verbs refused for a native
+/// conversation, by name rather than by a confusing "this server owns no
+/// terminals" from a server that owns plenty -- just not one for this session.
+fn no_terminal_here(is_native: bool, verb: &str) -> Result<(), ApiError> {
+    if !is_native {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorCode::Unsupported,
+        format!(
+            "this is a native conversation, not a terminal: `session.{verb}` has nothing to act \
+             on. Read it with `session.history` and drive it with `session.send_input`."
+        ),
+    ))
 }
 
 fn subscription_start(params: &Value) -> u64 {

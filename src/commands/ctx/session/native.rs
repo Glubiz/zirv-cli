@@ -1,0 +1,1198 @@
+//! Native conversations owned by the persistent runtime (issue #489, step
+//! N20 of the native-runtime roadmap #469).
+//!
+//! This is `host.rs`'s counterpart for sessions that have a journal instead of
+//! a pseudoterminal, and it is deliberately assembled from the same
+//! primitives the rest of zirv already uses rather than from new ones:
+//! `runtime::native::NativeBackend` (identity, durable acknowledgement,
+//! generation fencing), `runtime::journal::Journal` (the durable barrier),
+//! `sessions::SessionGuard` (the registry record), and
+//! `runtime::native::run_hosted_turns` (the SAME transport, broker and agent
+//! loop a headless `zirv ctx exec --runtime native` uses).
+//!
+//! Three rules are worth stating where they are implemented:
+//!
+//! - **The service holds the registry record.** Pacing, budgets, rot scoring,
+//!   mail addressing, writer permits, `zirv ctx status` and workflow policy
+//!   all read the session registry. A runtime-owned native session files one
+//!   and the SERVICE holds the guard, so detaching every client changes
+//!   nothing any of them can see -- exactly the mechanism §2.1 of the
+//!   persistent-runtime design note records for a pty session.
+//! - **Detach, cancel and stop are three things.** [`NativeHost::detach`] only
+//!   moves entries in `clients`/`controller`; [`NativeHost::interrupt`] only
+//!   sets a cancellation flag, ending the TURN; [`NativeHost::stop`] is the
+//!   one method that completes the journal session and releases the registry
+//!   guard.
+//! - **A restart reconciles, it never replays.** [`NativeSessions::restore`]
+//!   turns every execution that was durably `Started` into `OutcomeUnknown`
+//!   and advances the generation, and reports what it could and could not
+//!   bring back by name. Nothing is re-submitted, and no shell process is ever
+//!   described as having survived.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+
+use super::super::CtxResult;
+use super::super::api::server::NativeHost;
+use super::super::api::wire::{
+    ApiError, ApprovalDecision, AttachMode, AttachRole, Attachment, ErrorCode, HistoryEntry,
+    HistoryRole, InputAck, NativeEvent, NativeHistory, NativePage, SessionFacts, SessionState,
+    TaskOutcome,
+};
+use super::super::provider::adapter::CancellationFlag;
+use super::super::runtime::journal::{
+    AssistantBlock, ConversationState, ExecutionState, Journal, JournalEvent, JournalSessionId,
+    MessageRole, RouteIdentity, SeatId, SequenceId, SessionIdentity, TaskId, TaskReceiptState,
+};
+use super::super::runtime::native::{
+    HostedTurn, NativeLimits, journal_route_identity, resume_journal, run_hosted_turns,
+};
+use super::super::runtime::{
+    BackendConversationRef, RuntimeBackend, RuntimeKind, SessionHandle, SessionSpec, UiSurface,
+    native::NativeBackend,
+};
+use super::super::state::{self, StateDir};
+use super::super::{prompt::PromptRole, sessions};
+
+/// How many ENDED native sessions the table keeps, for the same reason
+/// `host::MAX_ENDED_SESSIONS` exists: a runtime up for a week must not list
+/// every conversation it has ever run. Live sessions are never pruned.
+pub const MAX_ENDED_NATIVE_SESSIONS: usize = 16;
+
+/// One entry of the durable native topology.
+///
+/// Separate from `host::Topology` on purpose: the two restore differently. A
+/// pty entry can at best be RELAUNCHED against a harness conversation; a
+/// native entry's conversation is right there in the journal, so restoring it
+/// is reading durable state rather than starting a process.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEntry {
+    pub session_id: String,
+    pub short: String,
+    pub role: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+    /// The service instance that owned this session. A restore under a
+    /// different instance continues the same conversation under a new
+    /// generation; it never claims to be the same run.
+    #[serde(default)]
+    pub instance: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTopology {
+    pub written: u64,
+    pub instance: String,
+    pub sessions: Vec<NativeEntry>,
+}
+
+pub fn topology_path(state: &StateDir, namespace: &str) -> PathBuf {
+    super::namespace::runtime_dir(state)
+        .join(format!("{}-native.json", state::provider_slug(namespace)))
+}
+
+pub fn write_topology(
+    state: &StateDir,
+    namespace: &str,
+    topology: &NativeTopology,
+) -> CtxResult<()> {
+    state::create_private_dir_all(&super::namespace::runtime_dir(state))?;
+    let body = serde_json::to_string_pretty(topology)?;
+    state::write_private(&topology_path(state, namespace), &body)?;
+    Ok(())
+}
+
+pub fn read_topology(state: &StateDir, namespace: &str) -> Option<NativeTopology> {
+    let body = std::fs::read_to_string(topology_path(state, namespace)).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// What a native restore actually did. Kept apart from the doing so the
+/// honesty rule is reportable rather than narrated.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NativeRestoreReport {
+    /// Conversations brought back under a new generation, ready to be driven.
+    pub resumed: Vec<String>,
+    /// Executions that were durably `Started` when the previous service
+    /// stopped and are now `OutcomeUnknown`. Never retried, never assumed to
+    /// have failed, and named so an operator can reconcile them for real.
+    pub outcome_unknown: Vec<String>,
+    /// Entries whose durable state could not be read back at all, with why.
+    pub lost: Vec<(String, String)>,
+}
+
+/// The two things this table needs from the outside world: which route a new
+/// conversation is filed under, and how a queued turn actually runs.
+///
+/// A trait so the runtime's own bookkeeping -- seats, durability, registry
+/// records, reconciliation, cursors, the controller rule -- is testable
+/// without a provider, a credential, a network or a model. The production
+/// implementation is [`ProviderEnvironment`], which is two calls into the
+/// shared native code and nothing else.
+pub trait NativeEnvironment: Send + Sync + std::fmt::Debug {
+    /// The durable route identity a new conversation is created with.
+    fn route_identity(
+        &self,
+        repo: &Path,
+        route: Option<&str>,
+        role: &str,
+    ) -> CtxResult<RouteIdentity>;
+    /// Drives every turn already queued on one conversation to completion.
+    fn run(&self, turn: &QueuedTurn) -> CtxResult<()>;
+}
+
+/// Everything a runner needs to drive the turns already queued on one
+/// conversation. Owned values: it crosses a thread boundary.
+#[derive(Debug, Clone)]
+pub struct QueuedTurn {
+    pub session: String,
+    pub seat_short: String,
+    pub generation: u64,
+    pub role: String,
+    pub cwd: PathBuf,
+    pub route: Option<String>,
+    pub task: Option<String>,
+    pub cancel: Arc<CancellationFlag>,
+}
+
+/// The production environment: the shared native agent loop, with the writer
+/// permit acquired for the duration of the turn and released with it.
+///
+/// The permit is per-turn rather than per-session deliberately. A lease is the
+/// right to write one tree, and holding one for an idle conversation would
+/// block every other worker on that checkout for as long as the operator left
+/// the session open.
+#[derive(Debug)]
+pub struct ProviderEnvironment {
+    limits: NativeLimits,
+    max_writers: usize,
+}
+
+impl ProviderEnvironment {
+    pub fn new(limits: NativeLimits, max_writers: usize) -> Self {
+        Self {
+            limits,
+            max_writers,
+        }
+    }
+}
+
+impl NativeEnvironment for ProviderEnvironment {
+    fn route_identity(
+        &self,
+        repo: &Path,
+        route: Option<&str>,
+        role: &str,
+    ) -> CtxResult<RouteIdentity> {
+        journal_route_identity(repo, route, role, &super::super::config::env_from_process())
+    }
+
+    fn run(&self, turn: &QueuedTurn) -> CtxResult<()> {
+        let state = StateDir::resolve(&super::super::config::env_from_process())?;
+        let session = JournalSessionId::new(turn.session.clone())?;
+        let writer = super::super::permit::acquire_writer(
+            &state,
+            self.max_writers,
+            &format!("session native {}: {}", turn.seat_short, turn.role),
+            &turn.cwd,
+        )
+        .ok()
+        .map(|permit| {
+            Box::new(permit) as Box<dyn super::super::runtime::enforcement::WriterLease>
+        });
+        let mut hosted = HostedTurn {
+            repo: &turn.cwd,
+            session: &session,
+            seat_short: &turn.seat_short,
+            generation: turn.generation,
+            role: &turn.role,
+            route: turn.route.as_deref(),
+            limits: self.limits,
+            provider: None,
+            fixture_tools: None,
+            task: turn.task.clone(),
+            writer,
+            cancel: Arc::clone(&turn.cancel),
+        };
+        let mut notes = Vec::new();
+        run_hosted_turns(
+            &mut hosted,
+            &mut notes,
+            &super::super::config::env_from_process(),
+        )?;
+        Ok(())
+    }
+}
+
+/// One native conversation this runtime owns.
+#[derive(Debug)]
+struct NativeSession {
+    handle: SessionHandle,
+    journal_session: JournalSessionId,
+    role: String,
+    cwd: PathBuf,
+    route: Option<String>,
+    task: Option<String>,
+    started_at: u64,
+    /// Held by the SERVICE. See this module's own doc comment.
+    guard: sessions::SessionGuard,
+    /// Shared with whichever turn is running, so `session.interrupt` cancels
+    /// the turn in flight rather than the next one.
+    cancel: Arc<CancellationFlag>,
+    /// Whether a turn is in flight. An atomic rather than a field behind the
+    /// table's mutex because the runner clears it from its own thread, without
+    /// taking the table lock a protocol call may be holding.
+    running: Arc<AtomicBool>,
+    /// Approval decisions this session's controller has made, by request id.
+    /// Durable in the journal as well (see [`NativeSessions::approve`]); this
+    /// is the copy a live turn can read without a database round trip.
+    approvals: BTreeMap<String, ApprovalDecision>,
+    clients: Vec<String>,
+    controller: Option<String>,
+    /// Set on a restore: the predecessor generation this one continues from.
+    /// Recorded, never reused as an identity.
+    restored_from: Option<u64>,
+    ended: bool,
+    ended_at: Option<u64>,
+}
+
+impl NativeSession {
+    fn attachment_for(&self, caller: &str) -> Attachment {
+        Attachment {
+            controller: self.controller.clone(),
+            clients: self.clients.clone(),
+            // A native conversation has no terminal, so it has no size. Zero
+            // is the honest answer; inventing 24x80 would tell a client to lay
+            // out a screen that does not exist.
+            rows: 0,
+            cols: 0,
+            role: if self.controller.as_deref() == Some(caller) {
+                AttachRole::Controller
+            } else if self.clients.iter().any(|id| id == caller) {
+                AttachRole::Observer
+            } else {
+                AttachRole::Detached
+            },
+        }
+    }
+
+    fn facts(&self) -> SessionFacts {
+        SessionFacts {
+            session_id: self.handle.logical_id.clone(),
+            short: self.handle.short.clone(),
+            runtime: RuntimeKind::Native,
+            generation: self.handle.generation,
+            surface: if self.clients.is_empty() {
+                UiSurface::Headless
+            } else {
+                UiSurface::Terminal
+            },
+            state: match (self.ended, self.running.load(Ordering::Acquire)) {
+                (true, _) => SessionState::Ended,
+                (false, true) => SessionState::Working,
+                (false, false) => SessionState::Idle,
+            },
+            role: Some(self.role.clone()),
+            agent: Some(RuntimeKind::Native.as_str().to_string()),
+            repo_slug: Some(state::repo_slug(&self.cwd)),
+            started_at: Some(self.started_at),
+            reachable: !self.ended,
+        }
+    }
+
+    fn entry(&self, instance: &str) -> NativeEntry {
+        NativeEntry {
+            session_id: self.handle.logical_id.clone(),
+            short: self.handle.short.clone(),
+            role: self.role.clone(),
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            route: self.route.clone(),
+            task: self.task.clone(),
+            instance: instance.to_string(),
+        }
+    }
+
+    fn queued_turn(&self) -> QueuedTurn {
+        QueuedTurn {
+            session: self.handle.logical_id.clone(),
+            seat_short: self.handle.short.clone(),
+            generation: self.handle.generation,
+            role: self.role.clone(),
+            cwd: self.cwd.clone(),
+            route: self.route.clone(),
+            task: self.task.clone(),
+            cancel: Arc::clone(&self.cancel),
+        }
+    }
+}
+
+/// The runtime service's native session table.
+pub struct NativeSessions {
+    state: StateDir,
+    namespace: String,
+    instance: String,
+    backend: Mutex<NativeBackend>,
+    sessions: Mutex<BTreeMap<String, NativeSession>>,
+    environment: Arc<dyn NativeEnvironment>,
+    ended_cap: AtomicUsize,
+    /// Run a queued turn on this thread instead of a spawned one. Test-only:
+    /// a deterministic test must not race a background thread, and production
+    /// must never block a protocol call on a model round trip.
+    inline_turns: AtomicBool,
+}
+
+impl std::fmt::Debug for NativeSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeSessions")
+            .field("namespace", &self.namespace)
+            .field("instance", &self.instance)
+            .finish()
+    }
+}
+
+impl NativeSessions {
+    pub fn new(
+        state: StateDir,
+        namespace: &str,
+        instance: &str,
+        environment: Arc<dyn NativeEnvironment>,
+    ) -> CtxResult<Arc<Self>> {
+        let mut backend = NativeBackend::new();
+        backend.attach_journal(Journal::open(&state)?);
+        Ok(Arc::new(Self {
+            state,
+            namespace: namespace.to_string(),
+            instance: instance.to_string(),
+            backend: Mutex::new(backend),
+            sessions: Mutex::new(BTreeMap::new()),
+            environment,
+            ended_cap: AtomicUsize::new(MAX_ENDED_NATIVE_SESSIONS),
+            inline_turns: AtomicBool::new(false),
+        }))
+    }
+
+    /// Same poison tolerance, and same reason, as `ApiServer::lock` and
+    /// `RuntimeHost::lock`: the state behind this mutex is a session table,
+    /// not a half-written invariant, and refusing every later call would turn
+    /// one panic into a runtime whose conversations can never be reached.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, NativeSession>> {
+        match self.sessions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn backend(&self) -> std::sync::MutexGuard<'_, NativeBackend> {
+        match self.backend.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Test seam: drive a queued turn on the calling thread.
+    #[cfg(test)]
+    pub fn run_turns_inline_for_test(&self) {
+        self.inline_turns.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn set_ended_cap_for_test(&self, cap: usize) {
+        self.ended_cap.store(cap, Ordering::Relaxed);
+    }
+
+    /// The predecessor generation a restored conversation continues from, if
+    /// any -- the only place it is read back, and never as an identity.
+    pub fn restored_from(&self, session_id: &str) -> Option<u64> {
+        self.lock()
+            .get(session_id)
+            .and_then(|session| session.restored_from)
+    }
+
+    /// Writes the durable native topology. Called on every structural change,
+    /// so a crash loses at most the sessions opened since the last one.
+    pub fn persist_topology(&self) {
+        let sessions = self.lock();
+        let topology = NativeTopology {
+            written: state::now_secs(),
+            instance: self.instance.clone(),
+            sessions: sessions
+                .values()
+                .filter(|session| !session.ended)
+                .map(|session| session.entry(&self.instance))
+                .collect(),
+        };
+        drop(sessions);
+        let _ = write_topology(&self.state, &self.namespace, &topology);
+    }
+
+    /// The operator's explicit shutdown: the topology is drained first, and
+    /// only the conversations named are completed. `stop_all = false` is the
+    /// ordinary case -- the service exits, the conversations do not.
+    pub fn shutdown(&self, stop_all: bool) {
+        self.persist_topology();
+        if !stop_all {
+            return;
+        }
+        let ids: Vec<String> = self.lock().keys().cloned().collect();
+        for id in ids {
+            let _ = self.stop(&id);
+        }
+    }
+
+    /// Tier 2 for native conversations (issue #489, item 6).
+    ///
+    /// For every entry of THIS runtime's own durable topology -- never every
+    /// session the journal happens to hold, which would fence a concurrent
+    /// `zirv ctx exec` out of a conversation this service never owned --
+    /// reconcile and adopt:
+    ///
+    /// 1. read the stored identity, which fails loudly for a session the
+    ///    journal has never heard of rather than inventing one;
+    /// 2. convert every execution whose last durable state is `Started` into
+    ///    `OutcomeUnknown`, because an effect that began and never reported
+    ///    cannot be assumed to have failed and must never be silently retried;
+    /// 3. advance the generation, fencing any straggler still holding the old
+    ///    one out of the journal and out of the execution broker.
+    ///
+    /// Nothing is re-submitted. A restored conversation is idle and drivable,
+    /// and what could not be brought back is reported by name.
+    pub fn restore(&self) -> NativeRestoreReport {
+        let mut report = NativeRestoreReport::default();
+        let Some(topology) = read_topology(&self.state, &self.namespace) else {
+            return report;
+        };
+        for entry in topology.sessions {
+            match self.resume_entry(&entry) {
+                Ok(outcome) => {
+                    report.resumed.push(outcome.0);
+                    report.outcome_unknown.extend(outcome.1);
+                }
+                Err(error) => report.lost.push((entry.short.clone(), error.to_string())),
+            }
+        }
+        self.persist_topology();
+        report
+    }
+
+    fn resume_entry(&self, entry: &NativeEntry) -> CtxResult<(String, Vec<String>)> {
+        let session = JournalSessionId::new(entry.session_id.clone())?;
+        let resumed = {
+            let mut backend = self.backend();
+            let journal = backend
+                .journal_mut()
+                .ok_or("native runtime: the journal was not attached")?;
+            resume_journal(
+                journal,
+                &session,
+                state::now_secs().saturating_mul(1000),
+            )?
+        };
+        let handle = SessionHandle {
+            runtime: RuntimeKind::Native,
+            logical_id: entry.session_id.clone(),
+            short: entry.short.clone(),
+            generation: resumed.generation,
+            role: entry.role.clone(),
+            surface: UiSurface::Headless,
+            conversation: Some(BackendConversationRef {
+                agent: RuntimeKind::Native.as_str().to_string(),
+                conversation: entry.session_id.clone(),
+            }),
+        };
+        self.backend().adopt(&handle, session.clone())?;
+        let cwd = restore_cwd(entry, &std::env::current_dir()?);
+        let record = self.register(&handle, &entry.role, &cwd);
+        let unknown: Vec<String> = resumed
+            .reconciled
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        self.lock().insert(
+            entry.session_id.clone(),
+            NativeSession {
+                handle,
+                journal_session: session,
+                role: entry.role.clone(),
+                cwd,
+                route: entry.route.clone(),
+                task: entry.task.clone(),
+                started_at: state::now_secs(),
+                guard: record,
+                cancel: Arc::new(CancellationFlag::default()),
+                running: Arc::new(AtomicBool::new(false)),
+                approvals: BTreeMap::new(),
+                clients: Vec::new(),
+                controller: None,
+                restored_from: Some(resumed.previous_generation),
+                ended: false,
+                ended_at: None,
+            },
+        );
+        Ok((entry.session_id.clone(), unknown))
+    }
+
+    /// The registry record that makes pacing, budgets, rot, mail addressing,
+    /// writer permits and workflow policy see a native session -- held by this
+    /// process, which is the one actually running its turns.
+    ///
+    /// `unreachable()`: a native conversation binds no turn-signal socket,
+    /// because there is no harness hook to post to one. Saying so is the
+    /// honest answer; claiming reachability would make a wake-up look
+    /// deliverable when nothing could ever act on it.
+    fn register(&self, handle: &SessionHandle, role: &str, cwd: &Path) -> sessions::SessionGuard {
+        let mut record = sessions::Record::new(
+            &handle.logical_id,
+            RuntimeKind::Native.as_str(),
+            cwd,
+            sessions::Verb::Chat,
+        )
+        .with_role(role)
+        .unreachable();
+        record.runtime = RuntimeKind::Native;
+        sessions::SessionGuard::register(&self.state, record)
+    }
+
+    /// Starts (or resumes, when a turn is already queued) the runner for one
+    /// session. Returns without waiting: a protocol call must never block on a
+    /// model round trip.
+    fn wake(&self, turn: QueuedTurn, running: Arc<AtomicBool>) {
+        if running.swap(true, Ordering::AcqRel) {
+            // Already running: the loop drains everything queued when it gets
+            // to the next delivery boundary, so a second runner would be a
+            // second conversation on one journal.
+            return;
+        }
+        let environment = Arc::clone(&self.environment);
+        if self.inline_turns.load(Ordering::Relaxed) {
+            let _ = environment.run(&turn);
+            running.store(false, Ordering::Release);
+            return;
+        }
+        std::thread::spawn(move || {
+            let _ = environment.run(&turn);
+            running.store(false, Ordering::Release);
+        });
+    }
+
+    fn with_session<T>(
+        &self,
+        session_id: &str,
+        call: impl FnOnce(&mut NativeSession) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        let mut sessions = self.lock();
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Err(ApiError::new(
+                ErrorCode::UnknownSession,
+                format!("no native session {session_id} on this runtime"),
+            ));
+        };
+        call(session)
+    }
+
+    /// Caps the ENDED table, oldest first. Live conversations are never
+    /// pruned: this bounds history, not concurrency -- the same rule, and the
+    /// same reason, as `host::prune_ended`.
+    fn prune_ended(&self) {
+        let cap = self.ended_cap.load(Ordering::Relaxed);
+        let mut sessions = self.lock();
+        let mut ended: Vec<(u64, String)> = sessions
+            .values()
+            .filter(|session| session.ended)
+            .map(|session| {
+                (
+                    session.ended_at.unwrap_or_default(),
+                    session.handle.logical_id.clone(),
+                )
+            })
+            .collect();
+        if ended.len() <= cap {
+            return;
+        }
+        ended.sort();
+        let excess = ended.len() - cap;
+        for (_, id) in ended.into_iter().take(excess) {
+            sessions.remove(&id);
+        }
+    }
+}
+
+/// Where a restored conversation's working directory comes from. Kept separate
+/// so an entry naming a directory that no longer exists degrades to the
+/// operator's current one rather than failing the whole restore -- the same
+/// rule, and the same shape, as `host::restore_cwd`.
+pub fn restore_cwd(entry: &NativeEntry, fallback: &Path) -> PathBuf {
+    let recorded = PathBuf::from(&entry.cwd);
+    if recorded.is_dir() {
+        recorded
+    } else {
+        fallback.to_path_buf()
+    }
+}
+
+impl NativeHost for NativeSessions {
+    fn sessions(&self) -> Vec<SessionFacts> {
+        self.lock().values().map(NativeSession::facts).collect()
+    }
+
+    fn owns(&self, session_id: &str) -> bool {
+        self.lock().contains_key(session_id)
+    }
+
+    fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+        if spec.runtime != RuntimeKind::Native {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "this host opens native conversations only",
+            ));
+        }
+        let role = if spec.role.trim().is_empty() {
+            PromptRole::Orchestrator.label().to_string()
+        } else {
+            PromptRole::from_label(&spec.role)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParams,
+                        format!("unknown session role '{}'", spec.role),
+                    )
+                })?
+                .label()
+                .to_string()
+        };
+        let facts = self
+            .open(spec, &role)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        // The launch prompt is an ordinary first input: durable before the
+        // caller is told the session exists, and queued as a turn like any
+        // other. A separate "launch" path would be a second way to get text
+        // into a conversation.
+        if !spec.prompt.trim().is_empty() {
+            self.submit(&facts.session_id, &spec.prompt, false, None)?;
+        }
+        Ok(facts)
+    }
+
+    fn submit(
+        &self,
+        session_id: &str,
+        input: &str,
+        steering: bool,
+        idempotency: Option<&str>,
+    ) -> Result<InputAck, ApiError> {
+        let (handle, turn, running) = {
+            let sessions = self.lock();
+            let Some(session) = sessions.get(session_id) else {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    format!("no native session {session_id} on this runtime"),
+                ));
+            };
+            if session.ended {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    "this session has ended",
+                ));
+            }
+            (
+                session.handle.clone(),
+                session.queued_turn(),
+                Arc::clone(&session.running),
+            )
+        };
+        // Durable FIRST, under the caller's own idempotency identity, and only
+        // then is a turn queued: a crash between the two costs a wake-up the
+        // next submit re-triggers, never the input itself.
+        let ack = self
+            .backend()
+            .accept_input(&handle, input, steering, idempotency)
+            .map_err(|error| backend_error(error.as_ref()))?;
+        if !ack.duplicate {
+            self.wake(turn, running);
+        }
+        Ok(InputAck {
+            message_id: ack.message_id.to_string(),
+            duplicate: ack.duplicate,
+        })
+    }
+
+    fn interrupt(&self, session_id: &str) -> Result<bool, ApiError> {
+        self.with_session(session_id, |session| {
+            if !session.running.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            session.cancel.cancel();
+            Ok(true)
+        })
+    }
+
+    fn approve(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+        note: Option<&str>,
+    ) -> Result<bool, ApiError> {
+        let journal_session = self.with_session(session_id, |session| {
+            session
+                .approvals
+                .insert(request_id.to_string(), decision);
+            Ok(session.journal_session.clone())
+        })?;
+        // Durable as well as in memory: an approval is an authority decision,
+        // and an authority decision that existed only in a process's memory
+        // would be unauditable the moment that process went away.
+        let mut backend = self.backend();
+        let journal = backend.journal_mut().ok_or_else(|| {
+            ApiError::new(ErrorCode::Internal, "the journal was not attached")
+        })?;
+        let task = TaskId::new(format!("approval-{request_id}"))
+            .map_err(|error| ApiError::new(ErrorCode::InvalidParams, error.to_string()))?;
+        let identity = journal
+            .session(&journal_session)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        journal
+            .record_task_receipt(
+                &journal_session,
+                identity.generation,
+                &Default::default(),
+                task,
+                match decision {
+                    ApprovalDecision::Allow => TaskReceiptState::Completed,
+                    _ => TaskReceiptState::Cancelled,
+                },
+                serde_json::json!({
+                    "kind": "approval",
+                    "request_id": request_id,
+                    "decision": if decision == ApprovalDecision::Allow { "allow" } else { "deny" },
+                    "note": note,
+                }),
+                state::now_secs(),
+            )
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        Ok(true)
+    }
+
+    fn task_result(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        outcome: TaskOutcome,
+        receipt: &serde_json::Value,
+    ) -> Result<bool, ApiError> {
+        let journal_session =
+            self.with_session(session_id, |session| Ok(session.journal_session.clone()))?;
+        let mut backend = self.backend();
+        let journal = backend.journal_mut().ok_or_else(|| {
+            ApiError::new(ErrorCode::Internal, "the journal was not attached")
+        })?;
+        let identity = journal
+            .session(&journal_session)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        let task = TaskId::new(task_id.to_string())
+            .map_err(|error| ApiError::new(ErrorCode::InvalidParams, error.to_string()))?;
+        journal
+            .record_task_receipt(
+                &journal_session,
+                identity.generation,
+                &Default::default(),
+                task,
+                receipt_state(outcome),
+                receipt.clone(),
+                state::now_secs(),
+            )
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        Ok(true)
+    }
+
+    fn history(
+        &self,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<NativeHistory, ApiError> {
+        let journal_session =
+            self.with_session(session_id, |session| Ok(session.journal_session.clone()))?;
+        let backend = self.backend();
+        let journal = journal_of(&backend)?;
+        let state = journal
+            .replay(&journal_session)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        let (_, last) = journal
+            .sequence_bounds(&journal_session)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        let entries = history_entries(&state, after, limit);
+        let cursor = entries
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or(after);
+        Ok(NativeHistory {
+            session_id: session_id.to_string(),
+            generation: state.identity.generation,
+            cursor,
+            last_sequence: last.0,
+            entries,
+        })
+    }
+
+    fn journal(&self, session_id: &str, after: u64, limit: usize) -> Result<NativePage, ApiError> {
+        let journal_session =
+            self.with_session(session_id, |session| Ok(session.journal_session.clone()))?;
+        let backend = self.backend();
+        let journal = journal_of(&backend)?;
+        let identity = journal
+            .session(&journal_session)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        let (first, last) = journal
+            .sequence_bounds(&journal_session)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        let events = journal
+            .events_after(&journal_session, SequenceId(after), limit)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        let page = NativePage {
+            session_id: session_id.to_string(),
+            generation: identity.generation,
+            after_sequence: after,
+            cursor: events.last().map(|e| e.sequence.0).unwrap_or(after),
+            last_sequence: last.0,
+            gap: gap_at(after, first.0, last.0),
+            events: events
+                .iter()
+                .map(|stored| NativeEvent {
+                    sequence: stored.sequence.0,
+                    generation: stored.generation,
+                    kind: event_kind(&stored.event).to_string(),
+                    detail: event_detail(&stored.event),
+                })
+                .collect(),
+        };
+        Ok(page)
+    }
+
+    fn attach(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        mode: AttachMode,
+    ) -> Result<Attachment, ApiError> {
+        self.with_session(session_id, |session| {
+            if !session.clients.iter().any(|id| id == client_id) {
+                session.clients.push(client_id.to_string());
+                session.clients.sort();
+            }
+            if mode == AttachMode::Controller {
+                match session.controller.clone() {
+                    Some(current) if current != client_id => {
+                        return Err(ApiError::new(
+                            ErrorCode::Busy,
+                            format!(
+                                "{current} already controls this session; `session.takeover` \
+                                 takes the seat explicitly"
+                            ),
+                        ));
+                    }
+                    _ => session.controller = Some(client_id.to_string()),
+                }
+            }
+            Ok(session.attachment_for(client_id))
+        })
+    }
+
+    fn detach(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+        self.with_session(session_id, |session| {
+            session.clients.retain(|id| id != client_id);
+            if session.controller.as_deref() == Some(client_id) {
+                session.controller = None;
+            }
+            // Nothing else. The conversation, its journal, its registry record
+            // and any turn in flight are untouched: that is the acceptance
+            // criterion this method exists to satisfy.
+            Ok(session.attachment_for(client_id))
+        })
+    }
+
+    fn takeover(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+        self.with_session(session_id, |session| {
+            if !session.clients.iter().any(|id| id == client_id) {
+                session.clients.push(client_id.to_string());
+                session.clients.sort();
+            }
+            session.controller = Some(client_id.to_string());
+            Ok(session.attachment_for(client_id))
+        })
+    }
+
+    fn seat(&self, session_id: &str) -> Result<(bool, Option<String>), ApiError> {
+        self.with_session(session_id, |session| {
+            Ok((!session.clients.is_empty(), session.controller.clone()))
+        })
+    }
+
+    fn stop(&self, session_id: &str) -> Result<bool, ApiError> {
+        let (journal_session, generation) = {
+            let mut sessions = self.lock();
+            let Some(session) = sessions.get_mut(session_id) else {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    format!("no native session {session_id} on this runtime"),
+                ));
+            };
+            if session.ended {
+                return Ok(false);
+            }
+            // The turn in flight is cancelled first: stopping a session whose
+            // model call was still streaming would otherwise leave the runner
+            // writing into a journal the operator has just ended.
+            session.cancel.cancel();
+            session.ended = true;
+            session.ended_at = Some(state::now_secs());
+            session.clients.clear();
+            session.controller = None;
+            // The registry entry goes with the conversation it described --
+            // here, on the operator's explicit stop. `detach` never reaches
+            // this, and neither does the service's own shutdown unless the
+            // operator asked for `--stop-sessions`.
+            session.guard.release();
+            (
+                session.journal_session.clone(),
+                session.handle.generation,
+            )
+        };
+        {
+            let mut backend = self.backend();
+            if let Some(journal) = backend.journal_mut() {
+                let _ = journal.complete_session(
+                    &journal_session,
+                    generation,
+                    "stopped".to_string(),
+                    state::now_secs(),
+                );
+            }
+        }
+        self.prune_ended();
+        self.persist_topology();
+        Ok(true)
+    }
+}
+
+impl NativeSessions {
+    /// Opens a new conversation: a fresh identity, a journal session, a
+    /// registry record and a durable topology entry. Separate from
+    /// [`NativeHost::start`] so the protocol-shaped error mapping stays in one
+    /// place and this stays readable.
+    fn open(&self, spec: &SessionSpec, role: &str) -> CtxResult<SessionFacts> {
+        let route = spec.provider_route.as_ref().map(ToString::to_string);
+        // Resolved BEFORE anything durable exists: a conversation pinned to a
+        // route the operator never configured would be a session that can
+        // never take a turn, and the honest place to say so is here.
+        let route_identity = self
+            .environment
+            .route_identity(&spec.cwd, route.as_deref(), role)?;
+        let mut backend = self.backend();
+        let handle = backend.start(&SessionSpec {
+            role: role.to_string(),
+            ..spec.clone()
+        })?;
+        let journal_session = JournalSessionId::new(handle.logical_id.clone())?;
+        let identity = SessionIdentity {
+            session: journal_session.clone(),
+            seat: SeatId::new(handle.short.clone())?,
+            generation: handle.generation,
+            task: None,
+            route: route_identity,
+            created_at: state::now_secs(),
+            completed_at: None,
+        };
+        backend
+            .journal_mut()
+            .ok_or("native runtime: the journal was not attached")?
+            .create_session(&identity)?;
+        backend.adopt(&handle, journal_session.clone())?;
+        drop(backend);
+
+        let guard = self.register(&handle, role, &spec.cwd);
+        let session = NativeSession {
+            handle: handle.clone(),
+            journal_session,
+            role: role.to_string(),
+            cwd: spec.cwd.clone(),
+            route,
+            task: None,
+            started_at: state::now_secs(),
+            guard,
+            cancel: Arc::new(CancellationFlag::default()),
+            running: Arc::new(AtomicBool::new(false)),
+            approvals: BTreeMap::new(),
+            clients: Vec::new(),
+            controller: None,
+            restored_from: None,
+            ended: false,
+            ended_at: None,
+        };
+        let facts = session.facts();
+        self.lock().insert(handle.logical_id.clone(), session);
+        self.persist_topology();
+        Ok(facts)
+    }
+}
+
+fn journal_of(backend: &NativeBackend) -> Result<&Journal, ApiError> {
+    backend
+        .journal()
+        .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the journal was not attached"))
+}
+
+fn receipt_state(outcome: TaskOutcome) -> TaskReceiptState {
+    match outcome {
+        TaskOutcome::Accepted => TaskReceiptState::Accepted,
+        TaskOutcome::Started => TaskReceiptState::Started,
+        TaskOutcome::Blocked => TaskReceiptState::Blocked,
+        TaskOutcome::Failed => TaskReceiptState::Failed,
+        TaskOutcome::Cancelled => TaskReceiptState::Cancelled,
+        // `Unknown` never reaches here: the server refuses it as invalid
+        // params before the host is called at all.
+        TaskOutcome::Completed | TaskOutcome::Unknown => TaskReceiptState::Completed,
+    }
+}
+
+/// Whether a caller's cursor can be continued from.
+///
+/// Pure, so the rule is provable without a database: a cursor of 0 always
+/// works (start from the beginning), a cursor at or past the newest sequence
+/// is simply "caught up", and anything below the OLDEST sequence this journal
+/// still holds cannot be continued -- that caller has to resynchronize from a
+/// history snapshot instead of applying a page it cannot place.
+pub fn gap_at(after: u64, first: u64, last: u64) -> bool {
+    if after == 0 || first == 0 {
+        return false;
+    }
+    if after > last {
+        // Ahead of the journal: whatever this cursor came from, it is not this
+        // conversation as it now stands.
+        return true;
+    }
+    after + 1 < first
+}
+
+fn event_kind(event: &JournalEvent) -> &'static str {
+    match event {
+        JournalEvent::InputAcknowledged { .. } => "input_acknowledged",
+        JournalEvent::AssistantMessageCommitted { .. } => "assistant_message_committed",
+        JournalEvent::UsageRecorded { .. } => "usage_recorded",
+        JournalEvent::ToolCallPrepared { .. } => "tool_call_prepared",
+        JournalEvent::ToolExecution { .. } => "tool_execution",
+        JournalEvent::TaskReceipt { .. } => "task_receipt",
+        JournalEvent::Checkpoint { .. } => "checkpoint",
+        JournalEvent::GenerationAdvanced { .. } => "generation_advanced",
+        JournalEvent::SessionEnded { .. } => "session_ended",
+    }
+}
+
+/// The short, REDACTED descriptor one durable event publishes.
+///
+/// Deliberately never the payload: a tool call's arguments and a tool
+/// execution's result routinely carry file contents and credentials, and this
+/// stream is a "what happened" feed, not a transcript. Conversation text is
+/// reachable only through `session.history`, which is seat-checked.
+fn event_detail(event: &JournalEvent) -> Option<String> {
+    match event {
+        JournalEvent::InputAcknowledged { steering, .. } => {
+            Some(if *steering { "steering" } else { "submit" }.to_string())
+        }
+        JournalEvent::ToolCallPrepared { name, .. } => Some(name.clone()),
+        JournalEvent::ToolExecution { state, .. } => Some(
+            match state {
+                ExecutionState::Prepared => "prepared",
+                ExecutionState::Started => "started",
+                ExecutionState::Completed => "completed",
+                ExecutionState::Failed => "failed",
+                ExecutionState::Cancelled => "cancelled",
+                ExecutionState::OutcomeUnknown => "outcome_unknown",
+            }
+            .to_string(),
+        ),
+        JournalEvent::GenerationAdvanced { previous, current } => {
+            Some(format!("{previous} -> {current}"))
+        }
+        JournalEvent::SessionEnded { reason } => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+/// The conversation, reduced to what the protocol publishes. Tool entries name
+/// the tool and nothing else -- see [`event_detail`] for why.
+fn history_entries(state: &ConversationState, after: u64, limit: usize) -> Vec<HistoryEntry> {
+    let mut entries: Vec<HistoryEntry> = Vec::new();
+    for message in &state.messages {
+        if message.sequence.0 <= after {
+            continue;
+        }
+        let (role, text) = match message.role {
+            MessageRole::User => (HistoryRole::User, message.text.clone().unwrap_or_default()),
+            MessageRole::Assistant => (
+                HistoryRole::Assistant,
+                message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        AssistantBlock::Text { text } | AssistantBlock::Refusal { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        };
+        entries.push(HistoryEntry {
+            sequence: message.sequence.0,
+            role,
+            text,
+            steering: message.steering,
+        });
+        for block in &message.blocks {
+            if let AssistantBlock::ToolCall { tool_call } = block
+                && let Some(call) = state.tool_calls.get(tool_call)
+            {
+                entries.push(HistoryEntry {
+                    sequence: call.sequence.0,
+                    role: HistoryRole::Tool,
+                    text: call.name.clone(),
+                    steering: false,
+                });
+            }
+        }
+    }
+    entries.sort_by_key(|entry| entry.sequence);
+    entries.truncate(limit);
+    entries
+}
+
+/// The runtime-contract failures a backend reports, mapped onto the published
+/// error codes -- the same four `runtime::protocol::dispatch` distinguishes,
+/// so a native refusal reads identically wherever a caller meets it.
+fn backend_error(error: &(dyn std::error::Error + 'static)) -> ApiError {
+    use super::super::runtime::RuntimeError;
+
+    match error.downcast_ref::<RuntimeError>() {
+        Some(RuntimeError::Unsupported(what)) => ApiError::new(ErrorCode::Unsupported, what),
+        Some(RuntimeError::UnknownSession(id)) => ApiError::new(
+            ErrorCode::UnknownSession,
+            format!("unknown session: {id}"),
+        ),
+        Some(RuntimeError::Busy(id)) => ApiError::new(
+            ErrorCode::Busy,
+            format!("a turn is already in flight for {id}"),
+        ),
+        Some(RuntimeError::StaleGeneration { expected, got }) => ApiError::new(
+            ErrorCode::StaleGeneration,
+            format!("session is at generation {expected}, not {got}"),
+        ),
+        None => ApiError::new(ErrorCode::Internal, error.to_string()),
+    }
+}

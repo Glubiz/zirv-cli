@@ -86,6 +86,23 @@ pub enum Method {
     SessionResize,
     #[serde(rename = "session.screen")]
     SessionScreen,
+    /// Issue #489: the five native verbs. Submit and steer are NOT here --
+    /// they are `session.send_input`'s existing `submit`/`steer` modes, and a
+    /// second way to say "here is input for this session" would be a second
+    /// authorization path to keep in step with the first. What is here is what
+    /// a native session can do that a pty cannot: cancel a turn without ending
+    /// the session, decide an approval, report a delegated task's outcome,
+    /// read the conversation, and page the durable journal by cursor.
+    #[serde(rename = "session.interrupt")]
+    SessionInterrupt,
+    #[serde(rename = "session.approve")]
+    SessionApprove,
+    #[serde(rename = "session.task_result")]
+    SessionTaskResult,
+    #[serde(rename = "session.history")]
+    SessionHistory,
+    #[serde(rename = "session.journal")]
+    SessionJournal,
     #[serde(rename = "events.subscribe")]
     EventsSubscribe,
     /// Forward-compat fallback: a method name this build has never heard of.
@@ -113,6 +130,11 @@ impl Method {
             Method::SessionTakeover => "session.takeover",
             Method::SessionResize => "session.resize",
             Method::SessionScreen => "session.screen",
+            Method::SessionInterrupt => "session.interrupt",
+            Method::SessionApprove => "session.approve",
+            Method::SessionTaskResult => "session.task_result",
+            Method::SessionHistory => "session.history",
+            Method::SessionJournal => "session.journal",
             Method::EventsSubscribe => "events.subscribe",
             Method::Unknown => "unknown",
         }
@@ -168,6 +190,16 @@ pub enum Capability {
     /// difference through a failed round trip.
     #[serde(rename = "session.attach")]
     SessionAttach,
+    /// Issue #489: `session.interrupt|approve|task_result|history|journal` --
+    /// the surface a client needs when the session on the other end is a
+    /// NATIVE conversation rather than a supervised harness process.
+    /// Advertised only by a server with a native host attached (`zirv session
+    /// serve`), so a client that never heard of native sessions negotiates the
+    /// whole surface away instead of discovering it through a failed round
+    /// trip, and a client that knows it disables it locally against an older
+    /// server.
+    #[serde(rename = "session.native")]
+    SessionNative,
     /// `events.subscribe`.
     #[serde(rename = "events.subscribe")]
     EventsSubscribe,
@@ -190,6 +222,7 @@ impl Capability {
             Capability::SessionWait => "session.wait",
             Capability::SessionReportStatus => "session.report_status",
             Capability::SessionAttach => "session.attach",
+            Capability::SessionNative => "session.native",
             Capability::EventsSubscribe => "events.subscribe",
             Capability::Idempotency => "idempotency",
             Capability::Unknown => "unknown",
@@ -358,6 +391,144 @@ pub struct ScreenView {
     /// TUI). A client must not paint its own chrome over one.
     pub alternate: bool,
     pub contents: String,
+}
+
+// ---------------------------------------------------------------------------
+// Native sessions (issue #489)
+// ---------------------------------------------------------------------------
+
+/// What a controller decides about one pending native approval. Deliberately
+/// two values: an "allow always" that widened policy from a socket would be a
+/// repository-reachable way to broaden authority, and repository-owned
+/// surfaces may only ever NARROW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Allow,
+    #[default]
+    Deny,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The terminal state a client reports for a delegated native task. Mirrors
+/// `runtime::journal::TaskReceiptState`, which is what it is recorded as --
+/// a separate published vocabulary because the journal's is an internal type
+/// a third party must not be pinned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    Accepted,
+    Started,
+    Blocked,
+    #[default]
+    Completed,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Who produced one history entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRole {
+    #[default]
+    User,
+    Assistant,
+    /// A tool call the assistant made. `text` names the tool and the state its
+    /// execution reached -- never its arguments and never its result, both of
+    /// which routinely carry file contents and credentials.
+    Tool,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One entry of a native conversation, as the protocol publishes it.
+///
+/// This is the ONE place v1 publishes conversation text, and it is reachable
+/// only through `session.history`, only under [`Capability::SessionNative`],
+/// and only for a caller holding the session's controller seat once anybody is
+/// attached. It is deliberately not part of [`SessionFacts`], so no snapshot,
+/// list or event frame ever carries a word of it -- the rule "no transcript
+/// bodies in snapshots by default" stays enforced by the types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// The journal sequence this entry was committed at: the cursor a client
+    /// pages from, and the same numbering `session.journal` uses.
+    pub sequence: u64,
+    pub role: HistoryRole,
+    pub text: String,
+    /// True for input that joined a turn already in flight.
+    #[serde(default)]
+    pub steering: bool,
+}
+
+/// One durable native event, reduced to what a client can act on: the journal
+/// sequence, the generation it belongs to, the event kind, and a short
+/// redacted descriptor. Payloads stay in the journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEvent {
+    pub sequence: u64,
+    pub generation: u64,
+    /// The journal event kind (`input_acknowledged`, `tool_execution`, ...).
+    pub kind: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// A bounded page of a native session's durable event stream.
+///
+/// The cursor discipline is the whole point (issue #489, item 3): a client
+/// reconnecting after a crash asks from the last `cursor` it durably applied.
+/// If the journal can no longer start there, `gap` is true and the client must
+/// resynchronize from `session.history` rather than applying a page it cannot
+/// place -- the same "refresh a snapshot, never drift" rule the server-wide
+/// revision already gives a live subscriber, expressed against the durable
+/// sequence that survives a service restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NativePage {
+    pub session_id: String,
+    pub generation: u64,
+    /// The cursor the caller asked from.
+    pub after_sequence: u64,
+    /// The cursor to pass next time. Equal to `after_sequence` for an empty
+    /// page, so a caller that polls never moves backwards.
+    pub cursor: u64,
+    /// The newest sequence the journal holds, so a client can tell "caught up"
+    /// from "there is more" without a second call.
+    pub last_sequence: u64,
+    /// The caller's cursor cannot be continued from: resynchronize.
+    #[serde(default)]
+    pub gap: bool,
+    pub events: Vec<NativeEvent>,
+}
+
+/// A bounded page of a native session's conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NativeHistory {
+    pub session_id: String,
+    pub generation: u64,
+    /// The sequence to ask from next.
+    pub cursor: u64,
+    pub last_sequence: u64,
+    pub entries: Vec<HistoryEntry>,
+}
+
+/// What a durable input acknowledgement reports back, over and above
+/// `accepted`.
+///
+/// `message_id` is the identity the input was recorded under. A retry carrying
+/// the same `idempotency_key` gets the SAME id back with `duplicate: true` and
+/// no second input in the journal -- which is what makes "a reconnect never
+/// duplicates submitted work" a property of durable state rather than of a
+/// server's memory, the server's own in-memory idempotency cache being bounded
+/// and lost on restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InputAck {
+    pub message_id: String,
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +833,18 @@ const COLS_IN: FieldSpec = FieldSpec {
     required: false,
     doc: "the controller's own terminal width; ignored for an observer",
 };
+/// Issue #489. Optional on the wire and enforced conditionally: a native
+/// session that NOBODY has attached to is driven by whoever can reach the
+/// owner-only endpoint, exactly as it was before this issue. The moment any
+/// client attaches, seats exist to arbitrate, and every mutation must name a
+/// `client_id` that holds the controller seat -- so an observer cannot mutate
+/// by attaching, and cannot mutate by omitting the field either.
+const CONTROLLER_ID: FieldSpec = FieldSpec {
+    name: "client_id",
+    ty: "string",
+    required: false,
+    doc: "the calling client's own id; required once any client is attached, and it must be the controller",
+};
 const ATTACHMENT_OUT: FieldSpec = FieldSpec {
     name: "attachment",
     ty: "attachment",
@@ -930,12 +1113,29 @@ pub static METHODS: &[MethodSpec] = &[
                 doc: "required for mode=raw: only the session's controller may type into it",
             },
         ],
-        result: &[FieldSpec {
-            name: "accepted",
-            ty: "boolean",
-            required: true,
-            doc: "",
-        }],
+        result: &[
+            FieldSpec {
+                name: "accepted",
+                ty: "boolean",
+                required: true,
+                doc: "",
+            },
+            // Issue #489: present only for a session a native host owns, where
+            // the acknowledgement is durable and therefore has an identity to
+            // report. A pty session's keystroke has neither.
+            FieldSpec {
+                name: "message_id",
+                ty: "string",
+                required: false,
+                doc: "native sessions: the durable identity this input was recorded under",
+            },
+            FieldSpec {
+                name: "duplicate",
+                ty: "boolean",
+                required: false,
+                doc: "native sessions: true when an idempotency_key replayed an input already on disk, so no second turn was queued",
+            },
+        ],
     },
     MethodSpec {
         method: Method::SessionWait,
@@ -1084,6 +1284,176 @@ pub static METHODS: &[MethodSpec] = &[
         ],
     },
     MethodSpec {
+        method: Method::SessionInterrupt,
+        name: "session.interrupt",
+        summary: "Cancel the turn in flight on a native session. The session stays alive and idle -- this is not `session.stop`.",
+        mutation: true,
+        capability: Capability::SessionNative,
+        params: &[SESSION_ID, GENERATION_IN, CONTROLLER_ID],
+        result: &[FieldSpec {
+            name: "interrupted",
+            ty: "boolean",
+            required: true,
+            doc: "false when no turn was in flight",
+        }],
+    },
+    MethodSpec {
+        method: Method::SessionApprove,
+        name: "session.approve",
+        summary: "Decide one pending approval on a native session. Controller only.",
+        mutation: true,
+        capability: Capability::SessionNative,
+        params: &[
+            SESSION_ID,
+            GENERATION_IN,
+            CONTROLLER_ID,
+            FieldSpec {
+                name: "request_id",
+                ty: "string",
+                required: true,
+                doc: "the pending approval this decision answers",
+            },
+            FieldSpec {
+                name: "decision",
+                ty: "approval_decision",
+                required: true,
+                doc: "allow or deny; there is no allow-always on this wire",
+            },
+            FieldSpec {
+                name: "note",
+                ty: "string",
+                required: false,
+                doc: "an operator note recorded with the decision",
+            },
+        ],
+        result: &[FieldSpec {
+            name: "recorded",
+            ty: "boolean",
+            required: true,
+            doc: "",
+        }],
+    },
+    MethodSpec {
+        method: Method::SessionTaskResult,
+        name: "session.task_result",
+        summary: "Record the outcome of a delegated native task against the session's durable journal.",
+        mutation: true,
+        capability: Capability::SessionNative,
+        params: &[
+            SESSION_ID,
+            GENERATION_IN,
+            CONTROLLER_ID,
+            FieldSpec {
+                name: "task_id",
+                ty: "string",
+                required: true,
+                doc: "the shared task card id",
+            },
+            FieldSpec {
+                name: "outcome",
+                ty: "task_outcome",
+                required: true,
+                doc: "the state to record",
+            },
+            FieldSpec {
+                name: "receipt",
+                ty: "object",
+                required: false,
+                doc: "the structured receipt body, recorded verbatim",
+            },
+        ],
+        result: &[FieldSpec {
+            name: "recorded",
+            ty: "boolean",
+            required: true,
+            doc: "",
+        }],
+    },
+    MethodSpec {
+        method: Method::SessionHistory,
+        name: "session.history",
+        summary: "One native session's conversation, by journal cursor. The only method that publishes conversation text.",
+        mutation: false,
+        capability: Capability::SessionNative,
+        params: &[
+            SESSION_ID,
+            CONTROLLER_ID,
+            FieldSpec {
+                name: "after_sequence",
+                ty: "integer",
+                required: false,
+                doc: "return entries strictly newer than this journal sequence, default 0",
+            },
+            FieldSpec {
+                name: "limit",
+                ty: "integer",
+                required: false,
+                doc: "maximum entries in this page; clamped to the server's own bound",
+            },
+        ],
+        result: &[
+            FieldSpec {
+                name: "session_id",
+                ty: "string",
+                required: true,
+                doc: "",
+            },
+            FieldSpec {
+                name: "generation",
+                ty: "integer",
+                required: true,
+                doc: "the generation this history is current at",
+            },
+            FieldSpec {
+                name: "cursor",
+                ty: "integer",
+                required: true,
+                doc: "the sequence to ask from next",
+            },
+            FieldSpec {
+                name: "last_sequence",
+                ty: "integer",
+                required: true,
+                doc: "the newest sequence the journal holds",
+            },
+            FieldSpec {
+                name: "entries",
+                ty: "array",
+                required: true,
+                doc: "history_entry objects: role, text and the sequence each was committed at",
+            },
+        ],
+    },
+    MethodSpec {
+        method: Method::SessionJournal,
+        name: "session.journal",
+        summary: "A bounded page of a native session's durable event stream, by cursor, with an explicit gap signal.",
+        mutation: false,
+        capability: Capability::SessionNative,
+        params: &[
+            SESSION_ID,
+            CONTROLLER_ID,
+            FieldSpec {
+                name: "after_sequence",
+                ty: "integer",
+                required: false,
+                doc: "return events strictly newer than this journal sequence, default 0",
+            },
+            FieldSpec {
+                name: "limit",
+                ty: "integer",
+                required: false,
+                doc: "maximum events in this page; clamped to the server's own bound",
+            },
+        ],
+        result: &[FieldSpec {
+            name: "page",
+            ty: "native_page",
+            required: true,
+            doc: "the events, the next cursor, the newest sequence, and whether the caller's cursor was continuable",
+        }],
+    },
+    MethodSpec {
         method: Method::EventsSubscribe,
         name: "events.subscribe",
         summary: "Stream event frames on this connection from after_revision onward until it closes.",
@@ -1125,6 +1495,7 @@ pub static ADVERTISED: &[Capability] = &[
     Capability::SessionWait,
     Capability::SessionReportStatus,
     Capability::SessionAttach,
+    Capability::SessionNative,
     Capability::EventsSubscribe,
     Capability::Idempotency,
 ];
@@ -1172,6 +1543,11 @@ mod tests {
             Method::SessionTakeover,
             Method::SessionResize,
             Method::SessionScreen,
+            Method::SessionInterrupt,
+            Method::SessionApprove,
+            Method::SessionTaskResult,
+            Method::SessionHistory,
+            Method::SessionJournal,
             Method::EventsSubscribe,
         ];
         for method in every {
@@ -1245,6 +1621,68 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Outcome>(r#"{"status":"levitating"}"#).expect("parse"),
             Outcome::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<ApprovalDecision>("\"levitate\"").expect("parse"),
+            ApprovalDecision::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskOutcome>("\"levitate\"").expect("parse"),
+            TaskOutcome::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<HistoryRole>("\"levitate\"").expect("parse"),
+            HistoryRole::Unknown
+        );
+    }
+
+    /// Issue #489: conversation text is publishable only through
+    /// `session.history`, which is gated on the native capability. Every other
+    /// method's result shape must stay free of it, the same property
+    /// `the_screen_is_reachable_only_through_its_own_method` pins for a
+    /// terminal.
+    #[test]
+    fn conversation_text_is_reachable_only_through_session_history() {
+        let history = spec_for(Method::SessionHistory).expect("spec");
+        assert_eq!(history.capability, Capability::SessionNative);
+        assert!(history.result.iter().any(|field| field.name == "entries"));
+        for spec in METHODS {
+            if spec.method == Method::SessionHistory {
+                continue;
+            }
+            assert!(
+                !spec
+                    .result
+                    .iter()
+                    .any(|field| field.ty == "history_entry" || field.name == "entries"),
+                "{} must not publish conversation entries",
+                spec.name
+            );
+        }
+    }
+
+    /// The native surface is one capability, so a client either has all five
+    /// verbs or none of them -- there is no half-supported native client to
+    /// reason about.
+    #[test]
+    fn every_native_method_sits_behind_the_one_native_capability() {
+        for method in [
+            Method::SessionInterrupt,
+            Method::SessionApprove,
+            Method::SessionTaskResult,
+            Method::SessionHistory,
+            Method::SessionJournal,
+        ] {
+            let spec = spec_for(method).expect("spec");
+            assert_eq!(
+                spec.capability,
+                Capability::SessionNative,
+                "{method} must be gated on session.native"
+            );
+        }
+        assert!(
+            !ADVERTISED_WITHOUT_HOST.contains(&Capability::SessionNative),
+            "a server with no native host must not advertise the native surface"
         );
     }
 

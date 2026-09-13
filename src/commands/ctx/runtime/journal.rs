@@ -1511,6 +1511,49 @@ impl Journal {
         read_events(&self.conn, session)
     }
 
+    /// One bounded page of a session's durable events, strictly newer than
+    /// `after`.
+    ///
+    /// Issue #489 (step N20) needs this rather than [`Self::events`] because a
+    /// protocol client pages a live conversation by cursor: reading the whole
+    /// event log to serve the tail of it would make fan-out a function of how
+    /// long the session has been running, and would put an hour of journal
+    /// into one frame.
+    pub fn events_after(
+        &self,
+        session: &JournalSessionId,
+        after: SequenceId,
+        limit: usize,
+    ) -> JournalResult<Vec<StoredEvent>> {
+        // Same reason as `events`: prove the session exists, so "unknown
+        // session" and "no events past your cursor" stay distinguishable.
+        let _ = self.session(session)?;
+        read_events_after(&self.conn, session, after, limit)
+    }
+
+    /// The oldest and newest sequence this journal still holds for `session`,
+    /// as `(first, last)`; `(0, 0)` for a session with no events yet.
+    ///
+    /// The first half is what makes a GAP detectable: a caller whose cursor is
+    /// older than `first - 1` cannot be continued from and has to
+    /// resynchronize from a snapshot instead of applying a page it cannot
+    /// place.
+    pub fn sequence_bounds(
+        &self,
+        session: &JournalSessionId,
+    ) -> JournalResult<(SequenceId, SequenceId)> {
+        let _ = self.session(session)?;
+        let (first, last): (Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT MIN(sequence), MAX(sequence) FROM native_events WHERE session_id = ?1",
+            [session.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            SequenceId(rust_u64(first.unwrap_or(0), "sequence")?),
+            SequenceId(rust_u64(last.unwrap_or(0), "sequence")?),
+        ))
+    }
+
     pub fn replay(&self, session: &JournalSessionId) -> JournalResult<ConversationState> {
         let identity = self.session(session)?;
         let events = read_events(&self.conn, session)?;
@@ -2195,31 +2238,70 @@ fn read_events(conn: &Connection, session: &JournalSessionId) -> JournalResult<V
     })?;
     let mut events = Vec::new();
     for row in rows {
-        let raw = row?;
-        let sequence = rust_u64(raw.sequence, "sequence")?;
-        let event: JournalEvent = serde_json::from_str(&raw.payload).map_err(|error| {
-            JournalError::Corrupt(format!("event payload at sequence {sequence}: {error}"))
-        })?;
-        if event.kind() != raw.event_type {
-            return Err(JournalError::Corrupt(format!(
-                "event type {:?} disagrees with payload {} at sequence {sequence}",
-                raw.event_type,
-                event.kind()
-            )));
-        }
-        events.push(StoredEvent {
-            sequence: SequenceId(sequence),
-            generation: rust_u64(raw.generation, "generation")?,
-            scope: EventScope {
-                turn: raw.turn.map(TurnId::new).transpose()?,
-                attempt: raw.attempt.map(RequestAttemptId::new).transpose()?,
-                task: raw.task.map(TaskId::new).transpose()?,
-            },
-            committed_at: rust_u64(raw.committed_at, "committed_at")?,
-            event,
-        });
+        events.push(decode_event(row?)?);
     }
     Ok(events)
+}
+
+/// The bounded, cursor-started form of [`read_events`] (issue #489). Same
+/// decoder, same ordering; only the `WHERE` and the `LIMIT` differ, so the two
+/// can never disagree about how a stored row becomes a [`StoredEvent`].
+fn read_events_after(
+    conn: &Connection,
+    session: &JournalSessionId,
+    after: SequenceId,
+    limit: usize,
+) -> JournalResult<Vec<StoredEvent>> {
+    let after = sql_u64(after.0, "sequence")?;
+    let limit = sql_u64(limit as u64, "limit")?;
+    let mut stmt = conn.prepare(
+        "SELECT sequence, generation, event_type, turn_id, attempt_id, task_id,
+                payload_json, committed_at
+         FROM native_events WHERE session_id = ?1 AND sequence > ?2
+         ORDER BY sequence LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![session.as_str(), after, limit], |row| {
+        Ok(RawEvent {
+            sequence: row.get(0)?,
+            generation: row.get(1)?,
+            event_type: row.get(2)?,
+            turn: row.get(3)?,
+            attempt: row.get(4)?,
+            task: row.get(5)?,
+            payload: row.get(6)?,
+            committed_at: row.get(7)?,
+        })
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(decode_event(row?)?);
+    }
+    Ok(events)
+}
+
+fn decode_event(raw: RawEvent) -> JournalResult<StoredEvent> {
+    let sequence = rust_u64(raw.sequence, "sequence")?;
+    let event: JournalEvent = serde_json::from_str(&raw.payload).map_err(|error| {
+        JournalError::Corrupt(format!("event payload at sequence {sequence}: {error}"))
+    })?;
+    if event.kind() != raw.event_type {
+        return Err(JournalError::Corrupt(format!(
+            "event type {:?} disagrees with payload {} at sequence {sequence}",
+            raw.event_type,
+            event.kind()
+        )));
+    }
+    Ok(StoredEvent {
+        sequence: SequenceId(sequence),
+        generation: rust_u64(raw.generation, "generation")?,
+        scope: EventScope {
+            turn: raw.turn.map(TurnId::new).transpose()?,
+            attempt: raw.attempt.map(RequestAttemptId::new).transpose()?,
+            task: raw.task.map(TaskId::new).transpose()?,
+        },
+        committed_at: rust_u64(raw.committed_at, "committed_at")?,
+        event,
+    })
 }
 
 struct RawEvent {

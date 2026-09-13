@@ -19,8 +19,9 @@ use std::io::Write;
 use serde_json::{Map, Value, json};
 
 use super::wire::{
-    self, ADVERTISED, ApiEvent, AttachMode, AttachRole, Capability, ErrorCode, FieldSpec,
-    InputMode, Method, PROTOCOL_VERSION, SERVER_NAME, SessionFacts, SessionState, WaitUntil,
+    self, ADVERTISED, ApiEvent, ApprovalDecision, AttachMode, AttachRole, Capability, ErrorCode,
+    FieldSpec, HistoryRole, InputMode, Method, PROTOCOL_VERSION, SERVER_NAME, SessionFacts,
+    SessionState, TaskOutcome, WaitUntil,
 };
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::runtime::{RuntimeKind, UiSurface};
@@ -84,6 +85,35 @@ pub fn vocabularies() -> Vec<(&'static str, Vec<String>)> {
                 AttachRole::Observer,
                 AttachRole::Detached,
                 AttachRole::Unknown,
+            ]),
+        ),
+        (
+            "approval_decision",
+            names(&[
+                ApprovalDecision::Allow,
+                ApprovalDecision::Deny,
+                ApprovalDecision::Unknown,
+            ]),
+        ),
+        (
+            "task_outcome",
+            names(&[
+                TaskOutcome::Accepted,
+                TaskOutcome::Started,
+                TaskOutcome::Blocked,
+                TaskOutcome::Completed,
+                TaskOutcome::Failed,
+                TaskOutcome::Cancelled,
+                TaskOutcome::Unknown,
+            ]),
+        ),
+        (
+            "history_role",
+            names(&[
+                HistoryRole::User,
+                HistoryRole::Assistant,
+                HistoryRole::Tool,
+                HistoryRole::Unknown,
             ]),
         ),
         (
