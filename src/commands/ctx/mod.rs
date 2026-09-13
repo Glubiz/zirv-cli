@@ -38,6 +38,7 @@ pub(crate) mod hook_project;
 pub mod judge;
 pub mod learn;
 pub mod ledger;
+pub mod lifecycle;
 pub mod log;
 pub mod mail;
 pub mod measure;
