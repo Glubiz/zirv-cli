@@ -13,7 +13,21 @@ use super::options::Options;
 pub struct AgentCommand {
     /// Adapter name, e.g. "claude". Passed straight to the ctx exec supervisor
     /// as `--agent`.
+    ///
+    /// Under `runtime: native` this is read as the provider ROUTE instead --
+    /// the same repurposing `zirv agent --runtime native` applies to its own
+    /// positional -- and the reserved value `native` defers to the operator's
+    /// `[roles]` entry for the worker role.
     pub agent: String,
+    /// Which runtime runs the step (issue #484, roadmap N15): `harness` (the
+    /// default -- zirv supervises an external coding-agent process, exactly as
+    /// this step always has) or `native` -- zirv conducts the conversation
+    /// itself over a direct provider route, with no coding harness installed.
+    ///
+    /// `#[serde(default)]`: every script written before this field existed
+    /// keeps running on the harness, unchanged.
+    #[serde(default)]
+    pub runtime: Option<String>,
     /// The task prompt. Supports the same `${var}` substitution as `command`,
     /// including the unresolved-placeholder hard error.
     pub prompt: String,
@@ -49,6 +63,17 @@ impl AgentCommand {
     /// Called at load time, so `--dry-run` and the real run reject the same
     /// scripts: a dry run that reports success for a script that can never
     /// execute is worse than no dry run.
+    /// Which runtime this step selects, refusing an unrecognised value rather
+    /// than falling back to a harness the script did not ask for.
+    fn runtime(&self) -> Result<crate::commands::ctx::runtime::RuntimeKind, String> {
+        match self.runtime.as_deref() {
+            None => Ok(crate::commands::ctx::runtime::RuntimeKind::Harness),
+            Some(value) => {
+                crate::commands::ctx::runtime::selected(value).map_err(|error| error.to_string())
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.capture.is_some() {
             return Err("agent steps do not support 'capture'".to_string());
@@ -68,6 +93,20 @@ impl AgentCommand {
                 "'flags' are passed to the agent's own CLI, so they must start with '-'; \
                  got '{first}'"
             ));
+        }
+        if self.runtime()? == crate::commands::ctx::runtime::RuntimeKind::Native {
+            // A native step has no vendor CLI, so there is no adapter to look
+            // up and nothing for `flags` to reach. Refused rather than
+            // silently dropped: a script whose flags do nothing is a script
+            // whose author believes they do something.
+            if self.flags.as_ref().is_some_and(|flags| !flags.is_empty()) {
+                return Err(
+                    "'flags' are passed to the agent's own CLI, which a native agent step does \
+                     not have; remove them or use runtime: harness"
+                        .to_string(),
+                );
+            }
+            return Ok(());
         }
         crate::commands::ctx::adapters::all(None)
             .iter()
@@ -142,11 +181,17 @@ impl AgentCommand {
         let prompt = prompt.to_string();
         let flags = self.flags.clone().unwrap_or_default();
         let repo = resolve_repo(cwd);
+        let native = self.runtime()? == crate::commands::ctx::runtime::RuntimeKind::Native;
 
-        let code =
-            tokio::task::spawn_blocking(move || run_supervised(&agent, &prompt, &flags, &repo))
-                .await
-                .map_err(|e| format!("agent task panicked: {e}"))??;
+        let code = tokio::task::spawn_blocking(move || {
+            if native {
+                run_native(&agent, &prompt, &repo)
+            } else {
+                run_supervised(&agent, &prompt, &flags, &repo)
+            }
+        })
+        .await
+        .map_err(|e| format!("agent task panicked: {e}"))??;
 
         if code == 0 {
             return Ok(());
@@ -159,6 +204,32 @@ fn resolve_repo(cwd: Option<&str>) -> PathBuf {
     cwd.map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Runs the step on zirv's own runtime (issue #484, roadmap N15) through the
+/// exact entry point `zirv ctx exec --runtime native` uses, so a native agent
+/// step gets the same journal, broker, tool registry and structured exit code.
+///
+/// `${var}` substitution, secrets, `options`, `fallback`, `proceed_on_failure`
+/// and the exit-code contract are all resolved by this step's caller and are
+/// identical on both runtimes: the only thing `runtime:` changes is which
+/// machinery conducts the conversation.
+fn run_native(route: &str, prompt: &str, repo: &Path) -> Result<i32, String> {
+    use crate::commands::ctx::config::env_from_process;
+    use crate::commands::ctx::exec::{self, ExecArgs};
+    use crate::commands::ctx::runtime::RuntimeKind;
+
+    // The reserved value `native` means "use the operator's own `[roles]`
+    // entry", the same convention `zirv agent --runtime native` uses.
+    let route = (route != RuntimeKind::Native.as_str()).then(|| route.to_string());
+    let args = ExecArgs {
+        runtime: RuntimeKind::Native.as_str().to_string(),
+        route,
+        prompt: Some(prompt.to_string()),
+        ..Default::default()
+    };
+    let mut out = std::io::stdout();
+    exec::run_with(&args, &mut out, repo, &env_from_process()).map_err(|e| e.to_string())
 }
 
 /// Builds the same `ExecArgs` a `zirv ctx exec --agent <agent> --prompt
@@ -251,6 +322,7 @@ mod tests {
     fn agent_step(prompt: &str) -> AgentCommand {
         AgentCommand {
             agent: "claude".to_string(),
+            runtime: None,
             prompt: prompt.to_string(),
             flags: None,
             description: None,
@@ -268,6 +340,65 @@ mod tests {
         assert_eq!(
             cmd.flags,
             Some(vec!["--model".to_string(), "sonnet".to_string()])
+        );
+    }
+
+    /// Issue #484 (roadmap N15) item 5: `runtime:` is an OPTIONAL field, so
+    /// every script written before it existed keeps running exactly as it did
+    /// -- on the harness, with its adapter validated and its flags passed
+    /// through. A default that silently changed which machinery ran a step
+    /// would be the worst possible outcome for this field.
+    #[test]
+    fn an_existing_script_step_keeps_its_harness_runtime_and_flags() {
+        let yaml = "agent: claude\nprompt: go\nflags: [\"--model\", \"sonnet\"]\n";
+        let cmd: AgentCommand = serde_yaml_ng::from_str(yaml).expect("valid yaml");
+        assert_eq!(cmd.runtime, None);
+        assert_eq!(
+            cmd.runtime().unwrap(),
+            crate::commands::ctx::runtime::RuntimeKind::Harness
+        );
+        cmd.validate()
+            .expect("an unchanged harness step still validates");
+    }
+
+    /// A native step names a provider route, has no vendor CLI, and therefore
+    /// no adapter to validate and nothing for `flags` to reach. Flags are
+    /// refused rather than silently ignored.
+    #[test]
+    fn a_native_step_needs_no_adapter_and_refuses_harness_flags() {
+        let yaml = "agent: fast-route\nruntime: native\nprompt: go\n";
+        let cmd: AgentCommand = serde_yaml_ng::from_str(yaml).expect("valid yaml");
+        assert_eq!(
+            cmd.runtime().unwrap(),
+            crate::commands::ctx::runtime::RuntimeKind::Native
+        );
+        cmd.validate()
+            .expect("a route name is not an adapter name and must not be looked up as one");
+
+        let with_flags: AgentCommand = serde_yaml_ng::from_str(
+            "agent: fast-route\nruntime: native\nprompt: go\nflags: [\"--model\"]\n",
+        )
+        .expect("valid yaml");
+        let error = with_flags.validate().expect_err("flags must be refused");
+        assert!(
+            error.contains("native agent step does not have"),
+            "got {error}"
+        );
+    }
+
+    /// An unrecognised runtime is a load-time error, so `--dry-run` and the
+    /// real run reject the same script.
+    #[test]
+    fn an_unknown_step_runtime_is_refused_at_load_time() {
+        let cmd: AgentCommand =
+            serde_yaml_ng::from_str("agent: claude\nruntime: wasm\nprompt: go\n")
+                .expect("valid yaml");
+        let error = cmd
+            .validate()
+            .expect_err("an unknown runtime must not load");
+        assert!(
+            error.contains("expected `harness` or `native`"),
+            "got {error}"
         );
     }
 

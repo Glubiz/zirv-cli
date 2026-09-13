@@ -267,6 +267,7 @@ mod tests {
         ]);
         script.commands.push(CommandTypes::Agent(AgentCommand {
             agent: "claude".to_string(),
+            runtime: None,
             prompt: "use ${token} with ${param} ${captured}".to_string(),
             flags: None,
             description: None,
@@ -422,6 +423,7 @@ mod tests {
             secrets: None,
             commands: vec![CommandTypes::Agent(AgentCommand {
                 agent: "codex".to_string(),
+                runtime: None,
                 prompt: "do the work".to_string(),
                 flags: None,
                 description: None,
@@ -471,6 +473,7 @@ mod tests {
                 }),
                 CommandTypes::Agent(AgentCommand {
                     agent: "claude".to_string(),
+                    runtime: None,
                     prompt: "do the work".to_string(),
                     flags: None,
                     description: None,
@@ -493,6 +496,7 @@ mod tests {
         let filtered_out = Script {
             commands: vec![CommandTypes::Agent(AgentCommand {
                 agent: "claude".to_string(),
+                runtime: None,
                 prompt: "do the work".to_string(),
                 flags: None,
                 description: None,

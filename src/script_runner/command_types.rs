@@ -674,6 +674,7 @@ commands:
     fn agent_step_display_substitutes_the_prompt() {
         let step = CommandTypes::Agent(AgentCommand {
             agent: "claude".to_string(),
+            runtime: None,
             prompt: "Fix ${dir}".to_string(),
             flags: None,
             description: None,
@@ -691,6 +692,7 @@ commands:
     fn agent_step_description_is_read_from_the_step() {
         let step = CommandTypes::Agent(AgentCommand {
             agent: "claude".to_string(),
+            runtime: None,
             prompt: "go".to_string(),
             flags: None,
             description: Some("fixes tests".to_string()),
