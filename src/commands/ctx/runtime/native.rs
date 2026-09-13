@@ -2789,6 +2789,39 @@ pub fn run_session<W: std::io::Write>(
     // fails before any seat, journal session or effect exists.
     let task = request.task.clone().map(TaskId::new).transpose()?;
 
+    // Issue #485 (roadmap N16) item 7: a COORDINATING session picks its own
+    // graph back up before it does anything else -- every terminal worker
+    // outcome published while it was away is consumed exactly once
+    // (`delegation::consume_delivery` is the mechanism, not a second one) and
+    // folded into the durable graph. A settled node is never re-settled, so a
+    // restarted coordinator neither loses a receipt nor restarts finished
+    // work. A worker session has no graph to resume and is left alone.
+    if matches!(
+        super::super::team::prompt_role(request.role),
+        super::super::prompt::PromptRole::Orchestrator
+            | super::super::prompt::PromptRole::SubOrchestrator
+    ) {
+        let mut graph = super::super::coordinator::load(&state, request.repo);
+        match super::super::coordinator::consume_pending(&state, request.repo, &mut graph, now) {
+            Ok(consumed) if !consumed.is_empty() => {
+                let _ = super::super::coordinator::store(&state, request.repo, &graph);
+                let _ = writeln!(
+                    w,
+                    "zirv ctx: resumed the coordinator graph -- consumed {} pending worker \
+                     receipt(s)",
+                    consumed.len()
+                );
+            }
+            Ok(_) => {}
+            // A graph that cannot be read must never stop a session from
+            // starting: the delegation records are still authoritative and
+            // `team_status` will say what it can see.
+            Err(error) => {
+                let _ = writeln!(w, "zirv ctx: could not resume the coordinator graph: {error}");
+            }
+        }
+    }
+
     let (provider, mut tools, route, brokered) =
         build_transport(request, &state, &home, &cfg, env)?;
 

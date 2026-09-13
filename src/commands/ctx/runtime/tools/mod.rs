@@ -11,6 +11,7 @@ mod capability;
 pub mod delegation;
 mod files;
 mod process;
+pub mod team;
 mod workflow;
 
 use std::collections::BTreeMap;
@@ -35,6 +36,9 @@ use self::files::{
 use self::process::{
     ProcessHandleArgs, ProcessLimits, ProcessManager, ProcessStartArgs, ProcessWaitArgs,
     ProcessWriteArgs,
+};
+use self::team::{
+    CardFilter, GroupCreateArgs, GroupStatusArgs, TaskCreateArgs, TaskIdArgs, TaskListArgs,
 };
 use self::workflow::{WorkflowAdvanceArgs, WorkflowLookupArgs};
 use super::capabilities::{CapabilityError, CapabilityServices};
@@ -85,6 +89,9 @@ pub const WORKFLOW_STATUS: &str = "workflow_status";
 pub const WORKFLOW_CONTEXT: &str = "workflow_context";
 pub const WORKFLOW_ADVANCE: &str = "workflow_advance";
 pub const WORKFLOW_APPROVE: &str = "workflow_approve";
+pub use team::{
+    GROUP_CREATE, GROUP_STATUS, OBJECTIVE_STATUS, TASK_CLAIM, TASK_CREATE, TASK_LIST, TEAM_STATUS,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -346,6 +353,13 @@ impl ToolRegistry {
             WORKFLOW_CONTEXT => parse!(WorkflowContext, WorkflowLookupArgs),
             WORKFLOW_ADVANCE => parse!(WorkflowAdvance, WorkflowAdvanceArgs),
             WORKFLOW_APPROVE => parse!(WorkflowApprove, WorkflowLookupArgs),
+            TASK_CREATE => parse!(TaskCreate, TaskCreateArgs),
+            TASK_CLAIM => parse!(TaskClaim, TaskIdArgs),
+            TASK_LIST => parse!(TaskList, TaskListArgs),
+            GROUP_CREATE => parse!(GroupCreate, GroupCreateArgs),
+            GROUP_STATUS => parse!(GroupStatus, GroupStatusArgs),
+            OBJECTIVE_STATUS => parse!(ObjectiveStatus, EmptyArgs),
+            TEAM_STATUS => parse!(TeamStatus, EmptyArgs),
             _ => unreachable!("registry membership and parser match stay in lockstep"),
         }?;
         parsed.validate()?;
@@ -468,6 +482,13 @@ enum ParsedTool {
     WorkflowContext(WorkflowLookupArgs),
     WorkflowAdvance(WorkflowAdvanceArgs),
     WorkflowApprove(WorkflowLookupArgs),
+    TaskCreate(TaskCreateArgs),
+    TaskClaim(TaskIdArgs),
+    TaskList(TaskListArgs),
+    GroupCreate(GroupCreateArgs),
+    GroupStatus(GroupStatusArgs),
+    ObjectiveStatus(EmptyArgs),
+    TeamStatus(EmptyArgs),
 }
 
 impl ParsedTool {
@@ -611,6 +632,16 @@ impl ParsedTool {
             | Self::WorkflowContext(args)
             | Self::WorkflowApprove(args) => workflow_id(args.id.as_deref()),
             Self::WorkflowAdvance(args) => workflow_id(args.id.as_deref()),
+            // Issue #485: ids that name a durable record are validated here,
+            // at the boundary, rather than left for the store to reject.
+            Self::TaskCreate(args) => args.validate(),
+            Self::TaskClaim(args) => team::validate_id(&args.task, "task"),
+            Self::TaskList(_) | Self::ObjectiveStatus(_) | Self::TeamStatus(_) => Ok(()),
+            Self::GroupCreate(args) => args.validate(),
+            Self::GroupStatus(args) => match &args.group {
+                Some(group) => team::validate_id(group, "group"),
+                None => Ok(()),
+            },
             Self::McpCall(args) => {
                 non_empty(&args.server, "server")?;
                 non_empty(&args.tool, "tool")?;
@@ -857,6 +888,59 @@ impl ParsedTool {
                 key: args.id.clone(),
                 write: true,
             },
+            // Issue #485: the task, group, objective and coordinator stores
+            // are shared state on exactly the same footing as the workflow
+            // store above. Minting a card, taking a claim and opening a work
+            // group are writes; reading any of them is inert.
+            Self::TaskCreate(args) => ExecutionAction::Knowledge {
+                service: "task".into(),
+                operation: "create".into(),
+                scope: Some("shared".into()),
+                key: args.group.clone(),
+                write: true,
+            },
+            Self::TaskClaim(args) => ExecutionAction::Knowledge {
+                service: "task".into(),
+                operation: "claim".into(),
+                scope: Some("shared".into()),
+                key: Some(args.task.clone()),
+                write: true,
+            },
+            Self::TaskList(_) => ExecutionAction::Knowledge {
+                service: "task".into(),
+                operation: "list".into(),
+                scope: Some("shared".into()),
+                key: None,
+                write: false,
+            },
+            Self::GroupCreate(_) => ExecutionAction::Knowledge {
+                service: "group".into(),
+                operation: "create".into(),
+                scope: Some("shared".into()),
+                key: None,
+                write: true,
+            },
+            Self::GroupStatus(args) => ExecutionAction::Knowledge {
+                service: "group".into(),
+                operation: "status".into(),
+                scope: Some("shared".into()),
+                key: args.group.clone(),
+                write: false,
+            },
+            Self::ObjectiveStatus(_) => ExecutionAction::Knowledge {
+                service: "objective".into(),
+                operation: "status".into(),
+                scope: Some("shared".into()),
+                key: None,
+                write: false,
+            },
+            Self::TeamStatus(_) => ExecutionAction::Knowledge {
+                service: "coordinator".into(),
+                operation: "status".into(),
+                scope: Some("shared".into()),
+                key: None,
+                write: false,
+            },
         })
     }
 
@@ -884,7 +968,13 @@ impl ParsedTool {
             | Self::McpList(_)
             | Self::McpDescribe(_)
             | Self::WorkflowStatus(_)
-            | Self::WorkflowContext(_) => RetryPolicy::Safe,
+            | Self::WorkflowContext(_)
+            // Reading a card index, a group's terms, the objective or the
+            // coordinator's own graph changes nothing.
+            | Self::TaskList(_)
+            | Self::GroupStatus(_)
+            | Self::ObjectiveStatus(_)
+            | Self::TeamStatus(_) => RetryPolicy::Safe,
             // Each writes durable local evidence, so a repeat has to
             // reconcile with what is already there rather than assume a
             // clean slate.
@@ -899,6 +989,12 @@ impl ParsedTool {
             // first: the caller has to reconcile against the workflow's own
             // current step rather than blindly retry.
             Self::WorkflowAdvance(_) | Self::WorkflowApprove(_) => RetryPolicy::Reconcile,
+            // A blind repeat would mint a SECOND card or a SECOND work group,
+            // and a repeated claim has to be read against the claim that is
+            // already held rather than taken again.
+            Self::TaskCreate(_) | Self::TaskClaim(_) | Self::GroupCreate(_) => {
+                RetryPolicy::Reconcile
+            }
             Self::WriteFile(_)
             | Self::ApplyPatch(_)
             | Self::ProcessWrite(_)
@@ -1570,7 +1666,274 @@ impl NativeToolClient {
             ParsedTool::WorkflowContext(args) => self.workflow_context(args.id.as_deref()),
             ParsedTool::WorkflowAdvance(args) => self.workflow_advance(&args),
             ParsedTool::WorkflowApprove(args) => self.workflow_approve(args.id.as_deref()),
+            ParsedTool::TaskCreate(args) => self.task_create(&args),
+            ParsedTool::TaskClaim(args) => self.task_claim(&args),
+            ParsedTool::TaskList(args) => self.task_list(&args),
+            ParsedTool::GroupCreate(args) => self.group_create(&args),
+            ParsedTool::GroupStatus(args) => self.group_status(args.group.as_deref()),
+            ParsedTool::ObjectiveStatus(_) => self.objective_status(),
+            ParsedTool::TeamStatus(_) => self.team_status(),
         }
+    }
+
+    // -- the team tools (issue #485, roadmap N16) -------------------------
+    //
+    // Each is a thin adaptor over the same shared service the corresponding
+    // CLI verb calls. The coordinator's own graph is updated alongside, by
+    // the service rather than by the model: what was planned and what is
+    // answering for it are facts zirv records, not claims it is told.
+
+    fn task_create(&mut self, args: &TaskCreateArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::{coordinator, task};
+
+        let slug = state::repo_slug(&self.repo);
+        let id = task::create_card(
+            &self.state,
+            &slug,
+            &task::CreateArgs {
+                title: args.title.clone(),
+                brief: args.brief.clone(),
+                parents: args.parents.clone(),
+                group: args.group.clone(),
+                workdir: args.workdir.as_ref().map(PathBuf::from),
+            },
+            state::now_secs(),
+        )
+        .map_err(ToolError::external)?;
+
+        let role = args
+            .role
+            .clone()
+            .unwrap_or_else(|| crate::commands::ctx::team::DEFAULT_ROLE.to_string());
+        let now = state::now_secs();
+        let _ = coordinator::update(&self.state, &self.repo, |graph| {
+            graph.plan(&id, &role, &args.parents, now);
+            graph.decide(&format!("planned {id} for role {role}: {}", args.title), now);
+        });
+        Ok(json!({"task": id, "role": role, "parents": args.parents}))
+    }
+
+    fn task_claim(&mut self, args: &TaskIdArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::{sessions, task};
+
+        let slug = state::repo_slug(&self.repo);
+        let identity = self.broker.identity().clone();
+        let pid = std::process::id();
+        let outcome = task::claim_locked(
+            &self.state,
+            &slug,
+            &args.task,
+            &identity.session,
+            pid,
+            sessions::process_start_secs(pid),
+            &task::local_host(),
+            state::now_secs(),
+            task::DEFAULT_CLAIM_TTL_SECS,
+        )
+        .map_err(ToolError::external)?;
+        match outcome {
+            None => Err(ToolError::new(
+                ToolErrorCode::PreconditionFailed,
+                format!("no task card {:?} in this repository", args.task),
+            )),
+            // A refusal is an ANSWER, not a malfunction: "somebody else holds
+            // this" is exactly what the coordinator needs to hear, and the
+            // reason is the refusal's own.
+            Some(Err(refusal)) => Ok(json!({
+                "claimed": false,
+                "task": args.task,
+                "reason": refusal.to_string(),
+            })),
+            Some(Ok(card)) => Ok(json!({
+                "claimed": true,
+                "task": card.id,
+                "attempts": card.attempts,
+                "state": card.state.to_string(),
+            })),
+        }
+    }
+
+    fn task_list(&self, args: &TaskListArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::task;
+
+        let slug = state::repo_slug(&self.repo);
+        let cards = task::load_cards(&self.state, &slug);
+        let total = cards.len();
+        let mut rows: Vec<&task::Card> = cards
+            .values()
+            .filter(|card| match args.filter {
+                CardFilter::All => true,
+                CardFilter::Open => {
+                    !matches!(card.state, task::State::Done | task::State::Archived)
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let shown = args.bounded_limit().min(rows.len());
+        let listed: Vec<Value> = rows[..shown]
+            .iter()
+            .map(|card| {
+                json!({
+                    "task": card.id,
+                    "title": card.title,
+                    "state": card.state.to_string(),
+                    "parents": card.parents,
+                    "group": card.group_id,
+                    "claimed_by": card.claim.as_ref().map(|claim| claim.session.clone()),
+                })
+            })
+            .collect();
+        Ok(json!({"total": total, "matched": rows.len(), "tasks": listed}))
+    }
+
+    fn group_create(&self, args: &GroupCreateArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::group;
+
+        let identity = self.broker.identity().clone();
+        let mut sink: Vec<u8> = Vec::new();
+        let id = group::run_create(
+            &self.state,
+            &mut sink,
+            &group::CreateArgs {
+                scope: args.scope.clone(),
+                child_limit: args.child_limit.unwrap_or(group::DEFAULT_CHILD_LIMIT),
+                token_budget: args.token_budget,
+                deadline_secs: args.deadline_secs,
+                completion_contract: args
+                    .completion_contract
+                    .clone()
+                    .unwrap_or_else(|| group::DEFAULT_COMPLETION_CONTRACT.to_string()),
+                parent_session: Some(identity.session.clone()),
+            },
+            state::now_secs(),
+        )
+        .map_err(ToolError::external)?;
+        Ok(json!({
+            "group": id,
+            "scope": args.scope,
+            "child_limit": args.child_limit.unwrap_or(group::DEFAULT_CHILD_LIMIT),
+        }))
+    }
+
+    fn group_status(&self, id: Option<&str>) -> Result<Value, ToolError> {
+        use crate::commands::ctx::group;
+
+        let render = |g: &group::WorkGroup| {
+            let cards: Vec<Value> = group::cards_for_group(&self.state, &g.work_group_id)
+                .into_iter()
+                .map(|card| json!({"task": card.id, "state": card.state.to_string()}))
+                .collect();
+            json!({
+                "group": g.work_group_id,
+                "scope": g.scope,
+                "status": if g.closed_at.is_some() { "closed" } else { "open" },
+                "child_limit": g.child_limit,
+                "admitted_children": g.admitted_children,
+                "token_budget": g.token_budget,
+                "spent_tokens": g.spent_tokens,
+                "reserved_tokens": g.reserved_tokens,
+                "overdue": group::is_overdue(g, state::now_secs()),
+                "completion_contract": g.completion_contract,
+                "tasks": cards,
+            })
+        };
+        match id {
+            Some(id) => match group::load(&self.state, id).map_err(ToolError::external)? {
+                Some(group) => Ok(render(&group)),
+                None => Err(ToolError::new(
+                    ToolErrorCode::PreconditionFailed,
+                    format!("no work group {id:?}"),
+                )),
+            },
+            None => Ok(json!({
+                "groups": group::list(&self.state).iter().map(render).collect::<Vec<Value>>(),
+            })),
+        }
+    }
+
+    fn objective_status(&self) -> Result<Value, ToolError> {
+        use crate::commands::ctx::{coordinator, objective};
+
+        let graph = coordinator::load(&self.state, &self.repo);
+        let record = objective::load(&self.state, &state::repo_slug(&self.repo))
+            .map_err(ToolError::external)?;
+        Ok(match record {
+            Some(record) => json!({
+                "objective": record.objective,
+                "status": format!("{:?}", record.status).to_lowercase(),
+                "budget_tokens": record.budget_tokens,
+                "spent_tokens": record.spent_tokens,
+                "deadline_secs": record.deadline_secs,
+                "constraints": graph.constraints,
+                "stopped": graph.cancelled,
+            }),
+            None => json!({
+                "objective": Value::Null,
+                "constraints": graph.constraints,
+                "stopped": graph.cancelled,
+                "note": "no objective is set for this repository",
+            }),
+        })
+    }
+
+    fn team_status(&self) -> Result<Value, ToolError> {
+        use crate::commands::ctx::coordinator;
+
+        let graph = coordinator::load(&self.state, &self.repo);
+        let pending = coordinator::pending(&self.state, &self.repo, &graph);
+        let nodes: Vec<Value> = graph
+            .nodes
+            .values()
+            .map(|node| {
+                json!({
+                    "task": node.task,
+                    "role": node.role,
+                    "runtime": node.runtime,
+                    "delegation": node.delegation,
+                    "parents": node.parents,
+                    "state": node.state.as_str(),
+                    "evidence": node.evidence,
+                })
+            })
+            .collect();
+        let decisions: Vec<&str> = graph
+            .decisions
+            .iter()
+            .rev()
+            .take(20)
+            .map(|decision| decision.what.as_str())
+            .collect();
+        let outstanding: Vec<&str> = graph
+            .outstanding()
+            .iter()
+            .map(|node| node.task.as_str())
+            .collect();
+        // Which roles this machine can actually staff. A coordinator that
+        // plans around a role with no configured route is planning work
+        // nothing can take.
+        let roster: Vec<Value> = self
+            .native_config()
+            .map(|native| {
+                crate::commands::ctx::team::roster(&native)
+                    .into_iter()
+                    .map(|(role, route)| {
+                        json!({"role": role.as_str(), "route": route.map(|id| id.to_string())})
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({
+            "objective": graph.objective,
+            "constraints": graph.constraints,
+            "stopped": graph.cancelled,
+            "nodes": nodes,
+            "outstanding": outstanding,
+            "roster": roster,
+            "pending_completions": pending,
+            "recent_decisions": decisions,
+            "note": "a node stays `delegated` until its worker's receipt is consumed; an \
+                     unconsumed outcome is listed under pending_completions rather than assumed",
+        }))
     }
 
     // -- the delegation tools (issue #479, roadmap N10) -------------------
@@ -1583,10 +1946,33 @@ impl NativeToolClient {
         CtxConfig::load(&self.repo, &|key| std::env::var(key).ok()).map_err(ToolError::external)
     }
 
+    /// The operator's native provider configuration, or `None` on a machine
+    /// that has none. Absence is not an error here: a harness-runtime
+    /// delegation needs no native route at all, and a native one fails with
+    /// the configuration message `native_worker` already produces.
+    fn native_config(&self) -> Option<crate::commands::ctx::provider::config::NativeConfig> {
+        let home = crate::utils::home_dir().ok()?;
+        crate::commands::ctx::provider::config::NativeConfig::load(&home, &self.repo).ok()?
+    }
+
     fn delegate(&mut self, args: DelegateArgs) -> Result<Value, ToolError> {
         use crate::commands::ctx::delegation as service;
+        use crate::commands::ctx::team;
 
         let cfg = self.ctx_config()?;
+        // Issue #485 item 2: a route the MODEL named for a role has to clear
+        // operator policy and stay on the billing the operator seated that
+        // role on. The operator's own `--route` on a CLI delegation is the
+        // operator speaking and is untouched; this is the other case.
+        let target = args.target_or_default();
+        if args.runtime == delegation::ToolRuntime::Native
+            && target != crate::commands::ctx::runtime::RuntimeKind::Native.as_str()
+            && let Some(native) = self.native_config()
+        {
+            team::authorize_route(&native, &args.role_or_default(), &target).map_err(|refusal| {
+                ToolError::new(ToolErrorCode::AuthorizationDenied, refusal.to_string())
+            })?;
+        }
         let request = service::LaunchRequest {
             runtime: args.runtime.kind(),
             target: args.target_or_default(),
@@ -2931,6 +3317,116 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &[ResourceClaimKind::WorktreeWrite],
             (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
         ),
+        // Issue #485 (roadmap N16): the coordinator's own services. Each is a
+        // thin adaptor over the same `ctx::task`/`ctx::group`/`ctx::objective`
+        // function the CLI verb calls; the three that mutate shared state
+        // declare the write capability, so a read-only seat can read the
+        // board and cannot move a piece on it.
+        definition(
+            TASK_CREATE,
+            "Mint a shared task card: a title, the brief a worker claiming it is told to do, and \
+             the parent cards that must be done first. Returns the card id every delegation for \
+             this work must carry.",
+            object_schema(
+                &["title", "brief"],
+                json!({
+                    "title":{"type":"string","minLength":1},
+                    "brief":{"type":"string","minLength":1},
+                    "role":{"type":"string","minLength":1},
+                    "parents":{"type":"array","items":{"type":"string","minLength":1}},
+                    "group":{"type":"string","minLength":1,"maxLength":128},
+                    "workdir":{"type":"string","minLength":1}
+                }),
+            ),
+            &write_caps,
+            ToolExecutionMode::Immediate,
+            &[ResourceClaimKind::WorktreeWrite],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
+        definition(
+            TASK_CLAIM,
+            "Take exclusive ownership of a card for this session. A card a live claimant already \
+             holds, or one whose parents are not done, is refused with the reason -- this is what \
+             stops two workers being paid for one task.",
+            object_schema(
+                &["task"],
+                json!({"task":{"type":"string","minLength":1,"maxLength":128}}),
+            ),
+            &write_caps,
+            ToolExecutionMode::Immediate,
+            &[ResourceClaimKind::WorktreeWrite],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
+        definition(
+            TASK_LIST,
+            "List this repository's task cards with their state, claimant and parents, newest \
+             first and bounded.",
+            object_schema(
+                &[],
+                json!({
+                    "filter":{"type":"string","enum":["open","all"]},
+                    "limit":{"type":"integer","minimum":1}
+                }),
+            ),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::ReadRoot],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            GROUP_CREATE,
+            "Open a work group: a scope, how many children it may admit, an optional token budget \
+             and deadline, and the contract every child must satisfy before it can close.",
+            object_schema(
+                &["scope"],
+                json!({
+                    "scope":{"type":"string","minLength":1},
+                    "child_limit":{"type":"integer","minimum":1},
+                    "token_budget":{"type":"integer","minimum":1},
+                    "deadline_secs":{"type":"integer","minimum":1},
+                    "completion_contract":{"type":"string","minLength":1}
+                }),
+            ),
+            &write_caps,
+            ToolExecutionMode::Immediate,
+            &[ResourceClaimKind::WorktreeWrite],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
+        definition(
+            GROUP_STATUS,
+            "Report a work group's scope, admission count, remaining budget and the cards bound \
+             to it; omit the id to list every group.",
+            object_schema(
+                &[],
+                json!({"group":{"type":"string","minLength":1,"maxLength":128}}),
+            ),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::ReadRoot],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            OBJECTIVE_STATUS,
+            "Report the operator's standing objective for this repository -- its budget, deadline \
+             and status -- together with every constraint the operator has since steered it with.",
+            object_schema(&[], json!({})),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::ReadRoot],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            TEAM_STATUS,
+            "Report the coordinator's own durable task graph: which task each role took, which \
+             delegation is answering for it, which bounded evidence came back, and which worker \
+             receipts are still waiting to be consumed. Unknown stays unknown until a receipt \
+             arrives.",
+            object_schema(&[], json!({})),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::ReadRoot],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
     ]
 }
 
@@ -2987,10 +3483,11 @@ mod tests {
     use super::*;
 
     /// 16 coding/knowledge tools (#474-#475), the 7 delegation tools
-    /// (#479), the 13 capability tools (#483) and the 4 workflow tools
-    /// (#484). Asserted as a number on purpose: a tool added without a
-    /// deliberate decision here is a tool the model was handed silently.
-    const NATIVE_TOOL_COUNT: usize = 40;
+    /// (#479), the 13 capability tools (#483), the 4 workflow tools (#484)
+    /// and the 7 team tools (#485). Asserted as a number on purpose: a tool
+    /// added without a deliberate decision here is a tool the model was
+    /// handed silently.
+    const NATIVE_TOOL_COUNT: usize = 47;
 
     #[test]
     fn registry_names_are_unique_and_schemas_are_closed_objects() {
@@ -3123,10 +3620,38 @@ mod tests {
         launches: std::sync::Arc<std::sync::Mutex<Vec<service::LaunchRequest>>>,
     }
 
+    /// A writer lease for the fixture's own checkout. The production lease is
+    /// `permit::HeavyPermit`, which takes a real per-tree claim; a test needs
+    /// the same ANSWER ("this session may write this tree") without the
+    /// machine-wide permit store, and the broker only ever asks `covers`.
+    #[derive(Debug)]
+    struct FixtureWriter(PathBuf);
+
+    impl crate::commands::ctx::runtime::enforcement::WriterLease for FixtureWriter {
+        fn covers(&self, worktree: &Path) -> bool {
+            // Both sides are re-canonicalised: the broker normalises its own
+            // worktree root on construction, and Windows has more than one
+            // spelling of the same directory.
+            let key = |path: &Path| {
+                crate::commands::ctx::permit::tree_key(
+                    &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+                )
+            };
+            key(&self.0) == key(worktree)
+        }
+    }
+
     /// A real `NativeToolClient` -- real registry, real broker, real seat
     /// fence -- with only the WORKER LAUNCH replaced, so the delegation tools
     /// are exercised through their production path without starting anything.
     fn delegation_fixture(exit_code: i32) -> DelegationFixture {
+        fixture_with(exit_code, "orchestrator", false)
+    }
+
+    /// The same fixture with the delegating seat's ROLE and its writer lease
+    /// as parameters: issue #485's bounds are decided from exactly those two
+    /// facts, so a test has to be able to vary them.
+    fn fixture_with(exit_code: i32, role: &str, writer: bool) -> DelegationFixture {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         let home = root.path().join("home");
@@ -3147,7 +3672,7 @@ mod tests {
                 agent: "native".to_string(),
                 model: None,
                 provider: "fixture".to_string(),
-                role: "orchestrator".to_string(),
+                role: role.to_string(),
                 pinned: false,
                 phase: Default::default(),
                 visited: Vec::new(),
@@ -3166,7 +3691,7 @@ mod tests {
                 session: "native-session-1".to_string(),
                 short: "nativ001".to_string(),
                 generation: 1,
-                role: "orchestrator".to_string(),
+                role: role.to_string(),
                 task: None,
             },
             ResourceClaims::new(&repo, &repo, state.root(), &home, NetworkScope::Denied)
@@ -3175,7 +3700,10 @@ mod tests {
             std::sync::Arc::new(ConfigPolicySource::new(repo.clone())),
             std::sync::Arc::new(StoredSeatFence::new(state.clone())),
             std::sync::Arc::new(ApprovalAuthority::new()),
-            None,
+            writer.then(|| {
+                Box::new(FixtureWriter(repo.clone()))
+                    as Box<dyn crate::commands::ctx::runtime::enforcement::WriterLease>
+            }),
             PlatformIsolation::detect(),
             Default::default(),
         )
@@ -3504,6 +4032,276 @@ mod tests {
             .parse(WORKFLOW_STATUS, json!({"id":"../other"}))
             .expect_err("a workflow id may not escape the store");
         assert_eq!(bad_id.code, ToolErrorCode::InvalidArguments);
+    }
+
+    // -- the team tools (issue #485, roadmap N16) -------------------------
+
+    fn result_of(receipt: &ToolReceipt) -> &Value {
+        receipt
+            .result
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected a result, got {:?}", receipt.error))
+    }
+
+    #[test]
+    fn every_team_tool_is_registered_with_a_closed_schema_and_a_typed_scope() {
+        let registry = ToolRegistry::native();
+        for name in team::ALL {
+            let definition = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(definition.input_schema["type"], "object");
+            assert_eq!(definition.input_schema["additionalProperties"], false);
+            assert!(!definition.capabilities.is_empty());
+        }
+        // The three that MUTATE shared state declare the write capability;
+        // the four reads do not, so a read-only seat still gets them.
+        for name in [TASK_CREATE, TASK_CLAIM, GROUP_CREATE] {
+            assert!(
+                registry
+                    .get(name)
+                    .expect(name)
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "repo_fs_write"),
+                "{name} mutates shared state and has to declare a write"
+            );
+        }
+        for name in [TASK_LIST, GROUP_STATUS, OBJECTIVE_STATUS, TEAM_STATUS] {
+            assert!(
+                !registry
+                    .get(name)
+                    .expect(name)
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "repo_fs_write"),
+                "{name} only reads"
+            );
+        }
+    }
+
+    /// Acceptance criterion 1 and 2, driven through the REAL registry, broker
+    /// and services with only the worker launch replaced: a native
+    /// coordinator plans a feature, dispatches a native implementer and a
+    /// wrapped (harness) reviewer against the same shared cards and group,
+    /// and reads one consistent board back.
+    #[test]
+    fn a_native_coordinator_runs_a_mixed_team_through_the_shared_services() {
+        let mut fixture = fixture_with(0, "coordinator", true);
+
+        let group = result_of(&call(
+            &mut fixture.client,
+            GROUP_CREATE,
+            json!({"scope":"ship N16","child_limit":4}),
+        ))["group"]
+            .as_str()
+            .expect("group id")
+            .to_string();
+
+        let implement = result_of(&call(
+            &mut fixture.client,
+            TASK_CREATE,
+            json!({
+                "title":"implement the coordinator",
+                "brief":"write ctx::coordinator",
+                "role":"implementer",
+                "group": group,
+            }),
+        ))["task"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        let review = result_of(&call(
+            &mut fixture.client,
+            TASK_CREATE,
+            json!({
+                "title":"review the coordinator",
+                "brief":"read the diff",
+                "role":"reviewer",
+                "parents":[implement.clone()],
+                "group": group,
+            }),
+        ))["task"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        // One native worker and one wrapped worker, on the same cards.
+        let native = handle_from(call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief":"implement","role":"implementer","task":implement,"group":group}),
+        ));
+        let wrapped = handle_from(call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({
+                "brief":"review","role":"reviewer","task":review,"group":group,
+                "runtime":"harness","target":"claude"
+            }),
+        ));
+        assert_ne!(native, wrapped);
+
+        let launches = fixture.launches.lock().expect("lock");
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[0].runtime, super::super::RuntimeKind::Native);
+        assert_eq!(launches[1].runtime, super::super::RuntimeKind::Harness);
+        assert!(
+            !launches[0].read_only && launches[1].read_only,
+            "the implementer writes and the reviewer does not, whichever runtime each ran on"
+        );
+        drop(launches);
+
+        // One board, both runtimes on it.
+        let board = call(&mut fixture.client, TEAM_STATUS, json!({}));
+        let board = result_of(&board);
+        let runtimes: Vec<&str> = board["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .filter_map(|node| node["runtime"].as_str())
+            .collect();
+        assert_eq!(runtimes, ["native", "harness"]);
+        assert_eq!(
+            board["pending_completions"]
+                .as_array()
+                .expect("pending")
+                .len(),
+            2,
+            "both outcomes are published and neither is consumed yet -- unknown stays unknown"
+        );
+
+        let cards = call(&mut fixture.client, TASK_LIST, json!({}));
+        assert_eq!(result_of(&cards)["total"], 2);
+        let status = call(&mut fixture.client, GROUP_STATUS, json!({"group": group}));
+        assert_eq!(result_of(&status)["tasks"].as_array().expect("tasks").len(), 2);
+        assert_eq!(result_of(&status)["scope"], "ship N16");
+    }
+
+    /// Acceptance criterion 3, the ownership half: the claim the tool takes is
+    /// the SHARED one, so a second claimant is refused with the reason rather
+    /// than paid to redo the first one's work.
+    #[test]
+    fn two_workers_can_never_claim_one_card() {
+        let mut fixture = fixture_with(0, "coordinator", true);
+        let task = result_of(&call(
+            &mut fixture.client,
+            TASK_CREATE,
+            json!({"title":"one card","brief":"do it"}),
+        ))["task"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        let first = call(&mut fixture.client, TASK_CLAIM, json!({"task": task}));
+        assert_eq!(result_of(&first)["claimed"], true);
+
+        // A different session, same card, through the shared task service.
+        let other = crate::commands::ctx::task::claim_locked(
+            &fixture.state,
+            &state::repo_slug(&fixture.repo),
+            &task,
+            "some-other-session",
+            std::process::id(),
+            crate::commands::ctx::sessions::process_start_secs(std::process::id()),
+            "host",
+            state::now_secs(),
+            crate::commands::ctx::task::DEFAULT_CLAIM_TTL_SECS,
+        )
+        .expect("claim")
+        .expect("card exists");
+        assert!(other.is_err(), "a live claim is exclusive");
+
+        let unknown = call(
+            &mut fixture.client,
+            TASK_CLAIM,
+            json!({"task":"task-does-not-exist"}),
+        );
+        assert_eq!(
+            unknown.error.as_ref().map(|error| error.code.clone()),
+            Some(ToolErrorCode::PreconditionFailed)
+        );
+    }
+
+    /// Acceptance criterion 3, the authority half: a reviewer seat may not
+    /// delegate at all, and the refusal reaches the model as an authorization
+    /// denial rather than as a launch that quietly did nothing.
+    #[test]
+    fn a_seat_whose_role_grants_no_delegation_authority_is_refused_at_the_tool() {
+        let mut fixture = fixture_with(0, "reviewer", true);
+        let refused = call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief":"do it","role":"implementer"}),
+        );
+        assert_eq!(refused.state, ToolReceiptState::Failed);
+        assert!(
+            refused
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("may not delegate")),
+            "{refused:?}"
+        );
+        assert!(fixture.launches.lock().expect("lock").is_empty());
+    }
+
+    /// Issue #485 item 1, the enforcement half: reading the board needs no
+    /// permit, moving a piece on it does -- decided by the broker at effect
+    /// time, exactly as the workflow tools are.
+    #[test]
+    fn a_session_with_no_writer_permit_can_read_the_board_but_never_move_it() {
+        let mut fixture = delegation_fixture(0);
+        for (name, arguments) in [
+            (TASK_LIST, json!({})),
+            (GROUP_STATUS, json!({})),
+            (OBJECTIVE_STATUS, json!({})),
+            (TEAM_STATUS, json!({})),
+        ] {
+            let receipt = call(&mut fixture.client, name, arguments);
+            assert_eq!(receipt.state, ToolReceiptState::Completed, "{name}: {receipt:?}");
+        }
+        for (name, arguments) in [
+            (TASK_CREATE, json!({"title":"t","brief":"b"})),
+            (TASK_CLAIM, json!({"task":"task-1"})),
+            (GROUP_CREATE, json!({"scope":"s"})),
+        ] {
+            let receipt = call(&mut fixture.client, name, arguments);
+            assert_eq!(
+                receipt.error.as_ref().map(|error| error.code.clone()),
+                Some(ToolErrorCode::ResourceBusy),
+                "{name} must be refused before the service is reached: {receipt:?}"
+            );
+        }
+    }
+
+    /// Item 5: the coordinator is handed a bounded manifest and a reference,
+    /// never a replay -- and its own board says plainly what it does not yet
+    /// know.
+    #[test]
+    fn a_coordinator_reads_a_bounded_result_and_keeps_unknown_honest() {
+        let mut fixture = fixture_with(0, "coordinator", true);
+        let handle = handle_from(call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief":"implement","role":"implementer","task":"task-a"}),
+        ));
+
+        let before = call(&mut fixture.client, TEAM_STATUS, json!({}));
+        let before = result_of(&before);
+        assert_eq!(before["nodes"][0]["state"], "delegated");
+        assert_eq!(before["pending_completions"][0]["delegation"], handle);
+
+        let manifest = call(
+            &mut fixture.client,
+            RESULT,
+            json!({"delegation": handle, "max_bytes": 512}),
+        );
+        let manifest = result_of(&manifest);
+        assert_eq!(manifest["delegation"], handle);
+        assert!(
+            manifest["summary"].as_str().unwrap_or_default().len() <= 512,
+            "a manifest is bounded, not a transcript"
+        );
     }
 
     #[test]
