@@ -21,7 +21,11 @@
 //!    is read once. A native request returns its own usage inline, and the
 //!    same request can be seen twice -- a retry that actually succeeded, a
 //!    replayed journal, two supervisors reading one run -- so "exactly once"
-//!    has to be stated rather than assumed.
+//!    has to be stated rather than assumed. Today the `Reconciliation` ledger
+//!    lives in one `NativeLoop` instance and its seen-id ring is bounded by
+//!    count, so the guarantee holds within one loop; folding it into the
+//!    on-disk reservation ledger (which would extend it across restarts and
+//!    a second supervisor) is deferred, see the design note.
 //!
 //! Pure in exactly the sense `rot.rs` documents for itself: no fs, clock,
 //! env or net. Every function takes its inputs and an explicit `now`, so a

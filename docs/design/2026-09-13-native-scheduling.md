@@ -138,8 +138,9 @@ and is still never a spawn gate.
   not taken; the five failure classes reach five distinct decisions and only
   three are breaker input; an endpoint outage is scoped to that endpoint
   alone; a failure's own scope may narrow the routing but never widen it; a
-  request reconciles exactly once however often it is replayed; the seen-id
-  ring is bounded; identical evidence replays to the identical verdict and
+  request reconciles exactly once however often it is replayed within one
+  loop instance (the ledger is in-memory and its seen-id ring is bounded by
+  count, not by time; persisting it is deferred below); identical evidence replays to the identical verdict and
   only the clock can change one.
 - `allocator::tests` — two routes on one account are one capacity and two
   accounts are not; a placement on one route reserves against the whole pool;
