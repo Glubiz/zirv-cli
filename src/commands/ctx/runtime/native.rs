@@ -56,6 +56,7 @@
 //! complete.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -494,15 +495,40 @@ pub struct NativeSessionConfig {
     pub task: Option<super::journal::TaskId>,
     /// A workflow gate that refuses completion, with its own message. Fed
     /// straight into the shared stop service, where it outranks any model
-    /// finish token. `None` today -- populating it from the workflow engine
-    /// is N15's step (#484) -- but the ladder already honours it, so that
-    /// wiring cannot land without taking effect.
+    /// finish token.
+    ///
+    /// A fixed override, used by tests and by a caller that has already
+    /// decided. Production leaves it `None` and sets [`Self::workflow_repo`]
+    /// instead, so the gate is read LIVE at every completion attempt rather
+    /// than snapshotted before the session had done anything.
     pub workflow_gate: Option<String>,
     /// Issue #486: how this session compacts itself. Default is a working
     /// configuration -- automatic policy, unknown context window, the shared
     /// scoring config's own thresholds -- so a caller that says nothing still
     /// gets compaction rather than a silently unprotected session.
     pub compaction: CompactionSettings,
+    /// Issue #484 (roadmap N15): the repository whose ACTIVE workflow gates
+    /// this session's completion. `None` for a session with no workflow in
+    /// view -- a helper call, a fixture run -- which is gated by nothing.
+    pub workflow_repo: Option<PathBuf>,
+    /// Issue #484: the standing instructions this session runs under, compiled
+    /// once by the native context compiler (`runtime::context`) -- the
+    /// engineering standard, the role methodology, the model profile, the
+    /// operator's and repository's own instruction files, and the active
+    /// workflow's current step. Sent as the provider's system prompt on every
+    /// request.
+    ///
+    /// Compiled ONCE, at session start, deliberately: it is the cacheable
+    /// stable prefix, and rebuilding it each turn would defeat prompt caching
+    /// for a refresh the session can ask for explicitly through the
+    /// `workflow_context` tool. What must stay live is the workflow GATE, and
+    /// that is read at every completion attempt (see `finalize`).
+    pub system: Vec<String>,
+    /// Issue #484: the untrusted DATA half of the same compilation --
+    /// repository instruction files, canonical context, memory. Delivered as
+    /// one leading user message rather than as instructions, because that is
+    /// what it is.
+    pub preamble: Vec<String>,
 }
 
 /// Everything one session's compaction needs that is not a live borrow.
@@ -807,9 +833,27 @@ impl<'a> NativeLoop<'a> {
         }
 
         self.delivered_through = last;
+        // Issue #484: the compiled standing context leads every request. The
+        // instruction half is the provider's system prompt; the untrusted data
+        // half is a leading user message, ahead of the journal's own replay,
+        // so a session never has to be hand-seeded with methodology.
+        if !self.config.preamble.is_empty() {
+            messages.insert(
+                0,
+                ProviderMessage {
+                    role: ProviderMessageRole::User,
+                    content: self
+                        .config
+                        .preamble
+                        .iter()
+                        .map(|text| ProviderContent::Text { text: text.clone() })
+                        .collect(),
+                },
+            );
+        }
         Ok(ProviderRequest {
             model: self.config.route.model.id.clone(),
-            system: Vec::new(),
+            system: self.config.system.clone(),
             messages,
             tools: self.tools.definitions(),
             max_output_tokens: self.config.limits.max_output_tokens,
@@ -1689,15 +1733,23 @@ impl<'a> NativeLoop<'a> {
         );
 
         // A model finish token is one input. The shared stop service is what
-        // actually decides, and its `Block` outranks the token outright --
-        // which is what keeps N15's workflow-gate wiring from being able to
-        // regress silently: the moment `workflow_gate` is populated, a gated
-        // session stops reporting `Completed` with no further change here.
+        // actually decides, and its `Block` outranks the token outright.
+        //
+        // Issue #484 (roadmap N15): the gate is read HERE, at the completion
+        // attempt, not snapshotted at session start -- a session that reached
+        // the Test step after it began is gated on the evidence that exists
+        // now. An explicit `workflow_gate` still wins, so a caller that has
+        // already decided (and every test) keeps a fixed answer.
+        let workflow_gate = self.config.workflow_gate.clone().or_else(|| {
+            let repo = self.config.workflow_repo.as_deref()?;
+            let state = super::super::state::StateDir::resolve(self.env).ok()?;
+            crate::commands::workflow::engine::native_completion_gate(&state, repo)
+        });
         let stop = lifecycle::stop(&lifecycle::StopSignals {
             already_blocked: false,
             incomplete_tools: incomplete.iter().cloned().collect(),
             verification: lifecycle::VerificationDecision::NotRequired,
-            workflow_gate: self.config.workflow_gate.clone(),
+            workflow_gate,
         });
         let blocked_reason = match &stop {
             lifecycle::StopDecision::Block(reason) => Some(reason.clone()),
@@ -2649,6 +2701,27 @@ pub fn run_session<W: std::io::Write>(
         tools = executor;
     }
 
+    // Issue #484 (roadmap N15): the standing context, compiled ONCE by the
+    // native context compiler. This is what makes methodology and workflow
+    // adoption automatic -- a native session gets the engineering standard,
+    // its role's methodology, the model profile, the operator's and
+    // repository's instruction files and the active workflow's current step
+    // without anyone hand-seeding a prompt. A compilation that fails degrades
+    // to no standing context rather than failing the session: a session that
+    // runs with less context is recoverable, one that will not start is not.
+    let (system, preamble) = match compile_standing_context(
+        &state, &home, &cfg, request, &route, &session, now,
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            writeln!(
+                w,
+                "native runtime: standing context could not be compiled ({error}); continuing                  with the conversation alone"
+            )?;
+            (Vec::new(), Vec::new())
+        }
+    };
+
     // The backend owns the durable acknowledgement, so the input is on disk
     // before anything is told it was accepted -- the same `acknowledge_input`
     // the loop's own `acknowledge` uses.
@@ -2706,6 +2779,13 @@ pub fn run_session<W: std::io::Write>(
                 task: task.clone(),
                 workflow_gate: None,
                 compaction,
+                // Issue #484: the active workflow of the repository this
+                // session is actually working, consulted live at every
+                // completion attempt. A fixture run brokers nothing and
+                // performs no effects, so gating it would only be theatre.
+                workflow_repo: brokered.then(|| request.repo.to_path_buf()),
+                system,
+                preamble,
             },
             provider.as_ref(),
             tools.as_mut(),
@@ -2726,6 +2806,79 @@ pub fn run_session<W: std::io::Write>(
         )?;
     }
     Ok(status)
+}
+
+/// The standing instruction and data context one native session runs under
+/// (issue #484, roadmap N15), split the way the provider request wants it:
+/// instructions become the system prompt, data becomes a leading user message.
+///
+/// Everything here comes from `runtime::context::compile`, which is the only
+/// place that decides what a native session is told and in what order. This
+/// function's whole job is handing it the session's own identity and budget.
+#[allow(clippy::type_complexity)]
+fn compile_standing_context(
+    state: &super::super::state::StateDir,
+    home: &std::path::Path,
+    cfg: &super::super::config::CtxConfig,
+    request: &HeadlessRequest<'_>,
+    route: &RouteIdentity,
+    session: &JournalSessionId,
+    now: u64,
+) -> CtxResult<(Vec<String>, Vec<String>)> {
+    use super::context::{CompileRequest, MessageRole, TokenBudget};
+
+    let capabilities =
+        super::super::provider::capability::declared(route.protocol, &route.model, None);
+    // The window the route's own model declares, or a conservative floor when
+    // the catalogue has nothing for it. Reserving the session's own output
+    // ceiling is what keeps the compiled prefix from crowding out the answer.
+    let context_window_tokens = capabilities.context_window.unwrap_or(128_000);
+    let compiled = super::context::compile(&CompileRequest {
+        home: Some(home),
+        repo: request.repo,
+        cwd: request.repo,
+        state,
+        config: cfg,
+        role: prompt_role(request.role),
+        session_id: &session.to_string(),
+        task: request.prompt,
+        constraints: &[],
+        pending_actions: &[],
+        provider: &route.provider.to_string(),
+        model: &route.model.id,
+        capabilities: &capabilities,
+        budget: TokenBudget {
+            context_window_tokens,
+            output_reserve_tokens: request.limits.max_output_tokens,
+            max_inline_evidence_bytes: cfg.output.max_summary_bytes,
+        },
+        evidence: &[],
+        token_counter: None,
+        now,
+    })?;
+    let mut system = Vec::new();
+    let mut preamble = Vec::new();
+    for message in &compiled.messages {
+        match message.role {
+            MessageRole::Instruction => system.push(message.content.clone()),
+            MessageRole::Data => preamble.push(message.content.clone()),
+        }
+    }
+    Ok((system, preamble))
+}
+
+/// The prompt role a native session's `--role` names. Unknown values are
+/// workers: the least-privileged methodology is the safe default, and an
+/// orchestrator layer handed to a worker would tell it to delegate work
+/// nobody asked it to delegate.
+fn prompt_role(role: &str) -> super::super::prompt::PromptRole {
+    use super::super::prompt::PromptRole;
+
+    match role {
+        "orchestrator" => PromptRole::Orchestrator,
+        "sub-orchestrator" => PromptRole::SubOrchestrator,
+        _ => PromptRole::Worker,
+    }
 }
 
 /// Resolves the provider transport, the tool executor and the route identity
@@ -3061,7 +3214,96 @@ mod tests {
             task: None,
             workflow_gate: None,
             compaction: CompactionSettings::default(),
+            workflow_repo: None,
+            system: Vec::new(),
+            preamble: Vec::new(),
         }
+    }
+
+    /// Issue #484 (roadmap N15) item 3: workflow and methodology adoption is
+    /// AUTOMATIC. Nobody hand-seeds a native session with a methodology
+    /// prompt; the context compiler puts the engineering standard and the
+    /// active workflow's current step into every request the session makes,
+    /// on the strength of the workflow store alone.
+    #[test]
+    fn a_native_session_adopts_the_active_workflow_without_being_seeded() {
+        use crate::commands::workflow::engine;
+
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("home");
+        let state = crate::commands::ctx::state::StateDir::from_root(
+            tempfile::tempdir().expect("state").keep(),
+        );
+        let workflow = engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "wire the native workflow tools".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            crate::commands::workflow::classify::Classification {
+                intent: crate::commands::workflow::classify::Intent::Feature,
+                complexity: crate::commands::workflow::classify::Complexity::Trivial,
+                risk: crate::commands::workflow::classify::RiskBand::Low,
+                risk_score: 0,
+                changed_files: 1,
+                changed_lines: 5,
+                declared_scope: false,
+                work_domain: Default::default(),
+                risk_measurement: crate::commands::workflow::classify::RiskMeasurement::Measured,
+                reasons: vec!["small".into()],
+            },
+        );
+        engine::save(&state, &workflow, true).expect("save");
+
+        let route = route_for(Protocol::AnthropicMessages, "claude-fixture");
+        let session = JournalSessionId::new("native-adoption-1").expect("session id");
+        let request = HeadlessRequest {
+            repo: repo.path(),
+            prompt: "continue the workflow",
+            route: None,
+            role: "orchestrator",
+            limits: NativeLimits::default(),
+            resume: None,
+            provider: None,
+            fixture_tools: None,
+            task: None,
+            writer: None,
+        };
+        let (system, preamble) = compile_standing_context(
+            &state,
+            home.path(),
+            &Default::default(),
+            &request,
+            &route,
+            &session,
+            1,
+        )
+        .expect("the standing context compiles");
+
+        let system_text = system.join(
+            "
+",
+        );
+        assert!(
+            system_text.contains("zirv native model profile"),
+            "the model profile is part of every native session's instructions"
+        );
+        assert!(
+            !system.is_empty() && system_text.len() > 200,
+            "the engineering standard and role methodology must be present: {system_text:?}"
+        );
+        let all = format!(
+            "{system_text}
+{}",
+            preamble.join(
+                "
+"
+            )
+        );
+        assert!(
+            all.contains("wire the native workflow tools"),
+            "the active workflow's own task must reach the session unseeded: {all}"
+        );
     }
 
     fn script(name: &str) -> FixtureScript {
