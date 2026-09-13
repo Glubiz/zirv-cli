@@ -167,15 +167,6 @@ pub struct RouteProfile {
     pub doc: &'static str,
 }
 
-impl RouteProfile {
-    /// Whether a plain-HTTP base URL is defensible for this profile. Only a
-    /// local runtime qualifies, and even then the endpoint host still has to
-    /// be loopback or private (`probe::is_local_http_host`).
-    pub fn allows_plain_http(&self) -> bool {
-        self.credential.is_local()
-    }
-}
-
 // -- common extension sets ----------------------------------------------
 
 /// Sampling controls the OpenAI chat-completions specification itself
@@ -922,7 +913,6 @@ mod tests {
             let local = profile(id).unwrap();
             assert!(local.credential.is_local(), "{id}");
             assert!(local.credential.is_optional(), "{id}");
-            assert!(local.allows_plain_http(), "{id}");
             assert!(
                 local
                     .base_url
@@ -931,8 +921,8 @@ mod tests {
                 "{id} must default to loopback"
             );
         }
-        // A remote vendor never gets the plain-http concession.
-        assert!(!profile("deepseek-chat").unwrap().allows_plain_http());
+        // A remote vendor is never a local credential class.
+        assert!(!profile("deepseek-chat").unwrap().credential.is_local());
     }
 
     #[test]

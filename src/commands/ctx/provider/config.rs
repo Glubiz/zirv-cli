@@ -298,26 +298,15 @@ impl NativeConfig {
                     )
                     .into());
                 }
+                // Plaintext is for a runtime the operator hosts, never for a
+                // public endpoint: TLS is not optional across the internet.
                 if let Some(base_url) = endpoint.base_url.as_deref()
-                    && base_url.starts_with("http://")
-                    && !profile.allows_plain_http()
-                {
-                    return Err(format!(
-                        "{}: `{key}.base_url` is plaintext http, which route profile `{}` does \
-                         not allow; only a local runtime may be reached without TLS",
-                        path.display(),
-                        profile.id
-                    )
-                    .into());
-                }
-                if let Some(base_url) = endpoint.base_url.as_deref()
-                    && profile.allows_plain_http()
                     && base_url.starts_with("http://")
                     && !super::probe::is_local_http_host(base_url)
                 {
                     return Err(format!(
-                        "{}: `{key}.base_url` reaches a public host over plaintext http; a local \
-                         runtime must be on a loopback or private address",
+                        "{}: `{key}.base_url` reaches a public host over plaintext http; only a \
+                         loopback or private address may be addressed without TLS",
                         path.display()
                     )
                     .into());
@@ -867,7 +856,7 @@ mod tests {
         let error = NativeConfig::load(home.path(), repo.path())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("does not allow"), "got {error}");
+        assert!(error.contains("public host over plaintext"), "got {error}");
 
         write(
             &path,
@@ -876,7 +865,7 @@ mod tests {
         let error = NativeConfig::load(home.path(), repo.path())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("loopback or private"), "got {error}");
+        assert!(error.contains("loopback or private address"), "got {error}");
 
         write(
             &path,
