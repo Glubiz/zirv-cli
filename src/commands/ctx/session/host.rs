@@ -527,6 +527,16 @@ impl RuntimeHost {
         Ok(spec.session_id)
     }
 
+    /// The rendered screen of one session, with no attachment required. A
+    /// test seam only: every production reader goes through `session.screen`,
+    /// which checks that the caller is attached first.
+    #[cfg(test)]
+    pub fn screen_for_test(&self, session_id: &str) -> Option<String> {
+        self.lock()
+            .get(session_id)
+            .map(|session| session.screen_view().contents)
+    }
+
     /// The session this runtime restored `session_id` from, if any -- the
     /// only place a predecessor id is ever read back, and never as an
     /// identity.
@@ -917,6 +927,381 @@ pub fn restore_cwd(entry: &TopologyEntry, fallback: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child that prints one recognizable line and then stays alive well
+    /// past any of these tests' deadlines. Never a real agent -- the same
+    /// absolute rule, and the same platform split, `dash::pane`'s own pty
+    /// tests already use (`cmd /c` on Windows, `sh -c` on unix).
+    #[cfg(windows)]
+    fn marker_argv(marker: &str) -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            format!("echo {marker} & ping -n 60 127.0.0.1 >nul"),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn marker_argv(marker: &str) -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo {marker}; sleep 60"),
+        ]
+    }
+
+    fn spawn_spec(id: &str, cwd: &Path, marker: &str) -> SpawnSpec {
+        SpawnSpec {
+            session_id: id.to_string(),
+            agent: "claude".to_string(),
+            role: PromptRole::Orchestrator.label().to_string(),
+            cwd: cwd.to_path_buf(),
+            repo: cwd.to_path_buf(),
+            verb: sessions::Verb::Chat,
+            argv: marker_argv(marker),
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            conversation: Some("conv-1".to_string()),
+            restored_from: None,
+        }
+    }
+
+    fn host_for(root: &Path) -> Arc<RuntimeHost> {
+        RuntimeHost::new(
+            StateDir::from_root(root.to_path_buf()),
+            "default",
+            "inst-1",
+            200,
+            false,
+        )
+    }
+
+    /// Pumps until `needle` shows up on `session_id`'s screen, or the deadline
+    /// passes. Returns the screen either way, so a failing assertion can print
+    /// what was actually there.
+    fn pump_until(host: &RuntimeHost, session_id: &str, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            host.pump();
+            let screen = host.screen_for_test(session_id).unwrap_or_default();
+            if screen.contains(needle) || std::time::Instant::now() >= deadline {
+                return screen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The headline acceptance criterion, end to end over a REAL pty (ConPTY
+    /// on Windows, a unix pty elsewhere): a client detaching leaves the
+    /// process running and the rendered screen intact, and reattaching gets
+    /// that same screen back without anything being relaunched.
+    ///
+    /// The proof that nothing relaunched is the pid: the registry record's
+    /// pid before the detach is the same live pid after it. A restart would
+    /// necessarily change it.
+    #[test]
+    fn detaching_leaves_the_process_and_its_screen_alive_for_the_next_client() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "11111111-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVMARKER"))
+            .expect("spawn");
+
+        let screen = pump_until(&host, id, "ZIRVMARKER");
+        assert!(screen.contains("ZIRVMARKER"), "never rendered: {screen:?}");
+
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let pid = sessions::list(&state)
+            .into_iter()
+            .find(|(record, _)| record.session == id)
+            .map(|(record, _)| record.pid)
+            .expect("the runtime files an ordinary registry record");
+        assert!(sessions::is_alive(pid), "the child must be running");
+
+        host.attach(id, "dash-1", AttachMode::Controller, Some((40, 120)))
+            .expect("attach");
+        host.detach(id, "dash-1").expect("detach");
+
+        // The whole point: the client is gone and nothing else moved.
+        assert!(sessions::is_alive(pid), "detaching must not end the process");
+        let facts = host.sessions();
+        let facts = facts.first().expect("still one session");
+        assert_ne!(facts.state, SessionState::Ended);
+        assert_eq!(
+            facts.surface,
+            UiSurface::Headless,
+            "no client is looking, which is not the same as no session"
+        );
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == id),
+            "the registry record -- and with it pacing, budgets, rot and mail -- survives a detach"
+        );
+
+        // Reattach: the same screen, from the same live parser.
+        let attachment = host
+            .attach(id, "dash-1", AttachMode::Controller, Some((40, 120)))
+            .expect("reattach");
+        assert_eq!(attachment.role, AttachRole::Controller);
+        let screen = host.screen(id, "dash-1").expect("screen");
+        assert!(
+            screen.contents.contains("ZIRVMARKER"),
+            "reattachment must restore the rendered state, not a blank terminal: {:?}",
+            screen.contents
+        );
+        assert!(sessions::is_alive(pid), "and still the same process");
+
+        host.stop(id).expect("stop");
+    }
+
+    /// Many observers, one controller, and a takeover that is explicit rather
+    /// than implicit -- the attachment rules, over a real session.
+    #[test]
+    fn many_observers_may_watch_but_only_one_client_holds_the_keyboard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "22222222-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSEAT"))
+            .expect("spawn");
+
+        host.attach(id, "ctrl", AttachMode::Controller, Some((24, 80)))
+            .expect("first controller");
+        for observer in ["watch-1", "watch-2", "watch-3"] {
+            let attachment = host
+                .attach(id, observer, AttachMode::Observer, None)
+                .expect("observers are never refused");
+            assert_eq!(attachment.role, AttachRole::Observer);
+            assert_eq!(attachment.controller.as_deref(), Some("ctrl"));
+        }
+        let refusal = host
+            .attach(id, "other", AttachMode::Controller, None)
+            .expect_err("a second controller is refused");
+        assert_eq!(refusal.code, ErrorCode::Busy);
+
+        // An observer may not type, and may not resize somebody else's
+        // terminal.
+        assert_eq!(
+            host.write_raw(id, "watch-1", b"x")
+                .expect_err("observers do not type")
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            host.resize(id, "watch-1", 10, 10)
+                .expect_err("observers do not resize")
+                .code,
+            ErrorCode::Denied
+        );
+
+        // Takeover is the one way the seat moves, and it is explicit.
+        let after = host.takeover(id, "watch-1").expect("takeover");
+        assert_eq!(after.controller.as_deref(), Some("watch-1"));
+        assert_eq!(after.role, AttachRole::Controller);
+        assert!(host.write_raw(id, "watch-1", b"").is_ok());
+        assert_eq!(
+            host.write_raw(id, "ctrl", b"x")
+                .expect_err("the displaced controller is now an observer")
+                .code,
+            ErrorCode::Denied
+        );
+
+        host.stop(id).expect("stop");
+    }
+
+    /// `stop` is the ONLY thing that ends a session, and it takes the registry
+    /// record with it. Paired with the detach test above, this is the
+    /// "detach and stop are different operations" criterion in code.
+    #[test]
+    fn stopping_ends_the_process_and_releases_its_registry_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let id = "33333333-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSTOP"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSTOP");
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == id)
+        );
+
+        assert!(host.stop(id).expect("stop"));
+        assert!(
+            !host.stop(id).expect("second stop"),
+            "stopping twice reports that nothing was stopped, rather than failing"
+        );
+        let facts = host.sessions();
+        assert_eq!(facts.first().expect("session").state, SessionState::Ended);
+        assert!(
+            !sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == id),
+            "an explicitly stopped session releases its registry record"
+        );
+    }
+
+    /// A restored session is a NEW session that continues an old
+    /// conversation: the predecessor's id is recorded, never re-published.
+    /// This is the concrete form of "a restarted service never reuses another
+    /// process's session identity".
+    #[test]
+    fn a_restored_session_gets_a_new_identity_and_only_records_its_predecessor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let successor = "44444444-2222-4333-8444-555555555555";
+        let mut spec = spawn_spec(successor, tmp.path(), "ZIRVRESTORE");
+        spec.restored_from = Some("the-old-session".to_string());
+        host.spawn(spec).expect("spawn");
+
+        assert_eq!(
+            host.restored_from(successor).as_deref(),
+            Some("the-old-session")
+        );
+        let facts = host.sessions();
+        assert_eq!(facts.first().expect("session").session_id, successor);
+        assert!(
+            !facts.iter().any(|f| f.session_id == "the-old-session"),
+            "the predecessor's identity is never republished"
+        );
+        // And the topology the successor writes belongs to the NEW instance.
+        host.persist_topology();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let topology = read_topology(&state, "default").expect("topology");
+        assert_eq!(topology.instance, "inst-1");
+        assert_eq!(topology.sessions.len(), 1);
+        assert_eq!(topology.sessions[0].session_id, successor);
+
+        host.stop(successor).expect("stop");
+    }
+
+    /// Unix only: after every client has detached, the pty MASTER is still
+    /// held by the service, so the child never sees the SIGHUP that closing
+    /// the last descriptor would send it. This is the platform-specific half
+    /// of "closing the dashboard leaves managed sessions running" -- on unix a
+    /// session dies from a hangup, not from a kill, and the assertion has to
+    /// be about the process still being there after the client is gone.
+    ///
+    /// Written conservatively: it cannot be compiled or run on the Windows
+    /// development machine this was written on, so it uses only helpers the
+    /// cross-platform tests above already exercise.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_unix_pty_child_survives_because_the_service_still_holds_the_master() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let id = "55555555-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVHUP"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVHUP");
+        let pid = sessions::list(&state)
+            .into_iter()
+            .find(|(record, _)| record.session == id)
+            .map(|(record, _)| record.pid)
+            .expect("record");
+
+        host.attach(id, "c1", AttachMode::Controller, Some((24, 80)))
+            .expect("attach");
+        host.detach(id, "c1").expect("detach");
+        std::thread::sleep(Duration::from_millis(200));
+        host.pump();
+        assert!(
+            sessions::is_alive(pid),
+            "no client holds the pty, so nothing can hang the child up"
+        );
+        host.stop(id).expect("stop");
+    }
+
+    /// Windows only: a ConPTY resize moves the pseudoconsole and the parser
+    /// together, and the child keeps running across it. The resize path is
+    /// the one place the two platforms differ in kind rather than in detail,
+    /// so it gets its own assertion on the platform that can run it.
+    #[cfg(windows)]
+    #[test]
+    fn a_conpty_session_resizes_without_disturbing_the_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let id = "66666666-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSIZE"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSIZE");
+        let pid = sessions::list(&state)
+            .into_iter()
+            .find(|(record, _)| record.session == id)
+            .map(|(record, _)| record.pid)
+            .expect("record");
+
+        host.attach(id, "c1", AttachMode::Controller, Some((50, 132)))
+            .expect("attach resizes to the client's window");
+        let screen = host.screen(id, "c1").expect("screen");
+        assert_eq!((screen.rows, screen.cols), (50, 132));
+
+        host.resize(id, "c1", 30, 100).expect("resize");
+        let screen = host.screen(id, "c1").expect("screen");
+        assert_eq!((screen.rows, screen.cols), (30, 100));
+        assert!(sessions::is_alive(pid), "a resize is not a restart");
+        host.stop(id).expect("stop");
+    }
+
+    /// Render/event fan-out, 1 session against 15 (issue #352's benchmark
+    /// criterion). `#[ignore]`d because it spawns 15 real pty children and
+    /// takes seconds rather than milliseconds; run it with
+    /// `cargo test --bin zirv session::host::tests::render_fanout -- --ignored
+    /// --nocapture`, and record the numbers in the design note.
+    #[test]
+    #[ignore = "benchmark: spawns 15 ptys; run explicitly and record the result"]
+    fn render_fanout_scales_from_one_session_to_fifteen() {
+        fn measure(count: usize) -> (Duration, Duration) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let host = host_for(tmp.path());
+            let ids: Vec<String> = (0..count)
+                .map(|index| format!("{index:08}-2222-4333-8444-555555555555"))
+                .collect();
+            for id in &ids {
+                host.spawn(spawn_spec(id, tmp.path(), "ZIRVBENCH"))
+                    .expect("spawn");
+                host.attach(id, "bench", AttachMode::Observer, None)
+                    .expect("attach");
+            }
+            for id in &ids {
+                pump_until(&host, id, "ZIRVBENCH");
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                host.pump();
+            }
+            let pump = started.elapsed() / 100;
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                for id in &ids {
+                    let _ = host.screen(id, "bench");
+                }
+            }
+            let render = started.elapsed() / 100;
+            for id in &ids {
+                let _ = host.stop(id);
+            }
+            (pump, render)
+        }
+
+        let (pump_one, render_one) = measure(1);
+        let (pump_many, render_many) = measure(15);
+        println!(
+            "fanout: 1 session pump {pump_one:?} render {render_one:?}; \
+             15 sessions pump {pump_many:?} render {render_many:?}"
+        );
+        // The only assertion worth making is the shape: fan-out is linear in
+        // the number of sessions, not quadratic. A wall-clock threshold on a
+        // shared CI box would be a flake generator.
+        assert!(
+            pump_many < pump_one.max(Duration::from_millis(1)) * 60,
+            "pump fan-out should stay linear: {pump_one:?} -> {pump_many:?}"
+        );
+    }
 
     fn entry(agent: &str, conversation: Option<&str>) -> TopologyEntry {
         TopologyEntry {
