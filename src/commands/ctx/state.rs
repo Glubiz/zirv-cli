@@ -274,6 +274,9 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         &[
             "commands/ctx/session/host.rs",
             "commands/ctx/session/mod.rs",
+            // Issue #489: the service test that proves mail reaches a
+            // detached session addresses the mailbox by the same slug.
+            "commands/ctx/session/service.rs",
         ],
     ),
 ];
