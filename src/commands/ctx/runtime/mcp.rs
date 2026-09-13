@@ -61,7 +61,10 @@ pub enum McpError {
     /// The server answered, but not with something this revision allows.
     Protocol(String),
     /// The server answered with a JSON-RPC error.
-    Server { code: i64, message: String },
+    Server {
+        code: i64,
+        message: String,
+    },
     /// The caller's cancellation flag fired; `notifications/cancelled` was
     /// sent, and the outcome of the server-side effect is unknown.
     Cancelled,
@@ -203,7 +206,11 @@ impl StdioTransport {
     /// notification, a server-initiated request, a stale response) so it can
     /// be drained later instead of being mistaken for this answer.
     fn await_response(&mut self, id: u64, deadline: Instant) -> Result<Value, McpError> {
-        if let Some(index) = self.pending.iter().position(|frame| frame_id(frame) == Some(id)) {
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|frame| frame_id(frame) == Some(id))
+        {
             return Ok(self.pending.remove(index));
         }
         loop {
@@ -747,20 +754,23 @@ impl McpCatalogue {
         if !first {
             for name in self.entries.keys() {
                 if !seen.contains(name) {
-                    self.invalidated
-                        .insert(name.clone(), "is no longer offered by this server".to_string());
+                    self.invalidated.insert(
+                        name.clone(),
+                        "is no longer offered by this server".to_string(),
+                    );
                 }
             }
         }
         // An invalidation only survives while its name is still absent or
         // changed; a name that came back identical is not stale.
-        self.invalidated
-            .retain(|name, _| !next.contains_key(name) || !self.entries.contains_key(name) || {
+        self.invalidated.retain(|name, _| {
+            !next.contains_key(name) || !self.entries.contains_key(name) || {
                 self.entries
                     .get(name)
                     .zip(next.get(name))
                     .is_none_or(|(old, new)| old.digest != new.digest)
-            });
+            }
+        });
         self.entries = next;
         self.resources = resources;
         self.generation += 1;
@@ -790,7 +800,11 @@ fn tool_entry(value: &Value) -> Option<McpToolEntry> {
         .get("inputSchema")
         .cloned()
         .unwrap_or_else(|| json!({"type": "object"}));
-    if !schema.is_object() || serde_json::to_vec(&schema).map(|b| b.len()).unwrap_or(usize::MAX) > MAX_SCHEMA_BYTES
+    if !schema.is_object()
+        || serde_json::to_vec(&schema)
+            .map(|b| b.len())
+            .unwrap_or(usize::MAX)
+            > MAX_SCHEMA_BYTES
     {
         return None;
     }
@@ -1003,7 +1017,10 @@ impl McpClient {
             {
                 let (Some(uri), name) = (
                     value.get("uri").and_then(Value::as_str),
-                    value.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    value
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
                 ) else {
                     continue;
                 };
@@ -1239,9 +1256,9 @@ impl FixtureServer {
                     .pointer("/params/name")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.results.get(name).cloned().unwrap_or_else(|| {
-                    json!({"content": [{"type": "text", "text": format!("ran {name}")}]})
-                })
+                self.results.get(name).cloned().unwrap_or_else(
+                    || json!({"content": [{"type": "text", "text": format!("ran {name}")}]}),
+                )
             }
             other => {
                 return json!({
@@ -1336,6 +1353,11 @@ impl TransportFactory for FixtureFactory {
     }
 }
 
+/// The headers of every request a [`FixtureHttpPoster`] saw, in order, so a
+/// test can assert that the credential travelled and the negotiated session
+/// id was pinned on later requests.
+pub type ObservedHeaders = Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
 /// A [`HttpPoster`] that runs a [`FixtureServer`] in process, so the remote
 /// transport's own framing is tested end to end without a socket.
 #[derive(Debug)]
@@ -1343,7 +1365,7 @@ pub struct FixtureHttpPoster {
     server: Arc<std::sync::Mutex<FixtureServer>>,
     /// Replies as SSE rather than JSON; both shapes are legal for a POST.
     pub stream: bool,
-    pub observed: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
+    pub observed: ObservedHeaders,
 }
 
 impl FixtureHttpPoster {
@@ -1439,7 +1461,11 @@ mod tests {
         assert_eq!(client.catalogue().resources().len(), 1);
 
         let result = client
-            .call_tool("lookup", json!({"symbol": "x"}), &CancellationFlag::default())
+            .call_tool(
+                "lookup",
+                json!({"symbol": "x"}),
+                &CancellationFlag::default(),
+            )
             .expect("call");
         assert!(!result.is_error);
         assert_eq!(result.text, "ran lookup");
@@ -1475,7 +1501,11 @@ mod tests {
             )
             .expect("connect");
             let result = client
-                .call_tool("search", json!({"query": "a"}), &CancellationFlag::default())
+                .call_tool(
+                    "search",
+                    json!({"query": "a"}),
+                    &CancellationFlag::default(),
+                )
                 .expect("call");
             assert_eq!(result.text, "ran search");
 
@@ -1509,7 +1539,11 @@ mod tests {
         client.reconnect().expect("reconnect");
 
         let error = client
-            .call_tool("deploy", json!({"target": "prod"}), &CancellationFlag::default())
+            .call_tool(
+                "deploy",
+                json!({"target": "prod"}),
+                &CancellationFlag::default(),
+            )
             .expect_err("a changed schema must not execute");
         assert!(matches!(error, McpError::StaleTool(_)), "{error:?}");
 
@@ -1564,7 +1598,11 @@ mod tests {
         let full_bytes: usize = client
             .catalogue()
             .entries()
-            .map(|entry| serde_json::to_vec(&entry.input_schema).expect("encode").len())
+            .map(|entry| {
+                serde_json::to_vec(&entry.input_schema)
+                    .expect("encode")
+                    .len()
+            })
             .sum();
         assert_eq!(index["count"], 64);
         assert!(index["tools"][0]["input_schema"].is_null());
@@ -1628,7 +1666,10 @@ mod tests {
         let error = client
             .call_tool("fragile", json!({}), &CancellationFlag::default())
             .expect_err("a JSON-RPC error is an error");
-        assert!(matches!(error, McpError::Server { code: -32000, .. }), "{error:?}");
+        assert!(
+            matches!(error, McpError::Server { code: -32000, .. }),
+            "{error:?}"
+        );
     }
 
     #[test]

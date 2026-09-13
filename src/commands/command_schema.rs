@@ -159,6 +159,11 @@ const READ_ONLY: &[&str] = &[
 /// on a GitHub issue). See [`READ_ONLY`]'s own doc comment for the
 /// completeness guarantee both tables share.
 const MUTATING: &[&str] = &[
+    // Issue #483: the report itself only reads configuration, PATH and the
+    // tree, but `--probe` spawns each configured local MCP server and reaches
+    // a remote one over the network. Classified by what the verb CAN do, like
+    // `ctx api call` right below.
+    "zirv ctx capabilities",
     // Issue #353. Both bind the local runtime endpoint and write its
     // state-directory marker file, and `api call` can carry a mutating
     // protocol method (`session.start|stop|send_input`). Classified by what
