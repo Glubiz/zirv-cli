@@ -893,6 +893,10 @@ pub fn build_usage(view: &pool::PoolView, billing: &str) -> UsageStrip {
             value: Some(view.harnesses.iter().map(|row| u64::from(row.queued)).sum()),
             provenance: Provenance::Measured,
         },
+        // The pool view carries capacity, never spend. Saying so explicitly
+        // is the whole point of item 3: a missing figure is "unknown", and a
+        // consumer must never be able to read it as `$0.00`.
+        Measure::unknown("pool spend"),
     ];
 
     let seat_phase = view
@@ -1037,8 +1041,10 @@ impl Notice {
                 text: "\u{23fa} ".to_string(),
                 tone: Tone::Accent,
             },
+            // Glyph AND word: no notice is ever distinguished by colour or
+            // by an icon alone (item 7).
             StyledSpan {
-                text: format!("{} ", self.kind.glyph()),
+                text: format!("{} {} ", self.kind.glyph(), self.kind.label()),
                 tone: Tone::Muted,
             },
             StyledSpan {
@@ -1370,7 +1376,16 @@ impl ApprovalRequest {
         format!("{}: {}", self.tool, self.scope.text())
     }
 
-    /// Builds the dialog's request from the enforcement broker's OWN request
+    /// Builds the dialog's request from the enforcement broker's OWN request.
+    ///
+    /// Not reachable from an in-process `spawn_interactive` session today:
+    /// `runtime::native::session_broker` constructs every native session's
+    /// broker with `ApprovalMode::Headless`, so such a session never yields a
+    /// grantable request -- see the design note. This is the path a
+    /// runtime-owned session's `session.approve` (protocol v1) uses, and it
+    /// is unit-tested directly (`the_dialog_scope_comes_from_the_brokers_own_
+    /// request`).
+    #[allow(dead_code)]
     /// -- the one whose `scope_digest` the grant is signed against. Nothing
     /// here re-derives or widens the scope: the tool name and the paths come
     /// straight off `ExecutionAction`/`resolved_paths`, so the dialog can
@@ -1378,6 +1393,7 @@ impl ApprovalRequest {
     /// `widen_to` is what the operator's "don't ask again" would cover,
     /// supplied by the caller (normally the session's own workdir) and `None`
     /// when no such standing grant is offered at all.
+    #[allow(dead_code)]
     pub fn from_enforcement(
         request: &super::super::runtime::enforcement::ApprovalRequest,
         actor: impl Into<String>,
@@ -1492,6 +1508,10 @@ pub struct ApprovalDialog {
 }
 
 impl ApprovalDialog {
+    /// A fully grantable dialog. Paired with
+    /// [`ApprovalRequest::from_enforcement`], so it shares that function's
+    /// "not reachable from an in-process session yet" note.
+    #[allow(dead_code)]
     pub fn new(request: ApprovalRequest) -> Self {
         Self {
             request,
@@ -2086,9 +2106,7 @@ pub fn contained_ref(workdir: &Path, candidate: &str) -> Option<PathBuf> {
             std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if parts.pop().is_none() {
-                    return None;
-                }
+                parts.pop()?;
             }
             _ => return None,
         }
@@ -2334,6 +2352,13 @@ impl UxState {
         self.approval.is_some()
     }
 
+    /// Whether a modal owns the screen right now. The pane's global `Esc`
+    /// (interrupt the turn) defers to this: a modal closes first, and only a
+    /// second `Esc` reaches the turn.
+    pub fn modal_open(&self) -> bool {
+        self.approval.is_some() || self.inspection.is_some() || self.help
+    }
+
     /// Re-derives the overview and the usage strip from records, keeping the
     /// operator's selection on the same AGENT rather than the same row, and
     /// noting any newly-appeared approval as a notice.
@@ -2357,23 +2382,11 @@ impl UxState {
         self.refreshed_at = now;
     }
 
-    /// Opens (or replaces) the approval dialog and takes focus. Focus moves
-    /// to the dialog deliberately: an approval the operator cannot see is
+    /// Opens the dialog for a detected approval, unless the operator already
+    /// answered that exact tool call. Idempotent: calling it every tick with
+    /// the same pending approval opens exactly one dialog. Focus moves to the
+    /// dialog deliberately -- an approval the operator cannot see is
     /// indistinguishable from a hung fleet.
-    pub fn open_approval(&mut self, request: ApprovalRequest) {
-        self.notices.push(Notice {
-            kind: NoticeKind::DeferredDelivery,
-            headline: format!("approval needed: {}", request.scope_text()),
-            detail: vec![request.actor.clone()],
-            at: request.asked_at,
-        });
-        self.approval = Some(ApprovalDialog::new(request));
-        self.focus = Focus::Approval;
-    }
-
-    /// Opens the dialog for a transcript-detected approval, unless the
-    /// operator already answered that exact tool call. Idempotent: calling it
-    /// every tick with the same pending approval opens exactly one dialog.
     pub fn sync_approval(&mut self, pending: Option<PendingApproval>) {
         let Some(pending) = pending else {
             return;
@@ -3082,6 +3095,7 @@ mod tests {
             boundary: None,
             subagents: Vec::new(),
             settlement: None,
+            source_cancelled: Vec::new(),
             started_at: 5,
             updated_at: 12,
         };
@@ -3553,7 +3567,12 @@ mod tests {
     #[test]
     fn an_open_approval_claims_every_key_before_any_other_region() {
         let mut ux = UxState::default();
-        ux.open_approval(approval_fixture("sess-w1"));
+        ux.sync_approval(Some(PendingApproval {
+            tool_call_id: "ap-1".to_string(),
+            request: approval_fixture("sess-w1"),
+            grantable: true,
+            unavailable_reason: None,
+        }));
         assert!(ux.blocked());
         assert_eq!(ux.focus, Focus::Approval);
         // Tab, '?', 'a' -- all normally meaningful -- are swallowed.
@@ -3648,7 +3667,12 @@ mod tests {
     #[test]
     fn closing_an_approval_releases_what_was_deferred_while_it_was_open() {
         let mut ux = UxState::default();
-        ux.open_approval(approval_fixture("sess-w1"));
+        ux.sync_approval(Some(PendingApproval {
+            tool_call_id: "ap-1".to_string(),
+            request: approval_fixture("sess-w1"),
+            grantable: true,
+            unavailable_reason: None,
+        }));
         ux.deferred.defer(Deferred {
             kind: "mail",
             id: "m1".to_string(),

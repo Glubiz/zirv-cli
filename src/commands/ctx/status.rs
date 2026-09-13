@@ -943,6 +943,16 @@ pub struct StatusArgs {
     /// mode, matching `--breakdown`'s own early-return shape.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// Issue #490 (roadmap N21, item 6): print the native dashboard's OWN
+    /// agent/task overview, usage-and-health provenance strip and recent
+    /// notices as pretty-printed JSON -- the same `dash::native_ux` values
+    /// the TUI renders, not a parallel re-derivation, so a headless operator
+    /// and the pane can never disagree about what is running, blocked,
+    /// approval-needed, done-unread or failed. Includes a `limitations` list
+    /// naming every fact this build genuinely cannot know, so a gap is never
+    /// readable as a zero. Returns immediately, like `--breakdown`/`--json`.
+    #[arg(long, default_value_t = false)]
+    pub agents: bool,
     /// Issue #326: restore the report `zirv ctx status` printed before
     /// `--brief --diff` became the bare default -- the full, non-collapsed
     /// sections with no snapshot-diffing. Overrides `--brief`/`--diff` back
@@ -2375,6 +2385,83 @@ fn render_pool_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> Ctx
     Ok(0)
 }
 
+/// Issue #490 (roadmap N21, item 6): `status --agents` -- the headless twin
+/// of the native dashboard's agent/task overview and provenance strip.
+///
+/// Built from the identical builders the pane draws through
+/// (`native_ux::build_overview`/`build_usage`), fed the identical records
+/// (`coordinator::load`, `delegation::list`, `seat::load`, `pool::build`), so
+/// "headless status agrees with the TUI" is a structural property of sharing
+/// one reducer rather than two implementations kept in step by hand.
+///
+/// The one thing it cannot share is the pane's live state: an approval is
+/// detected from a LIVE pane's transcript, and notices are that pane's own
+/// observations, so both are empty here and `limitations` says so.
+fn render_agents_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> CtxResult<i32> {
+    use super::dash::native_ux;
+    use super::{coordinator, delegation, seat};
+
+    let state = StateDir::resolve(repo_state_env(env))?;
+    let cfg = CtxConfig::load(repo, env)?;
+    let now = now_secs();
+
+    let graph = coordinator::load(&state, repo);
+    let records = delegation::list(&state, repo);
+    let seats: Vec<seat::Seat> = records
+        .iter()
+        .map(|record| record.handle.short.as_str())
+        .chain(mail::session_identity(env).as_deref())
+        .filter_map(|short| seat::load(&state, short))
+        .collect();
+    let view = pool::build(
+        &state,
+        &cfg,
+        now,
+        mail::session_identity(env).as_deref(),
+        Some(&repo_slug(repo)),
+    );
+
+    let overview = native_ux::build_overview(&graph, &records, &seats, &[], now);
+    let usage = native_ux::build_usage(&view, &billing_label(&cfg, repo));
+    let notices = native_ux::NoticeLog::new(native_ux::NOTICE_LOG_CAP);
+    let report = native_ux::headless_report(&overview, &usage, &notices, now);
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|e| format!("status --agents: failed to serialize the report: {e}"))?;
+    writeln!(w, "{json}")?;
+    Ok(0)
+}
+
+/// The operator's configured billing class for this repository's default
+/// native account, or the placeholder when nothing resolves -- never a
+/// guessed default.
+fn billing_label(cfg: &CtxConfig, repo: &Path) -> String {
+    let _ = cfg;
+    use super::provider::BillingClass;
+    use super::provider::config::NativeConfig;
+    let Ok(home) = crate::utils::home_dir() else {
+        return style::PLACEHOLDER.to_string();
+    };
+    let Ok(Some(native)) = NativeConfig::load(&home, repo) else {
+        return style::PLACEHOLDER.to_string();
+    };
+    match native
+        .accounts
+        .values()
+        .next()
+        .map(|account| account.billing)
+    {
+        Some(BillingClass::Api) => "api".to_string(),
+        Some(BillingClass::Subscription) => "subscription".to_string(),
+        None => style::PLACEHOLDER.to_string(),
+    }
+}
+
+/// `StateDir::resolve`'s own environment lookup, named so the two JSON paths
+/// read alike.
+fn repo_state_env(env: EnvLookup<'_>) -> EnvLookup<'_> {
+    env
+}
+
 pub fn run_with<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -2384,6 +2471,9 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     if let Some(session) = &args.breakdown {
         return render_breakdown(session, w, repo, env);
+    }
+    if args.agents {
+        return render_agents_json(w, repo, env);
     }
     if args.json {
         return render_pool_json(w, repo, env);
@@ -2664,6 +2754,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2704,6 +2795,7 @@ mod tests {
                 full: true,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2740,6 +2832,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2771,6 +2864,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: true,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2871,6 +2965,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             repo.path(),
@@ -2904,6 +2999,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             repo.path(),
@@ -2935,6 +3031,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             repo.path(),
@@ -2970,6 +3067,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3017,6 +3115,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3063,6 +3162,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3126,6 +3226,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3165,6 +3266,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3217,6 +3319,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3274,6 +3377,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3348,6 +3452,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3393,6 +3498,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3436,6 +3542,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3485,6 +3592,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3544,6 +3652,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3599,6 +3708,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3639,6 +3749,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3719,6 +3830,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3780,6 +3892,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3825,6 +3938,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3880,6 +3994,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3918,6 +4033,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3969,6 +4085,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -4032,6 +4149,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4150,6 +4268,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4216,6 +4335,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4269,6 +4389,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4333,6 +4454,7 @@ mod tests {
                     full: false,
                     breakdown: None,
                     json: false,
+                agents: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -4370,6 +4492,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
 
         let mut out = Vec::new();
@@ -4446,6 +4569,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4516,6 +4640,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4624,6 +4749,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
 
         ledger::record(
@@ -4694,6 +4820,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
 
         let mut out = Vec::new();
@@ -4729,6 +4856,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
 
         let mut out = Vec::new();
@@ -4793,6 +4921,7 @@ mod tests {
                     full: false,
                     breakdown: None,
                     json: false,
+                agents: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -4854,6 +4983,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4895,6 +5025,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4927,6 +5058,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4975,6 +5107,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5028,6 +5161,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5080,6 +5214,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5149,6 +5284,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5216,6 +5352,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5293,6 +5430,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5335,6 +5473,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5373,6 +5512,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5421,6 +5561,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -5472,6 +5613,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -5536,6 +5678,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -5572,6 +5715,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5615,6 +5759,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5652,6 +5797,7 @@ mod tests {
                         full: false,
                         breakdown: None,
                         json: false,
+                agents: false,
                     },
                     &mut out,
                     tmp.path(),
@@ -5697,6 +5843,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5949,6 +6096,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5981,6 +6129,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6036,6 +6185,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6105,6 +6255,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6171,6 +6322,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6325,6 +6477,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut full_out,
             &repo,
@@ -6343,6 +6496,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut brief_out,
             &repo,
@@ -6477,6 +6631,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6524,6 +6679,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
 
         let mut first = Vec::new();
@@ -6576,6 +6732,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
 
         let mut first = Vec::new();
@@ -6664,6 +6821,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
         let mut first_out = Vec::new();
         run_with(
@@ -6692,6 +6850,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut status_out,
             &repo,
@@ -6820,6 +6979,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+                agents: false,
         };
 
         let mut out_a = Vec::new();
@@ -6867,6 +7027,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut full_out,
             tmp.path(),
@@ -6884,6 +7045,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut brief_out,
             tmp.path(),
@@ -6916,6 +7078,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
