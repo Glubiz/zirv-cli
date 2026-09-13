@@ -861,6 +861,61 @@ mod tests {
     }
 
     #[test]
+    fn latest_valid_skips_a_malformed_newest_checkpoint_and_returns_the_previous_valid_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal =
+            Journal::open_path(dir.path().join("journal.sqlite")).expect("open journal");
+        let identity = session_identity("s1", route_identity());
+        let session = identity.session.clone();
+        journal.create_session(&identity).expect("create session");
+        let scope = EventScope::default();
+
+        let state = empty_state(identity.clone());
+        let older = build(
+            &state,
+            SequenceId(0),
+            SequenceId(0),
+            &CheckpointId::new("cp-older").expect("id"),
+            &CheckpointContext::default(),
+            structural(),
+            10,
+        );
+        journal
+            .record_checkpoint(
+                &session,
+                identity.generation,
+                &scope,
+                CheckpointId::new("cp-older").expect("id"),
+                CheckpointKind::Compaction,
+                serde_json::to_value(&older).expect("value"),
+                1,
+            )
+            .expect("record older checkpoint");
+
+        // The newest checkpoint's export is missing a required field
+        // ("session") -- genuine corruption, not a schema-version mismatch,
+        // so `serde_json::from_value` itself fails and the Err arm is hit.
+        let mut malformed = serde_json::to_value(&older).expect("value");
+        malformed.as_object_mut().expect("object").remove("session");
+        journal
+            .record_checkpoint(
+                &session,
+                identity.generation,
+                &scope,
+                CheckpointId::new("cp-newest").expect("id"),
+                CheckpointKind::Compaction,
+                malformed,
+                2,
+            )
+            .expect("record malformed checkpoint");
+
+        let found = latest_valid(&journal, &session, CheckpointKind::Compaction)
+            .expect("latest_valid")
+            .expect("the older valid checkpoint is still returned");
+        assert_eq!(found.checkpoint_id, "cp-older");
+    }
+
+    #[test]
     fn same_route_as_compares_every_identity_field() {
         let state = empty_state(session_identity("s1", route_identity()));
         let checkpoint = build(
