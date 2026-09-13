@@ -1165,7 +1165,7 @@ pub fn helper_answer(
             Ok(answer) => return Ok(answer.text),
             Err(helper::HelperError::Unconfigured(_)) => {}
             Err(error) => {
-                crate::output::warn(&format!(
+                crate::output::warn(format!(
                     "native {role} helper failed ({error}); falling back to the harness distiller"
                 ));
             }

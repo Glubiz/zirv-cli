@@ -2833,6 +2833,8 @@ fn compile_standing_context(
     // the catalogue has nothing for it. Reserving the session's own output
     // ceiling is what keeps the compiled prefix from crowding out the answer.
     let context_window_tokens = capabilities.context_window.unwrap_or(128_000);
+    let provider = route.provider.to_string();
+    let session_id = session.to_string();
     let compiled = super::context::compile(&CompileRequest {
         home: Some(home),
         repo: request.repo,
@@ -2840,11 +2842,11 @@ fn compile_standing_context(
         state,
         config: cfg,
         role: prompt_role(request.role),
-        session_id: &session.to_string(),
+        session_id: &session_id,
         task: request.prompt,
         constraints: &[],
         pending_actions: &[],
-        provider: &route.provider.to_string(),
+        provider: &provider,
         model: &route.model.id,
         capabilities: &capabilities,
         budget: TokenBudget {
