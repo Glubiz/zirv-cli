@@ -156,9 +156,12 @@ for plain and thought text.
   `InvalidStream`, never a completion (covers a truncated function-call
   argument stream the same way).
 - `finishReason` values `SAFETY`, `RECITATION`, `PROHIBITED_CONTENT`,
-  `BLOCKLIST`, `SPII`, `IMAGE_SAFETY` commit as a typed `Refusal` block and
-  `FinishReason::Refusal` -- never prose -- with any in-flight tool call
-  dropped. `MAX_TOKENS` maps to `FinishReason::MaxTokens`.
+  `BLOCKLIST`, `SPII`, `IMAGE_SAFETY` commit as **only** a typed `Refusal`
+  block and `FinishReason::Refusal` -- never prose: any text, thinking or
+  tool-use content the turn had already settled is dropped rather than sat
+  beside the refusal, and the number of dropped blocks is recorded in
+  `stop_details.omitted_blocks` for diagnostics. `MAX_TOKENS` maps to
+  `FinishReason::MaxTokens`.
   `MALFORMED_FUNCTION_CALL` is a hard `InvalidToolArguments` error, not a
   finish reason the runtime could treat as a completed turn.
   `promptFeedback.blockReason` (the whole prompt blocked, no candidates ever
