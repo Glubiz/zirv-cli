@@ -58,7 +58,7 @@ use super::super::CtxResult;
 use super::super::config::{CtxConfig, EnvLookup};
 use super::super::runtime::journal::{
     AssistantBlock, ContentRef, ConversationState, EventScope, ExecutionRecord, ExecutionState,
-    Journal, MessageId, MessageRole, RouteIdentity, ToolCallId,
+    Journal, JournalSessionId, MessageId, MessageRole, RouteIdentity, ToolCallId,
 };
 use super::super::runtime::native::{
     self, InteractiveProgress, InteractiveRequest, InteractiveSession,
@@ -2606,12 +2606,62 @@ pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64) -> String {
     )
 }
 
+/// Issue #490 (N20 integration): where a native pane's conversation actually
+/// lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneAttach {
+    /// This process owns it -- `runtime::native::spawn_interactive`, a
+    /// background thread, a journal handle of our own. The mode every native
+    /// pane used before the persistent runtime existed, and still the mode
+    /// whenever the operator has not opted in.
+    InProcess,
+    /// The persistent runtime owns it; the pane is a protocol v1 client
+    /// (`dash::link::RuntimeLink`). Opening a second in-process session for
+    /// the same seat is exactly the two-supervisors-on-one-conversation
+    /// failure `link::RUNTIME_OWNS_IT` names.
+    Runtime { session_id: String, generation: u64 },
+}
+
+/// Pure: which attachment a native pane gets. Every condition is required
+/// and each for its own reason -- the operator's `[session] persistent` gate
+/// (`RuntimeLink::connect` already returns `None` without it AND without
+/// something listening), the runtime having actually advertised
+/// `session.native` (a capability the server never offered is disabled here,
+/// not attempted and refused), and a live native seat for this repository to
+/// attach TO. Anything missing falls back to in-process, which is a working
+/// mode rather than a failure.
+pub fn resolve_attach(
+    link: Option<&super::link::RuntimeLink>,
+    seat: Option<&super::super::api::wire::SessionFacts>,
+) -> PaneAttach {
+    let Some(link) = link else {
+        return PaneAttach::InProcess;
+    };
+    if !link.serves_native() {
+        return PaneAttach::InProcess;
+    }
+    match seat {
+        Some(facts)
+            if facts.runtime == super::super::runtime::RuntimeKind::Native && facts.reachable =>
+        {
+            PaneAttach::Runtime {
+                session_id: facts.session_id.clone(),
+                generation: facts.generation,
+            }
+        }
+        _ => PaneAttach::InProcess,
+    }
+}
+
 /// A live native pane: the one thing in this module that owns a running
 /// session. Everything else it holds is either a pure derivation of that
 /// session's journal ([`ConversationState`]/[`TranscriptView`], refreshed by
 /// [`Self::tick`]) or this module's own already-tested presentation state.
 pub struct NativePaneRuntime {
-    session: InteractiveSession,
+    /// `None` when the persistent runtime owns this conversation: opening a
+    /// second in-process session for the same seat is precisely the
+    /// two-supervisors failure `link::RUNTIME_OWNS_IT` exists to prevent.
+    session: Option<InteractiveSession>,
     journal: Journal,
     presentation: NativePresentation,
     conversation: ConversationState,
@@ -2660,6 +2710,24 @@ pub struct NativePaneRuntime {
     /// The checked-out branch, read once at spawn time -- see `git_branch`'s
     /// own doc comment for why this is not re-read every tick.
     git_branch: Option<String>,
+    // -- issue #490 (N20 integration): identity and transport ------------
+    /// The seat's short id, the journal session and the generation this pane
+    /// answers for. Held directly rather than read back off `session`,
+    /// because a runtime-attached pane HAS no local `InteractiveSession`.
+    short: String,
+    session_id: JournalSessionId,
+    generation: u64,
+    /// The route, when this process resolved one. `None` for a
+    /// runtime-attached pane: protocol v1's `SessionFacts` publishes no route
+    /// identity, and a guessed one would be worse than an honest placeholder.
+    route: Option<RouteIdentity>,
+    /// Where the conversation lives. See [`resolve_attach`].
+    attach: PaneAttach,
+    /// The protocol client, for a runtime-attached pane only.
+    link: Option<super::link::RuntimeLink>,
+    /// The journal cursor this pane has consumed through, so a reconnect
+    /// carries on rather than re-reading the conversation.
+    link_cursor: u64,
 }
 
 impl NativePaneRuntime {
@@ -2705,7 +2773,14 @@ impl NativePaneRuntime {
         });
 
         Ok(Self {
-            session,
+            short: session.handle.short.clone(),
+            session_id: session.session.clone(),
+            generation: session.handle.generation,
+            route: Some(session.route.clone()),
+            attach: PaneAttach::InProcess,
+            link: None,
+            link_cursor: 0,
+            session: Some(session),
             journal,
             presentation,
             conversation,
@@ -2727,6 +2802,140 @@ impl NativePaneRuntime {
             cwd: spec.repo,
             git_branch,
         })
+    }
+
+    /// Issue #490: a pane over a conversation the persistent runtime already
+    /// owns. Nothing is spawned: the journal is the same durable SQLite file
+    /// the runtime writes, so the transcript reducer is unchanged, and every
+    /// ACTION (submit, steer, interrupt, approve) goes out over protocol v1
+    /// instead of into a local session -- see [`Self::send_submit`],
+    /// [`Self::interrupt`] and [`Self::decide_approval`].
+    pub fn attach_runtime(
+        state: &StateDir,
+        link: super::link::RuntimeLink,
+        facts: &super::super::api::wire::SessionFacts,
+        repo: PathBuf,
+    ) -> CtxResult<Self> {
+        let session_id = JournalSessionId::new(facts.session_id.clone())
+            .map_err(|error| format!("native chat: runtime session id: {error}"))?;
+        let journal = Journal::open(state)?;
+        let conversation = journal.replay(&session_id)?;
+        let transcript =
+            cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
+        let git_branch = git_branch(&repo);
+
+        let mut presentation = NativePresentation {
+            workdir: Some(repo.clone()),
+            ..NativePresentation::default()
+        };
+        load_draft(state, &facts.short).restore_onto(&mut presentation.composer);
+
+        let continuity = super::native_ux::Continuity::new(super::native_ux::SeatIdentity {
+            short: facts.short.clone(),
+            session: facts.session_id.clone(),
+            generation: facts.generation,
+        });
+
+        Ok(Self {
+            short: facts.short.clone(),
+            session_id,
+            generation: facts.generation,
+            route: None,
+            attach: PaneAttach::Runtime {
+                session_id: facts.session_id.clone(),
+                generation: facts.generation,
+            },
+            link: Some(link),
+            link_cursor: 0,
+            session: None,
+            journal,
+            presentation,
+            conversation,
+            transcript,
+            session_state: NativeSessionState::Idle,
+            turn_state: None,
+            billing: style::PLACEHOLDER.to_string(),
+            ux: super::native_ux::UxState::default(),
+            repo: repo.clone(),
+            state: state.clone(),
+            continuity,
+            replay_failures: 0,
+            announced_recoveries: 0,
+            announced_rollover_at: 0,
+            announced_terminal: BTreeSet::new(),
+            ended: false,
+            notice: None,
+            turn_started_at: None,
+            cwd: repo,
+            git_branch,
+        })
+    }
+
+    /// What the status line calls this pane's runtime. A runtime-attached
+    /// pane says so: the operator must be able to tell at a glance whether
+    /// closing this window stops the conversation or merely detaches from it.
+    fn runtime_label(&self) -> &'static str {
+        match self.attach {
+            PaneAttach::InProcess => "native",
+            PaneAttach::Runtime { .. } => "native \u{b7} runtime",
+        }
+    }
+
+    fn route_model_vendor(&self) -> String {
+        self.route
+            .as_ref()
+            .map(|route| route.model.vendor.to_string())
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string())
+    }
+
+    fn route_model_id(&self) -> String {
+        self.route
+            .as_ref()
+            .map(|route| route.model.id.to_string())
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string())
+    }
+
+    fn route_label(&self) -> String {
+        self.route
+            .as_ref()
+            .map(|route| route.route.to_string())
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string())
+    }
+
+    fn context_left(&self) -> Option<u8> {
+        self.route
+            .as_ref()
+            .and_then(|route| context_left_pct(route, &self.conversation))
+    }
+
+    /// Progress, for an in-process pane. A runtime-attached one learns the
+    /// same thing from the journal cursor instead -- protocol v1 publishes
+    /// durable events, not a progress channel.
+    fn drain_progress(&mut self) -> Vec<InteractiveProgress> {
+        match self.session.as_ref() {
+            Some(session) => session.drain_progress(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Starts a turn. One place, two transports: `session.send_input` over
+    /// protocol v1 for a runtime-owned conversation (with this pane's own
+    /// idempotency key, so a reconnect that resends cannot start a second
+    /// turn), the in-process channel otherwise.
+    fn send_submit(&mut self, text: &str) {
+        match (self.link.as_mut(), self.session.as_ref()) {
+            (Some(link), _) => {
+                let session_id = self.session_id.to_string();
+                let key = format!("{}-{}", self.short, now_ms_u64());
+                if let Err(error) = link.submit(&session_id, text, Some(&key)) {
+                    self.notice = Some(format!("submit refused by the runtime: {error}"));
+                }
+            }
+            (None, Some(session)) => {
+                let _ = session.submit(text.to_string());
+            }
+            (None, None) => {}
+        }
     }
 
     pub fn ux(&self) -> &super::native_ux::UxState {
@@ -2751,7 +2960,7 @@ impl NativePaneRuntime {
         // the fleet is. `fanout_plan` decides how many; the rest are picked up
         // on a later tick rather than turning one 150 ms frame into hundreds
         // of filesystem reads.
-        let shorts: Vec<&str> = std::iter::once(self.session.handle.short.as_str())
+        let shorts: Vec<&str> = std::iter::once(self.short.as_str())
             .chain(records.iter().map(|record| record.handle.short.as_str()))
             .collect();
         let fanout = super::native_ux::fanout_plan(shorts.len(), &self.ux.budget);
@@ -2793,7 +3002,7 @@ impl NativePaneRuntime {
         // rollover or a compaction that happened while this pane was not
         // looking is still announced exactly once.
         if let Some(record) =
-            super::super::rollover_runtime::load(&self.state, &self.session.handle.short)
+            super::super::rollover_runtime::load(&self.state, &self.short)
             && record.updated_at > self.announced_rollover_at
         {
             self.announced_rollover_at = record.updated_at;
@@ -2801,7 +3010,7 @@ impl NativePaneRuntime {
             self.ux.notices.push(notice);
         }
         if let Ok(history) =
-            super::super::runtime::compaction::history(&self.journal, &self.session.session)
+            super::super::runtime::compaction::history(&self.journal, &self.session_id)
         {
             let total = history.compactions.len() + history.resumes.len();
             if total > self.announced_recoveries {
@@ -2827,7 +3036,7 @@ impl NativePaneRuntime {
             &self.state,
             cfg,
             now,
-            Some(self.session.session.as_str()),
+            Some(self.session_id.as_str()),
             None,
         );
         let approvals: Vec<super::native_ux::ApprovalRequest> = self
@@ -2949,29 +3158,59 @@ impl NativePaneRuntime {
         decision: super::native_ux::ApprovalDecision,
         persistent: bool,
     ) {
-        use super::native_ux::ApprovalDecision;
+        use super::native_ux::{ApprovalDecision, ApprovalRoute};
         let released = self.ux.close_approval();
-        let route = super::native_ux::approval_route(persistent);
-        match decision {
-            ApprovalDecision::Deny => {
-                let guidance = format!(
-                    "The operator denied {}. Do not retry it; choose a different approach and say what you changed.",
-                    request.scope_text()
-                );
-                let _ = self.write_steering(&guidance);
+        let route = super::native_ux::approval_route(persistent && self.link.is_some());
+        let guidance = format!(
+            "The operator denied {}. Do not retry it; choose a different approach and say what you changed.",
+            request.scope_text()
+        );
+        match route {
+            // Issue #490 + N20: a runtime-owned conversation's decision goes
+            // to the service that is actually holding the request open, by
+            // ITS request id -- the dashboard never mints a grant of its own,
+            // and a note carries the "tell the agent what to do differently"
+            // text of a denial.
+            ApprovalRoute::Protocol => {
+                let session_id = self.session_id.to_string();
+                let wire = match decision {
+                    ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
+                        super::super::api::wire::ApprovalDecision::Allow
+                    }
+                    ApprovalDecision::Deny => super::super::api::wire::ApprovalDecision::Deny,
+                };
+                let note = (decision == ApprovalDecision::Deny).then_some(guidance.as_str());
+                let outcome = self
+                    .link
+                    .as_mut()
+                    .map(|link| link.approve(&session_id, &request.id, wire, note));
+                if let Some(Err(error)) = outcome {
+                    self.notice = Some(format!("approval refused by the runtime: {error}"));
+                }
             }
-            ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
-                self.ux.notices.push(super::native_ux::Notice {
-                    kind: super::native_ux::NoticeKind::DeferredDelivery,
-                    headline: format!(
-                        "approval {} via {route:?} \u{2014} {}",
-                        decision.as_str(),
-                        request.scope_text()
-                    ),
-                    detail: Vec::new(),
-                    at: 0,
-                });
-            }
+            // The in-process broker. A denial is a complete action -- the
+            // guidance is committed as steering and the running loop picks it
+            // up between requests; an allow is only ever OFFERED when the
+            // session's broker can actually issue a grant, which today's
+            // `ApprovalMode::Headless` native session cannot (see the design
+            // note).
+            ApprovalRoute::Broker => match decision {
+                ApprovalDecision::Deny => {
+                    let _ = self.write_steering(&guidance);
+                }
+                ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
+                    self.ux.notices.push(super::native_ux::Notice {
+                        kind: super::native_ux::NoticeKind::DeferredDelivery,
+                        headline: format!(
+                            "approval {} via {route:?} \u{2014} {}",
+                            decision.as_str(),
+                            request.scope_text()
+                        ),
+                        detail: Vec::new(),
+                        at: 0,
+                    });
+                }
+            },
         }
         for item in released {
             self.ux.notices.push(super::native_ux::Notice {
@@ -2987,7 +3226,7 @@ impl NativePaneRuntime {
     /// dashboard tick; cheap (a `try_recv` loop plus one SQLite read) so a
     /// short poll interval costs nothing while the session is idle.
     pub fn tick(&mut self) {
-        for progress in self.session.drain_progress() {
+        for progress in self.drain_progress() {
             match progress {
                 InteractiveProgress::Busy => {
                     self.session_state = NativeSessionState::Running;
@@ -3030,14 +3269,43 @@ impl NativePaneRuntime {
                 }
             }
         }
+        // Issue #490 + N20: a runtime-attached pane has no progress channel.
+        // Its cue that something happened is protocol v1's journal cursor --
+        // the same durable sequence the transcript is reduced from -- and a
+        // `gap` is the runtime telling us the cursor cannot be continued,
+        // which is a reconnect the operator must see rather than a silent
+        // resynchronization.
+        if let Some(link) = self.link.as_mut() {
+            let session_id = self.session_id.to_string();
+            match link.events(&session_id, self.link_cursor) {
+                Ok(page) => {
+                    if page.gap {
+                        self.ux.notices.push(super::native_ux::notice_reconnect(
+                            0,
+                            page.cursor,
+                            page.last_sequence.saturating_sub(self.link_cursor) as usize,
+                        ));
+                    }
+                    self.link_cursor = page.cursor;
+                    self.session_state = if page.cursor < page.last_sequence {
+                        NativeSessionState::Running
+                    } else {
+                        NativeSessionState::Idle
+                    };
+                }
+                Err(error) => {
+                    self.notice = Some(format!("runtime journal unavailable: {error}"));
+                }
+            }
+        }
         self.refresh_transcript();
         // Issue #490 (item 5): `blocked` is now a fact read from what the
         // journal recorded -- the broker's own approval refusal on a tool
         // call -- rather than the hardcoded `false` N11 shipped.
-        let actor = format!("{} \u{b7} {}", self.session.handle.short, "orchestrator");
+        let actor = format!("{} \u{b7} {}", self.short, "orchestrator");
         let pending = super::native_ux::detect_pending_approval(
             &self.transcript.items,
-            &self.session.session.to_string(),
+            &self.session_id.to_string(),
             &actor,
         );
         self.ux.sync_approval(pending);
@@ -3053,7 +3321,7 @@ impl NativePaneRuntime {
     /// [`MAX_TRANSCRIPT_ITEMS`] so a very long session's per-tick cost (and
     /// the pane's own memory) stays flat rather than growing without bound.
     fn refresh_transcript(&mut self) {
-        let Ok(conversation) = self.journal.replay(&self.session.session) else {
+        let Ok(conversation) = self.journal.replay(&self.session_id) else {
             // Issue #490 (item 4): a replay failure is a lost connection to
             // the durable record, not a reason to redraw a stale pane
             // silently. Count it; the recovery emits the reconnect notice.
@@ -3099,10 +3367,10 @@ impl NativePaneRuntime {
         StatusFacts {
             model: format!(
                 "{}/{}",
-                self.session.route.model.vendor, self.session.route.model.id
+                self.route_model_vendor(), self.route_model_id()
             ),
-            route: self.session.route.route.to_string(),
-            runtime: "native".to_string(),
+            route: self.route_label(),
+            runtime: self.runtime_label().to_string(),
             billing: self.billing.clone(),
             session_state: self.session_state,
             turn_state: self.turn_state,
@@ -3115,7 +3383,7 @@ impl NativePaneRuntime {
             activity: self.activity_line(),
             cwd: self.cwd.display().to_string(),
             git_branch: self.git_branch.clone(),
-            context_left_pct: context_left_pct(&self.session.route, &self.conversation),
+            context_left_pct: self.context_left(),
         }
     }
 
@@ -3206,7 +3474,7 @@ impl NativePaneRuntime {
         };
         match intent {
             SubmitIntent::Immediate => {
-                let _ = self.session.submit(text);
+                self.send_submit(&text);
             }
             SubmitIntent::Steer => {
                 let _ = self.write_steering(&text);
@@ -3224,9 +3492,9 @@ impl NativePaneRuntime {
 
     fn current_identity(&self) -> super::native_ux::SeatIdentity {
         super::native_ux::SeatIdentity {
-            short: self.session.handle.short.clone(),
-            session: self.session.session.to_string(),
-            generation: self.session.handle.generation,
+            short: self.short.clone(),
+            session: self.session_id.to_string(),
+            generation: self.generation,
         }
     }
 
@@ -3249,10 +3517,18 @@ impl NativePaneRuntime {
     /// running turn picks this up between requests without either side
     /// coordinating directly.
     fn write_steering(&mut self, text: &str) -> CtxResult<()> {
+        // Issue #490: a runtime-owned conversation is steered through the
+        // service that owns it, never by a second writer on its journal --
+        // the runtime is the one supervisor, and `session.send_input` is the
+        // documented way in.
+        if self.link.is_some() {
+            self.send_submit(text);
+            return Ok(());
+        }
         let message_id = MessageId::new(format!("steer-{}", uuid::Uuid::new_v4().simple()))?;
         self.journal.acknowledge_input(
-            &self.session.session,
-            self.session.handle.generation,
+            &self.session_id,
+            self.generation,
             &EventScope::default(),
             message_id,
             text.to_string(),
@@ -3263,20 +3539,60 @@ impl NativePaneRuntime {
         Ok(())
     }
 
-    pub fn interrupt(&self) {
-        self.session.interrupt();
+    pub fn interrupt(&mut self) {
+        match (self.link.as_mut(), self.session.as_ref()) {
+            (Some(link), _) => {
+                let session_id = self.session_id.to_string();
+                let _ = link.interrupt(&session_id);
+            }
+            (None, Some(session)) => session.interrupt(),
+            (None, None) => {}
+        }
     }
 
-    /// Persists the draft/queued input and stops the worker thread. Takes
-    /// `self` by value: there is nothing left to drive afterward.
-    pub fn shutdown(self, state: &StateDir) {
-        let short = self.session.handle.short.clone();
+    /// Persists the draft/queued input and releases this pane's hold. For an
+    /// in-process pane that stops the worker thread; for a runtime-attached
+    /// one it is a `session.detach` -- the session, its journal and its
+    /// supervisor are untouched, which is the whole point of the persistent
+    /// runtime. Takes `self` by value: there is nothing left to drive.
+    pub fn shutdown(mut self, state: &StateDir) {
+        let short = self.short.clone();
         persist_draft(
             state,
             &short,
             &PersistedDraft::from_composer(&self.presentation.composer),
         );
-        self.session.shutdown();
+        let session_id = self.session_id.to_string();
+        if let Some(link) = self.link.as_mut() {
+            let _ = link.detach(&session_id);
+        }
+        if let Some(session) = self.session {
+            session.shutdown();
+        }
+    }
+}
+
+/// Issue #490 + N20: opens the pane on whichever transport
+/// [`resolve_attach`] selects. Kept separate from [`run_native_dashboard`]
+/// so the decision is one small, readable function rather than a branch
+/// buried in a terminal-setup sequence.
+fn open_native_pane(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    env: EnvLookup<'_>,
+    spec: NativeDashboardSpec,
+) -> CtxResult<NativePaneRuntime> {
+    let mut link = super::link::RuntimeLink::connect(state, cfg.session.persistent);
+    let seat = link.as_mut().and_then(|link| {
+        let slug = super::super::state::repo_slug(&spec.repo);
+        link.seat_for(&slug, "native").ok().flatten()
+    });
+    match resolve_attach(link.as_ref(), seat.as_ref()) {
+        PaneAttach::Runtime { .. } => {
+            let (link, facts) = (link.expect("link"), seat.expect("seat"));
+            NativePaneRuntime::attach_runtime(state, link, &facts, spec.repo.clone())
+        }
+        PaneAttach::InProcess => NativePaneRuntime::spawn(cfg, state, env, spec),
     }
 }
 
@@ -3315,7 +3631,12 @@ pub fn run_native_dashboard(
     env: EnvLookup<'_>,
     spec: NativeDashboardSpec,
 ) -> CtxResult<i32> {
-    let mut pane = NativePaneRuntime::spawn(cfg, state, env, spec)?;
+    // Issue #490 + N20: attach through the persistent runtime when the
+    // operator has opted in, something is listening, it serves native
+    // conversations, and it already holds a live native seat for this
+    // repository -- otherwise open our own in-process session, which is a
+    // working mode rather than a failure (`link::ownership`'s own rule).
+    let mut pane = open_native_pane(cfg, state, env, spec)?;
     let mut last_ctrl_c: Option<std::time::Instant> = None;
 
     let previous_panic_hook = super::install_panic_hook();
@@ -4170,6 +4491,55 @@ mod tests {
         .collect();
         // Straight to the box: no completion rows.
         assert!(text[0].starts_with('\u{256d}'));
+    }
+
+    // -- issue #490 + N20: which transport a native pane attaches through --
+
+    #[test]
+    fn a_pane_attaches_in_process_unless_the_runtime_owns_a_live_native_seat() {
+        use crate::commands::ctx::api::wire::{SessionFacts, SessionState};
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let native_seat = |state: SessionState, reachable: bool| {
+            let mut facts = SessionFacts::new("sess-1");
+            facts.runtime = RuntimeKind::Native;
+            facts.state = state;
+            facts.reachable = reachable;
+            facts.generation = 3;
+            facts
+        };
+
+        // No link at all (the gate is off, or nothing is listening):
+        // in-process, which is a working mode rather than a failure.
+        assert_eq!(
+            resolve_attach(None, Some(&native_seat(SessionState::Idle, true))),
+            PaneAttach::InProcess
+        );
+
+        // A link, but a seat this runtime cannot actually serve as a
+        // conversation -- a wrapped session, or one it says is unreachable --
+        // is never attached to either. (`serves_native` needs a live
+        // negotiated client, which `link.rs`'s own tests cover against a real
+        // server; the seat half of the rule is what this pins.)
+        let mut harness_seat = native_seat(SessionState::Idle, true);
+        harness_seat.runtime = RuntimeKind::Harness;
+        assert_eq!(resolve_attach(None, Some(&harness_seat)), PaneAttach::InProcess);
+        assert_eq!(
+            resolve_attach(None, Some(&native_seat(SessionState::Idle, false))),
+            PaneAttach::InProcess
+        );
+        assert_eq!(resolve_attach(None, None), PaneAttach::InProcess);
+    }
+
+    #[test]
+    fn an_approval_on_a_runtime_owned_session_routes_over_the_protocol() {
+        use crate::commands::ctx::dash::native_ux::{ApprovalRoute, approval_route};
+        // The pane's own rule: the protocol path is taken only when the
+        // operator's gate is on AND this pane actually holds a link. A gate
+        // with no link is the in-process broker, never a silent no-op.
+        assert_eq!(approval_route(true && true), ApprovalRoute::Protocol);
+        assert_eq!(approval_route(true && false), ApprovalRoute::Broker);
+        assert_eq!(approval_route(false), ApprovalRoute::Broker);
     }
 
     // The in-flight spinner/verb/elapsed/interrupt-hint line is the head's
