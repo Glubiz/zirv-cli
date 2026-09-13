@@ -189,6 +189,14 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::Directory,
         &["commands/ctx/task.rs", "commands/ctx/agent.rs"],
     ),
+    // Issue #479. Delegation records live under `<state>/delegations/<slug>/`;
+    // the bucket is newer than every legacy slug scheme, so the adoption
+    // rename always no-ops, and the row exists to keep this audit complete.
+    (
+        "delegations",
+        SlugEntry::Directory,
+        &["commands/ctx/delegation.rs"],
+    ),
     (
         "worktrees",
         SlugEntry::File("", ".jsonl"),
