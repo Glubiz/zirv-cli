@@ -920,4 +920,94 @@ mod tests {
 
         service.shutdown(false);
     }
+
+    /// Issue #352's PTY-ownership residual, as the dashboard now behaves: with
+    /// the gate on and a runtime listening, the dashboard is a CLIENT of it.
+    ///
+    /// Every step here is `dash::link::RuntimeLink` over the real transport --
+    /// find the seat the dashboard would otherwise have opened a second
+    /// terminal for, attach as its controller, drive it, read its content, and
+    /// detach without ending anything. The dashboard opens no pty, spawns no
+    /// child and files no registry record anywhere in it.
+    #[test]
+    fn the_dashboard_drives_a_runtime_session_as_a_protocol_client() {
+        use crate::commands::ctx::dash::link::{ContentSource, RuntimeLink, content_source};
+
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = config(tmp.path());
+        let environment = Arc::new(RecordingEnvironment::default());
+        let service = RuntimeService::start_with(
+            state.clone(),
+            "default",
+            &cfg,
+            Arc::clone(&environment) as Arc<dyn NativeEnvironment>,
+        )
+        .expect("start");
+        service.native().run_turns_inline_for_test();
+
+        let id = NativeHost::start(
+            service.native().as_ref(),
+            &crate::commands::ctx::runtime::SessionSpec {
+                runtime: crate::commands::ctx::runtime::RuntimeKind::Native,
+                role: "orchestrator".to_string(),
+                agent: None,
+                provider_route: None,
+                model: None,
+                surface: crate::commands::ctx::runtime::UiSurface::Headless,
+                cwd: tmp.path().to_path_buf(),
+                prompt: "hello".to_string(),
+                extra_args: Vec::new(),
+            },
+        );
+        let _ = id;
+
+        let mut link = RuntimeLink::connect(&state, true).expect("a runtime is listening");
+        assert!(
+            link.serves_native(),
+            "a runtime that owns conversations advertises the native surface to the dashboard"
+        );
+        let seat = link
+            .seat_for(
+                &crate::commands::ctx::state::repo_slug(tmp.path()),
+                crate::commands::ctx::runtime::RuntimeKind::Native.as_str(),
+            )
+            .expect("seat lookup")
+            .expect("the runtime holds this repository's seat");
+        assert_eq!(content_source(&seat), ContentSource::Events);
+
+        let attachment = link
+            .attach(&seat.session_id, true)
+            .expect("attach as controller");
+        assert_eq!(attachment.controller.as_deref(), Some(link.client_id()));
+
+        link.submit(&seat.session_id, "carry on", Some("dash-retry-1"))
+            .expect("submit");
+        link.submit(&seat.session_id, "carry on", Some("dash-retry-1"))
+            .expect("a retry is accepted and deduplicated");
+
+        let page = link.events(&seat.session_id, 0).expect("events");
+        assert!(!page.gap);
+        assert!(
+            page.events
+                .iter()
+                .filter(|event| event.kind == "input_acknowledged")
+                .count()
+                == 2,
+            "the launch prompt and one deduplicated retry: {:?}",
+            page.events
+        );
+
+        link.detach(&seat.session_id).expect("detach");
+        assert!(
+            crate::commands::ctx::sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == seat.session_id),
+            "the dashboard going away costs a repaint, not a session"
+        );
+
+        service.shutdown(false);
+    }
 }

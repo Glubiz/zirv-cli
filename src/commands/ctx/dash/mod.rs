@@ -13,6 +13,7 @@
 
 pub mod actions;
 pub mod hit;
+pub mod link;
 pub mod notify;
 pub mod pane;
 pub mod roster;
@@ -10612,6 +10613,29 @@ pub fn run_dashboard(
         // keep a live poller (`poll: true`), unlike `fulfill_spawn_request`.
         let gate = super::pace::interactive_gate(state, cfg, provider, true);
         super::wrap::apply_interactive_gate(gate, force_pace)?;
+    }
+
+    // Issue #489 (issue #352's PTY-ownership residual): with `[session]
+    // persistent` on and a runtime listening, the terminals belong to the
+    // SERVICE. The dashboard becomes a protocol client of it rather than
+    // opening a second pty over a session that already has a supervisor --
+    // two supervisors on one conversation is exactly what the runtime exists
+    // to prevent. The link is dropped straight away here: it is the ownership
+    // question that matters at this point, and painting a runtime-owned
+    // session inside the dashboard is step N11 (#480).
+    if let Some(mut link) = link::RuntimeLink::connect(state, cfg.session.persistent) {
+        let slug = super::state::repo_slug(repo);
+        match link.seat_for(&slug, &agent_name) {
+            Ok(Some(seat)) => {
+                remove_request_dir(&requests_dir);
+                return Err(format!("{} ({})", link::RUNTIME_OWNS_IT, seat.short).into());
+            }
+            Ok(None) => {}
+            // A runtime that cannot be read is not a reason to refuse to
+            // start: the dashboard owns its own terminals in that case,
+            // which is the pre-runtime behaviour and a working one.
+            Err(error) => push_error(&mut errors, format!("runtime link: {error}")),
+        }
     }
 
     let size = (main.width.max(1), main.height.max(1));
