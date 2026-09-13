@@ -4172,37 +4172,12 @@ mod tests {
         assert!(text[0].starts_with('\u{256d}'));
     }
 
-    #[test]
-    fn the_spinner_runs_only_while_a_turn_is_in_flight() {
-        let presentation = NativePresentation::default();
-        assert!(
-            spinner_line(
-                &presentation,
-                &facts(NativeSessionState::Idle, None, false, false)
-            )
-            .is_none()
-        );
-        let line = spinner_line(
-            &presentation,
-            &facts(
-                NativeSessionState::Running,
-                Some(NativeTurnState::Requesting),
-                false,
-                false,
-            ),
-        )
-        .expect("spinner");
-        let text = line.to_plain_string();
-        assert!(text.contains("esc to interrupt"));
-        assert!(text.starts_with('\u{273b}'));
-    }
-
-    #[test]
-    fn the_spinner_verb_rotates_deterministically_with_elapsed_time() {
-        assert_eq!(spinner_verb(0), spinner_verb(3));
-        assert_ne!(spinner_verb(0), spinner_verb(4));
-        assert_eq!(spinner_verb(0), spinner_verb(24));
-    }
+    // The in-flight spinner/verb/elapsed/interrupt-hint line is the head's
+    // `activity_line_text`, already covered by
+    // `activity_line_text_carries_real_elapsed_seconds_tokens_and_the_
+    // interrupt_hint` and `activity_line_text_is_a_pure_function_of_elapsed_
+    // time`; issue #490's own second copy was dropped rather than kept in
+    // step with it.
 
     #[test]
     fn the_composer_box_survives_a_forty_column_pane() {
