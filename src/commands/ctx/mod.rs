@@ -47,6 +47,7 @@ pub mod memory;
 pub mod memory_cli;
 pub mod memory_optimize;
 pub mod native_hooks;
+pub mod native_worker;
 pub mod objective;
 pub mod optimize;
 pub mod output;
