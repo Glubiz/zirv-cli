@@ -2128,7 +2128,18 @@ pub fn run_headless<W: std::io::Write>(
     w: &mut W,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    let status = run_session(request, w, env)?;
+    // `run_session`'s own doc comment: `w` can carry one human line before
+    // the status exists (a resume's outcome-unknown reconcile notice), which
+    // a `--json` caller has to route somewhere other than its own
+    // single-object stdout. This is that caller -- it always prints exactly
+    // one JSON status object to `w` below, so the notice is captured here
+    // and re-emitted on stderr instead, mirroring `native_worker::launch_
+    // native`'s identical treatment of the same notice.
+    let mut notices: Vec<u8> = Vec::new();
+    let status = run_session(request, &mut notices, env)?;
+    if !notices.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&notices));
+    }
     writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
     Ok(status.exit_code)
 }
@@ -3704,6 +3715,142 @@ mod tests {
         );
         assert_eq!(status.status, NativeStatus::Incomplete);
         assert!(tools.calls.is_empty(), "a crashed effect is never replayed");
+    }
+
+    /// Review finding on `run_headless` (issue #479 follow-up): `run_
+    /// session`'s own doc comment promises its one human line -- a resume's
+    /// outcome-unknown reconcile notice -- is routed "somewhere other than
+    /// its own single-object stdout" for a `--json` caller. `run_headless`
+    /// broke that promise by writing the notice to the SAME writer as the
+    /// final status JSON. Seeds a journal session with an execution stuck
+    /// `Started` (mid-effect, as if the process had crashed there, exactly
+    /// like `a_resume_reconciles_a_started_execution_and_fences_the_old_
+    /// generation` above), resumes it end to end through `run_headless`
+    /// itself, and asserts the writer it was given holds exactly one
+    /// parseable JSON object -- which a leaked notice line ahead of it would
+    /// break entirely, since `serde_json::from_slice` accepts no other
+    /// content before or after the one value it parses.
+    #[test]
+    fn a_resume_with_a_reconcile_notice_writes_exactly_one_json_object_to_stdout() {
+        use super::super::super::state::StateDir;
+        use super::super::journal::PolicyProvenance;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let session = JournalSessionId::new("native-session-crashed").unwrap();
+        {
+            let mut journal = Journal::open(&state).expect("open journal");
+            journal
+                .create_session(&SessionIdentity {
+                    session: session.clone(),
+                    seat: SeatId::new("seat-crashed").unwrap(),
+                    generation: 1,
+                    task: None,
+                    route: route.clone(),
+                    created_at: 1,
+                    completed_at: None,
+                })
+                .unwrap();
+            let scope = EventScope::default();
+            let call = ToolCallId::new("call_crashed").unwrap();
+            let execution = ExecutionId::new("exec_crashed").unwrap();
+            journal
+                .prepare_tool_call(
+                    &session,
+                    1,
+                    &scope,
+                    call.clone(),
+                    "apply_patch".into(),
+                    serde_json::json!({"path": "src/lib.rs", "patch": "x"}),
+                    PolicyProvenance {
+                        fingerprint: String::new(),
+                        source: "native-loop".into(),
+                        decision: "allowed".into(),
+                        scope: "worker".into(),
+                    },
+                    Some(1),
+                    1,
+                )
+                .unwrap();
+            journal
+                .prepare_execution(
+                    &session,
+                    1,
+                    &scope,
+                    execution.clone(),
+                    call.clone(),
+                    Some(1),
+                    1,
+                )
+                .unwrap();
+            journal
+                .transition_execution(
+                    &session,
+                    1,
+                    &scope,
+                    &execution,
+                    ExecutionState::Started,
+                    None,
+                    None,
+                    Some(1),
+                    1,
+                )
+                .unwrap();
+            // ... and the process dies here, mid-effect. The journal is
+            // closed (end of this block) with the execution still `Started`.
+        }
+
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        let fixtures = fixture_root();
+        let provider = format!(
+            "fixture:{}",
+            fixtures.join("resume-continue.json").display()
+        );
+        let mut request = HeadlessRequest {
+            repo: repo.path(),
+            prompt: "",
+            route: None,
+            role: "worker",
+            limits: NativeLimits::default(),
+            resume: Some("native-session-crashed"),
+            provider: Some(&provider),
+            fixture_tools: None,
+            task: None,
+            writer: None,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        run_headless(&mut request, &mut out, &lookup).expect("resumed run");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or_else(|error| {
+            panic!(
+                "stdout must be exactly one JSON object, never mixed with the reconcile \
+                 notice: {error}: {}",
+                String::from_utf8_lossy(&out)
+            )
+        });
+        assert!(value.get("status").is_some(), "{value}");
+
+        // The reconcile really happened -- this is not a vacuous pass.
+        let journal = Journal::open(&state).expect("reopen journal");
+        let replayed = journal.replay(&session).expect("replay");
+        let execution = ExecutionId::new("exec_crashed").unwrap();
+        assert_eq!(
+            replayed
+                .executions
+                .get(&execution)
+                .map(|record| record.state),
+            Some(ExecutionState::OutcomeUnknown),
+            "the resume must have reconciled the started execution"
+        );
     }
 
     /// Finding 2, the other half: a resume through the backend seam does the
