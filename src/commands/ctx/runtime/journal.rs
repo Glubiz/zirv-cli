@@ -1489,6 +1489,21 @@ impl Journal {
         Ok(Some(envelope))
     }
 
+    /// Every session this journal holds, oldest first. Used by read-only
+    /// reporting surfaces (`zirv ctx status`) that have a state directory but
+    /// no session id of their own.
+    pub fn session_ids(&self) -> JournalResult<Vec<JournalSessionId>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT session_id FROM native_sessions ORDER BY created_at, session_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(JournalSessionId::new(row?)?);
+        }
+        Ok(out)
+    }
+
     pub fn events(&self, session: &JournalSessionId) -> JournalResult<Vec<StoredEvent>> {
         // Establish that the session exists before an empty query could
         // otherwise make unknown and no-events sessions indistinguishable.

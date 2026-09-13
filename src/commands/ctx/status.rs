@@ -16,6 +16,8 @@ use super::memory;
 use super::permit;
 use super::pool;
 use super::price;
+use super::runtime::compaction;
+use super::runtime::journal::Journal;
 use super::search;
 use super::session_spend;
 use super::sessions::{self, Liveness};
@@ -2011,6 +2013,15 @@ fn render_report<W: Write>(
         }
     }
 
+    // Issue #486: what native sessions have compacted and resumed, and why.
+    // Read straight off the native journal, so it survives a restart and
+    // needs no second bookkeeping store. OMITTED ENTIRELY when no native
+    // session has ever compacted or resumed: a machine that has not used the
+    // native runtime must not grow a permanent empty section.
+    for line in native_recovery_lines(&state) {
+        writeln!(w, "{}", label(colour, &line))?;
+    }
+
     if args.brief {
         writeln!(
             w,
@@ -2077,6 +2088,51 @@ fn render_report<W: Write>(
     // outcome (success, a skipped-unparsable layer, or any other load error)
     // keeps exiting 0.
     Ok(if repo_forbidden { 1 } else { 0 })
+}
+
+/// How many native sessions' recovery history one status report shows.
+const NATIVE_RECOVERY_SESSIONS: usize = 5;
+
+/// Issue #486: one line per native session that has compacted or resumed --
+/// how many times, and the reason for the newest compaction.
+///
+/// Best-effort and read-only throughout. A missing native journal, one this
+/// build cannot open, or a session whose events cannot be read all produce
+/// NOTHING rather than an error or a fabricated "none": `ctx status` must
+/// never fail, and must never create a database, because of this section.
+fn native_recovery_lines(state: &StateDir) -> Vec<String> {
+    if !state.native_journal().exists() {
+        return Vec::new();
+    }
+    let Ok(journal) = Journal::open(state) else {
+        return Vec::new();
+    };
+    let Ok(sessions) = journal.session_ids() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for session in sessions.iter().rev().take(NATIVE_RECOVERY_SESSIONS) {
+        let Ok(history) = compaction::history(&journal, session) else {
+            continue;
+        };
+        if history.is_empty() {
+            continue;
+        }
+        let mut line = format!(
+            "native {session}: {} compaction(s), {} resume(s)",
+            history.compactions.len(),
+            history.resumes.len()
+        );
+        if let Some(last) = history.compactions.last() {
+            line.push_str(&format!(
+                "; last {} through sequence {} ({} summary)",
+                last.reason, last.covers_through, last.summary_source
+            ));
+        }
+        lines.push(line);
+    }
+    lines.reverse();
+    lines
 }
 
 /// Issue #246: `status --diff`'s schema version for [`StatusSnapshot`].
@@ -2439,6 +2495,102 @@ mod tests {
 
     fn env_for(state: &std::path::Path) -> std::collections::HashMap<String, String> {
         [(STATE_ENV.to_string(), state.display().to_string())].into()
+    }
+
+    /// Issue #486: a machine that has never run a native session grows no
+    /// section at all -- and `status` never creates the journal database as a
+    /// side effect of looking.
+    #[test]
+    fn the_native_recovery_section_is_absent_without_a_native_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        assert!(native_recovery_lines(&state).is_empty());
+        assert!(!state.native_journal().exists());
+    }
+
+    /// Issue #486: a compacted native session reports its count and the
+    /// reason for its newest compaction, read straight off the journal.
+    #[test]
+    fn the_native_recovery_section_names_the_newest_compaction_reason() {
+        use crate::commands::ctx::provider::{
+            AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
+        };
+        use crate::commands::ctx::runtime::checkpoint;
+        use crate::commands::ctx::runtime::journal::{
+            CheckpointId, CheckpointKind, EventScope, Journal, JournalSessionId, MessageId,
+            RouteIdentity, SeatId, SequenceId, SessionIdentity,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(state.root()).unwrap();
+        let session = JournalSessionId::new("native-status-1").unwrap();
+        let mut journal = Journal::open(&state).unwrap();
+        journal
+            .create_session(&SessionIdentity {
+                session: session.clone(),
+                seat: SeatId::new("seat-1").unwrap(),
+                generation: 1,
+                task: None,
+                route: RouteIdentity {
+                    route: RouteId::new("fixture").unwrap(),
+                    provider: ProviderId::new("anthropic").unwrap(),
+                    endpoint: EndpointId::new("fixture").unwrap(),
+                    account: AccountId::new("fixture").unwrap(),
+                    billing_pool: BillingPoolId::new("fixture").unwrap(),
+                    protocol: Protocol::AnthropicMessages,
+                    model: ModelId {
+                        vendor: "fixture".into(),
+                        id: "fixture-model".into(),
+                    },
+                },
+                created_at: 1,
+                completed_at: None,
+            })
+            .unwrap();
+        journal
+            .acknowledge_input(
+                &session,
+                1,
+                &EventScope::default(),
+                MessageId::new("m1").unwrap(),
+                "go".to_string(),
+                false,
+                Some(1),
+                1,
+            )
+            .unwrap();
+        let replayed = journal.replay(&session).unwrap();
+        let portable = checkpoint::build(
+            &replayed,
+            SequenceId(1),
+            SequenceId(1),
+            &CheckpointId::new("cp-1").unwrap(),
+            &checkpoint::CheckpointContext {
+                reason: "token_pressure".to_string(),
+                ..Default::default()
+            },
+            compaction::structural_summary(&replayed, SequenceId(1)),
+            1,
+        );
+        checkpoint::commit(
+            &mut journal,
+            None,
+            1,
+            &EventScope::default(),
+            CheckpointKind::Compaction,
+            &portable,
+            1,
+        )
+        .unwrap();
+        drop(journal);
+
+        let lines = native_recovery_lines(&state);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].contains("native native-status-1"), "{}", lines[0]);
+        assert!(lines[0].contains("1 compaction(s)"), "{}", lines[0]);
+        assert!(lines[0].contains("token_pressure"), "{}", lines[0]);
+        assert!(lines[0].contains("structural summary"), "{}", lines[0]);
     }
 
     /// Issue #312: the pure rendering half of `--breakdown`, exercised

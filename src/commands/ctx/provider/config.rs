@@ -689,6 +689,65 @@ mod tests {
         );
     }
 
+    /// Issue #486: `policy.compaction` is the second key a checkout may set,
+    /// and it only ever narrows -- a repository asking for `automatic` cannot
+    /// turn an operator's `advisory` back on.
+    #[test]
+    fn a_repository_may_narrow_the_compaction_policy_but_never_widen_it() {
+        let operator = "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n\
+                        [route.a]\naccount='work'\nmodel='haiku'\n";
+        for (operator_policy, repo_policy, expected) in [
+            ("", "compaction='advisory'\n", CompactionPolicy::Advisory),
+            (
+                "[policy]\ncompaction='advisory'\n",
+                "compaction='automatic'\n",
+                CompactionPolicy::Advisory,
+            ),
+            (
+                "[policy]\ncompaction='automatic'\n",
+                "compaction='automatic'\n",
+                CompactionPolicy::Automatic,
+            ),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let _home = HomeGuard::set(home.path());
+            let repo = repo();
+            write(
+                &NativeConfig::operator_path(home.path()),
+                &format!("{operator}{operator_policy}"),
+            );
+            write(
+                &NativeConfig::repo_path(repo.path()),
+                &format!("schema=1\n[policy]\n{repo_policy}"),
+            );
+            let cfg = NativeConfig::load(home.path(), repo.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(cfg.compaction_policy(), expected);
+        }
+    }
+
+    /// And no OTHER policy key gains entry alongside it.
+    #[test]
+    fn a_repository_still_cannot_set_any_other_policy_key() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write(
+            &NativeConfig::operator_path(home.path()),
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n[route.a]\naccount='work'\nmodel='haiku'\n",
+        );
+        write(
+            &NativeConfig::repo_path(repo.path()),
+            "schema=1\n[policy]\nsomething_else=true\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("policy.something_else"),
+            "got {error}"
+        );
+    }
+
     #[test]
     fn narrowing_cannot_leave_a_bound_role_on_a_disallowed_route() {
         let home = tempfile::tempdir().unwrap();
