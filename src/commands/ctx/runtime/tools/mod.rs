@@ -242,7 +242,8 @@ impl ToolRegistry {
     pub fn clear_mcp(&mut self, server: &str) {
         let prefix = format!("{MCP_PREFIX}{server}__");
         self.bindings.retain(|name, _| !name.starts_with(&prefix));
-        self.definitions.retain(|name, _| !name.starts_with(&prefix));
+        self.definitions
+            .retain(|name, _| !name.starts_with(&prefix));
     }
 
     fn parse(&self, name: &str, arguments: Value) -> Result<ParsedTool, ToolError> {
@@ -913,7 +914,9 @@ fn mcp_error(error: super::mcp::McpError) -> ToolError {
             approval: None,
             outcome_unknown: true,
         },
-        McpError::StaleTool(_) => ToolError::new(ToolErrorCode::PreconditionFailed, error.to_string()),
+        McpError::StaleTool(_) => {
+            ToolError::new(ToolErrorCode::PreconditionFailed, error.to_string())
+        }
         McpError::Unavailable(_) => {
             ToolError::new(ToolErrorCode::PreconditionFailed, error.to_string())
         }
@@ -1426,13 +1429,15 @@ impl NativeToolClient {
                     .map_err(ToolError::from)
             }
             ParsedTool::BrowserInspect(args) => self.bounded(
-                self.browser()?.inspect(&args.url).map_err(ToolError::from)?,
+                self.browser()?
+                    .inspect(&args.url)
+                    .map_err(ToolError::from)?,
                 "dom",
                 &["browser_inspect", &args.url],
             ),
-            ParsedTool::DiagnosticsReport(_) => Ok(
-                super::capabilities::diagnostics_report(&self.repo),
-            ),
+            ParsedTool::DiagnosticsReport(_) => {
+                Ok(super::capabilities::diagnostics_report(&self.repo))
+            }
             ParsedTool::CapabilityReport(_) => self.capability_report(),
             ParsedTool::ArtifactRegister(args) => {
                 let path = authorized_path(authorization)?;
@@ -1734,14 +1739,9 @@ impl NativeToolClient {
         let report = CapabilityReport::for_repo("native", &self.repo)
             .map_err(ToolError::external)?
             .with_integrations(self.services.integrations.clone());
-        let plan = artifact::presentation_plan(
-            "native",
-            &record.path,
-            args.interactive,
-            false,
-            &report,
-        )
-        .map_err(ToolError::external)?;
+        let plan =
+            artifact::presentation_plan("native", &record.path, args.interactive, false, &report)
+                .map_err(ToolError::external)?;
         Ok(json!({
             "artifact": record,
             "plan": plan,
@@ -1797,12 +1797,7 @@ impl NativeToolClient {
     /// store, leaving a bounded summary and the opaque retrieval id behind.
     /// The same "never let the summary be the only copy" rule process output
     /// already follows, applied to untrusted MCP and web payloads.
-    fn bounded(
-        &self,
-        mut value: Value,
-        field: &str,
-        command: &[&str],
-    ) -> Result<Value, ToolError> {
+    fn bounded(&self, mut value: Value, field: &str, command: &[&str]) -> Result<Value, ToolError> {
         let Some(object) = value.as_object_mut() else {
             return Ok(value);
         };
@@ -2526,10 +2521,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             "Search the web through the operator's configured search endpoint. Every result \
              carries the source URL it came from. Unavailable unless one is configured -- a model \
              API provides no search of its own.",
-            object_schema(
-                &["query"],
-                json!({"query":{"type":"string","minLength":1}}),
-            ),
+            object_schema(&["query"], json!({"query":{"type":"string","minLength":1}})),
             &["tool_access", "network"],
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::Network, ResourceClaimKind::OutputStore],
@@ -2639,7 +2631,10 @@ fn native_definitions() -> Vec<ToolDefinition> {
             FRONTEND_REVIEW,
             "Run the visual review over the latest render and return its verdict, rubric and \
              findings.",
-            object_schema(&[], json!({"agent":{"type":"string"},"model":{"type":"string"}})),
+            object_schema(
+                &[],
+                json!({"agent":{"type":"string"},"model":{"type":"string"}}),
+            ),
             &["tool_access", "shell_exec", "network"],
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::ReadRoot, ResourceClaimKind::OutputStore],
@@ -3237,7 +3232,9 @@ mod tests {
             MCP_DESCRIBE,
             MCP_CALL,
         ] {
-            let definition = registry.get(name).unwrap_or_else(|| panic!("missing {name}"));
+            let definition = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(definition.input_schema["additionalProperties"], false);
         }
         let extra = registry
@@ -3245,7 +3242,10 @@ mod tests {
             .expect_err("unknown fields are rejected");
         assert_eq!(extra.code, ToolErrorCode::InvalidArguments);
         let empty = registry
-            .parse(BROWSER_CAPTURE, json!({"url":"https://a.example","label":""}))
+            .parse(
+                BROWSER_CAPTURE,
+                json!({"url":"https://a.example","label":""}),
+            )
             .expect_err("an empty label is rejected");
         assert_eq!(empty.code, ToolErrorCode::InvalidArguments);
     }
@@ -3274,7 +3274,11 @@ mod tests {
     fn a_promoted_mcp_tool_is_namespaced_and_can_never_shadow_a_built_in() {
         let mut registry = ToolRegistry::native();
         let name = registry
-            .register_mcp("docs", &entry("file_write", "path"), ProcessEffects::default())
+            .register_mcp(
+                "docs",
+                &entry("file_write", "path"),
+                ProcessEffects::default(),
+            )
             .expect("register");
         assert_eq!(name, "mcp__docs__file_write");
         assert!(
@@ -3312,7 +3316,9 @@ mod tests {
                 .contains(&"git_push_destructive".to_string())
         );
         assert!(
-            !definition.capabilities.contains(&"repo_fs_write".to_string()),
+            !definition
+                .capabilities
+                .contains(&"repo_fs_write".to_string()),
             "an undeclared effect must not be granted"
         );
         assert_eq!(definition.retry, RetryPolicy::NeverAfterStart);
@@ -3322,10 +3328,18 @@ mod tests {
     fn clearing_a_server_removes_only_its_own_promoted_tools() {
         let mut registry = ToolRegistry::native();
         registry
-            .register_mcp("docs", &entry("lookup", "symbol"), ProcessEffects::default())
+            .register_mcp(
+                "docs",
+                &entry("lookup", "symbol"),
+                ProcessEffects::default(),
+            )
             .expect("register");
         registry
-            .register_mcp("other", &entry("lookup", "symbol"), ProcessEffects::default())
+            .register_mcp(
+                "other",
+                &entry("lookup", "symbol"),
+                ProcessEffects::default(),
+            )
             .expect("register");
         registry.clear_mcp("docs");
         assert!(registry.get("mcp__docs__lookup").is_none());
@@ -3350,6 +3364,271 @@ mod tests {
             .parse(MCP_LIST, json!({}))
             .expect("parse");
         assert_eq!(discovery.retry_policy(), RetryPolicy::Safe);
+    }
+
+    // ----------------------------------------------------------------
+    // End-to-end: a native session calling a real MCP client through the
+    // real broker, with only the transport replaced by the in-process
+    // fixture server. Nothing here is stubbed between `execute` and the
+    // policy decision.
+    // ----------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct FixedPolicy(super::super::enforcement::PolicySnapshot);
+
+    impl super::super::enforcement::PolicySource for FixedPolicy {
+        fn current(
+            &self,
+        ) -> Result<super::super::enforcement::PolicySnapshot, super::super::enforcement::BrokerError>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedFence;
+
+    impl super::super::enforcement::GenerationFence for FixedFence {
+        fn verify(
+            &self,
+            _identity: &super::super::enforcement::ExecutionIdentity,
+        ) -> Result<(), super::super::enforcement::BrokerError> {
+            Ok(())
+        }
+    }
+
+    struct EndToEnd {
+        _root: tempfile::TempDir,
+        client: NativeToolClient,
+    }
+
+    fn end_to_end(
+        policy: super::super::super::policy::EffectivePolicy,
+        server: super::super::mcp::FixtureServer,
+        max_inline_mcp_tools: usize,
+    ) -> EndToEnd {
+        use super::super::super::config::{
+            CapabilitiesConfig, CtxConfig, McpServerConfig, McpTransportConfig,
+        };
+        use super::super::enforcement::{
+            ApprovalAuthority, ApprovalMode, ExecutionBroker, ExecutionIdentity, NetworkScope,
+            PlatformIsolation, PolicySnapshot, ResourceClaims,
+        };
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        let state_root = root.path().join("state");
+        let home = root.path().join("home");
+        for path in [&repo, &state_root, &home] {
+            std::fs::create_dir_all(path).expect("create root");
+        }
+        let repo = std::fs::canonicalize(&repo).expect("canonical repo");
+        let claims = ResourceClaims::new(&repo, &repo, &state_root, &home, NetworkScope::Any)
+            .expect("claims");
+        let broker = ExecutionBroker::new(
+            ExecutionIdentity {
+                session: "session-483".into(),
+                short: "abcd1234".into(),
+                generation: 1,
+                role: "worker".into(),
+                task: None,
+            },
+            claims,
+            ApprovalMode::Headless,
+            std::sync::Arc::new(FixedPolicy(
+                PolicySnapshot::new(policy, super::super::super::safety::SafetyPolicy::default())
+                    .expect("policy"),
+            )),
+            std::sync::Arc::new(FixedFence),
+            std::sync::Arc::new(ApprovalAuthority::new()),
+            None,
+            PlatformIsolation::Unavailable {
+                platform: "test".into(),
+                reason: "no test sandbox".into(),
+            },
+            Default::default(),
+        )
+        .expect("broker");
+
+        let cfg = CtxConfig {
+            capabilities: CapabilitiesConfig {
+                enabled: true,
+                max_inline_mcp_tools,
+                mcp: vec![McpServerConfig {
+                    name: "docs".into(),
+                    enabled: true,
+                    transport: McpTransportConfig::Stdio {
+                        command: "never-spawned".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        environment: Default::default(),
+                    },
+                    ..McpServerConfig::default()
+                }],
+                ..CapabilitiesConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        let mut services = super::super::capabilities::CapabilityServices::for_servers(&cfg, &repo);
+        services.transport_overrides.insert(
+            "docs".into(),
+            std::sync::Arc::new(super::super::mcp::FixtureFactory::new(server)),
+        );
+        let client = NativeToolClient::new(
+            broker,
+            StateDir::from_root(state_root.clone()),
+            repo,
+            ToolLimits::testing(),
+        )
+        .with_capabilities(services);
+        EndToEnd {
+            _root: root,
+            client,
+        }
+    }
+
+    fn tool_row(name: &str) -> Value {
+        json!({
+            "name": name,
+            "description": "A tool a server described.",
+            "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}},
+        })
+    }
+
+    #[test]
+    fn a_native_session_invokes_an_mcp_server_through_the_broker_with_a_bounded_receipt() {
+        let mut fixture = end_to_end(
+            super::super::super::policy::EffectivePolicy::default(),
+            super::super::mcp::FixtureServer {
+                tools: vec![tool_row("lookup")],
+                ..Default::default()
+            },
+            24,
+        );
+        let receipt =
+            fixture
+                .client
+                .execute("mcp__docs__lookup", json!({"value": "x"}), None, None);
+        assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+        assert_eq!(receipt.retry, RetryPolicy::NeverAfterStart);
+        assert!(receipt.policy_fingerprint.is_some());
+        let result = receipt.result.expect("result");
+        assert_eq!(result["text"], "ran lookup");
+        assert_eq!(result["is_error"], false);
+    }
+
+    #[test]
+    fn policy_denial_stops_an_mcp_call_before_the_server_is_ever_reached() {
+        use super::super::super::policy::{EffectivePolicy, Stance};
+
+        let mut fixture = end_to_end(
+            EffectivePolicy {
+                tool_access: Stance::Deny,
+                ..EffectivePolicy::default()
+            },
+            super::super::mcp::FixtureServer {
+                tools: vec![tool_row("lookup")],
+                ..Default::default()
+            },
+            24,
+        );
+        let receipt =
+            fixture
+                .client
+                .execute("mcp__docs__lookup", json!({"value": "x"}), None, None);
+        assert_eq!(receipt.state, ToolReceiptState::Failed);
+        assert_eq!(
+            receipt.error.expect("error").code,
+            ToolErrorCode::AuthorizationDenied
+        );
+    }
+
+    #[test]
+    fn a_large_catalogue_stays_out_of_the_registry_and_is_reachable_by_index() {
+        let tools: Vec<Value> = (0..40).map(|i| tool_row(&format!("tool{i}"))).collect();
+        let mut fixture = end_to_end(
+            super::super::super::policy::EffectivePolicy::default(),
+            super::super::mcp::FixtureServer {
+                tools,
+                ..Default::default()
+            },
+            8,
+        );
+        assert!(
+            !fixture
+                .client
+                .registry()
+                .definitions()
+                .any(|definition| definition.name.starts_with(MCP_PREFIX)),
+            "a catalogue above the inline budget must not be promoted"
+        );
+        let receipt = fixture.client.execute(MCP_LIST, json!({}), None, None);
+        assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+        let result = receipt.result.expect("result");
+        assert_eq!(result["servers"][0]["catalogue"]["count"], 40);
+        assert!(
+            result["servers"][0]["catalogue"]["tools"][0]["input_schema"].is_null(),
+            "the index must not carry schemas"
+        );
+
+        // The same tool is still callable by name through mcp_call.
+        let receipt = fixture.client.execute(
+            MCP_CALL,
+            json!({"server": "docs", "tool": "tool7", "arguments": {"value": "x"}}),
+            None,
+            None,
+        );
+        assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+    }
+
+    #[test]
+    fn an_unconfigured_web_capability_fails_the_call_rather_than_returning_nothing() {
+        let mut fixture = end_to_end(
+            super::super::super::policy::EffectivePolicy::default(),
+            super::super::mcp::FixtureServer::default(),
+            24,
+        );
+        let receipt = fixture
+            .client
+            .execute(WEB_SEARCH, json!({"query": "rust"}), None, None);
+        assert_eq!(receipt.state, ToolReceiptState::Failed);
+        let error = receipt.error.expect("error");
+        assert_eq!(error.code, ToolErrorCode::PreconditionFailed);
+        assert!(error.message.contains("capabilities.web"), "{error:?}");
+    }
+
+    #[test]
+    fn the_capability_report_tool_names_every_integration_state() {
+        let mut fixture = end_to_end(
+            super::super::super::policy::EffectivePolicy::default(),
+            super::super::mcp::FixtureServer {
+                tools: vec![tool_row("lookup")],
+                ..Default::default()
+            },
+            24,
+        );
+        let receipt = fixture
+            .client
+            .execute(CAPABILITY_REPORT, json!({}), None, None);
+        assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+        let result = receipt.result.expect("result");
+        let states: Vec<&str> = result["integrations"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row["state"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            states
+                .iter()
+                .all(|state| ["available", "unavailable", "unverified"].contains(state)),
+            "{states:?}"
+        );
+        assert_eq!(
+            result["registered_mcp_tools"],
+            json!(["mcp__docs__lookup"]),
+            "a small catalogue is promoted and reported"
+        );
     }
 
     #[test]

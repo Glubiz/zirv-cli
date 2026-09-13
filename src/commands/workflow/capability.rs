@@ -409,8 +409,7 @@ impl CapabilityReport {
     pub fn for_repo(adapter: &str, repo: &Path) -> CtxResult<Self> {
         let config =
             crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())?;
-        let integrations =
-            crate::commands::ctx::runtime::capabilities::discover(&config, repo);
+        let integrations = crate::commands::ctx::runtime::capabilities::discover(&config, repo);
         Ok(Self::for_policy(adapter, &config.policy).with_integrations(integrations))
     }
 

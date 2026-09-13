@@ -35,9 +35,7 @@ use serde_json::{Value, json};
 
 use super::super::config::{BrowserCapabilityConfig, CtxConfig, EnvLookup, WebCapabilityConfig};
 use super::super::pace::redact_for_log;
-use crate::commands::workflow::capability::{
-    IntegrationId, IntegrationState, IntegrationStatus,
-};
+use crate::commands::workflow::capability::{IntegrationId, IntegrationState, IntegrationStatus};
 
 const MAX_WEB_RESULTS: usize = 20;
 const MAX_SNIPPET_BYTES: usize = 400;
@@ -106,8 +104,12 @@ pub struct EgressRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EgressDecision {
     /// Send as-is, or with `payload` replaced by the returned text.
-    Allow { payload: String },
-    Refuse { reason: String },
+    Allow {
+        payload: String,
+    },
+    Refuse {
+        reason: String,
+    },
 }
 
 /// The single interception point for everything this module sends. Issue
@@ -264,7 +266,13 @@ impl WebBackend {
         }
     }
 
-    fn send(&self, integration: IntegrationId, url: &str, payload: &str, max_bytes: usize) -> Result<HttpGetReply, CapabilityError> {
+    fn send(
+        &self,
+        integration: IntegrationId,
+        url: &str,
+        payload: &str,
+        max_bytes: usize,
+    ) -> Result<HttpGetReply, CapabilityError> {
         let decision = self.egress.inspect(&EgressRequest {
             integration,
             url: url.to_string(),
@@ -354,9 +362,9 @@ fn parse_web_results(value: &Value) -> Vec<WebResult> {
             let url = ["url", "link", "href"]
                 .iter()
                 .find_map(|key| row.get(*key).and_then(Value::as_str))?;
-            if host_of(url).is_none() {
-                return None;
-            }
+            // A row whose URL has no parsable host names no source, and an
+            // unsourced result is not a result.
+            host_of(url)?;
             let title = ["title", "name", "heading"]
                 .iter()
                 .find_map(|key| row.get(*key).and_then(Value::as_str))
@@ -643,10 +651,26 @@ impl BrowserBackend {
 pub fn diagnostics_report(repo: &Path) -> Value {
     let checker = super::super::diagnostics::checker_for(repo);
     let tools: Vec<Value> = [
-        ("cargo", "Rust build and check", repo.join("Cargo.toml").is_file()),
-        ("rust-analyzer", "Rust language server", repo.join("Cargo.toml").is_file()),
-        ("tsc", "TypeScript type checker", repo.join("tsconfig.json").is_file()),
-        ("eslint", "JavaScript/TypeScript linter", repo.join("package.json").is_file()),
+        (
+            "cargo",
+            "Rust build and check",
+            repo.join("Cargo.toml").is_file(),
+        ),
+        (
+            "rust-analyzer",
+            "Rust language server",
+            repo.join("Cargo.toml").is_file(),
+        ),
+        (
+            "tsc",
+            "TypeScript type checker",
+            repo.join("tsconfig.json").is_file(),
+        ),
+        (
+            "eslint",
+            "JavaScript/TypeScript linter",
+            repo.join("package.json").is_file(),
+        ),
     ]
     .into_iter()
     .map(|(program, purpose, relevant)| {
@@ -712,7 +736,11 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
     } else {
         IntegrationStatus::unverified(
             IntegrationId::Mcp,
-            format!("{} configured server(s): {}", servers.len(), servers.join(", ")),
+            format!(
+                "{} configured server(s): {}",
+                servers.len(),
+                servers.join(", ")
+            ),
             "configured but not contacted this run; run `zirv ctx capabilities --probe`",
         )
     });
@@ -838,8 +866,8 @@ fn web_status(
 /// choice if it resolves, otherwise the same discovery `frontend render` does.
 pub fn browser_binary(config: &BrowserCapabilityConfig) -> Option<String> {
     if let Some(binary) = config.binary.as_deref() {
-        let present = Path::new(binary).is_file()
-            || super::super::adapters::program_is_present(binary);
+        let present =
+            Path::new(binary).is_file() || super::super::adapters::program_is_present(binary);
         return present.then(|| binary.to_string());
     }
     crate::commands::workflow::frontend_render::discover_browser()
@@ -908,12 +936,9 @@ impl CapabilityServices {
                 bearers.insert(server.name.clone(), secret);
             }
         }
-        let credential = resolve_credential(
-            cfg.capabilities.web.search_credential.as_deref(),
-            env,
-            now,
-        )
-        .unwrap_or(None);
+        let credential =
+            resolve_credential(cfg.capabilities.web.search_credential.as_deref(), env, now)
+                .unwrap_or(None);
         let web = Some(WebBackend::new(
             cfg.capabilities.web.clone(),
             credential,
@@ -1113,7 +1138,9 @@ mod tests {
             },
             ScriptedGetter::json("{}"),
         );
-        let error = backend.search("rust").expect_err("no endpoint is configured");
+        let error = backend
+            .search("rust")
+            .expect_err("no endpoint is configured");
         assert!(
             matches!(
                 &error,
@@ -1153,7 +1180,10 @@ mod tests {
         let not_a_url = backend
             .fetch("file:///etc/passwd")
             .expect_err("not an http(s) URL");
-        assert!(matches!(not_a_url, CapabilityError::Denied(_)), "{not_a_url:?}");
+        assert!(
+            matches!(not_a_url, CapabilityError::Denied(_)),
+            "{not_a_url:?}"
+        );
 
         let closed = web(
             WebCapabilityConfig {

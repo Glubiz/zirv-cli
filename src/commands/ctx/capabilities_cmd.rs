@@ -60,8 +60,7 @@ pub fn run(args: &CapabilitiesArgs, writer: &mut impl Write) -> CtxResult<i32> {
 
     let mut refusals = Vec::new();
     for name in &args.require {
-        let Some(integration) =
-            crate::commands::workflow::capability::IntegrationId::parse(name)
+        let Some(integration) = crate::commands::workflow::capability::IntegrationId::parse(name)
         else {
             return Err(format!(
                 "unknown integration {name:?}; expected one of {}",

@@ -68,6 +68,7 @@ criterion).
 | `ctx agent` | N10 (#479) | same surface as `agent`; `--runtime native` forks to `ctx::native_worker` after everything both runtimes share has already happened |
 | `ctx api` | N20 (#489) | the versioned local runtime protocol (issue #353): `schema`/`serve`/`call`. Backend-neutral by construction -- it publishes redacted session facts and a narrow method set over whichever `RuntimeBackend` is attached -- but the persistent runtime it exists to front is N20's, so the verb is owned there rather than marked `shared` |
 | `ctx ask` | N15 (#484) |  |
+| `ctx capabilities` | N14 (#483) | the available/unavailable/unverified integration report the native tool service and workflow admission both read; `--probe` verifies each configured MCP server, `--require` gates a script on the engine's own admission rule |
 | `ctx chat` | N11 (#480) |  |
 | `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |
 | `ctx config` | shared |  |
@@ -247,6 +248,13 @@ vendor, every local runtime and Azure OpenAI, and
 `src/commands/ctx/provider/bedrock.rs` (`perform_blocking`), the SigV4-signed
 Bedrock Converse transport. Neither adds a command verb: a route profile is
 configuration, not a new surface.
+
+N14 adds one command row, `ctx capabilities`. It calls no model: the report is
+built from configuration, PATH and the repository tree, and `--probe` contacts
+MCP servers over the protocol rather than a provider. The thirteen native
+capability tools it reports on are registry entries under `runtime::tools`, not
+command verbs and not model-calling call sites, so they add no row to either
+table.
 
 N09 adds the two rows that actually DRIVE a model rather than transport one
 request: `NativeLoop::stream_once`, the single place the loop reaches a
