@@ -4075,6 +4075,154 @@ mod tests {
 
     // -- classify_status / classify_submit_intent ---------------------------
 
+    // -- issue #490: the bordered composer, the spinner and the entry modes --
+
+    #[test]
+    fn the_composer_is_a_bordered_box_with_a_marker_and_a_hint_line() {
+        let mut presentation = NativePresentation::default();
+        presentation.composer.draft = "keep the shim".to_string();
+        let lines = composer_block(
+            &presentation,
+            &facts(NativeSessionState::Idle, None, false, false),
+            60,
+        );
+        let text: Vec<String> = lines.iter().map(StyledLine::to_plain_string).collect();
+        assert!(text[0].starts_with('\u{256d}') && text[0].ends_with('\u{256e}'));
+        assert!(text[1].contains("> keep the shim"));
+        assert!(text[2].starts_with('\u{2570}'));
+        assert!(text[3].contains("? for shortcuts"));
+        assert!(text[3].contains("enter sends"));
+        // Every box row is exactly the pane's width.
+        for row in &text[..3] {
+            assert_eq!(style::display_width(row), 60, "row {row:?} is not 60 wide");
+        }
+    }
+
+    #[test]
+    fn the_hint_line_says_what_enter_does_right_now() {
+        let presentation = NativePresentation::default();
+        let steering = composer_block(
+            &presentation,
+            &facts(NativeSessionState::Running, None, false, false),
+            60,
+        );
+        assert!(
+            steering
+                .last()
+                .expect("hint")
+                .to_plain_string()
+                .contains("steers")
+        );
+        let blocked = composer_block(
+            &presentation,
+            &facts(NativeSessionState::Idle, None, true, false),
+            60,
+        );
+        let hint = blocked.last().expect("hint").to_plain_string();
+        assert!(hint.contains("blocked") && hint.contains("queues"));
+    }
+
+    #[test]
+    fn a_slash_draft_lists_commands_above_the_box() {
+        let mut presentation = NativePresentation::default();
+        presentation.composer.draft = "/a".to_string();
+        let text: Vec<String> = composer_block(
+            &presentation,
+            &facts(NativeSessionState::Idle, None, false, false),
+            80,
+        )
+        .iter()
+        .map(StyledLine::to_plain_string)
+        .collect();
+        assert!(text[0].contains("/agents"));
+        assert!(text.iter().any(|line| line.contains("/approve")));
+    }
+
+    #[test]
+    fn a_bang_draft_says_it_runs_through_the_pane_process_tool() {
+        let mut presentation = NativePresentation::default();
+        presentation.composer.draft = "!cargo build".to_string();
+        let text = composer_block(
+            &presentation,
+            &facts(NativeSessionState::Idle, None, false, false),
+            80,
+        )
+        .iter()
+        .map(StyledLine::to_plain_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(text.contains("cargo build"));
+        assert!(text.contains("process tool"));
+    }
+
+    #[test]
+    fn an_at_draft_without_a_workdir_offers_nothing_at_all() {
+        let mut presentation = NativePresentation::default();
+        presentation.composer.draft = "look at @src".to_string();
+        assert!(presentation.workdir.is_none());
+        let text: Vec<String> = composer_block(
+            &presentation,
+            &facts(NativeSessionState::Idle, None, false, false),
+            80,
+        )
+        .iter()
+        .map(StyledLine::to_plain_string)
+        .collect();
+        // Straight to the box: no completion rows.
+        assert!(text[0].starts_with('\u{256d}'));
+    }
+
+    #[test]
+    fn the_spinner_runs_only_while_a_turn_is_in_flight() {
+        let presentation = NativePresentation::default();
+        assert!(
+            spinner_line(
+                &presentation,
+                &facts(NativeSessionState::Idle, None, false, false)
+            )
+            .is_none()
+        );
+        let line = spinner_line(
+            &presentation,
+            &facts(
+                NativeSessionState::Running,
+                Some(NativeTurnState::Requesting),
+                false,
+                false,
+            ),
+        )
+        .expect("spinner");
+        let text = line.to_plain_string();
+        assert!(text.contains("esc to interrupt"));
+        assert!(text.starts_with('\u{273b}'));
+    }
+
+    #[test]
+    fn the_spinner_verb_rotates_deterministically_with_elapsed_time() {
+        assert_eq!(spinner_verb(0), spinner_verb(3));
+        assert_ne!(spinner_verb(0), spinner_verb(4));
+        assert_eq!(spinner_verb(0), spinner_verb(24));
+    }
+
+    #[test]
+    fn the_composer_box_survives_a_forty_column_pane() {
+        let mut presentation = NativePresentation::default();
+        presentation.composer.draft =
+            "a very long line that has to wrap several times at forty columns".to_string();
+        let lines = composer_block(
+            &presentation,
+            &facts(NativeSessionState::Idle, None, false, false),
+            40,
+        );
+        for line in &lines {
+            assert!(
+                line.display_width() <= 40,
+                "line wider than the pane: {:?}",
+                line.to_plain_string()
+            );
+        }
+    }
+
     fn facts(
         session_state: NativeSessionState,
         turn_state: Option<NativeTurnState>,
