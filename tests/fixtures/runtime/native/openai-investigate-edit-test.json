@@ -1,0 +1,67 @@
+{
+  "shape": "openai",
+  "model": "fixture-openai-model",
+  "turns": [
+    {
+      "message_id": "resp_investigate",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Searching for the failing assertion.",
+          "deltas": 2
+        },
+        {
+          "type": "tool_use",
+          "id": "fc_search",
+          "name": "text_search",
+          "input": { "root": ".", "pattern": "assert_eq" }
+        },
+        {
+          "type": "tool_use",
+          "id": "fc_read",
+          "name": "file_read",
+          "input": { "path": "src/lib.rs" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 110, "output_tokens": 35 }
+    },
+    {
+      "message_id": "resp_edit",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "fc_write",
+          "name": "file_write",
+          "input": { "path": "src/lib.rs", "content": "pub fn ok() {}\n" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 190, "output_tokens": 45 }
+    },
+    {
+      "message_id": "resp_test",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "fc_tests",
+          "name": "process_start",
+          "input": { "command": ["cargo", "nextest", "run"] }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 240, "output_tokens": 20 }
+    },
+    {
+      "message_id": "resp_done",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Rewrote src/lib.rs and the suite is green."
+        }
+      ],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 280, "output_tokens": 28 }
+    }
+  ]
+}
