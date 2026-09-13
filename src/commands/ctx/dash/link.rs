@@ -70,8 +70,7 @@ pub fn ownership(persistent: bool, runtime_listening: bool) -> Ownership {
 /// The refusal the dashboard prints rather than opening a second terminal for
 /// a session the runtime already holds. Named once so the wording cannot
 /// drift between the surfaces that use it.
-pub const RUNTIME_OWNS_IT: &str =
-    "the persistent runtime already owns a session for this repository: attach to it with \
+pub const RUNTIME_OWNS_IT: &str = "the persistent runtime already owns a session for this repository: attach to it with \
      `zirv session attach` (or `zirv chat`). Opening a second terminal here would leave two \
      supervisors on one conversation, which is exactly what the runtime exists to prevent.";
 
@@ -125,11 +124,7 @@ impl RuntimeLink {
     /// The live session the runtime holds for `repo_slug` and `agent`, if any.
     /// The ownership question the dashboard actually asks at startup: is there
     /// already a supervisor for the seat I was about to open?
-    pub fn seat_for(
-        &mut self,
-        repo_slug: &str,
-        agent: &str,
-    ) -> CtxResult<Option<SessionFacts>> {
+    pub fn seat_for(&mut self, repo_slug: &str, agent: &str) -> CtxResult<Option<SessionFacts>> {
         Ok(self.sessions()?.into_iter().find(|facts| {
             facts.state != SessionState::Ended
                 && facts.repo_slug.as_deref() == Some(repo_slug)
@@ -151,7 +146,10 @@ impl RuntimeLink {
             }),
         )?;
         Ok(serde_json::from_value(
-            value.get("attachment").cloned().unwrap_or_else(|| json!({})),
+            value
+                .get("attachment")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         )?)
     }
 
