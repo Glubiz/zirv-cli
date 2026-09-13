@@ -1675,7 +1675,8 @@ mod tests {
     fn fence_errors_on_a_stale_generation() {
         let mut seat = base_seat();
         seat.generation = 3;
-        let err = superseded_only(Some(&seat), Some("1")).expect_err("stale generation must refuse");
+        let err =
+            superseded_only(Some(&seat), Some("1")).expect_err("stale generation must refuse");
         let message = err.to_string();
         assert!(message.contains("stale seat generation 1"), "{message}");
         assert!(message.contains("current 3"), "{message}");
@@ -2664,14 +2665,18 @@ mod tests {
         let short = super::super::sessions::short_id(session);
         registered(&state, &short, session, "claude");
 
-        assert!(may_prepare(&state, &short).is_ok(), "an idle seat admits one");
+        assert!(
+            may_prepare(&state, &short).is_ok(),
+            "an idle seat admits one"
+        );
 
         // Pinned: both refuse, with the same wording.
         let mut pinned = load(&state, &short).expect("seat");
         pinned.pinned = true;
         store(&state, &pinned).expect("store");
         let checked = may_prepare(&state, &short).expect_err("pinned");
-        let attempted = prepare(&state, &short, "codex", None, Cause::Manual, 2).expect_err("pinned");
+        let attempted =
+            prepare(&state, &short, "codex", None, Cause::Manual, 2).expect_err("pinned");
         assert!(checked.to_string().contains("is pinned"), "{checked}");
         assert_eq!(checked.to_string(), attempted.to_string());
 
@@ -2683,7 +2688,9 @@ mod tests {
         prepare(&state, &short, "codex", None, Cause::Manual, 2).expect("prepare");
         let checked = may_prepare(&state, &short).expect_err("already prepared");
         assert!(
-            checked.to_string().contains("already has a rollover prepared"),
+            checked
+                .to_string()
+                .contains("already has a rollover prepared"),
             "{checked}"
         );
 

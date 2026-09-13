@@ -2909,6 +2909,10 @@ pub fn run_session<W: std::io::Write>(
         },
     )?;
 
+    // Issue #488 (review finding 4): this seat's conversation reference,
+    // recorded under the runtime it belongs to.
+    record_seat_conversation(&state, &handle, &session);
+
     if brokered {
         // The broker is built here, after the seat record exists, because its
         // own fence reads that record at every effect.
@@ -3299,6 +3303,43 @@ fn join_worker_with_timeout(worker: std::thread::JoinHandle<()>, timeout: std::t
 /// Opens a session and starts its worker thread. Returns once the session
 /// exists and is ready to accept a first `submit` -- it does not wait for
 /// any turn to run.
+/// Records a native session's own conversation reference (issue #488, review
+/// finding 4) -- the single implementation both native session start paths
+/// use, so the headless and the pane session can never write a marker of a
+/// different shape.
+///
+/// A native conversation IS resumable: `NativeBackend::adopt`/`resume` take
+/// exactly this journal session id. Recording it is what lets a rollover that
+/// later moves this seat elsewhere park it honestly -- `seat::commit` writes
+/// `Displaced::conversation` from this marker -- instead of recording a
+/// displacement with no way home and cold-launching on the return.
+///
+/// The marker is keyed `(short, agent, session, runtime)` and is looked up
+/// with the seat's own three identity fields, which are the three the seat
+/// record beside this call was just stored with: `RuntimeKind::Native`'s own
+/// name is the agent every native seat and every native registry record
+/// (`session::native`) already uses. `sessions::native_conversation` refuses a
+/// marker whose runtime does not match the reader's, which keeps the other
+/// direction safe: a harness successor asking for a resume id gets `None` and
+/// cold-launches, never a journal session id it could not resume.
+///
+/// Best-effort, like every other marker in `sessions`: one that fails to write
+/// costs a later return its resume, never this session.
+fn record_seat_conversation(
+    state: &super::super::state::StateDir,
+    handle: &SessionHandle,
+    session: &JournalSessionId,
+) {
+    super::super::sessions::record_conversation_on(
+        state,
+        &handle.short,
+        RuntimeKind::Native.as_str(),
+        &handle.logical_id,
+        session.as_str(),
+        RuntimeKind::Native,
+    );
+}
+
 pub fn spawn_interactive(
     request: InteractiveRequest,
     env: EnvLookup<'_>,
@@ -3402,6 +3443,10 @@ pub fn spawn_interactive(
             runtime: RuntimeKind::Native,
         },
     )?;
+
+    // Issue #488 (review finding 4): this seat's conversation reference,
+    // recorded under the runtime it belongs to.
+    record_seat_conversation(&state, &handle, &session);
 
     if brokered {
         let executor = brokered_tools(&mut headless, &state, &home, &cfg, &handle)?;
@@ -5578,6 +5623,56 @@ mod tests {
         assert!(
             replayed.ended_reason.is_some(),
             "the journal session must be finalised (SessionEnded) by shutdown"
+        );
+    }
+
+    /// Issue #488 (review finding 4): a native session records its own
+    /// conversation reference, under its own runtime, beside the seat it just
+    /// registered -- so a rollover that later moves this seat can park it
+    /// honestly with a conversation a return can actually resume, instead of
+    /// recording a displacement with no way home.
+    ///
+    /// The other half is the safety property: the same marker must be
+    /// invisible to a reader asking as a HARNESS, so a harness successor can
+    /// never be handed a journal session id it could not resume.
+    #[test]
+    fn a_native_session_records_its_own_conversation_under_its_own_runtime() {
+        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+        let session = spawn_fixture_interactive_session(repo.path(), &env);
+        let short = session.handle.short.clone();
+        let logical = session.handle.logical_id.clone();
+        let journal_session = session.session.to_string();
+        session.shutdown();
+
+        // The seat this session registered names the agent the marker is
+        // keyed by, so the two genuinely resolve against each other rather
+        // than merely both existing.
+        let seat = crate::commands::ctx::seat::load(&state, &short).expect("a native seat");
+        assert_eq!(seat.runtime, RuntimeKind::Native);
+        assert_eq!(seat.agent, RuntimeKind::Native.as_str());
+
+        assert_eq!(
+            crate::commands::ctx::sessions::native_conversation(
+                &state,
+                &short,
+                &seat.agent,
+                &logical,
+                RuntimeKind::Native,
+            )
+            .as_deref(),
+            Some(journal_session.as_str()),
+            "a native session's conversation must be resumable by a later return"
+        );
+        assert_eq!(
+            crate::commands::ctx::sessions::native_conversation(
+                &state,
+                &short,
+                &seat.agent,
+                &logical,
+                RuntimeKind::Harness,
+            ),
+            None,
+            "a harness reader must never be handed a native journal session id"
         );
     }
 
