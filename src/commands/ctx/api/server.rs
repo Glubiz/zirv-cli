@@ -2898,4 +2898,460 @@ mod tests {
         assert_eq!(failure.code, ErrorCode::StaleGeneration, "{failure}");
         assert!(host.lock().clients.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // Native sessions (issue #489)
+    // -----------------------------------------------------------------
+
+    /// The native surface with no journal and no model in the way.
+    /// `session::native` is the production implementation of the same trait;
+    /// this one exists so the PROTOCOL's own routing and enforcement are
+    /// provable on their own.
+    #[derive(Debug, Default)]
+    struct FakeNative {
+        state: Mutex<FakeNativeState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeNativeState {
+        facts: Vec<SessionFacts>,
+        clients: Vec<String>,
+        controller: Option<String>,
+        inputs: Vec<(String, bool, Option<String>)>,
+        approvals: Vec<(String, ApprovalDecision)>,
+        interrupted: usize,
+        stopped: Vec<String>,
+    }
+
+    impl FakeNative {
+        fn with(facts: Vec<SessionFacts>) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(FakeNativeState {
+                    facts,
+                    ..FakeNativeState::default()
+                }),
+            })
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeNativeState> {
+            match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+
+        fn attachment(&self, caller: &str) -> Attachment {
+            let state = self.lock();
+            Attachment {
+                controller: state.controller.clone(),
+                clients: state.clients.clone(),
+                rows: 0,
+                cols: 0,
+                role: if state.controller.as_deref() == Some(caller) {
+                    super::super::wire::AttachRole::Controller
+                } else if state.clients.iter().any(|id| id == caller) {
+                    super::super::wire::AttachRole::Observer
+                } else {
+                    super::super::wire::AttachRole::Detached
+                },
+            }
+        }
+    }
+
+    impl NativeHost for FakeNative {
+        fn sessions(&self) -> Vec<SessionFacts> {
+            self.lock().facts.clone()
+        }
+
+        fn owns(&self, session_id: &str) -> bool {
+            self.lock()
+                .facts
+                .iter()
+                .any(|facts| facts.session_id == session_id)
+        }
+
+        fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+            let mut facts = SessionFacts::new(format!("native-{}", self.lock().facts.len() + 1));
+            facts.runtime = RuntimeKind::Native;
+            facts.role = Some(spec.role.clone());
+            facts.state = SessionState::Idle;
+            self.lock().facts.push(facts.clone());
+            Ok(facts)
+        }
+
+        fn submit(
+            &self,
+            _session_id: &str,
+            input: &str,
+            steering: bool,
+            idempotency: Option<&str>,
+        ) -> Result<InputAck, ApiError> {
+            let mut state = self.lock();
+            if let Some(key) = idempotency
+                && state
+                    .inputs
+                    .iter()
+                    .any(|(_, _, seen)| seen.as_deref() == Some(key))
+            {
+                return Ok(InputAck {
+                    message_id: format!("idem-{key}"),
+                    duplicate: true,
+                });
+            }
+            state.inputs.push((
+                input.to_string(),
+                steering,
+                idempotency.map(str::to_string),
+            ));
+            Ok(InputAck {
+                message_id: idempotency
+                    .map(|key| format!("idem-{key}"))
+                    .unwrap_or_else(|| format!("msg-{}", state.inputs.len())),
+                duplicate: false,
+            })
+        }
+
+        fn interrupt(&self, _session_id: &str) -> Result<bool, ApiError> {
+            self.lock().interrupted += 1;
+            Ok(true)
+        }
+
+        fn approve(
+            &self,
+            _session_id: &str,
+            request_id: &str,
+            decision: ApprovalDecision,
+            _note: Option<&str>,
+        ) -> Result<bool, ApiError> {
+            self.lock()
+                .approvals
+                .push((request_id.to_string(), decision));
+            Ok(true)
+        }
+
+        fn task_result(
+            &self,
+            _session_id: &str,
+            _task_id: &str,
+            _outcome: TaskOutcome,
+            _receipt: &Value,
+        ) -> Result<bool, ApiError> {
+            Ok(true)
+        }
+
+        fn history(
+            &self,
+            session_id: &str,
+            after: u64,
+            _limit: usize,
+        ) -> Result<NativeHistory, ApiError> {
+            Ok(NativeHistory {
+                session_id: session_id.to_string(),
+                generation: 1,
+                cursor: after,
+                last_sequence: 0,
+                entries: Vec::new(),
+            })
+        }
+
+        fn journal(
+            &self,
+            session_id: &str,
+            after: u64,
+            _limit: usize,
+        ) -> Result<NativePage, ApiError> {
+            Ok(NativePage {
+                session_id: session_id.to_string(),
+                generation: 1,
+                after_sequence: after,
+                cursor: after,
+                last_sequence: 0,
+                gap: false,
+                events: Vec::new(),
+            })
+        }
+
+        fn attach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            mode: AttachMode,
+        ) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                }
+                if mode == AttachMode::Controller {
+                    match state.controller.clone() {
+                        Some(current) if current != client_id => {
+                            return Err(ApiError::new(ErrorCode::Busy, "already controlled"));
+                        }
+                        _ => state.controller = Some(client_id.to_string()),
+                    }
+                }
+            }
+            Ok(self.attachment(client_id))
+        }
+
+        fn detach(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                state.clients.retain(|id| id != client_id);
+                if state.controller.as_deref() == Some(client_id) {
+                    state.controller = None;
+                }
+            }
+            Ok(self.attachment(client_id))
+        }
+
+        fn takeover(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                }
+                state.controller = Some(client_id.to_string());
+            }
+            Ok(self.attachment(client_id))
+        }
+
+        fn seat(&self, _session_id: &str) -> Result<(bool, Option<String>), ApiError> {
+            let state = self.lock();
+            Ok((!state.clients.is_empty(), state.controller.clone()))
+        }
+
+        fn stop(&self, session_id: &str) -> Result<bool, ApiError> {
+            self.lock().stopped.push(session_id.to_string());
+            Ok(true)
+        }
+    }
+
+    fn native_server() -> (Arc<ApiServer>, Arc<FakeNative>, String) {
+        let mut facts = facts("native-1", SessionState::Idle);
+        facts.runtime = RuntimeKind::Native;
+        let native = FakeNative::with(vec![facts.clone()]);
+        let server = ApiServer::new(Box::new(StaticSource(vec![facts.clone()])), None);
+        server.attach_native(Arc::clone(&native) as Arc<dyn NativeHost>);
+        (server, native, facts.session_id)
+    }
+
+    /// Issue #489: the native surface is advertised only by a server that
+    /// owns native conversations, so a client negotiates it away rather than
+    /// discovering it through a failed round trip.
+    #[test]
+    fn the_native_capability_is_advertised_only_by_a_server_that_owns_conversations() {
+        let bare = ApiServer::new(Box::new(StaticSource(Vec::new())), None);
+        assert!(!bare.advertised().contains(&Capability::SessionNative));
+        let (server, _, _) = native_server();
+        assert!(server.advertised().contains(&Capability::SessionNative));
+        assert!(
+            server.advertised().contains(&Capability::SessionAttach),
+            "a native host has seats, so the attachment surface comes with it"
+        );
+        let listed = result(&call(&server, Method::ServerCapabilities, Value::Null));
+        let methods: Vec<String> =
+            serde_json::from_value(listed["methods"].clone()).expect("methods");
+        for method in [
+            "session.interrupt",
+            "session.approve",
+            "session.task_result",
+            "session.history",
+            "session.journal",
+        ] {
+            assert!(methods.contains(&method.to_string()), "{methods:?}");
+        }
+    }
+
+    /// Issue #489, criterion 3: once ANY client is attached, only the
+    /// controller may drive a native session. An observer is refused whether
+    /// it names itself or omits the field, and both refusals are `denied`
+    /// rather than a silent success.
+    #[test]
+    fn only_the_controller_drives_a_native_session_and_observers_cannot_mutate() {
+        let (server, _, id) = native_server();
+
+        // Nobody attached: the owner-only endpoint is the only gate, exactly
+        // as it was before this issue.
+        let value = result(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "headless"}),
+        ));
+        assert_eq!(value["accepted"], json!(true));
+
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": id, "client_id": "driver", "mode": "controller"}),
+        );
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": id, "client_id": "watcher", "mode": "observer"}),
+        );
+
+        let denied = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "no", "client_id": "watcher"}),
+        ));
+        assert_eq!(denied.code, ErrorCode::Denied, "{denied}");
+        let anonymous = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "no"}),
+        ));
+        assert_eq!(
+            anonymous.code,
+            ErrorCode::Denied,
+            "omitting client_id must not be a way around the seat: {anonymous}"
+        );
+        for (method, params) in [
+            (
+                Method::SessionInterrupt,
+                json!({"session_id": id, "client_id": "watcher"}),
+            ),
+            (
+                Method::SessionApprove,
+                json!({"session_id": id, "client_id": "watcher", "request_id": "r1", "decision": "allow"}),
+            ),
+            (
+                Method::SessionHistory,
+                json!({"session_id": id, "client_id": "watcher"}),
+            ),
+        ] {
+            assert_eq!(
+                error(&call(&server, method, params)).code,
+                ErrorCode::Denied,
+                "{method} must be controller-only"
+            );
+        }
+
+        let accepted = result(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "yes", "client_id": "driver"}),
+        ));
+        assert_eq!(accepted["accepted"], json!(true));
+    }
+
+    /// Issue #489, item 5 as a protocol property: four verbs, four effects.
+    /// Interrupt leaves the session alive and idle; only stop reaches the
+    /// host's own stop.
+    #[test]
+    fn interrupt_cancels_a_turn_and_stop_is_the_only_verb_that_ends_one() {
+        let (server, native, id) = native_server();
+        let value = result(&call(
+            &server,
+            Method::SessionInterrupt,
+            json!({"session_id": id}),
+        ));
+        assert_eq!(value["interrupted"], json!(true));
+        assert_eq!(native.lock().interrupted, 1);
+        assert!(native.lock().stopped.is_empty(), "interrupt is not stop");
+        let get = result(&call(&server, Method::SessionGet, json!({"session_id": id})));
+        assert_eq!(get["session"]["state"], json!("idle"));
+
+        let _ = call(&server, Method::SessionStop, json!({"session_id": id}));
+        assert_eq!(native.lock().stopped, vec![id]);
+    }
+
+    /// A native conversation has no terminal, and the two terminal-shaped
+    /// verbs say so by name instead of reporting a server that owns no
+    /// terminals -- which would be false of a runtime holding plenty.
+    #[test]
+    fn a_native_session_refuses_the_terminal_verbs_by_name() {
+        let (server, _, id) = native_server();
+        for (method, params) in [
+            (
+                Method::SessionScreen,
+                json!({"session_id": id, "client_id": "c"}),
+            ),
+            (
+                Method::SessionResize,
+                json!({"session_id": id, "client_id": "c", "rows": 10, "cols": 20}),
+            ),
+            (
+                Method::SessionSendInput,
+                json!({"session_id": id, "input": "x", "mode": "raw", "client_id": "c"}),
+            ),
+        ] {
+            let refused = error(&call(&server, method, params));
+            assert_eq!(refused.code, ErrorCode::Unsupported, "{method}: {refused}");
+        }
+    }
+
+    /// The idempotency key reaches the host, which is where the DURABLE
+    /// deduplication lives -- the server's own cache is bounded and lost on
+    /// restart, so it can never be the guarantee.
+    #[test]
+    fn a_retried_native_input_carries_its_key_to_the_host() {
+        let (server, native, id) = native_server();
+        let request = Request::new(
+            "r1",
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "go"}),
+        )
+        .with_idempotency_key("k1");
+        let first = result(&server.handle(&request));
+        assert_eq!(first["duplicate"], json!(false));
+        assert_eq!(first["message_id"], json!("idem-k1"));
+
+        // A DIFFERENT request id carrying the same key: the server's cache
+        // keys on the key, so this one is answered from it -- and the host
+        // still saw exactly one input either way.
+        let again = Request::new(
+            "r2",
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "go"}),
+        )
+        .with_idempotency_key("k1");
+        let second = result(&server.handle(&again));
+        assert_eq!(second["message_id"], json!("idem-k1"));
+        assert_eq!(native.lock().inputs.len(), 1, "{:?}", native.lock().inputs);
+    }
+
+    /// The native methods on a server with no native host are refused with a
+    /// structured `unsupported` naming the issue -- never a silent success.
+    #[test]
+    fn a_server_without_a_native_host_refuses_every_native_method() {
+        let server = server_with(vec![facts("s1", SessionState::Idle)]);
+        for method in [
+            Method::SessionInterrupt,
+            Method::SessionApprove,
+            Method::SessionTaskResult,
+            Method::SessionHistory,
+            Method::SessionJournal,
+        ] {
+            let refused = error(&call(
+                &server,
+                method,
+                json!({
+                    "session_id": "s1",
+                    "request_id": "r",
+                    "decision": "allow",
+                    "task_id": "t",
+                    "outcome": "completed"
+                }),
+            ));
+            assert_eq!(refused.code, ErrorCode::Unsupported, "{method}");
+            assert!(refused.message.contains("#489"), "{refused}");
+        }
+    }
+
+    /// `session.start` is ONE verb for both kinds of session: the spec's
+    /// runtime decides which host answers, not a second method.
+    #[test]
+    fn one_start_verb_routes_a_native_spec_to_the_native_host() {
+        let (server, native, _) = native_server();
+        let started = result(&call(
+            &server,
+            Method::SessionStart,
+            json!({"runtime": "native", "role": "worker", "cwd": ".", "prompt": "go"}),
+        ));
+        assert_eq!(started["session"]["runtime"], json!("native"));
+        assert_eq!(started["session"]["role"], json!("worker"));
+        assert_eq!(native.lock().facts.len(), 2);
+    }
 }
