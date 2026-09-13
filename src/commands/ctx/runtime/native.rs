@@ -69,9 +69,9 @@ use super::super::provider::adapter::{
     ProviderStreamEvent, ProviderUsage, journal_blocks, replayed_content,
 };
 use super::journal::{
-    AssistantBlock, ContentRef, EventScope, ExecutionId, ExecutionState, Journal, JournalSessionId,
-    MessageId, MessageRole, RequestAttemptId, RouteIdentity, SequenceId, ToolCallId, TurnId,
-    UsageId, UsageRecord,
+    AssistantBlock, ContentRef, ConversationState, EventScope, ExecutionId, ExecutionRecord,
+    ExecutionState, Journal, JournalSessionId, MessageId, MessageRole, RequestAttemptId,
+    RouteIdentity, SequenceId, ToolCallId, TurnId, UsageId, UsageRecord,
 };
 use super::tools::{
     NativeToolClient, ResourceClaimKind, RetryPolicy, ToolDefinition, ToolExecutionMode,
@@ -473,6 +473,12 @@ pub struct NativeSessionConfig {
     pub write_posture: OrchestratorWrites,
     pub limits: NativeLimits,
     pub task: Option<super::journal::TaskId>,
+    /// A workflow gate that refuses completion, with its own message. Fed
+    /// straight into the shared stop service, where it outranks any model
+    /// finish token. `None` today -- populating it from the workflow engine
+    /// is N15's step (#484) -- but the ladder already honours it, so that
+    /// wiring cannot land without taking effect.
+    pub workflow_gate: Option<String>,
 }
 
 /// The native agent loop itself.
@@ -614,6 +620,7 @@ impl<'a> NativeLoop<'a> {
     /// after stays queued for the next boundary.
     fn build_request(&mut self) -> CtxResult<ProviderRequest> {
         let state = self.journal.replay(&self.config.session)?;
+        let latest = latest_executions(&state);
         let mut messages: Vec<ProviderMessage> = Vec::new();
         let mut last = self.delivered_through;
 
@@ -644,12 +651,10 @@ impl<'a> NativeLoop<'a> {
                                     input: record.arguments.clone(),
                                 });
                                 // Results follow their assistant message, in
-                                // the provider's own declared block order.
-                                if let Some(execution) = state
-                                    .executions
-                                    .values()
-                                    .find(|e| e.tool_call == *tool_call)
-                                {
+                                // the provider's own declared block order,
+                                // carrying each call's LATEST execution --
+                                // never the failed attempt a retry replaced.
+                                if let Some(execution) = latest.get(tool_call).copied() {
                                     let (text, is_error) =
                                         match (&execution.result, execution.state) {
                                             (Some(result), ExecutionState::Completed) => {
@@ -772,7 +777,28 @@ impl<'a> NativeLoop<'a> {
 
     /// Runs one turn: request, commit, tools, continue, until the model stops
     /// asking for tools or a bound stops the loop.
+    ///
+    /// A TURN is one unit of user intent -- an acknowledged input driven to
+    /// the point where the model stops asking for tools -- so a session's
+    /// turn count is how many separate things it was told to do. The bound is
+    /// enforced HERE rather than in [`Self::run_to_completion`] so it holds
+    /// for any driver: a caller stepping turns itself (an interactive surface,
+    /// a test) is bounded exactly as the headless loop is.
     pub fn run_turn(&mut self) -> CtxResult<TurnOutcome> {
+        if self.turns >= self.config.limits.max_turns {
+            let turn = TurnId::new(self.mint("turn"))?;
+            return Ok(TurnOutcome {
+                turn,
+                state: TurnState::Failed,
+                requests: 0,
+                results: Vec::new(),
+                final_text: None,
+                finish_reason: None,
+                usage: ProviderUsage::default(),
+                failure: None,
+                limit: Some(LimitKind::Turns),
+            });
+        }
         self.turns += 1;
         let turn = TurnId::new(self.mint("turn"))?;
         let mut outcome = TurnOutcome {
@@ -966,7 +992,14 @@ impl<'a> NativeLoop<'a> {
                 call: call.clone(),
                 execution,
                 independent: is_independent(definition),
-                retry: definition.map(|d| d.retry).unwrap_or(RetryPolicy::Safe),
+                // Fail closed, the same rule `is_independent` applies to an
+                // unknown tool: a call this build cannot classify gets the
+                // most restrictive contract there is, never the most
+                // permissive one. Assuming `Safe` for something whose effects
+                // are unknown is how a mutation gets silently repeated.
+                retry: definition
+                    .map(|d| d.retry)
+                    .unwrap_or(RetryPolicy::NeverAfterStart),
                 denied: match &admission {
                     lifecycle::ToolAdmission::Deny(reason) => Some(reason.clone()),
                     _ => None,
@@ -1186,17 +1219,24 @@ impl<'a> NativeLoop<'a> {
     /// Runs turns until the model stops asking for tools, a bound is hit, or
     /// an interrupt lands, then builds the final status.
     pub fn run_to_completion(&mut self) -> CtxResult<NativeFinalStatus> {
-        let mut last: Option<TurnOutcome> = None;
+        let mut last;
         let mut limit: Option<LimitKind> = None;
         let mut failure: Option<String> = None;
         let mut interrupted = false;
 
-        for _ in 0..self.config.limits.max_turns {
+        loop {
             let outcome = self.run_turn()?;
             match outcome.state {
                 TurnState::Completed => {
                     last = Some(outcome);
-                    break;
+                    // A finished turn is not necessarily a finished session:
+                    // an input acknowledged while that turn was running
+                    // reached no delivery boundary inside it, and the next
+                    // boundary is exactly here. Running another turn is what
+                    // makes `max_turns` a bound on something real.
+                    if self.queued_input()?.is_empty() {
+                        break;
+                    }
                 }
                 TurnState::Interrupted => {
                     interrupted = true;
@@ -1211,15 +1251,9 @@ impl<'a> NativeLoop<'a> {
                 }
                 _ => {
                     last = Some(outcome);
+                    break;
                 }
             }
-            if self.turns >= self.config.limits.max_turns {
-                limit = Some(LimitKind::Turns);
-                break;
-            }
-        }
-        if last.is_none() {
-            limit = Some(LimitKind::Turns);
         }
 
         self.finalize(last, limit, failure, interrupted)
@@ -1234,23 +1268,12 @@ impl<'a> NativeLoop<'a> {
         interrupted: bool,
     ) -> CtxResult<NativeFinalStatus> {
         let state = self.journal.replay(&self.config.session)?;
-
-        // One execution per tool call: the LATEST record wins, which is how a
-        // retry's own execution supersedes the failed one it replaced.
-        let mut latest: BTreeMap<ToolCallId, (SequenceId, ExecutionState)> = BTreeMap::new();
-        for execution in state.executions.values() {
-            let entry = latest
-                .entry(execution.tool_call.clone())
-                .or_insert((execution.sequence, execution.state));
-            if execution.sequence >= entry.0 {
-                *entry = (execution.sequence, execution.state);
-            }
-        }
+        let latest = latest_executions(&state);
 
         let mut incomplete = BTreeSet::new();
         let mut unknown = BTreeSet::new();
-        for (call, (_, execution_state)) in &latest {
-            match execution_state {
+        for (call, execution) in &latest {
+            match &execution.state {
                 ExecutionState::OutcomeUnknown => {
                     unknown.insert(call.to_string());
                 }
@@ -1273,12 +1296,16 @@ impl<'a> NativeLoop<'a> {
             Some(FinishReason::EndTurn) | Some(FinishReason::StopSequence)
         );
 
-        // A model finish token is one input. Anything below outranks it.
+        // A model finish token is one input. The shared stop service is what
+        // actually decides, and its `Block` outranks the token outright --
+        // which is what keeps N15's workflow-gate wiring from being able to
+        // regress silently: the moment `workflow_gate` is populated, a gated
+        // session stops reporting `Completed` with no further change here.
         let stop = lifecycle::stop(&lifecycle::StopSignals {
             already_blocked: false,
             incomplete_tools: incomplete.iter().cloned().collect(),
             verification: lifecycle::VerificationDecision::NotRequired,
-            workflow_gate: None,
+            workflow_gate: self.config.workflow_gate.clone(),
         });
         let blocked_reason = match &stop {
             lifecycle::StopDecision::Block(reason) => Some(reason.clone()),
@@ -1291,7 +1318,8 @@ impl<'a> NativeLoop<'a> {
             NativeStatus::Interrupted
         } else if limit.is_some() {
             NativeStatus::LimitReached
-        } else if !incomplete.is_empty()
+        } else if blocked_reason.is_some()
+            || !incomplete.is_empty()
             || !unknown.is_empty()
             || !queued.is_empty()
             || !model_says_done
@@ -1369,6 +1397,35 @@ fn accumulate(total: &mut ProviderUsage, delta: &ProviderUsage) {
     if let Some(reasoning) = delta.reasoning_tokens {
         total.reasoning_tokens = Some(total.reasoning_tokens.unwrap_or(0) + reasoning);
     }
+}
+
+/// The authoritative execution for each tool call: the one with the highest
+/// journal sequence.
+///
+/// A retried effect mints a NEW execution id (the journal's execution state
+/// machine is terminal at `Failed`, and reusing the id would both be rejected
+/// and hide that a second effect happened), so one tool call can own several
+/// execution records. `ConversationState::executions` is keyed by
+/// `ExecutionId` and therefore iterates in ID order, not in time order --
+/// taking the first match would hand a follow-up request the stale failed
+/// attempt that a successful retry already superseded. Both the request
+/// builder and the final status read this one helper so they can never
+/// disagree about what a tool call actually did.
+fn latest_executions(state: &ConversationState) -> BTreeMap<ToolCallId, &ExecutionRecord> {
+    let mut latest: BTreeMap<ToolCallId, &ExecutionRecord> = BTreeMap::new();
+    for execution in state.executions.values() {
+        match latest.entry(execution.tool_call.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(execution);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if execution.sequence >= slot.get().sequence {
+                    slot.insert(execution);
+                }
+            }
+        }
+    }
+    latest
 }
 
 /// The bounded head/tail extract a model reads in place of an offloaded tool
@@ -1919,6 +1976,7 @@ pub fn run_headless<W: std::io::Write>(
                 write_posture: lifecycle::orchestrator_write_posture(&cfg),
                 limits: request.limits,
                 task: None,
+                workflow_gate: None,
             },
             provider.as_ref(),
             &mut tools,
@@ -2004,6 +2062,7 @@ mod tests {
             write_posture: OrchestratorWrites::Allow,
             limits: NativeLimits::default(),
             task: None,
+            workflow_gate: None,
         }
     }
 
@@ -2678,6 +2737,217 @@ mod tests {
             .start(&spec(RuntimeKind::Harness))
             .expect_err("wrong runtime");
         assert!(error.to_string().contains("harness"));
+    }
+
+
+    // -- review round 2 ----------------------------------------------------
+
+    /// Finding 1: `ConversationState::executions` is keyed by `ExecutionId`
+    /// and therefore iterates in ID order. Taking the first execution that
+    /// mentions a call handed the CONTINUATION request the failed attempt a
+    /// successful retry had already superseded.
+    #[test]
+    fn a_continuation_request_carries_the_retrys_result_not_the_failed_attempt() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            script("anthropic-investigate-edit-test.json"),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-mixed-outcomes.json"));
+        let clock = || 1_000u64;
+        {
+            let mut driver = NativeLoop::new(
+                config_for(session, route),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge("go", false).unwrap();
+            driver.run_turn().unwrap();
+        }
+        // `file_read` failed on its first attempt and succeeded on its retry.
+        // The SECOND request is the continuation that replays that result.
+        let sent = provider.sent();
+        assert!(sent.len() >= 2, "expected a continuation request");
+        let result = sent[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ProviderContent::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == "call_read_src" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("call_read_src result in the continuation request");
+        assert!(!result.1, "replayed the failed attempt: {result:?}");
+        assert!(
+            result.0.contains("second attempt worked"),
+            "replayed the wrong attempt: {result:?}"
+        );
+    }
+
+    /// Finding 4: a turn is one unit of user intent, and `max_turns` bounds
+    /// how many a session may run -- enforced in `run_turn` itself, so it
+    /// holds for any driver, not only `run_to_completion`.
+    #[test]
+    fn the_turn_ceiling_bounds_a_session_across_separately_driven_turns() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            script("edge-cases.json"),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let clock = || 1_000u64;
+        let mut cfg = config_for(session, route);
+        cfg.limits.max_turns = 2;
+        let mut driver = NativeLoop::new(
+            cfg,
+            &provider,
+            &mut tools,
+            &mut journal,
+            Arc::new(CancellationFlag::default()),
+            &clock,
+            &no_env,
+        );
+        driver.acknowledge("go", false).unwrap();
+        assert_eq!(driver.run_turn().unwrap().state, TurnState::Completed);
+        assert_eq!(driver.run_turn().unwrap().state, TurnState::Completed);
+        let third = driver.run_turn().unwrap();
+        assert_eq!(third.state, TurnState::Failed);
+        assert_eq!(third.limit, Some(LimitKind::Turns));
+        // The refused turn sent nothing at all.
+        assert_eq!(third.requests, 0);
+    }
+
+    /// Finding 4, the other half: a turn that finished while an input was
+    /// still queued is not the end of the session -- the next delivery
+    /// boundary is another turn, and that is what `max_turns` bounds.
+    #[test]
+    fn run_to_completion_runs_another_turn_for_input_queued_during_the_last_one() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            script("edge-cases.json"),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let clock = || 1_000u64;
+        let status = {
+            let mut cfg = config_for(session.clone(), route);
+            cfg.limits.max_turns = 1;
+            let mut driver = NativeLoop::new(
+                cfg,
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge("go", false).unwrap();
+            // The first turn ends on the truncated-call response, having
+            // delivered "go". A second input is acknowledged before the loop
+            // asks whether anything is still queued.
+            driver.run_turn().unwrap();
+            driver.acknowledge("and this too", true).unwrap();
+            driver.run_to_completion().unwrap()
+        };
+        // Turn 1 is spent, so the queued input cannot be delivered inside the
+        // ceiling -- and the status says so rather than reporting completion.
+        assert_eq!(status.status, NativeStatus::LimitReached);
+        assert_eq!(status.limit, Some(LimitKind::Turns));
+        assert_eq!(status.queued_input.len(), 1);
+    }
+
+    /// Finding 6: a tool this build cannot classify gets the most restrictive
+    /// retry contract, never the most permissive one.
+    #[test]
+    fn an_unclassifiable_tool_is_never_retried() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(
+                r#"{"turns":[{"blocks":[{"type":"tool_use","id":"call_unknown",
+                   "name":"not_a_zirv_tool","input":{}}],"finish_reason":"tool_use"},
+                   {"blocks":[{"type":"text","text":"done"}],"finish_reason":"end_turn"}]}"#,
+            )
+            .expect("script"),
+        );
+        // The script would hand back a success on a second attempt; the loop
+        // must never ask for one.
+        let mut tools = FixtureToolExecutor::new(
+            FixtureToolScript::from_json(
+                r#"{"tools":{"not_a_zirv_tool":[{"state":"failed","message":"boom"},
+                   {"state":"completed","result":{"ok":true}}]}}"#,
+            )
+            .expect("tool script"),
+        );
+        let clock = || 1_000u64;
+        let outcome = {
+            let mut driver = NativeLoop::new(
+                config_for(session, route),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge("go", false).unwrap();
+            driver.run_turn().unwrap()
+        };
+        assert_eq!(outcome.results[0].retry, RetryPolicy::NeverAfterStart);
+        assert_eq!(outcome.results[0].state, ToolState::Failed);
+        assert_eq!(outcome.results[0].attempts, 1);
+        assert_eq!(tools.calls, vec!["call_unknown"]);
+    }
+
+    /// Finding 7: a blocking stop decision outranks a model finish token, so
+    /// N15's workflow-gate wiring cannot land without taking effect.
+    #[test]
+    fn a_blocking_workflow_gate_outranks_the_models_finish_token() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            script("anthropic-investigate-edit-test.json"),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let clock = || 1_000u64;
+        let status = {
+            let mut cfg = config_for(session, route);
+            cfg.workflow_gate = Some("zirv workflow: the Test step has no fresh evidence".into());
+            let mut driver = NativeLoop::new(
+                cfg,
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge("go", false).unwrap();
+            driver.run_to_completion().unwrap()
+        };
+        // The model said `end_turn` and every tool completed; the gate still
+        // decides.
+        assert_eq!(status.finish_reason.as_deref(), Some("EndTurn"));
+        assert!(status.incomplete_tools.is_empty());
+        assert_eq!(status.status, NativeStatus::Incomplete);
+        assert_eq!(
+            status.blocked_reason.as_deref(),
+            Some("zirv workflow: the Test step has no fresh evidence")
+        );
+        assert_ne!(status.exit_code, 0);
     }
 
     #[test]

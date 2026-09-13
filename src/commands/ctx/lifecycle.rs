@@ -426,6 +426,14 @@ pub enum VerificationDecision {
 /// all; `changed_paths` is what it changed; `final_only` selects `zirv
 /// verify` over `zirv test changed`, mirroring `engine::advance`'s own
 /// naming.
+///
+/// The gate order is `hook::verify_on_stop_nudge`'s own, unchanged by the
+/// extraction: modified, then doc-only, then the workflow step. The doc-only
+/// test is deliberately [`changes_are_doc_only`] applied to `changed_paths`
+/// as-is, with NO non-empty guard in front of it: an EMPTY change set is
+/// vacuously doc-only, and a session that modified nothing git can see owes
+/// no fresh evidence. Guarding on non-emptiness would turn "nothing changed"
+/// into "evidence required", which is exactly backwards.
 pub fn verification(
     modified: bool,
     changed_paths: &[PathBuf],
@@ -435,11 +443,11 @@ pub fn verification(
     if !modified {
         return VerificationDecision::NotRequired;
     }
+    if changes_are_doc_only(changed_paths) {
+        return VerificationDecision::NotRequired;
+    }
     if covered_by_workflow {
         return VerificationDecision::CoveredByWorkflow;
-    }
-    if !changed_paths.is_empty() && changes_are_doc_only(changed_paths) {
-        return VerificationDecision::NotRequired;
     }
     VerificationDecision::Required {
         command: verification_command(final_only),
@@ -660,6 +668,37 @@ mod tests {
         assert_eq!(
             verification(true, &[PathBuf::from("README.md")], false, false),
             VerificationDecision::NotRequired
+        );
+    }
+
+    #[test]
+    fn verification_is_not_owed_when_nothing_actually_changed() {
+        // An empty change set is vacuously doc-only -- `changes_are_doc_only`
+        // has always said so, and `hook::verify_on_stop_nudge` has always
+        // returned `None` for it. A non-empty guard in front of that test
+        // would turn "nothing changed" into "evidence required".
+        assert_eq!(
+            verification(true, &[], false, false),
+            VerificationDecision::NotRequired
+        );
+        assert_eq!(
+            verification(true, &[], true, true),
+            VerificationDecision::NotRequired
+        );
+    }
+
+    #[test]
+    fn a_doc_only_change_set_outranks_the_workflow_step_check() {
+        // Gate order is `hook::verify_on_stop_nudge`'s own: doc-only is
+        // tested before the active step is consulted, so both answers stay
+        // "nothing to say" for exactly the inputs they always did.
+        assert_eq!(
+            verification(true, &[PathBuf::from("docs/x.md")], true, false),
+            VerificationDecision::NotRequired
+        );
+        assert_eq!(
+            verification(true, &[PathBuf::from("src/main.rs")], true, false),
+            VerificationDecision::CoveredByWorkflow
         );
     }
 

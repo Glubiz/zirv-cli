@@ -9004,6 +9004,32 @@ mod tests {
         );
     }
 
+    /// Issue #478 review finding 5: a session whose transcript shows edit
+    /// tool calls but whose working tree is CLEAN owes no fresh evidence --
+    /// `changes_are_doc_only(&[])` is vacuously true, and always has been.
+    /// The gate this pins is the one the extraction of `verification` into
+    /// `lifecycle.rs` could have quietly inverted.
+    #[test]
+    fn verify_on_stop_nudge_is_silent_when_nothing_actually_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default();
+
+        assert!(
+            verification::changed_paths(repo.path())
+                .expect("changed paths")
+                .is_empty(),
+            "this fixture repository must have nothing to verify"
+        );
+        assert_eq!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-empty", &cfg, &transcript),
+            None,
+            "an empty change set has nothing for a test/verify gate to check"
+        );
+    }
+
     #[test]
     fn verify_on_stop_nudge_is_silent_when_the_active_workflow_step_already_verifies() {
         let dir = tempfile::tempdir().expect("tempdir");
