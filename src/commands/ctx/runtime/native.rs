@@ -2888,6 +2888,7 @@ fn prompt_role(role: &str) -> super::super::prompt::PromptRole {
         "sub-orchestrator" => PromptRole::SubOrchestrator,
         _ => PromptRole::Worker,
     }
+}
 
 // -- an interactive, multi-turn session for a dashboard native pane --------
 //
@@ -3129,6 +3130,34 @@ pub fn spawn_interactive(
         .cancellation(&handle)
         .unwrap_or_else(|| Arc::new(CancellationFlag::default()));
 
+    // Issue #484: the same standing context a headless session compiles,
+    // degraded to none rather than refusing to open the pane.
+    let (system, preamble) =
+        compile_standing_context(&state, &home, &cfg, &headless, &route, &session, now)
+            .unwrap_or_default();
+
+    // Issue #486: the same compaction envelope `run_session` builds.
+    let compaction = CompactionSettings {
+        enabled: true,
+        policy: super::super::provider::config::NativeConfig::load(&home, &request.repo)?
+            .map(|native| native.compaction_policy())
+            .unwrap_or_default(),
+        budget: NativeBudget {
+            context_window_tokens: super::super::provider::capability::declared(
+                route.protocol,
+                &route.model,
+                None,
+            )
+            .context_window,
+            output_reserve_tokens: request.limits.max_output_tokens,
+        },
+        score: cfg.score.clone(),
+        distill: DistillBudget::default(),
+        retain_recent_messages: RETAIN_RECENT_MESSAGES,
+        constraints: Vec::new(),
+        state: Some(state.clone()),
+    };
+
     let config = NativeSessionConfig {
         session: session.clone(),
         generation: handle.generation,
@@ -3139,6 +3168,10 @@ pub fn spawn_interactive(
         limits: request.limits,
         task: task_for_config(&handle, &route, request.task.as_deref())?,
         workflow_gate: None,
+        compaction,
+        workflow_repo: brokered.then(|| request.repo.clone()),
+        system,
+        preamble,
     };
 
     let (submit_tx, submit_rx) = mpsc::channel::<String>();
