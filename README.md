@@ -2335,7 +2335,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
-| `native.toml` keys other than `policy.allowed_routes` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set |
+| `native.toml` keys other than `policy.allowed_routes` and `policy.compaction` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, and repository `compaction` may only narrow `automatic` to `advisory`, never the reverse |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
@@ -2536,9 +2536,54 @@ hosts and that live probe is skipped; loopback HTTP remains available for
 local runtimes.
 
 The optional repository layer `<repo>/.zirv/native.toml` may contain only
-`schema` and `[policy].allowed_routes`. Its routes are intersected with the
-operator's set, so a checkout can narrow access but cannot add accounts,
-endpoints, routes, role bindings, credentials, or permissions.
+`schema`, `[policy].allowed_routes` and `[policy].compaction`. Its routes are
+intersected with the operator's set, so a checkout can narrow access but
+cannot add accounts, endpoints, routes, role bindings, credentials, or
+permissions.
+
+#### Native compaction
+
+A native session compacts itself rather than calling a harness `/compact`.
+Committed journal events and the provider's own measured input footprint
+(fresh input plus cache writes plus cache reads) are projected into zirv's
+existing rot scoring engine, with the token gate sized from the route model's
+declared context window less the run's output reservation — not from the
+harness-transcript token constants. An unknown context window falls back to
+the absolute `score.token_floor`/`score.token_ceiling` defaults rather than a
+guess.
+
+Four typed triggers are reported: `context_overflow` (the provider refused the
+request), `token_pressure` (measured input reached the derived ceiling),
+`repeated_identical_errors`, and `loss_of_progress`. The first two force a
+compaction; the others are advice until the rot gate escalates.
+
+A compaction writes a versioned portable checkpoint — objective, hard
+constraints, task/workflow refs, every acknowledged input, task claims,
+completed-action receipts, outstanding tool calls, and evidence by SHA-256 —
+as an atomic export under `<state>/native-checkpoints/` plus one journal
+event, which is the commit point. The original history and every stored
+artifact are retained: the summary only replaces what the next provider
+request sends, and the cacheable system prefix is never rewritten. The summary
+boundary never crosses a tool call whose effect has not settled, so compaction
+cannot mark a pending action complete, and acknowledged input that has not
+been answered is repeated verbatim. Distillation runs through the session's
+own native route with a bounded output budget and no tool schemas at all, and
+falls back to a deterministic structural summary whenever no model capacity,
+credential or valid reply is available — so it works with no coding-harness
+binary installed.
+
+A same-route resume keeps the provider's opaque continuation envelope. A
+route, model, endpoint, account or protocol change discards it and rebuilds a
+portable semantic history from the checkpoint and the journal: text and
+refusals only, with no hidden reasoning, no provider signature, and no
+synthesized tool outcome — an unknown outcome is carried as unknown.
+
+`[policy].compaction` is `automatic` (the default) or `advisory` (zirv reports
+the pressure and never compacts on its own). A repository layer may narrow it
+to `advisory` and can never widen it back — see [Trust
+boundary](#trust-boundary). `zirv ctx status` prints one line per native
+session that has compacted or resumed, with the newest reason, and `zirv ctx
+exec --runtime native` reports the same facts in its final-status JSON.
 
 #### Route profiles
 
