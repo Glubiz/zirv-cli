@@ -391,6 +391,15 @@ fn no_seat(short: &str) -> Box<dyn std::error::Error> {
 /// Refuses a seat that is pinned, or one that already has a rollover
 /// prepared (one in flight at a time; the caller must `commit` or `abort`
 /// the existing one first).
+///
+/// Issue #488: this is the wrapped->wrapped spelling of [`prepare_onto`] --
+/// the signature every caller predating the runtime dimension uses, and the
+/// one this module's own and the dashboard's rollover tests exercise. The
+/// live supervisors reach the transaction through `rollover::evaluate`, which
+/// names the successor's runtime explicitly, so this has no production caller
+/// of its own; deleting it would only force every wrapped->wrapped test to
+/// spell out a runtime that has never varied for them.
+#[allow(dead_code)]
 pub fn prepare(
     state: &StateDir,
     short: &str,

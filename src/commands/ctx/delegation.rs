@@ -1247,32 +1247,48 @@ pub fn delegate(
         .task
         .clone()
         .unwrap_or_else(|| delegation_id.clone());
-    graph.dispatched(
-        &node,
-        &request.role,
-        request.runtime.as_str(),
-        &delegation_id,
-        now,
-    );
-    // Review finding on issue #485: the launch receipt above is what is
-    // authoritative, so a coordinator-graph store failure must never block
-    // it -- but it must not vanish silently either. One decision-log line,
-    // the same best-effort idiom `log_boundary` uses just above.
-    if let Err(error) = super::coordinator::store(state, repo, &graph) {
-        let detail = format!("delegation {delegation_id}: {error}");
-        let _ = super::log::append(
-            state,
-            &super::log::Decision {
-                ts: now,
-                session: parent.short,
-                verb: "delegation",
-                verdict: "error",
-                score: 0,
-                action: "coordinator-store-failed",
-                detail: &detail,
-                observed_at: None,
-            },
+    // Issue #488: the graph write goes through the FENCED door, and re-reads
+    // rather than writing back the copy loaded above -- so the window in
+    // which a concurrently committed rollover could be overwritten is the
+    // fenced write itself rather than the whole launch. A caller with no
+    // generation to present writes exactly as before.
+    let dispatch = |graph: &mut super::coordinator::Coordinator| {
+        graph.dispatched(
+            &node,
+            &request.role,
+            request.runtime.as_str(),
+            &delegation_id,
+            now,
         );
+    };
+    match parent.generation {
+        Some(generation) => {
+            super::coordinator::update_fenced(state, repo, parent.short, generation, dispatch)?;
+        }
+        None => {
+            dispatch(&mut graph);
+            // Review finding on issue #485: the launch receipt above is what
+            // is authoritative, so a coordinator-graph store failure must
+            // never block it -- but it must not vanish silently either. One
+            // decision-log line, the same best-effort idiom `log_boundary`
+            // uses just above.
+            if let Err(error) = super::coordinator::store(state, repo, &graph) {
+                let detail = format!("delegation {delegation_id}: {error}");
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: now,
+                        session: parent.short,
+                        verb: "delegation",
+                        verdict: "error",
+                        score: 0,
+                        action: "coordinator-store-failed",
+                        detail: &detail,
+                        observed_at: None,
+                    },
+                );
+            }
+        }
     }
 
     let outcome = launcher.launch(request);
