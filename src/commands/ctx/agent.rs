@@ -3793,6 +3793,7 @@ pub fn run_with<W: Write>(
     // excluded it, and without it here a `fallback.harness.<name>.max_active
     // = 1` read as permanently `Draining` for that harness's own dispatches.
     let requester = super::mail::session_identity(env);
+    let base_excludes: Vec<&str> = same_harness_exclude.as_deref().into_iter().collect();
     let route_request = super::fallback::RouteRequest {
         requested: &args.name,
         source_model: requested_model,
@@ -3800,10 +3801,37 @@ pub fn run_with<W: Write>(
         delegation: true,
         bounds,
         now,
-        exclude: same_harness_exclude.as_deref(),
+        exclude: &base_excludes,
         requester: requester.as_deref(),
     };
     let route = super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
+    // Issue #455 slice C (finding 1): a half-open route admits exactly ONE
+    // recovery probe, and this is the moment a placement becomes a launch.
+    // Claimed here, BEFORE the route is applied, so a caller that loses the
+    // race re-plans rather than unpicking an applied reroute -- and a
+    // dispatch with nowhere healthy left to go is REFUSED rather than
+    // launched onto the route someone else is already probing.
+    let claimant = requester
+        .clone()
+        .unwrap_or_else(|| format!("pid-{}", std::process::id()));
+    let route = match super::fallback::claim_route_trial(
+        &state,
+        &cfg,
+        route_request,
+        route,
+        &claimant,
+        args.force,
+    ) {
+        super::fallback::TrialClaim::Cleared(route) => route,
+        super::fallback::TrialClaim::Refused(reason) => {
+            return Err(format!(
+                "zirv ctx agent: {reason}. Nothing else can take this work right now; retry \
+                 once the trial above frees itself, or pass --force to spend on '{}' anyway.",
+                args.name
+            )
+            .into());
+        }
+    };
     let mut routed_args = args.clone();
     // Issue #228: every downstream read of `routed_args`/`args` (the
     // dashboard-join request, and `launch_repo` below) must see the
@@ -5912,7 +5940,7 @@ mod tests {
                         tool_calls: None,
                     },
                     now,
-                    exclude: None,
+                    exclude: &[],
                     requester: None,
                 },
                 false,
