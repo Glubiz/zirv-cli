@@ -164,6 +164,22 @@ pub struct ExecArgs {
     /// for a per-run ceiling.
     #[arg(long)]
     pub objective: Option<String>,
+    /// Which runtime drives the conversation: `harness` (the default -- zirv
+    /// supervises an external coding-agent process) or `native` (issue #478,
+    /// roadmap N09 -- zirv conducts the model/tool conversation itself over a
+    /// direct provider route, with no coding harness installed at all).
+    /// Native mode is explicit and opt-in: it is never selected by detection.
+    #[arg(long, default_value = "harness")]
+    pub runtime: String,
+    /// Native runtime only: which `[route]` from the operator's own native
+    /// provider configuration to spend. Defaults to the `[roles]` entry for
+    /// this run's seat role.
+    #[arg(long)]
+    pub route: Option<String>,
+    /// Native runtime only: the session's role, which selects the default
+    /// route and the repository-write posture applied to its tools.
+    #[arg(long, default_value = "worker")]
+    pub role: String,
     /// The headless agent command, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
@@ -183,6 +199,32 @@ pub struct ExecArgs {
     /// delegation reservation of its own, which this never creates one for.
     #[arg(skip)]
     pub reservation_id: Option<String>,
+}
+
+/// The same defaults clap itself applies, so a caller that builds this struct
+/// in code (a delegation fold, an `agent:` script step, a test) gets the
+/// harness runtime and the worker role without restating them -- and a field
+/// added here later cannot silently become `""` at those call sites.
+impl Default for ExecArgs {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            session_id: None,
+            transcript: None,
+            prompt: None,
+            max_restarts: None,
+            timeout_secs: None,
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            runtime: super::runtime::RuntimeKind::Harness.to_string(),
+            route: None,
+            role: "worker".to_string(),
+            command: Vec::new(),
+            simple: false,
+            reservation_id: None,
+        }
+    }
 }
 
 /// One vendor-backed portion of a logical supervised execution. A cross-harness
@@ -671,6 +713,23 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    // Issue #478: `--runtime native` conducts the conversation in-process
+    // instead of supervising a harness, and shares nothing with the spawn
+    // path below -- no adapter, no argv, no PTY, no transcript to score. It
+    // is matched here, before any of that work starts, and the branch is
+    // explicit: an unrecognised value is an error, never a silent fall back
+    // to the harness.
+    match args.runtime.parse::<super::runtime::RuntimeKind>() {
+        Ok(super::runtime::RuntimeKind::Native) => return run_native(args, w, repo, env),
+        Ok(super::runtime::RuntimeKind::Harness) => {}
+        _ => {
+            return Err(format!(
+                "--runtime '{}': expected `harness` or `native`",
+                args.runtime
+            )
+            .into());
+        }
+    }
     run_with_clock(
         args,
         w,
@@ -678,6 +737,59 @@ pub fn run_with<W: Write>(
         env,
         &super::state::now_secs,
         &|d: Duration| std::thread::sleep(d),
+    )
+}
+
+/// `zirv ctx exec --runtime native` (issue #478, roadmap N09). The prompt is
+/// `--prompt`, or the trailing `-- <text>` words when no `--prompt` is given;
+/// `--agent`, `--transcript`, `--session-id` and the restart/rot flags have no
+/// meaning here and are refused rather than silently ignored, because a native
+/// session has no external process to restart or transcript to score.
+fn run_native<W: Write>(
+    args: &ExecArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    for (name, present) in [
+        ("--agent", args.agent.is_some()),
+        ("--transcript", args.transcript.is_some()),
+        ("--session-id", args.session_id.is_some()),
+        ("--max-restarts", args.max_restarts.is_some()),
+    ] {
+        if present {
+            return Err(format!(
+                "{name} is a harness-runtime flag; a native session supervises no external \
+                 process"
+            )
+            .into());
+        }
+    }
+    let prompt = match args.prompt.as_deref() {
+        Some(prompt) => prompt.to_string(),
+        None => args.command.join(" "),
+    };
+    if prompt.trim().is_empty() {
+        return Err("native runtime: pass a prompt with --prompt or after `--`".into());
+    }
+
+    let mut limits = super::runtime::native::NativeLimits::default();
+    if let Some(max_tool_calls) = args.max_tool_calls {
+        limits.max_tool_calls = max_tool_calls;
+    }
+    if let Some(timeout_secs) = args.timeout_secs {
+        limits.max_wall_ms = timeout_secs.saturating_mul(1000);
+    }
+    super::runtime::native::run_headless(
+        &super::runtime::native::HeadlessRequest {
+            repo,
+            prompt: &prompt,
+            route: args.route.as_deref(),
+            role: &args.role,
+            limits,
+        },
+        w,
+        env,
     )
 }
 
@@ -2452,6 +2564,7 @@ fn run_with_clock_inner<W: Write>(
                     command: target.model_args(&selected_model),
                     simple: args.simple,
                     reservation_id,
+                    ..Default::default()
                 };
 
                 let mut next_visited = visited;
@@ -4403,6 +4516,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -4443,6 +4557,7 @@ mod tests {
                 "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf '{}\\n' >> \"$1\"; /bin/sleep 0.25; done".into(),
                 "worker".into(), transcript.display().to_string(),
             ],
+            ..Default::default()
         };
         let code = run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned());
         assert_eq!(
@@ -4480,6 +4595,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: vec!["sh".into(), "-c".into(), "/bin/sleep 5".into()],
+            ..Default::default()
         };
         let code =
             run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -4526,6 +4642,7 @@ mod tests {
                 "-c".into(),
                 "printf 'Selected model is at capacity\\n'; /bin/sleep 3; exit 2".into(),
             ],
+            ..Default::default()
         };
         let code =
             run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -4561,6 +4678,7 @@ mod tests {
                 "-c".into(),
                 "printf 'insufficient_quota\\n'; /bin/sleep 3; exit 2".into(),
             ],
+            ..Default::default()
         };
         let code =
             run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -4595,6 +4713,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4643,6 +4762,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -4691,6 +4811,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4728,6 +4849,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4791,6 +4913,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4877,6 +5000,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4933,6 +5057,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4988,6 +5113,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5038,6 +5164,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5074,6 +5201,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -5109,6 +5237,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: vec!["true".to_string()],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -5291,6 +5420,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
@@ -5357,6 +5487,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
@@ -5409,6 +5540,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5468,6 +5600,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let started = std::time::Instant::now();
         let mut out = Vec::new();
@@ -5522,6 +5655,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let started = std::time::Instant::now();
         let mut out = Vec::new();
@@ -5631,6 +5765,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5685,6 +5820,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5730,6 +5866,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5773,6 +5910,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5814,6 +5952,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -5854,6 +5993,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5898,6 +6038,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -5934,6 +6075,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6022,6 +6164,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
 
@@ -6087,6 +6230,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6165,6 +6309,7 @@ mod tests {
             simple: false,
             reservation_id: Some(seeded.id.clone()),
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let (code, report) =
@@ -6246,6 +6391,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -6315,6 +6461,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let clock = std::cell::Cell::new(crate::commands::ctx::state::now_secs());
         let slept = std::cell::RefCell::new(Vec::new());
@@ -6388,6 +6535,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6442,6 +6590,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6497,6 +6646,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -6572,6 +6722,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6631,6 +6782,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6693,6 +6845,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6747,6 +6900,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -6814,6 +6968,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6865,6 +7020,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6940,6 +7096,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7054,6 +7211,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7116,6 +7274,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7194,6 +7353,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7279,6 +7439,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run(&args, &mut out);
@@ -7374,6 +7535,7 @@ mod tests {
             // adapter` below for the other shape (an explicit `-- <command>`),
             // where there is no such text to append to at all.
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7460,6 +7622,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7538,6 +7701,7 @@ mod tests {
                 "exec".to_string(),
                 "do the work".to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7635,6 +7799,7 @@ mod tests {
                 "exec".to_string(),
                 "do the work".to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7744,6 +7909,7 @@ mod tests {
                 "exec".to_string(),
                 "do the work".to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7819,6 +7985,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7889,6 +8056,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8043,6 +8211,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8115,6 +8284,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8189,6 +8359,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session1),
+            ..Default::default()
         };
         let mut out1 = Vec::new();
         let code1 = run_with(&args1, &mut out1, tmp.path(), &|k| env.get(k).cloned());
@@ -8220,6 +8391,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session2),
+            ..Default::default()
         };
         let mut out2 = Vec::new();
         let code2 = run_with(&args2, &mut out2, tmp.path(), &|k| env.get(k).cloned());
@@ -8285,6 +8457,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8355,6 +8528,7 @@ mod tests {
                 "--session-id".to_string(),
                 session.to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let result = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8422,6 +8596,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8471,6 +8646,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8533,6 +8709,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8740,6 +8917,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8826,6 +9004,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8904,6 +9083,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -9004,6 +9184,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -9111,6 +9292,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());

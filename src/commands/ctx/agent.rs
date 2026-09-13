@@ -4262,6 +4262,7 @@ pub fn run_with<W: Write>(
         // harness-handover restart can move it to the new provider mid-run
         // -- see `ExecArgs::reservation_id`'s own doc comment.
         reservation_id: reservation_id.clone(),
+        ..Default::default()
     };
 
     announcer.emit(&Event::DelegatedStart {
