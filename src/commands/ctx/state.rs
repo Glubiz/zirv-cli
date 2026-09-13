@@ -216,6 +216,13 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::File("", ".json"),
         &["commands/ctx/objective.rs"],
     ),
+    // Issue #485 (roadmap N16). The native coordinator's task graph, one
+    // slug-keyed JSON file per repository, exactly like `objective` above.
+    (
+        "coordinator",
+        SlugEntry::File("", ".json"),
+        &["commands/ctx/coordinator.rs"],
+    ),
     (
         "restart-chains",
         SlugEntry::File("", ".json"),
@@ -907,6 +914,17 @@ impl StateDir {
     /// delegated worker.
     pub fn objective(&self) -> PathBuf {
         self.0.join("objective")
+    }
+
+    /// `<state>/coordinator` -- one JSON file per repository holding the
+    /// native coordinator's task graph, decisions, evidence references and
+    /// user constraints (issue #485, roadmap N16), keyed by
+    /// `state::repo_slug` exactly the way `objective()` is, and for the same
+    /// reason: the plan outlives any one coordinating session, which is what
+    /// lets a restarted coordinator pick the graph back up instead of
+    /// re-deriving it from a transcript.
+    pub fn coordinator(&self) -> PathBuf {
+        self.0.join("coordinator")
     }
 
     /// `<state>/restart-chains` -- one JSON file per chain key (issue #310,

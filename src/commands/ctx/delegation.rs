@@ -1143,6 +1143,22 @@ impl WorkerLauncher for RecordingLauncher {
     }
 }
 
+/// The DELEGATING seat, as the launch path needs to know it.
+///
+/// Issue #485 (roadmap N16): `role` and `depth` are what make a delegation's
+/// bounds decidable before anything starts. Both come from trusted runtime
+/// state -- the role off the persisted seat record (reachable at effect time
+/// as `ExecutionIdentity::role`), the depth off this session's own
+/// `envelope::WorkerEnvelope` -- and neither is ever supplied by model
+/// output.
+#[derive(Clone, Copy, Debug)]
+pub struct Parent<'a> {
+    pub session: Option<&'a str>,
+    pub short: &'a str,
+    pub role: &'a str,
+    pub depth: u8,
+}
+
 /// Registers one delegation and starts its worker, in that order.
 ///
 /// The launch receipt is durable BEFORE `launcher` is called, so a crash
@@ -1150,19 +1166,41 @@ impl WorkerLauncher for RecordingLauncher {
 /// started -- the opposite order would lose it. The terminal outcome is then
 /// published through [`publish_terminal`], which is where the delivery
 /// identity a consumer deduplicates on comes from.
-/// Eight arguments, over clippy's default seven, for the same reason
-/// [`publish_terminal`] documents just above.
-#[allow(clippy::too_many_arguments)]
+///
+/// Issue #485: the bounds decision (`coordinator::check`) happens FIRST, so
+/// a refused delegation leaves no launch receipt naming work nobody started,
+/// and the child's write posture is the one its own ROLE grants rather than
+/// the one the caller asked for. Everything the check deliberately does not
+/// cover -- the task claim, the writer permit, the group's child limit and
+/// token budget, the per-provider reservation -- is enforced centrally
+/// further down `agent::run_with`, which both runtimes go through.
 pub fn delegate(
     state: &StateDir,
     repo: &Path,
     cfg: &CtxConfig,
     launcher: &mut dyn WorkerLauncher,
     request: &LaunchRequest,
-    parent_session: Option<String>,
-    parent_short: &str,
+    parent: &Parent<'_>,
     now: u64,
 ) -> CtxResult<(Record, Publication)> {
+    let mut graph = super::coordinator::load(state, repo);
+    let grant = super::coordinator::check(&super::coordinator::Bounds {
+        parent_role: parent.role,
+        child_role: &request.role,
+        depth: parent.depth,
+        cancelled: graph.cancelled,
+        requested_write: !request.read_only,
+    })
+    .map_err(|refusal| refusal.to_string())?;
+
+    // The one field a role identity may narrow. Cloned rather than mutated
+    // in place: the caller's request is what it asked for, and what actually
+    // ran has to be readable as a separate fact.
+    let request = &LaunchRequest {
+        read_only: !grant.write,
+        ..request.clone()
+    };
+
     let delegation_id = uuid::Uuid::new_v4().simple().to_string();
     let worker_session = format!("{delegation_id}-worker");
     let handle = WorkerHandle {
@@ -1170,7 +1208,7 @@ pub fn delegate(
         attempt: 1,
         runtime: request.runtime,
         worker_session: worker_session.clone(),
-        short: parent_short.to_string(),
+        short: parent.short.to_string(),
         role: request.role.clone(),
         task: request.task.clone(),
         group: request.group.clone(),
@@ -1180,7 +1218,22 @@ pub fn delegate(
             .clone()
             .unwrap_or_else(|| repo.to_path_buf()),
     };
-    let launched = record_launch(state, repo, handle, parent_session, now)?;
+    let launched = record_launch(state, repo, handle, parent.session.map(str::to_string), now)?;
+
+    // The coordinator's own graph, written beside the launch receipt: which
+    // task this delegation answers for, which role took it and on which
+    // runtime. A crash between here and the outcome leaves a node a resumed
+    // coordinator can still address, which is the whole point of persisting
+    // it.
+    let node = request.task.clone().unwrap_or_else(|| delegation_id.clone());
+    graph.dispatched(
+        &node,
+        &request.role,
+        request.runtime.as_str(),
+        &delegation_id,
+        now,
+    );
+    let _ = super::coordinator::store(state, repo, &graph);
 
     let outcome = launcher.launch(request);
     let (phase, exit_code, summary) = match &outcome {
@@ -1881,5 +1934,171 @@ mod tests {
             "record_ownership's own change must have persisted too -- neither mutator's write \
              may be lost to the other's stale-read overwrite"
         );
+    }
+
+    // -- the launch seam's bounds (issue #485, roadmap N16) ---------------
+
+    fn launch_request(role: &str, read_only: bool) -> LaunchRequest {
+        LaunchRequest {
+            runtime: RuntimeKind::Native,
+            target: "fast".to_string(),
+            brief: "do the thing".to_string(),
+            role: role.to_string(),
+            task: Some(format!("task-{role}")),
+            group: None,
+            workdir: None,
+            read_only,
+            budget_tokens: None,
+            max_tool_calls: None,
+        }
+    }
+
+    fn coordinator_parent() -> Parent<'static> {
+        Parent {
+            session: Some("coord-session"),
+            short: "coord001",
+            role: super::super::team::COORDINATOR,
+            depth: 2,
+        }
+    }
+
+    /// Issue #485 item 3: a delegation that cannot be admitted leaves NO
+    /// launch receipt -- a durable record naming work nobody started is
+    /// exactly the confusion the receipt exists to prevent -- and the
+    /// launcher is never reached.
+    #[test]
+    fn a_refused_delegation_starts_nothing_and_writes_no_receipt() {
+        let (_dir, state, repo, cfg) = fixture();
+        let mut launcher = RecordingLauncher::default();
+        let launches = launcher.launches.clone();
+        let parent = Parent {
+            role: super::super::team::REVIEWER,
+            ..coordinator_parent()
+        };
+        let error = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &parent,
+            10,
+        )
+        .expect_err("a reviewer seat may not delegate");
+        assert!(error.to_string().contains("may not delegate"), "{error}");
+        assert!(launches.lock().expect("lock").is_empty());
+        assert!(list(&state, &repo).is_empty(), "no receipt was written");
+
+        // Depth is the other identity-decidable bound, and it refuses the
+        // same way.
+        let exhausted = Parent {
+            depth: 0,
+            ..coordinator_parent()
+        };
+        assert!(
+            delegate(
+                &state,
+                &repo,
+                &cfg,
+                &mut launcher,
+                &launch_request(super::super::team::IMPLEMENTER, false),
+                &exhausted,
+                10,
+            )
+            .is_err()
+        );
+        assert!(list(&state, &repo).is_empty());
+    }
+
+    /// Issue #485 item 6, at the seam that actually launches: the child's
+    /// mode is its OWN role's, in both directions.
+    #[test]
+    fn the_childs_mode_is_decided_by_its_role_not_by_the_request() {
+        let (_dir, state, repo, cfg) = fixture();
+        let mut launcher = RecordingLauncher::default();
+        let launches = launcher.launches.clone();
+
+        // A reviewer asked for as a writer is launched read-only.
+        delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::REVIEWER, false),
+            &coordinator_parent(),
+            10,
+        )
+        .expect("admitted");
+        // An implementer is launched writing, and nothing about the
+        // delegating seat's own posture changes that.
+        delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &coordinator_parent(),
+            11,
+        )
+        .expect("admitted");
+
+        let seen = launches.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].read_only, "a reviewer is never handed a checkout");
+        assert!(!seen[1].read_only, "an implementer is");
+    }
+
+    /// Issue #485 item 4: the coordinator's graph names the delegation that
+    /// is answering for each task, written beside the launch receipt rather
+    /// than reconstructed from a transcript later.
+    #[test]
+    fn the_launch_binds_the_task_to_its_delegation_in_the_coordinators_graph() {
+        let (_dir, state, repo, cfg) = fixture();
+        let mut launcher = RecordingLauncher::default();
+        let (record, _) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &coordinator_parent(),
+            10,
+        )
+        .expect("admitted");
+
+        let graph = super::super::coordinator::load(&state, &repo);
+        let node = graph.nodes.get("task-implementer").expect("node");
+        assert_eq!(node.delegation.as_deref(), Some(record.handle.delegation.as_str()));
+        assert_eq!(node.runtime.as_deref(), Some("native"));
+        assert_eq!(node.role, super::super::team::IMPLEMENTER);
+        assert_eq!(
+            node.state,
+            super::super::coordinator::NodeState::Delegated,
+            "the node stays delegated until its receipt is CONSUMED, not merely published"
+        );
+    }
+
+    /// Issue #485 item 7: once the user cancels, nothing further is
+    /// dispatched -- and the refusal says so rather than failing opaquely.
+    #[test]
+    fn a_cancelled_objective_admits_no_further_delegations() {
+        let (_dir, state, repo, cfg) = fixture();
+        let mut graph = super::super::coordinator::Coordinator::default();
+        graph.cancel(5);
+        super::super::coordinator::store(&state, &repo, &graph).expect("store");
+
+        let mut launcher = RecordingLauncher::default();
+        let error = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &coordinator_parent(),
+            10,
+        )
+        .expect_err("cancelled");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(list(&state, &repo).is_empty());
     }
 }

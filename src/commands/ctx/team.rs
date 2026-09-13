@@ -185,20 +185,27 @@ pub struct Authority {
 }
 
 impl Authority {
-    /// Authority for any role outside the team: the least-privileged answer.
-    /// An unknown role is not evidence of an entitlement.
+    /// Authority for any role outside the team -- `worker`, `seat`, an
+    /// operator's own label.
+    ///
+    /// Deliberately UNCHANGED from every pre-N16 delegation: such a session
+    /// may delegate (bounded by `envelope::WorkerEnvelope::delegation_depth`,
+    /// which is what has always stopped the chain) and may write (bounded by
+    /// its writer permit, which is what has always decided whether it can).
+    /// This table narrows those two existing caps for the roles it actually
+    /// knows; it does not silently take an entitlement away from a role
+    /// nobody has told it about.
     pub const fn worker() -> Self {
         Self {
-            may_delegate: false,
+            may_delegate: true,
             may_write: true,
         }
     }
 }
 
 /// The authority a role string carries. Outside the team this is
-/// [`Authority::worker`] -- unchanged from every pre-N16 delegation, which
-/// is what keeps `worker`, `seat` and an operator's own labels working
-/// exactly as they did.
+/// [`Authority::worker`], which keeps `worker`, `seat` and an operator's own
+/// labels working exactly as they did.
 pub fn authority(role: &str) -> Authority {
     TeamRole::parse(role)
         .map(TeamRole::authority)
@@ -438,10 +445,13 @@ mod tests {
             assert!(!authority(read_only).may_delegate, "{read_only}");
         }
 
-        // Outside the team nothing changes: this is what every pre-N16
-        // `worker` delegation already got.
+        // Outside the team nothing changes: a role this table does not know
+        // keeps exactly the depth-and-permit-bounded reach every pre-N16
+        // delegation had. The table narrows the roles it knows; it never
+        // takes an entitlement away from one it does not.
         assert_eq!(authority("worker"), Authority::worker());
         assert_eq!(authority("something-new"), Authority::worker());
+        assert!(authority("worker").may_delegate);
     }
 
     #[test]

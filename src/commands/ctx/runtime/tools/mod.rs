@@ -1600,14 +1600,29 @@ impl NativeToolClient {
             max_tool_calls: args.max_tool_calls,
         };
         let identity = self.broker.identity().clone();
+        // Issue #485 (roadmap N16): the delegating seat's ROLE comes off the
+        // persisted seat record the broker is fenced on, and its remaining
+        // delegation DEPTH from the same envelope resolution `agent::run_with`
+        // performs for this session -- so the bounds this launch is judged
+        // against and the ones the launch itself later enforces are one
+        // answer, not two. Neither is reachable from model output.
+        let depth = crate::commands::ctx::agent::resolve_parent_envelope(&cfg, &|key| {
+            std::env::var(key).ok()
+        })
+        .map_err(|reason| ToolError::new(ToolErrorCode::AuthorizationDenied, reason))?
+        .delegation_depth;
         let (record, publication) = service::delegate(
             &self.state,
             &self.repo,
             &cfg,
             self.launcher.as_mut(),
             &request,
-            Some(identity.session.clone()),
-            &identity.short,
+            &service::Parent {
+                session: Some(identity.session.as_str()),
+                short: &identity.short,
+                role: &identity.role,
+                depth,
+            },
             state::now_secs(),
         )
         .map_err(ToolError::external)?;
