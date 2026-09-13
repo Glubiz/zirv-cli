@@ -29,6 +29,8 @@ use super::fallback;
 use super::handover::{self, HandoverRequest};
 use super::log;
 use super::pace;
+use super::rollover_runtime::{self, Drain, Settlement, Trigger};
+use super::runtime::RuntimeKind;
 use super::seat;
 use super::state::StateDir;
 
@@ -207,6 +209,7 @@ pub fn forget(state: &StateDir, seat_short: &str) {
         );
     }
     seat::remove(state, seat_short);
+    rollover_runtime::forget(state, seat_short);
     let _ = std::fs::remove_file(pool_state_path(state, seat_short));
 }
 
@@ -557,6 +560,43 @@ pub fn evaluate(
         .is_some_and(|(primary_pct, seat_pct)| {
             primary_pct >= seat_pct + cfg.fallback.min_candidate_headroom_pct
         });
+    // Issue #488 item 8: a return is still a route change, so it clears the
+    // same authority gate a forward rollover does. `authorized_return` is
+    // `None` when the target declares no offer at all -- every harness row
+    // today -- which is exactly how `allocator::place` already treats an
+    // undeclared offer, so nothing about the existing reclaim changes until a
+    // route says what it is. When one does, a home route billed in a way this
+    // work is not authorized for is REFUSED with its reason rather than
+    // silently taken.
+    let return_refusal = reclaim
+        .then(|| {
+            authorized_return(
+                &snapshot,
+                &current,
+                reclaim_target.as_deref(),
+                source_headroom_pct,
+                cfg,
+                now,
+                idle,
+            )
+        })
+        .flatten();
+    let reclaim = reclaim && return_refusal.is_none();
+    if let Some(refusal) = &return_refusal {
+        dropped.push(refusal.label());
+        // Item 7: a route that was tried and refused is part of this seat's
+        // rollover history, not just of one log line.
+        let mut ledger = rollover_runtime::load(state, seat_short).unwrap_or_else(|| {
+            rollover_runtime::Record::open(
+                &current,
+                Trigger::CapacityReturn,
+                "return to the preferred route",
+                now,
+            )
+        });
+        ledger.refused(refusal, runtime_of(&snapshot, refusal.route()), now);
+        let _ = rollover_runtime::store(state, &ledger);
+    }
 
     let binding_window = fresh.map(|window| window.window.clone());
     let reserved_tokens = source.map(|provider| provider.reserved_tokens).unwrap_or(0);
@@ -655,15 +695,85 @@ pub fn evaluate(
             let reactive = matches!(cause, seat::Cause::Reactive { .. });
             let reclaimed = matches!(cause, seat::Cause::Reclaim { .. });
             let resume_session = return_resume(&current, &agent);
-            match seat::prepare(
+            // Issue #488 (items 1 and 2). The successor's BACKEND is part of
+            // the transaction, and for a native source the safe boundary is
+            // reached -- in-flight work drained or explicitly cancelled,
+            // outcome-unknown effects reconciled, one portable checkpoint
+            // committed -- BEFORE the successor is prepared at all. A failure
+            // here is a failure to prepare, so the source keeps the seat
+            // (item 7) and nothing has been given up.
+            let successor_runtime = runtime_of(&snapshot, &agent);
+            let direction = match rollover_runtime::direction(current.runtime, successor_runtime) {
+                Ok(direction) => direction,
+                Err(e) => return Evaluation::Skip(e.to_string()),
+            };
+            let drain = if idle { Drain::Quiesced } else { Drain::Forced };
+            let boundary = match source_boundary(state, &current, drain, &cause, now) {
+                Ok(boundary) => boundary,
+                Err(e) => {
+                    let reason = format!(
+                        "the source session could not reach a safe boundary, so the seat was not \
+                         rolled over: {e}"
+                    );
+                    record(
+                        state,
+                        &current.session,
+                        verb,
+                        REFUSED,
+                        &PoolEvent {
+                            target_agent: Some(agent),
+                            reason: reason.clone(),
+                            ..base
+                        },
+                    );
+                    return Evaluation::Skip(reason);
+                }
+            };
+            // Criterion 4: a boundary that left an ambiguous external effect
+            // behind HALTS the successor. The decision says so up front, so
+            // the reason an operator reads is the reason the successor is
+            // sitting still.
+            let halted = boundary
+                .as_ref()
+                .is_some_and(rollover_runtime::Boundary::halts_successor);
+            let mut ledger = rollover_runtime::Record::open(
+                &current,
+                Trigger::from_cause(&cause, source_unreachable),
+                &format!(
+                    "roll onto {agent} ({}{}){}",
+                    direction.as_str(),
+                    if direction.crosses_runtime() {
+                        ", a cross-runtime move"
+                    } else {
+                        ""
+                    },
+                    if halted {
+                        "; the successor is halted for tool reconciliation"
+                    } else {
+                        ""
+                    }
+                ),
+                now,
+            );
+            ledger.direction = Some(direction);
+            ledger.boundary = boundary;
+            match seat::prepare_onto(
                 state,
                 seat_short,
                 &agent,
                 model.as_deref(),
+                successor_runtime,
                 cause.clone(),
                 now,
             ) {
                 Ok(generation) => {
+                    ledger.admitted(
+                        &agent,
+                        successor_runtime,
+                        "the seat transaction is open on this successor",
+                        now,
+                    );
+                    let _ = rollover_runtime::store(state, &ledger);
                     record(
                         state,
                         &current.session,
@@ -727,6 +837,16 @@ pub fn evaluate(
                     } else {
                         format!("{e} ({})", dropped.join("; "))
                     };
+                    // Item 7: a preparation that failed leaves the ORIGINAL
+                    // session holding the seat, and the record says exactly
+                    // that rather than implying a move happened.
+                    ledger.settle(
+                        Settlement::Restored {
+                            reason: reason.clone(),
+                        },
+                        now,
+                    );
+                    let _ = rollover_runtime::store(state, &ledger);
                     record(
                         state,
                         &current.session,
@@ -810,6 +930,20 @@ fn park_for_reset(
         );
         return Evaluation::Skip(reason.to_string());
     };
+    // Item 7's honest park: nothing could take the seat, so the record says
+    // the seat is waiting -- with all its durable state intact -- rather than
+    // leaving an operator to infer it from a missing commit.
+    let mut ledger = rollover_runtime::load(state, seat_short).unwrap_or_else(|| {
+        rollover_runtime::Record::open(current, Trigger::UsageExhaustion, reason, now)
+    });
+    ledger.settle(
+        Settlement::Parked {
+            until: choice.reset_at,
+            reason: detail.clone(),
+        },
+        now,
+    );
+    let _ = rollover_runtime::store(state, &ledger);
     record(
         state,
         &current.session,
@@ -1035,6 +1169,137 @@ fn return_resume(current: &seat::Seat, target: &str) -> Option<String> {
         .and_then(|displaced| displaced.conversation.clone())
 }
 
+/// Issue #488 item 8: whether the seat's own return to `target` clears the
+/// authority gate, and the typed refusal when it does not.
+///
+/// `None` -- the ordinary answer -- means "nothing objects": either the seat
+/// was never displaced, or the target declares no offer to judge (every
+/// harness row today), or every gate passed. `Some` is a refusal an operator
+/// has to see, and the one that matters in practice is
+/// `Ineligible::UnauthorizedBilling`: recovering capacity is not by itself
+/// permission to start spending a different kind of money.
+#[allow(clippy::too_many_arguments)]
+fn authorized_return(
+    snapshot: &allocator::CapacitySnapshot,
+    current: &seat::Seat,
+    target: Option<&str>,
+    source_headroom_pct: Option<f64>,
+    cfg: &CtxConfig,
+    now: u64,
+    idle: bool,
+) -> Option<rollover_runtime::Refusal> {
+    let offer = snapshot.harness(target?)?.offer.clone()?;
+    let facts = rollover_runtime::SuccessorFacts {
+        offer: &offer,
+        // A harness or route zirv has a capacity reading for has a resolvable
+        // credential by construction; a route that does not is refused by its
+        // own policy verdict, not by a guess made here.
+        authenticated: true,
+        budget_tokens: None,
+        // A return is a decision, not a launch: whether the successor starts
+        // is answered later, at the readiness check every rollover already
+        // performs.
+        started: true,
+    };
+    let demand = super::route::Demand {
+        authorized_billing: rollover_runtime::default_authorized_billing(
+            snapshot
+                .harness(&current.agent)
+                .and_then(|harness| harness.offer.as_ref())
+                .map(|offer| offer.billing)
+                .unwrap_or_default(),
+        ),
+        ..super::route::Demand::default()
+    };
+    let inputs = rollover_runtime::ReturnInputs {
+        seat: current,
+        now,
+        preferred: &facts,
+        preferred_headroom_pct: snapshot
+            .harness(target?)
+            .and_then(|harness| snapshot.provider(&harness.provider))
+            .and_then(|provider| allocator::projected_headroom(provider, cfg, 0)),
+        seat_headroom_pct: source_headroom_pct,
+        min_candidate_headroom_pct: cfg.fallback.min_candidate_headroom_pct,
+        cooldown_secs: cfg.fallback.rollover_cooldown_secs,
+        idle,
+    };
+    match rollover_runtime::plan_return(&inputs, &demand) {
+        rollover_runtime::ReturnVerdict::Refuse(refusal) => Some(refusal),
+        // A `Hold` here is the same gate the caller's own `reclaim` already
+        // applied (idle, cooldown, hysteresis), so it is not a second answer:
+        // this function only ever adds the authority verdict.
+        rollover_runtime::ReturnVerdict::Hold(_) | rollover_runtime::ReturnVerdict::Return { .. } => {
+            None
+        }
+    }
+}
+
+/// Which BACKEND a candidate actually runs on (issue #488). Read off the
+/// snapshot's own route identity rather than guessed from the name, so a row
+/// the snapshot describes as native is prepared as native. A candidate the
+/// snapshot has never heard of is a harness: that is the only kind of row
+/// `fallback.order` can name today, and guessing `Native` for an unknown name
+/// would prepare a transaction no backend could complete.
+fn runtime_of(snapshot: &allocator::CapacitySnapshot, agent: &str) -> RuntimeKind {
+    match snapshot.harness(agent).map(|harness| harness.identity.runtime) {
+        Some(super::route::RuntimeKind::Native) => RuntimeKind::Native,
+        _ => RuntimeKind::Harness,
+    }
+}
+
+/// Item 2: the safe boundary, for a source that has one.
+///
+/// A NATIVE source has durable in-flight state -- executions mid-effect,
+/// acknowledged input not yet delivered, claims, receipts -- so it drains or
+/// explicitly cancels, reconciles anything outcome-unknown, and commits one
+/// portable checkpoint before a successor is prepared.
+///
+/// A HARNESS source has none of that: its boundary is the verified-idle turn
+/// boundary the supervisor already observed and its carried state is
+/// `handoff.rs`'s structural packet, neither of which this issue changes. So
+/// it yields `None`, which is honest -- there is no native checkpoint to
+/// claim there is.
+///
+/// A native seat whose journal has never heard of its session also yields
+/// `None` rather than failing: an unsupervised or never-answered session has
+/// nothing durable to drain, and refusing the rollover for it would strand a
+/// seat that has nothing to lose.
+fn source_boundary(
+    state: &StateDir,
+    current: &seat::Seat,
+    drain: Drain,
+    cause: &seat::Cause,
+    now: u64,
+) -> CtxResult<Option<rollover_runtime::Boundary>> {
+    if current.runtime != RuntimeKind::Native {
+        return Ok(None);
+    }
+    let Ok(session) = super::runtime::journal::JournalSessionId::new(current.session.clone())
+    else {
+        return Ok(None);
+    };
+    let mut journal = super::runtime::journal::Journal::open(state)?;
+    let Ok(identity) = journal.session(&session) else {
+        return Ok(None);
+    };
+    let context = super::runtime::checkpoint::CheckpointContext {
+        hard_constraints: Vec::new(),
+        task: identity.task.as_ref().map(ToString::to_string),
+        workflow: None,
+        reason: format!("orchestrator rollover ({cause:?})"),
+    };
+    rollover_runtime::reach_boundary(
+        &mut journal,
+        &session,
+        identity.generation,
+        drain,
+        &context,
+        now,
+    )
+    .map(Some)
+}
+
 /// Commits a prepared rollover once the successor has proven itself ready --
 /// the supervisors' half of [`Evaluation::Rollover`].
 ///
@@ -1068,6 +1333,15 @@ pub fn commit(
             return Err(e);
         }
     };
+    settle(
+        state,
+        seat_short,
+        Settlement::Committed {
+            route: committed.agent.clone(),
+            generation: committed.generation,
+        },
+        now,
+    );
     record(
         state,
         &committed.session,
@@ -1083,6 +1357,20 @@ pub fn commit(
         },
     );
     Ok(committed)
+}
+
+/// Issue #488 item 7: closes this seat's rollover record with what actually
+/// happened. Best-effort, exactly like every `record` call beside it: a
+/// rollover that cannot write its own history must still complete.
+fn settle(state: &StateDir, seat_short: &str, settlement: Settlement, now: u64) {
+    let Some(mut ledger) = rollover_runtime::load(state, seat_short) else {
+        return;
+    };
+    if ledger.settlement.is_some() {
+        return;
+    }
+    ledger.settle(settlement, now);
+    let _ = rollover_runtime::store(state, &ledger);
 }
 
 /// Aborts a prepared rollover: the successor never took the seat, and
@@ -1112,6 +1400,16 @@ pub fn fail(
         Ok(_) => reason.to_string(),
         Err(e) => format!("{reason}; the seat transaction could not be closed: {e}"),
     };
+    // Item 7: the successor never took the seat, so the record says the
+    // original session was retained -- never that the seat moved.
+    settle(
+        state,
+        seat_short,
+        Settlement::Restored {
+            reason: reason.clone(),
+        },
+        now,
+    );
     terminate(
         state,
         verb,
@@ -1257,11 +1555,12 @@ pub fn on_resume(
         detail: "capacity resumed on another harness".to_string(),
         observed_at: now,
     };
-    let generation = seat::prepare(
+    let generation = seat::prepare_onto(
         state,
         seat_short,
         &candidate.name,
         candidate.model.as_deref(),
+        runtime_of(&snapshot, &candidate.name),
         cause,
         now,
     )
