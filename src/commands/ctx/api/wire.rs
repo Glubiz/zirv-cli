@@ -998,7 +998,14 @@ pub static METHODS: &[MethodSpec] = &[
         summary: "Attach a client to a server-owned session as an observer or (if the seat is free) its controller.",
         mutation: true,
         capability: Capability::SessionAttach,
-        params: &[SESSION_ID, GENERATION_IN, CLIENT_ID, ATTACH_MODE, ROWS_IN, COLS_IN],
+        params: &[
+            SESSION_ID,
+            GENERATION_IN,
+            CLIENT_ID,
+            ATTACH_MODE,
+            ROWS_IN,
+            COLS_IN,
+        ],
         result: &[ATTACHMENT_OUT],
     },
     MethodSpec {

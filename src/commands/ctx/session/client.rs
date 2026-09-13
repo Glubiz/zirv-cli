@@ -146,10 +146,7 @@ pub fn resolve_target<'a>(
 /// Every session the runtime at `endpoint` knows about.
 pub fn snapshot(client: &mut Client) -> CtxResult<Vec<SessionFacts>> {
     let value = client.call(Method::SessionSnapshot, json!({}))?;
-    let sessions = value
-        .get("sessions")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
     Ok(serde_json::from_value(sessions)?)
 }
 
@@ -204,10 +201,8 @@ pub fn attach_terminal<W: Write>(
     takeover: bool,
     notes: &mut W,
 ) -> CtxResult<AttachOutcome> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((
-        super::host::DEFAULT_COLS,
-        super::host::DEFAULT_ROWS,
-    ));
+    let (cols, rows) = crossterm::terminal::size()
+        .unwrap_or((super::host::DEFAULT_COLS, super::host::DEFAULT_ROWS));
     let mode = if controller { "controller" } else { "observer" };
     let attached = client.call(
         Method::SessionAttach,
@@ -366,11 +361,7 @@ fn attached_loop<W: Write>(
     }
 }
 
-fn read_screen(
-    client: &mut Client,
-    session_id: &str,
-    client_name: &str,
-) -> CtxResult<ScreenView> {
+fn read_screen(client: &mut Client, session_id: &str, client_name: &str) -> CtxResult<ScreenView> {
     let value = client.call(
         Method::SessionScreen,
         json!({ "session_id": session_id, "client_id": client_name }),
@@ -393,8 +384,8 @@ fn session_ended(client: &mut Client, session_id: &str) -> CtxResult<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::api::wire::{SessionFacts, SessionState};
+    use super::*;
 
     fn facts(id: &str, short: &str, agent: &str, state: SessionState) -> SessionFacts {
         let mut facts = SessionFacts::new(id);
@@ -413,7 +404,8 @@ mod tests {
     /// harness that binds it.
     #[test]
     fn ctrl_a_d_detaches_and_ctrl_a_ctrl_a_sends_a_literal_prefix() {
-        let (armed, verdict) = filter_attach_key(false, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let (armed, verdict) =
+            filter_attach_key(false, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(armed);
         assert_eq!(verdict, AttachVerdict::Pending);
 
@@ -429,7 +421,8 @@ mod tests {
     /// surface intercepts the prefix and nothing else.
     #[test]
     fn an_ordinary_keystroke_goes_to_the_session() {
-        let (armed, verdict) = filter_attach_key(false, key(KeyCode::Char('x'), KeyModifiers::NONE));
+        let (armed, verdict) =
+            filter_attach_key(false, key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(!armed);
         assert_eq!(verdict, AttachVerdict::ToSession(b"x".to_vec()));
         // `d` on its own is the child's too -- only the armed prefix makes it
@@ -445,7 +438,9 @@ mod tests {
             facts("id-2", "bbbb2222", "codex", SessionState::Ended),
         ];
         assert_eq!(
-            resolve_target(&sessions, None).expect("one live").session_id,
+            resolve_target(&sessions, None)
+                .expect("one live")
+                .session_id,
             "id-1"
         );
     }

@@ -230,8 +230,7 @@ fn start_secs(pid: u32) -> Option<u64> {
         if ok == 0 {
             return None;
         }
-        let ticks =
-            ((creation.dwHighDateTime as u64) << 32) | u64::from(creation.dwLowDateTime);
+        let ticks = ((creation.dwHighDateTime as u64) << 32) | u64::from(creation.dwLowDateTime);
         Some((ticks / TICKS_PER_SEC).saturating_sub(EPOCH_DELTA_SECS))
     }
 }
@@ -439,7 +438,10 @@ mod tests {
         let first = new_record(DEFAULT_NAMESPACE, "e", 1_000, false);
         let second = new_record(DEFAULT_NAMESPACE, "e", 1_000, false);
         assert_ne!(first.instance, second.instance);
-        assert_eq!(first.owner.pid, second.owner.pid, "same process, on purpose");
+        assert_eq!(
+            first.owner.pid, second.owner.pid,
+            "same process, on purpose"
+        );
     }
 
     /// This process is genuinely alive and genuinely has a start identity on
@@ -475,7 +477,9 @@ mod tests {
 
         touch(&state, DEFAULT_NAMESPACE, 99);
         assert_eq!(
-            read(&state, DEFAULT_NAMESPACE).expect("record").last_client_at,
+            read(&state, DEFAULT_NAMESPACE)
+                .expect("record")
+                .last_client_at,
             99
         );
 

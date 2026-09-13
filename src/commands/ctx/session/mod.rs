@@ -211,7 +211,16 @@ fn run_serve<W: Write>(
     if !args.no_restore {
         let report = service.restore(cfg);
         for id in &report.resumed {
-            writeln!(w, "  resumed {id} from its stored conversation")?;
+            // Named with its predecessor, because that is the honest
+            // description: this is a NEW session continuing an old
+            // conversation, not the old session brought back to life.
+            match service.host().restored_from(id) {
+                Some(previous) => writeln!(
+                    w,
+                    "  resumed {id} -- a new session continuing {previous}'s conversation"
+                )?,
+                None => writeln!(w, "  resumed {id} from its stored conversation")?,
+            }
         }
         for entry in &report.skipped {
             writeln!(
@@ -232,8 +241,9 @@ fn run_serve<W: Write>(
     let code = service.serve(w, until)?;
     // `stop_sessions = false`: the service exits, the agents do not. Only
     // `zirv session stop --runtime --stop-sessions` says otherwise.
+    let name = service.namespace().to_string();
     service.shutdown(false);
-    writeln!(w, "zirv runtime '{}' stopped; sessions left running", args.namespace)?;
+    writeln!(w, "zirv runtime '{name}' stopped; sessions left running")?;
     Ok(code)
 }
 
@@ -645,7 +655,10 @@ fn confirmed<W: Write>(yes: bool, what: &str, w: &mut W) -> CtxResult<bool> {
         return Ok(true);
     }
     if !std::io::stdin().is_terminal() {
-        writeln!(w, "refusing to {what} without --yes (stdin is not a terminal)")?;
+        writeln!(
+            w,
+            "refusing to {what} without --yes (stdin is not a terminal)"
+        )?;
         return Ok(false);
     }
     let answer = dialoguer::Confirm::new()
@@ -719,10 +732,7 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let tmp = tempfile::tempdir().expect("state");
-        let env = env_with(&[(
-            "ZIRV_CTX_STATE_DIR",
-            &tmp.path().to_string_lossy().into_owned(),
-        )]);
+        let env = env_with(&[("ZIRV_CTX_STATE_DIR", &tmp.path().to_string_lossy())]);
         for argv in [
             vec!["zirv session", "list"],
             vec!["zirv session", "attach"],
@@ -777,10 +787,7 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let tmp = tempfile::tempdir().expect("state");
         let env = env_with(&[
-            (
-                "ZIRV_CTX_STATE_DIR",
-                &tmp.path().to_string_lossy().into_owned(),
-            ),
+            ("ZIRV_CTX_STATE_DIR", &tmp.path().to_string_lossy()),
             ("ZIRV_CTX_SESSION_PERSISTENT", "true"),
         ]);
         let cli = SessionCli::try_parse_from(["zirv session", "list"]).expect("parse");

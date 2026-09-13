@@ -132,12 +132,7 @@ pub trait SessionHost: Send + Sync + std::fmt::Debug {
     ) -> Result<Attachment, ApiError>;
     fn screen(&self, session_id: &str, client_id: &str) -> Result<ScreenView, ApiError>;
     /// The controller's literal keystrokes. Refused for anyone else.
-    fn write_raw(
-        &self,
-        session_id: &str,
-        client_id: &str,
-        bytes: &[u8],
-    ) -> Result<(), ApiError>;
+    fn write_raw(&self, session_id: &str, client_id: &str, bytes: &[u8]) -> Result<(), ApiError>;
     /// The operator's explicit `zirv session stop`: terminate the child
     /// through the existing ladder. Detaching a client never reaches this.
     fn stop(&self, session_id: &str) -> Result<bool, ApiError>;
@@ -694,7 +689,12 @@ impl ApiServer {
         // it, which is what "client disconnection never terminates an agent"
         // means in code rather than in prose.
         match (self.host(), handle) {
-            (Some(host), _) if host.sessions().iter().any(|f| f.session_id == facts.session_id) => {
+            (Some(host), _)
+                if host
+                    .sessions()
+                    .iter()
+                    .any(|f| f.session_id == facts.session_id) =>
+            {
                 host.stop(&facts.session_id)?;
             }
             (_, Some(handle)) => self.with_backend(|backend| backend.interrupt(&handle))?,
@@ -925,8 +925,7 @@ impl ApiServer {
     fn screen_result(&self, params: &Value) -> Result<Value, ApiError> {
         let params: ClientParams = parse_params(params)?;
         self.pinned_facts(&params.session_id, None)?;
-        let screen =
-            self.with_host(|host| host.screen(&params.session_id, &params.client_id))?;
+        let screen = self.with_host(|host| host.screen(&params.session_id, &params.client_id))?;
         Ok(json!({ "revision": self.revision(), "screen": screen }))
     }
 
