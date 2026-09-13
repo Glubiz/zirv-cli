@@ -1706,13 +1706,33 @@ impl NativeToolClient {
             .clone()
             .unwrap_or_else(|| crate::commands::ctx::team::DEFAULT_ROLE.to_string());
         let now = state::now_secs();
-        let _ = coordinator::update(&self.state, &self.repo, |graph| {
+        // Review finding on issue #485: the task card minted above is the
+        // authoritative record, so a coordinator-graph store failure must
+        // never block it -- but it must not vanish silently either, so it
+        // gets the same decision-log line `delegation::delegate` and
+        // `objective::run_set` write for their own best-effort graph writes.
+        if let Err(error) = coordinator::update(&self.state, &self.repo, |graph| {
             graph.plan(&id, &role, &args.parents, now);
             graph.decide(
                 &format!("planned {id} for role {role}: {}", args.title),
                 now,
             );
-        });
+        }) {
+            let detail = format!("task {id}: {error}");
+            let _ = crate::commands::ctx::log::append(
+                &self.state,
+                &crate::commands::ctx::log::Decision {
+                    ts: now,
+                    session: &self.broker.identity().short,
+                    verb: "task",
+                    verdict: "error",
+                    score: 0,
+                    action: "coordinator-store-failed",
+                    detail: &detail,
+                    observed_at: None,
+                },
+            );
+        }
         Ok(json!({"task": id, "role": role, "parents": args.parents}))
     }
 

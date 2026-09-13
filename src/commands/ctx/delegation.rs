@@ -1236,7 +1236,26 @@ pub fn delegate(
         &delegation_id,
         now,
     );
-    let _ = super::coordinator::store(state, repo, &graph);
+    // Review finding on issue #485: the launch receipt above is what is
+    // authoritative, so a coordinator-graph store failure must never block
+    // it -- but it must not vanish silently either. One decision-log line,
+    // the same best-effort idiom `log_boundary` uses just above.
+    if let Err(error) = super::coordinator::store(state, repo, &graph) {
+        let detail = format!("delegation {delegation_id}: {error}");
+        let _ = super::log::append(
+            state,
+            &super::log::Decision {
+                ts: now,
+                session: parent.short,
+                verb: "delegation",
+                verdict: "error",
+                score: 0,
+                action: "coordinator-store-failed",
+                detail: &detail,
+                observed_at: None,
+            },
+        );
+    }
 
     let outcome = launcher.launch(request);
     let (phase, exit_code, summary) = match &outcome {
@@ -2081,6 +2100,51 @@ mod tests {
             node.state,
             super::super::coordinator::NodeState::Delegated,
             "the node stays delegated until its receipt is CONSUMED, not merely published"
+        );
+    }
+
+    /// Review finding on issue #485: the launch receipt is authoritative, so
+    /// a coordinator-graph store failure must never block it -- but it must
+    /// not vanish silently either. Forces `coordinator::store` to fail by
+    /// occupying its directory path with a plain FILE (a portable failure:
+    /// "create a directory where a file already exists" fails identically on
+    /// every platform, unlike a Unix permission bit), then asserts the
+    /// launch still proceeds AND the decision log gets a line naming it.
+    #[test]
+    fn a_coordinator_store_failure_never_blocks_the_launch_and_is_logged() {
+        let (_dir, state, repo, cfg) = fixture();
+        std::fs::create_dir_all(state.root()).expect("state root");
+        std::fs::write(state.coordinator(), b"not a directory").expect("occupy the path");
+        let mut launcher = RecordingLauncher::default();
+        let launches = launcher.launches.clone();
+
+        let (record, _) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &coordinator_parent(),
+            10,
+        )
+        .expect("a graph-store failure must not refuse the delegation");
+        assert_eq!(
+            launches.lock().expect("lock").len(),
+            1,
+            "the worker was launched despite the graph store failing"
+        );
+        assert_eq!(record.phase, Phase::Completed);
+
+        let decisions = super::super::log::read_decisions(&state);
+        let logged = decisions
+            .iter()
+            .find(|entry| entry.action == "coordinator-store-failed")
+            .expect("the store failure was logged, not swallowed");
+        assert_eq!(logged.verb, "delegation");
+        assert!(
+            logged.detail.contains(&record.handle.delegation),
+            "{}",
+            logged.detail
         );
     }
 
