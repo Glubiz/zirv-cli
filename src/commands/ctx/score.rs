@@ -2263,7 +2263,9 @@ mod tests {
         );
         std::fs::write(&transcript, turn_one).expect("write transcript");
         let mut scorer = IncrementalScorer::new(transcript.clone());
-        scorer.poll(&adapter, &cfg, &thresholds).expect("first poll");
+        scorer
+            .poll(&adapter, &cfg, &thresholds)
+            .expect("first poll");
 
         // A different, shorter session at the same path.
         let replacement = concat!(
