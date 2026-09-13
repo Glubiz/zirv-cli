@@ -57,7 +57,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use serde::Serialize;
 
@@ -3040,6 +3040,334 @@ fn prompt_role(role: &str) -> super::super::prompt::PromptRole {
         "sub-orchestrator" => PromptRole::SubOrchestrator,
         _ => PromptRole::Worker,
     }
+
+// -- an interactive, multi-turn session for a dashboard native pane --------
+//
+// Issue #480 (roadmap N11): everything above this point runs ONE submitted
+// prompt to completion and exits (`run_headless`/`run_session`) -- exactly
+// right for `zirv ctx exec --runtime native` and for a delegated worker
+// (`native_worker.rs`), wrong for a dashboard pane an operator keeps typing
+// into across many turns. [`spawn_interactive`] resolves transport/journal/
+// seat/writer exactly like `run_session` does, then hands the session to a
+// background OS thread that constructs a fresh [`NativeLoop`] and calls
+// `run_to_completion` once per submitted turn, looping for the pane's whole
+// lifetime instead of once. `dash::native_pane` never constructs a
+// `NativeLoop` itself and never reads a provider/tool-executor directly --
+// this is the one seam between the dashboard and this module.
+
+/// What a dashboard native pane needs to open a session. Owned (no borrowed
+/// lifetime) so it can be built on the caller's thread and then moved,
+/// whole, into the worker thread this spawns.
+pub struct InteractiveRequest {
+    pub repo: std::path::PathBuf,
+    pub role: String,
+    pub route: Option<String>,
+    pub limits: NativeLimits,
+    /// The shared task card a delegated launch already carries (N10); a
+    /// plain operator-opened pane has none.
+    pub task: Option<String>,
+    /// `true` acquires a writer permit for `repo` (issue #358's own
+    /// per-tree ledger, `permit::acquire_writer`) so this session's tool
+    /// calls can actually write -- the same ownership step
+    /// `native_worker.rs`'s `WorkerMode::Writing` already takes. `false`
+    /// mirrors a read-only session: every write this session's tools
+    /// attempt is refused by the execution broker, on purpose.
+    pub writing: bool,
+}
+
+/// One update from the worker thread, coarse on purpose: `dash::
+/// native_pane` never learns anything about a turn's CONTENT from this
+/// channel -- it re-reads the journal (`Journal::replay`, already proven
+/// deterministic by `native_pane::build_transcript`'s own tests) for that.
+/// This channel exists only to know when a re-read is worth doing and to
+/// carry the one thing the journal alone cannot: a turn that failed before
+/// committing anything durable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InteractiveProgress {
+    /// A submitted turn started running.
+    Busy,
+    /// A turn finished (however it finished -- completed, interrupted, hit
+    /// a limit); the journal has whatever it is going to have.
+    Idle,
+    /// The turn could not even be started (a transport/journal error, not a
+    /// provider failure -- a provider failure is a normal journaled
+    /// `Failed` turn and reaches `Idle` instead).
+    Failed(String),
+    /// The worker thread's loop has exited; no more progress will ever
+    /// follow. Sent once, always last.
+    Ended,
+}
+
+/// A live, in-process native session a dashboard pane drives. Read-only
+/// handles (`session`, `route`, `cancel`) are `Clone`/`Arc`-cheap to hand to
+/// `dash::native_pane`'s own presentation code; `submit`/`interrupt`/
+/// `shutdown` are the entire control surface -- there is no fourth way to
+/// reach the worker thread.
+pub struct InteractiveSession {
+    pub handle: SessionHandle,
+    pub session: JournalSessionId,
+    pub route: RouteIdentity,
+    /// Shared with the worker's own `NativeLoop`: calling `.cancel()` here
+    /// reaches an in-flight turn without going through the channel at all,
+    /// the same direct route `NativeBackend::interrupt` already documents
+    /// for "a caller that drives a `NativeLoop` itself".
+    pub cancel: Arc<CancellationFlag>,
+    submit_tx: mpsc::Sender<String>,
+    progress_rx: mpsc::Receiver<InteractiveProgress>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for InteractiveSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractiveSession")
+            .field("handle", &self.handle)
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InteractiveSession {
+    /// Queues one turn's input. This is the ONLY path a fresh (idle) turn
+    /// starts from; mid-turn steering does not go through this channel at
+    /// all -- see `dash::native_pane`'s own steering note -- because the
+    /// worker thread is synchronously blocked inside `run_to_completion`
+    /// while a turn runs and cannot service it. `queued_input` is the loop's
+    /// own re-poll of the journal between turns, which is how a `Steer`
+    /// written directly to the journal by the caller is picked up without
+    /// this channel's involvement.
+    pub fn submit(&self, text: String) -> Result<(), mpsc::SendError<String>> {
+        self.submit_tx.send(text)
+    }
+
+    /// Every progress update queued since the last call, oldest first.
+    /// Never blocks.
+    pub fn drain_progress(&self) -> Vec<InteractiveProgress> {
+        let mut out = Vec::new();
+        while let Ok(progress) = self.progress_rx.try_recv() {
+            out.push(progress);
+        }
+        out
+    }
+
+    pub fn interrupt(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Ends the session: drops the submit channel (the worker's `for text in
+    /// submit_rx` loop exits on the next iteration since a disconnected
+    /// channel reads as "no more messages" rather than blocking forever),
+    /// then joins the thread so a quitting dashboard never leaves an orphan
+    /// running. Consumes `self` -- there is nothing left to submit to
+    /// afterward.
+    pub fn shutdown(mut self) {
+        drop(std::mem::replace(&mut self.submit_tx, mpsc::channel().0));
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Opens a session and starts its worker thread. Returns once the session
+/// exists and is ready to accept a first `submit` -- it does not wait for
+/// any turn to run.
+pub fn spawn_interactive(
+    request: InteractiveRequest,
+    env: EnvLookup<'_>,
+) -> CtxResult<InteractiveSession> {
+    use super::super::state::{StateDir, now_secs};
+    use super::journal::{SeatId, SessionIdentity, TaskId};
+
+    let state = StateDir::resolve(env)?;
+    let home = crate::utils::home_dir()?;
+    let cfg = super::super::config::CtxConfig::load(&request.repo, env)?;
+    let now = now_secs();
+    let task = request.task.clone().map(TaskId::new).transpose()?;
+
+    let tree = std::fs::canonicalize(&request.repo).unwrap_or_else(|_| request.repo.clone());
+    let writer_permit = if request.writing {
+        match super::super::permit::acquire_writer(
+            &state,
+            cfg.supervise.max_writers,
+            "native pane",
+            &tree,
+        ) {
+            Ok(permit) => Some(permit),
+            Err(refusal) => {
+                let reason = super::super::permit::describe_writer_refusal(
+                    &refusal,
+                    &state,
+                    cfg.supervise.max_writers,
+                    &tree,
+                );
+                return Err(format!("native pane: {reason}").into());
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut headless = HeadlessRequest {
+        repo: &request.repo,
+        prompt: "",
+        route: request.route.as_deref(),
+        role: &request.role,
+        limits: request.limits,
+        resume: None,
+        provider: None,
+        fixture_tools: None,
+        task: request.task.clone(),
+        writer: writer_permit
+            .map(|permit| Box::new(permit) as Box<dyn super::enforcement::WriterLease>),
+    };
+
+    let (provider, mut tools, route, brokered) =
+        build_transport(&headless, &state, &home, &cfg, env)?;
+
+    let mut journal = Journal::open(&state)?;
+    let mut backend = NativeBackend::new();
+
+    let handle = backend.start(&SessionSpec {
+        runtime: RuntimeKind::Native,
+        role: request.role.clone(),
+        agent: None,
+        provider_route: Some(route.route.clone()),
+        model: Some(route.model.id.clone()),
+        surface: UiSurface::DashboardPane,
+        cwd: request.repo.clone(),
+        prompt: String::new(),
+        extra_args: Vec::new(),
+    })?;
+    let session = JournalSessionId::new(handle.logical_id.clone())?;
+    journal.create_session(&SessionIdentity {
+        session: session.clone(),
+        seat: SeatId::new(handle.short.clone())?,
+        generation: handle.generation,
+        task,
+        route: route.clone(),
+        created_at: now,
+        completed_at: None,
+    })?;
+
+    super::super::seat::store(
+        &state,
+        &super::super::seat::Seat {
+            short: handle.short.clone(),
+            session: handle.logical_id.clone(),
+            generation: handle.generation,
+            agent: RuntimeKind::Native.as_str().to_string(),
+            model: Some(route.model.id.clone()),
+            provider: route.provider.to_string(),
+            role: request.role.clone(),
+            pinned: false,
+            phase: Default::default(),
+            visited: Vec::new(),
+            last_rollover_at: None,
+            pending: None,
+            displaced: None,
+            created_at: now,
+            updated_at: now,
+            runtime: RuntimeKind::Native,
+        },
+    )?;
+
+    if brokered {
+        let executor = brokered_tools(&mut headless, &state, &home, &cfg, &handle)?;
+        tools = executor;
+    }
+
+    backend.attach_journal(journal);
+    backend.adopt(&handle, session.clone())?;
+    let cancel = backend
+        .cancellation(&handle)
+        .unwrap_or_else(|| Arc::new(CancellationFlag::default()));
+
+    let config = NativeSessionConfig {
+        session: session.clone(),
+        generation: handle.generation,
+        route: route.clone(),
+        role: request.role.clone(),
+        seat_model: env(super::super::adapters::SEAT_MODEL_ENV),
+        write_posture: lifecycle::orchestrator_write_posture(&cfg),
+        limits: request.limits,
+        task: task_for_config(&handle, &route, request.task.as_deref())?,
+        workflow_gate: None,
+    };
+
+    let (submit_tx, submit_rx) = mpsc::channel::<String>();
+    let (progress_tx, progress_rx) = mpsc::channel::<InteractiveProgress>();
+    let worker_cancel = Arc::clone(&cancel);
+    let worker_handle = handle.clone();
+    let worker_session = session.clone();
+
+    let worker = std::thread::spawn(move || {
+        let mut backend = backend;
+        let mut tools = tools;
+        let env_fn = super::super::config::env_from_process();
+        for text in submit_rx.iter() {
+            let _ = progress_tx.send(InteractiveProgress::Busy);
+            if let Err(error) = backend.submit(&worker_handle, &text) {
+                let _ = progress_tx.send(InteractiveProgress::Failed(error.to_string()));
+                continue;
+            }
+            let Some(journal) = backend.journal_mut() else {
+                let _ = progress_tx.send(InteractiveProgress::Failed(
+                    "native pane: the journal was not attached".to_string(),
+                ));
+                continue;
+            };
+            let env: EnvLookup<'_> = &env_fn;
+            let mut driver = NativeLoop::new(
+                config.clone(),
+                provider.as_ref(),
+                tools.as_mut(),
+                journal,
+                Arc::clone(&worker_cancel),
+                &now_ms,
+                env,
+            );
+            match driver.run_to_completion() {
+                Ok(_status) => {
+                    let _ = progress_tx.send(InteractiveProgress::Idle);
+                }
+                Err(error) => {
+                    let _ = progress_tx.send(InteractiveProgress::Failed(error.to_string()));
+                }
+            }
+        }
+        if let Some(journal) = backend.journal_mut() {
+            let _ = journal.complete_session(
+                &worker_session,
+                worker_handle.generation,
+                "ended".to_string(),
+                now_secs(),
+            );
+        }
+        let _ = progress_tx.send(InteractiveProgress::Ended);
+    });
+
+    Ok(InteractiveSession {
+        handle,
+        session,
+        route,
+        cancel,
+        submit_tx,
+        progress_rx,
+        worker: Some(worker),
+    })
+}
+
+/// `NativeSessionConfig::task` needs a validated `journal::TaskId`, but by
+/// the time it is built the plain `Option<String>` has already been
+/// consumed once (`task.clone().map(TaskId::new).transpose()?` above, moved
+/// into `SessionIdentity`) -- re-validating from the original string here is
+/// cheaper than threading a second clone through every intermediate step
+/// above for a value only this one call site still needs.
+fn task_for_config(
+    _handle: &SessionHandle,
+    _route: &RouteIdentity,
+    task: Option<&str>,
+) -> CtxResult<Option<super::journal::TaskId>> {
+    Ok(task.map(super::journal::TaskId::new).transpose()?)
 }
 
 /// Everything the persistent runtime needs to run the turns already queued on
