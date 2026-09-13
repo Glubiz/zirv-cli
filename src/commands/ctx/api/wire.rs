@@ -839,6 +839,17 @@ pub static METHODS: &[MethodSpec] = &[
                 required: true,
                 doc: "the launch prompt; never echoed back in session facts",
             },
+            // Issue #352: what an operator wrote after `--`. Optional and
+            // defaulted, so every v1 caller that never sent it -- including
+            // the frozen fixtures -- is unaffected; a server that ignored it
+            // would silently drop the flags a `zirv chat -- --foo` launch
+            // depends on.
+            FieldSpec {
+                name: "extra_args",
+                ty: "string[]",
+                required: false,
+                doc: "extra arguments for the agent, after the adapter's own",
+            },
         ],
         result: &[FieldSpec {
             name: "session",
