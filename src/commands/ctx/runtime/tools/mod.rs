@@ -1124,6 +1124,12 @@ impl NativeToolClient {
                 "route": "resume",
                 "session": journal_session,
                 "attempt": attempt,
+                // The journal IS the conversation, so a native continuation
+                // is a real resume of the original session rather than a
+                // replacement: `--resume` takes this exact id, reconciles
+                // anything that was still in flight as outcome-unknown and
+                // advances the generation.
+                "resume_with": "zirv ctx exec --runtime native --resume <session>",
             }),
             service::Continuation::Checkpoint { handoff } => json!({
                 "route": "checkpoint",

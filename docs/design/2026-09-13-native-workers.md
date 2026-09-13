@@ -129,6 +129,26 @@ original's hidden context. An unknown handle is an error. There is no
 "most recent session" fallback anywhere on this path, because one would
 silently answer a follow-up with the wrong worker.
 
+The native resume is not advisory: N09's post-review work (#519) shipped
+`zirv ctx exec --runtime native --resume <session>`, which takes exactly the
+journal session id this continuation returns, reconciles anything still in
+flight as outcome-unknown and advances the generation. The `follow_up` tool
+result therefore names that command alongside the session id.
+
+### What the merged N09 shape changed here
+
+The rebase onto #519 replaced this step's own `run_session` split rather than
+duplicating it. `run_headless` is now the printing wrapper; `run_session`
+carries the whole session (transport selection via `build_transport`, the
+resume-or-start identity fork, the seat record, `brokered_tools`, the loop)
+and returns the status as a value. The two N10 additions ride through it
+unchanged: the shared task id reaches the journal session identity, the
+loop's `NativeSessionConfig` and every tool call's `ExecutionIdentity`, and
+the writer permit is MOVED (not cloned -- a lease duplicated is a per-tree
+claim defeated) into `brokered_tools`' broker. A `fixture:` provider run
+never brokers and therefore never receives a permit, which is correct: it
+performs no effects at all.
+
 ### Boundary-aware delivery
 
 The #468 predicate moved out of `dash` into `attention::blocking` /
