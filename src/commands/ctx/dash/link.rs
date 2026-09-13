@@ -36,7 +36,8 @@ use super::super::CtxResult;
 use super::super::api::client::Client;
 use super::super::api::transport;
 use super::super::api::wire::{
-    Attachment, Capability, Method, NativePage, ScreenView, SessionFacts, SessionState,
+    ApprovalDecision, Attachment, Capability, Method, NativePage, ScreenView, SessionFacts,
+    SessionState,
 };
 use super::super::runtime::RuntimeKind;
 use super::super::state::StateDir;
@@ -229,6 +230,46 @@ impl RuntimeLink {
                 "input": text,
             }),
             idempotency,
+        )?;
+        Ok(())
+    }
+
+    /// Ends the TURN of a runtime-owned conversation, never the session --
+    /// the native counterpart of the dashboard's own `Esc`. Only the
+    /// controller may send it, and the runtime is what enforces that.
+    pub fn interrupt(&mut self, session_id: &str) -> CtxResult<()> {
+        self.client.call(
+            Method::SessionInterrupt,
+            json!({
+                "session_id": session_id,
+                "client_id": self.client_id,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Issue #490: the operator's answer to an approval a runtime-owned
+    /// conversation is blocked on. The decision is delivered to the session
+    /// that actually asked -- the dashboard never mints a grant of its own,
+    /// and `request_id` is the runtime's own identifier for the outstanding
+    /// request, so a stale dialog cannot answer a newer question. `note` is
+    /// the "tell the agent what to do differently" text a denial carries.
+    pub fn approve(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+        note: Option<&str>,
+    ) -> CtxResult<()> {
+        self.client.call(
+            Method::SessionApprove,
+            json!({
+                "session_id": session_id,
+                "client_id": self.client_id,
+                "request_id": request_id,
+                "decision": decision,
+                "note": note,
+            }),
         )?;
         Ok(())
     }
