@@ -1208,6 +1208,7 @@ pub fn on_resume(
         Some(current.agent.as_str()),
     );
     let unit = allocator::WorkUnit {
+        demand: super::route::Demand::default(),
         id: "orchestrator-seat".to_string(),
         requested: current.agent.clone(),
         bounds: fallback::TaskBounds {

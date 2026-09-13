@@ -454,6 +454,13 @@ pub struct NativeFinalStatus {
     pub requests: u32,
     pub tool_calls: u32,
     pub usage: ProviderUsage,
+    /// Issue #487 (item 7): what this session actually settled, separated
+    /// into billable and unpriced tokens and counted once per PROVIDER
+    /// REQUEST rather than once per fold. `usage` above is the running
+    /// accumulation the loop reports; this is the reconciliation that says
+    /// how many distinct requests it came from and what each was billed as,
+    /// which is what a spend readout can be checked against.
+    pub reconciliation: super::super::route::Reconciliation,
     pub finish_reason: Option<String>,
     pub final_text: Option<String>,
     pub incomplete_tools: Vec<String>,
@@ -572,6 +579,12 @@ pub struct NativeLoop<'a> {
     /// The newest decision, whatever it was. Reported even when the policy
     /// or the `enabled` flag stopped it from being acted on.
     last_decision: Option<CompactionDecision>,
+    /// Issue #487 (item 3): this session's own once-per-request settlement,
+    /// keyed by the provider's own request id. A response-level retry that
+    /// actually reached the provider, and a journal a second supervisor
+    /// replays, both present the same request twice; folding it twice would
+    /// double the pool's usage and the spend readout with it.
+    reconciliation: super::super::route::Reconciliation,
 }
 
 impl std::fmt::Debug for NativeLoop<'_> {
@@ -619,6 +632,7 @@ impl<'a> NativeLoop<'a> {
             overflows: 0,
             compactions: Vec::new(),
             last_decision: None,
+            reconciliation: super::super::route::Reconciliation::default(),
         }
     }
 
@@ -1008,6 +1022,56 @@ impl<'a> NativeLoop<'a> {
             )
     }
 
+    /// This loop's route, in the placement model's own vocabulary (#487).
+    pub(crate) fn route_identity(&self) -> super::super::route::RouteIdentity {
+        super::super::route::RouteIdentity::from_runtime(&self.config.route)
+    }
+
+    /// Which scope one provider failure is evidence about. Pure: the whole
+    /// decision lives in `route::route_failure`, so it can be replayed from
+    /// the failure and the identity alone.
+    fn failure_routing(&self, failure: &ProviderFailure) -> super::super::route::FailureRouting {
+        super::super::route::route_failure(failure, &self.route_identity())
+    }
+
+    /// Folds one completed request's settled usage into this session's
+    /// reconciliation, exactly once (#487 item 3).
+    ///
+    /// The key is the provider's own request id where there is one. A
+    /// response with no id falls back to the route plus this session's own
+    /// monotonic request counter, which is stable for the REQUEST -- the
+    /// retry loop in [`Self::stream_once`] does not mint a new one on a
+    /// retry that ultimately returns this same response.
+    fn reconcile_request(&mut self, response: &super::super::provider::adapter::ProviderResponse) {
+        let key = match &response.request_id {
+            Some(id) => id.clone(),
+            None => format!("{}#{}", self.config.route.route, self.requests),
+        };
+        // A pool id is not a posture, and the loop does not carry the
+        // account config that states one. Metered API credit is the
+        // conservative reading: over-reporting billable usage is visible to
+        // an operator, under-reporting is not.
+        let billing = super::super::route::BillingPosture::Api;
+        let (next, verdict) = super::super::route::reconcile(
+            &self.reconciliation,
+            &key,
+            super::super::route::Settled {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+            },
+            0,
+            billing,
+        );
+        self.reconciliation = next;
+        if verdict == super::super::route::Reconciled::AlreadyCounted {
+            self.note(
+                "usage_already_reconciled",
+                key,
+                "this provider request was already counted; not folded again".to_string(),
+            );
+        }
+    }
+
     /// Sends one request, retrying within the response-retry budget. Returns
     /// `Ok(None)` when cancellation won the race.
     fn stream_once(
@@ -1143,7 +1207,28 @@ impl<'a> NativeLoop<'a> {
                     }
                     outcome.state = TurnState::Failed;
                     outcome.failure = Some(failure.to_string());
-                    self.note("provider_failure", attempt.to_string(), failure.to_string());
+                    // #487 item 4: the failure is recorded with the SCOPE it
+                    // is evidence about, so a rejected credential does not
+                    // read as an endpoint outage, an over-long prompt does
+                    // not read as a failure at all, and a rate limit never
+                    // reaches a breaker. `breaker_key` is `None` for exactly
+                    // the classes that are not health evidence.
+                    let routing = self.failure_routing(&failure);
+                    let breaker = match routing.breaker_key() {
+                        Some((key, class)) => {
+                            format!("health evidence for {} as {class:?}", key.label())
+                        }
+                        None => "not health evidence".to_string(),
+                    };
+                    self.note(
+                        "provider_failure",
+                        attempt.to_string(),
+                        format!(
+                            "{failure} [route {}; scoped to {}; {breaker}]",
+                            self.route_identity().label(),
+                            routing.label(),
+                        ),
+                    );
                     return Ok(outcome);
                 }
             };
@@ -1177,6 +1262,7 @@ impl<'a> NativeLoop<'a> {
             )?;
             accumulate(&mut self.usage, &response.usage);
             accumulate(&mut outcome.usage, &response.usage);
+            self.reconcile_request(&response);
 
             // THE BARRIER. The assistant message -- with its complete tool
             // calls -- is committed before any preflight below can run.
@@ -1659,6 +1745,7 @@ impl<'a> NativeLoop<'a> {
             requests: self.requests,
             tool_calls: self.tool_calls,
             usage: self.usage.clone(),
+            reconciliation: self.reconciliation.clone(),
             finish_reason: finish.map(|reason| format!("{reason:?}")),
             final_text: last.as_ref().and_then(|t| t.final_text.clone()),
             incomplete_tools: incomplete.into_iter().collect(),
@@ -3884,6 +3971,67 @@ mod tests {
         assert_eq!(status.status, NativeStatus::LimitReached);
         assert_eq!(status.limit, Some(LimitKind::Turns));
         assert_eq!(status.queued_input.len(), 1);
+    }
+
+    /// Issue #487 (item 3, criterion 4): every provider request reconciles
+    /// exactly once, into this route's own pool, and the settlement is
+    /// reported beside the running usage so the two can be checked against
+    /// each other.
+    ///
+    /// A two-request turn (a tool call, then the answer) must report two
+    /// reconciled requests and a billable total equal to the usage the loop
+    /// accumulated -- not double it, which is what folding the same response
+    /// twice would produce.
+    #[test]
+    fn every_provider_request_reconciles_once_into_this_routes_pool() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(
+                r#"{"turns":[{"blocks":[{"type":"tool_use","id":"call_1",
+                   "name":"Read","input":{"file_path":"a.txt"}}],"finish_reason":"tool_use"},
+                   {"blocks":[{"type":"text","text":"done"}],"finish_reason":"end_turn"}]}"#,
+            )
+            .expect("script"),
+        );
+        let mut tools = FixtureToolExecutor::new(
+            FixtureToolScript::from_json(
+                r#"{"tools":{"Read":[{"state":"completed","result":{"ok":true}}]}}"#,
+            )
+            .expect("tool script"),
+        );
+        let clock = || 1_000u64;
+        let status = {
+            let mut driver = NativeLoop::new(
+                config_for(session, route),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge("go", false).unwrap();
+            driver.run_to_completion().unwrap()
+        };
+
+        let reconciled = &status.reconciliation;
+        assert_eq!(
+            reconciled.requests, status.requests as u64,
+            "one settlement per provider request, no more and no fewer: {reconciled:?}"
+        );
+        assert_eq!(
+            reconciled.billable_tokens,
+            status.usage.input_tokens + status.usage.output_tokens,
+            "the settled total matches the usage the loop accumulated"
+        );
+        assert_eq!(reconciled.unpriced_tokens, 0);
+        assert_eq!(
+            reconciled.seen.len(),
+            reconciled.requests as usize,
+            "every request is remembered by its own key, so a replay is a no-op"
+        );
     }
 
     /// Finding 6: a tool this build cannot classify gets the most restrictive

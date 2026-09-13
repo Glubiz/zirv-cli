@@ -85,6 +85,17 @@ pub struct HarnessCapacity {
     /// `Allow` whenever the policy is off, so this module's behaviour is
     /// unchanged by default.
     pub health: super::health::Admission,
+    /// Issue #487 (N18): what this route IS -- runtime, provider, endpoint,
+    /// credential, model and billing pool. A harness row states the identity
+    /// this module always implied (`RouteIdentity::harness`), so nothing
+    /// about harness placement changes; a native row states a real one, and
+    /// its `pool` is what `CapacitySnapshot::pool` looks capacity up by.
+    pub identity: super::route::RouteIdentity,
+    /// What this route can do and how it is paid for, for the eligibility
+    /// gate that runs BEFORE ranking. `None` for a route that declares
+    /// nothing, which is every harness row today: an undeclared offer is not
+    /// gated, exactly as before.
+    pub offer: Option<super::route::RouteOffer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -107,6 +118,44 @@ impl CapacitySnapshot {
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case(name))
     }
+
+    /// The capacity one route actually draws on (issue #487, item 1).
+    ///
+    /// `providers` is keyed by BILLING POOL, not by vendor: a harness row's
+    /// pool is its provider, so every existing lookup resolves exactly as
+    /// before, while two native routes on one account resolve to the one
+    /// `ProviderCapacity` -- and therefore to one `reserved_tokens` and one
+    /// set of windows, which is what stops two routes on one balance being
+    /// ranked as twice the capacity. Two accounts at one vendor carry
+    /// different pool ids and stay independent.
+    pub fn pool(&self, harness: &HarnessCapacity) -> Option<&ProviderCapacity> {
+        self.provider(&harness.identity.pool)
+            .or_else(|| self.provider(&harness.provider))
+    }
+
+    /// Every route drawing on one billing pool, `route` included (issue
+    /// #487, criterion 1). More than one name here means those routes share
+    /// a balance and must never be ranked as separate capacities; a route
+    /// alone in its pool is independent of every other route at the same
+    /// vendor.
+    pub fn pool_siblings(&self, route: &HarnessCapacity) -> Vec<&HarnessCapacity> {
+        self.harnesses
+            .iter()
+            .filter(|other| other.identity.shares_pool(&route.identity))
+            .collect()
+    }
+
+    /// Every route an outage on `route`'s endpoint would take with it,
+    /// `route` included (criterion 2). Sharing an endpoint is the ONLY
+    /// coupling a transport or server failure creates: a sibling account on
+    /// the same host is denied with it, a route on another host is not, and
+    /// a credential failure couples nothing at all.
+    pub fn endpoint_siblings(&self, route: &HarnessCapacity) -> Vec<&HarnessCapacity> {
+        self.harnesses
+            .iter()
+            .filter(|other| other.identity.shares_endpoint(&route.identity))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +168,13 @@ pub struct WorkUnit {
     pub source_model: Option<String>,
     pub source_model_explicit: bool,
     pub delegation: bool,
+    /// Issue #487 (item 5): what this unit needs from whatever route takes
+    /// it -- capabilities, context room and authorized billing. Checked
+    /// BEFORE ranking, so a route that could never have run the work is
+    /// excluded by its own reason rather than reported as outranked.
+    /// `Demand::default()` constrains nothing, which is every existing
+    /// caller.
+    pub demand: super::route::Demand,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -147,6 +203,13 @@ pub enum Exclusion {
     /// window and the estimated retry, rather than reporting a bare
     /// `HardBlocked` that reads as a usage refusal.
     Unhealthy(String),
+    /// Issue #487 (item 5): the route cannot run this work at all -- policy
+    /// refuses it, it lacks a required capability, its context window cannot
+    /// hold the prompt, or its billing posture is not one this work is
+    /// authorized for. Judged before capacity and before ranking, because
+    /// ranking a route that could never take the task is how "outranked"
+    /// ends up naming a route the work was never eligible for.
+    Ineligible(super::route::Ineligible),
     /// This candidate cleared every eligibility check but lost to `by`,
     /// whose own projected headroom (`projected_headroom_pct`) was greater
     /// (or tied and earlier in `cfg.fallback.order`). Issue #358 follow-up:
@@ -182,6 +245,7 @@ impl Exclusion {
             Self::Visited => "already visited in this order".to_string(),
             Self::Excluded => "explicitly excluded".to_string(),
             Self::Unhealthy(reason) => reason.clone(),
+            Self::Ineligible(why) => why.label(),
             Self::Outranked {
                 by,
                 projected_headroom_pct,
@@ -334,6 +398,115 @@ pub fn projected_headroom(
     ))
 }
 
+/// Issue #487 (items 2 and 7): every capacity dimension this route can run
+/// out of, as one list, each number labelled with where it came from.
+///
+/// The usage windows a provider reports are all `SubscriptionWindow`
+/// readings -- that is the one dimension a harness has ever had. A native
+/// route's offer adds the other four (requests/minute, tokens/minute,
+/// concurrent requests, a configured spend ceiling), which bind
+/// independently and are therefore NOT folded into the window figure.
+/// Dimensions the provider has never reported on are included as unknowns,
+/// because an unmeasured dimension is the one most likely to be binding and
+/// omitting it would report exactly the free-capacity illusion this list
+/// exists to prevent.
+///
+/// Diagnostic only, for now: `place`'s ranking still reads the windows
+/// through `projected_headroom`, so this adds a readout without moving a
+/// placement. It is the shape the ranking grows into once native routes
+/// report per-minute limits (see this issue's design note).
+pub fn route_dimensions(
+    harness: &HarnessCapacity,
+    provider: Option<&ProviderCapacity>,
+    now: u64,
+    cfg: &CtxConfig,
+) -> Vec<super::route::Headroom> {
+    let policy = estimate_policy(cfg);
+    let mut out: Vec<super::route::Headroom> = dimension_readings(harness, provider)
+        .iter()
+        .map(|reading| super::route::headroom(reading, now, &policy))
+        .collect();
+    out.sort_by(|a, b| {
+        a.pct
+            .partial_cmp(&b.pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.dimension.cmp(&b.dimension))
+    });
+    out
+}
+
+/// The dimension that actually binds this route, with its provenance (issue
+/// #487, item 7). `None` only for a route with no dimensions at all, which
+/// [`dimension_readings`] never produces.
+pub fn route_binding(
+    harness: &HarnessCapacity,
+    provider: Option<&ProviderCapacity>,
+    now: u64,
+    cfg: &CtxConfig,
+) -> Option<super::route::Headroom> {
+    super::route::binding(
+        &dimension_readings(harness, provider),
+        now,
+        &estimate_policy(cfg),
+    )
+}
+
+/// The two operator knobs that already govern "what do we do about a reading
+/// we do not have", handed to the pure model.
+fn estimate_policy(cfg: &CtxConfig) -> super::route::EstimatePolicy {
+    super::route::EstimatePolicy {
+        unknown_headroom_pct: cfg.fallback.unknown_headroom_pct,
+        max_age_secs: cfg.pace.collector_max_age_secs,
+        ..super::route::EstimatePolicy::default()
+    }
+}
+
+/// Every dimension this route can run out of, as raw readings.
+///
+/// The usage windows a provider reports are all `SubscriptionWindow`
+/// readings -- that is the one dimension a harness has ever had. A native
+/// route's offer adds the other four, which bind independently and are
+/// therefore NOT folded into the window figure. A dimension nothing has
+/// reported on is still listed, as an unknown: omitting it would report
+/// exactly the free-capacity illusion this list exists to prevent, since an
+/// unmeasured dimension is the one most likely to be binding.
+fn dimension_readings(
+    harness: &HarnessCapacity,
+    provider: Option<&ProviderCapacity>,
+) -> Vec<super::route::Reading> {
+    let mut readings: Vec<super::route::Reading> = Vec::new();
+    if let Some(provider) = provider {
+        for window in &provider.windows {
+            // `used_pct` is already a percentage, so the reading is stated
+            // against a notional 100 rather than a token budget: what this
+            // list adds is the dimension's identity and its provenance, not
+            // a second arithmetic for a number `pace` already computed.
+            let used = window.used_pct.clamp(0.0, 100.0).round() as u64;
+            readings.push(super::route::Reading::new(
+                super::route::Dimension::SubscriptionWindow,
+                Some(100),
+                used,
+                window.observed_at,
+            ));
+        }
+    }
+    if let Some(offer) = &harness.offer {
+        readings.extend(offer.readings.iter().cloned());
+    }
+    for dimension in [
+        super::route::Dimension::RequestsPerMinute,
+        super::route::Dimension::TokensPerMinute,
+        super::route::Dimension::ConcurrentRequests,
+        super::route::Dimension::SubscriptionWindow,
+        super::route::Dimension::SpendCeiling,
+    ] {
+        if !readings.iter().any(|r| r.dimension == dimension) {
+            readings.push(super::route::Reading::unknown(dimension));
+        }
+    }
+    readings
+}
+
 fn binding_headroom(provider: &ProviderCapacity) -> (f64, Option<String>) {
     match provider.binding.and_then(|i| provider.windows.get(i)) {
         Some(w) => (w.headroom_pct, Some(w.window.clone())),
@@ -449,6 +622,15 @@ fn requested_unfit_reason(
     }
 }
 
+/// Issue #487 (item 5): whether this route is disqualified from the task
+/// itself, as opposed to from its current capacity or health. `None` for a
+/// route that declares no offer, which leaves every existing harness row
+/// exactly as it was.
+fn ineligible(harness: &HarnessCapacity, unit: &WorkUnit) -> Option<super::route::Ineligible> {
+    let offer = harness.offer.as_ref()?;
+    super::route::eligible(offer, &unit.demand).err()
+}
+
 /// Places one [`WorkUnit`], deterministically: identical `snapshot`/`cfg`/
 /// `unit`/`exclude` inputs always produce the identical `Placement`.
 ///
@@ -486,9 +668,14 @@ pub fn place(
         .any(|excl| excl.eq_ignore_ascii_case(&unit.requested));
 
     if let Some(requested) = snapshot.harness(&unit.requested) {
-        if let Some(provider) = snapshot.provider(&requested.provider) {
+        if let Some(provider) = snapshot.pool(requested) {
             if requested_excluded {
                 exclusions.push((requested.name.clone(), Exclusion::Excluded));
+            } else if let Some(why) = ineligible(requested, unit) {
+                // Item 5: before every capacity and health question. A route
+                // the work may not run on does not keep it merely because it
+                // is the one that asked.
+                exclusions.push((requested.name.clone(), Exclusion::Ineligible(why)));
             } else if requested.state == HarnessState::Ready
                 && fits_all_windows(provider, &unit.bounds, cfg, unit.expected_tokens)
             {
@@ -589,6 +776,12 @@ pub fn place(
             exclusions.push((name.clone(), Exclusion::NoToolCallCounting));
             continue;
         }
+        // Item 5: capability, policy, context room and authorized billing,
+        // all before any capacity is read or any ranking happens.
+        if let Some(why) = ineligible(harness, unit) {
+            exclusions.push((name.clone(), Exclusion::Ineligible(why)));
+            continue;
+        }
         // Issue #455: before the state match below, which would otherwise
         // report a health denial as a bare `HardBlocked` and lose the
         // breaker's reason.
@@ -623,7 +816,7 @@ pub fn place(
             continue;
         }
 
-        let Some(provider) = snapshot.provider(&harness.provider) else {
+        let Some(provider) = snapshot.pool(harness) else {
             exclusions.push((
                 name.clone(),
                 Exclusion::Unready("no provider capacity for this harness".to_string()),
@@ -819,7 +1012,15 @@ pub fn plan(
         let placement = place(&scratch, cfg, unit, &[], &|name: &str| models(unit, name));
 
         if let Some(candidate) = &placement.selected {
-            let provider_name = scratch.harness(&candidate.name).map(|h| h.provider.clone());
+            // Item 1: the reservation lands on the POOL the route actually
+            // spends from, so a second unit placed on a sibling route of the
+            // same account sees the tokens the first one already claimed.
+            let provider_name = scratch.harness(&candidate.name).map(|h| {
+                match scratch.provider(&h.identity.pool) {
+                    Some(pool) => pool.provider.clone(),
+                    None => h.provider.clone(),
+                }
+            });
             if let Some(provider_name) = provider_name {
                 if let Some(provider) = scratch
                     .providers
@@ -931,6 +1132,37 @@ mod tests {
             state: HarnessState::Unknown,
             state_reason: String::new(),
             health: super::super::health::Admission::Allow,
+            identity: super::super::route::RouteIdentity::harness(name, provider),
+            offer: None,
+        }
+    }
+
+    /// A native route row: its own endpoint, credential and model, and a
+    /// billing pool that may or may not be shared with another row.
+    fn native(name: &str, endpoint: &str, credential: &str, pool: &str) -> HarnessCapacity {
+        use super::super::route::{RouteIdentity, RouteOffer, RuntimeKind};
+        let identity = RouteIdentity {
+            runtime: RuntimeKind::Native,
+            provider: "anthropic".to_string(),
+            endpoint: endpoint.to_string(),
+            credential: credential.to_string(),
+            model: Some(name.to_string()),
+            pool: pool.to_string(),
+        };
+        HarnessCapacity {
+            // `provider` stays the vendor; `identity.pool` is what capacity
+            // is looked up by, which is the whole point of the distinction.
+            provider: pool.to_string(),
+            offer: Some(RouteOffer {
+                identity: identity.clone(),
+                capabilities: Default::default(),
+                billing: super::super::route::BillingPosture::Api,
+                context_window_tokens: Some(200_000),
+                readings: Vec::new(),
+                policy: super::super::route::PolicyVerdict::Allowed,
+            }),
+            identity,
+            ..harness(name, pool, 0, None)
         }
     }
 
@@ -975,6 +1207,7 @@ mod tests {
             source_model: None,
             source_model_explicit: false,
             delegation: true,
+            demand: super::super::route::Demand::default(),
         }
     }
 
@@ -986,6 +1219,242 @@ mod tests {
         super::super::health::Admission::Degraded {
             reason: reason.to_string(),
         }
+    }
+
+    /// Issue #487, criterion 1: two routes on ONE account are one capacity.
+    ///
+    /// Before N18 the lookup was by vendor name, so two models on one
+    /// Anthropic account resolved to one `ProviderCapacity` only by accident
+    /// of both being called "anthropic" -- and two SEPARATE accounts at
+    /// Anthropic would have collided into that same row, refusing work the
+    /// operator had paid for twice. The lookup is by billing POOL now, so
+    /// both facts hold at once.
+    #[test]
+    fn two_routes_on_one_account_are_one_capacity_and_two_accounts_are_not() {
+        let cfg = base_cfg();
+        let snapshot = classify_all(
+            &cfg,
+            vec![
+                provider("work-account", vec![window("five_hour", 50.0)], Some(0)),
+                provider("personal-account", vec![window("five_hour", 90.0)], Some(0)),
+            ],
+            vec![
+                native("opus", "api.anthropic.com", "work", "work-account"),
+                native("sonnet", "api.anthropic.com", "work", "work-account"),
+                native("haiku", "api.anthropic.com", "personal", "personal-account"),
+            ],
+        );
+
+        let opus = snapshot.harness("opus").expect("opus row");
+        let sonnet = snapshot.harness("sonnet").expect("sonnet row");
+        let personal = snapshot.harness("haiku").expect("personal row");
+
+        assert_eq!(
+            snapshot.pool(opus).map(|p| p.provider.as_str()),
+            snapshot.pool(sonnet).map(|p| p.provider.as_str()),
+            "one account is one capacity, whichever model it is asked for"
+        );
+        assert_ne!(
+            snapshot.pool(opus).map(|p| p.provider.as_str()),
+            snapshot.pool(personal).map(|p| p.provider.as_str()),
+            "a second account at the same vendor is a second balance"
+        );
+
+        let pool_names: Vec<&str> = snapshot
+            .pool_siblings(opus)
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(pool_names, vec!["opus", "sonnet"], "and it says which");
+        assert_eq!(
+            snapshot.pool_siblings(personal).len(),
+            1,
+            "the other account is coupled to nothing"
+        );
+    }
+
+    /// The other half of criterion 1: a unit placed on one route claims the
+    /// POOL's tokens, so a later unit on a sibling route of the same account
+    /// sees a balance that has already been drawn down. Ranking them as two
+    /// capacities is exactly the artificial headroom N18 removes.
+    #[test]
+    fn a_placement_on_one_route_reserves_against_the_whole_pool() {
+        let mut cfg = base_cfg();
+        cfg.fallback.order = vec!["opus".to_string(), "sonnet".to_string()];
+        let snapshot = classify_all(
+            &cfg,
+            vec![provider(
+                "work-account",
+                vec![window("five_hour", 90.0)],
+                Some(0),
+            )],
+            vec![
+                native("opus", "api.anthropic.com", "work", "work-account"),
+                native("sonnet", "api.anthropic.com", "work", "work-account"),
+            ],
+        );
+
+        let planned = plan(
+            &snapshot,
+            &cfg,
+            &[unit("u1", "opus", 5_000), unit("u2", "sonnet", 5_000)],
+            &|_unit, name| Some(name.to_string()),
+        );
+        assert_eq!(planned.len(), 2);
+        assert!(
+            planned.iter().all(|p| p.selected.is_some()),
+            "both fit at 90% headroom: {planned:?}"
+        );
+        // The second placement was judged against the first one's claim,
+        // which only happens because both routes resolve to one pool row.
+        let first = planned[0].selected.as_ref().expect("first");
+        let second = planned[1].selected.as_ref().expect("second");
+        assert!(
+            second.projected_headroom_pct <= first.projected_headroom_pct,
+            "the sibling saw the tokens the first unit already claimed: {planned:?}"
+        );
+    }
+
+    /// Criterion 2: an endpoint outage takes exactly the routes that share
+    /// the endpoint, and nothing else -- not a route on another host, and
+    /// never one whose only relationship is the vendor's name.
+    #[test]
+    fn an_endpoint_outage_couples_only_the_routes_on_that_endpoint() {
+        let cfg = base_cfg();
+        let snapshot = classify_all(
+            &cfg,
+            vec![
+                provider("work-account", vec![window("five_hour", 50.0)], Some(0)),
+                provider("personal-account", vec![window("five_hour", 50.0)], Some(0)),
+                provider("aws-account", vec![window("five_hour", 50.0)], Some(0)),
+            ],
+            vec![
+                native("opus", "api.anthropic.com", "work", "work-account"),
+                native("haiku", "api.anthropic.com", "personal", "personal-account"),
+                native(
+                    "nova",
+                    "bedrock.us-east-1.amazonaws.com",
+                    "aws",
+                    "aws-account",
+                ),
+            ],
+        );
+
+        let direct = snapshot.harness("opus").expect("row");
+        let shared: Vec<&str> = snapshot
+            .endpoint_siblings(direct)
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            shared,
+            vec!["opus", "haiku"],
+            "the routes an outage on this host takes with it"
+        );
+        assert!(
+            !shared.contains(&"nova"),
+            "a route on another host is untouched: {shared:?}"
+        );
+        let bedrock = snapshot.harness("nova").expect("row");
+        assert!(!direct.identity.shares_endpoint(&bedrock.identity));
+        assert!(
+            !direct.identity.shares_pool(&bedrock.identity),
+            "and the two hosts are separate balances as well as separate dependencies"
+        );
+        // Sharing an endpoint is NOT sharing a balance.
+        let sibling = snapshot.harness("haiku").expect("row");
+        assert!(direct.identity.shares_endpoint(&sibling.identity));
+        assert!(!direct.identity.shares_pool(&sibling.identity));
+    }
+
+    /// Criterion 6 / item 6: a route the work is not authorized to be billed
+    /// to is excluded BEFORE ranking, by its own typed reason -- so nothing
+    /// reads as "outranked", and no subscription work slides onto metered
+    /// credit because the subscription happened to be busy.
+    #[test]
+    fn an_unauthorized_billing_route_is_excluded_before_ranking_with_its_own_reason() {
+        use super::super::route::{BillingPosture, Ineligible};
+        let cfg = base_cfg();
+        let mut metered = native("opus", "api.anthropic.com", "work", "work-account");
+        if let Some(offer) = metered.offer.as_mut() {
+            offer.billing = BillingPosture::Api;
+        }
+        let snapshot = classify_all(
+            &cfg,
+            vec![provider(
+                "work-account",
+                vec![window("five_hour", 90.0)],
+                Some(0),
+            )],
+            vec![metered],
+        );
+
+        let mut refused = unit("u1", "opus", 100);
+        refused.demand.authorized_billing = [BillingPosture::Subscription].into_iter().collect();
+        let placement = place(&snapshot, &cfg, &refused, &[], &always_model);
+
+        assert!(placement.selected.is_none(), "{placement:?}");
+        let (name, reason) = placement
+            .exclusions
+            .iter()
+            .find(|(_, reason)| matches!(reason, Exclusion::Ineligible(_)))
+            .expect("a typed ineligibility, not an outranking");
+        assert_eq!(name, "opus");
+        assert!(
+            matches!(
+                reason,
+                Exclusion::Ineligible(Ineligible::UnauthorizedBilling { .. })
+            ),
+            "{reason:?}"
+        );
+        assert!(reason.label().contains("not authorized"), "{reason:?}");
+
+        // Authorize it and the very same route takes the work -- the refusal
+        // is about permission, never about capacity or health.
+        let mut allowed = refused.clone();
+        allowed.demand.authorized_billing = [BillingPosture::Api].into_iter().collect();
+        let placement = place(&snapshot, &cfg, &allowed, &[], &always_model);
+        assert_eq!(
+            placement.selected.map(|c| c.name),
+            Some("opus".to_string()),
+            "an authorized route is placed normally"
+        );
+    }
+
+    /// Item 2 / criterion 7: a route that has reported one dimension still
+    /// lists the other four, as labelled estimates -- never as free capacity
+    /// -- and the binding dimension is always one of the listed ones.
+    #[test]
+    fn every_dimension_is_reported_and_the_unmeasured_ones_are_estimates() {
+        let cfg = base_cfg();
+        let route = native("opus", "api.anthropic.com", "work", "work-account");
+        let capacity = provider("work-account", vec![window("five_hour", 80.0)], Some(0));
+        let now = 1_700_000_010;
+
+        let dimensions = route_dimensions(&route, Some(&capacity), now, &cfg);
+        assert_eq!(
+            dimensions.len(),
+            5,
+            "one reported window plus the four nothing has reported: {dimensions:?}"
+        );
+        assert_eq!(
+            dimensions.iter().filter(|d| d.is_measured()).count(),
+            1,
+            "exactly the one the provider stated: {dimensions:?}"
+        );
+        assert!(
+            dimensions
+                .iter()
+                .filter(|d| !d.is_measured())
+                .all(|d| d.pct < 100.0 && d.provenance.reason().is_some()),
+            "an unmeasured dimension is a labelled conservative bound, never 100%: {dimensions:?}"
+        );
+
+        let binding = route_binding(&route, Some(&capacity), now, &cfg).expect("a binding");
+        assert!(
+            dimensions.contains(&binding),
+            "the binding dimension must be one this row also lists"
+        );
     }
 
     /// Slice A: a degraded route is reduced, not excluded -- rule (a) hands
