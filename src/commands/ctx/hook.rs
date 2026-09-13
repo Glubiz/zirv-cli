@@ -1611,6 +1611,35 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // itself) keeps every one of its existing call sites/tests untouched.
     // Issue #308 rides the same fold a third time, for the identical reason.
     // Issue #312 rides it a fourth time, for the identical reason.
+    //
+    // Issue #478: whether this session may stop quietly is the shared stop
+    // service's call, not this function's. `stop_hook_active` is its loop
+    // breaker -- exactly what this hook's own early return above already used
+    // it for -- and the verify-on-stop result is the verification signal it
+    // reads. Behaviour is unchanged today (a `Required` verification yields
+    // `AllowWithNote`, and the note is the one computed above), but the moment
+    // `StopSignals::workflow_gate` or `incomplete_tools` is populated, the
+    // harness path blocks for the same reasons the native loop already does.
+    let stop_decision = super::lifecycle::stop(&super::lifecycle::StopSignals {
+        already_blocked: payload.stop_hook_active,
+        incomplete_tools: Vec::new(),
+        verification: match verify_nudge.is_some() {
+            true => super::lifecycle::VerificationDecision::Required {
+                command: super::lifecycle::verification_command(false),
+            },
+            false => super::lifecycle::VerificationDecision::NotRequired,
+        },
+        workflow_gate: None,
+    });
+    let verify_nudge = match &stop_decision {
+        // The service says fresh evidence is owed; the nudge computed above is
+        // this hook's own wording for that, so it rides along.
+        super::lifecycle::StopDecision::AllowWithNote(_) => verify_nudge.clone(),
+        // Allowed outright, or blocked for a reason that outranks a nudge --
+        // in either case the evidence note is not what should be said.
+        super::lifecycle::StopDecision::Allow => None,
+        super::lifecycle::StopDecision::Block(reason) => Some(reason.clone()),
+    };
     let combined_nudge = [
         adoption_nudge.as_deref(),
         verify_nudge.as_deref(),

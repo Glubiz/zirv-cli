@@ -553,9 +553,17 @@ impl<'a> NativeLoop<'a> {
         }
     }
 
+    /// A fresh id for one journal record.
+    ///
+    /// Namespaced by GENERATION, not just by a per-loop counter: a resumed
+    /// session starts a new loop whose counter begins at zero again, and the
+    /// journal rejects a duplicate usage/execution id outright. Without the
+    /// generation in the name, every resume would collide with the records
+    /// the previous generation already wrote -- which is exactly the failure
+    /// a real resume surfaced.
     fn mint(&mut self, prefix: &str) -> String {
         self.counter += 1;
-        format!("{prefix}-{}", self.counter)
+        format!("{prefix}-g{}-{}", self.config.generation, self.counter)
     }
 
     fn secs(&self) -> u64 {
@@ -583,17 +591,15 @@ impl<'a> NativeLoop<'a> {
     /// "recorded" -- if this returns, the input is on disk.
     pub fn acknowledge(&mut self, text: &str, steering: bool) -> CtxResult<MessageId> {
         let message_id = MessageId::new(self.mint("msg"))?;
-        let now = self.secs();
         let at_ms = (self.now_ms)();
-        self.journal.acknowledge_input(
+        acknowledge_input(
+            self.journal,
             &self.config.session,
             self.config.generation,
-            &EventScope::default(),
             message_id.clone(),
-            text.to_string(),
+            text,
             steering,
-            Some(at_ms),
-            now,
+            at_ms,
         )?;
         self.note(
             "input",
@@ -1399,6 +1405,97 @@ fn accumulate(total: &mut ProviderUsage, delta: &ProviderUsage) {
     }
 }
 
+/// Wall-clock milliseconds. Only the entry points that have no injected clock
+/// of their own use it -- [`NativeLoop`] takes one, so every loop-correctness
+/// test stays deterministic.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// The ONE durable acknowledgement every entry point uses: [`NativeLoop::
+/// acknowledge`] for a loop the caller drives itself, and
+/// [`NativeBackend`]'s `submit`/`steer`/`resume` for a caller coming through
+/// the runtime trait. It is written before the input can be acted on or even
+/// reported as accepted, so nothing between "accepted" and "recorded" can
+/// lose it -- a crash immediately after either call returns `Ok` still finds
+/// the input in the journal.
+pub fn acknowledge_input(
+    journal: &mut Journal,
+    session: &JournalSessionId,
+    generation: u64,
+    message_id: MessageId,
+    text: &str,
+    steering: bool,
+    at_ms: u64,
+) -> CtxResult<()> {
+    journal.acknowledge_input(
+        session,
+        generation,
+        &EventScope::default(),
+        message_id,
+        text.to_string(),
+        steering,
+        Some(at_ms),
+        at_ms / 1000,
+    )?;
+    Ok(())
+}
+
+/// What a resume owed the journal before the session may run again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeOutcome {
+    pub identity: super::journal::SessionIdentity,
+    pub previous_generation: u64,
+    pub generation: u64,
+    /// Executions that were durably `Started` when the previous generation
+    /// stopped. Each is now `OutcomeUnknown` and must be reconciled against
+    /// the real world before anything retries its effect.
+    pub reconciled: Vec<ExecutionId>,
+}
+
+/// Brings a stored native session back under a live runtime.
+///
+/// This is the only correct order, and the reason `Journal::
+/// reconcile_started_as_unknown` and `Journal::advance_generation` exist:
+///
+/// 1. Read the stored identity, which fails loudly for a session this
+///    journal has never heard of rather than inventing one.
+/// 2. Convert every execution whose last durable state is `Started` to
+///    `OutcomeUnknown`. An effect that began and never reported cannot be
+///    assumed to have failed, so it is never silently retried; it is marked
+///    for reconciliation instead.
+/// 3. Advance the generation. That fences the previous one: any straggler
+///    still holding the old generation -- a half-dead process, a stale
+///    handle -- is refused by the journal and by the N04 broker from here on.
+///
+/// Reconciliation happens BEFORE the fence on purpose: it is written as the
+/// old generation, which is the generation those executions actually belong
+/// to, so the record reads as one continuous history rather than as the new
+/// generation having somehow started effects it never issued.
+pub fn resume_journal(
+    journal: &mut Journal,
+    session: &JournalSessionId,
+    at_ms: u64,
+) -> CtxResult<ResumeOutcome> {
+    let now = at_ms / 1000;
+    let identity = journal.session(session)?;
+    let previous_generation = identity.generation;
+    let reconciled =
+        journal.reconcile_started_as_unknown(session, previous_generation, Some(at_ms), now)?;
+    let generation = previous_generation.saturating_add(1);
+    journal.advance_generation(session, previous_generation, generation, now)?;
+    Ok(ResumeOutcome {
+        identity,
+        previous_generation,
+        generation,
+        reconciled,
+    })
+}
+
 /// The authoritative execution for each tool call: the one with the highest
 /// journal sequence.
 ///
@@ -1541,14 +1638,20 @@ fn classify(receipt: &ToolReceipt) -> (ToolState, String, bool) {
 
 /// The `RuntimeKind::Native` [`RuntimeBackend`].
 ///
-/// The backend owns session identity, the input queue's durable
-/// acknowledgement and the cancellation flag; [`NativeLoop`] owns the
-/// conversation. `submit` runs the loop to completion synchronously, which is
-/// what a headless native session is; `steer` and `interrupt` are safe to
-/// call from another thread holding the same `Arc`s while it runs.
+/// The backend owns session identity, the durable acknowledgement of input
+/// and the cancellation flag; [`NativeLoop`] owns the conversation.
+///
+/// A backend with a journal attached ([`NativeBackend::attach_journal`] plus
+/// [`NativeBackend::bind_session`]) writes every accepted input through the
+/// same [`acknowledge_input`] the loop uses, and resumes through the same
+/// [`resume_journal`]. Without one it is a pure in-memory protocol surface,
+/// which is all a wire-shape test needs and all `runtime::select` can build
+/// without knowing a state directory.
 #[derive(Debug)]
 pub struct NativeBackend {
     sessions: BTreeMap<String, NativeSessionRecord>,
+    journal: Option<Journal>,
+    minted: u64,
 }
 
 #[derive(Debug)]
@@ -1560,13 +1663,108 @@ struct NativeSessionRecord {
     state: SessionState,
     cancel: Arc<CancellationFlag>,
     events: Vec<super::protocol::EventEnvelope>,
+    /// The journal session this handle's inputs are recorded against, once a
+    /// caller has bound one. `None` for an unbacked in-memory session.
+    journal_session: Option<JournalSessionId>,
 }
 
 impl NativeBackend {
     pub fn new() -> Self {
         Self {
             sessions: BTreeMap::new(),
+            journal: None,
+            minted: 0,
         }
+    }
+
+    /// Gives this backend the journal every accepted input is recorded in.
+    pub fn attach_journal(&mut self, journal: Journal) {
+        self.journal = Some(journal);
+    }
+
+    /// Registers an EXISTING handle under this backend and binds it to the
+    /// journal session its conversation lives in.
+    ///
+    /// Idempotent, and the only way a session this process did not itself
+    /// `start` -- one recovered by [`resume_journal`] after a crash, or one a
+    /// persistent runtime is re-attaching to -- becomes drivable. Until a
+    /// handle is adopted its inputs are accepted but tracked only in memory,
+    /// which is why `run_headless` adopts before it accepts anything.
+    pub fn adopt(
+        &mut self,
+        session: &SessionHandle,
+        journal_session: JournalSessionId,
+    ) -> CtxResult<()> {
+        match self.sessions.get_mut(&session.logical_id) {
+            Some(entry) => {
+                entry.generation = session.generation;
+                entry.journal_session = Some(journal_session);
+            }
+            None => {
+                self.sessions.insert(
+                    session.logical_id.clone(),
+                    NativeSessionRecord {
+                        short: session.short.clone(),
+                        generation: session.generation,
+                        role: session.role.clone(),
+                        surface: session.surface,
+                        state: SessionState::Idle,
+                        cancel: Arc::new(CancellationFlag::default()),
+                        events: Vec::new(),
+                        journal_session: Some(journal_session),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The journal, for a caller that drives the loop itself against the same
+    /// database this backend acknowledges input into.
+    pub fn journal_mut(&mut self) -> Option<&mut Journal> {
+        self.journal.as_mut()
+    }
+
+    fn mint_message_id(&mut self) -> CtxResult<MessageId> {
+        self.minted += 1;
+        Ok(MessageId::new(format!(
+            "input-{}-{}",
+            uuid::Uuid::new_v4().simple(),
+            self.minted
+        ))?)
+    }
+
+    /// Records one accepted input durably, BEFORE the caller is told it was
+    /// accepted. A session with no journal bound is a no-op, not an error:
+    /// the in-memory protocol surface has no durable store to lose it from.
+    fn record_input(
+        &mut self,
+        session: &SessionHandle,
+        input: &str,
+        steering: bool,
+    ) -> CtxResult<()> {
+        let Some(entry) = self.sessions.get(&session.logical_id) else {
+            return Err(RuntimeError::UnknownSession(session.logical_id.clone()).into());
+        };
+        let Some(journal_session) = entry.journal_session.clone() else {
+            return Ok(());
+        };
+        let generation = entry.generation;
+        if self.journal.is_none() {
+            return Ok(());
+        }
+        let message_id = self.mint_message_id()?;
+        let at_ms = now_ms();
+        let journal = self.journal.as_mut().expect("checked just above");
+        acknowledge_input(
+            journal,
+            &journal_session,
+            generation,
+            message_id,
+            input,
+            steering,
+            at_ms,
+        )
     }
 
     fn resolve_current_mut(
@@ -1671,6 +1869,7 @@ impl RuntimeBackend for NativeBackend {
             state: SessionState::Idle,
             cancel: Arc::new(CancellationFlag::default()),
             events: Vec::new(),
+            journal_session: None,
         };
         record.push(
             &logical_id,
@@ -1688,10 +1887,18 @@ impl RuntimeBackend for NativeBackend {
     /// not carry -- see `run_headless`.
     fn submit(&mut self, session: &SessionHandle, input: &str) -> CtxResult<()> {
         let logical_id = session.logical_id.clone();
-        let entry = self.resolve_current_mut(session)?;
-        if entry.state == SessionState::Running {
-            return Err(RuntimeError::Busy(logical_id).into());
+        {
+            let entry = self.resolve_current_mut(session)?;
+            if entry.state == SessionState::Running {
+                return Err(RuntimeError::Busy(logical_id).into());
+            }
         }
+        // Durable FIRST, in-memory bookkeeping after: a crash between the two
+        // costs a protocol event a subscriber can re-derive, never the input
+        // itself. The reverse order would let a caller see `Ok` for an input
+        // that exists nowhere but this process's memory.
+        self.record_input(session, input, false)?;
+        let entry = self.resolve_current_mut(session)?;
         entry.state = SessionState::Running;
         entry.push(&logical_id, super::protocol::RuntimeEvent::TurnStarted);
         entry.push(
@@ -1704,9 +1911,13 @@ impl RuntimeBackend for NativeBackend {
     }
 
     /// Steering is accepted at ANY time, including mid-turn: that is the
-    /// point. It joins the conversation at the next delivery boundary.
+    /// point. It joins the conversation at the next delivery boundary, and is
+    /// durable from the moment it is accepted.
     fn steer(&mut self, session: &SessionHandle, input: &str) -> CtxResult<()> {
         let logical_id = session.logical_id.clone();
+        // Fences on generation before anything is written.
+        self.resolve_current_mut(session)?;
+        self.record_input(session, input, true)?;
         let entry = self.resolve_current_mut(session)?;
         entry.push(
             &logical_id,
@@ -1726,12 +1937,36 @@ impl RuntimeBackend for NativeBackend {
         Ok(())
     }
 
+    /// Brings a session back under this runtime.
+    ///
+    /// With a journal bound this is the real thing: every execution that was
+    /// durably `Started` when the previous generation stopped becomes
+    /// `OutcomeUnknown` (never silently retried), and the generation advances,
+    /// fencing the old one out of the journal and out of the N04 broker. See
+    /// [`resume_journal`]. Without a journal it is the in-memory generation
+    /// bump a protocol-shape test needs.
     fn resume(&mut self, session: &SessionHandle, input: Option<&str>) -> CtxResult<SessionHandle> {
         let logical_id = session.logical_id.clone();
+        let journal_session = self
+            .sessions
+            .get(&logical_id)
+            .ok_or_else(|| RuntimeError::UnknownSession(logical_id.clone()))?
+            .journal_session
+            .clone();
+        let resumed = match (journal_session.as_ref(), self.journal.as_mut()) {
+            (Some(journal_session), Some(journal)) => {
+                Some(resume_journal(journal, journal_session, now_ms())?)
+            }
+            _ => None,
+        };
+
         let Some(entry) = self.sessions.get_mut(&logical_id) else {
             return Err(RuntimeError::UnknownSession(logical_id).into());
         };
-        entry.generation += 1;
+        entry.generation = match &resumed {
+            Some(resumed) => resumed.generation,
+            None => entry.generation + 1,
+        };
         // A resume is a fresh cancellation scope: the flag an earlier
         // interrupt set must not silently cancel the resumed turn.
         entry.cancel = Arc::new(CancellationFlag::default());
@@ -1754,7 +1989,11 @@ impl RuntimeBackend for NativeBackend {
                 session: handle.clone(),
             },
         );
+        // The input a resume carries is acknowledged against the NEW
+        // generation, durably, exactly like any other accepted input.
         if let Some(input) = input {
+            self.record_input(&handle, input, false)?;
+            let entry = self.resolve_current_mut(&handle)?;
             entry.push(
                 &logical_id,
                 super::protocol::RuntimeEvent::AssistantText {
@@ -1784,6 +2023,11 @@ impl RuntimeBackend for NativeBackend {
 
 // -- headless execution ---------------------------------------------------
 
+/// The `--provider` prefix that swaps the live transport for a deterministic
+/// fixture script. Operator-only by construction: it is a command-line flag,
+/// and no configuration layer -- least of all a repository's -- can set it.
+pub const FIXTURE_PROVIDER_PREFIX: &str = "fixture:";
+
 /// Everything `zirv ctx exec --runtime native -- <prompt>` needs.
 ///
 /// `route` is a `[route]` name from the operator's own native provider
@@ -1796,6 +2040,17 @@ pub struct HeadlessRequest<'a> {
     pub route: Option<&'a str>,
     pub role: &'a str,
     pub limits: NativeLimits,
+    /// An existing native journal session to continue instead of starting a
+    /// new one. See [`resume_journal`] for what a resume owes first.
+    pub resume: Option<&'a str>,
+    /// Operator-only transport override. The only accepted shape today is
+    /// `fixture:<path>`, which replays the deterministic provider script at
+    /// that path instead of calling a provider.
+    pub provider: Option<&'a str>,
+    /// The fixture tool script a `fixture:` provider executes against. With
+    /// none, every tool call reports a fixture failure rather than touching
+    /// the machine.
+    pub fixture_tools: Option<&'a std::path::Path>,
 }
 
 /// Runs one headless native session end to end and prints its structured
@@ -1812,6 +2067,171 @@ pub fn run_headless<W: std::io::Write>(
     w: &mut W,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    use super::super::state::{StateDir, now_secs};
+    use super::journal::{SeatId, SessionIdentity};
+
+    let state = StateDir::resolve(env)?;
+    let home = crate::utils::home_dir()?;
+    let cfg = super::super::config::CtxConfig::load(request.repo, env)?;
+    let now = now_secs();
+
+    let (provider, mut tools, route, brokered) =
+        build_transport(request, &state, &home, &cfg, env)?;
+
+    let mut journal = Journal::open(&state)?;
+    let mut backend = NativeBackend::new();
+
+    // Session identity first: the seat record is what the effect-time
+    // generation fence reads, so it has to exist before any tool can run.
+    let (handle, session) = match request.resume {
+        Some(resume) => {
+            let session = JournalSessionId::new(resume)?;
+            let resumed = resume_journal(&mut journal, &session, now_ms())?;
+            let handle = SessionHandle {
+                runtime: RuntimeKind::Native,
+                logical_id: session.to_string(),
+                short: resumed.identity.seat.to_string(),
+                generation: resumed.generation,
+                role: request.role.to_string(),
+                surface: UiSurface::Headless,
+                conversation: Some(BackendConversationRef {
+                    agent: RuntimeKind::Native.as_str().to_string(),
+                    conversation: session.to_string(),
+                }),
+            };
+            if !resumed.reconciled.is_empty() {
+                writeln!(
+                    w,
+                    "native runtime: {} execution(s) were in flight when this session stopped and \
+                     are now outcome-unknown; reconcile before retrying their effects",
+                    resumed.reconciled.len()
+                )?;
+            }
+            (handle, session)
+        }
+        None => {
+            let handle = backend.start(&SessionSpec {
+                runtime: RuntimeKind::Native,
+                role: request.role.to_string(),
+                agent: None,
+                provider_route: Some(route.route.clone()),
+                model: Some(route.model.id.clone()),
+                surface: UiSurface::Headless,
+                cwd: request.repo.to_path_buf(),
+                prompt: request.prompt.to_string(),
+                extra_args: Vec::new(),
+            })?;
+            let session = JournalSessionId::new(handle.logical_id.clone())?;
+            journal.create_session(&SessionIdentity {
+                session: session.clone(),
+                seat: SeatId::new(handle.short.clone())?,
+                generation: handle.generation,
+                task: None,
+                route: route.clone(),
+                created_at: now,
+                completed_at: None,
+            })?;
+            (handle, session)
+        }
+    };
+
+    super::super::seat::store(
+        &state,
+        &super::super::seat::Seat {
+            short: handle.short.clone(),
+            session: handle.logical_id.clone(),
+            generation: handle.generation,
+            agent: RuntimeKind::Native.as_str().to_string(),
+            model: Some(route.model.id.clone()),
+            provider: route.provider.to_string(),
+            role: request.role.to_string(),
+            pinned: false,
+            phase: Default::default(),
+            visited: Vec::new(),
+            last_rollover_at: None,
+            pending: None,
+            displaced: None,
+            created_at: now,
+            updated_at: now,
+            runtime: RuntimeKind::Native,
+        },
+    )?;
+
+    if brokered {
+        // The broker is built here, after the seat record exists, because its
+        // own fence reads that record at every effect.
+        let executor = brokered_tools(request, &state, &home, &cfg, &handle)?;
+        tools = executor;
+    }
+
+    // The backend owns the durable acknowledgement, so the input is on disk
+    // before anything is told it was accepted -- the same `acknowledge_input`
+    // the loop's own `acknowledge` uses.
+    backend.attach_journal(journal);
+    backend.adopt(&handle, session.clone())?;
+    if !request.prompt.is_empty() {
+        backend.submit(&handle, request.prompt)?;
+    }
+    let cancel = backend
+        .cancellation(&handle)
+        .unwrap_or_else(|| std::sync::Arc::new(CancellationFlag::default()));
+
+    let status = {
+        let journal = backend
+            .journal_mut()
+            .ok_or("native runtime: the journal was not attached")?;
+        let mut driver = NativeLoop::new(
+            NativeSessionConfig {
+                session: session.clone(),
+                generation: handle.generation,
+                route: route.clone(),
+                role: request.role.to_string(),
+                seat_model: env(super::super::adapters::SEAT_MODEL_ENV),
+                write_posture: lifecycle::orchestrator_write_posture(&cfg),
+                limits: request.limits,
+                task: None,
+                workflow_gate: None,
+            },
+            provider.as_ref(),
+            tools.as_mut(),
+            journal,
+            cancel,
+            &now_ms,
+            env,
+        );
+        driver.run_to_completion()?
+    };
+
+    if let Some(journal) = backend.journal_mut() {
+        journal.complete_session(
+            &session,
+            handle.generation,
+            status.status.as_str().to_string(),
+            now_secs(),
+        )?;
+    }
+    writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
+    Ok(status.exit_code)
+}
+
+/// Resolves the provider transport, the tool executor and the route identity
+/// for one headless run. The fourth value says whether the returned executor
+/// is a placeholder that must be replaced by a brokered one once the seat
+/// record exists -- a fixture run never brokers, because it performs no
+/// effects at all.
+#[allow(clippy::type_complexity)]
+fn build_transport(
+    request: &HeadlessRequest<'_>,
+    state: &super::super::state::StateDir,
+    home: &std::path::Path,
+    cfg: &super::super::config::CtxConfig,
+    env: EnvLookup<'_>,
+) -> CtxResult<(
+    Box<dyn ProviderAdapter>,
+    Box<dyn ToolExecutor>,
+    RouteIdentity,
+    bool,
+)> {
     use std::time::Duration;
 
     use super::super::provider::anthropic::AnthropicMessagesAdapter;
@@ -1820,23 +2240,59 @@ pub fn run_headless<W: std::io::Write>(
     use super::super::provider::openai::OpenAiResponsesAdapter;
     use super::super::provider::transport::StreamTimeouts;
     use super::super::provider::{Protocol, RouteId, adapter::resolve_target};
-    use super::super::state::{StateDir, now_secs};
-    use super::enforcement::{
-        ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, ExecutionIdentity,
-        NetworkScope, PlatformIsolation, ResourceClaims, StoredSeatFence,
+    use super::super::state::now_secs;
+    use super::fixture::{
+        FixtureProvider, FixtureScript, FixtureToolExecutor, FixtureToolScript, fixture_target,
     };
-    use super::journal::{SeatId, SessionIdentity};
-    use super::tools::ToolLimits;
 
-    let state = StateDir::resolve(env)?;
-    let home = crate::utils::home_dir()?;
-    let cfg = super::super::config::CtxConfig::load(request.repo, env)?;
+    let _ = (state, cfg);
 
-    let native = NativeConfig::load(&home, request.repo)?.ok_or_else(|| {
+    if let Some(spec) = request.provider {
+        let Some(path) = spec.strip_prefix(FIXTURE_PROVIDER_PREFIX) else {
+            return Err(format!(
+                "--provider '{spec}': the only supported value is \
+                 `{FIXTURE_PROVIDER_PREFIX}<path to a provider script>`"
+            )
+            .into());
+        };
+        let script = FixtureScript::load(std::path::Path::new(path))?;
+        let protocol = if script.shape == "openai" {
+            Protocol::OpenAiResponses
+        } else {
+            Protocol::AnthropicMessages
+        };
+        let model = if script.model.is_empty() {
+            "fixture-model".to_string()
+        } else {
+            script.model.clone()
+        };
+        let target = fixture_target(protocol, &model);
+        let route = RouteIdentity {
+            route: target.route.clone(),
+            provider: target.provider.clone(),
+            endpoint: target.endpoint.clone(),
+            account: target.account.clone(),
+            billing_pool: target.billing_pool.clone(),
+            protocol: target.protocol,
+            model: target.model.clone(),
+        };
+        let tool_script = match request.fixture_tools {
+            Some(path) => FixtureToolScript::load(path)?,
+            None => FixtureToolScript::default(),
+        };
+        return Ok((
+            Box::new(FixtureProvider::new(target, script)),
+            Box::new(FixtureToolExecutor::new(tool_script)),
+            route,
+            false,
+        ));
+    }
+
+    let native = NativeConfig::load(home, request.repo)?.ok_or_else(|| {
         format!(
             "native runtime: no provider configuration at {}. Run `zirv ctx provider` to \
              set up an account, endpoint and route first.",
-            NativeConfig::operator_path(&home).display()
+            NativeConfig::operator_path(home).display()
         )
     })?;
     let route_id = match request.route {
@@ -1872,43 +2328,6 @@ pub fn run_headless<W: std::io::Write>(
             .into());
         }
     };
-
-    // Session identity first: the seat record is what the effect-time
-    // generation fence reads, so it has to exist before any tool can run.
-    let mut backend = NativeBackend::new();
-    let handle = backend.start(&SessionSpec {
-        runtime: RuntimeKind::Native,
-        role: request.role.to_string(),
-        agent: None,
-        provider_route: Some(route_id.clone()),
-        model: Some(target.model.id.clone()),
-        surface: UiSurface::Headless,
-        cwd: request.repo.to_path_buf(),
-        prompt: request.prompt.to_string(),
-        extra_args: Vec::new(),
-    })?;
-    super::super::seat::store(
-        &state,
-        &super::super::seat::Seat {
-            short: handle.short.clone(),
-            session: handle.logical_id.clone(),
-            generation: handle.generation,
-            agent: RuntimeKind::Native.as_str().to_string(),
-            model: Some(target.model.id.clone()),
-            provider: target.provider.to_string(),
-            role: request.role.to_string(),
-            pinned: false,
-            phase: Default::default(),
-            visited: Vec::new(),
-            last_rollover_at: None,
-            pending: None,
-            displaced: None,
-            created_at: now,
-            updated_at: now,
-            runtime: RuntimeKind::Native,
-        },
-    )?;
-
     let route = RouteIdentity {
         route: target.route.clone(),
         provider: target.provider.clone(),
@@ -1918,25 +2337,38 @@ pub fn run_headless<W: std::io::Write>(
         protocol: target.protocol,
         model: target.model.clone(),
     };
-    let mut journal = Journal::open(&state)?;
-    let session = JournalSessionId::new(handle.logical_id.clone())?;
-    journal.create_session(&SessionIdentity {
-        session: session.clone(),
-        seat: SeatId::new(handle.short.clone())?,
-        generation: handle.generation,
-        task: None,
-        route: route.clone(),
-        created_at: now,
-        completed_at: None,
-    })?;
+    // A placeholder: the real executor needs the seat record that only exists
+    // once session identity is settled, so `run_headless` swaps it in there.
+    Ok((
+        provider,
+        Box::new(FixtureToolExecutor::new(FixtureToolScript::default())),
+        route,
+        true,
+    ))
+}
+
+/// The production tool executor: N05's client behind N04's broker, fenced on
+/// the persisted native seat record this run just wrote.
+fn brokered_tools(
+    request: &HeadlessRequest<'_>,
+    state: &super::super::state::StateDir,
+    home: &std::path::Path,
+    cfg: &super::super::config::CtxConfig,
+    handle: &SessionHandle,
+) -> CtxResult<Box<dyn ToolExecutor>> {
+    use super::enforcement::{
+        ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, ExecutionIdentity,
+        NetworkScope, PlatformIsolation, ResourceClaims, StoredSeatFence,
+    };
+    use super::tools::ToolLimits;
 
     let broker = ExecutionBroker::new(
-        ExecutionIdentity::from_handle(&handle, None)?,
+        ExecutionIdentity::from_handle(handle, None)?,
         ResourceClaims::new(
             request.repo,
             request.repo,
             state.root(),
-            &home,
+            home,
             NetworkScope::Denied,
         )?
         .discover_linked_worktree_git()?,
@@ -1948,55 +2380,12 @@ pub fn run_headless<W: std::io::Write>(
         PlatformIsolation::detect(),
         Default::default(),
     )?;
-    let mut tools = ClientToolExecutor::new(NativeToolClient::new(
+    Ok(Box::new(ClientToolExecutor::new(NativeToolClient::new(
         broker,
         state.clone(),
         request.repo.to_path_buf(),
-        ToolLimits::from_config(&cfg),
-    ));
-
-    let cancel = backend
-        .cancellation(&handle)
-        .unwrap_or_else(|| std::sync::Arc::new(CancellationFlag::default()));
-    let now_ms = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64
-    };
-    let status = {
-        let mut driver = NativeLoop::new(
-            NativeSessionConfig {
-                session: session.clone(),
-                generation: handle.generation,
-                route,
-                role: request.role.to_string(),
-                seat_model: env(super::super::adapters::SEAT_MODEL_ENV),
-                write_posture: lifecycle::orchestrator_write_posture(&cfg),
-                limits: request.limits,
-                task: None,
-                workflow_gate: None,
-            },
-            provider.as_ref(),
-            &mut tools,
-            &mut journal,
-            cancel,
-            &now_ms,
-            env,
-        );
-        driver.acknowledge(request.prompt, false)?;
-        driver.run_to_completion()?
-    };
-
-    journal.complete_session(
-        &session,
-        handle.generation,
-        status.status.as_str().to_string(),
-        now_secs(),
-    )?;
-    writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
-    Ok(status.exit_code)
+        ToolLimits::from_config(cfg),
+    ))))
 }
 
 #[cfg(test)]
@@ -2739,7 +3128,6 @@ mod tests {
         assert!(error.to_string().contains("harness"));
     }
 
-
     // -- review round 2 ----------------------------------------------------
 
     /// Finding 1: `ConversationState::executions` is keyed by `ExecutionId`
@@ -2948,6 +3336,202 @@ mod tests {
             Some("zirv workflow: the Test step has no fresh evidence")
         );
         assert_ne!(status.exit_code, 0);
+    }
+
+    /// Finding 2: a crash leaves an execution durably `Started`. A resume
+    /// must reconcile it as outcome-unknown, advance the generation so the
+    /// old one is fenced out, and never re-run the effect.
+    #[test]
+    fn a_resume_reconciles_a_started_execution_and_fences_the_old_generation() {
+        use super::super::journal::{PolicyProvenance, ToolCallId};
+
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let scope = EventScope::default();
+        let call = ToolCallId::new("call_crashed").unwrap();
+        let execution = ExecutionId::new("exec_crashed").unwrap();
+        journal
+            .prepare_tool_call(
+                &session,
+                1,
+                &scope,
+                call.clone(),
+                "apply_patch".into(),
+                serde_json::json!({"path": "src/lib.rs", "patch": "x"}),
+                PolicyProvenance {
+                    fingerprint: String::new(),
+                    source: "native-loop".into(),
+                    decision: "allowed".into(),
+                    scope: "worker".into(),
+                },
+                Some(1),
+                1,
+            )
+            .unwrap();
+        journal
+            .prepare_execution(
+                &session,
+                1,
+                &scope,
+                execution.clone(),
+                call.clone(),
+                Some(1),
+                1,
+            )
+            .unwrap();
+        journal
+            .transition_execution(
+                &session,
+                1,
+                &scope,
+                &execution,
+                ExecutionState::Started,
+                None,
+                None,
+                Some(1),
+                1,
+            )
+            .unwrap();
+        // ... and the process dies here, mid-effect.
+
+        let resumed = resume_journal(&mut journal, &session, 2_000).expect("resumed");
+        assert_eq!(resumed.previous_generation, 1);
+        assert_eq!(resumed.generation, 2);
+        assert_eq!(resumed.reconciled, vec![execution.clone()]);
+
+        let state = journal.replay(&session).unwrap();
+        assert_eq!(
+            state.executions.get(&execution).map(|e| e.state),
+            Some(ExecutionState::OutcomeUnknown),
+            "an effect that began and never reported is never assumed to have failed"
+        );
+        assert_eq!(journal.session(&session).unwrap().generation, 2);
+
+        // The old generation is fenced: anything still holding it is refused
+        // rather than allowed to keep writing.
+        let stale = journal.acknowledge_input(
+            &session,
+            1,
+            &scope,
+            MessageId::new("msg_stale").unwrap(),
+            "from the dead generation".into(),
+            false,
+            Some(2_000),
+            2,
+        );
+        assert!(stale.is_err(), "the superseded generation must be fenced");
+
+        // A continued session reports it as outcome-unknown and never re-runs
+        // it: the provider is the only thing that can ask for a tool, and it
+        // was never asked again.
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(
+                r#"{"turns":[{"blocks":[{"type":"text","text":"carrying on"}],
+                   "finish_reason":"end_turn"}]}"#,
+            )
+            .unwrap(),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let clock = || 3_000u64;
+        let status = {
+            let mut cfg = config_for(session, route);
+            cfg.generation = resumed.generation;
+            let mut driver = NativeLoop::new(
+                cfg,
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.run_to_completion().unwrap()
+        };
+        assert_eq!(
+            status.outcome_unknown_tools,
+            vec!["call_crashed".to_string()]
+        );
+        assert_eq!(status.status, NativeStatus::Incomplete);
+        assert!(tools.calls.is_empty(), "a crashed effect is never replayed");
+    }
+
+    /// Finding 2, the other half: a resume through the backend seam does the
+    /// same durable work, not just an in-memory counter bump.
+    #[test]
+    fn a_backend_resume_with_a_journal_advances_the_stored_generation() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, journal, session) = journal_for(&route);
+        let mut backend = NativeBackend::new();
+        let handle = backend.start(&spec(RuntimeKind::Native)).expect("started");
+        backend.attach_journal(journal);
+        backend.adopt(&handle, session.clone()).expect("adopted");
+
+        let resumed = backend.resume(&handle, None).expect("resumed");
+        assert_eq!(resumed.generation, 2);
+        assert_eq!(
+            backend
+                .journal_mut()
+                .unwrap()
+                .session(&session)
+                .unwrap()
+                .generation,
+            2,
+            "the backend's generation must be the journal's, not a private counter"
+        );
+    }
+
+    /// Finding 3: an input the backend accepted is durable before the caller
+    /// is told it was accepted, so a crash straight after `Ok` cannot lose it.
+    #[test]
+    fn backend_input_is_journalled_before_it_is_reported_as_accepted() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, journal, session) = journal_for(&route);
+        let mut backend = NativeBackend::new();
+        let handle = backend.start(&spec(RuntimeKind::Native)).expect("started");
+        backend.attach_journal(journal);
+        backend.adopt(&handle, session.clone()).expect("adopted");
+
+        backend.submit(&handle, "do the thing").expect("submitted");
+        backend.steer(&handle, "and this too").expect("steered");
+        let resumed = backend
+            .resume(&handle, Some("carry on"))
+            .expect("resumed with input");
+
+        let state = backend
+            .journal_mut()
+            .unwrap()
+            .replay(&session)
+            .expect("replay");
+        let inputs: Vec<(String, bool)> = state
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .map(|message| (message.text.clone().unwrap_or_default(), message.steering))
+            .collect();
+        assert_eq!(
+            inputs,
+            vec![
+                ("do the thing".to_string(), false),
+                ("and this too".to_string(), true),
+                ("carry on".to_string(), false),
+            ]
+        );
+        // The resume's own input is acknowledged against the NEW generation.
+        assert_eq!(resumed.generation, 2);
+    }
+
+    /// A backend with no journal is still a usable in-memory protocol surface
+    /// -- accepting input is a no-op there, never an error.
+    #[test]
+    fn a_backend_without_a_journal_still_accepts_input() {
+        let mut backend = NativeBackend::new();
+        let handle = backend.start(&spec(RuntimeKind::Native)).expect("started");
+        backend
+            .submit(&handle, "in memory only")
+            .expect("submitted");
+        backend.steer(&handle, "also in memory").expect("steered");
+        assert_eq!(backend.state(&handle), Some(SessionState::Running));
     }
 
     #[test]
