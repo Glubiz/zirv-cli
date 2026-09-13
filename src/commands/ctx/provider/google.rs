@@ -916,7 +916,7 @@ fn process_chunk(
                 }
             }
             if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
-                flush_open(accumulator)?;
+                flush_open(accumulator, sink)?;
                 accumulator.finish_reason_raw = Some(reason.to_string());
                 let mut details = json!({"finishReason": reason});
                 if let Some(ratings) = candidate.get("safetyRatings") {
@@ -935,8 +935,9 @@ fn process_part(
     sink: &mut dyn EventSink,
 ) -> Result<(), ProviderFailure> {
     if let Some(function_call) = part.get("functionCall") {
-        flush_open(accumulator)?;
+        flush_open(accumulator, sink)?;
         if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
+            let signature_index = accumulator.completed.len();
             accumulator.completed.push(ProviderContent::Thinking {
                 thinking: String::new(),
                 signature: OpaqueProviderData::new(json!({
@@ -944,6 +945,9 @@ fn process_part(
                     "attached_to": "function_call",
                     "thought_signature": sig,
                 })),
+            });
+            sink.push(ProviderStreamEvent::BlockCompleted {
+                index: signature_index,
             });
         }
         let name = required_string(function_call, "name", "functionCall")?;
@@ -987,7 +991,7 @@ fn process_part(
             (Some(OpenBlock::Thought { .. }), true) | (Some(OpenBlock::Text(_)), false)
         );
         if !continues {
-            flush_open(accumulator)?;
+            flush_open(accumulator, sink)?;
             accumulator.open = Some(if thought {
                 OpenBlock::Thought {
                     text: String::new(),
@@ -998,7 +1002,12 @@ fn process_part(
             });
         }
         let index = accumulator.completed.len();
-        match accumulator.open.as_mut().expect("just opened above") {
+        let Some(open) = accumulator.open.as_mut() else {
+            return Err(invalid_stream(
+                "Google text part processing lost its own just-opened block",
+            ));
+        };
+        match open {
             OpenBlock::Thought {
                 text: buffer,
                 signature: stored,
@@ -1030,10 +1039,18 @@ fn process_part(
     Ok(())
 }
 
-fn flush_open(accumulator: &mut Accumulator) -> Result<(), ProviderFailure> {
+/// Settles whatever text/thought block is currently open, if any, and
+/// announces it with the same `BlockCompleted` event every other settled
+/// block (tool calls included) gets -- a consumer watching the stream for
+/// block boundaries sees one for every kind, not just tool calls.
+fn flush_open(
+    accumulator: &mut Accumulator,
+    sink: &mut dyn EventSink,
+) -> Result<(), ProviderFailure> {
     let Some(open) = accumulator.open.take() else {
         return Ok(());
     };
+    let index = accumulator.completed.len();
     match open {
         OpenBlock::Text(text) => accumulator.completed.push(ProviderContent::Text { text }),
         OpenBlock::Thought { text, signature } => {
@@ -1050,6 +1067,7 @@ fn flush_open(accumulator: &mut Accumulator) -> Result<(), ProviderFailure> {
             });
         }
     }
+    sink.push(ProviderStreamEvent::BlockCompleted { index });
     Ok(())
 }
 
@@ -1087,7 +1105,10 @@ fn finish_stream(
     if !accumulator.saw_candidate {
         return Err(invalid_stream("Google stream produced no candidates"));
     }
-    flush_open(&mut accumulator)?;
+    // Defensive only: `process_chunk` already flushes any open block before
+    // ever setting `finish_reason_raw`, so `accumulator.open` is always
+    // `None` by this point. No caller observes this discarded sink.
+    flush_open(&mut accumulator, &mut Vec::new())?;
     let message_id = accumulator
         .response_id
         .clone()
@@ -1110,13 +1131,24 @@ fn finish_stream(
         }
         "MAX_TOKENS" => FinishReason::MaxTokens,
         "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" | "IMAGE_SAFETY" => {
-            // A safety block is a typed refusal outcome, never prose: any
-            // in-flight tool call is dropped and a `Refusal` block records
-            // which finish reason triggered it.
-            content.retain(|block| !matches!(block, ProviderContent::ToolUse { .. }));
+            // A safety block is a typed refusal outcome, never prose: the
+            // settled content becomes the `Refusal` block alone -- any text,
+            // thinking or tool-use content already produced this turn is
+            // dropped rather than sitting beside the refusal, and the number
+            // of dropped blocks is recorded in `stop_details` for
+            // diagnostics instead of being replayed as assistant prose.
+            let omitted_blocks = content.len();
+            content.clear();
             content.push(ProviderContent::Refusal {
                 text: format!("blocked: {reason_raw}"),
             });
+            if let Some(details) = accumulator.stop_details.take() {
+                let mut object = details.expose().clone();
+                if let Some(map) = object.as_object_mut() {
+                    map.insert("omitted_blocks".into(), json!(omitted_blocks));
+                }
+                accumulator.stop_details = Some(OpaqueProviderData::new(object));
+            }
             FinishReason::Refusal
         }
         "MALFORMED_FUNCTION_CALL" => {
@@ -1503,6 +1535,16 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ProviderStreamEvent::ToolInputDelta { .. }))
         );
+        // Every settled block -- the flushed thought, both tool calls, and
+        // the signature-only thought riding on the second call -- gets its
+        // own `BlockCompleted`, the same as every other kind already did.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderStreamEvent::BlockCompleted { .. }))
+                .count(),
+            response.content.len()
+        );
         assert!(!format!("{response:?}").contains("sig-thought-1"));
         assert!(!format!("{response:?}").contains("sig-call-2"));
     }
@@ -1536,15 +1578,15 @@ mod tests {
     fn safety_finish_reason_is_a_typed_refusal_not_prose() {
         let response = parse(SAFETY).unwrap();
         assert_eq!(response.finish_reason, FinishReason::Refusal);
-        assert!(response.content.iter().any(
-            |block| matches!(block, ProviderContent::Refusal { text } if text.contains("SAFETY"))
+        // The fixture's already-flushed "partial" text block never sits
+        // beside the refusal: the settled content is the `Refusal` alone.
+        assert_eq!(response.content.len(), 1);
+        assert!(matches!(
+            &response.content[0],
+            ProviderContent::Refusal { text } if text.contains("SAFETY")
         ));
-        assert!(
-            !response
-                .content
-                .iter()
-                .any(|block| matches!(block, ProviderContent::ToolUse { .. }))
-        );
+        let details = response.stop_details.expect("stop details");
+        assert_eq!(details.expose()["omitted_blocks"], 1);
     }
 
     #[test]
