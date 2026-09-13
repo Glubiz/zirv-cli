@@ -1478,15 +1478,14 @@ including `score`, `handoff` and `status`, works on all three platforms.
 
 ### Runtime backends
 
-Every supervised session picks a `RuntimeKind`: `harness` (the default,
-today's only implementation — an `AgentAdapter` spawns the real Claude
-Code/Codex/etc. binary through the `supervise::spawn_tapped` chokepoint) or
-`native` (not yet available; a direct provider call with no vendor CLI
-in the loop, tracked on the native-runtime roadmap,
-[issue #469](https://github.com/Glubiz/zirv-cli/issues/469)). Selecting
-`native` today (`runtime::select(RuntimeKind::Native, ..)`) returns a typed
-`RuntimeError::Unsupported` naming roadmap steps N02-N09 by number, rather
-than a silent fallback to `harness`.
+Every supervised session picks a `RuntimeKind`: `harness` (the default — an
+`AgentAdapter` spawns the real Claude Code/Codex/etc. binary through the
+`supervise::spawn_tapped` chokepoint) or `native` (zirv conducts the
+model/tool conversation itself over a direct provider route, with no vendor
+CLI in the loop, on the native-runtime roadmap,
+[issue #469](https://github.com/Glubiz/zirv-cli/issues/469)). Native mode is
+always explicit and opt-in: nothing detects it, and an unrecognised runtime
+name is an error rather than a silent fallback to `harness`.
 
 The session registry (`sessions::Record`), the orchestrator seat
 (`seat::Seat`), and the `.conversation` marker each persist which
@@ -1622,6 +1621,56 @@ ids -- a Codex harness model id is not assumed to be a Responses model. The
 routes are fixture-verified with live validation still pending; the contract
 is in
 [`docs/design/2026-09-12-native-openai-provider.md`](docs/design/2026-09-12-native-openai-provider.md).
+
+#### The native agent loop
+
+`zirv ctx exec --runtime native` runs a whole session without a coding
+harness installed:
+
+```
+zirv ctx exec --runtime native --prompt "fix the failing test"
+zirv ctx exec --runtime native --route work-sonnet --role worker -- fix the failing test
+```
+
+Flags: `--runtime harness|native` (default `harness`), `--route <id>` (a
+`[route]` from the operator's native provider configuration; defaults to the
+`[roles]` entry for `--role`), `--role <role>` (default `worker`; selects
+that default route and the repository-write posture its tools run under).
+`--max-tool-calls` and `--timeout-secs` apply as the loop's own ceilings.
+`--agent`, `--transcript`, `--session-id` and `--max-restarts` are
+harness-runtime flags and are **refused** here, not ignored: a native session
+supervises no external process, has no transcript to score and nothing to
+restart. The command prints one structured JSON final status (`schema_version`,
+`status`, the actual route/provider/endpoint/account, the configured **and**
+served model, turn/request/tool counts, usage, evidence, and any incomplete or
+outcome-unknown tools) and exits on the same supervisor exit codes.
+
+Inside, an explicit session/turn/request/tool state machine drives the cycle.
+The assistant message and its complete tool calls are committed to the journal
+**before** any tool preflight, so a truncated argument stream can never become
+an effect. Independent (read-only) calls may be scheduled ahead of mutating
+ones, but results always go back in the provider's own declared order, keyed by
+call id. Every input is durably acknowledged the moment it is accepted and
+joins the conversation at an explicit delivery boundary — between requests in
+a turn, or between turns, never mid-stream or mid-tool; anything not yet
+delivered is reported as `queued_input` rather than dropped. An interrupt
+cancels the in-flight stream, every unstarted tool and the remaining turns, but
+never an effect already in progress: that becomes `outcome_unknown` and must be
+reconciled before any retry. Response retries (re-sending a request that
+committed nothing) are budgeted separately from tool-effect retries, and only a
+tool whose own contract says `safe` is ever re-run. A model's finish token
+cannot produce `completed` while an execution is incomplete, an outcome is
+unknown, an acknowledged input is undelivered, or a lifecycle gate objects.
+
+Every lifecycle decision the loop makes — before-tool admission, after-tool
+result disposition, prompt notes, stop, notification classification, owed
+verification — comes from `ctx::lifecycle`, the shared service `hook.rs` now
+translates its harness payloads into. The native path calls it directly: no
+hook process, no harness binary, no PATH probe. Deterministic fixture
+provider/tool scripts under `tests/fixtures/runtime/native/` prove loop
+correctness for both primary provider shapes without a paid call. The contract
+is in
+[`docs/design/2026-09-13-native-agent-loop.md`](docs/design/2026-09-13-native-agent-loop.md).
 
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
@@ -1878,6 +1927,17 @@ Process environment overrides are part of the broker-signed action and may
 not replace protected credential variables. Declared process effects only
 request additional sandbox access; under-declaring an effect leaves that
 resource read-only or disconnected rather than bypassing policy.
+
+The native agent loop adds no repository-settable key either. Which runtime
+runs, which provider route it spends and which role it holds come from the
+command line and from the operator-owned native provider configuration in
+`~/.zirv/native.toml` — never from a checkout. Model output is untrusted
+input throughout: a tool call it emits is admitted by the shared before-tool
+service and the N04 broker before anything runs, and its "I am finished"
+token is one input to the final status rather than the answer. A repository
+can still narrow, through the same `[supervise] orchestrator_writes` posture
+that governs the harness path, which the native loop applies to its own
+`file_write`/`apply_patch` calls.
 
 The local runtime protocol ([`zirv ctx api`](#runtime-protocol-v1-zirv-ctx-api))
 adds no configuration key, and deliberately so: its endpoint is always derived
