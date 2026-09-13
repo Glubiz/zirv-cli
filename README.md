@@ -2313,7 +2313,8 @@ allowed_routes = ["work-sonnet"]
 ```
 
 Providers with a default URL have an implicit endpoint named after the
-provider. `openai-compatible` instead requires both `base_url` and `vendor`.
+provider. `openai-compatible` and `aws-bedrock` instead require a `vendor`,
+and a `base_url` unless the vendor's route profile has a documented one.
 Account pools default to the account id; two accounts may deliberately share
 one `pool` when they share quota. Every API-billed account except
 `openai-compatible` must declare a credential reference. Subscription-billed
@@ -2344,6 +2345,109 @@ The optional repository layer `<repo>/.zirv/native.toml` may contain only
 `schema` and `[policy].allowed_routes`. Its routes are intersected with the
 operator's set, so a checkout can narrow access but cannot add accounts,
 endpoints, routes, role bindings, credentials, or permissions.
+
+#### Route profiles
+
+Every configured route binds to a *route profile*: the versioned record of
+one vendor route's documented base URL, request path, credential class,
+capability caveats and permitted provider-native options. `zirv ctx provider
+list` prints the whole registry and the profile each route bound to. A route
+whose vendor has no profile is refused at load time rather than sent to a
+guessed endpoint.
+
+The primary families keep their own transports (`anthropic`, `openai`,
+`google`, `google-vertex`). Everything else speaks one of two:
+
+| Family | Provider | Vendor | Protocol |
+|---|---|---|---|
+| DeepSeek, xAI, Qwen (DashScope), Moonshot/Kimi, Mistral, Zhipu/GLM, MiniMax, Meta (Llama API) | `openai-compatible` | the vendor slug | chat completions |
+| Ollama, LM Studio, vLLM | `openai-compatible` | `ollama` / `lmstudio` / `vllm` | chat completions |
+| Azure OpenAI | `azure-openai` | (fixed) | chat completions |
+| Amazon Nova and every Bedrock-hosted family | `aws-bedrock` | the vendor slug | Bedrock Converse |
+
+A vendor with a documented base URL does not need one configured:
+
+```toml
+[endpoint.deepseek]
+provider = "openai-compatible"
+vendor = "deepseek"
+
+[account.deepseek]
+provider = "openai-compatible"
+credential = "env:DEEPSEEK_API_KEY"
+
+[route.reason]
+account = "deepseek"
+endpoint = "deepseek"
+model = "deepseek-v4-pro"
+
+[route.reason.extensions]
+temperature = 0.2
+```
+
+`[route.<id>.extensions]` carries provider-native request options and is
+validated against the profile's typed allow-list: an unknown key, a wrong
+type or an out-of-range value is a load error that names the accepted keys.
+There is no free-form passthrough, and an extension can never overwrite a
+protocol-owned field such as `messages` or `tools`.
+
+A compatible endpoint is not a feature superset of OpenAI's. Capabilities are
+declared per profile, and a request asking for something the profile does not
+declare -- tools, a reasoning-effort control, a thinking configuration,
+prompt caching -- is refused with a typed failure instead of being silently
+stripped. Reasoning text a chat-completions endpoint emits
+(`reasoning_content`) is streamed for display but never replayed as
+continuation state, because it carries no signature.
+
+#### Local models
+
+`ollama`, `lmstudio` and `vllm` routes default to their runtime's own
+loopback address (`127.0.0.1:11434`, `:1234`, `:8000`). Their credential
+class is "none" or "optional": no key is fabricated for them, and declaring
+one on a key-less local route is an error rather than a secret sent to a
+local server. Plain `http://` is accepted only for a loopback or private
+address (a literal one -- a hostname is never assumed local); a credential is
+still never sent in the clear to a non-loopback host.
+
+#### Cloud routes
+
+`aws-bedrock` requires `account.<id>.region` and signs every request with
+SigV4; its credential is a JSON object rather than a bare key, because a
+signature needs a key pair:
+
+```toml
+[endpoint.bedrock]
+provider = "aws-bedrock"
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+vendor = "anthropic"
+
+[account.aws]
+provider = "aws-bedrock"
+credential = "store:aws-bedrock"   # {"access_key_id":"…","secret_access_key":"…"}
+region = "us-east-1"
+
+[route.bedrock-sonnet]
+account = "aws"
+endpoint = "bedrock"
+model = "claude-sonnet-5"
+```
+
+`azure-openai` requires `account.<id>.api_version` and a per-route
+`deployment`; the request is addressed at
+`{base}/openai/deployments/{deployment}/chat/completions?api-version=…` with
+an `api-key` header, and carries no model id, because on Azure the deployment
+names the model. Each identity field is required by exactly one provider and
+forbidden on every other, so a Vertex `project`, a Bedrock `region` and an
+Azure `api_version` can never be read as one another.
+
+#### Broker subscriptions
+
+GitHub Copilot and Factory/Droid resell models under their own subscription
+identity, with no documented, separately authorized direct API. Their
+profiles are `legacy-only` with that reason recorded, configuring one as a
+native route is refused, and they remain available through their harness
+backend. `zirv ctx provider list` distinguishes this from `planned`, which
+means zirv has not written an adapter yet -- the two are never conflated.
 
 ### .settings.toml
 
