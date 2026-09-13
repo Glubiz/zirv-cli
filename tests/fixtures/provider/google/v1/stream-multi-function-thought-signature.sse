@@ -1,0 +1,8 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"check both files","thought":true,"thoughtSignature":"sig-thought-1"}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"resp_fixture"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"file_read","args":{"path":"src/lib.rs"}}}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"resp_fixture"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"file_read","args":{"path":"Cargo.toml"}},"thoughtSignature":"sig-call-2"}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"resp_fixture"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":45,"totalTokenCount":176,"thoughtsTokenCount":11,"cachedContentTokenCount":60},"modelVersion":"gemini-2.5-pro","responseId":"resp_fixture"}
+
