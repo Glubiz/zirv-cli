@@ -76,6 +76,7 @@ pub mod retrieval;
 pub mod reuse;
 pub mod rollover;
 pub mod rot;
+pub mod route;
 pub mod run_loop;
 pub mod runtime;
 pub mod safety;

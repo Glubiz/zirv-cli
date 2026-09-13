@@ -49,6 +49,34 @@ pub struct HarnessRow {
     pub queued: u32,
     pub reserved_tokens: u64,
     pub resets_at: Option<u64>,
+    /// Issue #487 (items 2 and 7): the runtime this route runs on, and the
+    /// billing pool it actually spends from. Two rows sharing a pool share
+    /// one balance; two rows at one provider with different pools do not.
+    pub runtime: String,
+    pub pool: String,
+    /// Every capacity dimension this route can run out of, tightest first,
+    /// each labelled `measured` or `estimated` with the reason. Omitted from
+    /// `--json` when it would only restate `headroom_pct`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<DimensionRow>,
+    /// Which of them actually binds. Always one of `dimensions`, so a row can
+    /// never name a binding dimension it does not also list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_dimension: Option<String>,
+}
+
+/// One capacity dimension in a [`HarnessRow`]. The provenance is the point:
+/// an operator has to be able to tell a number the provider stated from one
+/// zirv assumed on its behalf, and a placement that lost to an estimate is a
+/// different fact from one that lost to a measurement.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DimensionRow {
+    pub dimension: String,
+    pub headroom_pct: f64,
+    /// `"measured"` or `"estimated"`.
+    pub provenance: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One provider's row: the reservation ledger's own view
@@ -106,6 +134,23 @@ pub struct PoolView {
     /// stopped trusting a route.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub health: Vec<RouteHealthRow>,
+    /// Issue #487 (criterion 1): every billing pool more than one route
+    /// draws on, and every endpoint more than one route depends on. Empty
+    /// -- and omitted from `--json` -- when no two routes share anything,
+    /// which is the ordinary single-harness-per-vendor case. A row here is
+    /// the operator's warning that those routes are ONE balance, or that one
+    /// outage takes all of them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<SharedRow>,
+}
+
+/// One shared dependency in a [`PoolView`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SharedRow {
+    /// `"billing-pool"` or `"endpoint"`.
+    pub kind: &'static str,
+    pub id: String,
+    pub routes: Vec<String>,
 }
 
 /// One unhealthy route in a [`PoolView`].
@@ -206,6 +251,45 @@ fn seat_view_for(record: &seat::Seat) -> SeatView {
 /// (`allocator::place`'s own doc comment: "explain every candidate it
 /// considered, eligible losers included"). `None` when there is no harness
 /// to plan against at all (no seat, no configured fallback order).
+/// Issue #487 (criterion 1): the shared dependencies in one snapshot --
+/// every billing pool and every endpoint that more than one route depends
+/// on, each listing the routes involved.
+///
+/// Pure over the snapshot, and empty whenever nothing is shared, so the
+/// ordinary one-harness-per-vendor picture gains no rows at all. A pool row
+/// is the operator's warning that two routes are ONE balance (ranking them
+/// as two would invent capacity); an endpoint row is the warning that one
+/// outage takes all of them.
+fn shared_rows(snapshot: &allocator::CapacitySnapshot) -> Vec<SharedRow> {
+    let mut rows: Vec<SharedRow> = Vec::new();
+    let mut push = |kind: &'static str, id: String, routes: Vec<String>| {
+        if routes.len() > 1 && !rows.iter().any(|row| row.kind == kind && row.id == id) {
+            rows.push(SharedRow { kind, id, routes });
+        }
+    };
+    for route in &snapshot.harnesses {
+        push(
+            "billing-pool",
+            route.identity.pool.clone(),
+            snapshot
+                .pool_siblings(route)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect(),
+        );
+        push(
+            "endpoint",
+            route.identity.endpoint.clone(),
+            snapshot
+                .endpoint_siblings(route)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect(),
+        );
+    }
+    rows
+}
+
 fn build_exclusions(
     snapshot: &allocator::CapacitySnapshot,
     cfg: &CtxConfig,
@@ -215,6 +299,7 @@ fn build_exclusions(
         return Vec::new();
     };
     let unit = allocator::WorkUnit {
+        demand: super::route::Demand::default(),
         id: "pool".to_string(),
         requested: requested.to_string(),
         bounds: allocator::TaskBounds {
@@ -331,6 +416,23 @@ pub fn build(
                 queued,
                 reserved_tokens,
                 resets_at: binding.map(|w| w.resets_at),
+                runtime: harness.identity.runtime.as_str().to_string(),
+                pool: harness.identity.pool.clone(),
+                binding_dimension: allocator::route_binding(harness, provider_capacity, now, cfg)
+                    .map(|headroom| headroom.dimension.as_str().to_string()),
+                dimensions: allocator::route_dimensions(harness, provider_capacity, now, cfg)
+                    .into_iter()
+                    .map(|headroom| DimensionRow {
+                        dimension: headroom.dimension.as_str().to_string(),
+                        headroom_pct: headroom.pct,
+                        provenance: if headroom.is_measured() {
+                            "measured".to_string()
+                        } else {
+                            "estimated".to_string()
+                        },
+                        reason: headroom.provenance.reason().map(str::to_string),
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -345,6 +447,7 @@ pub fn build(
         providers,
         exclusions,
         health: health_rows(state, cfg, now),
+        shared: shared_rows(&snapshot),
     }
 }
 
@@ -669,6 +772,10 @@ mod tests {
 
     fn sample_row(name: &str, provider: &str, state: &str, headroom: Option<f64>) -> HarnessRow {
         HarnessRow {
+            runtime: "harness".to_string(),
+            pool: provider.to_string(),
+            dimensions: Vec::new(),
+            binding_dimension: None,
             name: name.to_string(),
             provider: provider.to_string(),
             state: state.to_string(),
@@ -714,6 +821,7 @@ mod tests {
             }],
             exclusions: vec![("gemini".to_string(), "disabled".to_string())],
             health: Vec::new(),
+            shared: Vec::new(),
         }
     }
 
@@ -813,6 +921,7 @@ mod tests {
             providers: Vec::new(),
             exclusions: Vec::new(),
             health: Vec::new(),
+            shared: Vec::new(),
         };
         let text = render_text(&view, true, false);
         assert_eq!(text, "pool: seat claude gen 1");

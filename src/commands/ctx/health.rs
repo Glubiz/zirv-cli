@@ -59,31 +59,84 @@ pub struct Trial {
     pub at: u64,
 }
 
-/// Which route an observation belongs to: one harness, lower-cased. See this
-/// module's own header for why the model is deliberately NOT part of the
-/// identity.
+/// What a breaker record is ABOUT (issue #487, item 4).
+///
+/// Slice 1 of #455 had one scope because a harness has one: the failing hop
+/// is the connection or the endpoint, and a harness names both at once. A
+/// native route names four separately, and folding them together means one
+/// rejected key disables an account's other models and one model an account
+/// may not use looks like an outage. `Harness` is the `Default`, so every
+/// record written before this reads back unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteScope {
+    #[default]
+    Harness,
+    /// A host: every route reaching it is affected by its outage.
+    Endpoint,
+    /// One credential. A sibling account at the same endpoint is untouched.
+    Credential,
+    /// One model on one credential. That account's other models still work.
+    Model,
+}
+
+impl RouteScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::Endpoint => "endpoint",
+            Self::Credential => "credential",
+            Self::Model => "model",
+        }
+    }
+}
+
+/// Which route an observation belongs to: one harness, lower-cased, or -- for
+/// a native route -- one endpoint, credential or model. See this module's own
+/// header for why the model is deliberately NOT part of a HARNESS identity.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RouteKey {
     pub harness: String,
+    #[serde(default)]
+    pub scope: RouteScope,
 }
 
 impl RouteKey {
     pub fn new(harness: &str) -> Self {
         Self {
             harness: harness.to_lowercase(),
+            scope: RouteScope::Harness,
         }
     }
 
-    /// The human form -- the harness name.
+    /// A native route's breaker key, in one of the three non-harness scopes.
+    /// The scope is part of the identity, so an endpoint called `work` and a
+    /// credential called `work` are two records, not one.
+    pub fn scoped(scope: RouteScope, id: &str) -> Self {
+        Self {
+            harness: id.to_lowercase(),
+            scope,
+        }
+    }
+
+    /// The human form -- the harness name, or `<scope> <id>` for a native
+    /// scope, so a status line never reports a credential id as a harness.
     pub fn label(&self) -> String {
-        self.harness.clone()
+        match self.scope {
+            RouteScope::Harness => self.harness.clone(),
+            other => format!("{} {}", other.as_str(), self.harness),
+        }
     }
 
     /// The file-safe form used as a record's basename: everything outside
     /// `[a-z0-9._-]` folds to `-`. The record itself carries the key
-    /// verbatim, so this never has to be parsed back.
+    /// verbatim, so this never has to be parsed back. A harness stem is
+    /// unprefixed, so existing records keep their existing paths.
     pub fn file_stem(&self) -> String {
-        sanitize(&self.harness)
+        match self.scope {
+            RouteScope::Harness => sanitize(&self.harness),
+            other => format!("{}-{}", other.as_str(), sanitize(&self.harness)),
+        }
     }
 }
 
@@ -806,10 +859,7 @@ pub fn observe(
         // phase, so it gets its own window-aged ring rather than competing
         // for slots with a burst of rate limits.
         if class == ProviderErrorClass::Auth {
-            next.seen_auth_ids.push(SeenId {
-                id: id.clone(),
-                at,
-            });
+            next.seen_auth_ids.push(SeenId { id: id.clone(), at });
             next.seen_auth_ids = prune_seen_auth(next.seen_auth_ids, now, policy);
         } else {
             let (ring, cap) = if counts_toward_opening(class) {
@@ -2191,6 +2241,29 @@ mod tests {
         assert_eq!(key.file_stem(), "claude");
         assert_eq!(key.label(), "claude");
         assert_eq!(RouteKey::new("gpt/6 astra").file_stem(), "gpt-6-astra");
+    }
+
+    /// Issue #487 (item 4): a native route's scopes are separate records, so
+    /// a rejected credential cannot deny the endpoint (or a sibling account
+    /// that happens to share its name), and a harness record keeps the
+    /// unprefixed path it has always had.
+    #[test]
+    fn a_native_scope_is_part_of_the_breaker_key_and_leaves_harness_paths_alone() {
+        let harness = RouteKey::new("claude");
+        let endpoint = RouteKey::scoped(RouteScope::Endpoint, "api.anthropic.com");
+        let credential = RouteKey::scoped(RouteScope::Credential, "work");
+        let model = RouteKey::scoped(RouteScope::Model, "work/claude-opus");
+
+        assert_eq!(harness.file_stem(), "claude", "unchanged, so records load");
+        assert_eq!(endpoint.file_stem(), "endpoint-api.anthropic.com");
+        assert_eq!(credential.file_stem(), "credential-work");
+        assert_eq!(model.file_stem(), "model-work-claude-opus");
+
+        // The scope is part of the identity: same id, different record.
+        let same_id_endpoint = RouteKey::scoped(RouteScope::Endpoint, "work");
+        assert_ne!(same_id_endpoint, credential);
+        assert_ne!(same_id_endpoint.file_stem(), credential.file_stem());
+        assert_eq!(credential.label(), "credential work");
     }
     /// Review round 2, finding 1: a dated Auth row from outside the window
     /// is history, not a live credential problem. Before this it denied the

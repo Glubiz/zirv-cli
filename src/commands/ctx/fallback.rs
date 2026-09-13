@@ -386,6 +386,12 @@ pub fn capacity_snapshot(
             state: allocator::HarnessState::Unknown,
             state_reason: String::new(),
             health: super::health_store::admission_for(&health, name),
+            // N18: a harness route's identity is the one this module
+            // always implied -- its provider is its billing pool, and it
+            // declares no offer, so nothing about harness placement or
+            // eligibility changes.
+            identity: super::route::RouteIdentity::harness(name, &provider),
+            offer: None,
         };
         let (state, reason) = allocator::classify(&harness, provider_capacity, cfg);
         harness.state = state;
@@ -1018,6 +1024,7 @@ fn health_names(cfg: &CtxConfig, requested: &str) -> Vec<String> {
 /// every adaptive call site so the mapping cannot drift between them.
 fn work_unit_for(request: RouteRequest<'_>) -> super::allocator::WorkUnit {
     super::allocator::WorkUnit {
+        demand: super::route::Demand::default(),
         id: "delegation".to_string(),
         requested: request.requested.to_string(),
         bounds: request.bounds,
@@ -2076,6 +2083,7 @@ mod tests {
         assert_eq!(claude.state, allocator::HarnessState::Ready);
 
         let unit = allocator::WorkUnit {
+            demand: super::super::route::Demand::default(),
             id: "u1".to_string(),
             requested: "claude".to_string(),
             bounds: TaskBounds {
@@ -2945,6 +2953,7 @@ mod tests {
         );
 
         let unit = allocator::WorkUnit {
+            demand: super::super::route::Demand::default(),
             id: "u1".to_string(),
             requested: "claude".to_string(),
             bounds: TaskBounds {
