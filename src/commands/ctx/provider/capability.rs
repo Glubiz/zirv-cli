@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::profiles::RouteProfile;
 use super::{ModelId, Protocol};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +69,17 @@ const SOURCE: &str =
 
 /// Declared provider documentation only. N02 never returns `Verified`;
 /// N07/N08 may upgrade individual fields after a live validation.
-pub fn declared(protocol: Protocol, model: &ModelId) -> ModelCapabilities {
+///
+/// `profile` is the route's N13 profile when one is bound. A compatible
+/// endpoint's capabilities are a property of the *vendor*, not of the
+/// protocol -- two endpoints both speaking `chat.completions` can differ on
+/// vision, caching and reasoning -- so the profile's caveats, not the
+/// protocol arm, are what a bound compatible route declares.
+pub fn declared(
+    protocol: Protocol,
+    model: &ModelId,
+    profile: Option<&RouteProfile>,
+) -> ModelCapabilities {
     let mut capabilities = ModelCapabilities {
         tools: Capability::Unknown,
         streaming: Capability::Unknown,
@@ -116,10 +127,24 @@ pub fn declared(protocol: Protocol, model: &ModelId) -> ModelCapabilities {
             capabilities.reasoning_controls = Capability::declared(thinking_family);
             capabilities.continuation = Capability::declared(thinking_family);
         }
-        Protocol::OpenAiChatCompatible => {
+        Protocol::OpenAiChatCompatible | Protocol::AzureOpenAiChat | Protocol::AwsBedrock => {
             capabilities.streaming = Capability::declared(true);
         }
         _ => {}
+    }
+    if let Some(profile) = profile
+        && matches!(
+            protocol,
+            Protocol::OpenAiChatCompatible | Protocol::AzureOpenAiChat | Protocol::AwsBedrock
+        )
+    {
+        let caveats = profile.caveats;
+        capabilities.tools = Capability::declared(caveats.tools);
+        capabilities.vision = Capability::declared(caveats.vision);
+        capabilities.structured_output = Capability::declared(caveats.structured_output);
+        capabilities.prompt_caching = Capability::declared(caveats.prompt_caching);
+        capabilities.reasoning_controls = Capability::declared(caveats.reasoning_controls);
+        capabilities.continuation = Capability::declared(caveats.reasoning_replay);
     }
     capabilities
 }
@@ -137,6 +162,7 @@ mod tests {
             Protocol::GoogleGenerativeAi,
             Protocol::GoogleVertex,
             Protocol::AwsBedrock,
+            Protocol::AzureOpenAiChat,
         ] {
             let caps = declared(
                 protocol,
@@ -144,6 +170,7 @@ mod tests {
                     vendor: "anthropic".into(),
                     id: "claude-sonnet-5".into(),
                 },
+                super::super::profiles::profile("anthropic-messages"),
             );
             assert!(
                 [
@@ -159,6 +186,37 @@ mod tests {
                 .all(|capability| !capability.is_verified())
             );
         }
+    }
+
+    #[test]
+    fn a_compatible_route_declares_its_vendor_profile_not_its_protocol() {
+        let model = ModelId {
+            vendor: "deepseek".into(),
+            id: "deepseek-chat".into(),
+        };
+        let unbound = declared(Protocol::OpenAiChatCompatible, &model, None);
+        assert_eq!(unbound.tools, Capability::Unknown);
+        assert_eq!(unbound.streaming, Capability::declared(true));
+
+        let bound = declared(
+            Protocol::OpenAiChatCompatible,
+            &model,
+            super::super::profiles::profile("deepseek-chat"),
+        );
+        assert_eq!(bound.tools, Capability::declared(true));
+        assert_eq!(bound.vision, Capability::declared(false));
+        assert_eq!(bound.continuation, Capability::declared(false));
+
+        let ollama = declared(
+            Protocol::OpenAiChatCompatible,
+            &ModelId {
+                vendor: "ollama".into(),
+                id: "qwen3".into(),
+            },
+            super::super::profiles::profile("ollama-openai"),
+        );
+        assert_eq!(ollama.structured_output, Capability::declared(false));
+        assert_eq!(ollama.prompt_caching, Capability::declared(false));
     }
 
     #[test]

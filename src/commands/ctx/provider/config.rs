@@ -55,6 +55,12 @@ pub struct AccountConfig {
     /// AI addresses a model by project and location, not by a bare API key.
     pub project: Option<String>,
     pub location: Option<String>,
+    /// Required, and only meaningful, for `aws-bedrock`: SigV4 signs for one
+    /// region, and the signature is not portable to another one.
+    pub region: Option<String>,
+    /// Required, and only meaningful, for `azure-openai`: the data-plane
+    /// `api-version` an Azure resource is pinned to.
+    pub api_version: Option<String>,
 }
 
 impl Default for AccountConfig {
@@ -66,6 +72,8 @@ impl Default for AccountConfig {
             pool: None,
             project: None,
             location: None,
+            region: None,
+            api_version: None,
         }
     }
 }
@@ -76,6 +84,13 @@ pub struct RouteConfig {
     pub account: AccountId,
     pub endpoint: Option<EndpointId>,
     pub model: String,
+    /// Required, and only meaningful, for `azure-openai`: an Azure route is
+    /// addressed by deployment id, and the model a deployment serves is an
+    /// account fact zirv cannot infer from the id.
+    pub deployment: Option<String>,
+    /// Provider-native request options, validated against the route
+    /// profile's typed allow-list (`profiles::validate_extensions`).
+    pub extensions: BTreeMap<String, toml::Value>,
 }
 
 impl Default for RouteConfig {
@@ -84,6 +99,8 @@ impl Default for RouteConfig {
             account: AccountId::new("missing").expect("static account id"),
             endpoint: None,
             model: String::new(),
+            deployment: None,
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -198,18 +215,22 @@ impl NativeConfig {
             let Some(spec) = provider(endpoint.provider.as_ref()) else {
                 continue;
             };
-            let Some(base_url) = endpoint
-                .base_url
-                .clone()
-                .or_else(|| spec.default_base_url.map(str::to_string))
-            else {
-                continue;
-            };
             let Some(vendor) = endpoint
                 .vendor
                 .clone()
                 .or_else(|| spec.vendor.map(str::to_string))
             else {
+                continue;
+            };
+            // A vendor with a documented base URL does not need the operator
+            // to retype it; the profile registry is where that fact lives.
+            let Some(base_url) = endpoint.base_url.clone().or_else(|| {
+                spec.default_base_url.map(str::to_string).or_else(|| {
+                    super::profiles::profile_for(spec.id, &vendor)
+                        .and_then(|profile| profile.base_url.default_url())
+                        .map(str::to_string)
+                })
+            }) else {
                 continue;
             };
             endpoints.insert(
@@ -251,22 +272,56 @@ impl NativeConfig {
                 )
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             }
-            if spec.id == "openai-compatible" {
-                if endpoint.base_url.is_none() {
-                    return Err(format!(
-                        "{}: `{key}.base_url` is required for openai-compatible",
-                        path.display()
-                    )
-                    .into());
-                }
+            if spec.vendor.is_none() {
                 let vendor = endpoint.vendor.as_deref().ok_or_else(|| {
                     format!(
-                        "{}: `{key}.vendor` is required for openai-compatible",
-                        path.display()
+                        "{}: `{key}.vendor` is required for provider `{}`",
+                        path.display(),
+                        spec.id
                     )
                 })?;
                 ProviderId::new(vendor)
                     .map_err(|error| format!("{}: `{key}.vendor`: {error}", path.display()))?;
+                let profile = super::profiles::profile_for(spec.id, vendor).ok_or_else(|| {
+                    format!(
+                        "{}: `{key}` has no route profile for vendor `{vendor}` on provider `{}`",
+                        path.display(),
+                        spec.id
+                    )
+                })?;
+                if endpoint.base_url.is_none() && profile.base_url.default_url().is_none() {
+                    return Err(format!(
+                        "{}: `{key}.base_url` is required because route profile `{}` has no \
+                         documented base URL",
+                        path.display(),
+                        profile.id
+                    )
+                    .into());
+                }
+                if let Some(base_url) = endpoint.base_url.as_deref()
+                    && base_url.starts_with("http://")
+                    && !profile.allows_plain_http()
+                {
+                    return Err(format!(
+                        "{}: `{key}.base_url` is plaintext http, which route profile `{}` does \
+                         not allow; only a local runtime may be reached without TLS",
+                        path.display(),
+                        profile.id
+                    )
+                    .into());
+                }
+                if let Some(base_url) = endpoint.base_url.as_deref()
+                    && profile.allows_plain_http()
+                    && base_url.starts_with("http://")
+                    && !super::probe::is_local_http_host(base_url)
+                {
+                    return Err(format!(
+                        "{}: `{key}.base_url` reaches a public host over plaintext http; a local \
+                         runtime must be on a loopback or private address",
+                        path.display()
+                    )
+                    .into());
+                }
             } else if endpoint.vendor.is_some() {
                 return Err(format!(
                     "{}: `{key}.vendor` is forbidden because provider `{}` fixes vendor `{}`",
@@ -298,28 +353,32 @@ impl NativeConfig {
                 )
                 .into());
             }
-            if spec.id == "google-vertex" {
-                if account.project.as_deref().is_none_or(str::is_empty) {
+            // Per-provider identity fields. Each one is required by exactly
+            // one provider and forbidden everywhere else, so a Vertex project
+            // can never be read as a Bedrock region or an Azure api-version.
+            let identity: [(&str, &str, &Option<String>); 4] = [
+                ("google-vertex", "project", &account.project),
+                ("google-vertex", "location", &account.location),
+                ("aws-bedrock", "region", &account.region),
+                ("azure-openai", "api_version", &account.api_version),
+            ];
+            for (owner, field, value) in identity {
+                if spec.id == owner {
+                    if value.as_deref().is_none_or(str::is_empty) {
+                        return Err(format!(
+                            "{}: `account.{id}.{field}` is required for provider `{owner}`",
+                            path.display()
+                        )
+                        .into());
+                    }
+                } else if value.is_some() {
                     return Err(format!(
-                        "{}: `account.{id}.project` is required for provider `google-vertex`",
-                        path.display()
+                        "{}: `account.{id}.{field}` is forbidden because provider `{}` is not {owner}",
+                        path.display(),
+                        account.provider
                     )
                     .into());
                 }
-                if account.location.as_deref().is_none_or(str::is_empty) {
-                    return Err(format!(
-                        "{}: `account.{id}.location` is required for provider `google-vertex`",
-                        path.display()
-                    )
-                    .into());
-                }
-            } else if account.project.is_some() || account.location.is_some() {
-                return Err(format!(
-                    "{}: `account.{id}.project`/`location` are forbidden because provider `{}` is not google-vertex",
-                    path.display(),
-                    account.provider
-                )
-                .into());
             }
         }
 
@@ -378,6 +437,82 @@ impl NativeConfig {
             }
             super::inventory::resolve_model(id, &endpoint_id, &endpoint.vendor, &route.model)
                 .map_err(|error| format!("{}: `route.{id}.model`: {error}", path.display()))?;
+
+            // Every accessible route binds to a profile. An unbound route is
+            // refused here rather than sent to a guessed endpoint.
+            let profile =
+                super::profiles::profile_for(spec.id, &endpoint.vendor).ok_or_else(|| {
+                    format!(
+                        "{}: `route.{id}` has no route profile for vendor `{}` on provider `{}`",
+                        path.display(),
+                        endpoint.vendor,
+                        spec.id
+                    )
+                })?;
+            match profile.support {
+                Support::Native => {}
+                Support::Planned(tracking) => {
+                    return Err(format!(
+                        "{}: `route.{id}` needs route profile `{}`, whose adapter is not \
+                         implemented yet; tracked as {tracking}",
+                        path.display(),
+                        profile.id
+                    )
+                    .into());
+                }
+                Support::LegacyOnly(reason) => {
+                    return Err(format!(
+                        "{}: `route.{id}` cannot be native: {reason}. Run that model through its \
+                         coding-harness backend instead.",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+            if profile.credential == super::profiles::CredentialClass::LocalNone
+                && account.credential.is_some()
+            {
+                return Err(format!(
+                    "{}: `account.{}.credential` is set but route profile `{}` is a local \
+                     runtime that takes no credential; remove it rather than sending a secret to \
+                     a local server",
+                    path.display(),
+                    route.account,
+                    profile.id
+                )
+                .into());
+            }
+            if !profile.credential.is_optional()
+                && account.credential.is_none()
+                && spec.default_credential_env.is_empty()
+                && profile.credential_env.is_empty()
+            {
+                return Err(format!(
+                    "{}: `account.{}.credential` is required by route profile `{}`",
+                    path.display(),
+                    route.account,
+                    profile.id
+                )
+                .into());
+            }
+            if spec.id == "azure-openai" {
+                if route.deployment.as_deref().is_none_or(str::is_empty) {
+                    return Err(format!(
+                        "{}: `route.{id}.deployment` is required for provider `azure-openai`",
+                        path.display()
+                    )
+                    .into());
+                }
+            } else if route.deployment.is_some() {
+                return Err(format!(
+                    "{}: `route.{id}.deployment` is forbidden because provider `{}` is not azure-openai",
+                    path.display(),
+                    account.provider
+                )
+                .into());
+            }
+            super::profiles::validate_extensions(profile, &route.extensions)
+                .map_err(|error| format!("{}: `route.{id}.extensions`: {error}", path.display()))?;
         }
 
         for (role, route) in &self.roles {
@@ -558,18 +693,215 @@ mod tests {
     }
 
     #[test]
-    fn planned_provider_route_names_its_roadmap_step() {
-        // aws-bedrock (N13, #482) is still the generic "route uses a planned
-        // provider" case now that google-vertex (N12, #481) is native.
+    fn bedrock_routes_need_a_vendor_and_a_signing_region() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        let path = NativeConfig::operator_path(home.path());
+        let endpoint = "[endpoint.bedrock]\nprovider='aws-bedrock'\nbase_url='https://bedrock-runtime.us-east-1.amazonaws.com'\n";
+        write(
+            &path,
+            &format!(
+                "schema=1\n{endpoint}[account.work]\nprovider='aws-bedrock'\ncredential='env:KEY'\nregion='us-east-1'\n[route.work]\naccount='work'\nendpoint='bedrock'\nmodel='claude-sonnet-5'\n"
+            ),
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`endpoint.bedrock.vendor`"),
+            "got {error}"
+        );
+
+        let endpoint = format!("{endpoint}vendor='anthropic'\n");
+        write(
+            &path,
+            &format!(
+                "schema=1\n{endpoint}[account.work]\nprovider='aws-bedrock'\ncredential='env:KEY'\n[route.work]\naccount='work'\nendpoint='bedrock'\nmodel='claude-sonnet-5'\n"
+            ),
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`account.work.region`"),
+            "got {error}"
+        );
+
+        write(
+            &path,
+            &format!(
+                "schema=1\n{endpoint}[account.work]\nprovider='aws-bedrock'\ncredential='env:KEY'\nregion='us-east-1'\n[route.work]\naccount='work'\nendpoint='bedrock'\nmodel='claude-sonnet-5'\n"
+            ),
+        );
+        let cfg = NativeConfig::load(home.path(), repo.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.accounts
+                .get(&AccountId::new("work").unwrap())
+                .unwrap()
+                .region
+                .as_deref(),
+            Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn azure_routes_are_addressed_by_deployment_and_api_version() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        let path = NativeConfig::operator_path(home.path());
+        let endpoint = "[endpoint.azure]\nprovider='azure-openai'\nbase_url='https://contoso.openai.azure.com'\n";
+        write(
+            &path,
+            &format!(
+                "schema=1\n{endpoint}[account.work]\nprovider='azure-openai'\ncredential='env:KEY'\n[route.work]\naccount='work'\nendpoint='azure'\nmodel='gpt-5.6-sol'\n"
+            ),
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`account.work.api_version`"),
+            "got {error}"
+        );
+
+        write(
+            &path,
+            &format!(
+                "schema=1\n{endpoint}[account.work]\nprovider='azure-openai'\ncredential='env:KEY'\napi_version='2026-05-01'\n[route.work]\naccount='work'\nendpoint='azure'\nmodel='gpt-5.6-sol'\n"
+            ),
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`route.work.deployment`"),
+            "got {error}"
+        );
+
+        write(
+            &path,
+            &format!(
+                "schema=1\n{endpoint}[account.work]\nprovider='azure-openai'\ncredential='env:KEY'\napi_version='2026-05-01'\n[route.work]\naccount='work'\nendpoint='azure'\nmodel='gpt-5.6-sol'\ndeployment='sol-prod'\n"
+            ),
+        );
+        assert!(
+            NativeConfig::load(home.path(), repo.path())
+                .unwrap()
+                .is_some()
+        );
+
+        // A deployment on a non-Azure route is a configuration error, not a
+        // silently ignored key.
+        write(
+            &path,
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n[route.work]\naccount='work'\nmodel='sonnet'\ndeployment='sol-prod'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("is forbidden because provider"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn a_broker_subscription_vendor_is_refused_with_its_upstream_reason() {
         let home = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(home.path());
         let repo = repo();
         write(
             &NativeConfig::operator_path(home.path()),
-            "schema=1\n[endpoint.bedrock]\nprovider='aws-bedrock'\nbase_url='https://bedrock-runtime.us-east-1.amazonaws.com'\n[account.work]\nprovider='aws-bedrock'\ncredential='env:KEY'\n[route.work]\naccount='work'\nendpoint='bedrock'\nmodel='claude-sonnet-5'\n",
+            "schema=1\n[endpoint.copilot]\nprovider='openai-compatible'\nbase_url='https://api.example.invalid'\nvendor='copilot'\n[account.copilot]\nprovider='openai-compatible'\ncredential='env:KEY'\n[route.copilot]\naccount='copilot'\nendpoint='copilot'\nmodel='gpt-5.6-sol'\n",
         );
-        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
-        assert!(error.to_string().contains("N13 (#482)"), "got {error}");
+        let error = NativeConfig::load(home.path(), repo.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be native"), "got {error}");
+        assert!(error.contains("Copilot"), "got {error}");
+        assert!(error.contains("coding-harness backend"), "got {error}");
+    }
+
+    #[test]
+    fn a_documented_vendor_base_url_does_not_have_to_be_retyped() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write(
+            &NativeConfig::operator_path(home.path()),
+            "schema=1\n[endpoint.deepseek]\nprovider='openai-compatible'\nvendor='deepseek'\n[account.deepseek]\nprovider='openai-compatible'\ncredential='env:DEEPSEEK_API_KEY'\n[route.reason]\naccount='deepseek'\nendpoint='deepseek'\nmodel='deepseek-v4-pro'\n[route.reason.extensions]\ntemperature=0.2\n",
+        );
+        let cfg = NativeConfig::load(home.path(), repo.path())
+            .unwrap()
+            .unwrap();
+        let endpoint = cfg.effective_endpoints();
+        assert_eq!(
+            endpoint
+                .get(&EndpointId::new("deepseek").unwrap())
+                .unwrap()
+                .base_url,
+            "https://api.deepseek.com"
+        );
+    }
+
+    #[test]
+    fn route_extensions_are_validated_against_the_bound_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write(
+            &NativeConfig::operator_path(home.path()),
+            "schema=1\n[endpoint.deepseek]\nprovider='openai-compatible'\nvendor='deepseek'\n[account.deepseek]\nprovider='openai-compatible'\ncredential='env:KEY'\n[route.reason]\naccount='deepseek'\nendpoint='deepseek'\nmodel='deepseek-v4-pro'\n[route.reason.extensions]\nenable_thinking=true\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`route.reason.extensions`"), "got {error}");
+        assert!(error.contains("not an extension of profile"), "got {error}");
+    }
+
+    #[test]
+    fn plaintext_http_is_only_for_a_local_runtime_on_a_local_host() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        let path = NativeConfig::operator_path(home.path());
+        write(
+            &path,
+            "schema=1\n[endpoint.remote]\nprovider='openai-compatible'\nbase_url='http://api.deepseek.com'\nvendor='deepseek'\n[account.a]\nprovider='openai-compatible'\ncredential='env:KEY'\n[route.a]\naccount='a'\nendpoint='remote'\nmodel='deepseek-v4-pro'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not allow"), "got {error}");
+
+        write(
+            &path,
+            "schema=1\n[endpoint.remote]\nprovider='openai-compatible'\nbase_url='http://models.example.com:11434'\nvendor='ollama'\n[account.a]\nprovider='openai-compatible'\n[route.a]\naccount='a'\nendpoint='remote'\nmodel='qwen3'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("loopback or private"), "got {error}");
+
+        write(
+            &path,
+            "schema=1\n[endpoint.lan]\nprovider='openai-compatible'\nbase_url='http://192.168.1.9:11434'\nvendor='ollama'\n[account.a]\nprovider='openai-compatible'\n[route.a]\naccount='a'\nendpoint='lan'\nmodel='qwen3'\n",
+        );
+        assert!(
+            NativeConfig::load(home.path(), repo.path())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_local_runtime_route_never_carries_a_credential() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write(
+            &NativeConfig::operator_path(home.path()),
+            "schema=1\n[endpoint.local]\nprovider='openai-compatible'\nvendor='ollama'\n[account.local]\nprovider='openai-compatible'\ncredential='env:KEY'\n[route.local]\naccount='local'\nendpoint='local'\nmodel='qwen3'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("takes no credential"), "got {error}");
     }
 
     #[test]

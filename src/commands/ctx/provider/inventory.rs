@@ -35,6 +35,11 @@ pub struct RouteReport {
     pub model: ModelId,
     pub billing: BillingClass,
     pub state: RouteState,
+    /// The N13 route profile this route binds to, and what that profile's
+    /// support status is. An accessible route is never left unbound.
+    pub profile: Option<&'static str>,
+    pub profile_version: Option<u32>,
+    pub support: Support,
     pub capabilities: ModelCapabilities,
     pub allowed: bool,
     pub problems: Vec<String>,
@@ -272,6 +277,7 @@ impl Inventory {
             else {
                 continue;
             };
+            let profile = super::profiles::profile_for(spec.id, &endpoint.vendor);
             let mut report = RouteReport {
                 route: route_id.clone(),
                 account: route.account.clone(),
@@ -279,14 +285,41 @@ impl Inventory {
                 endpoint: endpoint_id,
                 provider: account.provider.clone(),
                 protocol: spec.protocol,
-                capabilities: declared(spec.protocol, &model),
+                capabilities: declared(spec.protocol, &model, profile),
                 model,
                 billing: account.billing,
                 state: RouteState::Configured,
+                profile: profile.map(|profile| profile.id),
+                profile_version: profile.map(|profile| profile.version),
+                support: profile.map_or(spec.support, |profile| profile.support),
                 allowed: cfg.allowed_routes().contains(route_id),
                 problems: Vec::new(),
                 notes: catalogue_note.into_iter().collect(),
             };
+            match profile {
+                None => report.problems.push(format!(
+                    "no route profile binds vendor `{}` on provider `{}`; an accessible route is \
+                     never left unbound",
+                    endpoint.vendor, spec.id
+                )),
+                Some(profile) => {
+                    report
+                        .notes
+                        .extend(profile.caveats.notes.iter().map(|note| (*note).to_string()));
+                    match profile.support {
+                        Support::Native => {}
+                        Support::Planned(tracking) => report.problems.push(format!(
+                            "route profile `{}` has no adapter yet (tracked as {tracking}); this \
+                             is a zirv gap, not an upstream entitlement limit",
+                            profile.id
+                        )),
+                        Support::LegacyOnly(reason) => report.problems.push(format!(
+                            "route profile `{}` is legacy-only upstream: {reason}",
+                            profile.id
+                        )),
+                    }
+                }
+            }
             let plaintext_non_loopback = is_plaintext_non_loopback(&endpoint.base_url);
             if plaintext_non_loopback {
                 report
@@ -696,12 +729,22 @@ mod tests {
             model_ids: vec!["claude-sonnet-5".into()],
         });
         assert_eq!(listed.routes[0].state, RouteState::Authenticated);
-        assert!(listed.routes[0].notes.is_empty());
+        assert!(
+            !listed.routes[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("model not listed"))
+        );
         let absent = build(ProbeResult::Http {
             status: 200,
             model_ids: vec![],
         });
-        assert!(absent.routes[0].notes[0].contains("model not listed"));
+        assert!(
+            absent.routes[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("model not listed"))
+        );
         let rejected = build(ProbeResult::Http {
             status: 401,
             model_ids: vec![],
