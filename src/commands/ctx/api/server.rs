@@ -102,6 +102,18 @@ pub trait SessionHost: Send + Sync + std::fmt::Debug {
     /// Facts for the sessions this host owns, in the same redacted shape a
     /// registry record projects to.
     fn sessions(&self) -> Vec<SessionFacts>;
+    /// Opens a NEW server-owned terminal for `spec`. Reached from
+    /// `session.start` whenever a host is attached, so a client asks for a
+    /// session with the same method whether a pty or a native backend ends up
+    /// carrying it -- issue #352 adds no second "start" verb, because a
+    /// client that had to know which kind of runtime it was talking to before
+    /// it could ask for a session would not be speaking one protocol.
+    ///
+    /// The host, not the caller, turns the spec into a command line: the
+    /// endpoint is owner-only, but "owner-only" is not a reason to accept an
+    /// arbitrary argv over a socket when the only launches a runtime ever
+    /// needs to make are an adapter's own.
+    fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError>;
     fn attach(
         &self,
         session_id: &str,
@@ -621,6 +633,24 @@ impl ApiServer {
             prompt: params.prompt,
             extra_args: Vec::new(),
         };
+        // Issue #352: a runtime that owns terminals answers `session.start`
+        // itself. Checked before the backend, and only when a host is
+        // attached at all, so the server issue #353 shipped is unaffected.
+        if let Some(host) = self.host() {
+            let facts = host.start(&spec)?;
+            let mut inner = self.lock();
+            inner
+                .sessions
+                .insert(facts.session_id.clone(), facts.clone());
+            inner.emit(
+                Some(facts.session_id.clone()),
+                Some(facts.generation),
+                ApiEvent::SessionStarted {
+                    session: facts.clone(),
+                },
+            );
+            return Ok(json!({ "session": facts }));
+        }
         let handle = self.with_backend(|backend| backend.start(&spec))?;
         let facts = SessionFacts {
             session_id: handle.logical_id.clone(),
@@ -1737,6 +1767,16 @@ mod tests {
     impl SessionHost for FakeHost {
         fn sessions(&self) -> Vec<SessionFacts> {
             self.lock().facts.clone()
+        }
+
+        /// The double owns no pty, so it opens nothing: every test here
+        /// exercises the ATTACHMENT surface over sessions seeded by `with`.
+        /// `session::host`'s own tests cover the spawn.
+        fn start(&self, _spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+            Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "the test host opens no terminals",
+            ))
         }
 
         fn attach(

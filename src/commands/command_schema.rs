@@ -149,6 +149,8 @@ const READ_ONLY: &[&str] = &[
     // Issue #353: renders the protocol contract compiled into this binary.
     // Touches no disk, no registry and no socket.
     "zirv ctx api schema",
+    // Issue #352: reads one runtime's session list over the protocol.
+    "zirv session list",
 ];
 
 /// Leaf paths that write: state on disk, a session/registry entry, a
@@ -163,6 +165,14 @@ const MUTATING: &[&str] = &[
     // the verb CAN do, not by what the narrowest invocation happens to do.
     "zirv ctx api serve",
     "zirv ctx api call",
+    // Issue #352: `serve` binds the endpoint and owns processes; `attach`
+    // types into one; `detach` rewrites the attachment table; `stop` ends a
+    // process. Classified by what the verb CAN do -- `detach` deliberately
+    // cannot end anything, but it still writes runtime state.
+    "zirv session serve",
+    "zirv session attach",
+    "zirv session detach",
+    "zirv session stop",
     "zirv init",
     "zirv create",
     "zirv report bug",
@@ -391,7 +401,7 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
     let mut entries = Vec::new();
     let mut unclassified = Vec::new();
 
-    let roots: [Command; 7] = [
+    let roots: [Command; 8] = [
         super::ctx::CtxCli::command(),
         super::ctx::memory_cli::MemoryCli::command(),
         super::ctx::context_cli::ContextCli::command(),
@@ -399,6 +409,7 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
         super::report::ReportCli::command(),
         super::setup::SetupCli::command(),
         super::update::UpdateCli::command(),
+        super::ctx::session::SessionCli::command(),
     ];
     for root in &roots {
         let prefix = root.get_name().to_string();
