@@ -580,6 +580,25 @@ pub enum WriterRefusal {
     /// `seat::StaleGeneration` is carried whole so a caller can tell
     /// "you were replaced" from "your transaction has not committed yet"
     /// without matching on prose.
+    ///
+    /// Reached two different ways, named explicitly here because they answer
+    /// two different questions (see [`SeatFence`]'s own doc comment for the
+    /// full caller list):
+    ///
+    /// - an explicit `Some(SeatFence)` caller fails [`super::seat::guard`],
+    ///   the STRICT verdict -- refuses a superseded predecessor AND an
+    ///   uncommitted successor. Today: `session::native::ProviderEnvironment`
+    ///   (a hosted turn, handed its seat short/generation by the runtime) and
+    ///   `runtime::native::spawn_interactive` (a native pane, once its own
+    ///   seat is stored a few lines before the lease is acquired).
+    /// - a `None` caller fails [`super::seat::guard_from_env`], the
+    ///   supersession-only verdict -- refuses a superseded predecessor but
+    ///   lets an uncommitted successor's own launch proceed (see
+    ///   `guard_from_env`'s own doc comment for why). Today: `agent.rs`'s
+    ///   legacy (subprocess) worker launch, `dash/mod.rs`'s dashboard pane
+    ///   spawn, and `native_worker.rs`'s delegated native worker launch --
+    ///   the last of these has no seat of its own to present explicitly even
+    ///   in principle (see that call site's own doc comment).
     StaleSeat {
         stale: super::seat::StaleGeneration,
     },
@@ -595,6 +614,10 @@ pub enum WriterRefusal {
 /// a superseded predecessor. `None` keeps the env-derived answer
 /// (`seat::guard_from_env`), which is the only thing a legacy worker launch or
 /// a bare terminal could ask, and which is deliberately supersession-only.
+///
+/// The exhaustive list of [`acquire_writer`] callers, and which they use, is
+/// kept on [`WriterRefusal::StaleSeat`]'s own doc comment rather than
+/// duplicated here -- see that instead of trusting this list to stay current.
 #[derive(Debug, Clone, Copy)]
 pub struct SeatFence<'a> {
     pub short: &'a str,

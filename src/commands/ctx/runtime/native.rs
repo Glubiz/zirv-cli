@@ -3340,6 +3340,29 @@ fn record_seat_conversation(
     );
 }
 
+/// The writer-lease acquisition [`spawn_interactive`] performs once its own
+/// session's seat exists (issue #488 review finding 1 follow-up, PR #535).
+/// Split out so a test can drive it directly against a `handle`-shaped short
+/// and generation it controls, without needing to predict the random
+/// `logical_id`/`short` `NativeBackend::start` mints for a real session.
+fn acquire_pane_writer_permit(
+    state: &super::super::state::StateDir,
+    max_writers: usize,
+    tree: &std::path::Path,
+    handle: &SessionHandle,
+) -> Result<super::super::permit::HeavyPermit, super::super::permit::WriterRefusal> {
+    super::super::permit::acquire_writer(
+        state,
+        max_writers,
+        "native pane",
+        tree,
+        Some(super::super::permit::SeatFence {
+            short: &handle.short,
+            generation: handle.generation,
+        }),
+    )
+}
+
 pub fn spawn_interactive(
     request: InteractiveRequest,
     env: EnvLookup<'_>,
@@ -3354,32 +3377,14 @@ pub fn spawn_interactive(
     let task = request.task.clone().map(TaskId::new).transpose()?;
 
     let tree = std::fs::canonicalize(&request.repo).unwrap_or_else(|_| request.repo.clone());
-    let writer_permit = if request.writing {
-        match super::super::permit::acquire_writer(
-            &state,
-            cfg.supervise.max_writers,
-            "native pane",
-            &tree,
-            // Issue #488: the pane's own session is being created right here,
-            // so there is no seat generation to present yet; the env fence
-            // still refuses a pane opened by a superseded orchestrator.
-            None,
-        ) {
-            Ok(permit) => Some(permit),
-            Err(refusal) => {
-                let reason = super::super::permit::describe_writer_refusal(
-                    &refusal,
-                    &state,
-                    cfg.supervise.max_writers,
-                    &tree,
-                );
-                return Err(format!("native pane: {reason}").into());
-            }
-        }
-    } else {
-        None
-    };
 
+    // Issue #488 (review finding 1 follow-up, PR #535): the writer lease is
+    // acquired AFTER this session's own seat is stored below, so it can
+    // fence on the STRICT `seat::guard` verdict (`Some(SeatFence)`) instead
+    // of the env-derived, supersession-only one -- `build_transport` reads
+    // nothing off `headless.writer`, so leaving it `None` here and filling
+    // it in once `handle`/the seat exist costs nothing. `writer` therefore
+    // starts unset and is populated in place further down.
     let mut headless = HeadlessRequest {
         repo: &request.repo,
         prompt: "",
@@ -3390,8 +3395,7 @@ pub fn spawn_interactive(
         provider: request.provider.as_deref(),
         fixture_tools: None,
         task: request.task.clone(),
-        writer: writer_permit
-            .map(|permit| Box::new(permit) as Box<dyn super::enforcement::WriterLease>),
+        writer: None,
     };
 
     let (provider, mut tools, route, brokered) =
@@ -3447,6 +3451,31 @@ pub fn spawn_interactive(
     // Issue #488 (review finding 4): this seat's conversation reference,
     // recorded under the runtime it belongs to.
     record_seat_conversation(&state, &handle, &session);
+
+    // Issue #488 (review finding 1 follow-up): the seat this session was
+    // just stored under is real now, so the writer lease can be fenced on
+    // its actual generation (`Some(SeatFence)`, the STRICT `seat::guard`
+    // verdict) rather than only the env-derived supersession check every
+    // unseated caller gets -- see `acquire_pane_writer_permit`'s own doc
+    // comment for why this is the honest fence for a session whose identity
+    // did not exist a moment ago.
+    if request.writing {
+        match acquire_pane_writer_permit(&state, cfg.supervise.max_writers, &tree, &handle) {
+            Ok(permit) => {
+                headless.writer =
+                    Some(Box::new(permit) as Box<dyn super::enforcement::WriterLease>);
+            }
+            Err(refusal) => {
+                let reason = super::super::permit::describe_writer_refusal(
+                    &refusal,
+                    &state,
+                    cfg.supervise.max_writers,
+                    &tree,
+                );
+                return Err(format!("native pane: {reason}").into());
+            }
+        }
+    }
 
     if brokered {
         let executor = brokered_tools(&mut headless, &state, &home, &cfg, &handle)?;
@@ -5674,6 +5703,95 @@ mod tests {
             None,
             "a harness reader must never be handed a native journal session id"
         );
+    }
+
+    /// Issue #488 (review finding 1 follow-up, PR #535): `spawn_interactive`
+    /// now fences its writer lease on `Some(SeatFence)` once its own seat is
+    /// stored, so an uncommitted or superseded generation must be refused a
+    /// lease and the committed one must be granted -- mirrors `permit::
+    /// tests::a_stale_or_uncommitted_generation_may_not_take_a_writer_
+    /// lease`, driven against `acquire_pane_writer_permit` directly: a real
+    /// pane's short/logical id is random (`NativeBackend::start` mints it),
+    /// so a `SessionHandle` this test controls stands in for the one a real
+    /// session would carry at the exact point the lease is acquired.
+    #[test]
+    fn a_stale_or_uncommitted_generation_may_not_open_a_native_pane() {
+        use crate::commands::ctx::seat;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+
+        let session_id = "8c7b6a5d-9999-4000-8000-000000000535";
+        let short = crate::commands::ctx::sessions::short_id(session_id);
+        seat::register(
+            &state,
+            &short,
+            session_id,
+            "native",
+            None,
+            "anthropic",
+            "worker",
+            false,
+            1,
+        )
+        .expect("register");
+
+        let handle_at = |generation: u64| SessionHandle {
+            runtime: RuntimeKind::Native,
+            logical_id: session_id.to_string(),
+            short: short.clone(),
+            generation,
+            role: "worker".to_string(),
+            surface: UiSurface::DashboardPane,
+            conversation: None,
+        };
+
+        // The seat's own generation is granted.
+        let held = acquire_pane_writer_permit(&state, 2, &tree, &handle_at(1))
+            .expect("the committed generation holds the seat");
+        drop(held);
+
+        let prepared = seat::prepare_onto(
+            &state,
+            &short,
+            "claude",
+            None,
+            RuntimeKind::Harness,
+            seat::Cause::Manual,
+            2,
+        )
+        .expect("prepare");
+
+        // The successor of a prepared-but-uncommitted rollover may not write.
+        let refusal = acquire_pane_writer_permit(&state, 2, &tree, &handle_at(prepared))
+            .expect_err("an uncommitted successor may not take a writer lease");
+        let crate::commands::ctx::permit::WriterRefusal::StaleSeat { stale } = &refusal else {
+            panic!("expected a stale-seat refusal, got {refusal:?}");
+        };
+        assert_eq!(stale.reason, seat::StaleReason::Uncommitted);
+
+        // ...and the source still holds the seat while the transaction is
+        // open.
+        let source = acquire_pane_writer_permit(&state, 2, &tree, &handle_at(1))
+            .expect("the source keeps the seat until the commit");
+        drop(source);
+
+        seat::commit(&state, &short, prepared, "successor-session", 3).expect("commit");
+
+        // After the commit the answer swaps: the predecessor is refused as
+        // superseded rather than as uncommitted.
+        let refusal = acquire_pane_writer_permit(&state, 2, &tree, &handle_at(1))
+            .expect_err("a superseded predecessor may not take a writer lease");
+        let crate::commands::ctx::permit::WriterRefusal::StaleSeat { stale } = &refusal else {
+            panic!("expected a stale-seat refusal, got {refusal:?}");
+        };
+        assert_eq!(stale.reason, seat::StaleReason::Superseded);
+
+        let successor = acquire_pane_writer_permit(&state, 2, &tree, &handle_at(prepared))
+            .expect("the committed successor holds the seat");
+        drop(successor);
     }
 
     /// PR #531 review finding 7's second case: interrupt a turn and shut

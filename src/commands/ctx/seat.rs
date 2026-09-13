@@ -764,6 +764,27 @@ pub fn fence(state: &StateDir) -> CtxResult<()> {
 /// from launching at all, which is a different and much larger rule than the
 /// one item 4 states. A caller that genuinely knows its own generation --
 /// because a broker handed it one -- gets the strict answer from [`guard`].
+///
+/// `permit::acquire_writer`'s own callers (issue #488 review, finding 1
+/// follow-up) split along exactly this line, and are named here rather than
+/// only on `WriterRefusal::StaleSeat` because this is the function whose
+/// narrowing they are actually relying on:
+///
+/// - `agent.rs`'s legacy (subprocess) worker launch and `dash/mod.rs`'s
+///   dashboard pane spawn both launch a process the dashboard/orchestrator
+///   does not itself hold a seat generation for -- the env this function
+///   reads is the only statement available, and it may legitimately be a
+///   launching successor's PREPARED generation.
+/// - `native_worker.rs`'s delegated native worker launch is the same
+///   env-only answer for a different reason: it runs in-process (no
+///   subprocess launch), and the delegated worker's own eventual native
+///   session seat does not exist yet at the point its writer lease is
+///   acquired -- `runtime::native::run_session` only creates and stores it
+///   afterward, under a session identity `NativeBackend::start` mints fresh,
+///   unrelated to anything `native_worker.rs` could pre-register. Passing an
+///   explicit fence here would mean fencing on a seat that either does not
+///   exist yet or is unrelated bookkeeping, which is not more correct than
+///   this env answer -- see that call site's own doc comment.
 pub fn guard_from_env(state: &StateDir) -> Result<(), StaleGeneration> {
     let session = std::env::var(super::adapters::SESSION_ENV).ok();
     let generation = std::env::var(GENERATION_ENV).ok();
