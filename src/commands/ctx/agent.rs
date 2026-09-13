@@ -7383,6 +7383,36 @@ mod tests {
         }
     }
 
+    /// Issue #479, acceptance criterion (a) at the flag boundary: an
+    /// unchanged caller -- one that has never heard of `--runtime` -- is the
+    /// harness delegation, and an unrecognised value is refused rather than
+    /// quietly treated as one.
+    #[test]
+    fn an_absent_runtime_flag_is_the_harness_delegation_and_a_bad_one_is_refused() {
+        let unchanged = args_for("claude", "do the thing");
+        assert_eq!(
+            resolve_runtime(&unchanged).expect("default"),
+            super::super::runtime::RuntimeKind::Harness
+        );
+        assert_eq!(runtime_label(&unchanged), "harness");
+
+        let mut native = args_for("work-sonnet", "do the thing");
+        native.runtime = "native".to_string();
+        assert_eq!(
+            resolve_runtime(&native).expect("native"),
+            super::super::runtime::RuntimeKind::Native
+        );
+        assert_eq!(runtime_label(&native), "native");
+
+        let mut nonsense = args_for("claude", "do the thing");
+        nonsense.runtime = "magic".to_string();
+        let error = resolve_runtime(&nonsense).expect_err("unknown runtime");
+        assert!(
+            error.to_string().contains("expected `harness` or `native`"),
+            "{error}"
+        );
+    }
+
     /// Whether `git` is on `PATH` at all in this test environment -- the
     /// `--workdir` git-ancestry tests below need a real `git` binary to shell
     /// out to (`adapters::git_common_dir`), and must skip gracefully rather
