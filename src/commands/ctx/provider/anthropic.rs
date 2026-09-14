@@ -21,8 +21,9 @@ use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
 use super::probe::is_plaintext_non_loopback;
 use super::transport::{
-    MAX_ERROR_BODY_BYTES, StreamTimeouts, WORKER_READ_POLL, invalid_stream, parse_retry_after_ms,
-    read_sse_line, supervise, target_scope,
+    MAX_ERROR_BODY_BYTES, ResponseLimits, StreamTimeouts, WORKER_READ_POLL,
+    check_response_block_cap, invalid_stream, parse_retry_after_ms, read_sse_line, supervise,
+    target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId};
 use crate::commands::ctx::config::EnvLookup;
@@ -350,6 +351,10 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
 
     fn target(&self) -> &ProviderTarget {
         &self.target
+    }
+
+    fn redact_failure(&self, failure: ProviderFailure) -> ProviderFailure {
+        super::adapter::redact_failure(failure, &[self.credential.secret.expose()])
     }
 
     fn stream(
@@ -698,11 +703,17 @@ fn parse_sse<R: BufRead>(
     let mut event_name = String::new();
     let mut data = String::new();
     let mut line = String::new();
+    let mut limits = ResponseLimits::new();
     loop {
         let read = read_sse_line(&mut reader, &mut line, "Anthropic", cancellation, target)?;
+        limits.record_bytes("Anthropic", read)?;
         if read == 0 {
             if !event_name.is_empty() || !data.is_empty() {
                 process_sse_event(&event_name, &data, &mut accumulator, sink, target)?;
+                check_response_block_cap(
+                    "Anthropic",
+                    accumulator.blocks.len() + accumulator.completed.len(),
+                )?;
             }
             break;
         }
@@ -710,6 +721,10 @@ fn parse_sse<R: BufRead>(
         if trimmed.is_empty() {
             if !event_name.is_empty() || !data.is_empty() {
                 process_sse_event(&event_name, &data, &mut accumulator, sink, target)?;
+                check_response_block_cap(
+                    "Anthropic",
+                    accumulator.blocks.len() + accumulator.completed.len(),
+                )?;
                 event_name.clear();
                 data.clear();
             }

@@ -26,6 +26,8 @@ pub(crate) const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 /// A single SSE line is already bounded by `MAX_SSE_LINE_BYTES`, but a block
 /// is rebuilt from an unbounded number of deltas, so it needs its own ceiling.
 pub(crate) const MAX_BLOCK_ACCUMULATOR_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BLOCKS: usize = 4_096;
 /// Bounds how long a worker's blocking body read may go without new bytes
 /// before it loops back and rechecks cancellation. The real first-event/idle
 /// deadlines are enforced independently by [`supervise`]'s wall-clock loop, so
@@ -224,6 +226,51 @@ pub(crate) fn check_block_accumulator_cap(
     Ok(())
 }
 
+pub(crate) struct ResponseLimits {
+    total_bytes: usize,
+    max_total_bytes: usize,
+}
+
+impl ResponseLimits {
+    pub(crate) fn new() -> Self {
+        Self::with_total_bytes(MAX_RESPONSE_BYTES)
+    }
+
+    fn with_total_bytes(max_total_bytes: usize) -> Self {
+        Self {
+            total_bytes: 0,
+            max_total_bytes,
+        }
+    }
+
+    pub(crate) fn record_bytes(
+        &mut self,
+        provider: &'static str,
+        bytes: usize,
+    ) -> Result<(), ProviderFailure> {
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        if self.total_bytes > self.max_total_bytes {
+            return Err(invalid_stream(format!(
+                "{provider} response exceeds {} bytes",
+                self.max_total_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn check_response_block_cap(
+    provider: &'static str,
+    blocks: usize,
+) -> Result<(), ProviderFailure> {
+    if blocks > MAX_RESPONSE_BLOCKS {
+        return Err(invalid_stream(format!(
+            "{provider} response exceeds {MAX_RESPONSE_BLOCKS} content blocks"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn cancelled(provider: &str) -> ProviderFailure {
     ProviderFailure::new(
         FailureClass::Cancelled,
@@ -287,14 +334,65 @@ pub(crate) fn target_scope(target: &ProviderTarget, kind: FailureScopeKind) -> F
     FailureScope { kind, id }
 }
 
-/// `Retry-After` is delta-seconds in every response these providers send; an
-/// HTTP-date form is left unparsed rather than guessed at.
 pub(crate) fn parse_retry_after_ms(value: &str) -> Option<u64> {
-    value
+    parse_retry_after_ms_at(value, std::time::SystemTime::now())
+}
+
+fn parse_retry_after_ms_at(value: &str, now: std::time::SystemTime) -> Option<u64> {
+    if let Some(ms) = value
         .trim()
         .parse::<u64>()
         .ok()
         .and_then(|seconds| seconds.checked_mul(1000))
+    {
+        return Some(ms);
+    }
+    let fields: Vec<&str> = value.split_whitespace().collect();
+    if fields.len() != 6 || !fields[0].ends_with(',') || fields[5] != "GMT" {
+        return None;
+    }
+    let day = fields[1].parse::<u32>().ok()?;
+    let month = match fields[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = fields[3].parse::<i32>().ok()?;
+    let mut clock = fields[4].split(':');
+    let hour = clock.next()?.parse::<u32>().ok()?;
+    let minute = clock.next()?.parse::<u32>().ok()?;
+    let second = clock.next()?.parse::<u32>().ok()?;
+    if clock.next().is_some() || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let timestamp = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour * 3_600 + minute * 60 + second))?;
+    let now = i64::try_from(now.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    u64::try_from(timestamp.saturating_sub(now).max(0))
+        .ok()?
+        .checked_mul(1000)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
 }
 
 #[cfg(test)]
@@ -318,6 +416,25 @@ mod tests {
                 vendor: "openai".into(),
                 id: "gpt-5.6-sol".into(),
             },
+        }
+    }
+
+    #[test]
+    fn provider_response_total_bytes_and_blocks_are_bounded() {
+        let mut limits = ResponseLimits::with_total_bytes(10);
+        for line in [b"data".as_slice(), b": ok", b"\n\n"] {
+            limits.record_bytes("Test", line.len()).unwrap();
+        }
+        let bytes = limits.record_bytes("Test", 1).unwrap_err();
+        assert_eq!(bytes.class, FailureClass::InvalidStream);
+
+        for blocks in 0..=MAX_RESPONSE_BLOCKS + 1 {
+            let result = check_response_block_cap("Test", blocks);
+            if blocks <= MAX_RESPONSE_BLOCKS {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().class, FailureClass::InvalidStream);
+            }
         }
     }
 
@@ -346,8 +463,12 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_seconds_convert_and_http_dates_stay_unparsed() {
+    fn retry_after_http_date_is_parsed() {
         assert_eq!(parse_retry_after_ms(" 3 "), Some(3_000));
-        assert_eq!(parse_retry_after_ms("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_792_567_677);
+        assert_eq!(
+            parse_retry_after_ms_at("Wed, 21 Oct 2026 07:28:00 GMT", now),
+            Some(3_000)
+        );
     }
 }

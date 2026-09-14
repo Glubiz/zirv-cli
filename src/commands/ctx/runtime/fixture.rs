@@ -129,6 +129,8 @@ pub struct FixtureFailure {
     pub message: String,
     #[serde(default)]
     pub retryable: bool,
+    #[serde(default)]
+    pub after_ms: Option<u64>,
 }
 
 /// A whole scripted provider script.
@@ -266,7 +268,7 @@ impl ProviderAdapter for FixtureProvider {
             );
             error.retry = RetryHint {
                 retryable: failure.retryable,
-                after_ms: None,
+                after_ms: failure.after_ms,
             };
             return Err(error);
         }

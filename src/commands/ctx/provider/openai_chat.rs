@@ -32,11 +32,11 @@ use super::adapter::{
 };
 use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
-use super::probe::{is_local_http_host, is_plaintext_non_loopback};
+use super::probe::{is_local_http_host, is_plaintext_non_loopback, join_url_path};
 use super::profiles::{CredentialClass, RouteProfile, profile_for, validate_extensions};
 use super::transport::{
-    MAX_ERROR_BODY_BYTES, StreamTimeouts, WORKER_READ_POLL, parse_retry_after_ms, read_sse_line,
-    supervise, target_scope,
+    MAX_ERROR_BODY_BYTES, ResponseLimits, StreamTimeouts, WORKER_READ_POLL,
+    check_response_block_cap, parse_retry_after_ms, read_sse_line, supervise, target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId, Support};
 use crate::commands::ctx::config::EnvLookup;
@@ -238,7 +238,7 @@ impl OpenAiChatAdapter {
     fn request_url(&self) -> String {
         let base = self.target.base_url.trim_end_matches('/');
         match &self.endpoint {
-            ChatEndpoint::Compatible => format!("{base}{}", self.profile.path),
+            ChatEndpoint::Compatible => join_url_path(base, self.profile.path),
             ChatEndpoint::Azure {
                 deployment,
                 api_version,
@@ -379,6 +379,15 @@ impl ProviderAdapter for OpenAiChatAdapter {
 
     fn target(&self) -> &ProviderTarget {
         &self.target
+    }
+
+    fn redact_failure(&self, failure: ProviderFailure) -> ProviderFailure {
+        let secrets: Vec<&str> = self
+            .credential
+            .iter()
+            .map(|credential| credential.secret.expose())
+            .collect();
+        super::adapter::redact_failure(failure, &secrets)
     }
 
     fn stream(
@@ -755,11 +764,14 @@ fn parse_sse<R: BufRead>(
     let mut data = String::new();
     let mut line = String::new();
     let mut done = false;
+    let mut limits = ResponseLimits::new();
     loop {
         let read = read_sse_line(&mut reader, &mut line, PROVIDER, cancellation, target)?;
+        limits.record_bytes(PROVIDER, read)?;
         if read == 0 {
             if !data.is_empty() && !done {
                 process_chunk(&data, &mut accumulator, sink, target)?;
+                check_response_block_cap(PROVIDER, accumulator.tool_calls.len() + 2)?;
             }
             break;
         }
@@ -770,6 +782,7 @@ fn parse_sse<R: BufRead>(
                     done = true;
                 } else {
                     process_chunk(&data, &mut accumulator, sink, target)?;
+                    check_response_block_cap(PROVIDER, accumulator.tool_calls.len() + 2)?;
                 }
                 data.clear();
             }
@@ -938,7 +951,7 @@ fn finish_response(
             text: accumulator.text,
         });
     }
-    let truncated = reason == "length";
+    let non_executable = matches!(reason.as_str(), "length" | "content_filter");
     let mut omitted: Vec<String> = Vec::new();
     for (index, state) in accumulator.tool_calls {
         if state.id.is_empty() || state.name.is_empty() {
@@ -946,7 +959,7 @@ fn finish_response(
                 "streamed tool call {index} never named its id and function"
             )));
         }
-        if truncated {
+        if non_executable {
             // A truncated turn never hands the runtime an executable call.
             omitted.push(state.id);
             continue;
