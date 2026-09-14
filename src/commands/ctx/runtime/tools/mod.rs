@@ -85,9 +85,11 @@ fn resolve_frontend_runner(
             .collect()
     };
 
+    // Canonical paths only: a symlinked runner (Homebrew, nvm) must be launched
+    // and admitted by the target it resolves to, or isolation cannot exec it.
     for candidate in candidates {
         if frontend_runner_is_executable(&candidate) {
-            return Ok(candidate);
+            return Ok(std::fs::canonicalize(&candidate)?);
         }
         #[cfg(windows)]
         for extension in std::env::var("PATHEXT")
@@ -97,7 +99,7 @@ fn resolve_frontend_runner(
         {
             let extended = PathBuf::from(format!("{}{extension}", candidate.display()));
             if frontend_runner_is_executable(&extended) {
-                return Ok(extended);
+                return Ok(std::fs::canonicalize(&extended)?);
             }
         }
     }
@@ -3956,6 +3958,10 @@ mod tests {
         let state = StateDir::from_root(repo.join("state"));
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&bin).expect("bin");
+        // The runner is found through a symlinked PATH entry, as with Homebrew
+        // or nvm; it must be launched and admitted by its canonical target.
+        let bin_link = repo.join("bin-link");
+        std::os::unix::fs::symlink(&bin, &bin_link).expect("bin symlink");
         let observed = repo.join("observed");
         let runner = bin.join("frontend-fixture");
         std::fs::write(
@@ -3979,7 +3985,7 @@ mod tests {
         .expect("sandbox fixture");
         std::fs::set_permissions(&sandbox, std::fs::Permissions::from_mode(0o755))
             .expect("sandbox executable");
-        let path = bin.to_string_lossy();
+        let path = bin_link.to_string_lossy();
         let _env = crate::commands::ctx::testenv::VarGuard::set(&[
             ("PATH", Some(path.as_ref())),
             ("FRONTEND_PARENT_VALUE", Some("must-not-leak")),
