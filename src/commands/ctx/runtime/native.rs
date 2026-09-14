@@ -6084,7 +6084,10 @@ mod tests {
         );
         assert_eq!(status.status, NativeStatus::LimitReached);
         assert_eq!(status.limit, Some(LimitKind::Tokens));
-        assert_eq!(status.exit_code, super::super::super::exec::EXIT_BUDGET_EXHAUSTED);
+        assert_eq!(
+            status.exit_code,
+            super::super::super::exec::EXIT_BUDGET_EXHAUSTED
+        );
     }
 
     /// Issue #637: the soft checkpoint fires once, as evidence, strictly
@@ -7784,7 +7787,9 @@ mod tests {
         let lookup = |k: &str| env.get(k).cloned();
         let provider = format!(
             "fixture:{}",
-            fixture_root().join("compaction-overflow-recovery.json").display()
+            fixture_root()
+                .join("compaction-overflow-recovery.json")
+                .display()
         );
         let fixture_tools = fixture_root().join("tools-investigate-edit-test.json");
 
