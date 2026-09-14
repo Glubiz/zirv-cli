@@ -2972,7 +2972,7 @@ impl super::rollover_runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
         }
         Err(super::rollover_runtime::SuccessorRefusal::LaunchFailed(
             format!(
-                "`zirv ctx wrap` supervises a harness child and has no {} backend; the seat is              parked on its current harness with its handoff stored, rather than swapped onto a              harness this rollover never chose",
+                "`zirv ctx wrap` supervises a harness child and has no {} backend; the seat                  is parked on its current harness with its handoff stored, rather than swapped                  onto a harness this rollover never chose",
                 plan.to.as_str()
             ),
         ))
