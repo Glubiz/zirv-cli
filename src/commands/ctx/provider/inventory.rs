@@ -357,6 +357,19 @@ impl Inventory {
                         .push("no credential declared (unauthenticated endpoint)".into());
                     None
                 }
+                // Issue #643: a route whose profile marks the credential
+                // optional (`CredentialClass::is_optional`, e.g. vllm) used
+                // to block the probe the same way a genuinely required,
+                // missing credential does -- staying at `Configured` with no
+                // network attempt at all. An optional credential that fails
+                // to resolve is an advisory (kept in `problems` so the gap is
+                // still visible), never a reason to skip probing: it must
+                // reach `reachable` exactly like a credential-less
+                // (`LocalNone`) profile such as ollama already does.
+                Err(problem) if profile.is_some_and(|profile| profile.credential.is_optional()) => {
+                    report.problems.push(problem);
+                    None
+                }
                 Err(problem) => {
                     report.problems.push(problem);
                     routes.push(report);
@@ -950,6 +963,45 @@ mod tests {
         assert_eq!(
             rejected.routes[0].problems,
             ["endpoint requires a credential; declare `account.local.credential`"]
+        );
+    }
+
+    /// Issue #643: `vllm` (`CredentialClass::LocalOptional`) with no
+    /// credential configured used to stay at `Configured` and never probe --
+    /// the missing-credential error blocked the probe the same way a
+    /// genuinely required credential would. It must probe exactly like a
+    /// credential-less (`LocalNone`, e.g. ollama) profile: reach `reachable`,
+    /// with the missing credential downgraded to an advisory in `problems`.
+    #[test]
+    fn optional_credential_profile_still_probes_with_no_credential_configured() {
+        let cfg = config(
+            "schema=1\n[endpoint.local]\nprovider='openai-compatible'\nbase_url='http://127.0.0.1:8000'\nvendor='vllm'\n[account.local]\nprovider='openai-compatible'\n[route.local]\naccount='local'\nendpoint='local'\nmodel='model'\n",
+        );
+        let offline = Inventory::build(&cfg, &|_| None, &FakeStore::default(), 0, None);
+        assert_eq!(offline.routes[0].state, RouteState::Configured);
+
+        let live = Inventory::build(
+            &cfg,
+            &|_| None,
+            &FakeStore::default(),
+            0,
+            Some(&FakeProbe::new(ProbeResult::Http {
+                status: 200,
+                model_ids: vec!["model".into()],
+            })),
+        );
+        assert_eq!(
+            live.routes[0].state,
+            RouteState::Reachable,
+            "an optional credential must probe like a credential-less profile, not block at Configured"
+        );
+        assert!(
+            live.routes[0]
+                .problems
+                .iter()
+                .any(|problem| problem.contains("credential") && problem.contains("missing")),
+            "the missing optional credential stays visible as an advisory: {:?}",
+            live.routes[0].problems
         );
     }
 
