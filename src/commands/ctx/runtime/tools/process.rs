@@ -1114,7 +1114,8 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let state = StateDir::from_root(dir.path().join("state"));
-            let mut manager = ProcessManager::new(state, dir.path().to_path_buf(), limits());
+            let mut manager =
+                ProcessManager::new(state.clone(), dir.path().to_path_buf(), limits());
 
             match scenario {
                 Scenario::UnpolledTimeout => {
@@ -1143,30 +1144,49 @@ mod tests {
                             &start,
                         )
                         .expect("start");
-                    let mut delivered = 0usize;
+                    // Poll until the reader itself reports it crossed the
+                    // ceiling -- no running byte total accumulated across
+                    // polls here. Review round 2 (CI #630): summing
+                    // `snap.output`/`snap.pending_output_bytes` per poll
+                    // proved non-deterministic (over-counted under some
+                    // schedulings, on macOS and in the Linux serial run).
+                    // The persisted capture FILE is the unambiguous source
+                    // of truth for total bytes instead: `drain` appends
+                    // every consumed chunk's full bytes to it exactly once,
+                    // via the same channel `try_recv` that removes each
+                    // chunk as it is read, regardless of the inline display
+                    // budget.
                     let mut truncated = false;
                     for _ in 0..40 {
                         let snap = manager.poll(&snapshot.handle).expect("poll");
-                        delivered += snap
-                            .output
-                            .iter()
-                            .map(|chunk| chunk.byte_len)
-                            .sum::<usize>()
-                            + snap.pending_output_bytes;
-                        truncated |= snap.stream_truncated;
+                        if snap.stream_truncated {
+                            truncated = true;
+                            break;
+                        }
                         std::thread::sleep(Duration::from_millis(50));
                     }
-                    assert!(
-                        delivered <= MAX_STREAM_BYTES + 8192,
-                        "the reader must stop at the byte ceiling instead of buffering \
-                         the whole 9 MB, single-line stream unbounded: delivered {delivered}"
-                    );
                     assert!(
                         truncated,
                         "hitting the byte ceiling must be surfaced on the snapshot, not silent \
                          (review round 1 on #583)"
                     );
-                    let _ = manager.terminate(&snapshot.handle);
+                    let stopped = manager.terminate(&snapshot.handle).expect("terminate");
+                    let output_id = stopped.output_id.clone().expect("captured output id");
+                    let output_dir = std::fs::read_dir(state.outputs())
+                        .expect("outputs")
+                        .next()
+                        .expect("repository output directory")
+                        .expect("repository output entry")
+                        .path();
+                    let captured_len =
+                        std::fs::metadata(output_dir.join(format!("{output_id}.log")))
+                            .expect("captured output file")
+                            .len() as usize;
+                    assert!(
+                        captured_len <= MAX_STREAM_BYTES + 8192,
+                        "the persisted capture must stop at the byte ceiling instead of the \
+                         whole 9 MB, single-line stream unbounded: captured {captured_len}"
+                    );
                 }
                 Scenario::DescendantIgnoresTermination => {
                     let start = args(dir.path(), "descendant-survives");
