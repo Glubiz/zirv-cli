@@ -3208,6 +3208,16 @@ impl NativePaneRuntime {
         if body.is_empty() {
             return;
         }
+        // An observer pane offers nothing that steers a worker, the mailbox
+        // included: the same rule the composer hint, submit, interrupt and
+        // approval paths apply.
+        if self.link.is_some() && self.presentation.observer {
+            self.notice = Some(
+                "follow-up unavailable: this pane holds no controller seat (observer mode)"
+                    .to_string(),
+            );
+            return;
+        }
         // Review finding 2 (PR #544): route through the same current-session
         // guard a composer submit uses (finding 1) rather than calling
         // `delegation::send` unconditionally. `delegation::send` addresses
