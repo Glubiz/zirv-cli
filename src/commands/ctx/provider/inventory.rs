@@ -176,6 +176,34 @@ pub(crate) fn resolve_model(
     vendor_slug: &str,
     requested: &str,
 ) -> Result<(ModelId, Option<String>), ModelResolutionError> {
+    // Issue #596 (roadmap N13): a vendor with no catalogue rungs at all --
+    // every local-compatible profile (`ollama`, `lmstudio`, `vllm`), and any
+    // other vendor slug this catalogue does not carry -- has no fixed model
+    // lineup for a `vendor/model` PREFIX to mean anything against. The
+    // configured id is opaque and stays exactly as written, slashes and all
+    // (Hugging-Face-style ids such as `Qwen/model` are the common case), so
+    // the vendor-prefix mismatch check below -- which exists only to catch a
+    // model accidentally written for a DIFFERENT, catalogued vendor's own
+    // `vendor/model` convention -- never runs for one. `nonempty_model_name`
+    // still strips a genuine `<this vendor>/` prefix and still catches an
+    // empty model name, so `vllm/` alone is still refused and
+    // `vllm/Qwen/model` still strips down to the opaque `Qwen/model`.
+    let catalogued_vendor = crate::commands::ctx::catalogue::vendor(vendor_slug)
+        .filter(|vendor| !vendor.rungs.is_empty());
+    let Some(vendor) = catalogued_vendor else {
+        let model_name = nonempty_model_name(vendor_slug, requested).map_err(|vendor_prefix| {
+            ModelResolutionError::EmptyModel {
+                vendor_prefix: vendor_prefix.map(str::to_string),
+            }
+        })?;
+        return Ok((
+            ModelId {
+                vendor: vendor_slug.to_string(),
+                id: model_name.to_string(),
+            },
+            Some("not in the catalogue; declared by the operator".into()),
+        ));
+    };
     if let Some((named_vendor, _)) = requested.split_once('/')
         && !named_vendor.eq_ignore_ascii_case(vendor_slug)
     {
@@ -192,24 +220,6 @@ pub(crate) fn resolve_model(
         }
     })?;
     let needle = model_name.to_ascii_lowercase();
-    let Some(vendor) = crate::commands::ctx::catalogue::vendor(vendor_slug) else {
-        return Ok((
-            ModelId {
-                vendor: vendor_slug.to_string(),
-                id: model_name.to_string(),
-            },
-            Some("not in the catalogue; declared by the operator".into()),
-        ));
-    };
-    if vendor.rungs.is_empty() {
-        return Ok((
-            ModelId {
-                vendor: vendor_slug.to_string(),
-                id: model_name.to_string(),
-            },
-            Some("not in the catalogue; declared by the operator".into()),
-        ));
-    }
     if let Some(rung) = vendor.rungs.iter().find(|rung| {
         rung.id.eq_ignore_ascii_case(model_name) || rung.alias.eq_ignore_ascii_case(model_name)
     }) {
@@ -646,6 +656,48 @@ mod tests {
         assert!(ambiguous.to_string().contains("gpt-5.6-terra"));
         let unknown = resolve_model(&route, &endpoint, "anthropic", "unknown-alias").unwrap_err();
         assert!(unknown.to_string().contains("claude-sonnet-5"));
+    }
+
+    /// Issue #596 (roadmap N13): a local compatible endpoint's model id is
+    /// opaque -- there is no catalogue rung a `vendor/model` prefix could
+    /// mean anything against for `ollama`/`lmstudio`/`vllm` -- so a
+    /// Hugging-Face-style slash-qualified id like `Qwen/model` must resolve
+    /// unchanged rather than being rejected as naming a mismatched vendor.
+    /// Covers both `resolve_model` directly (what `NativeConfig::validate`
+    /// calls at load time) and `resolve_target` (what an actual dispatch
+    /// calls), for all three local vendors.
+    #[test]
+    fn local_profile_accepts_slash_qualified_opaque_model_id() {
+        for vendor in ["ollama", "lmstudio", "vllm"] {
+            let route = RouteId::new("work").unwrap();
+            let endpoint = EndpointId::new(vendor).unwrap();
+            let (model, note) = resolve_model(&route, &endpoint, vendor, "Qwen/model")
+                .unwrap_or_else(|error| panic!("vendor {vendor} must accept it: {error}"));
+            assert_eq!(model.id, "Qwen/model", "vendor {vendor}");
+            assert_eq!(model.vendor, vendor);
+            assert!(
+                note.is_some(),
+                "vendor {vendor}: opaque local ids are unrewritten catalogue misses"
+            );
+
+            let config: NativeConfig = toml::from_str(&format!(
+                "schema=1\n[policy]\nallowed_routes=['work']\n\
+                 [account.work]\nprovider='openai-compatible'\n\
+                 [endpoint.local]\nprovider='openai-compatible'\nvendor='{vendor}'\n\
+                 base_url='http://127.0.0.1:8000'\n\
+                 [route.work]\naccount='work'\nendpoint='local'\nmodel='Qwen/model'\n"
+            ))
+            .unwrap();
+            let (target, _credential) = super::super::adapter::resolve_target(
+                &config,
+                &route,
+                &|_| None,
+                &FakeStore::default(),
+                0,
+            )
+            .unwrap_or_else(|error| panic!("vendor {vendor} dispatch must resolve: {error}"));
+            assert_eq!(target.model.id, "Qwen/model", "vendor {vendor}");
+        }
     }
 
     #[test]
