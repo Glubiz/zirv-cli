@@ -1983,7 +1983,22 @@ the parent's session authority.
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
 honest against the real command surface and source tree: every command verb
 and every model-calling call site in `src/` has a named implementation
-owner, checked on every run. The architecture decision behind all of this is
+owner, checked on every run. Its sibling `ZCHK-NATIVE-PARITY` keeps
+[`docs/design/native-parity.md`](docs/design/native-parity.md) -- the
+release-blocking parity matrix -- honest in turn: every capability the
+inventory knows about has a row naming the native path, the legacy path, the
+provider/platform requirement, the evidence, and the *rung* that says how
+strong the claim is (`unit`, `integration`, `ci-matrix`, `live-validated`,
+`legacy-only`). A missing row, a cited test that exists nowhere in `src/`, a
+CI step that is not in `ci.yaml`, an uncommitted `docs/benchmarks/` pointer,
+a `live-validated` claim with no recording, an evidence-free row that is not
+named as a release blocker, or a `legacy-only` row that does not say why --
+each fails the build, so no row can claim more than its evidence. What that
+record is worth, what is deliberately *not* verified, the pre-declared
+non-regression targets and the release decision (the default stays the
+harness; native is opt-in) are in
+[`docs/design/2026-09-14-native-release-evidence.md`](docs/design/2026-09-14-native-release-evidence.md).
+The architecture decision behind all of this is
 recorded in
 [`docs/design/2026-09-11-native-runtime-contracts.md`](docs/design/2026-09-11-native-runtime-contracts.md).
 
