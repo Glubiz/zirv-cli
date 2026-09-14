@@ -15,6 +15,7 @@ pub mod team;
 mod workflow;
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
@@ -55,6 +56,105 @@ use crate::commands::ctx::state::{self, StateDir};
 
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_PROCESSES: usize = 16;
+
+fn resolve_frontend_runner(
+    program: &OsStr,
+    cwd: &Path,
+) -> crate::commands::ctx::CtxResult<PathBuf> {
+    let program_path = Path::new(program);
+    let has_directory = program_path.components().count() > 1;
+    let candidates = if has_directory {
+        vec![if program_path.is_absolute() {
+            program_path.to_path_buf()
+        } else {
+            cwd.join(program_path)
+        }]
+    } else {
+        let parent_cwd = std::env::current_dir()?;
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| {
+                let directory = if directory.is_absolute() {
+                    directory
+                } else {
+                    parent_cwd.join(directory)
+                };
+                directory.join(program_path)
+            })
+            .collect()
+    };
+
+    for candidate in candidates {
+        if frontend_runner_is_executable(&candidate) {
+            return Ok(candidate);
+        }
+        #[cfg(windows)]
+        for extension in std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+        {
+            let extended = PathBuf::from(format!("{}{extension}", candidate.display()));
+            if frontend_runner_is_executable(&extended) {
+                return Ok(extended);
+            }
+        }
+    }
+    Err(format!(
+        "frontend runner '{}' is unavailable",
+        program.to_string_lossy()
+    )
+    .into())
+}
+
+fn frontend_runner_is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn fixed_frontend_path(runner: &Path) -> crate::commands::ctx::CtxResult<String> {
+    let mut directories = vec![
+        runner
+            .parent()
+            .ok_or("frontend runner has no parent directory")?
+            .to_path_buf(),
+    ];
+    #[cfg(unix)]
+    directories.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+    #[cfg(windows)]
+    {
+        let windows = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        directories.extend([
+            windows.join("System32"),
+            windows.clone(),
+            windows.join("System32").join("Wbem"),
+        ]);
+    }
+    let mut unique = Vec::new();
+    for directory in directories {
+        if !unique.contains(&directory) {
+            unique.push(directory);
+        }
+    }
+    std::env::join_paths(unique)
+        .map_err(|error| error.to_string())?
+        .into_string()
+        .map_err(|_| "frontend runner path is not valid Unicode".into())
+}
 
 pub const FILE_READ: &str = "file_read";
 pub const DIRECTORY_LIST: &str = "directory_list";
@@ -1694,25 +1794,29 @@ impl NativeToolClient {
         &self,
         command: std::process::Command,
     ) -> crate::commands::ctx::CtxResult<std::process::Child> {
+        let cwd = command
+            .get_current_dir()
+            .ok_or("frontend server command has no working directory")?;
+        let runner = resolve_frontend_runner(command.get_program(), cwd)?;
+        let mut environment: BTreeMap<String, String> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        environment.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+        environment.insert("PATH".into(), fixed_frontend_path(&runner)?);
         let invocation = ProcessInvocation::Argv {
-            program: command.get_program().to_string_lossy().into_owned(),
+            program: runner.to_string_lossy().into_owned(),
             args: command
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect(),
-            cwd: command
-                .get_current_dir()
-                .ok_or("frontend server command has no working directory")?
-                .to_path_buf(),
-            environment: command
-                .get_envs()
-                .filter_map(|(key, value)| {
-                    Some((
-                        key.to_string_lossy().into_owned(),
-                        value?.to_string_lossy().into_owned(),
-                    ))
-                })
-                .collect(),
+            cwd: cwd.to_path_buf(),
+            environment,
         };
         let action = ExecutionAction::Process {
             invocation,
@@ -3848,24 +3952,38 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = std::fs::canonicalize(root.path()).expect("canonical repo");
         let home = repo.join("home");
+        let bin = repo.join("bin");
         let state = StateDir::from_root(repo.join("state"));
         std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&bin).expect("bin");
         let observed = repo.join("observed");
+        let runner = bin.join("frontend-fixture");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nresult=clean\nif [ \"${{FRONTEND_PARENT_VALUE+x}}\" = x ]; then result=leaked; fi\nprintf '%s\\n%s' \"$result\" \"$PATH\" > '{}'\n",
+                observed.display()
+            ),
+        )
+        .expect("runner fixture");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+            .expect("runner executable");
         let sandbox = repo.join("sandbox");
         std::fs::write(
             &sandbox,
             format!(
-                "#!/bin/sh\nresult=clean\nif [ \"${{FRONTEND_PARENT_VALUE+x}}\" = x ]; then result=leaked; fi\nfor arg in \"$@\"; do [ \"$arg\" = FRONTEND_PARENT_VALUE ] && result=leaked; done\nprintf %s \"$result\" > '{}'\n",
-                observed.display()
+                "#!/bin/sh\nrunner_root=missing\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --ro-bind) [ \"$2\" = '{}' ] && runner_root=present; shift 3 ;;\n    --setenv) export \"$2=$3\"; shift 3 ;;\n    --) shift; [ \"$runner_root\" = present ] || exit 90; exec \"$@\" ;;\n    *) shift ;;\n  esac\ndone\nexit 91\n",
+                bin.display()
             ),
         )
         .expect("sandbox fixture");
         std::fs::set_permissions(&sandbox, std::fs::Permissions::from_mode(0o755))
             .expect("sandbox executable");
-        let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
-            "FRONTEND_PARENT_VALUE",
-            Some("must-not-leak"),
-        )]);
+        let path = bin.to_string_lossy();
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("PATH", Some(path.as_ref())),
+            ("FRONTEND_PARENT_VALUE", Some("must-not-leak")),
+        ]);
         let policy = EffectivePolicy {
             network: Some(Stance::Allow),
             ..EffectivePolicy::default()
@@ -3910,7 +4028,10 @@ mod tests {
         assert!(child.wait().expect("wait").success());
         assert_eq!(
             std::fs::read_to_string(&observed).expect("observation"),
-            "clean"
+            format!(
+                "clean\n{}",
+                fixed_frontend_path(&runner).expect("fixed path")
+            )
         );
 
         std::fs::remove_file(&observed).expect("clear observation");
