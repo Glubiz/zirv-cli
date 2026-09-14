@@ -2802,9 +2802,9 @@ pub fn journal_route_identity(
     role: &str,
     env: EnvLookup<'_>,
 ) -> CtxResult<RouteIdentity> {
+    use super::super::provider::adapter::resolve_target;
     use super::super::provider::config::NativeConfig;
     use super::super::provider::credential::OsStore;
-    use super::super::provider::{RouteId, adapter::resolve_target};
     use super::super::state::now_secs;
 
     let home = crate::utils::home_dir()?;
@@ -2815,12 +2815,7 @@ pub fn journal_route_identity(
             NativeConfig::operator_path(&home).display()
         )
     })?;
-    let route_id = match route {
-        Some(name) => RouteId::new(name)?,
-        None => native.roles.get(role).cloned().ok_or_else(|| {
-            format!("native runtime: no route for role `{role}`; add a [roles] entry")
-        })?,
-    };
+    let route_id = resolve_role_route(&native, route, role)?;
     let (target, _) = resolve_target(&native, &route_id, env, &OsStore::default(), now_secs())?;
     Ok(RouteIdentity {
         route: target.route.clone(),
