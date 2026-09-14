@@ -395,6 +395,8 @@ fn run_native_chat<E: Write>(
             route: None,
             writing: true,
             provider: None,
+            seat: None,
+            initial_input: None,
         }),
         args.force_pace,
     )

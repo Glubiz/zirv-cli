@@ -3871,13 +3871,21 @@ fn push_error(errors: &mut ErrorLog, message: String) {
 
 /// The dashboard's own successor backend (issue #552).
 ///
-/// A harness successor is the in-place pty swap `Pane::handover` has always
-/// performed. A NATIVE successor has no backend at this seam yet: a native
-/// pane is opened by `Pane::spawn_native`, which mints its own session rather
-/// than replacing a live pane's child in place, so claiming it here would be
-/// claiming a mechanism that does not exist. It is a typed `NoBackend`
-/// refusal instead, which leaves the source holding the seat with all of its
-/// durable state -- `rollover_runtime`'s own item 7.
+/// Two backends, one per successor runtime:
+///
+/// * a HARNESS successor is the in-place pty swap `Pane::handover` has always
+///   performed -- one child replaced under one pane, the pane's own identity
+///   untouched;
+/// * a NATIVE successor cannot be an in-place child replacement, because a
+///   native pane has no child: it is an in-process session with its own
+///   journal. So it is opened first (`Pane::spawn_native`, on THIS seat's
+///   short id and the committed generation) and the source pane is retired
+///   only once the successor exists. Exactly one of the two is ever live: the
+///   successor is built before anything is taken away, and a failure to build
+///   it leaves the source untouched and holding the seat.
+///
+/// Nothing here is `#[cfg(unix)]`; both halves compile and run on every
+/// platform CI covers.
 struct PaneSuccessorLauncher<'a> {
     pane: &'a mut Pane,
     cfg: &'a CtxConfig,
@@ -3886,6 +3894,61 @@ struct PaneSuccessorLauncher<'a> {
     role: prompt::PromptRole,
     repo: &'a Path,
     size: (u16, u16),
+    /// The two `NativeDashboardSpec` fields a successor cannot infer.
+    /// `Default` is what every production call site passes; a deterministic
+    /// test opens a REAL successor pane against `fixture::FixtureProvider`
+    /// in a bare temp repo, the same escape `NativeDashboardSpec::provider`
+    /// already documents for itself.
+    native: NativeSuccessorSpec,
+}
+
+/// See [`PaneSuccessorLauncher::native`].
+struct NativeSuccessorSpec {
+    /// Whether the successor acquires the per-tree writer permit. A seat that
+    /// was writing keeps writing, which is every production rollover.
+    writing: bool,
+    provider: Option<String>,
+}
+
+impl Default for NativeSuccessorSpec {
+    fn default() -> Self {
+        Self {
+            writing: true,
+            provider: None,
+        }
+    }
+}
+
+/// What a native successor is told first: the handoff packet the source's own
+/// context was distilled into, every acknowledged input the source never
+/// delivered, and the reconciliation it is halted on.
+///
+/// Criterion 2 is the reason acknowledged input is spelled out here rather
+/// than assumed to be in the packet: the packet is a SUMMARY, and an
+/// operator's undelivered instruction is not something a summary may lose.
+fn native_successor_input(
+    plan: &super::rollover_runtime::SuccessorPlan,
+    note: &handoff::Handoff,
+    cfg: &CtxConfig,
+) -> String {
+    let mut text = super::wrap::restart_prompt(note, &cfg.screen.thresholds());
+    if !plan.acknowledged_input.is_empty() {
+        text.push_str(
+            "\n\nAcknowledged input the previous session never answered. Treat each line as an \
+             instruction you still owe:\n",
+        );
+        for input in &plan.acknowledged_input {
+            text.push_str("- ");
+            text.push_str(input);
+            text.push('\n');
+        }
+    }
+    if let Some(halt) = &plan.halted_for {
+        text.push_str("\n\nSTOP AND RECONCILE FIRST: ");
+        text.push_str(halt);
+        text.push('\n');
+    }
+    text
 }
 
 impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
@@ -3895,21 +3958,80 @@ impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
     ) -> Result<String, super::rollover_runtime::SuccessorRefusal> {
         use super::rollover_runtime::SuccessorRefusal;
 
-        if plan.to == super::runtime::RuntimeKind::Native {
-            return Err(SuccessorRefusal::NoBackend {
-                runtime: plan.to,
-                reason: "a dashboard pane replaces a harness child in place; opening a native \
-                         session in its place is not yet implemented, so the source keeps the \
-                         seat"
-                    .to_string(),
-            });
+        if plan.to != super::runtime::RuntimeKind::Native {
+            // A native SOURCE has no harness child to swap in place, and this
+            // seam has no wrapped-successor spawn of its own (a pty pane is
+            // built by `Pane::spawn` from an argv `Pane::handover` derives
+            // internally). Named honestly rather than surfaced as an opaque
+            // launch failure; the source keeps the seat either way.
+            if self.pane.is_native() {
+                return Err(SuccessorRefusal::NoBackend {
+                    runtime: plan.to,
+                    reason: "a native pane has no harness child to hand over, and this seam                              cannot yet spawn a wrapped successor beside it"
+                        .to_string(),
+                });
+            }
+            return self
+                .pane
+                .handover(
+                    self.cfg, self.req, self.note, self.role, self.repo, self.size,
+                )
+                .map(|()| self.pane.session_id().to_string())
+                .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()));
         }
-        self.pane
-            .handover(
-                self.cfg, self.req, self.note, self.role, self.repo, self.size,
-            )
-            .map(|()| self.pane.session_id().to_string())
-            .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()))
+
+        // Built BEFORE anything is taken away: a failure here leaves the
+        // source pane exactly as it was, still holding the seat with all of
+        // its durable state (`rollover_runtime`'s own item 7).
+        // The successor's session must be created in the SAME state
+        // directory this pane is registered in: `spawn_interactive` resolves
+        // its own from the environment, and a bare `env_from_process()` would
+        // send the journal somewhere the pane then replays nothing from.
+        let state = self.pane.state_dir().clone();
+        let state_root = state.root().to_str().map(str::to_string);
+        let process_env = super::config::env_from_process();
+        let env = move |key: &str| {
+            if key == super::state::STATE_ENV {
+                return state_root.clone();
+            }
+            process_env(key)
+        };
+        let successor = Pane::spawn_native(
+            self.cfg,
+            &state,
+            &env,
+            self.repo,
+            self.pane.verb(),
+            self.pane.title().to_string(),
+            self.size,
+            native_pane::NativeDashboardSpec {
+                repo: self.pane.cwd().to_path_buf(),
+                role: self.role.label().to_string(),
+                route: plan.target_route.clone(),
+                writing: self.native.writing,
+                provider: self.native.provider.clone(),
+                // The seat's stable address and the generation `seat::commit`
+                // promoted. This is what keeps mail, nudge and `zirv ctx
+                // status` pointed at the same logical seat across the swap.
+                seat: Some((plan.short.clone(), plan.generation)),
+                initial_input: Some(native_successor_input(plan, self.note, self.cfg)),
+            },
+        )
+        .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()))?;
+
+        // One live successor from here on: the source is swapped out of the
+        // roster and then retired WITHOUT releasing the registry record or
+        // the seat, both of which the successor has just adopted under the
+        // same short id (see `Pane::retire_for_successor`).
+        let session = successor.session_id().to_string();
+        let mut source = std::mem::replace(self.pane, successor);
+        // The SOURCE's own harness quit sequence -- a native source has no
+        // child to ask politely and ignores it.
+        let quit_sequence = adapters::select(Some(source.agent()), &[], self.cfg)
+            .map(|adapter| adapter.quit_sequence().to_string())
+            .unwrap_or_default();
+        source.retire_for_successor(&quit_sequence);
+        Ok(session)
     }
 }
 
@@ -4031,6 +4153,7 @@ fn handover_pane(
         role,
         repo,
         size: (size.1, size.0),
+        native: NativeSuccessorSpec::default(),
     };
     match super::rollover_runtime::launch_successor(
         state,
@@ -6549,6 +6672,8 @@ fn fulfill_spawn_request(
                 // which is the same answer `--mode read-only` produces.
                 writing: req.mode == super::permit::WorkerMode::Writing,
                 provider: None,
+                seat: None,
+                initial_input: None,
             },
         )
         .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
@@ -9247,6 +9372,8 @@ fn spawn_restored_pane(
                 route: None,
                 writing: true,
                 provider: None,
+                seat: None,
+                initial_input: None,
             },
         ) {
             Ok(mut pane) => {
@@ -22504,6 +22631,174 @@ mod tests {
         for pane in &mut panes {
             let _ = pane.shutdown("");
         }
+    }
+
+    /// Issue #552: the two directions with a NATIVE target actually open a
+    /// live native pane, through the production launcher
+    /// (`PaneSuccessorLauncher`, which is what `handover_pane` drives) --
+    /// not a `NoBackend` refusal.
+    ///
+    /// What is asserted is what a successor owes: it exists, it is native, it
+    /// sits in the roster slot the source occupied (so exactly one seat
+    /// holder), it is a NEW conversation, it answers to the seat's own short
+    /// id, it runs under the committed generation, and retiring the source
+    /// did not delete the registry record the successor just wrote.
+    #[test]
+    fn a_native_successor_actually_opens_as_a_live_pane_on_the_same_seat() {
+        use super::super::rollover_runtime::{SuccessorLauncher, plan_successor};
+        use super::super::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_root = tmp.path().join("state");
+        let state = StateDir::from_root(state_root.clone());
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state_root.to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let cfg = CtxConfig::default();
+
+        for source_runtime in [RuntimeKind::Harness, RuntimeKind::Native] {
+            let mut source = if source_runtime == RuntimeKind::Native {
+                Pane::spawn_native(
+                    &cfg,
+                    &state,
+                    &lookup,
+                    repo.path(),
+                    sessions::Verb::Chat,
+                    "seat".to_string(),
+                    (80, 24),
+                    native_pane::NativeDashboardSpec {
+                        repo: repo.path().to_path_buf(),
+                        role: "orchestrator".to_string(),
+                        route: None,
+                        writing: false,
+                        provider: Some(fixture_provider()),
+                        seat: None,
+                        initial_input: None,
+                    },
+                )
+                .expect("a native source pane opens")
+            } else {
+                Pane::spawn(
+                    PaneSpec {
+                        agent_name: "test-agent".to_string(),
+                        argv: trivial_argv(),
+                        role: prompt::PromptRole::Orchestrator,
+                        verb: sessions::Verb::Chat,
+                        session_id: "51111111-2222-4333-8444-555555555555".to_string(),
+                        title: "seat".to_string(),
+                    },
+                    &state,
+                    repo.path(),
+                    repo.path(),
+                    (80, 24),
+                    &[],
+                    true,
+                    pane::DEFAULT_IDLE_QUIET,
+                )
+                .expect("a wrapped source pane opens")
+            };
+
+            let seat_short = source.short().to_string();
+            let source_session = source.session_id().to_string();
+            let plan = super::super::rollover_runtime::SuccessorPlan {
+                acknowledged_input: vec!["finish the migration note".to_string()],
+                ..plan_successor(
+                    source_runtime,
+                    RuntimeKind::Native,
+                    &seat_short,
+                    9,
+                    Some("claude"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let note = handoff::Handoff {
+                task: "carry the seat across".to_string(),
+                ..handoff::Handoff::default()
+            };
+            let req = handover::HandoverRequest {
+                target_agent: "claude".to_string(),
+                target_model: None,
+                force: false,
+                requested_at: 0,
+                interactive: false,
+                automatic: true,
+                generation: Some(9),
+                structural_only: true,
+                resume_session: None,
+                target_runtime: Some(RuntimeKind::Native.as_str().to_string()),
+                target_route: None,
+            };
+            let successor_session = {
+                let mut launcher = PaneSuccessorLauncher {
+                    pane: &mut source,
+                    cfg: &cfg,
+                    req: &req,
+                    note: &note,
+                    role: prompt::PromptRole::Orchestrator,
+                    repo: repo.path(),
+                    size: (24, 80),
+                    native: NativeSuccessorSpec {
+                        // A bare temp repo cannot take a writer lease, and
+                        // this test is about the successor existing at all.
+                        writing: false,
+                        provider: Some(fixture_provider()),
+                    },
+                };
+                launcher.launch(&plan).unwrap_or_else(|e| {
+                    panic!("{source_runtime:?} -> Native must open a pane: {e}")
+                })
+            };
+
+            assert!(
+                source.is_native(),
+                "{source_runtime:?} -> Native must leave a LIVE native pane, not a refusal"
+            );
+            assert!(source.native().is_some(), "with its own native driver");
+            assert_ne!(
+                successor_session, source_session,
+                "a successor is a new conversation, never the source's own"
+            );
+            assert_eq!(
+                source.session_id(),
+                successor_session,
+                "and the pane in the roster slot IS that successor"
+            );
+            assert_eq!(
+                source.short(),
+                seat_short,
+                "the seat's short id is its address and does not move across a rollover"
+            );
+            let seat =
+                super::super::seat::load(&state, &seat_short).expect("the seat still exists");
+            assert_eq!(
+                seat.generation, 9,
+                "the successor runs under the committed generation"
+            );
+            assert_eq!(seat.runtime, RuntimeKind::Native);
+            assert!(
+                sessions::list(&state)
+                    .iter()
+                    .any(|(record, _)| record.short == seat_short),
+                "retiring the source must not delete the record the successor registered"
+            );
+            let _ = source.shutdown("");
+        }
+    }
+
+    fn fixture_provider() -> String {
+        format!(
+            "fixture:{}",
+            super::super::runtime::fixture::fixture_root()
+                .join("helper-answer.json")
+                .display()
+        )
     }
 
     /// Issue #155, Phase 5(a): the depth cap is enforced HERE, at the

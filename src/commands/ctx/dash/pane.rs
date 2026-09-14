@@ -2047,6 +2047,12 @@ impl Pane {
         &self.cwd
     }
 
+    /// The state directory this pane was registered in. Issue #552: a
+    /// rollover successor is opened in the same one the source is in.
+    pub(crate) fn state_dir(&self) -> &StateDir {
+        &self.state_dir
+    }
+
     /// Whether this pane owns its `cwd` as an agent-allocated worktree (see
     /// the [`Pane::owns_cwd`] field).
     pub(crate) fn owns_cwd(&self) -> bool {
@@ -2655,6 +2661,43 @@ impl Pane {
         self.guard.release();
         self.writer_permit.take();
         Ok(())
+    }
+
+    /// Ends this pane because a SUCCESSOR has taken its seat (issue #552).
+    ///
+    /// [`Pane::shutdown`] is the wrong verb for a rollover: it releases the
+    /// registry record and forgets the seat, and both of those now belong to
+    /// the successor, which registered under the SAME short id (a seat's
+    /// address does not move across a rollover -- see
+    /// `sessions::SessionGuard::refresh_session`). So the child is ended and
+    /// the lifecycle released exactly as a shutdown would, and the two things
+    /// the successor owns are deliberately left alone:
+    ///
+    /// * the registry record -- this guard `disown`s it rather than deleting
+    ///   the file the successor just wrote;
+    /// * the seat and its rollover record -- `rollover::forget` would drop the
+    ///   very transaction that put the successor there.
+    ///
+    /// The socket path unpublished is this pane's OWN session id, which the
+    /// successor does not share, so that one is an ordinary release.
+    pub fn retire_for_successor(&mut self, quit_sequence: &str) {
+        if self.done {
+            return;
+        }
+        match &mut self.kind {
+            PaneKind::Wrapped(pty) => {
+                if let Ok(mut writer) = pty.writer.lock() {
+                    let sink: &mut dyn Write = &mut **writer;
+                    let _ = wrap::quit_child(sink, &mut pty.child, quit_sequence, QUIT_GRACE);
+                }
+            }
+            _ => self.finish_native(),
+        }
+        self.done = true;
+        self.release_lifecycle();
+        wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
+        self.guard.disown();
+        self.writer_permit.take();
     }
 
     /// M9: the first half of a *batched* shutdown -- sends this pane's harness
@@ -6329,6 +6372,8 @@ pub(crate) mod tests {
                 route: None,
                 writing: true,
                 provider: Some(provider),
+                seat: None,
+                initial_input: None,
             },
         )
         .expect("spawn native pane");
@@ -6487,6 +6532,8 @@ pub(crate) mod tests {
                     .join("helper-answer.json")
                     .display()
             )),
+            seat: None,
+            initial_input: None,
         }
     }
 

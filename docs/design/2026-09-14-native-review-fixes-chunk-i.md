@@ -66,7 +66,41 @@ successor is admitted **halted** rather than unaware.
 fills both from the runtime it already resolved off the snapshot
 (`runtime_of`), so what a rollover decided is what the swap seam starts.
 `dash::handover_pane` — the dashboard's live swap driver — now goes through
-`launch_successor` with `PaneSuccessorLauncher`.
+`launch_successor` with `PaneSuccessorLauncher`, which carries two backends:
+
+- a **harness** successor is the in-place pty swap `Pane::handover` has always
+  performed;
+- a **native** successor cannot be an in-place child replacement, because a
+  native pane has no child — it is an in-process session with its own journal.
+  So the successor pane is **opened first** (`Pane::spawn_native`) and the
+  source is retired only once it exists. Exactly one of the two is ever live,
+  and a failure to build the successor leaves the source untouched and still
+  holding the seat.
+
+Three small seams make that honest, rather than a new session wearing the old
+one's name:
+
+- `NativeBackend::start_on_seat` starts a brand-new conversation **on an
+  existing seat**: it keeps the seat's stable short id (the address mail,
+  nudge and `zirv ctx status` resolve, which by design does not move across a
+  rollover) and runs under the generation `seat::commit` promoted. The logical
+  session id is still fresh — this is a new conversation, not a resumed one.
+  `RuntimeBackend::start` is now a call to it with no seat.
+- `NativeDashboardSpec::initial_input` carries the handoff packet, every
+  acknowledged input the source never delivered, and the reconciliation the
+  plan is halted on, submitted as the successor's first turn. Acknowledged
+  input is spelled out separately from the packet on purpose: the packet is a
+  summary, and criterion 2 forbids a summary losing an operator's instruction.
+  `NativeDashboardSpec::seat` also forces the in-process spawn — a successor
+  must never attach to whatever a persistent runtime already holds for this
+  repository, which is the conversation the rollover just moved away from.
+- `Pane::retire_for_successor` ends the source without releasing the registry
+  record or forgetting the seat, both of which the successor has adopted under
+  the same short id. `SessionGuard::disown` is what lets the source's guard
+  stop speaking for an address without deleting the file the successor wrote.
+
+Nothing in this half is `#[cfg(unix)]`; both backends compile and run on every
+platform CI covers.
 
 ### #580 — no acknowledged input is ever dropped
 
@@ -104,6 +138,7 @@ fallback at all. The claim itself is refused either way.
 - `checkpoint::tests::portable_checkpoint_preserves_more_than_64_acknowledged_inputs`
 - `native_worker::tests::native_requests_allocate_record_health_and_reconcile_pool_spend`
 - `rollover_runtime::tests::every_rollover_direction_launches_one_successor`
+- `dash::tests::a_native_successor_actually_opens_as_a_live_pane_on_the_same_seat`
 - `agent::tests::the_dashboard_hosting_this_caller_is_preferred_over_a_newer_foreign_one`
 - `agent::tests::a_restarted_hosted_seats_chat_record_still_names_its_dashboard_for_this_repo`
 - `agent::tests::a_foreign_repo_refusal_tries_the_next_live_dashboard_before_running_inline`
@@ -111,15 +146,18 @@ fallback at all. The claim itself is refused either way.
 
 ## What is deferred
 
-- **A native successor has no backend at the dashboard seam.**
-  `PaneSuccessorLauncher` refuses `to == Native` with a typed `NoBackend`,
-  which leaves the source holding the seat with all of its durable state
-  (item 7). A native pane is opened by `Pane::spawn_native`, which mints its
-  own session rather than replacing a live pane's child in place; claiming
-  otherwise here would be claiming a mechanism that does not exist. The
-  direction dispatch, the halt gate, the subagent settlement and the plan are
-  all in place and tested for all four directions — what is missing is one
-  backend.
+- **`native -> harness` has no successor backend at the dashboard seam.**
+  The three directions with either a native target or a wrapped source are
+  live; the fourth is not. `Pane::handover` swaps a harness child *in place*
+  and correctly refuses a native pane (there is no child to swap), and this
+  seam has no wrapped-successor *spawn* of its own — the argv and turn-env a
+  pty pane needs are derived inside `Pane::handover`, not exposed as a
+  standalone builder that `Pane::spawn` could be handed. So the launcher names
+  it as a typed `NoBackend`: the source keeps the seat with all of its durable
+  state (item 7) instead of failing opaquely. The missing seam is exactly one
+  function — lift `Pane::handover`'s argv/turn-env derivation out into
+  something that produces a `PaneSpec` plus env, which the native branch's
+  existing open-then-retire shape can then use unchanged.
 - **`wrap.rs`'s own swap seam is untouched.** Its ~30 `#[cfg(unix)]` PTY tests
   cannot be compiled on the Windows machine this was developed on.
 - **Native rows still rank on `Unknown`.** A native route reports no
