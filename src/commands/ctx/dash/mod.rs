@@ -12469,19 +12469,35 @@ pub fn run_dashboard(
                                                 match panes.iter_mut().find(|p| p.short() == target)
                                                 {
                                                     Some(pane) => {
-                                                        let quit_sequence = adapters::select(
-                                                            Some(pane.agent()),
-                                                            &[],
-                                                            cfg,
-                                                        )
-                                                        .map(|adapter| adapter.quit_sequence())
-                                                        .unwrap_or("");
-                                                        pane.request_quit(quit_sequence);
-                                                        push_notice(
-                                                            &mut notices,
-                                                            now,
-                                                            format!("asked {target} to quit"),
-                                                        );
+                                                        if pane.is_native() {
+                                                            match pane.stop_now(0) {
+                                                                Ok(()) => push_notice(
+                                                                    &mut notices,
+                                                                    now,
+                                                                    format!("stopped {target}"),
+                                                                ),
+                                                                Err(error) => push_error(
+                                                                    &mut errors,
+                                                                    format!(
+                                                                        "could not stop {target}: {error}"
+                                                                    ),
+                                                                ),
+                                                            }
+                                                        } else {
+                                                            let quit_sequence = adapters::select(
+                                                                Some(pane.agent()),
+                                                                &[],
+                                                                cfg,
+                                                            )
+                                                            .map(|adapter| adapter.quit_sequence())
+                                                            .unwrap_or("");
+                                                            pane.request_quit(quit_sequence);
+                                                            push_notice(
+                                                                &mut notices,
+                                                                now,
+                                                                format!("asked {target} to quit"),
+                                                            );
+                                                        }
                                                     }
                                                     None => push_notice(
                                                         &mut notices,
@@ -13839,6 +13855,11 @@ pub fn run_dashboard(
         if let Err(e) = draw {
             push_error(&mut errors, format!("draw: {e}"));
         } else {
+            if matches!(overlay, ui::Overlay::None)
+                && let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
+            {
+                native.ux_mut().mark_approval_visible();
+            }
             frame_snapshot = next_snapshot;
             frame_snapshot_overlay_ident = next_snapshot_overlay_ident;
             // Issue #354 phase 2: this frame COMPLETED, so whatever it showed
