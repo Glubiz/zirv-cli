@@ -537,12 +537,18 @@ impl NativeConfig {
                 )
                 .into());
             }
-            if !self.allowed_routes().contains(route) {
-                return Err(format!(
-                    "{}: `roles.{role}` references route `{route}` outside effective `policy.allowed_routes`",
-                    path.display()
-                ).into());
-            }
+            // Issue #595 (roadmap N02): a route excluded by repository
+            // `policy.allowed_routes` narrowing is deliberately NOT checked
+            // here anymore. This ran at whole-config LOAD time, so one role
+            // naming an excluded route failed `NativeConfig::load` entirely
+            // -- taking down every other, still-allowed role with it, in a
+            // checkout that is by definition not allowed to touch the role
+            // table at all (`roles` is `REPO_FORBIDDEN`; only the operator
+            // writes it). The exclusion is real, but it must surface only
+            // when that specific role is actually selected -- exactly what
+            // `team::route_for_role` now checks -- the same posture
+            // `resolve_target` and `route::eligible`/`offers_from_config`
+            // already give every OTHER route lookup.
         }
         Ok(())
     }
@@ -689,6 +695,62 @@ mod tests {
         );
     }
 
+    /// Issue #595 (roadmap N02): a repository `allowed_routes` narrowing that
+    /// excludes route `b` must not fail `NativeConfig::load` for the WHOLE
+    /// operator configuration just because some UNRELATED global role
+    /// (`worker`, here) still names `b` -- `roles` is `REPO_FORBIDDEN`, so a
+    /// checkout cannot repair that binding itself. Route `a`, the allowed
+    /// intersection, must resolve normally for `reviewer`; only selecting the
+    /// excluded role (`worker`) must fail, and only at that selection.
+    #[test]
+    fn repo_allowed_routes_narrows_without_invalidating_unrequested_global_roles() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write(
+            &NativeConfig::operator_path(home.path()),
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n\
+             [route.a]\naccount='work'\nmodel='haiku'\n\
+             [route.b]\naccount='work'\nmodel='sonnet'\n\
+             [roles]\nreviewer='a'\nworker='b'\n",
+        );
+        write(
+            &NativeConfig::repo_path(repo.path()),
+            "schema=1\n[policy]\nallowed_routes=['a']\n",
+        );
+
+        // The load itself must succeed -- the whole point of #595.
+        let cfg = NativeConfig::load(home.path(), repo.path())
+            .expect("load must not fail")
+            .expect("operator config exists");
+        assert_eq!(
+            cfg.allowed_routes()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            ["a"],
+            "the allowed intersection"
+        );
+
+        // The allowed role resolves successfully.
+        let reviewer = crate::commands::ctx::team::route_for_role(&cfg, "reviewer")
+            .expect("route `a` is allowed; `reviewer` must resolve");
+        assert_eq!(reviewer.as_ref(), "a");
+
+        // The excluded role fails ONLY at selection, with a scoped policy
+        // refusal -- not a load-time error, and not `Unconfigured` (the role
+        // IS configured; the route it names is merely excluded here).
+        let refusal = crate::commands::ctx::team::route_for_role(&cfg, "worker")
+            .expect_err("route `b` is excluded by repo policy");
+        match refusal {
+            crate::commands::ctx::team::RouteRefusal::Ineligible { role, route, .. } => {
+                assert_eq!(role, "worker");
+                assert_eq!(route, "b");
+            }
+            other => panic!("expected a scoped Ineligible refusal, got {other:?}"),
+        }
+    }
+
     /// Issue #486: `policy.compaction` is the second key a checkout may set,
     /// and it only ever narrows -- a repository asking for `automatic` cannot
     /// turn an operator's `advisory` back on.
@@ -744,27 +806,6 @@ mod tests {
         let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
         assert!(
             error.to_string().contains("policy.something_else"),
-            "got {error}"
-        );
-    }
-
-    #[test]
-    fn narrowing_cannot_leave_a_bound_role_on_a_disallowed_route() {
-        let home = tempfile::tempdir().unwrap();
-        let _home = HomeGuard::set(home.path());
-        let repo = repo();
-        write(
-            &NativeConfig::operator_path(home.path()),
-            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n[route.a]\naccount='work'\nmodel='haiku'\n[route.b]\naccount='work'\nmodel='sonnet'\n[roles]\nworker='b'\n",
-        );
-        write(
-            &NativeConfig::repo_path(repo.path()),
-            "schema=1\n[policy]\nallowed_routes=['a']\n",
-        );
-        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
-        assert!(error.to_string().contains("roles.worker"), "got {error}");
-        assert!(
-            error.to_string().contains("outside effective"),
             "got {error}"
         );
     }

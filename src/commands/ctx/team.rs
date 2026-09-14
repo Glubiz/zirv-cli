@@ -293,14 +293,33 @@ fn configured_roles(config: &NativeConfig) -> Vec<String> {
 /// own `[roles]` table, with a typed refusal when there is no entry. No
 /// inference, no nearest-neighbour, no reuse of another role's route.
 pub fn route_for_role(config: &NativeConfig, role: &str) -> Result<RouteId, RouteRefusal> {
-    config
+    let route_id = config
         .roles
         .get(role)
         .cloned()
         .ok_or_else(|| RouteRefusal::Unconfigured {
             role: role.to_string(),
             configured: configured_roles(config),
-        })
+        })?;
+    // Issue #595 (roadmap N02): a repository's own `policy.allowed_routes`
+    // narrowing excludes this route from the checkout without touching the
+    // operator's global `[roles]` table (a checkout may only narrow, never
+    // edit, `roles` itself). The exclusion has to surface HERE, at the point
+    // this specific role is selected, not at `NativeConfig::load` -- the
+    // same `policy.allowed_routes` gate `route::eligible`/`offers_from_config`
+    // already apply to a REQUESTED route in `authorize_route`, and the same
+    // wording `offers_from_config` already gives a refused route's
+    // `PolicyVerdict`.
+    if !config.allowed_routes().contains(&route_id) {
+        return Err(RouteRefusal::Ineligible {
+            role: role.to_string(),
+            route: route_id.to_string(),
+            reason: Ineligible::PolicyRefused {
+                reason: "not in the operator's allowed_routes".to_string(),
+            },
+        });
+    }
+    Ok(route_id)
 }
 
 /// Every configured route with its id, in configuration order.
