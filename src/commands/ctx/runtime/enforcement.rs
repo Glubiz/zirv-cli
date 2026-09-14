@@ -15,7 +15,7 @@
 //! instead of silently running unsandboxed.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -1647,6 +1647,7 @@ impl ExecutionBroker {
         invocation: &ProcessInvocation,
         effects: &ProcessEffects,
     ) -> Result<ProcessSandboxPolicy, BrokerError> {
+        let mut read_roots = self.claims.read_roots.clone();
         let mut write_roots = Vec::new();
         if effects.repo_write {
             write_roots.push(self.claims.worktree_root.clone());
@@ -1668,8 +1669,19 @@ impl ExecutionBroker {
             scrub_tool_environment(std::env::vars_os(), &self.protected_env_names)
         };
         environment.extend(invocation.environment().clone());
+        if effects.clean_environment {
+            for path in environment
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                .flat_map(|(_, path)| std::env::split_paths(OsStr::new(path)))
+            {
+                if path.is_absolute() && path.is_dir() {
+                    read_roots.push(normalize_scope_path(&path)?);
+                }
+            }
+        }
         Ok(ProcessSandboxPolicy {
-            read_roots: self.claims.read_roots.clone(),
+            read_roots: dedup_paths(read_roots),
             write_roots: dedup_paths(write_roots),
             masked_roots: self
                 .claims
