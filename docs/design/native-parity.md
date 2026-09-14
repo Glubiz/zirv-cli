@@ -39,8 +39,8 @@ document may claim a rung it has not earned:
 | `live-validated` | a recorded run against a real provider endpoint, with the recording committed under `docs/benchmarks/`. **No row in this document claims this rung.** |
 | `legacy-only` | there is no native path, and the `Requires` cell says why. Every one of these is an entitlement limitation, not an unfinished feature -- see the two tables at the end. |
 
-Current distribution, counted by the check itself: 99 `unit`, 35
-`integration`, 16 `ci-matrix`, 8 `legacy-only`, 0 `live-validated`, across
+Current distribution, counted by the check itself: 98 `unit`, 35
+`integration`, 17 `ci-matrix`, 8 `legacy-only`, 0 `live-validated`, across
 158 capabilities (121 command verbs, 37 model-calling call sites).
 
 ## Release blockers
@@ -173,7 +173,7 @@ means it runs on any supported OS with no provider configured at all.
 | `test baseline` | `workflow::verification` | same zirv code | none | `verification::tests::baseline_round_trips_through_the_operator_home_directory`, `verification::tests::a_failure_not_in_the_baseline_blocks_the_gate_and_names_the_new_failure` | `unit` |
 | `test changed` | `workflow::verification` | same zirv code | none | `verification::tests::changed_paths_since_base_includes_untracked_and_drops_deleted_paths` | `unit` |
 | `update` | `commands::update` | same zirv code | none | `update::tests::assets_match_supported_platforms_and_release_urls` | `unit` |
-| `verify` | `workflow::verification` + `workflow::checks` | same zirv code | none | `verification::tests::verify_still_runs_checks_the_test_gate_did_not_cover`, `parity::tests::the_real_repo_parity_matrix_passes` | `unit` |
+| `verify` | `workflow::verification` + `workflow::checks` | same zirv code | none | `verification::tests::verify_still_runs_checks_the_test_gate_did_not_cover`, `parity::tests::the_real_repo_parity_matrix_passes`, `CI: Verify Native Parity Matrix` | `ci-matrix` |
 | `version` | `commands::version` | same zirv code | none | `version::tests::test_get_version_output` | `unit` |
 | `workflow` | `workflow::engine` | same zirv code | none | `mod::tests::top_level_workflow_command_is_case_insensitive` | `unit` |
 | `workflow advance` | `engine::advance_with_evidence` + native `workflow_advance` tool | same zirv code | none | `tools::tests::a_session_with_no_writer_permit_can_read_a_workflow_but_never_advance_it`, `engine::tests::advance_run_checks_runs_the_test_gate_and_advances_on_success` | `integration` |
@@ -271,6 +271,15 @@ enumerates native->native, native->wrapped, wrapped->native and
 wrapped->wrapped, and
 `every_direction_and_trigger_commits_without_losing_acknowledged_state` drives
 all four with every trigger.
+
+The mixed-runtime proof and the four invariants above are not Linux-only:
+the `Verify Mixed Runtime And Fault Invariants` step of the `Native Install`
+job runs the seat-fence, approval-channel, queued-mail and rollover tests on
+ubuntu, macOS and Windows, and
+`runtime::tests::a_mixed_board_exchanges_mail_and_survives_a_return_to_the_harness_default`
+drives a wrapped and a native seat on one board through mail in both
+directions and then a return to the harness default with every seat record,
+conversation reference and unread message intact.
 
 ## Entitlement limitations versus implementation gaps
 
