@@ -5062,6 +5062,109 @@ mod tests {
         assert_eq!(states, ["completed", "completed", "completed"]);
     }
 
+    /// Issue #609 (roadmap N22, review of #493): the fresh-install proof
+    /// widened past the test above. That test proves the COORDINATOR needs
+    /// no harness by substituting `RecordingLauncher` for the one seam that
+    /// cannot be fixture-driven from a model-facing tool call (the delegate
+    /// tool's `LaunchRequest` is deliberately never given an operator-only
+    /// transport override -- see `HeadlessRequest::provider`'s own doc
+    /// comment -- so a real dispatched worker cannot be driven through it
+    /// deterministically without live credentials). This test closes the gap
+    /// the review found: it drives the REAL production worker entry point
+    /// (`runtime::native::run_session`, the exact function `zirv ctx exec
+    /// --runtime native --provider fixture:<path>` calls) and the REAL
+    /// helper entry point (`helper::run`) to completion, and it does so with
+    /// every name `ctx::adapters::ADAPTERS` registers -- not a hard-coded
+    /// `claude`/`codex` pair -- replaced by a CANARY executable that leaves
+    /// evidence if the OS ever actually runs it. `PATH` naming eight
+    /// look-alike executables and still completing with no canary firing is
+    /// strictly stronger evidence than an empty `PATH`, which only proves a
+    /// lookup would have failed, not that nothing tried to look.
+    #[test]
+    fn a_real_native_worker_and_every_helper_role_complete_with_every_registered_harness_canaried_and_uninvoked()
+     {
+        use crate::commands::ctx::helper::{self, HelperBudget, HelperRequest};
+        use crate::commands::ctx::runtime::native::{HeadlessRequest, NativeLimits, NativeStatus};
+        use crate::commands::ctx::state::STATE_ENV;
+        use crate::commands::ctx::testenv;
+
+        let canary_root = tempfile::tempdir().expect("canary root");
+        let invoked_log = canary_root.path().join("invoked.log");
+        let (_canary_dir, _path) = testenv::canary_path_for_every_registered_harness(&invoked_log);
+
+        let repo = testenv::repo();
+        let home = tempfile::tempdir().expect("home");
+        let state_dir = tempfile::tempdir().expect("state");
+        let _home = testenv::HomeGuard::set(home.path());
+        let state_path = state_dir.path().to_string_lossy().into_owned();
+        let env = move |key: &str| (key == STATE_ENV).then(|| state_path.clone());
+
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("runtime")
+            .join("native")
+            .join("helper-answer.json");
+        let provider_spec = format!("fixture:{}", script.display());
+
+        // A REAL worker: the same function a delegated native worker and a
+        // plain `zirv ctx exec --runtime native` both run, not a stub.
+        let mut notices: Vec<u8> = Vec::new();
+        let status = crate::commands::ctx::runtime::native::run_session(
+            &mut HeadlessRequest {
+                repo: repo.path(),
+                prompt: "implement the thing",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: None,
+                provider: Some(provider_spec.as_str()),
+                fixture_tools: None,
+                task: None,
+                writer: None,
+            },
+            &mut notices,
+            &env,
+        )
+        .expect("a real native worker completes with no harness on PATH");
+        assert_eq!(status.status, NativeStatus::Completed);
+        assert_eq!(status.runtime, "native");
+
+        // A helper call, widened to every role an installed team needs
+        // (issue #492 item 3's own widening, reused here rather than
+        // duplicated).
+        for role in [
+            helper::ROLE_DISTILLER,
+            helper::ROLE_ASK,
+            helper::ROLE_OPTIMIZE,
+            helper::ROLE_SEAT,
+        ] {
+            let answer = helper::run(
+                &HelperRequest {
+                    repo: repo.path(),
+                    prompt: "distill this",
+                    role,
+                    route: None,
+                    budget: HelperBudget::one_shot(30_000),
+                    provider: Some(provider_spec.as_str()),
+                },
+                &env,
+            )
+            .unwrap_or_else(|err| {
+                panic!("role {role} must answer with no harness on PATH: {err:?}")
+            });
+            assert_eq!(answer.status, NativeStatus::Completed, "role {role}");
+        }
+
+        assert!(
+            !invoked_log.exists(),
+            "a registered harness executable was invoked: {}",
+            std::fs::read_to_string(&invoked_log).unwrap_or_default()
+        );
+    }
+
     /// Acceptance criterion 7: the operator steers and stops the objective
     /// through the command they already have, and the coordinator sees it.
     #[test]

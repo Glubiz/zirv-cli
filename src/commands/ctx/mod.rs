@@ -290,6 +290,76 @@ pub(crate) mod testenv {
         (dir, guard)
     }
 
+    /// Issue #609 (roadmap N22, review of #493): the install-proof
+    /// counterpart of [`stub_live_adapters_on_path`] above. That helper
+    /// drops an empty placeholder file per adapter, which is enough to prove
+    /// PRESENCE but nothing about INVOCATION. This drops one CANARY
+    /// executable per [`super::adapters::ADAPTERS`] entry -- enumerated from
+    /// the same registry, so a ninth adapter needs no test rewritten -- and
+    /// each canary appends its own name to `invoked_log` and exits non-zero
+    /// if the OS ever actually runs it. A test can then assert `invoked_log`
+    /// never came to exist: direct evidence that no registered harness
+    /// executable was spawned, not merely that `PATH` came up empty (which a
+    /// regression that resolved a harness by full path, or via `PATHEXT`,
+    /// could still slip past).
+    ///
+    /// Returns both guards for the same reason `stub_live_adapters_on_path`
+    /// does: the `TempDir` must outlive the `VarGuard`.
+    pub(crate) fn canary_path_for_every_registered_harness(
+        invoked_log: &Path,
+    ) -> (tempfile::TempDir, VarGuard) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in super::adapters::ADAPTERS {
+            write_canary(dir.path(), name, invoked_log);
+        }
+        let guard = VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        (dir, guard)
+    }
+
+    /// Windows canary: a `.cmd` script. `std::process::Command` on Windows
+    /// resolves a bare program name (no extension) against `PATHEXT`-style
+    /// candidates on each `PATH` directory, the same resolution a real
+    /// `claude`/`codex` npm-shim install relies on, so `Command::new(name)`
+    /// finds this exactly as it would a genuine install.
+    #[cfg(windows)]
+    fn write_canary(dir: &Path, name: &str, invoked_log: &Path) {
+        let script = dir.join(format!("{name}.cmd"));
+        std::fs::write(
+            &script,
+            format!(
+                "@echo off\r\necho {name}>>\"{}\"\r\nexit /b 7\r\n",
+                invoked_log.display()
+            ),
+        )
+        .expect("write canary");
+    }
+
+    /// Unix canary: a `chmod +x` shell script with the bare adapter name --
+    /// mirrors `wrap.rs`'s own `#[cfg(unix)]` stub-executable tests (see
+    /// CLAUDE.md). Not exercised on this Windows dev machine; CI's Linux and
+    /// macOS legs of the `Native Install` job are what actually run it.
+    #[cfg(unix)]
+    fn write_canary(dir: &Path, name: &str, invoked_log: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho {name} >> \"{}\"\nexit 7\n",
+                invoked_log.display()
+            ),
+        )
+        .expect("write canary");
+        let mut perms = std::fs::metadata(&script)
+            .expect("canary metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod +x canary");
+    }
+
     /// Enters `dir` and returns to the previous working directory on drop --
     /// including on a panicking assertion, which is the whole point.
     ///
