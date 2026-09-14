@@ -2647,6 +2647,96 @@ mod tests {
         ));
     }
 
+    /// Issue #610 scenario 5 (roadmap N05/N14/N15, review of #493): the test
+    /// above proves the broker refuses a hand-fed `Unavailable` isolation
+    /// value; it never calls [`PlatformIsolation::detect`] itself, so it
+    /// says nothing about what THIS actual OS reports. This is the same
+    /// broker refusal, driven by the REAL per-OS detection this machine
+    /// produces right now -- the genuine "per-OS containment backend"
+    /// acceptance proof, not a value chosen to make the test pass.
+    #[test]
+    fn a_process_action_is_refused_by_this_machines_own_real_platform_isolation_detection() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = root.path().join("workspace");
+        let worktree = root.path().join("worktree");
+        let state = root.path().join("state");
+        let home = root.path().join("home");
+        for path in [&workspace, &worktree, &state, &home] {
+            std::fs::create_dir_all(path).expect("create root");
+        }
+        let worktree = std::fs::canonicalize(worktree).expect("canonical worktree");
+        let claims = ResourceClaims::new(&workspace, &worktree, &state, &home, NetworkScope::Any)
+            .expect("claims");
+        let policy = Arc::new(MutablePolicy(Mutex::new(
+            PolicySnapshot::new(EffectivePolicy::default(), SafetyPolicy::default())
+                .expect("policy"),
+        )));
+        let generation = Arc::new(TestFence(Mutex::new(7)));
+        let authority = Arc::new(ApprovalAuthority::new());
+        let writer = Box::new(TestWriter(worktree.clone())) as Box<dyn WriterLease>;
+        let detected = PlatformIsolation::detect();
+        let broker = ExecutionBroker::new(
+            ExecutionIdentity {
+                session: "session-1".to_string(),
+                short: "abcd1234".to_string(),
+                generation: 7,
+                role: "worker".to_string(),
+                task: Some("task-1".to_string()),
+            },
+            claims,
+            ApprovalMode::Headless,
+            policy,
+            generation,
+            authority,
+            Some(writer),
+            detected.clone(),
+            BTreeSet::new(),
+        )
+        .expect("broker");
+
+        let action = ExecutionAction::Process {
+            invocation: ProcessInvocation::Argv {
+                program: "git".to_string(),
+                args: vec!["status".to_string()],
+                cwd: worktree,
+                environment: BTreeMap::new(),
+            },
+            effects: ProcessEffects::default(),
+        };
+        let outcome = broker.authorize_at(&action, None, 10);
+
+        #[cfg(windows)]
+        {
+            // Verified on this machine: there is no restricted-token/
+            // AppContainer helper shipped (N04, #473), so `detect` must
+            // report `Unavailable` naming windows specifically, and the
+            // broker must refuse -- never silently run the process
+            // unconfined.
+            assert!(
+                matches!(&detected, PlatformIsolation::Unavailable { platform, .. } if platform == "windows"),
+                "{detected:?}"
+            );
+            assert!(matches!(outcome, Err(BrokerError::IsolationUnavailable(_))));
+        }
+        #[cfg(not(windows))]
+        {
+            // Conservative on Linux/macOS, not verified on this Windows dev
+            // machine: whichever backend `detect` finds (or its own
+            // `Unavailable`, on a runner with neither `bwrap` nor
+            // `sandbox-exec`), a process action must never be silently
+            // authorized without SOME isolation decision having been made.
+            match &detected {
+                PlatformIsolation::Unavailable { .. } => {
+                    assert!(matches!(outcome, Err(BrokerError::IsolationUnavailable(_))))
+                }
+                _ => assert!(
+                    outcome.is_ok(),
+                    "a genuinely available backend must not be refused: {outcome:?}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn sandbox_profiles_mask_credentials_and_expose_only_declared_writes() {
         let root = tempfile::tempdir().expect("tempdir");

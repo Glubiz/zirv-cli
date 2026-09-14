@@ -1541,6 +1541,183 @@ mod tests {
         }
     }
 
+    fn fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("runtime")
+            .join("native")
+    }
+
+    /// Issue #610 (roadmap N05/N14/N15, review of #493): every other
+    /// environment in this module stubs `run()` -- `TestEnvironment` only
+    /// records that it was asked to run, `ApprovalEnvironment` drives one
+    /// hand-built `ExecutionAction` directly -- so production's own
+    /// [`ProviderEnvironment`] (the real turn runner a live `zirv chat
+    /// --runtime native` conversation uses) had never actually executed in
+    /// any test in this file. This is `ProviderEnvironment::run` verbatim
+    /// with exactly one substitution: a fixture transport and a fixture tool
+    /// script in place of `None, None`, so the REAL `run_hosted_turns` --
+    /// not a stand-in -- drives a real search/read/edit/test-run sequence
+    /// through the native pane/session driver.
+    #[derive(Debug)]
+    struct FixtureProviderEnvironment {
+        limits: NativeLimits,
+        max_writers: usize,
+        provider: String,
+        fixture_tools: PathBuf,
+    }
+
+    impl NativeEnvironment for FixtureProviderEnvironment {
+        fn route_identity(
+            &self,
+            _repo: &Path,
+            _route: Option<&str>,
+            _role: &str,
+        ) -> CtxResult<RouteIdentity> {
+            let target = fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model");
+            Ok(RouteIdentity {
+                route: target.route.clone(),
+                provider: target.provider.clone(),
+                endpoint: target.endpoint.clone(),
+                account: target.account.clone(),
+                billing_pool: target.billing_pool.clone(),
+                protocol: target.protocol,
+                model: target.model.clone(),
+            })
+        }
+
+        fn run(&self, turn: &QueuedTurn) -> CtxResult<()> {
+            let state = StateDir::resolve(&super::super::super::config::env_from_process())?;
+            let session = JournalSessionId::new(turn.session.clone())?;
+            let writer = super::super::super::permit::acquire_writer(
+                &state,
+                self.max_writers,
+                &format!("session native {}: {}", turn.seat_short, turn.role),
+                &turn.cwd,
+                Some(super::super::super::permit::SeatFence {
+                    short: &turn.seat_short,
+                    generation: turn.generation,
+                }),
+            )
+            .ok()
+            .map(|permit| {
+                Box::new(permit) as Box<dyn super::super::super::runtime::enforcement::WriterLease>
+            });
+            let mut hosted = HostedTurn {
+                repo: &turn.cwd,
+                session: &session,
+                seat_short: &turn.seat_short,
+                generation: turn.generation,
+                role: &turn.role,
+                route: turn.route.as_deref(),
+                limits: self.limits,
+                provider: Some(self.provider.as_str()),
+                fixture_tools: Some(self.fixture_tools.as_path()),
+                task: turn.task.clone(),
+                writer,
+                approvals: Some(Arc::clone(&turn.approvals)),
+                cancel: Arc::clone(&turn.cancel),
+            };
+            let mut notes = Vec::new();
+            run_hosted_turns(
+                &mut hosted,
+                &mut notes,
+                &super::super::super::config::env_from_process(),
+            )?;
+            Ok(())
+        }
+    }
+
+    /// Issue #610 scenario 1: the coding TUI's own read/edit/test path,
+    /// driven through the real native pane/session driver (`session::native`,
+    /// `run_hosted_turns`) rather than the lower-level `NativeLoop` harness
+    /// every fixture test in `runtime::native` uses directly. Asserts both
+    /// the user-visible result (the transcript a client reads through
+    /// `session.history`) and the durable evidence (the journal's own
+    /// execution events) independently.
+    #[test]
+    fn a_hosted_native_conversation_reads_edits_and_tests_through_the_real_turn_runner() {
+        // `FixtureProviderEnvironment::run` -- like production's own
+        // `ProviderEnvironment::run` -- resolves its `StateDir` and home
+        // directory from the AMBIENT process environment via
+        // `env_from_process`/`home_dir`, not from anything passed to
+        // `NativeSessions::new`. Both have to be pinned at this test's own
+        // temp directories, or the turn runs for real but against a
+        // different `StateDir` than the one this test reads back from.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let state_dir = tmp.path().join("state");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let _state_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            Some(state_dir.to_str().expect("utf8 state dir")),
+        )]);
+        let state = StateDir::from_root(state_dir);
+        let environment = Arc::new(FixtureProviderEnvironment {
+            limits: NativeLimits::default(),
+            max_writers: 4,
+            provider: format!(
+                "fixture:{}",
+                fixture_root()
+                    .join("anthropic-investigate-edit-test.json")
+                    .display()
+            ),
+            fixture_tools: fixture_root().join("tools-investigate-edit-test.json"),
+        });
+        let host = NativeSessions::new(
+            state,
+            "default",
+            "instance-1",
+            Arc::clone(&environment) as Arc<dyn NativeEnvironment>,
+        )
+        .expect("native host");
+        host.run_turns_inline_for_test();
+
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+        host.submit(&facts.session_id, "fix the failing test", false, None)
+            .expect("submit");
+        wait_for_native_idle(&host, &facts.session_id);
+
+        let history = host.history(&facts.session_id, 0, 64).expect("history");
+        let tool_entries: Vec<&str> = history
+            .entries
+            .iter()
+            .filter(|entry| entry.role == HistoryRole::Tool)
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert!(
+            tool_entries.iter().any(|text| text.contains("file_read")),
+            "a real read tool call must appear in the transcript: {tool_entries:?}"
+        );
+        assert!(
+            tool_entries.iter().any(|text| text.contains("apply_patch")),
+            "a real edit tool call must appear in the transcript: {tool_entries:?}"
+        );
+        assert!(
+            tool_entries
+                .iter()
+                .any(|text| text.contains("process_start")),
+            "a real test-run tool call must appear in the transcript: {tool_entries:?}"
+        );
+
+        // Durable evidence, independent of the transcript projection above:
+        // the journal itself recorded the tool executions.
+        let page = host
+            .journal(&facts.session_id, 0, 64)
+            .expect("journal page");
+        let execution_events = page
+            .events
+            .iter()
+            .filter(|event| event.kind.contains("execution") || event.kind.contains("tool"))
+            .count();
+        assert!(
+            execution_events > 0,
+            "the durable journal must record the tool executions, not just the transcript: {:?}",
+            page.events
+        );
+    }
+
     #[derive(Debug)]
     struct ApprovalEnvironment {
         state: StateDir,
