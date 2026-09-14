@@ -74,7 +74,15 @@ tree -- `ZCHK-NATIVE-PARITY` fails the build if one stops existing.
   `helper::tests::every_helper_role_answers_with_every_coding_harness_removed_from_path`
   covers the distiller, ask, optimize and seat helper roles with an empty
   `PATH`; `review::tests::a_native_reviewer_argv_pins_read_only_with_no_harness_flags`
-  covers the independent reviewer.
+  covers the independent reviewer. Read the helper test precisely: it proves
+  that every helper role plumbs through session construction, the loop and
+  answer extraction with `PATH` emptied, so none of them shells out to a
+  vendor CLI on that path. It supplies the provider as a fixture transport,
+  which *bypasses route resolution* — so it is not, by itself, evidence that
+  route resolution never consults `PATH`. What covers that is
+  `provider::inventory`'s own tests together with the `Native Install` job,
+  which runs `zirv ctx provider list` and `zirv ctx doctor --json` on a
+  machine the job has already asserted has no coding harness installed.
 - **Mixed runtime and the way back.**
   `tools::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services`
   (one board, both runtimes, one graph) and
