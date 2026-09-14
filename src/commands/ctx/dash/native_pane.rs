@@ -470,7 +470,7 @@ pub struct StatusFacts {
     /// [`activity_line_text`]. `None` while idle, and on every path that
     /// constructs `StatusFacts` without a live [`NativePaneRuntime`] behind
     /// it.
-    pub activity: Option<String>,
+    pub activity: Option<ActivityFacts>,
     /// The repository this session is running in -- part of the bottom
     /// status line (operator direction, PR #531 follow-up).
     pub cwd: String,
@@ -1999,11 +1999,15 @@ pub fn render_lines(view: &TranscriptView, presentation: &NativePresentation) ->
 pub fn render_lines_with_activity(
     view: &TranscriptView,
     presentation: &NativePresentation,
-    activity: Option<&str>,
+    activity: Option<ActivityFacts>,
+    width: usize,
 ) -> Vec<StyledLine> {
     let mut lines = render_lines(view, presentation);
-    if let Some(text) = activity {
-        lines.push(StyledLine::toned(text.to_string(), Tone::Accent));
+    if let Some(facts) = activity {
+        lines.push(StyledLine::toned(
+            activity_line_text(facts.elapsed, facts.tokens, width),
+            Tone::Accent,
+        ));
     }
     lines
 }
@@ -2117,7 +2121,7 @@ pub fn render_native_pane(
             width: area.width,
             height: transcript_height,
         };
-        let raw = render_lines_with_activity(view, presentation, facts.activity.as_deref());
+        let raw = render_lines_with_activity(view, presentation, facts.activity, width);
         let wrapped = wrap_all(&raw, width);
         let visible = viewport_slice(&wrapped, transcript_height as usize);
         let text: Vec<Line> = visible
@@ -2534,7 +2538,7 @@ pub fn render_plain(
     let mut out = String::new();
     out.push_str(&status_line_text(facts));
     out.push('\n');
-    let raw = render_lines_with_activity(view, presentation, facts.activity.as_deref());
+    let raw = render_lines_with_activity(view, presentation, facts.activity, width.max(1));
     let wrapped = wrap_all(&raw, width.max(1));
     for line in &wrapped {
         out.push_str(&line.to_plain_string());
@@ -2678,15 +2682,59 @@ const ACTIVITY_VERBS: [&str; 6] = [
 /// `elapsed`/`tokens` are the caller's own (`NativePaneRuntime::
 /// activity_line`), so this is directly testable without a live session or
 /// a wall clock.
-pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64) -> String {
+pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64, width: usize) -> String {
     let millis = elapsed.as_millis() as u64;
     let spinner = ACTIVITY_SPINNER_FRAMES[(millis / 120) as usize % ACTIVITY_SPINNER_FRAMES.len()];
     let verb = ACTIVITY_VERBS[(millis / 2_500) as usize % ACTIVITY_VERBS.len()];
-    format!(
+    let full = format!(
         "{spinner} {verb}\u{2026} (esc to interrupt \u{b7} {elapsed} \u{b7} \u{2193} {tokens} tokens)",
         elapsed = elapsed_text(elapsed),
         tokens = token_text(tokens),
-    )
+    );
+    if style::display_width(&full) <= width {
+        return full;
+    }
+    // The mock's narrow floor (`docs/design/mocks/2026-09-13-native-pane.html`,
+    // the 40-column frame): `\u{273b} Wrangling\u{2026} (esc \u{b7} 1m12s)`. The interrupt hint
+    // and the elapsed reading are what an operator acts on; the token total is
+    // the one part that can be read off the usage strip instead, so it is what
+    // goes first. Narrowing beats wrapping: a wrapped activity line eats a
+    // transcript row every tick and moves the whole conversation under it.
+    let narrow = format!(
+        "{spinner} {verb}\u{2026} (esc \u{b7} {elapsed})",
+        elapsed = elapsed_text(elapsed).replace(' ', ""),
+    );
+    if style::display_width(&narrow) <= width {
+        return narrow;
+    }
+    // Narrower still than the mock ever draws: keep the spinner and the hint,
+    // which are the two things that say "a turn is running and esc stops it",
+    // and drop the decorative verb rather than let anything wrap.
+    let bare = format!(
+        "{spinner} (esc \u{b7} {elapsed})",
+        elapsed = elapsed_text(elapsed).replace(' ', ""),
+    );
+    if style::display_width(&bare) <= width {
+        return bare;
+    }
+    spinner.to_string()
+}
+
+/// Issue #490 (PR #545 review finding 1): the inputs an activity line is
+/// rendered from, carried on [`StatusFacts`] instead of a pre-rendered
+/// string.
+///
+/// The line is width-aware now, and the width belongs to whoever is drawing --
+/// `render_native_pane` and `render_plain` each know theirs, and
+/// `NativePaneRuntime::status_facts` knows none. Carrying the facts rather
+/// than the text is what lets both renderers narrow correctly from one place,
+/// instead of one of them wrapping a string the other had already baked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivityFacts {
+    pub elapsed: std::time::Duration,
+    /// The conversation's OWN recorded usage so far -- see
+    /// [`NativePaneRuntime::activity_facts`] for why this is not per-turn.
+    pub tokens: u64,
 }
 
 /// Issue #490 (N21 item B): the dialog's request, built from the enforcement
@@ -3865,7 +3913,7 @@ impl NativePaneRuntime {
             blocked: self.ux.blocked(),
             unread_result: self.presentation.unread,
             notice: self.notice.clone(),
-            activity: self.activity_line(),
+            activity: self.activity_facts(),
             cwd: self.cwd.display().to_string(),
             git_branch: self.git_branch.clone(),
             context_left_pct: self.context_left(),
@@ -3879,7 +3927,7 @@ impl NativePaneRuntime {
     /// "usage recorded since this turn started" read), so it only ever
     /// grows across turns rather than resetting at each one; documented in
     /// the design note.
-    fn activity_line(&self) -> Option<String> {
+    fn activity_facts(&self) -> Option<ActivityFacts> {
         let started = self.turn_started_at?;
         let tokens: u64 = self
             .conversation
@@ -3887,7 +3935,10 @@ impl NativePaneRuntime {
             .values()
             .map(|record| record.input_tokens + record.output_tokens)
             .sum();
-        Some(activity_line_text(started.elapsed(), tokens))
+        Some(ActivityFacts {
+            elapsed: started.elapsed(),
+            tokens,
+        })
     }
 
     pub fn view(&self) -> (&TranscriptView, &NativePresentation) {
@@ -4130,6 +4181,35 @@ impl NativePaneRuntime {
             session.shutdown();
         }
     }
+}
+
+/// Issue #490 (PR #545 review finding 3): a mouse wheel notch over a focused
+/// NATIVE pane.
+///
+/// A native pane has no `vt100` grid and no pty scrollback, so routing the
+/// wheel to `Pane::scroll_wheel` moved a buffer that is never rendered while
+/// the transcript the operator is actually looking at sat still. This moves
+/// the one scroll position that exists -- `NativePresentation::scroll`, the
+/// same state `Up`/`Down`/`PageUp`/`PageDown` reach through
+/// [`handle_native_key`] -- so the wheel and the keyboard agree.
+///
+/// Reaching the bottom marks the transcript seen, exactly as `End` does:
+/// scrolling back to the live view IS having looked at it.
+pub fn wheel_scroll(pane: &mut NativePaneRuntime, delta: isize) -> bool {
+    if delta == 0 {
+        return false;
+    }
+    let total = pane.view().0.items.len().max(1);
+    let presentation = pane.presentation_mut();
+    if delta > 0 {
+        presentation.scroll.scroll_up(delta.unsigned_abs(), total);
+    } else {
+        presentation.scroll.scroll_down(delta.unsigned_abs());
+        if presentation.scroll.follow {
+            presentation.mark_seen();
+        }
+    }
+    true
 }
 
 /// Issue #490 (roadmap N21 item A): #354's clickable overview rows, for a
@@ -5722,20 +5802,20 @@ mod tests {
     fn activity_line_text_carries_real_elapsed_seconds_tokens_and_the_interrupt_hint() {
         // The mock's own reading: `(esc to interrupt · <elapsed> · ↓ <tokens>)`,
         // with a minute-aware elapsed and a `k`-scaled token count.
-        let text = activity_line_text(std::time::Duration::from_secs(12), 1_234);
+        let text = activity_line_text(std::time::Duration::from_secs(12), 1_234, 120);
         assert!(
             text.contains("(esc to interrupt \u{b7} 12s \u{b7} \u{2193} 1.2k tokens)"),
             "{text:?}"
         );
-        let longer = activity_line_text(std::time::Duration::from_secs(72), 420);
+        let longer = activity_line_text(std::time::Duration::from_secs(72), 420, 120);
         assert!(longer.contains("1m 12s"), "{longer:?}");
         assert!(longer.contains("\u{2193} 420 tokens"), "{longer:?}");
     }
 
     #[test]
     fn activity_line_text_is_a_pure_function_of_elapsed_time() {
-        let a = activity_line_text(std::time::Duration::from_millis(500), 0);
-        let b = activity_line_text(std::time::Duration::from_millis(500), 0);
+        let a = activity_line_text(std::time::Duration::from_millis(500), 0, 120);
+        let b = activity_line_text(std::time::Duration::from_millis(500), 0, 120);
         assert_eq!(a, b);
     }
 
@@ -6696,19 +6776,67 @@ mod tests {
 
     #[test]
     fn the_activity_line_matches_the_mocks_exact_reading() {
-        // The mock's own frame: `✻ Wrangling… (esc to interrupt · 1m 12s · ↓ 3.4k tokens)`.
-        let text = activity_line_text(std::time::Duration::from_secs(72), 3_400);
-        let (_spinner, rest) = text.split_once(' ').expect("a spinner then the verb");
+        // The mock draws TWO readings: the wide frame
+        // `(esc to interrupt · 1m 12s · ↓ 3.4k tokens)` at 80 columns and up,
+        // and the narrow floor `(esc · 1m12s)` at 40. Both are pinned here,
+        // and at every size the line must FIT rather than wrap -- a wrapped
+        // activity line eats a transcript row on every tick and walks the
+        // whole conversation up the screen under the operator.
+        let elapsed = std::time::Duration::from_secs(72);
+        for width in MOCK_WIDTHS {
+            let text = activity_line_text(elapsed, 3_400, width);
+            assert!(
+                style::display_width(&text) <= width,
+                "{width}: the activity line wraps instead of narrowing: {text:?}"
+            );
+            let (_spinner, rest) = text.split_once(' ').expect("a spinner then the verb");
+            assert!(
+                rest.split('\u{2026}')
+                    .next()
+                    .is_some_and(|verb| !verb.is_empty() && !verb.contains('(')),
+                "{width}: a rotating verb precedes the ellipsis: {text:?}"
+            );
+            if width >= 80 {
+                assert!(
+                    rest.ends_with("(esc to interrupt \u{b7} 1m 12s \u{b7} \u{2193} 3.4k tokens)"),
+                    "{width}: {text:?}"
+                );
+            } else {
+                assert!(rest.ends_with("(esc \u{b7} 1m12s)"), "{width}: {text:?}");
+            }
+        }
+    }
+
+    /// PR #545 review finding 3: the wheel moves the transcript a native pane
+    /// actually renders, not the vt100 scrollback it does not have.
+    #[test]
+    fn a_wheel_notch_over_a_native_pane_moves_its_own_transcript_scroll() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut pane = pane_fixture(&state, "s1", "sess-1", 1, None);
+        // A transcript long enough to have somewhere to scroll back to.
+        pane.transcript = TranscriptView {
+            items: (0..40)
+                .map(|i| TranscriptItem::AssistantText {
+                    message_id: format!("m{i}"),
+                    text: format!("line {i}"),
+                })
+                .collect(),
+        };
+        assert!(pane.view().1.scroll.follow, "a fresh pane follows the tail");
+
+        assert!(wheel_scroll(&mut pane, 3));
         assert!(
-            rest.ends_with("(esc to interrupt \u{b7} 1m 12s \u{b7} \u{2193} 3.4k tokens)"),
-            "{text:?}"
+            !pane.view().1.scroll.follow,
+            "scrolling up disengages auto-follow"
         );
-        assert!(
-            rest.split('\u{2026}')
-                .next()
-                .is_some_and(|verb| !verb.is_empty() && !verb.contains('(')),
-            "a rotating verb precedes the ellipsis: {text:?}"
-        );
+        let back = pane.view().1.scroll.items_back;
+        assert!(back > 0, "the wheel moved the transcript: {back}");
+
+        // And back down to the live view, which counts as having seen it.
+        assert!(wheel_scroll(&mut pane, -3));
+        assert!(pane.view().1.scroll.follow, "the tail is live again");
+        assert!(!wheel_scroll(&mut pane, 0), "a zero notch is not a scroll");
     }
 
     #[test]
