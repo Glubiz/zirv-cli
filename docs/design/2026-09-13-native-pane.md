@@ -238,6 +238,14 @@ stream this round does not add (see "still deferred" below).
 
 ### `dash::native_pane::run_native_dashboard`: its own dashboard mode
 
+> **Superseded (issue #490, N21 item A, 2026-09-14.)** This function no
+> longer exists. `zirv chat --runtime native` opens its conversation as the
+> FIRST PANE of the ordinary dashboard: `dash::pane::Pane` carries a
+> `PaneKind`, so one event loop, one raw-mode sequence and one key contract
+> (`native_pane::handle_native_key`) serve wrapped and native panes alike.
+> The reasoning below is kept as the record of why it was deferred twice;
+> see `docs/design/2026-09-13-native-ux.md` for what it became.
+
 Rather than adding a `PaneKind` to `dash::mod`'s existing `Vec<Pane>` --
 which would mean touching every one of those ~100 call sites, none of which
 this issue's own acceptance criteria require changing, and doing so
