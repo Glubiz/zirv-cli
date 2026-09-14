@@ -77,6 +77,7 @@ impl Default for HttpProbe {
     fn default() -> Self {
         Self {
             agent: ureq::Agent::config_builder()
+                .max_redirects(0)
                 .timeout_global(Some(Duration::from_secs(10)))
                 .timeout_connect(Some(Duration::from_secs(10)))
                 .build()
@@ -258,5 +259,12 @@ mod tests {
             r#"{"models":[{"name":"models/gemini-3"}]}"#,
         );
         assert_eq!(google, ["gemini-3"]);
+    }
+
+    #[test]
+    fn cross_host_redirect_never_forwards_provider_secret_headers() {
+        // Issue #558.
+        let probe = HttpProbe::default();
+        assert_eq!(probe.agent.config().max_redirects(), 0);
     }
 }

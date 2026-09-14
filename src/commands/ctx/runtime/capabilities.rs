@@ -169,6 +169,7 @@ impl HttpGetter for UreqGetter {
     ) -> Result<HttpGetReply, String> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .timeout_connect(Some(timeout))
             .timeout_recv_response(Some(timeout))
             .build()
@@ -914,10 +915,6 @@ pub struct CapabilityServices {
     pub browser: Option<BrowserBackend>,
     pub integrations: Vec<IntegrationStatus>,
     config: super::super::config::CapabilitiesConfig,
-    /// Resolved bearer credentials per remote server. Resolved once, at
-    /// session start, so a credential rotation is picked up by a reconnect
-    /// through a fresh session rather than mid-call from a changing file.
-    bearers: BTreeMap<String, String>,
     /// Lazily connected clients. A session that never calls an MCP tool never
     /// spawns a server, so starting one does not depend on a server being up.
     clients: BTreeMap<String, super::mcp::McpClient>,
@@ -939,17 +936,6 @@ impl CapabilityServices {
                 integrations,
                 ..Self::default()
             };
-        }
-        let mut bearers = BTreeMap::new();
-        for server in cfg.capabilities.active_servers() {
-            if let super::super::config::McpTransportConfig::Http {
-                credential: Some(reference),
-                ..
-            } = &server.transport
-                && let Ok(Some(secret)) = resolve_credential(Some(reference), env, now)
-            {
-                bearers.insert(server.name.clone(), secret);
-            }
         }
         let credential =
             resolve_credential(cfg.capabilities.web.search_credential.as_deref(), env, now)
@@ -976,7 +962,6 @@ impl CapabilityServices {
             browser,
             integrations,
             config: cfg.capabilities.clone(),
-            bearers,
             clients: BTreeMap::new(),
             transport_overrides: BTreeMap::new(),
         }
@@ -1028,19 +1013,18 @@ impl CapabilityServices {
                 Arc::new(super::mcp::StdioFactory::new(server.clone()))
             }
             super::super::config::McpTransportConfig::Http { url, credential } => {
-                if credential.is_some() && !self.bearers.contains_key(&server.name) {
-                    return Err(CapabilityError::Unavailable(CapabilityUnavailable::new(
-                        IntegrationId::Mcp,
-                        format!(
-                            "server `{}` names credential {:?}, which did not resolve",
-                            server.name,
-                            credential.as_deref().unwrap_or_default()
-                        ),
-                    )));
-                }
-                Arc::new(super::mcp::HttpFactory::new(
+                let reference = credential.clone();
+                Arc::new(super::mcp::HttpFactory::new_resolving(
                     url.clone(),
-                    self.bearers.get(&server.name).cloned(),
+                    Arc::new(move || {
+                        let env = super::super::config::env_from_process();
+                        resolve_credential(
+                            reference.as_deref(),
+                            &env,
+                            super::super::state::now_secs(),
+                        )
+                        .map_err(super::mcp::McpError::Unavailable)
+                    }),
                     Arc::new(super::mcp::UreqPoster),
                 ))
             }
