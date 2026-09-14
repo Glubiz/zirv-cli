@@ -1,7 +1,7 @@
 # Native feature parity
 
-**Issues:** #484 (roadmap N15), #485 (roadmap N16) · **Roadmap:** #469 ·
-**Last updated:** 2026-09-13
+**Issues:** #484 (roadmap N15), #485 (roadmap N16), #491 (roadmap N22) ·
+**Roadmap:** #469 · **Last updated:** 2026-09-14
 
 Every shipped Zirv command surface and helper-model call that touches a model
 or a workflow, with the native implementation that serves it and the test that
@@ -104,3 +104,33 @@ over the same durable state the CLI verb writes.
 | Cross-harness handover (`zirv ctx handover`) | swaps one vendor CLI for another, which a native session has none of; changing a native seat's model is `[roles]`/`--route` configuration, not a handover | roadmap #469, unassigned — N16 (#485) covers team orchestration, not vendor-CLI swapping |
 | Writable built-in agent seats on the native seat dispatcher | the dispatcher is read-only by mechanism; a writable seat must be a delegated worker with a real permit (`zirv agent --runtime native --mode writing`) | by design, #484 |
 | Live-provider validation of any row above | every test here is fixture- or service-level | N19 (#487) validation pass |
+
+## Entitlement limitations versus implementation gaps
+
+Added by N22 (#491). The "Still harness-only" table above mixes two things
+that must never be reported to an operator in the same bucket, because the
+next action differs completely. `zirv ctx doctor` separates them at runtime —
+`upstream-entitlement` versus `missing-tool` — and this is the authoritative
+list behind that classification. No entry is a bare "later": an
+implementation gap names its owner, and an entitlement limitation names why
+it is not ours.
+
+### Genuine upstream entitlement limitations
+
+| Limitation | Why it is upstream, not ours | Where it surfaces |
+|---|---|---|
+| A Claude.ai / ChatGPT subscription is not an API entitlement | the plan is sold for that vendor's own CLI; there is no direct-API grant to spend | `doctor` class `upstream-entitlement`; the route stops at `configured` with the problem named (`inventory::tests::subscription_route_stops_at_configured_without_harming_api_route`) |
+| Harness login tokens are refused as native credentials | reusing the vendor CLI's stored login for direct API calls is outside what that token is issued for | `credential::refuse_harness_login`, before a secret is read (`provider_cmd::tests::credential_set_refuses_harness_login_stores_before_reading_or_writing`) |
+| `zirv ctx wrap` | supervises a vendor TUI by definition; a native session has no PTY to wrap | "Still harness-only" above |
+| `zirv ctx handover` | swaps one vendor CLI for another; a native seat's model is `[roles]` configuration, not a handover | "Still harness-only" above |
+| A model absent from an account's own model list | that account's entitlement with the vendor | `doctor` class `inaccessible-model`, from the live model-list probe |
+
+### Implementation gaps (ours, each tracked)
+
+| Gap | Owner | How it is reported |
+|---|---|---|
+| A route profile with no native adapter yet | the tracking issue named in the profile's own `Support::Planned` | `doctor` class `missing-tool`; the message says "this is a zirv gap, not an upstream entitlement limit" verbatim (`provider::inventory`) |
+| Windows process isolation (restricted token / AppContainer helper) | N04 (#473); no verified backend shipped | `doctor` class `unsupported-isolation`; `enforcement` refuses a sandboxed invocation rather than running it unconfined |
+| Harness-transcript rot parsing for native sessions | N09 (#478) | "Still harness-only" above |
+| Writable built-in agent seats on the native seat dispatcher | by design, #484 — a writable seat is a delegated worker with a real permit | "Still harness-only" above |
+| Live-provider validation of every row in this document | N19 (#487) | the `validated` rung is unreachable; no row here claims it |
