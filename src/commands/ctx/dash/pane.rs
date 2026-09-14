@@ -1195,6 +1195,7 @@ impl Pane {
     /// the pane's mail/nudge address, the restore roster, the attention
     /// projection and the budget sweep all key on the same identity the
     /// native session registered for itself.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_native(
         cfg: &super::super::config::CtxConfig,
         state: &StateDir,
@@ -6450,7 +6451,8 @@ pub(crate) mod tests {
         let native = spawn_native_test_pane(&state, &env, repo);
 
         // ONE vector, two kinds -- the whole point of the retrofit.
-        let mut panes = vec![wrapped, native];
+        // One roster, two kinds -- the dashboard's own `Vec<Pane>` shape.
+        let mut panes: Vec<Pane> = vec![wrapped, native];
         assert_eq!(
             panes.iter().map(Pane::is_native).collect::<Vec<_>>(),
             vec![false, true]
@@ -6490,7 +6492,8 @@ pub(crate) mod tests {
         )
         .expect("wrapped pane");
         let native = spawn_native_test_pane(&state, &env, repo);
-        let mut panes = vec![wrapped, native];
+        // One roster, two kinds -- the dashboard's own `Vec<Pane>` shape.
+        let mut panes: Vec<Pane> = vec![wrapped, native];
 
         // Focus on the native pane: the key reaches the composer, not a pty.
         let key = crossterm::event::KeyEvent::new(
