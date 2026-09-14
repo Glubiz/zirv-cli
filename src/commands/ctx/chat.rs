@@ -444,9 +444,27 @@ pub fn run_with<W: Write, E: Write>(
     // same function, not dropped until `run_with` itself returns), so the
     // native pane's own `ratatui`/`crossterm` setup sees the same VT mode
     // `wrap`'s raw-mode session would have.
-    if let Some(runtime) = args.runtime.as_deref() {
+    //
+    // Issue #491 (roadmap N22): with no `--runtime` at all, the operator's
+    // own `[runtime]` table decides, through the same `runtime::resolve`
+    // ladder `exec`/`agent` use, at the `orchestrator` role this seat runs
+    // as. An unconfigured table resolves to the harness, so the wrapped path
+    // below stays the behaviour of every build before N22.
+    let configured = runtime_kind::resolve(
+        args.runtime.as_deref().unwrap_or(runtime_kind::CONFIGURED),
+        &cfg.runtime,
+        "orchestrator",
+    );
+    if let Ok(choice) = &configured
+        && let Some(note) = &choice.note
+    {
+        writeln!(stderr, "zirv chat: {note}")?;
+    }
+    let native = args.runtime.is_some()
+        || configured.is_ok_and(|choice| choice.kind == RuntimeKind::Native);
+    if native {
         return run_native_chat(
-            runtime,
+            args.runtime.as_deref().unwrap_or(RuntimeKind::Native.as_str()),
             &cfg,
             repo,
             env,

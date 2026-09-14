@@ -112,6 +112,127 @@ impl std::str::FromStr for RuntimeKind {
     }
 }
 
+/// The `--runtime` value meaning "whatever `[runtime]` in `~/.zirv/ctx.toml`
+/// says, harness when it says nothing" (issue #491, roadmap N22). It is the
+/// clap default for `zirv ctx exec`/`zirv ctx agent`, and `zirv chat` with no
+/// `--runtime` resolves the same way, so the operator's opt-in default
+/// reaches every entry point without any of them guessing.
+pub const CONFIGURED: &str = "configured";
+
+/// Which authority decided a session's backend. Carried so the decision can
+/// be *shown* rather than inferred: "native because you asked" and "native
+/// because your config says so" are the same outcome and very different
+/// facts when a bill arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSource {
+    /// An explicit `--runtime harness|native` on this invocation.
+    Flag,
+    /// `[runtime.roles]` named this role.
+    RoleTable,
+    /// `[runtime] default`.
+    ConfiguredDefault,
+    /// Nothing said anything: the pre-N22 behaviour, the harness.
+    BuiltIn,
+}
+
+impl RuntimeSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RuntimeSource::Flag => "flag",
+            RuntimeSource::RoleTable => "runtime.roles",
+            RuntimeSource::ConfiguredDefault => "runtime.default",
+            RuntimeSource::BuiltIn => "built-in",
+        }
+    }
+}
+
+/// A resolved backend decision plus the authority behind it, and a note when
+/// something configured had to be ignored to get here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeChoice {
+    pub kind: RuntimeKind,
+    pub source: RuntimeSource,
+    /// One line naming a configured value this build does not recognise, and
+    /// what was used instead. `None` on every ordinary path.
+    pub note: Option<String>,
+}
+
+/// The one place [`CONFIGURED`] is turned into a backend.
+///
+/// Pure: no fs, clock, env or net -- the caller supplies the already-loaded
+/// table. An explicit flag always wins; then `[runtime.roles]` for this role;
+/// then `[runtime] default`; then the harness. A configured value this build
+/// has never heard of degrades to the harness with a note rather than an
+/// error, because a typo in a machine-wide config file must not wedge every
+/// command on that machine -- `zirv ctx doctor` is where it is reported.
+///
+/// An unrecognised *flag* stays a hard error ([`selected`]): an operator
+/// typing `--runtime natve` at the prompt is asking for one specific thing
+/// and must not silently get another.
+pub fn resolve(
+    flag: &str,
+    cfg: &super::config::RuntimeConfig,
+    role: &str,
+) -> crate::commands::ctx::CtxResult<RuntimeChoice> {
+    if !flag.eq_ignore_ascii_case(CONFIGURED) {
+        return Ok(RuntimeChoice {
+            kind: selected(flag)?,
+            source: RuntimeSource::Flag,
+            note: None,
+        });
+    }
+    let configured = cfg
+        .roles
+        .get(role)
+        .map(|value| (value, RuntimeSource::RoleTable, format!("runtime.roles.{role}")))
+        .or_else(|| {
+            cfg.default.as_ref().map(|value| {
+                (
+                    value,
+                    RuntimeSource::ConfiguredDefault,
+                    "runtime.default".to_string(),
+                )
+            })
+        });
+    let Some((value, source, key)) = configured else {
+        return Ok(RuntimeChoice {
+            kind: RuntimeKind::Harness,
+            source: RuntimeSource::BuiltIn,
+            note: None,
+        });
+    };
+    match value.parse::<RuntimeKind>() {
+        Ok(kind @ (RuntimeKind::Harness | RuntimeKind::Native)) => Ok(RuntimeChoice {
+            kind,
+            source,
+            note: None,
+        }),
+        _ => Ok(RuntimeChoice {
+            kind: RuntimeKind::Harness,
+            source: RuntimeSource::BuiltIn,
+            note: Some(format!(
+                "{key} = '{value}' is not `harness` or `native`; running on the harness"
+            )),
+        }),
+    }
+}
+
+/// [`resolve`]'s impure caller: loads the operator's `[runtime]` table only
+/// when there is a [`CONFIGURED`] flag to resolve, so an explicit
+/// `--runtime harness|native` still costs no config read at all.
+pub fn resolve_for_cli(
+    flag: &str,
+    repo: &std::path::Path,
+    env: super::config::EnvLookup<'_>,
+    role: &str,
+) -> crate::commands::ctx::CtxResult<RuntimeChoice> {
+    if !flag.eq_ignore_ascii_case(CONFIGURED) {
+        return resolve(flag, &super::config::RuntimeConfig::default(), role);
+    }
+    let cfg = super::config::CtxConfig::load(repo, env)?;
+    resolve(flag, &cfg.runtime, role)
+}
+
 /// Which UI is currently attached to a session, independent of which
 /// backend runs it -- a headless launch, an interactive terminal, or a
 /// dashboard pane can all sit in front of either an `Harness` or `Native`
@@ -388,5 +509,63 @@ mod tests {
     #[test]
     fn select_unknown_is_an_error() {
         assert!(select(RuntimeKind::Unknown, None).is_err());
+    }
+
+    fn runtime_config(toml: &str) -> super::super::config::RuntimeConfig {
+        toml::from_str(toml).expect("runtime table")
+    }
+
+    /// Issue #491: the opt-in ladder, in the one order that keeps an explicit
+    /// request sovereign -- flag, then the role table, then the default, then
+    /// the pre-N22 harness.
+    #[test]
+    fn an_explicit_flag_outranks_every_configured_native_default() {
+        let cfg = runtime_config("default = 'native'\n[roles]\nworker = 'native'\n");
+        let choice = resolve("harness", &cfg, "worker").expect("resolve");
+        assert_eq!(choice.kind, RuntimeKind::Harness);
+        assert_eq!(choice.source, RuntimeSource::Flag);
+    }
+
+    #[test]
+    fn a_role_entry_outranks_the_configured_default() {
+        let cfg = runtime_config("default = 'native'\n[roles]\nworker = 'harness'\n");
+        let worker = resolve(CONFIGURED, &cfg, "worker").expect("resolve");
+        assert_eq!(worker.kind, RuntimeKind::Harness);
+        assert_eq!(worker.source, RuntimeSource::RoleTable);
+        let reviewer = resolve(CONFIGURED, &cfg, "reviewer").expect("resolve");
+        assert_eq!(reviewer.kind, RuntimeKind::Native);
+        assert_eq!(reviewer.source, RuntimeSource::ConfiguredDefault);
+    }
+
+    /// The compatibility promise N22 ships on: an operator config written
+    /// before this key existed resolves exactly the way every build before
+    /// N22 behaved, and says so.
+    #[test]
+    fn an_unconfigured_runtime_table_still_resolves_to_the_harness() {
+        let choice = resolve(CONFIGURED, &runtime_config(""), "orchestrator").expect("resolve");
+        assert_eq!(choice.kind, RuntimeKind::Harness);
+        assert_eq!(choice.source, RuntimeSource::BuiltIn);
+        assert_eq!(choice.note, None);
+    }
+
+    /// A typo in a machine-wide config file must not wedge every command on
+    /// that machine, but it must not be silent either.
+    #[test]
+    fn an_unrecognised_configured_value_degrades_to_the_harness_with_a_note() {
+        let cfg = runtime_config("default = 'natve'\n");
+        let choice = resolve(CONFIGURED, &cfg, "worker").expect("resolve");
+        assert_eq!(choice.kind, RuntimeKind::Harness);
+        assert_eq!(choice.source, RuntimeSource::BuiltIn);
+        assert!(
+            choice
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("runtime.default") && note.contains("natve")),
+            "got {:?}",
+            choice.note
+        );
+        // A typo in the FLAG stays a hard error: that operator is at a prompt
+        // asking for one specific thing.
+        assert!(resolve("natve", &cfg, "worker").is_err());
     }
 }

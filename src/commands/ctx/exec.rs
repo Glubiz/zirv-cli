@@ -129,7 +129,7 @@ fn capacity_backoff_secs(attempt: u32) -> u64 {
     }
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ExecArgs {
     /// Adapter name: claude or codex. Detected from the command when omitted.
     #[arg(long)]
@@ -164,12 +164,17 @@ pub struct ExecArgs {
     /// for a per-run ceiling.
     #[arg(long)]
     pub objective: Option<String>,
-    /// Which runtime drives the conversation: `harness` (the default -- zirv
-    /// supervises an external coding-agent process) or `native` (issue #478,
-    /// roadmap N09 -- zirv conducts the model/tool conversation itself over a
-    /// direct provider route, with no coding harness installed at all).
-    /// Native mode is explicit and opt-in: it is never selected by detection.
-    #[arg(long, default_value = "harness")]
+    /// Which runtime drives the conversation: `harness` (zirv supervises an
+    /// external coding-agent process) or `native` (issue #478, roadmap N09 --
+    /// zirv conducts the model/tool conversation itself over a direct
+    /// provider route, with no coding harness installed at all). Native mode
+    /// is explicit and opt-in: it is never selected by detection.
+    ///
+    /// The default, `configured` (issue #491), means "whatever `[runtime]` in
+    /// `~/.zirv/ctx.toml` says, harness when it says nothing" -- so an
+    /// operator config written before that key existed behaves exactly as it
+    /// always did. See `runtime::resolve`.
+    #[arg(long, default_value = super::runtime::CONFIGURED)]
     pub runtime: String,
     /// Native runtime only: which `[route]` from the operator's own native
     /// provider configuration to spend. Defaults to the `[roles]` entry for
@@ -3913,7 +3918,17 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     // (`parent: None`), so a direct launch always resolves to no parent --
     // fail-closed to peer trust.
     let env = agent::parent_session_env(&ambient, None);
-    run_with(args, w, &repo, &env)
+    // Issue #491: the CLI entry is where the operator's opt-in `[runtime]`
+    // default becomes an explicit backend, so everything below -- `run_with`,
+    // the native branch, `script_runner`'s own direct callers -- keeps seeing
+    // one of exactly two literal values and never has to resolve anything.
+    let choice = super::runtime::resolve_for_cli(&args.runtime, &repo, &env, "worker")?;
+    if let Some(note) = &choice.note {
+        eprintln!("zirv ctx exec: {note}");
+    }
+    let mut args = args.clone();
+    args.runtime = choice.kind.as_str().to_string();
+    run_with(&args, w, &repo, &env)
 }
 
 #[cfg(test)]
