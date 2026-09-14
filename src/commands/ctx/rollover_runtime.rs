@@ -2036,6 +2036,88 @@ mod tests {
         }
     }
 
+    /// Issue #492 (roadmap N23) item 4: mail already queued for a seat when
+    /// the rollover happens.
+    ///
+    /// Mail is addressed to the seat's LOGICAL short id, and a rollover keeps
+    /// that id while replacing what answers at it -- which is exactly why the
+    /// queue has to be checked rather than assumed. Two invariants, in every
+    /// direction: **no lost acknowledged input** (the successor still sees a
+    /// message the source never read, in all four runtime pairs), and **no
+    /// duplicated exclusive work** (once the successor consumes it, it is
+    /// gone -- a second read does not hand the same instruction to the seat
+    /// again).
+    #[test]
+    fn queued_mail_survives_every_rollover_direction_and_is_delivered_exactly_once() {
+        use crate::commands::ctx::config::CtxConfig;
+        use crate::commands::ctx::mail;
+
+        let route = offer(
+            "anthropic",
+            "claude-sonnet-4-5",
+            BillingPosture::Api,
+            route::RuntimeKind::Native,
+        );
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        for (index, (source, target)) in runtimes().into_iter().enumerate() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let session = format!("{index:04x}0001-1111-4000-8000-000000000000");
+            let (short, _journal) = source_session(&state, &session, source);
+
+            // Queued before the rollover, addressed to the seat, never read.
+            let queued = mail::Message {
+                from_session: "operator".to_string(),
+                from_agent: "operator".to_string(),
+                to: "any".to_string(),
+                to_session: Some(short.clone()),
+                sent: 1_700_000_000,
+                body: "pick the release branch back up".to_string(),
+            };
+            mail::store(&state, slug, &queued, &cfg).expect("queue mail for the seat");
+
+            let moving = direction(source, target).expect("direction");
+            assert!(
+                validate(&facts(&route), &demand(), &ContinuationPlan::Rebuilt {
+                    checkpoint: None,
+                    messages: Vec::new(),
+                }, moving)
+                .is_ok(),
+                "{moving:?}: the successor clears every gate"
+            );
+            let generation = seat::prepare_onto(
+                &state,
+                &short,
+                "successor",
+                Some("standard"),
+                target,
+                seat::Cause::Manual,
+                500,
+            )
+            .expect("prepare");
+            let committed = seat::commit(&state, &short, generation, "successor-session", 501)
+                .expect("commit");
+            assert_eq!(committed.short, short, "{moving:?}");
+
+            let waiting = mail::list(&state, slug, None, Some(&short)).expect("list after");
+            assert_eq!(
+                waiting.len(),
+                1,
+                "{moving:?}: a message queued before the rollover is never lost"
+            );
+            assert_eq!(waiting[0].1.body, "pick the release branch back up");
+
+            mail::consume_and_log(&state, slug, &waiting[0].0, &short, "exec", "exec:test")
+                .expect("consume once");
+            let after = mail::list(&state, slug, None, Some(&short)).expect("list again");
+            assert!(
+                after.is_empty(),
+                "{moving:?}: the successor may not be handed the same instruction twice: {after:?}"
+            );
+        }
+    }
+
     /// Criterion 5, for every direction: a successor that never comes up is
     /// refused BEFORE the seat moves, the source keeps the seat and its own
     /// conversation, and no conversation id is ever resumed under the wrong

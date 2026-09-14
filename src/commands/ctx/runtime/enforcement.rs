@@ -2709,6 +2709,42 @@ mod tests {
         );
     }
 
+    /// Issue #492 (roadmap N23) item 4: the approval channel closing *while
+    /// a call is already blocked* -- the pane that raised the dialog went
+    /// away without ever answering. Distinct from both neighbours:
+    /// `a_closed_prompt_channel_fails_the_call_closed` closes the channel
+    /// BEFORE the request is made, and
+    /// `an_interrupt_while_blocked_cancels_the_call_and_releases_nothing`
+    /// is an explicit operator interrupt. Here nobody cancels and nobody
+    /// closes; the reply path simply dies mid-wait. The call must fail
+    /// closed rather than block forever or mint a grant on nobody's
+    /// authority -- **no blind repeated external mutation**, because the
+    /// write it was asking about is never authorized.
+    #[test]
+    fn a_prompt_channel_dropped_while_a_call_is_blocked_grants_nothing() {
+        let (fixture, prompts, approvals) = interactive_fixture(ApprovalMode::Interactive);
+        let action = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("one.rs"),
+        };
+        let dialog = std::thread::spawn(move || {
+            let prompt = prompts.recv().expect("request");
+            // The pane disappears: the prompt -- and with it the only reply
+            // sender -- is dropped unanswered, then the queue itself goes.
+            drop(prompt);
+            drop(prompts);
+        });
+        let outcome = fixture.broker.authorize_at(&action, None, 10);
+        dialog.join().expect("dialog thread");
+        assert!(
+            matches!(outcome, Err(BrokerError::ApprovalRequired(_))),
+            "a dead reply path fails the call closed, got {outcome:?}"
+        );
+        assert!(
+            !approvals.is_cancelled(),
+            "nothing interrupted this session -- it failed closed on its own"
+        );
+    }
+
     #[test]
     fn a_closed_prompt_channel_fails_the_call_closed() {
         let (fixture, prompts, approvals) = interactive_fixture(ApprovalMode::Interactive);

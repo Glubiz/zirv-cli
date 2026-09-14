@@ -4645,6 +4645,64 @@ mod tests {
         assert!(status.failure.unwrap().contains("connection reset"));
     }
 
+    /// Issue #492 (roadmap N23) item 4, journal-commit failure: a durable
+    /// write that is REFUSED must leave no effect behind it.
+    ///
+    /// The refusal injected here is the real one a displaced seat hits
+    /// rather than a synthetic I/O error -- a second, write-capable
+    /// generation has taken the seat while this loop still holds generation
+    /// 1 -- so this pins two invariants at once. **No two write-capable seat
+    /// generations:** the journal fences the older loop's very first commit.
+    /// **No blind repeated external mutation:** the fixture tool executor is
+    /// never reached at all, so a session that no longer owns the seat
+    /// cannot re-run an effect the successor is about to run. The
+    /// journal-unit view of the same fence is `journal::tests::
+    /// stale_generation_cannot_append_or_advance`; this is the loop's.
+    #[test]
+    fn a_fenced_generation_commits_nothing_and_runs_no_effect() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        journal
+            .advance_generation(&session, 1, 2, 500)
+            .expect("a successor takes the seat");
+
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            script("anthropic-investigate-edit-test.json"),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let clock = || 1_000u64;
+        let (refused, then_ran) = {
+            let mut driver = NativeLoop::new(
+                config_for(session, route),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            let refused = driver.acknowledge("fix the failing test", false);
+            // ...and a loop driven anyway, ignoring the refusal, still
+            // reaches no effect: the fence is the journal's, not the
+            // caller's politeness.
+            (refused, driver.run_to_completion())
+        };
+        assert!(
+            refused.is_err(),
+            "a fenced generation may not commit: {refused:?}"
+        );
+        assert!(
+            then_ran.is_err(),
+            "a fenced generation may not run a turn either: {then_ran:?}"
+        );
+        assert!(
+            tools.calls.is_empty(),
+            "no effect may run behind a refused journal commit: {:?}",
+            tools.calls
+        );
+    }
+
     // -- (c) input delivery, steering and interruption ---------------------
 
     #[test]
