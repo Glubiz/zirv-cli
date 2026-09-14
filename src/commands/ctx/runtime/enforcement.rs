@@ -862,14 +862,14 @@ impl PlatformIsolation {
         #[cfg(target_os = "macos")]
         {
             let executable = PathBuf::from("/usr/bin/sandbox-exec");
-            return if executable.is_file() {
+            if executable.is_file() {
                 Self::MacOsSeatbelt { executable }
             } else {
                 Self::Unavailable {
                     platform: "macos".to_string(),
                     reason: "macOS sandbox-exec is unavailable".to_string(),
                 }
-            };
+            }
         }
         #[cfg(windows)]
         {
