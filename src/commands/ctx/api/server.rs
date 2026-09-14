@@ -22,13 +22,13 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::transport::{Connection, Endpoint, Listener, server_uid};
+use super::transport::{Connection, Endpoint, Listener, MAX_FRAME_BYTES, server_uid};
 use super::wire::{
     ADVERTISED, ADVERTISED_WITHOUT_HOST, ApiError, ApiEvent, ApprovalDecision, AttachMode,
     Attachment, Capability, ErrorCode, EventFrame, Hello, InputAck, InputMode, Method,
@@ -48,6 +48,7 @@ use crate::commands::ctx::state::StateDir;
 /// exactly the signal issue #353 asks for: refresh a snapshot rather than
 /// drift.
 const MAX_EVENTS: usize = 512;
+const MAX_SUBSCRIBER_BACKLOG: usize = MAX_EVENTS;
 
 /// How many idempotency keys the server remembers, evicted oldest-first.
 const MAX_IDEMPOTENCY: usize = 256;
@@ -273,7 +274,7 @@ struct Inner {
     events: VecDeque<EventFrame>,
     idempotency: BTreeMap<String, Value>,
     idempotency_order: VecDeque<String>,
-    subscribers: Vec<Sender<EventFrame>>,
+    subscribers: Vec<SyncSender<EventFrame>>,
     /// Lifecycle states a CLIENT reported (`session.report_status`) or this
     /// server itself caused (`session.send_input`, `session.stop`). A
     /// refresh from the session source must not silently undo them: the
@@ -305,7 +306,10 @@ impl Inner {
             self.events.pop_front();
         }
         self.subscribers
-            .retain(|subscriber| subscriber.send(frame.clone()).is_ok());
+            .retain(|subscriber| match subscriber.try_send(frame.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            });
     }
 
     fn remember(&mut self, key: String, result: Value) {
@@ -597,7 +601,14 @@ impl ApiServer {
             .idempotency_key
             .as_ref()
             .filter(|_| spec.mutation)
-            .map(|key| format!("{}:{key}", spec.name));
+            .map(|key| {
+                let session = request
+                    .params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                format!("{}:{session}:{key}", spec.name)
+            });
         // The lookup is its own statement on purpose: an `if let` chain
         // would hold the guard across the `self.ok` call in its body, and
         // `self.ok` locks again to read the revision.
@@ -1265,11 +1276,27 @@ impl ApiServer {
             &facts.session_id,
             params.client_id.as_deref(),
         )?;
-        let history = native.history(
+        let mut history = native.history(
             &facts.session_id,
             params.after_sequence,
             params.limit.unwrap_or(MAX_PAGE).min(MAX_PAGE),
         )?;
+        let byte_limit = MAX_FRAME_BYTES as usize - 64 * 1024;
+        while history.entries.len() > 1
+            && serde_json::to_vec(&history).is_ok_and(|encoded| encoded.len() > byte_limit)
+        {
+            history.entries.pop();
+        }
+        history.cursor = history
+            .entries
+            .last()
+            .map_or(params.after_sequence, |entry| entry.sequence);
+        if serde_json::to_vec(&history).is_ok_and(|encoded| encoded.len() > byte_limit) {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "one history entry exceeds the protocol frame limit",
+            ));
+        }
         serde_json::to_value(history)
             .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))
     }
@@ -1592,33 +1619,65 @@ impl ApiServer {
         }
         connection.write_frame(&super::wire::ServerFrame::Hello(self.hello()))?;
 
-        while let Some(request) = connection.read_frame::<Request>()? {
-            let subscribing =
-                request.method == Method::EventsSubscribe && request.version == PROTOCOL_VERSION;
-            let response = self.handle(&request);
-            let accepted = matches!(response.outcome, Outcome::Ok { .. });
-            let after_revision = subscription_start(&request.params);
-            let receiver = if subscribing && accepted {
-                Some(self.subscribe(after_revision))
-            } else {
-                None
-            };
-            connection.write_frame(&super::wire::ServerFrame::Response(response))?;
-            if let Some((receiver, backlog)) = receiver {
-                for frame in backlog {
-                    connection.write_frame(&super::wire::ServerFrame::Event(frame))?;
+        let mut attachments: Vec<(String, String)> = Vec::new();
+        let result = (|| -> CtxResult<()> {
+            while let Some(request) = connection.read_frame::<Request>()? {
+                let subscribing = request.method == Method::EventsSubscribe
+                    && request.version == PROTOCOL_VERSION;
+                let response = self.handle(&request);
+                let accepted = matches!(response.outcome, Outcome::Ok { .. });
+                if accepted
+                    && matches!(
+                        request.method,
+                        Method::SessionAttach | Method::SessionTakeover
+                    )
+                    && let (Some(session_id), Some(client_id)) = (
+                        request.params.get("session_id").and_then(Value::as_str),
+                        request.params.get("client_id").and_then(Value::as_str),
+                    )
+                {
+                    let attachment = (session_id.to_string(), client_id.to_string());
+                    if !attachments.contains(&attachment) {
+                        attachments.push(attachment);
+                    }
+                } else if accepted
+                    && request.method == Method::SessionDetach
+                    && let (Some(session_id), Some(client_id)) = (
+                        request.params.get("session_id").and_then(Value::as_str),
+                        request.params.get("client_id").and_then(Value::as_str),
+                    )
+                {
+                    attachments
+                        .retain(|entry| entry != &(session_id.to_string(), client_id.to_string()));
                 }
-                return self.pump(&mut connection, receiver);
+                let after_revision = subscription_start(&request.params);
+                let receiver = if subscribing && accepted {
+                    Some(self.subscribe(after_revision))
+                } else {
+                    None
+                };
+                connection.write_frame(&super::wire::ServerFrame::Response(response))?;
+                if let Some((receiver, backlog)) = receiver {
+                    for frame in backlog {
+                        connection.write_frame(&super::wire::ServerFrame::Event(frame))?;
+                    }
+                    return self.pump(&mut connection, receiver);
+                }
             }
+            Ok(())
+        })();
+        for (session_id, client_id) in attachments {
+            let _ =
+                self.detach_result(&json!({ "session_id": session_id, "client_id": client_id }));
         }
-        Ok(())
+        result
     }
 
     /// Registers a subscriber and returns its channel plus everything it
     /// missed, both computed under ONE lock so no event can slip between
     /// the backlog and the live stream.
     fn subscribe(&self, after_revision: u64) -> (Receiver<EventFrame>, Vec<EventFrame>) {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(MAX_SUBSCRIBER_BACKLOG);
         let mut inner = self.lock();
         inner.subscribers.push(tx);
         let backlog = inner
@@ -1839,6 +1898,7 @@ pub fn endpoint_for(state: &StateDir) -> Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::api::wire::{HistoryEntry, HistoryRole, ServerFrame};
     use crate::commands::ctx::runtime::fake::FakeNativeBackend;
 
     fn facts(id: &str, state: SessionState) -> SessionFacts {
@@ -2417,6 +2477,54 @@ mod tests {
         (server, host)
     }
 
+    /// Issue #579: losing the owning socket releases only that connection's
+    /// controller attachment; the hosted session remains available.
+    #[test]
+    fn controller_disconnect_detaches_without_stopping_session() {
+        use crate::commands::ctx::api::client::Client;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::at(tmp.path().join("api.sock"));
+        let (server, host) = hosted_server();
+        let _running = RunningServer::start(&endpoint, Arc::clone(&server)).expect("server");
+        let mut first = Client::connect(&endpoint).expect("first client");
+        first
+            .call(
+                Method::SessionAttach,
+                json!({
+                    "session_id": HOSTED,
+                    "client_id": "crashed",
+                    "mode": "controller"
+                }),
+            )
+            .expect("first attach");
+        drop(first);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while host.lock().controller.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disconnected controller was not detached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut second = Client::connect(&endpoint).expect("second client");
+        second
+            .call(
+                Method::SessionAttach,
+                json!({
+                    "session_id": HOSTED,
+                    "client_id": "replacement",
+                    "mode": "controller"
+                }),
+            )
+            .expect("normal reattach");
+        assert_eq!(host.lock().controller.as_deref(), Some("replacement"));
+        assert!(host.lock().stopped.is_empty(), "disconnect is not stop");
+        assert_eq!(host.sessions()[0].session_id, HOSTED);
+    }
+
     /// Capability negotiation, the direction that matters: a server with no
     /// terminals never advertises the attachment surface, so a client turns
     /// the feature off LOCALLY rather than learning about it from a failed
@@ -2923,8 +3031,9 @@ mod tests {
         facts: Vec<SessionFacts>,
         clients: Vec<String>,
         controller: Option<String>,
-        inputs: Vec<(String, bool, Option<String>)>,
+        inputs: Vec<(String, String, bool, Option<String>)>,
         approvals: Vec<(String, ApprovalDecision)>,
+        history: Vec<HistoryEntry>,
         interrupted: usize,
         stopped: Vec<String>,
     }
@@ -2987,26 +3096,28 @@ mod tests {
 
         fn submit(
             &self,
-            _session_id: &str,
+            session_id: &str,
             input: &str,
             steering: bool,
             idempotency: Option<&str>,
         ) -> Result<InputAck, ApiError> {
             let mut state = self.lock();
             if let Some(key) = idempotency
-                && state
-                    .inputs
-                    .iter()
-                    .any(|(_, _, seen)| seen.as_deref() == Some(key))
+                && state.inputs.iter().any(|(seen_session, _, _, seen)| {
+                    seen_session == session_id && seen.as_deref() == Some(key)
+                })
             {
                 return Ok(InputAck {
                     message_id: format!("idem-{key}"),
                     duplicate: true,
                 });
             }
-            state
-                .inputs
-                .push((input.to_string(), steering, idempotency.map(str::to_string)));
+            state.inputs.push((
+                session_id.to_string(),
+                input.to_string(),
+                steering,
+                idempotency.map(str::to_string),
+            ));
             Ok(InputAck {
                 message_id: idempotency
                     .map(|key| format!("idem-{key}"))
@@ -3047,14 +3158,22 @@ mod tests {
             &self,
             session_id: &str,
             after: u64,
-            _limit: usize,
+            limit: usize,
         ) -> Result<NativeHistory, ApiError> {
+            let entries: Vec<_> = self
+                .lock()
+                .history
+                .iter()
+                .filter(|entry| entry.sequence > after)
+                .take(limit)
+                .cloned()
+                .collect();
             Ok(NativeHistory {
                 session_id: session_id.to_string(),
                 generation: 1,
-                cursor: after,
-                last_sequence: 0,
-                entries: Vec::new(),
+                cursor: entries.last().map_or(after, |entry| entry.sequence),
+                last_sequence: self.lock().history.last().map_or(0, |entry| entry.sequence),
+                entries,
             })
         }
 
@@ -3318,6 +3437,123 @@ mod tests {
         let second = result(&server.handle(&again));
         assert_eq!(second["message_id"], json!("idem-k1"));
         assert_eq!(native.lock().inputs.len(), 1, "{:?}", native.lock().inputs);
+    }
+
+    /// Issue #568: protocol replay keys deduplicate within one target native
+    /// session, never across two independent journals.
+    #[test]
+    fn same_idempotency_key_in_two_sessions_dispatches_once_per_session() {
+        let mut first = facts("native-1", SessionState::Idle);
+        first.runtime = RuntimeKind::Native;
+        let mut second = facts("native-2", SessionState::Idle);
+        second.runtime = RuntimeKind::Native;
+        let native = FakeNative::with(vec![first.clone(), second.clone()]);
+        let server = ApiServer::new(
+            Box::new(StaticSource(vec![first.clone(), second.clone()])),
+            None,
+        );
+        server.attach_native(Arc::clone(&native) as Arc<dyn NativeHost>);
+
+        for (request_id, session_id) in [("one", &first.session_id), ("two", &second.session_id)] {
+            let request = Request::new(
+                request_id,
+                Method::SessionSendInput,
+                json!({"session_id": session_id, "input": request_id}),
+            )
+            .with_idempotency_key("shared-key");
+            assert_eq!(result(&server.handle(&request))["duplicate"], json!(false));
+        }
+        for (request_id, session_id) in [
+            ("retry-one", &first.session_id),
+            ("retry-two", &second.session_id),
+        ] {
+            let retry = Request::new(
+                request_id,
+                Method::SessionSendInput,
+                json!({"session_id": session_id, "input": "ignored retry body"}),
+            )
+            .with_idempotency_key("shared-key");
+            let _ = server.handle(&retry);
+        }
+
+        let inputs = &native.lock().inputs;
+        assert_eq!(inputs.len(), 2, "one dispatch per session: {inputs:?}");
+        assert_eq!(inputs[0].0, first.session_id);
+        assert_eq!(inputs[1].0, second.session_id);
+    }
+
+    /// Issue #600: byte-heavy history is split into wire-safe cursor pages
+    /// without changing order or dropping conversation text.
+    #[test]
+    fn session_history_paginates_below_wire_byte_limit() {
+        let (server, native, id) = native_server();
+        native.lock().history = (1..=12)
+            .map(|sequence| HistoryEntry {
+                sequence,
+                role: HistoryRole::Assistant,
+                text: format!("{sequence}:").repeat(55_000),
+                steering: false,
+            })
+            .collect();
+        let expected: Vec<String> = native
+            .lock()
+            .history
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect();
+        let mut after = 0;
+        let mut actual = Vec::new();
+        while after < 12 {
+            let response = server.handle(&Request::new(
+                "history",
+                Method::SessionHistory,
+                json!({"session_id": id, "after_sequence": after}),
+            ));
+            let frame = ServerFrame::Response(response.clone());
+            assert!(
+                serde_json::to_vec(&frame).expect("frame").len()
+                    < super::super::transport::MAX_FRAME_BYTES as usize,
+                "history response exceeded the wire bound"
+            );
+            let value = result(&response);
+            let page: NativeHistory = serde_json::from_value(value).expect("history");
+            assert!(page.cursor > after, "history cursor must advance");
+            after = page.cursor;
+            actual.extend(page.entries.into_iter().map(|entry| entry.text));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    /// Issue #607: a socket writer that stops reading cannot grow an
+    /// unbounded cloned-event queue; it is disconnected and can resume by
+    /// cursor from retained history.
+    #[test]
+    fn slow_api_subscriber_has_bounded_backlog_and_recovers() {
+        let server = server_with(Vec::new());
+        let (receiver, backlog) = server.subscribe(server.revision());
+        assert!(backlog.is_empty());
+        for _ in 0..=MAX_EVENTS {
+            server.publish(None, None, ApiEvent::Heartbeat);
+        }
+        assert!(
+            server.lock().subscribers.is_empty(),
+            "a full subscriber queue must be disconnected"
+        );
+        let received = receiver.try_iter().count();
+        assert!(received <= MAX_EVENTS, "subscriber backlog stayed bounded");
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "disconnect is the explicit recovery outcome"
+        );
+        let (_, retained) = server.subscribe(0);
+        assert_eq!(
+            retained.len(),
+            MAX_EVENTS,
+            "cursor refresh remains available"
+        );
     }
 
     /// The native methods on a server with no native host are refused with a

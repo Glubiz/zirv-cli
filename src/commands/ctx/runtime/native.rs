@@ -77,8 +77,8 @@ use super::compaction::{
 use super::journal::{
     AssistantBlock, CheckpointId, CheckpointKind, ContentRef, ConversationState, EventScope,
     ExecutionId, ExecutionRecord, ExecutionState, Journal, JournalSessionId, MessageId,
-    MessageRole, RequestAttemptId, RouteIdentity, SequenceId, ToolCallId, TurnId, UsageId,
-    UsageRecord,
+    MessageRole, RequestAttemptId, RouteIdentity, SequenceId, TaskId, TaskReceiptState, ToolCallId,
+    TurnId, UsageId, UsageRecord,
 };
 use super::tools::{
     NativeToolClient, ResourceClaimKind, RetryPolicy, ToolDefinition, ToolExecutionMode,
@@ -662,6 +662,9 @@ impl<'a> NativeLoop<'a> {
         env: EnvLookup<'a>,
     ) -> Self {
         let started_ms = now_ms();
+        let counter = journal
+            .sequence_bounds(&config.session)
+            .map_or(0, |(_, last)| last.0);
         Self {
             config,
             provider,
@@ -670,7 +673,7 @@ impl<'a> NativeLoop<'a> {
             cancel,
             now_ms,
             env,
-            counter: 0,
+            counter,
             started_ms,
             delivered_through: SequenceId(0),
             turns: 0,
@@ -1563,6 +1566,19 @@ impl<'a> NativeLoop<'a> {
                 state,
                 result,
                 (!terminal_with_result).then_some(content.as_str()),
+            )?;
+            self.journal.record_task_receipt(
+                &self.config.session,
+                self.config.generation,
+                scope,
+                TaskId::new(format!("tool-{execution}"))?,
+                match receipt.state {
+                    ToolReceiptState::Completed => TaskReceiptState::Completed,
+                    ToolReceiptState::Failed => TaskReceiptState::Failed,
+                    ToolReceiptState::OutcomeUnknown => TaskReceiptState::Blocked,
+                },
+                serde_json::to_value(&receipt)?,
+                self.secs(),
             )?;
 
             // A tool-effect retry is NOT a response retry. An outcome-unknown
@@ -3734,8 +3750,19 @@ pub fn spawn_interactive(
                 &now_ms,
                 env,
             );
-            match driver.run_to_completion() {
-                Ok(_status) => {
+            let result = driver.run_to_completion();
+            drop(driver);
+            match result {
+                Ok(status) => {
+                    if let Some(entry) = backend.sessions.get_mut(&worker_handle.logical_id) {
+                        entry.state = SessionState::Idle;
+                        entry.push(
+                            &worker_handle.logical_id,
+                            super::protocol::RuntimeEvent::TurnCompleted {
+                                final_text: status.final_text,
+                            },
+                        );
+                    }
                     let _ = progress_tx.send(InteractiveProgress::Idle);
                 }
                 Err(error) => {
@@ -3812,6 +3839,8 @@ pub struct HostedTurn<'a> {
     /// `None` for a session nobody granted a tree to -- whose file writes are
     /// then refused, which is the honest answer rather than an unbacked write.
     pub writer: Option<Box<dyn super::enforcement::WriterLease>>,
+    /// The hosted protocol controller's exact-action approval channel.
+    pub approvals: Option<Arc<super::enforcement::InteractiveApprovals>>,
     /// Shared with the host, so `session.interrupt` cancels the turn this
     /// call is running rather than the next one.
     pub cancel: Arc<CancellationFlag>,
@@ -3874,7 +3903,15 @@ pub fn run_hosted_turns<W: std::io::Write>(
         }),
     };
     if brokered {
-        tools = brokered_tools(&mut request, &state, &home, &cfg, &handle, None, env)?;
+        tools = brokered_tools(
+            &mut request,
+            &state,
+            &home,
+            &cfg,
+            &handle,
+            turn.approvals.clone(),
+            env,
+        )?;
     }
 
     let compaction = CompactionSettings {
@@ -4452,6 +4489,68 @@ mod tests {
             driver.run_to_completion().expect("ran")
         };
         (status, tools.calls)
+    }
+
+    #[derive(Debug)]
+    struct AuthoritativeReceiptExecutor(FixtureToolExecutor);
+
+    impl ToolExecutor for AuthoritativeReceiptExecutor {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            self.0.definitions()
+        }
+
+        fn execute(&mut self, call: &NativeToolCall) -> ToolReceipt {
+            let mut receipt = self.0.execute(call);
+            receipt.receipt_id = format!("authoritative-{}", call.id);
+            receipt.approved_by = Some("protocol-controller".to_string());
+            receipt.policy_fingerprint = Some("policy-fingerprint-584".to_string());
+            receipt.started_at_ms = 584_001;
+            receipt.completed_at_ms = 584_002;
+            receipt
+        }
+    }
+
+    /// Issue #584: replay keeps the complete authoritative tool receipt,
+    /// including the approval and policy provenance used for the effect.
+    #[test]
+    fn live_loop_replay_preserves_complete_tool_receipt() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            script("anthropic-investigate-edit-test.json"),
+        );
+        let mut tools = AuthoritativeReceiptExecutor(FixtureToolExecutor::new(tool_script(
+            "tools-investigate-edit-test.json",
+        )));
+        let clock = || 1_000u64;
+        let mut driver = NativeLoop::new(
+            config_for(session.clone(), route),
+            &provider,
+            &mut tools,
+            &mut journal,
+            Arc::new(CancellationFlag::default()),
+            &clock,
+            &no_env,
+        );
+        driver.acknowledge("go", false).expect("acknowledge");
+        driver.run_to_completion().expect("complete");
+        drop(driver);
+
+        let replayed = journal.replay(&session).expect("replay");
+        let receipt = replayed
+            .task_receipts
+            .values()
+            .flatten()
+            .map(|record| &record.receipt)
+            .find(|receipt| receipt["receipt_id"] == "authoritative-call_read_src")
+            .expect("complete receipt");
+        assert_eq!(receipt["approved_by"], "protocol-controller");
+        assert_eq!(receipt["started_at_ms"], 584_001);
+        assert_eq!(receipt["completed_at_ms"], 584_002);
+        assert_eq!(receipt["policy_fingerprint"], "policy-fingerprint-584");
+        assert_eq!(receipt["state"], "completed");
+        assert_eq!(receipt["result"]["text"], "pub fn broken() {}");
     }
 
     // -- (a) multi-turn investigate/edit/test, once per primary provider ---
@@ -5879,6 +5978,74 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Issue #576: completing one dashboard turn returns the backend to idle,
+    /// so the same native conversation can accept the next operator input.
+    #[test]
+    fn local_native_session_accepts_two_sequential_turns() {
+        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+        let session = spawn_fixture_interactive_session(repo.path(), &env);
+        let session_id = session.session.clone();
+
+        session.submit("first".to_string()).expect("first submit");
+        wait_for_idle(&session);
+        session.submit("second".to_string()).expect("second submit");
+        wait_for_idle(&session);
+        session.shutdown();
+
+        let replayed = Journal::open(&state)
+            .expect("journal")
+            .replay(&session_id)
+            .expect("replay");
+        let inputs: Vec<_> = replayed
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .filter_map(|message| message.text.as_deref())
+            .collect();
+        assert_eq!(inputs, ["first", "second"]);
+    }
+
+    /// Issue #577: hosted turns rebuild `NativeLoop`, but journal identities
+    /// remain unique for the lifetime of the conversation.
+    #[test]
+    fn hosted_native_session_persists_two_turns_without_id_collision() {
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let mut tools = FixtureToolExecutor::new(FixtureToolScript::default());
+
+        for input in ["first", "second"] {
+            let provider = FixtureProvider::new(
+                fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+                script("helper-answer.json"),
+            );
+            let mut driver = NativeLoop::new(
+                config_for(session.clone(), route.clone()),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &now_ms,
+                &no_env,
+            );
+            driver.acknowledge(input, false).expect("acknowledge");
+            driver.run_to_completion().expect("turn completes");
+        }
+
+        let replayed = journal.replay(&session).expect("replay");
+        assert_eq!(
+            replayed.usage.len(),
+            2,
+            "one distinct usage record per turn"
+        );
+        let inputs: Vec<_> = replayed
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .filter_map(|message| message.text.as_deref())
+            .collect();
+        assert_eq!(inputs, ["first", "second"]);
     }
 
     /// PR #531 review finding 7's first case: submit a turn, let it finish
