@@ -444,7 +444,15 @@ pub(super) fn apply_patch(path: &Path, args: &ApplyPatchArgs) -> Result<FileOutc
     }
     let desired = encode_text(&text, encoding);
     let desired_sha = sha256(&desired);
-    state::write_atomic_bytes(path, &desired, false).map_err(ToolError::io)?;
+    // Re-verified immediately before the rename, not just here: an edit
+    // landing after this point but before the replace must still be
+    // refused, not silently overwritten (issue #582 / roadmap N05).
+    if let Some(current_sha) =
+        state::write_atomic_bytes_if_unchanged(path, &desired, false, &actual_sha)
+            .map_err(ToolError::io)?
+    {
+        return Err(stale(&actual_sha, &current_sha));
+    }
     Ok(FileOutcome {
         data: json!({
             "path": path,
@@ -804,6 +812,77 @@ mod tests {
         assert_eq!(decode_text(&changed).expect("decode").0, "æble\r\nny\r\n");
         let error = apply_patch(&path, &args).expect_err("stale patch must fail");
         assert_eq!(error.code, ToolErrorCode::PreconditionFailed);
+    }
+
+    /// Issue #582 (roadmap N05): `apply_patch` validated its precondition
+    /// once at the start and then performed an unconditional atomic rename,
+    /// so an edit landing in the window between the two silently overwrote
+    /// it. Proved with a real race rather than a pre-arranged mismatch,
+    /// since a single-threaded call can never let the destination change
+    /// out from under itself: a background writer is synchronized on the
+    /// one externally observable side effect `write_atomic_bytes_if_
+    /// unchanged` produces before it ever re-reads the destination -- the
+    /// temp sibling's directory entry, created by `open()` well before its
+    /// content is flushed -- so it always lands the external write before
+    /// that re-read. The patch content is large enough that flushing it
+    /// leaves a wide margin for the busy-polling writer to win.
+    #[test]
+    fn patch_refuses_edit_racing_final_replace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("racy.txt");
+        let filler = "filler line to widen the temp-file write window\n".repeat(200_000);
+        let original = format!("{filler}old-marker\n");
+        std::fs::write(&path, &original).expect("write");
+        let expected_sha256 = sha256(original.as_bytes());
+        let args = ApplyPatchArgs {
+            path: path.clone(),
+            expected_sha256: expected_sha256.clone(),
+            operations: vec![ReplaceOperation {
+                expected: "old-marker\n".into(),
+                replacement: "new-marker\n".into(),
+                expected_occurrences: 1,
+            }],
+            idempotency_key: "race-1".into(),
+        };
+
+        let external_bytes = b"external edit landed mid-replace".to_vec();
+        let racer_dir = dir.path().to_path_buf();
+        let racer_target = path.clone();
+        let racer_bytes = external_bytes.clone();
+        let racer = std::thread::spawn(move || -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let Ok(entries) = std::fs::read_dir(&racer_dir) else {
+                    std::thread::yield_now();
+                    continue;
+                };
+                let found_temp_sibling = entries.filter_map(|entry| entry.ok()).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with('.') && name.contains(".tmp-"))
+                });
+                if found_temp_sibling {
+                    std::fs::write(&racer_target, &racer_bytes).expect("racing write");
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        });
+
+        let error = apply_patch(&path, &args).expect_err("racing edit must be refused");
+        let raced = racer.join().expect("racer thread");
+        assert!(
+            raced,
+            "race harness never observed the temp sibling in time; widen the margin"
+        );
+        assert_eq!(error.code, ToolErrorCode::PreconditionFailed);
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            external_bytes,
+            "the racing external edit must survive, never the patch's own replacement"
+        );
     }
 
     #[test]
