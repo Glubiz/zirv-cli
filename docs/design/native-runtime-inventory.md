@@ -282,3 +282,37 @@ and `run_headless`, the `zirv ctx exec --runtime native` entry point that
 resolves the route, builds the adapter and runs the loop to a structured
 final status. `--runtime`/`--route`/`--role` are flags on an existing verb,
 so no `## Commands` row changes.
+
+Issue #617 (N01 follow-up) closed the gap that let a documented row go
+stale without detection: `ZCHK-RUNTIME-INVENTORY` no longer only confirms
+the rows already written above, it independently *rediscovers* production
+model-calling entry points on every run and fails when a real one is
+missing from the table. Discovery walks every `src/**/*.rs` file, drops
+everything from the first `#[cfg(test)] mod tests` marker onward plus any
+file under an `adapters/` directory (trait/implementation definitions, not
+call sites) or `src/commands/update.rs` (swaps the installed binary; never
+spawns it), and flags a line inside a function as an entry point when it
+matches one of the same markers the starter `grep` above already used --
+`interactive_cmd(`, `headless_cmd(`, `headless_cmd_stdin(`,
+`headless_resume_cmd(`, `distiller_cmd(`, `dispatch_agent(`, `current_exe(`
+-- plus the two markers that cover the native direct-transport and
+agent-loop rows the starter grep could not, since neither is a vendor-CLI
+launch: `.stream(` (the loop's one call into a `ProviderAdapter`) and `fn
+perform_blocking(` (each transport's blocking HTTPS/SSE call). A discovered
+`(path, function)` pair counts as documented if it matches an inventory
+row's `Path` and either its `Symbol` or the matched call's own name; anything
+left over fails the check by name. A small, explicit `excluded_model_call`
+allowlist keeps this from false-positiving on shapes that match a marker
+but are not a production entry point in their own right: test-only argv
+probes/builders already owned by their spawning caller
+(`ctx/exec.rs::headless_resume_launch`/`prompt_delivery_via_stdin`,
+`ctx/run_loop.rs::prompt_delivery_via_stdin`/`zirv_invocation`,
+`ctx/dash/mod.rs::task_prompt_fallback_is_safe`), binary
+inspection/self-service (`ctx/measure.rs::current_binary_mtime`,
+`ctx/session/host.rs::resume_argv`, `ctx/session/mod.rs::spawn_service`,
+`ctx/wrap.rs::relaunch_command`), the check's own marker table and scanner
+(`workflow/checks/inventory.rs::model_call_marker`/`perform_blocking`), and
+the dormant `ctx/runtime/harness.rs::start`/`submit` backend -- excluded
+only while `runtime::select` has no production caller, a precondition its
+own regression test enforces so wiring it up trips a visible failure
+instead of silently losing inventory coverage.
