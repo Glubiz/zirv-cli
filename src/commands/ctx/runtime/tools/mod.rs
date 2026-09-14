@@ -5990,6 +5990,7 @@ done
                         id: "fixture-model".into(),
                     },
                 },
+                repo: std::path::PathBuf::from("/native-test-repo"),
                 created_at: 1,
                 completed_at: None,
             })
