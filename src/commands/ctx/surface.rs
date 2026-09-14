@@ -484,6 +484,10 @@ mod tests {
     /// surface. Neither call could produce `Trust::Operator` even if it
     /// didn't panic (both target scopes are `RepoUntrusted`), so this test
     /// is about correctness, not the trust boundary itself.
+    // The refusal is a `debug_assert!`, compiled out in a release build, so
+    // this test only holds under `cfg(debug_assertions)` (it otherwise fails
+    // under `cargo nextest run --release`).
+    #[cfg(debug_assertions)]
     #[test]
     fn into_nested_and_into_local_private_refuse_a_global_surface() {
         let repo = Path::new("/repo");
