@@ -55,7 +55,19 @@ use super::journal::{
 };
 
 /// How many of the newest messages a compaction always leaves verbatim.
-pub const RETAIN_RECENT_MESSAGES: usize = 4;
+///
+/// Issue #638: was 4 until every acceptance test proved this value only
+/// against an explicit override of 2 -- the untouched default was never
+/// actually exercised end to end. At 4, a short, realistic session (as few
+/// as 3 tool-call turns) that overflows the context window on its very
+/// first compaction attempt keeps its ENTIRE history inside the retained
+/// tail, so `checkpoint::boundary` finds nothing before it to compact and a
+/// context-overflow recovery fails with the same overflow a second time
+/// instead of distilling. 2 is the value both the long-session and the
+/// overflow-recovery acceptance tests already validate as correct, so this
+/// makes the default match what was already proven, rather than inventing
+/// an unproven number.
+pub const RETAIN_RECENT_MESSAGES: usize = 2;
 
 /// How much of the covered conversation is handed to a distiller, and how
 /// much it may write back. Both are hard bounds: a distillation that would
