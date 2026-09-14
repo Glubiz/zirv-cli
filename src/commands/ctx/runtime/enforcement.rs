@@ -127,8 +127,13 @@ impl ResourceClaims {
         let mut protected_roots = vec![state_root];
         for relative in [
             ".zirv",
+            ".netrc",
+            ".git-credentials",
+            ".npmrc",
+            ".pypirc",
             ".ssh",
             ".aws",
+            ".azure",
             ".docker",
             ".kube",
             ".gnupg",
@@ -208,6 +213,7 @@ pub struct ProcessEffects {
     pub network: bool,
     pub git_metadata_write: bool,
     pub git_push_or_destructive: bool,
+    pub clean_environment: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +287,10 @@ pub enum ExecutionAction {
     },
     WriteFile {
         path: PathBuf,
+    },
+    WriteFileExact {
+        path: PathBuf,
+        operation_digest: String,
     },
     Process {
         invocation: ProcessInvocation,
@@ -926,9 +936,6 @@ impl PlatformIsolation {
                     "--die-with-parent",
                     "--new-session",
                     "--unshare-all",
-                    "--ro-bind",
-                    "/",
-                    "/",
                     "--dev",
                     "/dev",
                     "--proc",
@@ -938,6 +945,18 @@ impl PlatformIsolation {
                 if policy.network {
                     args.push("--share-net".into());
                 }
+                for root in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
+                    if Path::new(root).exists() {
+                        args.extend(strings(["--ro-bind"]));
+                        args.push(root.into());
+                        args.push(root.into());
+                    }
+                }
+                for root in &policy.read_roots {
+                    args.extend(strings(["--ro-bind"]));
+                    args.push(root.as_os_str().to_owned());
+                    args.push(root.as_os_str().to_owned());
+                }
                 for root in &policy.write_roots {
                     args.extend(strings(["--bind"]));
                     args.push(root.as_os_str().to_owned());
@@ -946,6 +965,11 @@ impl PlatformIsolation {
                 // Apply masks after writable binds so a protected child path
                 // cannot be re-exposed by a broader parent write root.
                 for root in &policy.masked_roots {
+                    if !inside_any(root, &policy.read_roots)
+                        && !inside_any(root, &policy.write_roots)
+                    {
+                        continue;
+                    }
                     if root.is_dir() {
                         args.extend(strings(["--tmpfs"]));
                         args.push(root.as_os_str().to_owned());
@@ -1013,6 +1037,7 @@ pub struct Authorization {
     /// Canonical targets checked at the effect boundary. Concrete file tools
     /// use these rather than reopening the unresolved model-supplied spelling.
     resolved_paths: Vec<PathBuf>,
+    protected_paths: Vec<PathBuf>,
     process_sandbox: Option<ProcessSandboxPolicy>,
 }
 
@@ -1027,6 +1052,10 @@ impl Authorization {
 
     pub fn resolved_paths(&self) -> &[PathBuf] {
         &self.resolved_paths
+    }
+
+    pub fn protected_paths(&self) -> &[PathBuf] {
+        &self.protected_paths
     }
 
     pub fn process_sandbox(&self) -> Option<&ProcessSandboxPolicy> {
@@ -1152,6 +1181,7 @@ impl ExecutionBroker {
         )?;
         let mut approved_by = None;
         let mut approval_expires_at = None;
+        let mut waited_for_approval = false;
 
         if validation.needs_approval {
             if snapshot.effective.approval == Stance::Deny {
@@ -1178,29 +1208,41 @@ impl ExecutionBroker {
                 // interactive one with nobody listening -- refuses exactly as
                 // before.
                 None => match self.approvals.as_ref() {
-                    Some(approvals) => match approvals.request(&request, now) {
-                        ApprovalOutcome::Granted(grant)
-                            if self.approval_authority.verify(&grant, &request, now) =>
-                        {
-                            approved_by = Some(grant.approved_by.clone());
-                            approval_expires_at = grant.expires_at;
+                    Some(approvals) => {
+                        waited_for_approval = true;
+                        match approvals.request(&request, now) {
+                            ApprovalOutcome::Granted(grant)
+                                if self.approval_authority.verify(&grant, &request, now) =>
+                            {
+                                approved_by = Some(grant.approved_by.clone());
+                                approval_expires_at = grant.expires_at;
+                            }
+                            ApprovalOutcome::Granted(_) => {
+                                return Err(BrokerError::InvalidApproval(Box::new(request)));
+                            }
+                            ApprovalOutcome::Denied { guidance } => {
+                                return Err(BrokerError::Denied(guidance));
+                            }
+                            ApprovalOutcome::Cancelled => {
+                                return Err(BrokerError::ApprovalRequired(Box::new(request)));
+                            }
                         }
-                        ApprovalOutcome::Granted(_) => {
-                            return Err(BrokerError::InvalidApproval(Box::new(request)));
-                        }
-                        ApprovalOutcome::Denied { guidance } => {
-                            return Err(BrokerError::Denied(guidance));
-                        }
-                        ApprovalOutcome::Cancelled => {
-                            return Err(BrokerError::ApprovalRequired(Box::new(request)));
-                        }
-                    },
+                    }
                     None => return Err(BrokerError::ApprovalRequired(Box::new(request))),
                 },
             }
         } else if grant.is_some() {
             // A grant for an action that no longer needs one is ignored. It
             // never broadens the freshly reloaded current policy.
+        }
+
+        if waited_for_approval {
+            self.fence.verify(&self.identity)?;
+            if self.policy.current()?.fingerprint != snapshot.fingerprint {
+                return Err(BrokerError::InvalidAction(
+                    "authorization was invalidated by a policy change during approval".to_string(),
+                ));
+            }
         }
 
         Ok(Authorization {
@@ -1210,6 +1252,7 @@ impl ExecutionBroker {
             approved_by,
             approval_expires_at,
             resolved_paths: validation.resolved_paths,
+            protected_paths: self.claims.protected_roots.clone(),
             process_sandbox: validation.process_sandbox,
         })
     }
@@ -1356,22 +1399,8 @@ impl ExecutionBroker {
                     required.push(Capability::RepoFsWrite);
                     needs_writer = true;
                 }
-                // Issue #483: not every knowledge service is inert. The
-                // frontend one starts a development server and a headless
-                // browser through zirv's own vetted `frontend_render` path,
-                // so it carries exactly the capabilities that implies --
-                // named here rather than inside the tool, so the broker stays
-                // the only place an effect is priced.
-                if service == "frontend" {
-                    required.push(Capability::ShellExec);
-                    required.push(Capability::Network);
-                    if *write {
-                        required.push(Capability::RepoFsWrite);
-                        needs_writer = true;
-                    }
-                }
             }
-            ExecutionAction::WriteFile { path } => {
+            ExecutionAction::WriteFile { path } | ExecutionAction::WriteFileExact { path, .. } => {
                 let (path, capability) = self.validate_write(path)?;
                 resolved_paths.push(path);
                 required.push(capability);
@@ -1633,8 +1662,11 @@ impl ExecutionBroker {
         if effects.outside_write {
             write_roots.extend(self.claims.outside_write_roots.clone());
         }
-        let mut environment =
-            scrub_tool_environment(std::env::vars_os(), &self.protected_env_names);
+        let mut environment = if effects.clean_environment {
+            BTreeMap::new()
+        } else {
+            scrub_tool_environment(std::env::vars_os(), &self.protected_env_names)
+        };
         environment.extend(invocation.environment().clone());
         Ok(ProcessSandboxPolicy {
             read_roots: self.claims.read_roots.clone(),
@@ -1947,8 +1979,17 @@ fn shell_quote_for_classification(value: &str) -> String {
 
 fn seatbelt_profile(policy: &ProcessSandboxPolicy) -> String {
     let mut profile = String::from(
-        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow file-read*)\n",
+        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n\
+         (allow file-read* (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") \
+         (subpath \"/System\") (subpath \"/Library\") (subpath \"/dev\") \
+         (subpath \"/private/var/db\"))\n",
     );
+    for root in &policy.read_roots {
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            seatbelt_escape(root)
+        ));
+    }
     for root in &policy.masked_roots {
         profile.push_str(&format!(
             "(deny file-read* file-write* (subpath \"{}\"))\n",
@@ -2219,6 +2260,7 @@ mod tests {
     }
 
     #[test]
+    // Issue #563: an approval covers the complete write operation, not its path alone.
     fn approval_is_bound_to_action_policy_generation_and_parent_identity() {
         let effective = EffectivePolicy {
             repo_fs_write: Stance::Ask,
@@ -2241,6 +2283,36 @@ mod tests {
             .broker
             .authorize_at(&first, Some(&grant), 11)
             .expect("exact grant");
+
+        let exact = ExecutionAction::WriteFileExact {
+            path: fixture.worktree.join("same.rs"),
+            operation_digest: "content:a;precondition:old".to_string(),
+        };
+        let exact_request = match fixture.broker.authorize_at(&exact, None, 10) {
+            Err(BrokerError::ApprovalRequired(request)) => request,
+            other => panic!("expected exact write approval request, got {other:?}"),
+        };
+        let exact_grant = fixture
+            .authority
+            .approve(&exact_request, "operator", 10, Some(20))
+            .expect("exact write approval");
+        for changed_operation in [
+            "content:b;precondition:old",
+            "patch:a-to-b;precondition:old",
+            "patch:a-to-c;precondition:old",
+            "content:a;precondition:new",
+        ] {
+            let changed = ExecutionAction::WriteFileExact {
+                path: fixture.worktree.join("same.rs"),
+                operation_digest: changed_operation.to_string(),
+            };
+            assert!(matches!(
+                fixture
+                    .broker
+                    .authorize_at(&changed, Some(&exact_grant), 11),
+                Err(BrokerError::InvalidApproval(_))
+            ));
+        }
 
         let changed_args = ExecutionAction::WriteFile {
             path: fixture.worktree.join("two.rs"),
@@ -2363,18 +2435,104 @@ mod tests {
     }
 
     #[test]
+    // Issue #549: production broker construction carries provider env names into scrubbing.
     fn provider_credentials_are_scrubbed_from_tool_environment() {
-        let env = vec![
-            ("PATH".into(), "/bin".into()),
-            ("OPENAI_API_KEY".into(), "secret".into()),
-            ("GITHUB_TOKEN".into(), "secret".into()),
-            ("PROJECT_NAME".into(), "zirv".into()),
-        ];
-        let clean = scrub_tool_environment(env, &BTreeSet::from(["OPENAI_API_KEY".to_string()]));
-        assert_eq!(clean.get("PATH").map(String::as_str), Some("/bin"));
-        assert_eq!(clean.get("PROJECT_NAME").map(String::as_str), Some("zirv"));
-        assert!(!clean.contains_key("OPENAI_API_KEY"));
-        assert!(!clean.contains_key("GITHUB_TOKEN"));
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(home.join(".zirv")).expect("home config dir");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::write(
+            home.join(".zirv/native.toml"),
+            "schema=1\n[account.deepseek]\nprovider='anthropic'\ncredential='env:DEEPSEEK_KEY'\n[account.aws]\nprovider='anthropic'\ncredential='env:AWS_ACCESS_KEY_ID'\n[route.deepseek]\naccount='deepseek'\nmodel='claude-sonnet-5'\n[route.aws]\naccount='aws'\nmodel='claude-sonnet-5'\n",
+        )
+        .expect("native config");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            "[policy]\nshell_exec='allow'\napproval='allow'\n[safety]\nallow=['/usr/bin/env']\n",
+        )
+        .expect("ctx config");
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("HOME", Some(home.to_str().expect("utf-8 home"))),
+            ("USERPROFILE", Some(home.to_str().expect("utf-8 home"))),
+            ("DEEPSEEK_KEY", Some("provider-secret-a")),
+            ("AWS_ACCESS_KEY_ID", Some("provider-secret-b")),
+        ]);
+        let state = crate::commands::ctx::state::StateDir::from_root(root.path().join("state"));
+        let session = "native-provider-env";
+        let short = crate::commands::ctx::sessions::short_id(session);
+        let mut registered = seat::register(
+            &state,
+            &short,
+            session,
+            "native",
+            None,
+            "anthropic",
+            "worker",
+            false,
+            1,
+        )
+        .expect("seat");
+        registered.runtime = RuntimeKind::Native;
+        seat::store(&state, &registered).expect("native seat");
+        let cfg = CtxConfig::load_for_launch(&repo, &env_from_process()).expect("config");
+        let (approvals, prompts) =
+            InteractiveApprovals::new(Arc::new(ApprovalAuthority::new()), "test operator");
+        let broker = super::super::native::session_broker(
+            &repo,
+            &state,
+            &home,
+            &cfg,
+            ExecutionIdentity {
+                session: session.to_string(),
+                short,
+                generation: 1,
+                role: "worker".to_string(),
+                task: None,
+            },
+            None,
+            Some(approvals),
+        )
+        .expect("production broker");
+        if !broker.isolation_status().1 {
+            return;
+        }
+        let action = ExecutionAction::Process {
+            invocation: ProcessInvocation::Argv {
+                program: "/usr/bin/env".to_string(),
+                args: Vec::new(),
+                cwd: repo,
+                environment: BTreeMap::new(),
+            },
+            effects: ProcessEffects::default(),
+        };
+        let dialog = std::thread::spawn(move || {
+            if let Ok(prompt) = prompts.recv_timeout(std::time::Duration::from_secs(1)) {
+                assert!(prompt.decide(InteractiveDecision::Once));
+            }
+        });
+        let authorization = broker
+            .authorize(&action, None)
+            .expect("authorize env child");
+        dialog.join().expect("approval dialog");
+        let environment = &authorization
+            .process_sandbox()
+            .expect("process sandbox")
+            .environment;
+        let output = Command::new("/usr/bin/env")
+            .current_dir(root.path())
+            .env_clear()
+            .envs(environment)
+            .output()
+            .expect("spawn env child");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).expect("utf-8 environment");
+        assert!(!output.contains("DEEPSEEK_KEY="), "{output}");
+        assert!(!output.contains("AWS_ACCESS_KEY_ID="), "{output}");
     }
 
     #[test]
@@ -2435,6 +2593,92 @@ mod tests {
         assert!(!rendered.contains("--share-net"));
         assert!(rendered.contains("--clearenv"));
         assert!(rendered.contains("--bind"));
+    }
+
+    #[test]
+    // Issue #562: OS containment enforces resolved read roots.
+    fn process_cannot_read_outside_resolved_roots() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let allowed = root.path().join("allowed");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&allowed).expect("allowed root");
+        std::fs::create_dir_all(&outside).expect("outside root");
+        let allowed = std::fs::canonicalize(allowed).expect("canonical allowed root");
+        let outside = std::fs::canonicalize(outside).expect("canonical outside root");
+        let allowed_file = allowed.join("visible.txt");
+        let outside_files = [outside.join(".netrc"), outside.join(".npmrc")];
+        std::fs::write(&allowed_file, "allowed").expect("allowed file");
+        for path in &outside_files {
+            std::fs::write(path, "outside").expect("outside file");
+        }
+        let policy = ProcessSandboxPolicy {
+            read_roots: vec![allowed.clone()],
+            write_roots: Vec::new(),
+            masked_roots: Vec::new(),
+            network: false,
+            environment: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+        };
+        let isolation = PlatformIsolation::detect();
+        if !isolation.is_available() {
+            return;
+        }
+        let launch_for = |path: &Path| {
+            isolation
+                .prepare(
+                    &ProcessInvocation::Argv {
+                        program: "/bin/cat".to_string(),
+                        args: vec![path.to_string_lossy().to_string()],
+                        cwd: allowed.clone(),
+                        environment: BTreeMap::new(),
+                    },
+                    &policy,
+                )
+                .expect("sandbox launch")
+        };
+        let allowed_launch = launch_for(&allowed_file);
+        match &isolation {
+            PlatformIsolation::LinuxBubblewrap { .. } => assert!(
+                !allowed_launch
+                    .args
+                    .windows(3)
+                    .any(|args| args == ["--ro-bind", "/", "/"])
+            ),
+            PlatformIsolation::MacOsSeatbelt { .. } => assert!(
+                !allowed_launch.args[1]
+                    .to_string_lossy()
+                    .contains("(allow file-read*)\n")
+            ),
+            _ => {}
+        }
+        let run = |launch: SandboxLaunch| {
+            Command::new(&launch.program)
+                .args(&launch.args)
+                .current_dir(&launch.cwd)
+                .env_clear()
+                .envs(&launch.environment)
+                .output()
+                .expect("sandbox child")
+        };
+        let allowed_output = run(allowed_launch);
+        if !allowed_output.status.success()
+            && (String::from_utf8_lossy(&allowed_output.stderr).contains("Operation not permitted")
+                || (cfg!(target_os = "macos")
+                    && matches!(allowed_output.status.code(), None | Some(71))))
+        {
+            return;
+        }
+        assert!(
+            allowed_output.status.success(),
+            "status={:?}, stderr={}",
+            allowed_output.status.code(),
+            String::from_utf8_lossy(&allowed_output.stderr)
+        );
+        assert_eq!(allowed_output.stdout, b"allowed");
+        for outside_file in &outside_files {
+            let outside_output = run(launch_for(outside_file));
+            assert!(!outside_output.status.success());
+            assert_ne!(outside_output.stdout, b"outside");
+        }
     }
 
     #[test]
@@ -2604,6 +2848,66 @@ mod tests {
         // Yes is once: nothing was remembered, so the queue is empty rather
         // than holding a standing grant.
         assert!(prompts.try_recv().is_err());
+    }
+
+    #[test]
+    // Issue #565: approval waits cannot outlive the seat or policy snapshot.
+    fn non_process_approval_rechecks_generation_and_policy_after_wait() {
+        for kind in ["file", "knowledge", "mcp"] {
+            for stale_generation in [true, false] {
+                let (fixture, prompts, _approvals) = interactive_fixture(ApprovalMode::Interactive);
+                let action = match kind {
+                    "file" => ExecutionAction::WriteFile {
+                        path: fixture.worktree.join("one.rs"),
+                    },
+                    "knowledge" => ExecutionAction::Knowledge {
+                        service: "memory".to_string(),
+                        operation: "remember".to_string(),
+                        scope: Some("shared".to_string()),
+                        key: Some("fact".to_string()),
+                        write: true,
+                    },
+                    "mcp" => ExecutionAction::Mcp {
+                        server: "filesystem".to_string(),
+                        tool: "write".to_string(),
+                        arguments: serde_json::json!({"path":"one.rs"}),
+                        effects: ProcessEffects {
+                            repo_write: true,
+                            ..ProcessEffects::default()
+                        },
+                    },
+                    _ => unreachable!(),
+                };
+                let generation = fixture.generation.clone();
+                let policy = fixture.policy.clone();
+                let dialog = std::thread::spawn(move || {
+                    let prompt = prompts.recv().expect("blocked approval");
+                    if stale_generation {
+                        *generation.0.lock().expect("generation lock") = 8;
+                    } else {
+                        let mut changed = asking_policy();
+                        changed.repo_fs_write = Stance::Deny;
+                        *policy.0.lock().expect("policy lock") =
+                            PolicySnapshot::new(changed, SafetyPolicy::default())
+                                .expect("changed policy");
+                    }
+                    assert!(prompt.decide(InteractiveDecision::Once));
+                });
+                let outcome = fixture.broker.authorize_at(&action, None, 10);
+                dialog.join().expect("dialog thread");
+                if stale_generation {
+                    assert!(
+                        matches!(outcome, Err(BrokerError::StaleGeneration { .. })),
+                        "{kind}: {outcome:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(outcome, Err(BrokerError::InvalidAction(_))),
+                        "{kind}: {outcome:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

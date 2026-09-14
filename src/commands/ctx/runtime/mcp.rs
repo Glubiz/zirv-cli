@@ -1347,6 +1347,7 @@ impl From<&CapabilityEffectsConfig> for ProcessEffects {
             network: value.network,
             git_metadata_write: value.git_metadata_write,
             git_push_or_destructive: value.git_push_or_destructive,
+            clean_environment: false,
         }
     }
 }

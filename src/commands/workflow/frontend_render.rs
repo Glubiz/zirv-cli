@@ -389,6 +389,17 @@ pub fn latest_visual_is_fresh_and_passing(state: &StateDir, repo: &Path) -> CtxR
 }
 
 pub fn render(state: &StateDir, repo: &Path) -> CtxResult<RenderReport> {
+    render_with_launcher(state, repo, |mut command| {
+        super::isolate_process_tree(&mut command);
+        Ok(command.spawn()?)
+    })
+}
+
+pub(crate) fn render_with_launcher(
+    state: &StateDir,
+    repo: &Path,
+    mut launch_server: impl FnMut(Command) -> CtxResult<Child>,
+) -> CtxResult<RenderReport> {
     let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let profile = super::frontend::ensure_profile(state, &repo)?;
     let change_fingerprint = super::verification::change_fingerprint(&repo)?;
@@ -491,8 +502,7 @@ pub fn render(state: &StateDir, repo: &Path) -> CtxResult<RenderReport> {
         .env("NITRO_HOST", "127.0.0.1")
         .env("PORT", port.to_string())
         .env("BROWSER", "none");
-    super::isolate_process_tree(&mut command);
-    let mut child = match command.spawn() {
+    let mut child = match launch_server(command) {
         Ok(child) => child,
         Err(error) => {
             report

@@ -60,6 +60,7 @@ impl ProcessStartArgs {
             network: self.network,
             git_metadata_write: shell || self.git_metadata_write || git_write,
             git_push_or_destructive: shell || self.git_push_or_destructive || destructive,
+            clean_environment: false,
         }
     }
 

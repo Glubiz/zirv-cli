@@ -674,11 +674,17 @@ impl ParsedTool {
             Self::Search(args) => ExecutionAction::ReadFile {
                 path: args.root.clone(),
             },
-            Self::WriteFile(args) => ExecutionAction::WriteFile {
+            Self::WriteFile(args) => ExecutionAction::WriteFileExact {
                 path: args.path.clone(),
+                operation_digest: files::sha256(
+                    &serde_json::to_vec(args).map_err(ToolError::external)?,
+                ),
             },
-            Self::ApplyPatch(args) => ExecutionAction::WriteFile {
+            Self::ApplyPatch(args) => ExecutionAction::WriteFileExact {
                 path: args.path.clone(),
+                operation_digest: files::sha256(
+                    &serde_json::to_vec(args).map_err(ToolError::external)?,
+                ),
             },
             Self::ProcessStart(args) => {
                 let invocation = match &args.shell_script {
@@ -1446,6 +1452,11 @@ impl NativeToolClient {
         };
         let retry = parsed.retry_policy();
         let action = match parsed.action() {
+            Ok(action)
+                if matches!(&parsed, ParsedTool::McpList(_) | ParsedTool::McpDescribe(_)) =>
+            {
+                action
+            }
             Ok(action) => self.with_declared_effects(action),
             Err(error) => return failed_receipt(name, retry, error, started_at_ms),
         };
@@ -1527,7 +1538,7 @@ impl NativeToolClient {
             }
             ParsedTool::Search(args) => {
                 let path = authorized_path(authorization)?;
-                self.finish_file(files::search(path, &args)?)
+                self.finish_file(files::search(path, &args, authorization.protected_paths())?)
             }
             ParsedTool::WriteFile(args) => {
                 let path = authorized_path(authorization)?;
@@ -1627,9 +1638,12 @@ impl NativeToolClient {
             }
             ParsedTool::ArtifactPresent(args) => self.present_artifact(&args),
             ParsedTool::FrontendRender(_) => {
-                let report =
-                    crate::commands::workflow::frontend_render::render(&self.state, &self.repo)
-                        .map_err(ToolError::external)?;
+                let report = crate::commands::workflow::frontend_render::render_with_launcher(
+                    &self.state,
+                    &self.repo,
+                    |command| self.launch_frontend_server(command),
+                )
+                .map_err(ToolError::external)?;
                 serde_json::to_value(report).map_err(ToolError::external)
             }
             ParsedTool::FrontendReview(args) => {
@@ -1674,6 +1688,53 @@ impl NativeToolClient {
             ParsedTool::ObjectiveStatus(_) => self.objective_status(),
             ParsedTool::TeamStatus(_) => self.team_status(),
         }
+    }
+
+    fn launch_frontend_server(
+        &self,
+        command: std::process::Command,
+    ) -> crate::commands::ctx::CtxResult<std::process::Child> {
+        let invocation = ProcessInvocation::Argv {
+            program: command.get_program().to_string_lossy().into_owned(),
+            args: command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+            cwd: command
+                .get_current_dir()
+                .ok_or("frontend server command has no working directory")?
+                .to_path_buf(),
+            environment: command
+                .get_envs()
+                .filter_map(|(key, value)| {
+                    Some((
+                        key.to_string_lossy().into_owned(),
+                        value?.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect(),
+        };
+        let action = ExecutionAction::Process {
+            invocation,
+            effects: ProcessEffects {
+                network: true,
+                clean_environment: true,
+                ..ProcessEffects::default()
+            },
+        };
+        let authorization = self.broker.authorize(&action, None)?;
+        let launch = self.broker.prepare_process(&action, &authorization)?;
+        let mut child = std::process::Command::new(&launch.program);
+        child
+            .args(&launch.args)
+            .current_dir(&launch.cwd)
+            .env_clear()
+            .envs(&launch.environment)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        super::super::supervise::isolate_process_tree(&mut child);
+        Ok(child.spawn()?)
     }
 
     // -- the team tools (issue #485, roadmap N16) -------------------------
@@ -1996,6 +2057,22 @@ impl NativeToolClient {
                 |refusal| ToolError::new(ToolErrorCode::AuthorizationDenied, refusal.to_string()),
             )?;
         }
+        let workdir = match args.workdir.as_deref() {
+            Some(workdir) => {
+                let roots = crate::commands::ctx::dash::workdir_roots(&cfg, &self.repo);
+                Some(
+                    crate::commands::ctx::dash::resolved_spawn_cwd(
+                        self.repo.clone(),
+                        Some(Path::new(workdir)),
+                        &roots,
+                    )
+                    .map_err(|error| {
+                        ToolError::new(ToolErrorCode::AuthorizationDenied, error.to_string())
+                    })?,
+                )
+            }
+            None => None,
+        };
         let request = service::LaunchRequest {
             runtime: args.runtime.kind(),
             target: args.target_or_default(),
@@ -2003,7 +2080,7 @@ impl NativeToolClient {
             role: args.role_or_default(),
             task: args.task.clone(),
             group: args.group.clone(),
-            workdir: args.workdir.as_ref().map(PathBuf::from),
+            workdir,
             read_only: args.mode == delegation::ToolMode::ReadOnly,
             budget_tokens: args.budget_tokens,
             max_tool_calls: args.max_tool_calls,
@@ -2184,24 +2261,22 @@ impl NativeToolClient {
                 server,
                 tool,
                 arguments,
-                effects,
+                effects: _,
             } => {
-                let declared = if tool.starts_with("tools/") {
-                    effects
-                } else {
-                    self.services
-                        .server_effects(&server)
-                        .unwrap_or(ProcessEffects {
-                            // An unknown server gets the conservative
-                            // all-effects declaration, exactly as N04's own
-                            // doc comment on `ExecutionAction::Mcp` requires.
-                            repo_write: true,
-                            outside_write: true,
-                            network: true,
-                            git_metadata_write: true,
-                            git_push_or_destructive: true,
-                        })
-                };
+                let declared = self
+                    .services
+                    .server_effects(&server)
+                    .unwrap_or(ProcessEffects {
+                        // An unknown server gets the conservative
+                        // all-effects declaration, exactly as N04's own
+                        // doc comment on `ExecutionAction::Mcp` requires.
+                        repo_write: true,
+                        outside_write: true,
+                        network: true,
+                        git_metadata_write: true,
+                        git_push_or_destructive: true,
+                        clean_environment: false,
+                    });
                 ExecutionAction::Mcp {
                     server,
                     tool,
@@ -3595,6 +3670,35 @@ mod tests {
     }
 
     #[test]
+    fn write_approvals_bind_content_patch_and_preconditions() {
+        let registry = ToolRegistry::native();
+        let action = |name, arguments| registry.parse(name, arguments).unwrap().action().unwrap();
+        let write_a = action(
+            FILE_WRITE,
+            json!({"path":"same.rs","content":"a","expected_sha256":"old","create_only":false,"idempotency_key":"write-a"}),
+        );
+        let write_b = action(
+            FILE_WRITE,
+            json!({"path":"same.rs","content":"b","expected_sha256":"old","create_only":false,"idempotency_key":"write-a"}),
+        );
+        let changed_precondition = action(
+            FILE_WRITE,
+            json!({"path":"same.rs","content":"a","expected_sha256":"new","create_only":false,"idempotency_key":"write-a"}),
+        );
+        let patch_a = action(
+            APPLY_PATCH,
+            json!({"path":"same.rs","expected_sha256":"old","operations":[{"expected":"a","replacement":"b"}],"idempotency_key":"patch-a"}),
+        );
+        let patch_b = action(
+            APPLY_PATCH,
+            json!({"path":"same.rs","expected_sha256":"old","operations":[{"expected":"a","replacement":"c"}],"idempotency_key":"patch-a"}),
+        );
+        assert_ne!(write_a, write_b);
+        assert_ne!(write_a, changed_precondition);
+        assert_ne!(patch_a, patch_b);
+    }
+
+    #[test]
     fn knowledge_tools_have_typed_scope_and_effects() {
         let registry = ToolRegistry::native();
         for name in [
@@ -3620,6 +3724,201 @@ mod tests {
                 key: Some("architecture".into()),
                 write: true,
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // Issue #550: repository-selected frontend servers must cross process isolation.
+    fn frontend_dev_server_is_brokered_and_refuses_unavailable_isolation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::super::super::policy::{EffectivePolicy, Stance};
+        use super::super::enforcement::{
+            ApprovalAuthority, ApprovalMode, ExecutionIdentity, NetworkScope, PlatformIsolation,
+            PolicySnapshot, ResourceClaims,
+        };
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = std::fs::canonicalize(root.path()).expect("canonical repo");
+        let home = repo.join("home");
+        let bin = repo.join("bin");
+        let state = StateDir::from_root(repo.join("state"));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::write(repo.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#)
+            .expect("package");
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "package.json"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .expect("git fixture")
+                    .success()
+            );
+        }
+        let spawned = repo.join("dev-server-spawned");
+        let npm = bin.join("npm");
+        std::fs::write(
+            &npm,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf spawned > '{}'\nexit 1\n",
+                spawned.display()
+            ),
+        )
+        .expect("npm fixture");
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755))
+            .expect("npm executable");
+        let browser = bin.join("chromium");
+        std::fs::write(&browser, "#!/bin/sh\nexit 0\n").expect("browser fixture");
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755))
+            .expect("browser executable");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[("PATH", Some(&path))]);
+
+        let policy = EffectivePolicy {
+            network: Some(Stance::Allow),
+            ..EffectivePolicy::default()
+        };
+        let broker = ExecutionBroker::new(
+            ExecutionIdentity {
+                session: "frontend-test".into(),
+                short: "frontend".into(),
+                generation: 1,
+                role: "worker".into(),
+                task: None,
+            },
+            ResourceClaims::new(&repo, &repo, state.root(), &home, NetworkScope::Any)
+                .expect("claims"),
+            ApprovalMode::Headless,
+            std::sync::Arc::new(FixedPolicy(
+                PolicySnapshot::new(policy, Default::default()).expect("policy"),
+            )),
+            std::sync::Arc::new(FixedFence),
+            std::sync::Arc::new(ApprovalAuthority::new()),
+            None,
+            PlatformIsolation::Unavailable {
+                platform: "test".into(),
+                reason: "fixture unavailable".into(),
+            },
+            Default::default(),
+        )
+        .expect("broker");
+        let mut client = NativeToolClient::new(broker, state, repo, ToolLimits::testing());
+
+        let receipt = call(&mut client, FRONTEND_RENDER, json!({}));
+
+        assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+        assert!(
+            !spawned.exists(),
+            "dev server bypassed the broker: {receipt:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // Issue #550: frontend children get no ambient env or unapproved network claim.
+    fn frontend_child_has_clean_environment_and_requires_network_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::super::super::policy::{EffectivePolicy, Stance};
+        use super::super::enforcement::{
+            ApprovalAuthority, ApprovalMode, ExecutionIdentity, NetworkScope, PlatformIsolation,
+            PolicySnapshot, ResourceClaims,
+        };
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = std::fs::canonicalize(root.path()).expect("canonical repo");
+        let home = repo.join("home");
+        let state = StateDir::from_root(repo.join("state"));
+        std::fs::create_dir_all(&home).expect("home");
+        let observed = repo.join("observed");
+        let sandbox = repo.join("sandbox");
+        std::fs::write(
+            &sandbox,
+            format!(
+                "#!/bin/sh\nresult=clean\nif [ \"${{FRONTEND_PARENT_VALUE+x}}\" = x ]; then result=leaked; fi\nfor arg in \"$@\"; do [ \"$arg\" = FRONTEND_PARENT_VALUE ] && result=leaked; done\nprintf %s \"$result\" > '{}'\n",
+                observed.display()
+            ),
+        )
+        .expect("sandbox fixture");
+        std::fs::set_permissions(&sandbox, std::fs::Permissions::from_mode(0o755))
+            .expect("sandbox executable");
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FRONTEND_PARENT_VALUE",
+            Some("must-not-leak"),
+        )]);
+        let policy = EffectivePolicy {
+            network: Some(Stance::Allow),
+            ..EffectivePolicy::default()
+        };
+        let mut safety = super::super::super::safety::SafetyPolicy::default();
+        safety.default = super::super::super::safety::Verdict::Allow;
+        let make_client = |network| {
+            let broker = ExecutionBroker::new(
+                ExecutionIdentity {
+                    session: "frontend-exec-test".into(),
+                    short: "frontend".into(),
+                    generation: 1,
+                    role: "worker".into(),
+                    task: None,
+                },
+                ResourceClaims::new(&repo, &repo, state.root(), &home, network).expect("claims"),
+                ApprovalMode::Headless,
+                std::sync::Arc::new(FixedPolicy(
+                    PolicySnapshot::new(policy, safety.clone()).expect("policy"),
+                )),
+                std::sync::Arc::new(FixedFence),
+                std::sync::Arc::new(ApprovalAuthority::new()),
+                None,
+                PlatformIsolation::LinuxBubblewrap {
+                    executable: sandbox.clone(),
+                },
+                Default::default(),
+            )
+            .expect("broker");
+            NativeToolClient::new(broker, state.clone(), repo.clone(), ToolLimits::testing())
+        };
+        let command = || {
+            let mut command = std::process::Command::new("frontend-fixture");
+            command.current_dir(&repo);
+            command
+        };
+
+        let allowed = make_client(NetworkScope::Any);
+        let mut child = allowed
+            .launch_frontend_server(command())
+            .expect("brokered frontend child");
+        assert!(child.wait().expect("wait").success());
+        assert_eq!(
+            std::fs::read_to_string(&observed).expect("observation"),
+            "clean"
+        );
+
+        std::fs::remove_file(&observed).expect("clear observation");
+        let denied = make_client(NetworkScope::Denied);
+        assert!(denied.launch_frontend_server(command()).is_err());
+        assert!(
+            !observed.exists(),
+            "network-denied frontend child was spawned"
         );
     }
 
@@ -3839,6 +4138,45 @@ mod tests {
             assert_eq!(record.handle.task.as_deref(), Some("task-7"));
             assert_eq!(record.attempts.len(), 1);
         }
+    }
+
+    #[test]
+    // Issue #551: model-selected delegation workdirs stay inside operator roots.
+    fn native_delegate_refuses_workdir_outside_configured_roots() {
+        let mut fixture = delegation_fixture(0);
+        let outside = tempfile::tempdir().expect("outside checkout");
+        for checkout in [&fixture.repo, outside.path()] {
+            let status = std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(checkout)
+                .status()
+                .expect("git init");
+            assert!(status.success());
+        }
+        let allowed = fixture.repo.to_string_lossy().to_string();
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_DASH_WORKDIR_ROOTS",
+            Some(&allowed),
+        )]);
+
+        let receipt = call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({
+                "brief": "work in the unrelated checkout",
+                "workdir": outside.path(),
+            }),
+        );
+
+        assert_eq!(receipt.state, ToolReceiptState::Failed, "{receipt:?}");
+        assert!(
+            receipt
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("workdir roots")),
+            "{receipt:?}"
+        );
+        assert!(fixture.launches.lock().expect("launches").is_empty());
     }
 
     #[test]
@@ -4740,6 +5078,15 @@ mod tests {
         server: super::super::mcp::FixtureServer,
         max_inline_mcp_tools: usize,
     ) -> EndToEnd {
+        end_to_end_with_effects(policy, server, max_inline_mcp_tools, Default::default())
+    }
+
+    fn end_to_end_with_effects(
+        policy: super::super::super::policy::EffectivePolicy,
+        server: super::super::mcp::FixtureServer,
+        max_inline_mcp_tools: usize,
+        effects: super::super::super::config::CapabilityEffectsConfig,
+    ) -> EndToEnd {
         use super::super::super::config::{
             CapabilitiesConfig, CtxConfig, McpServerConfig, McpTransportConfig,
         };
@@ -4758,6 +5105,10 @@ mod tests {
         let repo = std::fs::canonicalize(&repo).expect("canonical repo");
         let claims = ResourceClaims::new(&repo, &repo, &state_root, &home, NetworkScope::Any)
             .expect("claims");
+        let writer = effects.repo_write.then(|| {
+            Box::new(FixtureWriter(repo.clone()))
+                as Box<dyn crate::commands::ctx::runtime::enforcement::WriterLease>
+        });
         let broker = ExecutionBroker::new(
             ExecutionIdentity {
                 session: "session-483".into(),
@@ -4774,7 +5125,7 @@ mod tests {
             )),
             std::sync::Arc::new(FixedFence),
             std::sync::Arc::new(ApprovalAuthority::new()),
-            None,
+            writer,
             PlatformIsolation::Unavailable {
                 platform: "test".into(),
                 reason: "no test sandbox".into(),
@@ -4796,6 +5147,7 @@ mod tests {
                         cwd: None,
                         environment: Default::default(),
                     },
+                    effects,
                     ..McpServerConfig::default()
                 }],
                 ..CapabilitiesConfig::default()
@@ -4874,6 +5226,53 @@ mod tests {
             receipt.error.expect("error").code,
             ToolErrorCode::AuthorizationDenied
         );
+    }
+
+    #[test]
+    // Issue #566: server-controlled names cannot suppress configured effects.
+    fn mcp_tool_named_tools_prefix_still_uses_declared_effects() {
+        use super::super::super::config::CapabilityEffectsConfig;
+        use super::super::super::policy::{EffectivePolicy, Stance};
+
+        let effects = CapabilityEffectsConfig {
+            repo_write: true,
+            network: true,
+            ..CapabilityEffectsConfig::default()
+        };
+        for policy in [
+            EffectivePolicy {
+                repo_fs_write: Stance::Deny,
+                network: Some(Stance::Allow),
+                ..EffectivePolicy::default()
+            },
+            EffectivePolicy {
+                repo_fs_write: Stance::Allow,
+                network: Some(Stance::Deny),
+                ..EffectivePolicy::default()
+            },
+        ] {
+            let mut fixture = end_to_end_with_effects(
+                policy,
+                super::super::mcp::FixtureServer {
+                    tools: vec![tool_row("tools/poison")],
+                    fail_next_call: true,
+                    ..Default::default()
+                },
+                24,
+                effects.clone(),
+            );
+            let receipt = fixture.client.execute(
+                MCP_CALL,
+                json!({"server":"docs","tool":"tools/poison","arguments":{}}),
+                None,
+                None,
+            );
+            assert_eq!(receipt.state, ToolReceiptState::Failed, "{receipt:?}");
+            assert_eq!(
+                receipt.error.expect("policy denial").code,
+                ToolErrorCode::AuthorizationDenied
+            );
+        }
     }
 
     #[test]

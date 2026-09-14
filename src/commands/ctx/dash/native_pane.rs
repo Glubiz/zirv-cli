@@ -2761,7 +2761,9 @@ fn dialog_request_from_broker(
     use super::super::runtime::enforcement::ExecutionAction;
     let (tool, verb) = match &request.action {
         ExecutionAction::ReadFile { .. } => ("Read", "read"),
-        ExecutionAction::WriteFile { .. } => ("Write", "write"),
+        ExecutionAction::WriteFile { .. } | ExecutionAction::WriteFileExact { .. } => {
+            ("Write", "write")
+        }
         ExecutionAction::Process { .. } => ("Bash", "run"),
         ExecutionAction::ProcessControl { .. } => ("Process", "control"),
         ExecutionAction::OutputRead { .. } => ("Output", "read"),
