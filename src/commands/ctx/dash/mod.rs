@@ -5708,6 +5708,51 @@ impl SpawnRefusal {
     }
 }
 
+/// Whether a request's claimed `parent_session` is refused, and as which
+/// KIND of refusal. `None` allows it.
+///
+/// `requester` is the identity the intake channel itself proved (`Some` only
+/// for a pane's own private directory); `claims_a_live_pane` says whether an
+/// unproven claim names a session this dashboard is actually running.
+///
+/// Issue #627: the two cases are not the same refusal. A request that arrived
+/// on some pane's OWN channel and named a different session is that pane
+/// forging a lineage -- `::policy`, because an inline fallback would route
+/// straight around a gate this operator's dashboard just applied. A request
+/// on the SHARED channel proved no identity at all, which is the ordinary
+/// shape of a dashboard-hosted seat that re-registered after a restart with
+/// handoff: nothing was forged, the channel simply cannot carry the claim.
+/// That is `::channel`, so the requester falls back to the inline supervised
+/// run (`agent::answer_for_ack`) instead of the delegation exiting 1 with no
+/// fallback at all. The claim itself is refused either way -- the caller's
+/// `verified_parent` reads `requester` and never `req.parent_session`.
+pub(crate) fn parent_claim_refusal(
+    claimed: &str,
+    requester: Option<&str>,
+    claims_a_live_pane: bool,
+) -> Option<SpawnRefusal> {
+    let mismatched = match requester {
+        Some(requester) => claimed != requester,
+        None => claims_a_live_pane,
+    };
+    if !mismatched {
+        return None;
+    }
+    let reason = format!(
+        "a spawn request may only name the session it was sent from as its parent; this one \
+         arrived on {} and claimed '{claimed}'",
+        match requester {
+            Some(requester) => format!("session {requester}'s own channel"),
+            None => "a channel that proves no session identity".to_string(),
+        }
+    );
+    Some(if requester.is_some() {
+        SpawnRefusal::policy(reason)
+    } else {
+        SpawnRefusal::channel(reason)
+    })
+}
+
 /// Why this spawn is refused on delegation depth, or `None` to allow it.
 ///
 /// The whole permitted tree is Orchestrator -> SubOrchestrator -> Worker.
@@ -6404,20 +6449,12 @@ fn fulfill_spawn_request(
     // is attributed the sibling's identity. Accepted for this release;
     // socket-peer-credential hardening is tracked in issue #179.
     if let Some(claimed) = req.parent_session.as_deref() {
-        let mismatched = match requester {
-            Some(requester) => claimed != requester,
-            None => panes
+        let claims_a_live_pane = requester.is_none()
+            && panes
                 .iter()
-                .any(|pane| sessions::short_id(pane.session_id()) == claimed),
-        };
-        if mismatched {
-            return Err(SpawnRefusal::policy(format!(
-                "a spawn request may only name the session it was sent from as its parent; this                  one arrived on {} and claimed '{claimed}'",
-                match requester {
-                    Some(requester) => format!("session {requester}'s own channel"),
-                    None => "a channel that proves no session identity".to_string(),
-                }
-            )));
+                .any(|pane| sessions::short_id(pane.session_id()) == claimed);
+        if let Some(refusal) = parent_claim_refusal(claimed, requester, claims_a_live_pane) {
+            return Err(refusal);
         }
     }
     // Issue #249: the ONLY parent id any downstream mail-trust seam for the
@@ -22512,6 +22549,38 @@ mod tests {
             )
             .is_some(),
             "nothing may spawn a full Orchestrator seat"
+        );
+    }
+
+    /// Issue #627: a parent claim this dashboard cannot verify is a CHANNEL
+    /// refusal, so the delegation falls back to the inline supervised run
+    /// instead of exiting with no fallback at all -- while a claim forged on
+    /// a channel that DID prove an identity stays a policy refusal.
+    #[test]
+    fn an_unprovable_parent_claim_is_a_retryable_channel_refusal() {
+        // The shape from the bug report: a dashboard-hosted seat, writing on
+        // the shared channel, naming its own live session as its parent.
+        let refusal = parent_claim_refusal("50aaa609", None, true)
+            .expect("an unproven claim on a live pane is still refused");
+        assert!(
+            refusal.retryable,
+            "the channel could not carry the claim; that is not a judgement on the task: \
+             {refusal:?}"
+        );
+        assert!(!refusal.budget_exhausted);
+        assert!(refusal.reason.contains("proves no session identity"));
+
+        // Same claim, but on a channel that proved a DIFFERENT session: a
+        // forged lineage, and an inline fallback would route around the gate.
+        let forged = parent_claim_refusal("50aaa609", Some("bbbb2222"), false)
+            .expect("a forged lineage is refused");
+        assert!(!forged.retryable, "got {forged:?}");
+
+        // And the two allowed shapes stay allowed.
+        assert!(parent_claim_refusal("bbbb2222", Some("bbbb2222"), false).is_none());
+        assert!(
+            parent_claim_refusal("50aaa609", None, false).is_none(),
+            "an unproven claim naming no live pane was never refused"
         );
     }
 
