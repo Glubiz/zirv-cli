@@ -40,7 +40,7 @@
 //! view model directly and never touch a terminal.
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -2211,10 +2211,10 @@ pub fn render_native_dashboard(
     presentation: &NativePresentation,
     facts: &StatusFacts,
     ux: &super::native_ux::UxState,
-) {
+) -> bool {
     use super::native_ux::{Focus, OVERVIEW_WIDTH};
     if area.height == 0 || area.width == 0 {
-        return;
+        return false;
     }
     let plan = super::native_ux::resolve_layout(area.width as usize, area.height as usize);
     let usage_rows = (plan.usage_rows as u16).min(area.height.saturating_sub(6));
@@ -2234,7 +2234,7 @@ pub fn render_native_dashboard(
     // An open approval takes the bottom of the conversation pane, replacing
     // the composer: an approval is never answered from the composer, so
     // leaving it drawn and focusable there would advertise the wrong control.
-    match &ux.approval {
+    let approval_rendered = match &ux.approval {
         Some(dialog) => {
             let lines = dialog.lines(main.width as usize);
             let dialog_rows = (lines.len() as u16 + 1).min(main.height.saturating_sub(2));
@@ -2253,9 +2253,13 @@ pub fn render_native_dashboard(
                 },
                 &lines,
             );
+            dialog_rows > 0 && main.width > 0
         }
-        None => render_native_pane(f, main, view, presentation, facts),
-    }
+        None => {
+            render_native_pane(f, main, view, presentation, facts);
+            false
+        }
+    };
 
     if panel_width > 0 {
         let panel = Rect {
@@ -2304,6 +2308,7 @@ pub fn render_native_dashboard(
         );
     }
     let _ = Focus::Composer;
+    approval_rendered
 }
 
 /// The composer's own draft rendered as plain display lines (`> ` on the
@@ -2948,6 +2953,7 @@ pub struct NativePaneRuntime {
     /// while idle. Set the first time `tick()` observes `Busy` for a turn
     /// and cleared on `Idle`/`Failed`/`Ended`.
     turn_started_at: Option<std::time::Instant>,
+    stop_state: NativeStopState,
     /// The repo this pane is running in, for the bottom status line.
     cwd: PathBuf,
     /// The checked-out branch, read once at spawn time -- see `git_branch`'s
@@ -2986,6 +2992,16 @@ pub struct NativePaneRuntime {
     #[cfg(test)]
     journal_payload_reads: usize,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeStopState {
+    Active,
+    Requested(Instant),
+    TimedOut,
+    Escalated,
+}
+
+const STOP_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl NativePaneRuntime {
     pub fn spawn(
@@ -3063,6 +3079,7 @@ impl NativePaneRuntime {
             ended: false,
             notice: None,
             turn_started_at: None,
+            stop_state: NativeStopState::Active,
             cwd: spec.repo,
             git_branch,
         })
@@ -3165,6 +3182,7 @@ impl NativePaneRuntime {
             ended: false,
             notice: attach_notice,
             turn_started_at: None,
+            stop_state: NativeStopState::Active,
             cwd: repo,
             git_branch,
         })
@@ -3298,7 +3316,8 @@ impl NativePaneRuntime {
 
     /// Whether a turn is running right now.
     pub fn busy(&self) -> bool {
-        matches!(self.session_state, NativeSessionState::Running)
+        !matches!(self.stop_state, NativeStopState::Active)
+            || matches!(self.session_state, NativeSessionState::Running)
     }
 
     /// Whether this pane is waiting on a human -- an open approval dialog.
@@ -3803,12 +3822,15 @@ impl NativePaneRuntime {
                     self.notice = Some(message);
                 }
                 InteractiveProgress::Ended => {
-                    self.ended = true;
-                    self.session_state = NativeSessionState::Completed;
+                    if matches!(self.stop_state, NativeStopState::Active) {
+                        self.ended = true;
+                        self.session_state = NativeSessionState::Completed;
+                    }
                     self.turn_started_at = None;
                 }
             }
         }
+        self.reap_stopping_session();
         // Issue #490 + N20: a runtime-attached pane has no progress channel.
         // Its cue that something happened is protocol v1's journal cursor --
         // the same durable sequence the transcript is reduced from -- and a
@@ -3859,6 +3881,39 @@ impl NativePaneRuntime {
             &actor,
         );
         self.ux.sync_approval(pending);
+    }
+
+    fn reap_stopping_session(&mut self) {
+        let stopping = !matches!(self.stop_state, NativeStopState::Active);
+        if !stopping {
+            return;
+        }
+        if matches!(self.stop_state, NativeStopState::Requested(_))
+            && !matches!(self.session_state, NativeSessionState::Running)
+            && let Some(session) = self.session.as_mut()
+        {
+            session.request_shutdown();
+        }
+        if self
+            .session
+            .as_mut()
+            .is_some_and(InteractiveSession::try_finish_shutdown)
+        {
+            let _ = self.session.take();
+            self.session_state = NativeSessionState::Interrupted;
+            self.turn_state = None;
+            self.turn_started_at = None;
+            self.ended = true;
+            return;
+        }
+        if matches!(self.stop_state, NativeStopState::Requested(at) if at.elapsed() >= STOP_REAP_TIMEOUT)
+        {
+            self.stop_state = NativeStopState::TimedOut;
+            self.notice = Some(
+                "native pane: stop is still waiting for the worker; press Stop again to escalate"
+                    .to_string(),
+            );
+        }
     }
 
     /// Issue #490 (N21 item B): drains at most one live approval request from
@@ -4229,7 +4284,9 @@ impl NativePaneRuntime {
     }
 
     /// Stops the conversation itself, as distinct from closing the dashboard
-    /// and merely detaching from a persistent runtime-owned conversation.
+    /// and merely detaching from a persistent runtime-owned conversation. An
+    /// in-process worker is cancelled here and reaped by later ticks; a
+    /// repeated request closes its input channel as the escalation step.
     pub fn stop(&mut self, state: &StateDir) -> CtxResult<()> {
         persist_draft(
             state,
@@ -4238,21 +4295,24 @@ impl NativePaneRuntime {
         );
         if let Some(link) = self.link.as_mut() {
             link.stop(&self.session_id.to_string())?;
-        } else if let Some(session) = self.session.take() {
-            session.shutdown();
-            if self
-                .journal
-                .replay(&self.session_id)?
-                .ended_reason
-                .is_none()
-            {
-                return Err(
-                    "native pane: session did not reach a terminal state after stop".into(),
-                );
-            }
+            self.session_state = NativeSessionState::Interrupted;
+            self.ended = true;
+            return Ok(());
         }
-        self.session_state = NativeSessionState::Interrupted;
-        self.ended = true;
+        if let Some(session) = self.session.as_mut() {
+            self.stop_state = match self.stop_state {
+                NativeStopState::Active => {
+                    session.interrupt();
+                    NativeStopState::Requested(Instant::now())
+                }
+                NativeStopState::Requested(_)
+                | NativeStopState::TimedOut
+                | NativeStopState::Escalated => {
+                    session.request_shutdown();
+                    NativeStopState::Escalated
+                }
+            };
+        }
         Ok(())
     }
 }
@@ -6223,6 +6283,50 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_sized_dashboard_main_area_does_not_make_an_approval_actionable() {
+        let mut ux = super::super::native_ux::UxState::default();
+        ux.open_live_approval(super::super::native_ux::ApprovalRequest {
+            id: "approval-1".to_string(),
+            session: "session-1".to_string(),
+            tool: "Write".to_string(),
+            scope: super::super::native_ux::Scope {
+                verb: "write".to_string(),
+                paths: vec![PathBuf::from("src/lib.rs")],
+                directory: None,
+            },
+            actor: "worker".to_string(),
+            reason: "policy".to_string(),
+            preview: Vec::new(),
+            asked_at: 0,
+        });
+        let backend = ratatui::backend::TestBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut approval_rendered = false;
+        terminal
+            .draw(|frame| {
+                approval_rendered = render_native_dashboard(
+                    frame,
+                    Rect::new(0, 0, 0, 0),
+                    &TranscriptView::default(),
+                    &NativePresentation::default(),
+                    &facts(NativeSessionState::Running, None, true, false),
+                    &ux,
+                );
+            })
+            .expect("draw");
+        if approval_rendered {
+            ux.mark_approval_visible();
+        }
+
+        assert_eq!(
+            ux.handle_key(KeyEvent::from(KeyCode::Enter), false),
+            super::super::native_ux::UxKey::Consumed,
+            "an Enter queued before an undrawn approval must not authorize it"
+        );
+        assert!(ux.approval.is_some());
+    }
+
+    #[test]
     fn status_line_text_shows_model_route_runtime_billing_and_state() {
         let f = facts(
             NativeSessionState::Running,
@@ -6319,6 +6423,7 @@ mod tests {
             ended: false,
             notice: None,
             turn_started_at: None,
+            stop_state: NativeStopState::Active,
             cwd: PathBuf::from("."),
             git_branch: None,
         }
@@ -6571,6 +6676,7 @@ mod tests {
     struct FakeHostState {
         facts: Vec<crate::commands::ctx::api::wire::SessionFacts>,
         controller: Option<String>,
+        stopped: bool,
     }
 
     impl FakeHost {
@@ -6579,6 +6685,7 @@ mod tests {
                 inner: std::sync::Mutex::new(FakeHostState {
                     facts,
                     controller: None,
+                    stopped: false,
                 }),
             })
         }
@@ -6717,10 +6824,8 @@ mod tests {
             &self,
             _session_id: &str,
         ) -> Result<bool, crate::commands::ctx::api::wire::ApiError> {
-            Err(crate::commands::ctx::api::wire::ApiError::new(
-                crate::commands::ctx::api::wire::ErrorCode::Unsupported,
-                "not exercised by this test",
-            ))
+            self.lock().stopped = true;
+            Ok(true)
         }
     }
 
@@ -6768,6 +6873,19 @@ mod tests {
 
         assert!(cancellation.is_cancelled());
         assert!(
+            pane.session.is_some(),
+            "stop retains the worker until a tick reaps it"
+        );
+        assert!(
+            !pane.ended,
+            "requesting stop is not proof that the worker ended"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.ended && Instant::now() < deadline {
+            pane.tick();
+            std::thread::yield_now();
+        }
+        assert!(
             Journal::open(&state)
                 .expect("journal")
                 .replay(&session_id)
@@ -6776,7 +6894,44 @@ mod tests {
                 .is_some()
         );
         assert!(pane.ended);
+        assert!(pane.session.is_none(), "the terminated worker was reaped");
         assert_eq!(pane.session_state, NativeSessionState::Interrupted);
+    }
+
+    #[test]
+    fn dashboard_stop_sends_session_stop_over_a_runtime_link() {
+        use crate::commands::ctx::api::server::{ApiServer, RunningServer, StaticSource};
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let facts = wire_facts("session-stop", "stop1", RuntimeKind::Native);
+        let mut setup_journal = Journal::open(&state).expect("open journal");
+        setup_journal
+            .create_session(&identity_for(&facts.session_id, facts.generation))
+            .expect("create session");
+
+        let host = FakeHost::with(vec![facts.clone()]);
+        let endpoint = crate::commands::ctx::api::server::endpoint_for(&state);
+        let server = ApiServer::new(Box::new(StaticSource(vec![facts.clone()])), None);
+        server.attach_host(std::sync::Arc::clone(&host)
+            as std::sync::Arc<dyn crate::commands::ctx::api::server::SessionHost>);
+        let running =
+            RunningServer::start(&endpoint, std::sync::Arc::clone(&server)).expect("start");
+        let link = super::super::link::RuntimeLink::connect(&state, true).expect("runtime link");
+        let mut pane = NativePaneRuntime::attach_runtime(&state, link, &facts, PathBuf::from("."))
+            .expect("attach runtime pane");
+
+        pane.stop(&state).expect("runtime stop");
+
+        assert!(host.lock().stopped, "session.stop reached the runtime host");
+        assert!(
+            pane.ended,
+            "the attached pane ends after runtime confirmation"
+        );
+        assert_eq!(pane.session_state, NativeSessionState::Interrupted);
+        pane.shutdown(&state);
+        drop(running);
     }
 
     #[test]
