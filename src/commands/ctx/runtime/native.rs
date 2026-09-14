@@ -1189,7 +1189,6 @@ impl<'a> NativeLoop<'a> {
     fn stream_once(
         &mut self,
         request: &ProviderRequest,
-        events: &mut Vec<ProviderStreamEvent>,
     ) -> Result<Option<super::super::provider::adapter::ProviderResponse>, ProviderFailure> {
         let mut attempt = 0u32;
         loop {
@@ -1197,7 +1196,7 @@ impl<'a> NativeLoop<'a> {
                 return Ok(None);
             }
             self.requests += 1;
-            let mut sink = CollectingSink(events);
+            let mut sink = DiscardingSink;
             match self
                 .provider
                 .stream(request, self.cancel.as_ref(), &mut sink)
@@ -1308,8 +1307,7 @@ impl<'a> NativeLoop<'a> {
 
             outcome.state = TurnState::Requesting;
             let request = self.build_request()?;
-            let mut events: Vec<ProviderStreamEvent> = Vec::new();
-            let mut response = match self.stream_once(&request, &mut events) {
+            let mut response = match self.stream_once(&request) {
                 Ok(Some(response)) => response,
                 Ok(None) => {
                     outcome.state = TurnState::Interrupted;
@@ -1922,12 +1920,10 @@ struct PreparedCall {
     advice: Option<String>,
 }
 
-struct CollectingSink<'a>(&'a mut Vec<ProviderStreamEvent>);
+struct DiscardingSink;
 
-impl EventSink for CollectingSink<'_> {
-    fn push(&mut self, event: ProviderStreamEvent) {
-        self.0.push(event);
-    }
+impl EventSink for DiscardingSink {
+    fn push(&mut self, _event: ProviderStreamEvent) {}
 }
 
 fn accumulate(total: &mut ProviderUsage, delta: &ProviderUsage) {
@@ -4399,6 +4395,19 @@ mod tests {
             system: Vec::new(),
             preamble: Vec::new(),
         }
+    }
+
+    #[test]
+    fn native_streaming_does_not_retain_unused_deltas() {
+        let mut sink = DiscardingSink;
+        for index in 0..10_000 {
+            sink.push(ProviderStreamEvent::TextDelta {
+                index,
+                text: "streamed output that is already present in the final response".repeat(8),
+            });
+        }
+
+        assert_eq!(std::mem::size_of_val(&sink), 0);
     }
 
     /// Issue #484 (roadmap N15) item 3: workflow and methodology adoption is
