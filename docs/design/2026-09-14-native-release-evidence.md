@@ -160,7 +160,7 @@ rollback** section; the design rationale is
 [`2026-09-14-native-release-readiness.md`](2026-09-14-native-release-readiness.md)
 §4. The short form, and the order matters:
 
-1. **Forward.** `zirv ctx provider init`, then `zirv ctx credential set` for
+1. **Forward.** `zirv ctx provider init`, then `zirv ctx provider credential set` for
    the routes you want, then `zirv ctx doctor` until it reports no blockers.
    Turning it on is `zirv ctx config migrate --to native`, which writes
    `[runtime]`, backs the previous document up beside it, and records the
@@ -212,7 +212,7 @@ Each of these is a step only the operator can take; none is blocked on code.
 
 | Gap | What closes it |
 |---|---|
-| Live provider evidence (§3.1) | configure one route per vendor you care about (`zirv ctx provider init`, `zirv ctx credential set`), run `zirv ctx doctor --live` to confirm the model list, then drive one real task with `zirv ctx exec --runtime native --route <id>`. Record the run under `docs/benchmarks/` and raise the affected rows to `live-validated` -- `ZCHK-NATIVE-PARITY` will not accept that rung without the committed recording. |
+| Live provider evidence (§3.1) | configure one route per vendor you care about (`zirv ctx provider init`, `zirv ctx provider credential set`), run `zirv ctx doctor --live` to confirm the model list, then drive one real task with `zirv ctx exec --runtime native --route <id>`. Record the run under `docs/benchmarks/` and raise the affected rows to `live-validated` -- `ZCHK-NATIVE-PARITY` will not accept that rung without the committed recording. |
 | Comparative quality (§3.2) | run at least three roadmap steps or release batches with `--runtime native`, append one `"runtime": "native"` row per run to `docs/benchmarks/native-runtime-baseline.jsonl` with observed fields only, and check them against T1-T3. |
 | Real-OS fresh install (§3.3) | install the released artefact on a clean Windows, macOS and Linux machine (Chocolatey, Homebrew, `install.sh`), then run `zirv ctx provider init && zirv ctx doctor --json` and confirm it matches what the CI job reports. |
 | Windows process isolation (§3.4) | tracked as N04 (#473); needs a restricted-token/AppContainer helper, not an operator action. |
