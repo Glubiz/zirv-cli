@@ -2972,6 +2972,8 @@ pub struct NativePaneRuntime {
     attach: PaneAttach,
     /// The protocol client, for a runtime-attached pane only.
     link: Option<super::link::RuntimeLink>,
+    runtime_stop:
+        Option<std::sync::mpsc::Receiver<(super::link::RuntimeLink, Result<bool, String>)>>,
     /// The journal cursor this pane has consumed through, so a reconnect
     /// carries on rather than re-reading the conversation.
     link_cursor: u64,
@@ -3052,6 +3054,7 @@ impl NativePaneRuntime {
             route: Some(session.route.clone()),
             attach: PaneAttach::InProcess,
             link: None,
+            runtime_stop: None,
             link_cursor: 0,
             idempotency_seq: 0,
             live_approval: None,
@@ -3155,6 +3158,7 @@ impl NativePaneRuntime {
                 generation: facts.generation,
             },
             link: Some(link),
+            runtime_stop: None,
             link_cursor: 0,
             idempotency_seq: 0,
             live_approval: None,
@@ -3829,6 +3833,10 @@ impl NativePaneRuntime {
             }
         }
         self.reap_stopping_session();
+        if self.ended {
+            self.refresh_transcript();
+            return;
+        }
         // Issue #490 + N20: a runtime-attached pane has no progress channel.
         // Its cue that something happened is protocol v1's journal cursor --
         // the same durable sequence the transcript is reduced from -- and a
@@ -3886,6 +3894,35 @@ impl NativePaneRuntime {
         if !stopping {
             return;
         }
+        if let Some(receiver) = self.runtime_stop.as_ref() {
+            match receiver.try_recv() {
+                Ok((link, result)) => {
+                    self.runtime_stop = None;
+                    self.link = Some(link);
+                    match result {
+                        Ok(_) => {
+                            self.session_state = NativeSessionState::Interrupted;
+                            self.turn_state = None;
+                            self.turn_started_at = None;
+                            self.ended = true;
+                        }
+                        Err(error) => {
+                            self.stop_state = NativeStopState::TimedOut;
+                            self.notice =
+                                Some(format!("native pane: runtime stop failed: {error}"));
+                        }
+                    }
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.runtime_stop = None;
+                    self.stop_state = NativeStopState::TimedOut;
+                    self.notice = Some("native pane: runtime stop worker disconnected".to_string());
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if matches!(self.stop_state, NativeStopState::Requested(_))
             && !matches!(self.session_state, NativeSessionState::Running)
             && let Some(session) = self.session.as_mut()
@@ -3911,6 +3948,28 @@ impl NativePaneRuntime {
                 "native pane: stop is still waiting for the worker; press Stop again to escalate"
                     .to_string(),
             );
+        }
+    }
+
+    fn request_runtime_stop(&mut self) {
+        let Some(mut link) = self.link.take() else {
+            return;
+        };
+        let session_id = self.session_id.to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("zirv-runtime-stop".to_string())
+            .spawn(move || {
+                let result = link.stop(&session_id).map_err(|error| error.to_string());
+                let _ = sender.send((link, result));
+            }) {
+            Ok(_) => self.runtime_stop = Some(receiver),
+            Err(error) => {
+                self.stop_state = NativeStopState::TimedOut;
+                self.notice = Some(format!(
+                    "native pane: could not start runtime stop: {error}"
+                ));
+            }
         }
     }
 
@@ -4291,10 +4350,17 @@ impl NativePaneRuntime {
             &self.short,
             &PersistedDraft::from_composer(&self.presentation.composer),
         );
-        if let Some(link) = self.link.as_mut() {
-            link.stop(&self.session_id.to_string())?;
-            self.session_state = NativeSessionState::Interrupted;
-            self.ended = true;
+        if self.runtime_stop.is_some() {
+            self.stop_state = NativeStopState::Escalated;
+            return Ok(());
+        }
+        if self.link.is_some() {
+            self.stop_state = if matches!(self.stop_state, NativeStopState::Active) {
+                NativeStopState::Requested(Instant::now())
+            } else {
+                NativeStopState::Escalated
+            };
+            self.request_runtime_stop();
             return Ok(());
         }
         if let Some(session) = self.session.as_mut() {
@@ -6397,6 +6463,7 @@ mod tests {
             route: None,
             attach: PaneAttach::InProcess,
             link,
+            runtime_stop: None,
             link_cursor: 0,
             idempotency_seq: 0,
             live_approval: None,
@@ -6897,6 +6964,79 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_stop_times_out_without_retiring_a_non_finishing_worker_and_escalates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let env = std::collections::HashMap::from([(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.display().to_string(),
+        )]);
+        let lookup = |key: &str| env.get(key).cloned();
+        let provider = format!(
+            "fixture:{}",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/runtime/native/helper-answer.json")
+                .display()
+        );
+        let mut pane = NativePaneRuntime::spawn(
+            &CtxConfig::default(),
+            &state,
+            &lookup,
+            NativeDashboardSpec {
+                repo,
+                role: "worker".to_string(),
+                route: None,
+                writing: true,
+                provider: Some(provider),
+            },
+        )
+        .expect("spawn native pane");
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = blocked.recv();
+        });
+        assert!(
+            pane.session
+                .as_mut()
+                .expect("in-process session")
+                .replace_worker_for_test(worker),
+            "replace the fixture worker with the deliberately blocked one"
+        );
+
+        let started = Instant::now();
+        pane.stop(&state).expect("request stop");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "Stop must not wait for the worker"
+        );
+        assert!(matches!(pane.stop_state, NativeStopState::Requested(_)));
+        assert!(pane.session.is_some());
+        assert!(!pane.ended);
+
+        pane.stop_state = NativeStopState::Requested(Instant::now() - STOP_REAP_TIMEOUT);
+        pane.tick();
+        assert_eq!(pane.stop_state, NativeStopState::TimedOut);
+        assert!(pane.session.is_some(), "the timed-out worker remains owned");
+        assert!(!pane.ended, "timeout is not termination confirmation");
+
+        pane.stop(&state).expect("escalate stop");
+        assert_eq!(pane.stop_state, NativeStopState::Escalated);
+        assert!(pane.session.is_some());
+        assert!(!pane.ended);
+
+        release.send(()).expect("release blocked worker");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.ended && Instant::now() < deadline {
+            pane.tick();
+            std::thread::yield_now();
+        }
+        assert!(pane.ended, "the released worker is reaped on a later tick");
+    }
+
+    #[test]
     fn dashboard_stop_sends_session_stop_over_a_runtime_link() {
         use crate::commands::ctx::api::server::{ApiServer, RunningServer, StaticSource};
         use crate::commands::ctx::runtime::RuntimeKind;
@@ -6922,6 +7062,12 @@ mod tests {
 
         pane.stop(&state).expect("runtime stop");
 
+        assert!(!pane.ended, "the UI tick has not observed confirmation yet");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.ended && Instant::now() < deadline {
+            pane.tick();
+            std::thread::yield_now();
+        }
         assert!(host.lock().stopped, "session.stop reached the runtime host");
         assert!(
             pane.ended,

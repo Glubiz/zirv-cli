@@ -3296,6 +3296,20 @@ impl InteractiveSession {
         true
     }
 
+    #[cfg(test)]
+    pub fn replace_worker_for_test(&mut self, worker: std::thread::JoinHandle<()>) -> bool {
+        self.request_shutdown();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !self.try_finish_shutdown() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if self.worker.is_some() {
+            return false;
+        }
+        self.worker = Some(worker);
+        true
+    }
+
     /// Ends the session: cancels any turn currently in flight, drops the
     /// submit channel (the worker's `for text in submit_rx` loop exits on
     /// its next iteration since a disconnected channel reads as "no more
