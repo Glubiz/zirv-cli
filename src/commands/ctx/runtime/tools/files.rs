@@ -388,7 +388,23 @@ pub(super) fn write_file(path: &Path, args: &WriteFileArgs) -> Result<FileOutcom
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(ToolError::io)?;
     }
-    state::write_atomic_bytes(path, &desired, false).map_err(ToolError::io)?;
+    // Re-verified immediately before the rename, not just here: an edit
+    // landing after this point but before the replace must still be
+    // refused, not silently overwritten (same race as #582's patch fix).
+    // `before_sha` mirrors what was just validated above: the real content
+    // hash when the file already existed, or the empty-bytes hash when it
+    // did not -- `write_atomic_bytes_if_unchanged` reads a missing
+    // destination the same way.
+    let before_sha = current
+        .as_deref()
+        .map(sha256)
+        .unwrap_or_else(|| sha256(&[]));
+    if let Some(current_sha) =
+        state::write_atomic_bytes_if_unchanged(path, &desired, false, &before_sha)
+            .map_err(ToolError::io)?
+    {
+        return Err(stale(&before_sha, &current_sha));
+    }
     Ok(FileOutcome {
         data: json!({
             "path": path,
@@ -882,6 +898,67 @@ mod tests {
             std::fs::read(&path).expect("read"),
             external_bytes,
             "the racing external edit must survive, never the patch's own replacement"
+        );
+    }
+
+    /// Review round 1 on #582's fix: `write_file`'s replace path had the
+    /// same check-then-unconditional-`write_atomic_bytes` race
+    /// `apply_patch` had, just not covered by a test. Mirrors
+    /// `patch_refuses_edit_racing_final_replace` exactly -- same
+    /// temp-sibling-appearance synchronization, same shape of assertions --
+    /// against `write_file` instead.
+    #[test]
+    fn write_file_refuses_edit_racing_final_replace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("racy-write.txt");
+        let filler = "filler line to widen the temp-file write window\n".repeat(200_000);
+        let original = format!("{filler}before\n");
+        std::fs::write(&path, &original).expect("write");
+        let args = WriteFileArgs {
+            path: path.clone(),
+            content: format!("{filler}after\n"),
+            expected_sha256: Some(sha256(original.as_bytes())),
+            create_only: false,
+            idempotency_key: "write-race-1".into(),
+        };
+
+        let external_bytes = b"external edit landed mid-replace".to_vec();
+        let racer_dir = dir.path().to_path_buf();
+        let racer_target = path.clone();
+        let racer_bytes = external_bytes.clone();
+        let racer = std::thread::spawn(move || -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let Ok(entries) = std::fs::read_dir(&racer_dir) else {
+                    std::thread::yield_now();
+                    continue;
+                };
+                let found_temp_sibling = entries.filter_map(|entry| entry.ok()).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with('.') && name.contains(".tmp-"))
+                });
+                if found_temp_sibling {
+                    std::fs::write(&racer_target, &racer_bytes).expect("racing write");
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        });
+
+        let error = write_file(&path, &args).expect_err("racing edit must be refused");
+        let raced = racer.join().expect("racer thread");
+        assert!(
+            raced,
+            "race harness never observed the temp sibling in time; widen the margin"
+        );
+        assert_eq!(error.code, ToolErrorCode::PreconditionFailed);
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            external_bytes,
+            "the racing external edit must survive, never the write's own replacement"
         );
     }
 
