@@ -40,7 +40,8 @@ use super::super::config::{CapabilityEffectsConfig, McpServerConfig, McpTranspor
 use super::super::pace::redact_for_log;
 use super::super::provider::adapter::{Cancellation, NeverCancelled};
 use super::enforcement::{
-    PlatformIsolation, ProcessEffects, ProcessInvocation, ProcessSandboxPolicy, SandboxLaunch,
+    ExecutionBroker, PlatformIsolation, ProcessEffects, ProcessInvocation, ProcessSandboxPolicy,
+    SandboxLaunch,
 };
 
 /// The protocol revision this client negotiates.
@@ -198,6 +199,7 @@ impl StdioTransport {
     fn spawn_isolated(
         config: &McpServerConfig,
         isolation: &PlatformIsolation,
+        policy: &ProcessSandboxPolicy,
     ) -> Result<Self, McpError> {
         let McpTransportConfig::Stdio {
             command,
@@ -217,27 +219,14 @@ impl StdioTransport {
             .ok_or_else(|| {
                 McpError::Transport("could not resolve the MCP working directory".into())
             })?;
-        let effects = ProcessEffects::from(&config.effects);
         let invocation = ProcessInvocation::Argv {
             program: command.clone(),
             args: args.clone(),
             cwd: cwd.clone(),
             environment: environment.clone(),
         };
-        let policy = ProcessSandboxPolicy {
-            read_roots: vec![cwd.clone()],
-            write_roots: (effects.repo_write
-                || effects.outside_write
-                || effects.git_metadata_write)
-                .then_some(cwd)
-                .into_iter()
-                .collect(),
-            masked_roots: Vec::new(),
-            network: effects.network,
-            environment: environment.clone(),
-        };
         let launch = isolation
-            .prepare(&invocation, &policy)
+            .prepare(&invocation, policy)
             .map_err(|error| McpError::Unavailable(error.to_string()))?;
         Self::spawn_launch(launch, &config.name, command)
     }
@@ -502,19 +491,55 @@ fn frame_id(frame: &Value) -> Option<u64> {
 pub struct StdioFactory {
     config: McpServerConfig,
     isolation: PlatformIsolation,
+    policy: ProcessSandboxPolicy,
 }
 
 impl StdioFactory {
-    pub fn new(config: McpServerConfig) -> Self {
-        Self {
+    pub fn new(config: McpServerConfig, broker: &ExecutionBroker) -> Result<Self, McpError> {
+        let McpTransportConfig::Stdio {
+            command,
+            args,
+            cwd,
+            environment,
+        } = &config.transport
+        else {
+            return Err(McpError::Unavailable(format!(
+                "server `{}` is not configured for the stdio transport",
+                config.name
+            )));
+        };
+        let invocation = ProcessInvocation::Argv {
+            program: command.clone(),
+            args: args.clone(),
+            cwd: cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .ok_or_else(|| {
+                    McpError::Transport("could not resolve the MCP working directory".into())
+                })?,
+            environment: environment.clone(),
+        };
+        let (_, policy) = broker
+            .process_policy(&invocation, &ProcessEffects::from(&config.effects))
+            .map_err(|error| McpError::Unavailable(error.to_string()))?;
+        Ok(Self {
             config,
             isolation: PlatformIsolation::detect(),
-        }
+            policy,
+        })
     }
 
     #[cfg(test)]
-    fn with_isolation(config: McpServerConfig, isolation: PlatformIsolation) -> Self {
-        Self { config, isolation }
+    fn with_isolation(
+        config: McpServerConfig,
+        isolation: PlatformIsolation,
+        policy: ProcessSandboxPolicy,
+    ) -> Self {
+        Self {
+            config,
+            isolation,
+            policy,
+        }
     }
 }
 
@@ -523,6 +548,7 @@ impl TransportFactory for StdioFactory {
         Ok(Box::new(StdioTransport::spawn_isolated(
             &self.config,
             &self.isolation,
+            &self.policy,
         )?))
     }
 }
@@ -1769,6 +1795,13 @@ mod tests {
             PlatformIsolation::Unavailable {
                 platform: "test".into(),
                 reason: "fixture has no process sandbox".into(),
+            },
+            ProcessSandboxPolicy {
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                masked_roots: Vec::new(),
+                network: false,
+                environment: BTreeMap::new(),
             },
         );
         let error = factory.connect().expect_err("isolation is required");

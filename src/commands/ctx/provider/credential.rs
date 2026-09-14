@@ -550,6 +550,19 @@ pub fn macos_get_command(item: &str) -> CommandSpec {
 
 #[cfg(any(test, target_os = "macos"))]
 pub fn macos_set_command(item: &str, secret: &str, interactive: bool) -> CommandSpec {
+    if !interactive {
+        return CommandSpec {
+            program: "security",
+            args: vec!["-i".into()],
+            stdin: Some(format!(
+                "add-generic-password -U -s {} -a {} -w {}\n",
+                macos_interactive_arg("zirv-native"),
+                macos_interactive_arg(item),
+                macos_interactive_arg(secret),
+            )),
+            inherit_stdin: false,
+        };
+    }
     CommandSpec {
         program: "security",
         args: vec![
@@ -561,9 +574,23 @@ pub fn macos_set_command(item: &str, secret: &str, interactive: bool) -> Command
             item.into(),
             "-w".into(),
         ],
-        stdin: (!interactive).then(|| secret.to_string()),
-        inherit_stdin: interactive,
+        stdin: None,
+        inherit_stdin: true,
     }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_interactive_arg(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        if matches!(character, '\\' | '"') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -749,8 +776,11 @@ mod tests {
         );
         assert!(mac_prompt.inherit_stdin);
         let mac_piped = macos_set_command("work", "secret", false);
-        assert!(!mac_piped.args.contains(&"secret".into()));
-        assert_eq!(mac_piped.stdin.as_deref(), Some("secret"));
+        assert_eq!(mac_piped.args, ["-i"]);
+        assert_eq!(
+            mac_piped.stdin.as_deref(),
+            Some("add-generic-password -U -s \"zirv-native\" -a \"work\" -w \"secret\"\n")
+        );
         assert!(!mac_piped.inherit_stdin);
         let linux = linux_set_command("work", "secret");
         assert_eq!(linux.program, "secret-tool");
@@ -832,8 +862,11 @@ mod tests {
             .expect("recording lock")
             .clone()
             .expect("command");
-        assert!(!command.args.contains(&"piped-value".into()));
-        assert_eq!(command.stdin.as_deref(), Some("piped-value"));
+        assert_eq!(command.args, ["-i"]);
+        assert_eq!(
+            command.stdin.as_deref(),
+            Some("add-generic-password -U -s \"zirv-native\" -a \"work\" -w \"piped-value\"\n")
+        );
     }
 
     #[cfg(unix)]
