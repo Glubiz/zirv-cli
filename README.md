@@ -1724,8 +1724,16 @@ Flags: `--runtime harness|native` (default `configured` — the operator's own
 `[roles]` entry for `--role`), `--role <role>` (default `worker`; selects
 that default route and the repository-write posture its tools run under),
 `--resume <session>` (continue a stored native session — see below; a resume
-needs no fresh prompt). `--max-tool-calls` and `--timeout-secs` apply as the
-loop's own ceilings. `--agent`, `--transcript`, `--session-id` and
+needs no fresh prompt). `--budget-tokens`, `--max-tool-calls` and
+`--timeout-secs` apply as the loop's own ceilings (issue #637:
+`--budget-tokens` checkpoints once at `agent::BUDGET_SOFT_FRACTION` of the
+ceiling and stops at it, `status:"limit_reached"`, `limit:"tokens"`, the
+same exit code the harness path's own budget ceiling uses). The ceiling
+counts input + cache-creation + cache-read + output tokens, the same four
+classes the harness path's own `--budget-tokens` sums (harness parity);
+the final status's own `reconciliation.billable_tokens` counts only input +
+output, so the two figures differ whenever cache tokens are in play.
+`--agent`, `--transcript`, `--session-id` and
 `--max-restarts` are harness-runtime flags and are **refused** here, not
 ignored: a native session supervises no external process, has no transcript to
 score and nothing to restart. The command prints one structured JSON final
@@ -1739,7 +1747,7 @@ status, through the dashboard native pane's own non-ratatui renderer (issue
 links and errors, readable in a piped log or a terminal too small for the
 dashboard, with no `ratatui` required.
 
-`--resume <session>` does the three things a continuation owes before it may
+`--resume <session>` does the four things a continuation owes before it may
 run, in this order: it reads the stored session (a session this journal has
 never heard of is an error, never an invented one), checks it was started in
 **this** repository (issue #639 — the canonical repository root is recorded

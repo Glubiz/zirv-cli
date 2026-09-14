@@ -7161,6 +7161,81 @@ mod tests {
         assert_eq!(status.status, NativeStatus::Completed);
     }
 
+    /// Issue #645 review round: the companion negative case. `CallerOwned`
+    /// (a delegated `native_worker` run) is deliberately excluded from the
+    /// new registration -- the caller that placed it already owns its own
+    /// visibility and settlement, and registering a second record here
+    /// would risk a conflicting entry over whatever the caller (a dashboard
+    /// pane, a coordinator) already filed for the same process. Polls the
+    /// registry for the WHOLE run, not just once, so a registration that
+    /// only happened to land outside a single check could not slip past.
+    #[test]
+    fn a_caller_owned_delegated_run_never_appears_in_the_registry_while_live() {
+        use crate::commands::ctx::sessions;
+
+        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+        let repo_path = repo.path().to_path_buf();
+        let provider = format!(
+            "fixture:{}",
+            fixture_root()
+                .join("compaction-long-session.json")
+                .display()
+        );
+        let fixture_tools = fixture_root().join("tools-investigate-edit-test.json");
+
+        let worker = std::thread::spawn(move || {
+            let lookup = |k: &str| env.get(k).cloned();
+            run_session(
+                &mut HeadlessRequest {
+                    repo: &repo_path,
+                    prompt: "fix the failing test",
+                    route: None,
+                    role: "worker",
+                    limits: NativeLimits::default(),
+                    session_id: None,
+                    cancellation: None,
+                    resume: None,
+                    provider: Some(&provider),
+                    fixture_tools: Some(&fixture_tools),
+                    task: None,
+                    writer: None,
+                    accounting: Accounting::CallerOwned,
+                },
+                &mut Vec::new(),
+                &lookup,
+            )
+            .map_err(|error| error.to_string())
+        });
+
+        let mut seen: Option<Vec<sessions::Record>> = None;
+        loop {
+            let records: Vec<sessions::Record> = sessions::list(&state)
+                .into_iter()
+                .map(|(record, _)| record)
+                .collect();
+            if !records.is_empty() {
+                seen = Some(records);
+                break;
+            }
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let status = worker
+            .join()
+            .expect("the run_session thread must not panic")
+            .expect("a caller-owned headless native run completes");
+
+        assert_eq!(
+            seen, None,
+            "a CallerOwned run must never register a registry record"
+        );
+        assert!(sessions::list(&state).is_empty());
+        assert_eq!(status.status, NativeStatus::Completed);
+    }
+
     /// Issue #554 (review round 1): the same four obligations for a headless
     /// `zirv ctx exec --runtime native` run, driven through `run_session`.
     #[test]
