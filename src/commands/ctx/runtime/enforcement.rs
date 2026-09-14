@@ -596,6 +596,232 @@ impl Default for ApprovalAuthority {
     }
 }
 
+// =========================================================================
+// Interactive approvals (issue #490, roadmap N21 item B)
+// =========================================================================
+
+/// How long a grant minted from an in-process dialog stays valid. Short on
+/// purpose: the grant exists to admit the ONE call the operator was looking
+/// at, and `prepare_process` re-checks the expiry before it launches
+/// anything, so a stale answer cannot admit a later action.
+pub const INTERACTIVE_GRANT_TTL_SECS: u64 = 300;
+
+/// How often a blocked tool call re-checks the cancellation flag while it
+/// waits. The operator's own answer arrives on the channel and wakes the wait
+/// immediately; this only bounds how long an *interrupt* takes to be noticed.
+const INTERACTIVE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What an operator answered an interactive approval with.
+///
+/// `Remember` is deliberately session-scoped and scope-exact: it suppresses
+/// the next request whose `scope_digest` is identical -- the same tool, the
+/// same resolved paths, the same policy and claims fingerprints -- and
+/// nothing else. It is never persisted, never widened to a directory, and
+/// never outlives the session that granted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InteractiveDecision {
+    /// Run this one call.
+    Once,
+    /// Run it, and stop asking for this exact tool+scope for the rest of this
+    /// session.
+    Remember,
+    /// Refuse it. `guidance` is what the operator told the agent to do
+    /// instead; the caller records it as steering and the broker fails the
+    /// call with it.
+    Deny { guidance: String },
+}
+
+/// One outstanding request, handed to whoever drains the prompt channel.
+///
+/// [`Self::decide`] takes `self` by value, so a decision is applied at most
+/// once by construction: there is no second send to race with, and the reply
+/// channel has room for exactly one message.
+#[derive(Debug)]
+pub struct ApprovalPrompt {
+    request: ApprovalRequest,
+    reply: std::sync::mpsc::SyncSender<InteractiveDecision>,
+}
+
+impl ApprovalPrompt {
+    pub fn request(&self) -> &ApprovalRequest {
+        &self.request
+    }
+
+    /// Delivers the operator's answer. `false` means the waiter is already
+    /// gone (the session was interrupted, or the turn was cancelled while the
+    /// dialog was open), in which case NOTHING was released: the tool call
+    /// this prompt belonged to has already failed closed.
+    pub fn decide(self, decision: InteractiveDecision) -> bool {
+        self.reply.send(decision).is_ok()
+    }
+}
+
+/// The outcome of asking the operator.
+#[derive(Debug)]
+pub enum ApprovalOutcome {
+    Granted(ApprovalGrant),
+    Denied {
+        guidance: String,
+    },
+    /// The session was interrupted or cancelled, or nothing is draining the
+    /// prompt channel. The call fails closed; no grant was minted.
+    Cancelled,
+}
+
+/// The interactive side of the broker: a channel an in-process pane drains,
+/// and the session-scoped set of scopes the operator said "don't ask again"
+/// for.
+///
+/// This is the whole of what makes [`ApprovalMode::Interactive`] real for an
+/// in-process session. A session that has one asks; a session that does not
+/// keeps today's headless behaviour, because `session_broker` derives the
+/// mode from the presence of this type rather than from a separate flag that
+/// could drift out of step with whether anyone is listening.
+#[derive(Debug)]
+pub struct InteractiveApprovals {
+    authority: Arc<ApprovalAuthority>,
+    prompts: std::sync::Mutex<Option<std::sync::mpsc::Sender<ApprovalPrompt>>>,
+    remembered: std::sync::Mutex<BTreeSet<String>>,
+    cancelled: std::sync::atomic::AtomicBool,
+    approved_by: String,
+}
+
+impl InteractiveApprovals {
+    /// Builds the gate and the receiver the pane drains. The authority is
+    /// shared with the broker this gate is installed on, so a grant it mints
+    /// verifies against that broker and no other.
+    pub fn new(
+        authority: Arc<ApprovalAuthority>,
+        approved_by: impl Into<String>,
+    ) -> (Arc<Self>, std::sync::mpsc::Receiver<ApprovalPrompt>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                authority,
+                prompts: std::sync::Mutex::new(Some(tx)),
+                remembered: std::sync::Mutex::new(BTreeSet::new()),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+                approved_by: approved_by.into(),
+            }),
+            rx,
+        )
+    }
+
+    /// Blocks the calling tool call until the operator answers, the session is
+    /// interrupted, or the pane stops draining. Never blocks forever on a
+    /// dropped receiver and never mints a grant for a request the operator did
+    /// not actually see.
+    pub fn request(&self, request: &ApprovalRequest, now: u64) -> ApprovalOutcome {
+        use std::sync::atomic::Ordering;
+        if self.cancelled.load(Ordering::SeqCst) {
+            return ApprovalOutcome::Cancelled;
+        }
+        if self
+            .remembered
+            .lock()
+            .is_ok_and(|remembered| remembered.contains(&request.scope_digest))
+        {
+            return self.mint(request, now);
+        }
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let sent = match self.prompts.lock() {
+            Ok(prompts) => prompts.as_ref().is_some_and(|prompts| {
+                prompts
+                    .send(ApprovalPrompt {
+                        request: request.clone(),
+                        reply: reply_tx,
+                    })
+                    .is_ok()
+            }),
+            Err(_) => false,
+        };
+        if !sent {
+            return ApprovalOutcome::Cancelled;
+        }
+        loop {
+            match reply_rx.recv_timeout(INTERACTIVE_POLL) {
+                Ok(InteractiveDecision::Once) => return self.mint(request, now),
+                Ok(InteractiveDecision::Remember) => {
+                    if let Ok(mut remembered) = self.remembered.lock() {
+                        remembered.insert(request.scope_digest.clone());
+                    }
+                    return self.mint(request, now);
+                }
+                Ok(InteractiveDecision::Deny { guidance }) => {
+                    return ApprovalOutcome::Denied { guidance };
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self.cancelled.load(Ordering::SeqCst) {
+                        return ApprovalOutcome::Cancelled;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return ApprovalOutcome::Cancelled;
+                }
+            }
+        }
+    }
+
+    /// Interrupts every blocked call. Each returns [`ApprovalOutcome::
+    /// Cancelled`] and releases nothing; a decision that arrives afterwards
+    /// finds the receiver gone and reports `false` from
+    /// [`ApprovalPrompt::decide`].
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Re-arms the gate for the next turn. Called when a fresh turn is
+    /// submitted -- an interrupt cancels the turn that was running, not the
+    /// session's ability to be asked again.
+    pub fn resume(&self) {
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The signer this gate mints grants with. A broker installing this gate
+    /// MUST be built with the same authority, or every grant fails
+    /// verification -- see [`ExecutionBroker::with_interactive_approvals`].
+    pub fn authority(&self) -> Arc<ApprovalAuthority> {
+        self.authority.clone()
+    }
+
+    /// Whether this exact scope has a standing session grant.
+    pub fn remembers(&self, scope_digest: &str) -> bool {
+        self.remembered
+            .lock()
+            .is_ok_and(|remembered| remembered.contains(scope_digest))
+    }
+
+    /// Closes the prompt channel, so a later request fails closed instead of
+    /// queueing a dialog nobody will ever see.
+    pub fn close(&self) {
+        self.cancel();
+        if let Ok(mut prompts) = self.prompts.lock() {
+            prompts.take();
+        }
+    }
+
+    fn mint(&self, request: &ApprovalRequest, now: u64) -> ApprovalOutcome {
+        match self.authority.approve(
+            request,
+            self.approved_by.clone(),
+            now,
+            Some(now.saturating_add(INTERACTIVE_GRANT_TTL_SECS)),
+        ) {
+            Ok(grant) => ApprovalOutcome::Granted(grant),
+            // An unsignable request is not an approved one. Failing closed
+            // here is the only safe direction: the digest the operator saw
+            // and the digest being signed have to be the same value.
+            Err(_) => ApprovalOutcome::Cancelled,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessSandboxPolicy {
     pub read_roots: Vec<PathBuf>,
@@ -815,6 +1041,12 @@ pub struct ExecutionBroker {
     policy: Arc<dyn PolicySource>,
     fence: Arc<dyn GenerationFence>,
     approval_authority: Arc<ApprovalAuthority>,
+    /// Issue #490 (N21 item B): the operator's own dialog, for an in-process
+    /// interactive session. `None` -- every headless session, and every
+    /// interactive one whose caller did not install a gate -- keeps the
+    /// pre-#490 behaviour exactly: a request that needs approval and carries
+    /// no grant is refused with [`BrokerError::ApprovalRequired`].
+    approvals: Option<Arc<InteractiveApprovals>>,
     writer: Option<Box<dyn WriterLease>>,
     isolation: PlatformIsolation,
     protected_env_names: BTreeSet<String>,
@@ -862,6 +1094,7 @@ impl ExecutionBroker {
             policy,
             fence,
             approval_authority,
+            approvals: None,
             writer,
             isolation,
             protected_env_names: protected_env_names
@@ -869,6 +1102,24 @@ impl ExecutionBroker {
                 .map(|name| name.to_ascii_uppercase())
                 .collect(),
         })
+    }
+
+    /// Issue #490 (N21 item B): installs the in-process operator dialog this
+    /// broker asks when an action needs approval and carries no grant. The
+    /// gate must share this broker's own [`ApprovalAuthority`], or every grant
+    /// it mints fails verification -- `runtime::native::session_broker` is the
+    /// one place that pairs them.
+    ///
+    /// Only meaningful in [`ApprovalMode::Interactive`]: a headless session
+    /// refuses before the gate is ever consulted, which is what keeps
+    /// "headless cannot be approved away" true no matter who calls this.
+    pub fn with_interactive_approvals(mut self, approvals: Arc<InteractiveApprovals>) -> Self {
+        self.approvals = Some(approvals);
+        self
+    }
+
+    pub fn interactive_approvals(&self) -> Option<&Arc<InteractiveApprovals>> {
+        self.approvals.as_ref()
     }
 
     pub fn isolation_status(&self) -> (&'static str, bool) {
@@ -917,7 +1168,35 @@ impl ExecutionBroker {
                     approval_expires_at = grant.expires_at;
                 }
                 Some(_) => return Err(BrokerError::InvalidApproval(Box::new(request))),
-                None => return Err(BrokerError::ApprovalRequired(Box::new(request))),
+                // Issue #490 (N21 item B): an in-process interactive session
+                // asks its own operator here and BLOCKS this call until the
+                // dialog answers. The decision is applied exactly once (the
+                // prompt is consumed by answering it) and a grant is verified
+                // against this broker's authority before it admits anything,
+                // so the dialog can never describe less authority than what
+                // actually runs. Every other session -- headless, and any
+                // interactive one with nobody listening -- refuses exactly as
+                // before.
+                None => match self.approvals.as_ref() {
+                    Some(approvals) => match approvals.request(&request, now) {
+                        ApprovalOutcome::Granted(grant)
+                            if self.approval_authority.verify(&grant, &request, now) =>
+                        {
+                            approved_by = Some(grant.approved_by.clone());
+                            approval_expires_at = grant.expires_at;
+                        }
+                        ApprovalOutcome::Granted(_) => {
+                            return Err(BrokerError::InvalidApproval(Box::new(request)));
+                        }
+                        ApprovalOutcome::Denied { guidance } => {
+                            return Err(BrokerError::Denied(guidance));
+                        }
+                        ApprovalOutcome::Cancelled => {
+                            return Err(BrokerError::ApprovalRequired(Box::new(request)));
+                        }
+                    },
+                    None => return Err(BrokerError::ApprovalRequired(Box::new(request))),
+                },
             }
         } else if grant.is_some() {
             // A grant for an action that no longer needs one is ignored. It
@@ -2234,5 +2513,213 @@ mod tests {
                 assert_ne!(available.mechanism(), "unavailable");
             }
         }
+    }
+
+    // -- issue #490 (N21 item B): the in-process interactive dialog ---------
+
+    /// The policy that makes a repository write ask.
+    fn asking_policy() -> EffectivePolicy {
+        EffectivePolicy {
+            repo_fs_write: Stance::Ask,
+            approval: Stance::Ask,
+            ..EffectivePolicy::default()
+        }
+    }
+
+    /// A broker with the operator's own dialog installed, plus the receiver a
+    /// pane would drain. The gate shares the fixture's authority, exactly as
+    /// `runtime::native::session_broker` pairs them in production.
+    fn interactive_fixture(
+        mode: ApprovalMode,
+    ) -> (
+        Fixture,
+        std::sync::mpsc::Receiver<ApprovalPrompt>,
+        Arc<InteractiveApprovals>,
+    ) {
+        let Fixture {
+            _root,
+            worktree,
+            outside,
+            broker,
+            authority,
+            policy,
+            generation,
+        } = fixture(asking_policy(), mode, true);
+        let (approvals, prompts) = InteractiveApprovals::new(authority.clone(), "operator");
+        let broker = broker.with_interactive_approvals(approvals.clone());
+        (
+            Fixture {
+                _root,
+                worktree,
+                outside,
+                broker,
+                authority,
+                policy,
+                generation,
+            },
+            prompts,
+            approvals,
+        )
+    }
+
+    #[test]
+    fn an_interactive_tool_call_blocks_until_the_dialog_answers_yes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (fixture, prompts, _approvals) = interactive_fixture(ApprovalMode::Interactive);
+        let answered = Arc::new(AtomicUsize::new(0));
+        let action = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("one.rs"),
+        };
+
+        let dialog = {
+            let answered = answered.clone();
+            std::thread::spawn(move || {
+                let prompt = prompts.recv().expect("the broker raised a request");
+                assert!(matches!(
+                    prompt.request().action,
+                    ExecutionAction::WriteFile { .. }
+                ));
+                assert!(!prompt.request().scope_digest.is_empty());
+                // Long enough that the authorizing thread is genuinely parked
+                // on the reply channel rather than racing us to the flag.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                answered.store(1, Ordering::SeqCst);
+                assert!(prompt.decide(InteractiveDecision::Once));
+                prompts
+            })
+        };
+
+        let authorization = fixture
+            .broker
+            .authorize_at(&action, None, 10)
+            .expect("the dialog said yes");
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            1,
+            "the call must not return before the operator answers"
+        );
+        assert_eq!(authorization.approved_by(), Some("operator"));
+        let prompts = dialog.join().expect("dialog thread");
+
+        // Yes is once: nothing was remembered, so the queue is empty rather
+        // than holding a standing grant.
+        assert!(prompts.try_recv().is_err());
+    }
+
+    #[test]
+    fn remembering_a_scope_suppresses_the_next_identical_request_but_not_another()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (fixture, prompts, approvals) = interactive_fixture(ApprovalMode::Interactive);
+        let same = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("one.rs"),
+        };
+        let other = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("two.rs"),
+        };
+
+        let dialog = std::thread::spawn(move || {
+            let first = prompts.recv().expect("first request");
+            let digest = first.request().scope_digest.clone();
+            assert!(first.decide(InteractiveDecision::Remember));
+            // The SECOND prompt this thread ever sees must belong to the other
+            // path: a remembered scope never reaches the dialog again.
+            let next = prompts.recv().expect("a different scope still asks");
+            assert_ne!(next.request().scope_digest, digest);
+            assert!(next.decide(InteractiveDecision::Once));
+            digest
+        });
+
+        fixture.broker.authorize_at(&same, None, 10)?;
+        let digest = {
+            // The remembered grant is applied without any dialog at all.
+            fixture.broker.authorize_at(&same, None, 11)?;
+            fixture.broker.authorize_at(&other, None, 12)?;
+            dialog.join().expect("dialog thread")
+        };
+        assert!(approvals.remembers(&digest));
+        assert!(!approvals.remembers("a-scope-nobody-approved"));
+        Ok(())
+    }
+
+    #[test]
+    fn denying_an_interactive_approval_fails_the_call_with_the_operators_guidance() {
+        let (fixture, prompts, _approvals) = interactive_fixture(ApprovalMode::Interactive);
+        let action = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("one.rs"),
+        };
+        let dialog = std::thread::spawn(move || {
+            let prompt = prompts.recv().expect("request");
+            assert!(prompt.decide(InteractiveDecision::Deny {
+                guidance: "write a test first".to_string(),
+            }));
+        });
+        match fixture.broker.authorize_at(&action, None, 10) {
+            Err(BrokerError::Denied(message)) => assert_eq!(message, "write a test first"),
+            other => panic!("expected a denial carrying the guidance, got {other:?}"),
+        }
+        dialog.join().expect("dialog thread");
+    }
+
+    #[test]
+    fn an_interrupt_while_blocked_cancels_the_call_and_releases_nothing() {
+        let (fixture, prompts, approvals) = interactive_fixture(ApprovalMode::Interactive);
+        let action = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("one.rs"),
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let dialog = {
+            let approvals = approvals.clone();
+            std::thread::spawn(move || {
+                let prompt = prompts.recv().expect("request");
+                approvals.cancel();
+                // Only answer once the blocked call has already failed closed,
+                // so the assertion below is about the release and not a race.
+                done_rx.recv().expect("the call finished");
+                prompt.decide(InteractiveDecision::Once)
+            })
+        };
+        let outcome = fixture.broker.authorize_at(&action, None, 10);
+        done_tx.send(()).expect("signal the dialog");
+        assert!(
+            matches!(outcome, Err(BrokerError::ApprovalRequired(_))),
+            "a cancelled call fails closed, got {outcome:?}"
+        );
+        assert!(
+            !dialog.join().expect("dialog thread"),
+            "an answer after the interrupt releases nothing"
+        );
+        assert!(approvals.is_cancelled());
+        approvals.resume();
+        assert!(!approvals.is_cancelled());
+    }
+
+    #[test]
+    fn a_headless_session_refuses_even_with_a_dialog_installed() {
+        let (fixture, prompts, _approvals) = interactive_fixture(ApprovalMode::Headless);
+        let action = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("one.rs"),
+        };
+        assert!(matches!(
+            fixture.broker.authorize_at(&action, None, 10),
+            Err(BrokerError::ApprovalUnavailable(_))
+        ));
+        assert!(
+            prompts.try_recv().is_err(),
+            "a headless session never raises a dialog"
+        );
+    }
+
+    #[test]
+    fn a_closed_prompt_channel_fails_the_call_closed() {
+        let (fixture, prompts, approvals) = interactive_fixture(ApprovalMode::Interactive);
+        drop(prompts);
+        approvals.close();
+        let action = ExecutionAction::WriteFile {
+            path: fixture.worktree.join("one.rs"),
+        };
+        assert!(matches!(
+            fixture.broker.authorize_at(&action, None, 10),
+            Err(BrokerError::ApprovalRequired(_))
+        ));
     }
 }

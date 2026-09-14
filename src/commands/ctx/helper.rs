@@ -420,6 +420,9 @@ mod tests {
             },
             // The read-only mechanism, verbatim from `run`.
             None,
+            // No operator dialog: a helper session stays headless, so the
+            // refusal cannot be approved away either (issue #490, N21 item B).
+            None,
         )
         .unwrap();
         let mut client =

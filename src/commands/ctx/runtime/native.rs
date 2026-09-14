@@ -2916,7 +2916,7 @@ pub fn run_session<W: std::io::Write>(
     if brokered {
         // The broker is built here, after the seat record exists, because its
         // own fence reads that record at every effect.
-        let executor = brokered_tools(request, &state, &home, &cfg, &handle)?;
+        let executor = brokered_tools(request, &state, &home, &cfg, &handle, None)?;
         tools = executor;
     }
 
@@ -3186,6 +3186,11 @@ pub struct InteractiveSession {
     /// the same direct route `NativeBackend::interrupt` already documents
     /// for "a caller that drives a `NativeLoop` itself".
     pub cancel: Arc<CancellationFlag>,
+    /// Issue #490 (N21 item B): the in-process approval gate this session's
+    /// execution broker asks. The pane answers through
+    /// [`Self::next_approval`]; `interrupt` cancels whatever is blocked on it.
+    approvals: Arc<super::enforcement::InteractiveApprovals>,
+    approval_prompts: mpsc::Receiver<super::enforcement::ApprovalPrompt>,
     submit_tx: mpsc::Sender<String>,
     progress_rx: mpsc::Receiver<InteractiveProgress>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -3223,7 +3228,19 @@ impl InteractiveSession {
         out
     }
 
+    /// The next approval request this session's broker has raised, if any.
+    /// Never blocks: the pane polls it once per tick, the same way it polls
+    /// progress.
+    pub fn next_approval(&self) -> Option<super::enforcement::ApprovalPrompt> {
+        self.approval_prompts.try_recv().ok()
+    }
+
+    /// Issue #490 (N21 item B): interrupting also cancels whatever tool call
+    /// is blocked on the operator's dialog. Without this, `Esc` would end the
+    /// turn's provider work and leave a worker thread parked forever on an
+    /// answer the dialog it belonged to no longer draws.
     pub fn interrupt(&self) {
+        self.approvals.cancel();
         self.cancel.cancel();
     }
 
@@ -3260,6 +3277,10 @@ impl InteractiveSession {
     ///    (`journal.complete_session`, then dropping `tools`/the writer
     ///    permit as the closure returns) runs before `shutdown` returns.
     pub fn shutdown(mut self) {
+        // Issue #490 (N21 item B): close the dialog channel first, so a tool
+        // call blocked on an operator who is walking away fails closed
+        // instead of parking the worker thread we are about to join.
+        self.approvals.close();
         self.cancel.cancel();
         drop(std::mem::replace(&mut self.submit_tx, mpsc::channel().0));
         if let Some(worker) = self.worker.take() {
@@ -3477,8 +3498,24 @@ pub fn spawn_interactive(
         }
     }
 
+    // Issue #490 (N21 item B): an in-process pane HAS an operator, so its
+    // broker runs interactive and raises its approval requests on this
+    // channel. `approvals` is built before the executor because the executor's
+    // broker is what installs it; the pane drains `approval_prompts`.
+    let (approvals, approval_prompts) = super::enforcement::InteractiveApprovals::new(
+        Arc::new(super::enforcement::ApprovalAuthority::new()),
+        format!("pane {}", handle.short),
+    );
+
     if brokered {
-        let executor = brokered_tools(&mut headless, &state, &home, &cfg, &handle)?;
+        let executor = brokered_tools(
+            &mut headless,
+            &state,
+            &home,
+            &cfg,
+            &handle,
+            Some(Arc::clone(&approvals)),
+        )?;
         tools = executor;
     }
 
@@ -3557,11 +3594,15 @@ pub fn spawn_interactive(
     let worker_handle = handle.clone();
     let worker_session = session.clone();
 
+    let worker_approvals = Arc::clone(&approvals);
     let worker = std::thread::spawn(move || {
         let mut backend = backend;
         let mut tools = tools;
         let env_fn = super::super::config::env_from_process();
         for text in submit_rx.iter() {
+            // A new turn re-arms the dialog: an interrupt cancels the turn
+            // that was running, never the session's ability to be asked again.
+            worker_approvals.resume();
             let _ = progress_tx.send(InteractiveProgress::Busy);
             if let Err(error) = backend.submit(&worker_handle, &text) {
                 let _ = progress_tx.send(InteractiveProgress::Failed(error.to_string()));
@@ -3600,6 +3641,7 @@ pub fn spawn_interactive(
                 now_secs(),
             );
         }
+        worker_approvals.close();
         let _ = progress_tx.send(InteractiveProgress::Ended);
     });
 
@@ -3608,6 +3650,8 @@ pub fn spawn_interactive(
         session,
         route,
         cancel,
+        approvals,
+        approval_prompts,
         submit_tx,
         progress_rx,
         worker: Some(worker),
@@ -3717,7 +3761,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
         }),
     };
     if brokered {
-        tools = brokered_tools(&mut request, &state, &home, &cfg, &handle)?;
+        tools = brokered_tools(&mut request, &state, &home, &cfg, &handle, None)?;
     }
 
     let compaction = CompactionSettings {
@@ -3928,6 +3972,7 @@ fn brokered_tools(
     home: &std::path::Path,
     cfg: &super::super::config::CtxConfig,
     handle: &SessionHandle,
+    approvals: Option<Arc<super::enforcement::InteractiveApprovals>>,
 ) -> CtxResult<Box<dyn ToolExecutor>> {
     use super::enforcement::ExecutionIdentity;
     use super::tools::ToolLimits;
@@ -3939,6 +3984,7 @@ fn brokered_tools(
         cfg,
         ExecutionIdentity::from_handle(handle, request.task.clone())?,
         request.writer.take(),
+        approvals,
     )?;
     let services = super::capabilities::CapabilityServices::from_config(
         cfg,
@@ -3965,8 +4011,17 @@ fn brokered_tools(
 /// drift. `writer` is the whole of that contract: a `None` lease means every
 /// repository write, outside write, write-effect process and shared-scope
 /// knowledge write is refused here, at effect time, with
-/// `BrokerError::WriterPermit` -- and `ApprovalMode::Headless` means the
-/// refusal cannot be approved away either.
+/// `BrokerError::WriterPermit` -- and a session with no `approvals` gate runs
+/// in `ApprovalMode::Headless`, which means the refusal cannot be approved
+/// away either.
+///
+/// Issue #490 (roadmap N21 item B): `approvals` is the operator's own dialog,
+/// and the approval MODE is derived from it rather than passed separately --
+/// a session is interactive exactly when there is a live channel to ask on.
+/// That makes the invariant structural: there is no way to build a broker
+/// that says it will ask and then has nobody to ask, and no way to build one
+/// that has a dialog it never consults. Every headless caller passes `None`
+/// and gets precisely the pre-#490 construction.
 pub(crate) fn session_broker(
     repo: &std::path::Path,
     state: &super::super::state::StateDir,
@@ -3974,6 +4029,7 @@ pub(crate) fn session_broker(
     cfg: &super::super::config::CtxConfig,
     identity: super::enforcement::ExecutionIdentity,
     writer: Option<Box<dyn super::enforcement::WriterLease>>,
+    approvals: Option<Arc<super::enforcement::InteractiveApprovals>>,
 ) -> Result<super::enforcement::ExecutionBroker, super::enforcement::BrokerError> {
     use super::enforcement::{
         ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, PlatformIsolation,
@@ -3999,17 +4055,31 @@ pub(crate) fn session_broker(
         None => claims,
     };
 
-    ExecutionBroker::new(
+    let mode = match approvals {
+        Some(_) => ApprovalMode::Interactive,
+        None => ApprovalMode::Headless,
+    };
+    // The gate and the broker must share one signer, or every grant the
+    // dialog mints fails verification on the way back in.
+    let authority = approvals
+        .as_ref()
+        .map(|approvals| approvals.authority())
+        .unwrap_or_else(|| std::sync::Arc::new(ApprovalAuthority::new()));
+    let broker = ExecutionBroker::new(
         identity,
         claims,
-        ApprovalMode::Headless,
+        mode,
         std::sync::Arc::new(ConfigPolicySource::new(repo.to_path_buf())),
         std::sync::Arc::new(StoredSeatFence::new(state.clone())),
-        std::sync::Arc::new(ApprovalAuthority::new()),
+        authority,
         writer,
         PlatformIsolation::detect(),
         Default::default(),
-    )
+    )?;
+    Ok(match approvals {
+        Some(approvals) => broker.with_interactive_approvals(approvals),
+        None => broker,
+    })
 }
 
 /// The task's network claim, built from the operator's own capability
