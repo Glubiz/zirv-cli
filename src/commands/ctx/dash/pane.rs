@@ -853,6 +853,7 @@ pub struct Pane {
     /// anything, but gates injection only, not the pane's displayed state.
     user_typed_since_turn: bool,
     exit_code: Option<i32>,
+    native_stop_code: Option<i32>,
     /// Monotonic launch age captured when the real child exit is observed.
     launched_at: Instant,
     exited_after: Option<Duration>,
@@ -1153,7 +1154,7 @@ impl Pane {
         let ended = native.ended;
         let changed = native.last_sequence() != before;
         if ended && self.exit_code.is_none() {
-            self.exit_code = Some(0);
+            self.exit_code = Some(self.native_stop_code.unwrap_or(0));
             self.exited_after = Some(self.launched_at.elapsed());
         }
         if changed {
@@ -1253,6 +1254,7 @@ impl Pane {
             injected_awaiting_turn: false,
             user_typed_since_turn: false,
             exit_code: None,
+            native_stop_code: None,
             launched_at: Instant::now(),
             exited_after: None,
             done: false,
@@ -1535,6 +1537,7 @@ impl Pane {
             injected_awaiting_turn: false,
             user_typed_since_turn: false,
             exit_code: None,
+            native_stop_code: None,
             launched_at,
             exited_after: None,
             done: false,
@@ -2737,13 +2740,19 @@ impl Pane {
     /// No polite quit sequence, unlike [`Self::enforce_deadline`]: this is
     /// the operator saying kill it, and a pane settled enough to need `zirv
     /// ctx kill` is precisely the pane that will not answer one. A child that
-    /// had already exited keeps its own exit code.
+    /// had already exited keeps its own exit code. Native panes request
+    /// cancellation without blocking here; [`Self::tick_native`] records the
+    /// requested code only after the worker has actually terminated.
     pub fn stop_now(&mut self, code: i32) -> CtxResult<()> {
         self.poll_exit();
         if let PaneKind::Native(native) = &mut self.kind {
             native.stop(&self.state_dir)?;
-            self.kind = PaneKind::Ended;
-            self.exit_code = Some(code);
+            if native.ended {
+                self.exit_code = Some(code);
+            } else {
+                self.native_stop_code.get_or_insert(code);
+                return Ok(());
+            }
         }
         self.finish_shutdown()?;
         if self.exit_code.is_none() {
@@ -6308,6 +6317,7 @@ pub(crate) mod tests {
 
         assert!(pane.holds_writer_permit());
         pane.stop_now(0).expect("stop native pane");
+        wait_for_native_pane_end(&mut pane);
         assert!(!pane.holds_writer_permit());
     }
 
@@ -6479,6 +6489,18 @@ pub(crate) mod tests {
             native_spec(repo),
         )
         .expect("a native pane opens")
+    }
+
+    fn wait_for_native_pane_end(pane: &mut Pane) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(pane.state(), PaneState::Ended(_)) && Instant::now() < deadline {
+            let _ = pane.drain_with_budget(DRAIN_BUDGET_BYTES);
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(pane.state(), PaneState::Ended(_)),
+            "native worker did not terminate after stop"
+        );
     }
 
     #[test]
@@ -6704,8 +6726,25 @@ pub(crate) mod tests {
         assert!(record_path.exists(), "the record exists while it runs");
 
         pane.stop_now(7).expect("stop_now");
+        assert!(
+            !matches!(pane.state(), PaneState::Ended(_)),
+            "requesting cancellation is not proof of worker termination"
+        );
+        assert!(
+            record_path.exists(),
+            "lifecycle remains held while the worker is stopping"
+        );
+        wait_for_native_pane_end(&mut pane);
         assert_eq!(pane.state(), PaneState::Ended(7));
-        assert!(!record_path.exists(), "the record is released");
+        assert!(
+            record_path.exists(),
+            "the reap has not released lifecycle yet"
+        );
+        pane.finish_shutdown().expect("finish shutdown");
+        assert!(
+            !record_path.exists(),
+            "the record is released after termination"
+        );
         // Both halves are idempotent, exactly as they are for a wrapped pane.
         pane.finish_shutdown().expect("idempotent");
         pane.shutdown("").expect("idempotent");

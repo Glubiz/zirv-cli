@@ -3273,6 +3273,29 @@ impl InteractiveSession {
         self.cancel.cancel();
     }
 
+    /// Starts session shutdown without waiting for the worker thread. The
+    /// dashboard uses this on its event loop, then polls
+    /// [`Self::try_finish_shutdown`] on later ticks.
+    pub fn request_shutdown(&mut self) {
+        self.approvals.close();
+        self.cancel.cancel();
+        drop(std::mem::replace(&mut self.submit_tx, mpsc::channel().0));
+    }
+
+    /// Reaps a worker that has already terminated. Never blocks.
+    pub fn try_finish_shutdown(&mut self) -> bool {
+        let Some(worker) = self.worker.as_ref() else {
+            return true;
+        };
+        if !worker.is_finished() {
+            return false;
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        true
+    }
+
     /// Ends the session: cancels any turn currently in flight, drops the
     /// submit channel (the worker's `for text in submit_rx` loop exits on
     /// its next iteration since a disconnected channel reads as "no more
@@ -3306,12 +3329,7 @@ impl InteractiveSession {
     ///    (`journal.complete_session`, then dropping `tools`/the writer
     ///    permit as the closure returns) runs before `shutdown` returns.
     pub fn shutdown(mut self) {
-        // Issue #490 (N21 item B): close the dialog channel first, so a tool
-        // call blocked on an operator who is walking away fails closed
-        // instead of parking the worker thread we are about to join.
-        self.approvals.close();
-        self.cancel.cancel();
-        drop(std::mem::replace(&mut self.submit_tx, mpsc::channel().0));
+        self.request_shutdown();
         if let Some(worker) = self.worker.take() {
             join_worker_with_timeout(worker, SHUTDOWN_JOIN_TIMEOUT);
         }

@@ -12474,7 +12474,9 @@ pub fn run_dashboard(
                                                                 Ok(()) => push_notice(
                                                                     &mut notices,
                                                                     now,
-                                                                    format!("stopped {target}"),
+                                                                    format!(
+                                                                        "asked {target} to stop"
+                                                                    ),
                                                                 ),
                                                                 Err(error) => push_error(
                                                                     &mut errors,
@@ -13764,6 +13766,7 @@ pub fn run_dashboard(
         // same `&overlay` it was built from -- see `overlay_route_is_current`.
         let next_snapshot_overlay_ident = overlay_identity(&overlay);
         let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
+        let mut native_approval_rendered = false;
         let draw = terminal.draw(|f| {
             if !zoomed {
                 ui::render_header(f, layout.header, &facts);
@@ -13815,7 +13818,7 @@ pub fn run_dashboard(
                     // `native_ux::resolve_layout`'s decision against the area
                     // it is actually given, so the same code draws every
                     // terminal size with no size-specific branch here.
-                    native_pane::render_native_dashboard(
+                    native_approval_rendered = native_pane::render_native_dashboard(
                         f,
                         main_area,
                         view,
@@ -13855,7 +13858,8 @@ pub fn run_dashboard(
         if let Err(e) = draw {
             push_error(&mut errors, format!("draw: {e}"));
         } else {
-            if matches!(overlay, ui::Overlay::None)
+            if native_approval_rendered
+                && matches!(overlay, ui::Overlay::None)
                 && let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
             {
                 native.ux_mut().mark_approval_visible();
