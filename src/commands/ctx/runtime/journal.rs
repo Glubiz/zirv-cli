@@ -107,6 +107,14 @@ pub struct SessionIdentity {
     pub generation: u64,
     pub task: Option<TaskId>,
     pub route: RouteIdentity,
+    /// Issue #639: the canonical repository root this session started in,
+    /// recorded once at [`Journal::create_session`] and never rewritten.
+    /// `--resume` from any other root is refused (`run_session`'s own
+    /// affinity check) -- a native session's journal, its checkpoints and
+    /// every tool receipt in it are all relative to the tree it began
+    /// working in, so continuing it against a different one would silently
+    /// hand a stale plan a different checkout's files.
+    pub repo: PathBuf,
     pub created_at: u64,
     pub completed_at: Option<u64>,
 }
@@ -828,12 +836,13 @@ impl Journal {
             .map(|value| sql_u64(value, "completed_at"))
             .transpose()?;
         let protocol = protocol_name(identity.route.protocol);
+        let repo_root = identity.repo.to_string_lossy().into_owned();
         let result = self.conn.execute(
             "INSERT INTO native_sessions (
                  session_id, seat_id, generation, task_id, route_id, provider_id,
                  endpoint_id, account_id, billing_pool_id, protocol, model_vendor,
-                 model_id, created_at, updated_at, next_sequence, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, 0, ?14)",
+                 model_id, created_at, updated_at, next_sequence, completed_at, repo_root
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, 0, ?14, ?15)",
             params![
                 identity.session.as_str(),
                 identity.seat.as_str(),
@@ -849,6 +858,7 @@ impl Journal {
                 identity.route.model.id,
                 created_at,
                 completed_at,
+                repo_root,
             ],
         );
         match result {
@@ -1802,7 +1812,12 @@ fn migrate(conn: &Connection) -> JournalResult<()> {
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
              next_sequence INTEGER NOT NULL DEFAULT 0 CHECK (next_sequence >= 0),
-             completed_at INTEGER
+             completed_at INTEGER,
+             -- Issue #639: the canonical repository root this session
+             -- started in (schema still unreleased at 1, so added to the
+             -- genesis table rather than an ALTER TABLE migration -- no
+             -- shipped journal predates this column).
+             repo_root TEXT NOT NULL DEFAULT ''
          );
          CREATE TABLE native_events (
              session_id TEXT NOT NULL REFERENCES native_sessions(session_id) ON DELETE CASCADE,
@@ -2204,7 +2219,7 @@ fn read_session(conn: &Connection, session: &JournalSessionId) -> JournalResult<
         .query_row(
             "SELECT seat_id, generation, task_id, route_id, provider_id, endpoint_id,
                     account_id, billing_pool_id, protocol, model_vendor, model_id,
-                    created_at, completed_at
+                    created_at, completed_at, repo_root
              FROM native_sessions WHERE session_id = ?1",
             [session.as_str()],
             |row| {
@@ -2222,6 +2237,7 @@ fn read_session(conn: &Connection, session: &JournalSessionId) -> JournalResult<
                     model_id: row.get(10)?,
                     created_at: row.get(11)?,
                     completed_at: row.get(12)?,
+                    repo_root: row.get(13)?,
                 })
             },
         )
@@ -2246,6 +2262,7 @@ fn read_session(conn: &Connection, session: &JournalSessionId) -> JournalResult<
                 id: raw.model_id,
             },
         },
+        repo: PathBuf::from(raw.repo_root),
         created_at: rust_u64(raw.created_at, "created_at")?,
         completed_at: raw
             .completed_at
@@ -2268,6 +2285,7 @@ struct RawSession {
     model_id: String,
     created_at: i64,
     completed_at: Option<i64>,
+    repo_root: String,
 }
 
 fn read_events(conn: &Connection, session: &JournalSessionId) -> JournalResult<Vec<StoredEvent>> {
@@ -2494,6 +2512,7 @@ mod tests {
                     id: "gpt-5.6-sol".into(),
                 },
             },
+            repo: PathBuf::from("/repo"),
             created_at: 1,
             completed_at: None,
         }

@@ -544,6 +544,7 @@ mod tests {
                         id: "gpt-5".into(),
                     },
                 },
+                repo: repo.clone(),
                 created_at: 1,
                 completed_at: None,
             })
@@ -676,6 +677,7 @@ mod tests {
                         id: "gpt-5".into(),
                     },
                 },
+                repo: std::path::PathBuf::from("/native-test-repo"),
                 created_at: 1,
                 completed_at: None,
             })

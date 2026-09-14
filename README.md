@@ -1741,12 +1741,17 @@ dashboard, with no `ratatui` required.
 
 `--resume <session>` does the three things a continuation owes before it may
 run, in this order: it reads the stored session (a session this journal has
-never heard of is an error, never an invented one), converts every execution
-whose last durable state is `started` to `outcome_unknown` — an effect that
-began and never reported is **never** silently retried — and then advances the
-generation, which fences the previous one out of both the journal and the
-execution broker. Anything still holding the old generation (a half-dead
-process, a stale handle) is refused from that point on.
+never heard of is an error, never an invented one), checks it was started in
+**this** repository (issue #639 — the canonical repository root is recorded
+once at session start and never rewritten; `--resume` from any other root is
+refused, naming the recorded origin, before anything else below runs or
+mutates the journal at all — resume from the same repository is unaffected),
+converts every execution whose last durable state is `started` to
+`outcome_unknown` — an effect that began and never reported is **never**
+silently retried — and then advances the generation, which fences the
+previous one out of both the journal and the execution broker. Anything still
+holding the old generation (a half-dead process, a stale handle) is refused
+from that point on.
 
 Two operator-only flags make a whole native session runnable with no provider
 configured at all: `--provider fixture:<path>` replays a deterministic

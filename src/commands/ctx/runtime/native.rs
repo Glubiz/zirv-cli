@@ -3246,11 +3246,40 @@ pub fn run_session<W: std::io::Write>(
     let mut journal = Journal::open(&state)?;
     let mut backend = NativeBackend::new();
 
+    // Issue #639: the same canonical form recorded on the journal session
+    // at start (below) and compared against on every `--resume` of it --
+    // canonicalized so a symlinked or relative checkout of the SAME
+    // worktree still affinity-matches, and falls back to the raw path
+    // (never fails the run over it) when canonicalization itself cannot
+    // resolve it, exactly like `spawn_interactive`'s own `tree` above it.
+    let canonical_repo =
+        std::fs::canonicalize(request.repo).unwrap_or_else(|_| request.repo.to_path_buf());
+
     // Session identity first: the seat record is what the effect-time
     // generation fence reads, so it has to exist before any tool can run.
     let (handle, session) = match request.resume {
         Some(resume) => {
             let session = JournalSessionId::new(resume)?;
+            // Issue #639: checked BEFORE `resume_journal` (below), which
+            // mutates -- it reconciles outcome-unknown executions and
+            // advances the generation. A refused resume must be a pure
+            // refusal, not a resume attempt that partly happened and then
+            // got refused. `repo` is empty only for a session whose journal
+            // predates this field (never shipped, but tolerated the same
+            // tolerant-read way every other optional seat/journal field is)
+            // -- an empty recorded origin refuses nothing, since there is no
+            // origin to contradict.
+            let identity = journal.session(&session)?;
+            if !identity.repo.as_os_str().is_empty() && identity.repo != canonical_repo {
+                return Err(format!(
+                    "--resume {resume}: this native session started in {}; refusing to \
+                     continue it from {} -- resume it from its own repository, or start a new \
+                     session here",
+                    identity.repo.display(),
+                    canonical_repo.display(),
+                )
+                .into());
+            }
             let resumed = resume_journal(&mut journal, &session, now_ms())?;
             let handle = SessionHandle {
                 runtime: RuntimeKind::Native,
@@ -3309,6 +3338,9 @@ pub fn run_session<W: std::io::Write>(
                 // session and a legacy worker's task card name one task.
                 task: task.clone(),
                 route: route.clone(),
+                // Issue #639: recorded once, at true session start, so a
+                // later `--resume` has an origin to check itself against.
+                repo: canonical_repo.clone(),
                 created_at: now,
                 completed_at: None,
             })?;
@@ -4041,6 +4073,11 @@ pub fn spawn_interactive(
         generation: handle.generation,
         task,
         route: route.clone(),
+        // Issue #639: same affinity record a headless `run_session` writes;
+        // an interactive pane always mints a FRESH journal session here
+        // (never a `--resume` of an existing one), so there is nothing to
+        // check against yet, only an origin to record for a later one.
+        repo: tree.clone(),
         created_at: now,
         completed_at: None,
     })?;
@@ -4858,6 +4895,7 @@ mod tests {
                 generation: 1,
                 task: None,
                 route: route.clone(),
+                repo: std::path::PathBuf::from("/native-test-repo"),
                 created_at: 1,
                 completed_at: None,
             })
@@ -6580,6 +6618,11 @@ mod tests {
                     generation: 1,
                     task: None,
                     route: route.clone(),
+                    // Issue #639: must match the `repo` the `HeadlessRequest`
+                    // below resumes from (canonicalized, the same way
+                    // `run_session` canonicalizes it), or the new affinity
+                    // check refuses this resume.
+                    repo: std::fs::canonicalize(repo.path()).expect("canonicalize repo"),
                     created_at: 1,
                     completed_at: None,
                 })
@@ -6684,6 +6727,153 @@ mod tests {
             Some(ExecutionState::OutcomeUnknown),
             "the resume must have reconciled the started execution"
         );
+    }
+
+    /// Issue #639: a native session is bound to the repository it started
+    /// in. A fresh session is started (through `run_session`, the real
+    /// entry point, so `repo` is recorded exactly the way production does
+    /// it) in repo A, then `--resume`d from an unrelated repo B -- the
+    /// refusal must name repo A (the recorded origin), and must happen
+    /// BEFORE the resume mutates anything: the generation the crashed-
+    /// execution reconcile test above proves advances must NOT have
+    /// advanced here.
+    #[test]
+    fn resume_from_a_different_repository_is_refused_and_names_the_recorded_origin() {
+        let (repo_a, state, _tree, env) = interactive_shutdown_fixture();
+        let repo_b = tempfile::tempdir().expect("repo b");
+        let lookup = |k: &str| env.get(k).cloned();
+        let provider = format!(
+            "fixture:{}",
+            fixture_root().join("helper-answer.json").display()
+        );
+
+        let status = run_session(
+            &mut HeadlessRequest {
+                repo: repo_a.path(),
+                prompt: "do the thing",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: None,
+                provider: Some(&provider),
+                fixture_tools: None,
+                task: None,
+                writer: None,
+                accounting: Accounting::Seat,
+            },
+            &mut Vec::new(),
+            &lookup,
+        )
+        .expect("a fresh native run in repo A completes");
+
+        let resume_provider = format!(
+            "fixture:{}",
+            fixture_root().join("resume-continue.json").display()
+        );
+        let error = run_session(
+            &mut HeadlessRequest {
+                repo: repo_b.path(),
+                prompt: "carry on",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: Some(&status.session),
+                provider: Some(&resume_provider),
+                fixture_tools: None,
+                task: None,
+                writer: None,
+                accounting: Accounting::Seat,
+            },
+            &mut Vec::new(),
+            &lookup,
+        )
+        .expect_err("a resume from a different repository must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                &std::fs::canonicalize(repo_a.path())
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ),
+            "the refusal must name the recorded origin: {message}"
+        );
+
+        // A pure refusal: the generation the resume WOULD have advanced (and
+        // the reconcile it would have run) must not have happened.
+        let journal = Journal::open(&state).expect("reopen journal");
+        let identity = journal
+            .session(&JournalSessionId::new(status.session.clone()).unwrap())
+            .expect("session still exists");
+        assert_eq!(
+            identity.generation, 1,
+            "a refused resume must not advance the generation"
+        );
+    }
+
+    /// Issue #639: the companion acceptance criterion -- resume from the
+    /// SAME repository the session started in is unaffected by the new
+    /// affinity check.
+    #[test]
+    fn resume_from_the_same_repository_is_unaffected() {
+        let (repo, _state, _tree, env) = interactive_shutdown_fixture();
+        let lookup = |k: &str| env.get(k).cloned();
+        let provider = format!(
+            "fixture:{}",
+            fixture_root().join("helper-answer.json").display()
+        );
+
+        let status = run_session(
+            &mut HeadlessRequest {
+                repo: repo.path(),
+                prompt: "do the thing",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: None,
+                provider: Some(&provider),
+                fixture_tools: None,
+                task: None,
+                writer: None,
+                accounting: Accounting::Seat,
+            },
+            &mut Vec::new(),
+            &lookup,
+        )
+        .expect("a fresh native run completes");
+
+        let resume_provider = format!(
+            "fixture:{}",
+            fixture_root().join("resume-continue.json").display()
+        );
+        let resumed = run_session(
+            &mut HeadlessRequest {
+                repo: repo.path(),
+                prompt: "carry on",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: Some(&status.session),
+                provider: Some(&resume_provider),
+                fixture_tools: None,
+                task: None,
+                writer: None,
+                accounting: Accounting::Seat,
+            },
+            &mut Vec::new(),
+            &lookup,
+        )
+        .expect("resume from the same repository is unaffected by the affinity check");
+        assert_eq!(resumed.status, NativeStatus::Completed);
+        assert_eq!(resumed.session, status.session);
     }
 
     // -- PR #531 review finding 1 / finding 7: `spawn_interactive` +
