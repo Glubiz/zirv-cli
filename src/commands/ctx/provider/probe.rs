@@ -151,9 +151,10 @@ pub(crate) fn models_url(
     profile: Option<&RouteProfile>,
 ) -> Option<String> {
     let path = if spec.protocol == Protocol::OpenAiChatCompatible {
-        let request_path = profile?.path;
-        let prefix = request_path.strip_suffix("/chat/completions")?;
-        format!("{prefix}/models")
+        match profile.and_then(|profile| profile.path.strip_suffix("/chat/completions")) {
+            Some(prefix) => format!("{prefix}/models"),
+            None => spec.models_list_path?.to_string(),
+        }
     } else {
         spec.models_list_path?.to_string()
     };
