@@ -641,6 +641,66 @@ mod tests {
         assert!(result.details.contains("no file under src/"), "{result:?}");
     }
 
+    /// The third resolution outcome, and the one that actually bit the real
+    /// matrix: `native` names two different modules in this tree. Both
+    /// fixture files DECLARE the cited fn, so a pass here would mean the
+    /// check had silently picked one -- the collision has to be refused
+    /// before the fn lookup, and the message has to name every candidate so
+    /// the author knows how far to lengthen the path.
+    #[test]
+    fn an_ambiguous_module_suffix_fails_and_names_every_colliding_file() {
+        let dir =
+            fixture(&PASSING_ROWS.replace("checks::tests::a_real_test", "native::tests::foo"));
+        let colliding = [
+            ["src", "commands", "ctx", "runtime", "native.rs"],
+            ["src", "commands", "ctx", "session", "native.rs"],
+        ];
+        for parts in colliding {
+            let path: std::path::PathBuf = parts.iter().collect();
+            std::fs::create_dir_all(dir.path().join(path.parent().expect("parent")))
+                .expect("mkdir");
+            std::fs::write(dir.path().join(&path), "fn foo() {}\n").expect("write module");
+        }
+
+        let result = outcome(&dir);
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Fail,
+            "{result:?}"
+        );
+        assert!(result.details.contains("ambiguous"), "{result:?}");
+        for parts in colliding {
+            // Built through `PathBuf` so the assertion reads the same
+            // separator the check's own `display()` wrote.
+            let shown = parts.iter().collect::<std::path::PathBuf>();
+            assert!(
+                result.details.contains(&shown.display().to_string()),
+                "{} must be named as a candidate: {result:?}",
+                shown.display()
+            );
+        }
+    }
+
+    /// `tests` is an inline `#[cfg(test)]` module, never a file, so it is
+    /// stripped -- which leaves a bare `tests::foo` citation with no module
+    /// path at all. That is the "names no module" failure, not a lookup for
+    /// a module called `tests`.
+    #[test]
+    fn a_citation_with_only_a_tests_segment_names_no_module_and_fails() {
+        let dir = fixture(&PASSING_ROWS.replace("checks::tests::a_real_test", "tests::foo"));
+        let result = outcome(&dir);
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Fail,
+            "{result:?}"
+        );
+        assert!(result.details.contains("names no module"), "{result:?}");
+        assert!(
+            result.details.contains("<module path>::tests::<fn>"),
+            "{result:?}"
+        );
+    }
+
     /// The whole point of the rung vocabulary: `live-validated` is the one
     /// claim a fixture test can never earn, so it may only be written next to
     /// a recording that is actually committed.
