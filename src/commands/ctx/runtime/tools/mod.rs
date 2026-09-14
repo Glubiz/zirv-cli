@@ -1598,6 +1598,13 @@ impl NativeToolClient {
             Ok(action) => self.with_declared_effects(action),
             Err(error) => return failed_receipt(name, retry, error, started_at_ms),
         };
+        if matches!(
+            &parsed,
+            ParsedTool::BrowserCapture(_) | ParsedTool::BrowserInspect(_)
+        ) && let Err(error) = self.broker.authorize_browser_network(name)
+        {
+            return failed_receipt(name, retry, error.into(), started_at_ms);
+        }
         let authorization = match self.broker.authorize(&action, grant) {
             Ok(authorization) => authorization,
             Err(error) => return failed_receipt(name, retry, error.into(), started_at_ms),
@@ -5329,7 +5336,7 @@ mod tests {
         server: super::super::mcp::FixtureServer,
         max_inline_mcp_tools: usize,
     ) -> EndToEnd {
-        end_to_end_with_effects(policy, server, max_inline_mcp_tools, Default::default())
+        end_to_end_configured(policy, server, max_inline_mcp_tools, Default::default(), NetworkScope::Any)
     }
 
     fn end_to_end_with_effects(
@@ -5338,12 +5345,31 @@ mod tests {
         max_inline_mcp_tools: usize,
         effects: super::super::super::config::CapabilityEffectsConfig,
     ) -> EndToEnd {
+        end_to_end_configured(policy, server, max_inline_mcp_tools, effects, NetworkScope::Any)
+    }
+
+    fn end_to_end_with_network_scope(
+        policy: super::super::super::policy::EffectivePolicy,
+        server: super::super::mcp::FixtureServer,
+        max_inline_mcp_tools: usize,
+        network: super::super::enforcement::NetworkScope,
+    ) -> EndToEnd {
+        end_to_end_configured(policy, server, max_inline_mcp_tools, Default::default(), network)
+    }
+
+    fn end_to_end_configured(
+        policy: super::super::super::policy::EffectivePolicy,
+        server: super::super::mcp::FixtureServer,
+        max_inline_mcp_tools: usize,
+        effects: super::super::super::config::CapabilityEffectsConfig,
+        network: NetworkScope,
+    ) -> EndToEnd {
         use super::super::super::config::{
             CapabilitiesConfig, CtxConfig, McpServerConfig, McpTransportConfig,
         };
         use super::super::enforcement::{
-            ApprovalAuthority, ApprovalMode, ExecutionBroker, ExecutionIdentity, NetworkScope,
-            PlatformIsolation, PolicySnapshot, ResourceClaims,
+            ApprovalAuthority, ApprovalMode, ExecutionBroker, ExecutionIdentity, PlatformIsolation,
+            PolicySnapshot, ResourceClaims,
         };
 
         let root = tempfile::tempdir().expect("tempdir");
@@ -5354,7 +5380,7 @@ mod tests {
             std::fs::create_dir_all(path).expect("create root");
         }
         let repo = std::fs::canonicalize(&repo).expect("canonical repo");
-        let claims = ResourceClaims::new(&repo, &repo, &state_root, &home, NetworkScope::Any)
+        let claims = ResourceClaims::new(&repo, &repo, &state_root, &home, network)
             .expect("claims");
         let writer = effects.repo_write.then(|| {
             Box::new(FixtureWriter(repo.clone()))
@@ -5639,6 +5665,58 @@ mod tests {
             ToolErrorCode::AuthorizationDenied
         );
         assert_eq!(requests.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn host_scoped_role_cannot_use_browser_tools() {
+        // Issue #558.
+        use super::super::super::policy::{EffectivePolicy, Stance};
+        use super::super::enforcement::{NetworkScope, NetworkTarget};
+
+        let policy = EffectivePolicy {
+            network: Some(Stance::Allow),
+            ..EffectivePolicy::default()
+        };
+        for (tool, arguments) in [
+            (
+                BROWSER_CAPTURE,
+                json!({"url":"https://example.com","label":"page"}),
+            ),
+            (BROWSER_INSPECT, json!({"url":"https://example.com"})),
+        ] {
+            let target = NetworkTarget::new("https", "example.com", None).expect("target");
+            for (scope, label) in [
+                (NetworkScope::Denied, "denied"),
+                (
+                    NetworkScope::Only {
+                        targets: std::iter::once(target.clone()).collect(),
+                    },
+                    "only",
+                ),
+            ] {
+                let mut fixture = end_to_end_with_network_scope(
+                    policy,
+                    super::super::mcp::FixtureServer::default(),
+                    24,
+                    scope,
+                );
+                let receipt = fixture.client.execute(tool, arguments.clone(), None, None);
+                assert_eq!(receipt.state, ToolReceiptState::Failed);
+                let error = receipt.error.expect("scope error");
+                assert_eq!(error.code, ToolErrorCode::AuthorizationDenied);
+                assert!(error.message.contains(tool), "{error:?}");
+                assert!(error.message.contains(label), "{error:?}");
+                assert!(error.message.contains("request interception"), "{error:?}");
+                assert!(error.message.contains("not shipped yet"), "{error:?}");
+            }
+
+            let mut fixture = end_to_end(policy, super::super::mcp::FixtureServer::default(), 24);
+            let receipt = fixture.client.execute(tool, arguments, None, None);
+            assert_ne!(
+                receipt.error.map(|error| error.code),
+                Some(ToolErrorCode::AuthorizationDenied)
+            );
+        }
     }
 
     #[test]

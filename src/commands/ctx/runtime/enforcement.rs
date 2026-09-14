@@ -1189,6 +1189,18 @@ impl ExecutionBroker {
         (self.isolation.mechanism(), self.isolation.is_available())
     }
 
+    pub fn authorize_browser_network(&self, tool: &str) -> Result<(), BrokerError> {
+        let scope = match &self.claims.network {
+            NetworkScope::Any => return Ok(()),
+            NetworkScope::Denied => "denied",
+            NetworkScope::Only { .. } => "only",
+        };
+        Err(BrokerError::Scope(format!(
+            "browser tool {tool} requires unrestricted network access; effective network scope is \
+             {scope}; host-scoped browsing needs request interception (not shipped yet)"
+        )))
+    }
+
     pub fn authorize(
         &self,
         action: &ExecutionAction,
