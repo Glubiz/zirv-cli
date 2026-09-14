@@ -2915,9 +2915,10 @@ fn try_join_dashboard<W: Write>(
         .unwrap_or_else(envelope::WorkerEnvelope::locked);
     let parent_envelope = &parent_envelope;
     let inherited = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from);
-    let Some(dir) = live_join_target(inherited.as_deref(), env, repo) else {
+    let targets = live_join_targets(inherited.as_deref(), env, repo);
+    if targets.is_empty() {
         return Dispatch::Inline { no_dashboard: true };
-    };
+    }
     // A model pin is the one trailing flag a pane can carry across the
     // untrusted request channel -- it travels in `SpawnRequest::model` and
     // the pane re-checks it before building its own argv (`dash::mod::
@@ -3036,85 +3037,107 @@ fn try_join_dashboard<W: Write>(
             .filter(|text| !text.is_empty())
             .map(str::to_string),
     };
-    let path = match spawnreq::write_request(&dir, &req) {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!(
-                "zirv ctx agent: could not write a spawn request into {}: {e}; running inline in \
-                 this terminal",
-                dir.display()
-            );
-            return Dispatch::Inline {
-                no_dashboard: false,
-            };
-        }
-    };
-    let Some(stem) = spawnreq::request_stem(&path) else {
-        eprintln!(
-            "zirv ctx agent: could not derive a request stem from {}; running inline in this \
-             terminal",
-            path.display()
-        );
-        return Dispatch::Inline {
-            no_dashboard: false,
-        };
-    };
     // Issue #307.3: computed once, here, and threaded through both this
     // ack and `wait_out_a_claimed_request`'s own -- a nudge for THIS
     // session's own visibility into `--workdir`, not the worker's.
     let workdir_hint = workdir_visibility_hint(args.workdir.as_deref(), repo, env);
-    let inline = Dispatch::Inline {
-        no_dashboard: false,
-    };
-    match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
-        Some(ack) => match answer_for_ack(ack, w, workdir_hint.as_deref()) {
-            Some((result, facts)) => Dispatch::Answered(result, facts),
-            None => inline,
-        },
-        // F10: `take_requests` takes the request the moment the dashboard
-        // picks it up, so a timeout here is ambiguous -- nobody was listening,
-        // or somebody took it and is still spawning. Both ends acting on that
-        // ambiguity is how one `zirv ctx agent` became two live sessions
-        // working the same prompt.
-        //
-        // F2: the **removal is the decision**, not a check followed by one.
-        // This used to ask `is_claimed` and then remove the request, which is
-        // check-then-act against a dashboard doing exactly one thing: renaming
-        // this very file into its claim (`spawnreq::take_requests`). A claim
-        // landing between the check and the remove sent this side headless
-        // while the dashboard was already spawning the same prompt. Removing
-        // first collapses the two into one atomic operation that only one side
-        // can win:
-        //
-        // * `Ok` -- this process took its own request back off disk before
-        //   anybody claimed it, and a dashboard's later rename now finds
-        //   nothing, so the headless fallback cannot double-run it;
-        // * `Err`, for any reason -- the file is no longer where this process
-        //   left it (or cannot be removed), and the thing that moves it is a
-        //   claim. Waiting the claim out is the safe reading: the worst case
-        //   is an honest "claimed but never confirmed" failure for a request
-        //   whose directory vanished with a quitting dashboard, against a
-        //   double-run of the operator's task if this guessed the other way.
-        None => {
-            if std::fs::remove_file(&path).is_ok() {
+    // Issue #620/#627: one attempt PER live candidate. A `retryable` refusal
+    // (a foreign-repo dashboard, an unprovable parent claim, a pty that would
+    // not open) is the channel declining to carry this request, not a
+    // judgement on the task -- so the next live dashboard gets it before the
+    // delegation gives up and runs inline. Every other outcome keeps its
+    // existing single-attempt semantics.
+    let last = targets.len().saturating_sub(1);
+    for (index, dir) in targets.iter().enumerate() {
+        let dir = dir.as_path();
+        let path = match spawnreq::write_request(dir, &req) {
+            Ok(path) => path,
+            Err(e) => {
                 eprintln!(
-                    "zirv ctx agent: dashboard did not answer within {ack_timeout:?} (request \
-                     was {}); running inline in this terminal",
-                    path.display()
+                    "zirv ctx agent: could not write a spawn request into {}: {e}; running inline \
+                     in this terminal",
+                    dir.display()
                 );
-                return inline;
+                return Dispatch::Inline {
+                    no_dashboard: false,
+                };
             }
-            match wait_out_a_claimed_request(
-                &dir,
-                &stem,
-                claim_extension,
-                w,
-                workdir_hint.as_deref(),
-            ) {
+        };
+        let Some(stem) = spawnreq::request_stem(&path) else {
+            eprintln!(
+                "zirv ctx agent: could not derive a request stem from {}; running inline in this \
+                 terminal",
+                path.display()
+            );
+            return Dispatch::Inline {
+                no_dashboard: false,
+            };
+        };
+        let inline = Dispatch::Inline {
+            no_dashboard: false,
+        };
+        return match spawnreq::wait_for_ack(dir, &stem, ack_timeout) {
+            Some(ack) => match answer_for_ack(ack, w, workdir_hint.as_deref()) {
                 Some((result, facts)) => Dispatch::Answered(result, facts),
-                None => inline,
+                None => {
+                    if index < last {
+                        eprintln!(
+                            "zirv ctx agent: trying the next live dashboard ({})",
+                            targets[index + 1].display()
+                        );
+                        continue;
+                    }
+                    inline
+                }
+            },
+            // F10: `take_requests` takes the request the moment the dashboard
+            // picks it up, so a timeout here is ambiguous -- nobody was listening,
+            // or somebody took it and is still spawning. Both ends acting on that
+            // ambiguity is how one `zirv ctx agent` became two live sessions
+            // working the same prompt.
+            //
+            // F2: the **removal is the decision**, not a check followed by one.
+            // This used to ask `is_claimed` and then remove the request, which is
+            // check-then-act against a dashboard doing exactly one thing: renaming
+            // this very file into its claim (`spawnreq::take_requests`). A claim
+            // landing between the check and the remove sent this side headless
+            // while the dashboard was already spawning the same prompt. Removing
+            // first collapses the two into one atomic operation that only one side
+            // can win:
+            //
+            // * `Ok` -- this process took its own request back off disk before
+            //   anybody claimed it, and a dashboard's later rename now finds
+            //   nothing, so the headless fallback cannot double-run it;
+            // * `Err`, for any reason -- the file is no longer where this process
+            //   left it (or cannot be removed), and the thing that moves it is a
+            //   claim. Waiting the claim out is the safe reading: the worst case
+            //   is an honest "claimed but never confirmed" failure for a request
+            //   whose directory vanished with a quitting dashboard, against a
+            //   double-run of the operator's task if this guessed the other way.
+            None => {
+                if std::fs::remove_file(&path).is_ok() {
+                    eprintln!(
+                        "zirv ctx agent: dashboard did not answer within {ack_timeout:?} (request \
+                     was {}); running inline in this terminal",
+                        path.display()
+                    );
+                    return inline;
+                }
+                match wait_out_a_claimed_request(
+                    dir,
+                    &stem,
+                    claim_extension,
+                    w,
+                    workdir_hint.as_deref(),
+                ) {
+                    Some((result, facts)) => Dispatch::Answered(result, facts),
+                    None => inline,
+                }
             }
-        }
+        };
+    }
+    Dispatch::Inline {
+        no_dashboard: false,
     }
 }
 
@@ -3245,11 +3268,25 @@ fn candidate_hosts_repo(
 /// The dashboard sessions currently registered against `repo`, by short id.
 /// Best-effort: an unreadable registry simply yields no preference, and the
 /// caller falls back to the machine-wide selection rule.
+///
+/// Issue #620: `Verb::Chat` counts as well as `Verb::Dash`. A dashboard's
+/// token directory is named by the dashboard's own short id, which is the
+/// short id of the ORCHESTRATOR seat it hosts (`dash::run_dashboard`'s
+/// `dashboard_short`) -- and that seat's registry row is `Verb::Chat` from
+/// the moment `zirv ctx` restarts it with handoff and it re-registers. Keying
+/// this only on `Verb::Dash` therefore lost the live dashboard hosting the
+/// caller as soon as its seat was restarted, and a foreign-repo dashboard won
+/// the machine-wide rule in its place.
 fn dash_shorts_for_repo(state: &super::state::StateDir, repo: &Path) -> Vec<String> {
     let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     super::sessions::list(state)
         .into_iter()
-        .filter(|(record, _)| record.verb == super::sessions::Verb::Dash)
+        .filter(|(record, _)| {
+            matches!(
+                record.verb,
+                super::sessions::Verb::Dash | super::sessions::Verb::Chat
+            )
+        })
         .filter(|(record, _)| {
             let record_repo =
                 std::fs::canonicalize(&record.repo).unwrap_or_else(|_| record.repo.clone());
@@ -3266,11 +3303,72 @@ fn dash_shorts_for_repo(state: &super::state::StateDir, repo: &Path) -> Vec<Stri
 /// different repo is display-only and can never misroute the task's working
 /// directory -- see `dash::discover_live_dash_dirs`'s own doc comment -- so
 /// it stays the fallback rather than a refusal.
+#[cfg(test)]
 fn select_join_target<'a>(
     state: &super::state::StateDir,
     candidates: &'a [super::dash::DashCandidate],
     repo: &Path,
+    env: EnvLookup<'_>,
 ) -> Option<&'a super::dash::DashCandidate> {
+    join_targets_in_order(state, candidates, repo, env)
+        .into_iter()
+        .next()
+}
+
+/// The dashboard process THIS caller is hosted by, from the caller's own
+/// registry row: `Record::owner_pid` is the process that filed the record,
+/// which for a pane is the dashboard itself (`dash::pane::Pane::spawn` ->
+/// `sessions::SessionGuard::register`).
+///
+/// Issue #620: this is a stronger answer than either selection rule below,
+/// because it is not an inference about repositories at all -- it names the
+/// dashboard this delegation is literally running inside, whatever verb its
+/// row currently carries and whatever repo the registry thinks it holds. A
+/// caller with no session identity, no record, or no owner pid simply yields
+/// `None` and the ordinary rules decide.
+fn hosting_dash_pid(state: &super::state::StateDir, env: EnvLookup<'_>) -> Option<u32> {
+    let session = env(super::adapters::SESSION_ENV)?;
+    let short = super::sessions::short_id(&session);
+    if short.is_empty() {
+        return None;
+    }
+    super::sessions::list(state)
+        .into_iter()
+        .find(|(record, _)| record.short == short)
+        .and_then(|(record, _)| record.owner_pid)
+}
+
+/// Every live dashboard this delegation may join, best first.
+///
+/// Order: the dashboard hosting this caller ([`hosting_dash_pid`]), then a
+/// live dashboard whose own registry row names THIS repository, then
+/// `dash::select_live_dash_dir`'s machine-wide rule (most recently started
+/// first) over whatever is left. Joining a dashboard that hosts a different
+/// repo is display-only and can never misroute the task's working directory
+/// -- see `dash::discover_live_dash_dirs`'s own doc comment -- so it stays a
+/// lower-ranked candidate rather than a refusal.
+///
+/// Issue #620: a LIST rather than one winner, so a foreign-repo dashboard
+/// that refuses the request (a `retryable` ack) costs the delegation one
+/// round-trip and the next live candidate, instead of ending it inline while
+/// a perfectly willing dashboard sits one directory away.
+fn join_targets_in_order<'a>(
+    state: &super::state::StateDir,
+    candidates: &'a [super::dash::DashCandidate],
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Vec<&'a super::dash::DashCandidate> {
+    let is_live = |c: &super::dash::DashCandidate| {
+        matches!(c.status, super::dash::CandidateStatus::Live { .. })
+    };
+    let mut ordered: Vec<&'a super::dash::DashCandidate> = Vec::new();
+    if let Some(owner) = hosting_dash_pid(state, env)
+        && let Some(host) = candidates.iter().find(
+            |c| matches!(c.status, super::dash::CandidateStatus::Live { pid, .. } if pid == owner),
+        )
+    {
+        ordered.push(host);
+    }
     let shorts = dash_shorts_for_repo(state, repo);
     if !shorts.is_empty() {
         let own_repo: Vec<super::dash::DashCandidate> = candidates
@@ -3280,15 +3378,65 @@ fn select_join_target<'a>(
             .collect();
         if let Some(winner) = super::dash::select_live_dash_dir(&own_repo) {
             let chosen = winner.requests_dir.clone();
-            return candidates.iter().find(|c| c.requests_dir == chosen);
+            if let Some(candidate) = candidates.iter().find(|c| c.requests_dir == chosen)
+                && !ordered
+                    .iter()
+                    .any(|o| o.requests_dir == candidate.requests_dir)
+            {
+                ordered.push(candidate);
+            }
         }
     }
-    super::dash::select_live_dash_dir(candidates)
+    // Whatever is left, newest-started first -- the same ordering
+    // `select_live_dash_dir` applies, just walked rather than maximised.
+    let mut rest: Vec<&'a super::dash::DashCandidate> = candidates
+        .iter()
+        .filter(|c| is_live(c))
+        .filter(|c| !ordered.iter().any(|o| o.requests_dir == c.requests_dir))
+        .collect();
+    rest.sort_by(|a, b| match (a.status, b.status) {
+        (
+            super::dash::CandidateStatus::Live { started_at: sa, .. },
+            super::dash::CandidateStatus::Live { started_at: sb, .. },
+        ) => sb
+            .cmp(&sa)
+            .then_with(|| b.requests_dir.cmp(&a.requests_dir)),
+        _ => std::cmp::Ordering::Equal,
+    });
+    ordered.extend(rest);
+    ordered
 }
 
+#[cfg(test)]
 fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -> Option<PathBuf> {
+    live_join_targets(inherited, env, repo).into_iter().next()
+}
+
+/// [`live_join_target`]'s whole ordered candidate list -- see
+/// [`join_targets_in_order`] for why a refusal needs a next one.
+fn live_join_targets(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -> Vec<PathBuf> {
+    let inherited_live = matches!(
+        inherited.map(|dir| (dir, inherited_dashboard_liveness(dir))),
+        Some((_, Some(super::sessions::OwnerLiveness::Live)))
+    );
+    let mut targets = Vec::new();
+    if inherited_live && let Some(dir) = inherited {
+        targets.push(dir.to_path_buf());
+    }
+    targets.extend(live_join_fallbacks(inherited, env, repo, inherited_live));
+    targets
+}
+
+fn live_join_fallbacks(
+    inherited: Option<&Path>,
+    env: EnvLookup<'_>,
+    repo: &Path,
+    inherited_live: bool,
+) -> Vec<PathBuf> {
     match inherited.map(|dir| (dir, inherited_dashboard_liveness(dir))) {
-        Some((dir, Some(super::sessions::OwnerLiveness::Live))) => return Some(dir.to_path_buf()),
+        // Already the head of the list its caller built: nothing to explain,
+        // and the scan below still runs so a refusal has somewhere to go next.
+        Some((_, Some(super::sessions::OwnerLiveness::Live))) => {}
         Some((dir, Some(super::sessions::OwnerLiveness::Dead(pid)))) => {
             eprintln!(
                 "zirv ctx agent: {} names a dashboard that already quit (owner.pid names \
@@ -3324,7 +3472,7 @@ fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -
                 "zirv ctx agent: could not resolve the state dir to look for a live \
                  dashboard: {e}"
             );
-            return None;
+            return Vec::new();
         }
     };
     // The inherited directory may itself live under `state.dash()` and would
@@ -3341,7 +3489,8 @@ fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -
     // appear exactly once. See this function's own doc comment: "every
     // candidate ... is logged, live or not", which a silent `Live => {}` arm
     // here used to violate for every live sibling that lost the selection.
-    let winner = select_join_target(&state, &others, repo);
+    let ordered = join_targets_in_order(&state, &others, repo, env);
+    let winner = ordered.first().copied();
     for candidate in &others {
         let is_winner = winner.is_some_and(|w| w.requests_dir == candidate.requests_dir);
         match candidate.status {
@@ -3362,29 +3511,43 @@ fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -
     }
     match winner {
         Some(winner) => {
-            eprintln!(
-                "zirv ctx agent: joining {} instead",
-                winner.requests_dir.display()
-            );
-            Some(winner.requests_dir.clone())
+            // `instead` only when something was actually rejected above: a
+            // live inherited channel is the head of the list, not a
+            // replacement for one.
+            if inherited_live {
+                eprintln!(
+                    "zirv ctx agent: {} is also live and available if the first refuses",
+                    winner.requests_dir.display()
+                );
+            } else {
+                eprintln!(
+                    "zirv ctx agent: joining {} instead",
+                    winner.requests_dir.display()
+                );
+            }
         }
         None => {
-            let considered: Vec<String> = others
-                .iter()
-                .map(|c| c.requests_dir.display().to_string())
-                .collect();
-            eprintln!(
-                "zirv ctx agent: no live dashboard found under {} ({})",
-                state.dash().display(),
-                if considered.is_empty() {
-                    "no other candidates".to_string()
-                } else {
-                    format!("candidates: {}", considered.join(", "))
-                }
-            );
-            None
+            if !inherited_live {
+                let considered: Vec<String> = others
+                    .iter()
+                    .map(|c| c.requests_dir.display().to_string())
+                    .collect();
+                eprintln!(
+                    "zirv ctx agent: no live dashboard found under {} ({})",
+                    state.dash().display(),
+                    if considered.is_empty() {
+                        "no other candidates".to_string()
+                    } else {
+                        format!("candidates: {}", considered.join(", "))
+                    }
+                );
+            }
         }
     }
+    ordered
+        .into_iter()
+        .map(|candidate| candidate.requests_dir.clone())
+        .collect()
 }
 
 /// Issue #223 §E: `workflow.adoption = enforce`'s delegation gate. Refuses
@@ -10907,6 +11070,104 @@ mod tests {
         );
     }
 
+    /// Issue #620, behaviour 1: the dashboard HOSTING this caller wins, even
+    /// when a more recently started dashboard for another repository would
+    /// win the machine-wide rule. `owner_pid` on the caller's own registry
+    /// row names it, and that answer survives the seat's row being re-created
+    /// by a restart with handoff.
+    #[test]
+    fn the_dashboard_hosting_this_caller_is_preferred_over_a_newer_foreign_one() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+
+        // The caller's own registry row, exactly as a dashboard-hosted seat
+        // re-registers it after a restart: verb `chat`, and `owner_pid` the
+        // dashboard's (this process, here).
+        let session = "e84d72bc-1111-4222-8333-444444444444";
+        let record = super::super::sessions::Record::new(
+            session,
+            "claude",
+            tmp.path(),
+            super::super::sessions::Verb::Chat,
+        );
+        let _guard = super::super::sessions::SessionGuard::register(&state, record);
+
+        let hosting = state.dash().join("aaaa1111-hosting").join("requests");
+        let foreign = state.dash().join("bbbb2222-foreign").join("requests");
+        let base = std::time::SystemTime::now();
+        let candidates = vec![
+            // Newer, so it wins `select_live_dash_dir` outright -- and it is
+            // the foreign-repo dashboard from the bug report.
+            super::super::dash::DashCandidate {
+                requests_dir: foreign.clone(),
+                status: super::super::dash::CandidateStatus::Live {
+                    started_at: base + std::time::Duration::from_secs(60),
+                    pid: crate::commands::ctx::testenv::dead_pid(),
+                },
+            },
+            super::super::dash::DashCandidate {
+                requests_dir: hosting.clone(),
+                status: super::super::dash::CandidateStatus::Live {
+                    started_at: base,
+                    pid: std::process::id(),
+                },
+            },
+        ];
+
+        let mut env = base_env(state.root());
+        env.insert(
+            super::super::adapters::SESSION_ENV.to_string(),
+            session.to_string(),
+        );
+        let chosen = select_join_target(&state, &candidates, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a live dashboard is selected");
+        assert_eq!(
+            chosen.requests_dir, hosting,
+            "the dashboard this seat is hosted by must win over a newer foreign one"
+        );
+
+        // With no session identity at all the machine-wide rule is unchanged.
+        let plain = base_env(state.root());
+        let chosen =
+            select_join_target(&state, &candidates, tmp.path(), &|k| plain.get(k).cloned())
+                .expect("a live dashboard is still selected");
+        assert_eq!(chosen.requests_dir, foreign);
+    }
+
+    /// Issue #620, behaviour 2: a dashboard-hosted seat re-registered as
+    /// `verb = chat` still makes its dashboard a repo match. The token
+    /// directory is named by the dashboard's short id, which IS that seat's
+    /// short id -- keying the repo preference on `Verb::Dash` alone lost the
+    /// live dashboard the moment the seat was restarted.
+    #[test]
+    fn a_restarted_hosted_seats_chat_record_still_names_its_dashboard_for_this_repo() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let session = "e84d72bc-1111-4222-8333-444444444444";
+        let short = super::super::sessions::short_id(session);
+        let record = super::super::sessions::Record::new(
+            session,
+            "claude",
+            tmp.path(),
+            super::super::sessions::Verb::Chat,
+        );
+        let _guard = super::super::sessions::SessionGuard::register(&state, record);
+
+        let shorts = dash_shorts_for_repo(&state, tmp.path());
+        assert!(
+            shorts.contains(&short),
+            "the hosted seat's own row names its dashboard for this repo: {shorts:?}"
+        );
+        let candidate = super::super::dash::DashCandidate {
+            requests_dir: state
+                .dash()
+                .join(format!("{short}-0123456789abcdef"))
+                .join("requests"),
+            status: super::super::dash::CandidateStatus::NoOwnerPid,
+        };
+        assert!(candidate_hosts_repo(&candidate, &shorts));
+    }
+
     /// F2 (defense in depth): the request's prompt is encoded positionally
     /// into the pane's argv, so a prompt shaped like a flag would reach the
     /// real harness child as one. The dashboard refuses such a request at the
@@ -11374,6 +11635,72 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&out).contains("bbbb2222"),
             "got {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Issue #620, behaviour 3: a `retryable` refusal from the first live
+    /// dashboard (the foreign-repo one from the bug report) costs the
+    /// delegation one round-trip and the NEXT live candidate -- not the whole
+    /// delegation. Only after every live dashboard has declined does it run
+    /// inline.
+    #[test]
+    fn a_foreign_repo_refusal_tries_the_next_live_dashboard_before_running_inline() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // The inherited channel is live, and is tried first.
+        let (first, env) = live_dashboard_dir(tmp.path());
+        // A second live dashboard, under the state dir, never inherited.
+        let second = tmp
+            .path()
+            .join("state")
+            .join("dash")
+            .join("bbbb2222-secondtoken")
+            .join("requests");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+        std::fs::write(
+            second.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write owner.pid");
+
+        let refuser = std::thread::spawn({
+            let dir = first.clone();
+            move || {
+                respond_to_next_request(
+                    dir,
+                    r#"{"ok":false,"short":null,"reason":"this dashboard only spawns panes in its own repo","retryable":true}"#,
+                )
+            }
+        });
+        let accepter = std::thread::spawn({
+            let dir = second.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"feed5678","reason":null}"#)
+        });
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            None,
+        );
+        refuser.join().expect("refuser thread");
+        accepter.join().expect("accepter thread");
+
+        let code = joined
+            .expect_answer("the second live dashboard took it")
+            .expect("writes its line");
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8_lossy(&out).contains("feed5678"),
+            "the delegation must land in the next live dashboard, not inline: {}",
             String::from_utf8_lossy(&out)
         );
     }
