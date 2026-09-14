@@ -2248,6 +2248,7 @@ impl NativeToolClient {
                 // refused here, before a durable launch receipt names work
                 // the live generation knows nothing about.
                 generation: Some(identity.generation),
+                generation_locked: true,
             },
             state::now_secs(),
         )
@@ -4423,7 +4424,27 @@ mod tests {
         )
         .result
         .expect("result");
-        assert_eq!(interrupted["phase"], "cancelled");
+        assert_eq!(interrupted["phase"], "launched");
+
+        let premature = call(
+            &mut fixture.client,
+            CLOSE,
+            json!({ "delegation": handle.clone() }),
+        );
+        assert_eq!(premature.state, ToolReceiptState::Failed);
+
+        service::publish_terminal(
+            &fixture.state,
+            &fixture.repo,
+            &Default::default(),
+            &handle,
+            service::Phase::Cancelled,
+            Some(130),
+            Some("cancelled".to_string()),
+            None,
+            state::now_secs(),
+        )
+        .expect("terminal cancellation");
 
         let closed = call(&mut fixture.client, CLOSE, json!({ "delegation": handle }))
             .result
