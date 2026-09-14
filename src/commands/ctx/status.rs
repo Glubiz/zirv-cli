@@ -2597,7 +2597,7 @@ mod tests {
         assert!(!state.native_journal().exists());
     }
 
-    fn native_status_journal() -> (tempfile::TempDir, StateDir) {
+    fn native_status_journal(filler_events: usize) -> (tempfile::TempDir, StateDir) {
         use crate::commands::ctx::provider::{
             AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
         };
@@ -2671,6 +2671,37 @@ mod tests {
         .unwrap();
         drop(journal);
 
+        // Issue #614: pad the session with `filler_events` extra, unrelated
+        // events (inserted directly, bypassing the journal API's own
+        // bookkeeping) so a test can prove the recovery summary's work does
+        // not scale with total journal history.
+        if filler_events > 0 {
+            let connection = rusqlite::Connection::open(state.native_journal()).unwrap();
+            let mut next_sequence: i64 = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM native_events WHERE session_id = ?1",
+                    [session.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            for index in 0..filler_events {
+                next_sequence += 1;
+                let payload = format!(
+                    r#"{{"type":"input_acknowledged","message_id":"filler-{index}","text":"filler payload {index}","steering":false,"at_ms":null}}"#
+                );
+                connection
+                    .execute(
+                        "INSERT INTO native_events (
+                            session_id, sequence, generation, event_type, turn_id, attempt_id,
+                            message_id, tool_call_id, execution_id, usage_id, task_id,
+                            checkpoint_id, payload_json, committed_at
+                        ) VALUES (?1, ?2, 1, 'input_acknowledged', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?3, ?2)",
+                        rusqlite::params![session.as_str(), next_sequence, payload],
+                    )
+                    .unwrap();
+            }
+        }
+
         (dir, state)
     }
 
@@ -2678,7 +2709,7 @@ mod tests {
     /// reason for its newest compaction, read straight off the journal.
     #[test]
     fn the_native_recovery_section_names_the_newest_compaction_reason() {
-        let (_dir, state) = native_status_journal();
+        let (_dir, state) = native_status_journal(0);
 
         let lines = native_recovery_lines(&state);
         assert_eq!(lines.len(), 1, "got {lines:?}");
@@ -2688,9 +2719,64 @@ mod tests {
         assert!(lines[0].contains("structural summary"), "{}", lines[0]);
     }
 
+    /// Issue #614's own Fix acceptance: instruments `journal::decode_event`
+    /// calls (behind `#[cfg(test)]`) and asserts the recovery summary
+    /// decodes the same, small number of payloads whether the session's
+    /// history is 10 events or 800 -- the work ceiling is the projection,
+    /// never the total history.
     #[test]
     fn status_recovery_summary_reads_bounded_history() {
-        let (_dir, state) = native_status_journal();
+        use crate::commands::ctx::runtime::journal;
+
+        let (_small_dir, small_state) = native_status_journal(10);
+        journal::reset_decoded_payload_count();
+        let small_lines = native_recovery_lines(&small_state);
+        let small_decoded = journal::decoded_payload_count();
+
+        let (_large_dir, large_state) = native_status_journal(800);
+        journal::reset_decoded_payload_count();
+        let large_lines = native_recovery_lines(&large_state);
+        let large_decoded = journal::decoded_payload_count();
+
+        assert_eq!(small_lines.len(), 1, "got {small_lines:?}");
+        assert!(
+            small_lines[0].contains("1 compaction(s)"),
+            "{}",
+            small_lines[0]
+        );
+        assert!(
+            small_lines[0].contains("token_pressure"),
+            "{}",
+            small_lines[0]
+        );
+
+        assert_eq!(large_lines.len(), 1, "got {large_lines:?}");
+        assert!(
+            large_lines[0].contains("1 compaction(s)"),
+            "{}",
+            large_lines[0]
+        );
+        assert!(
+            large_lines[0].contains("token_pressure"),
+            "{}",
+            large_lines[0]
+        );
+
+        assert_eq!(
+            small_decoded, large_decoded,
+            "decoded-payload work must not grow with journal history size"
+        );
+        assert!(
+            large_decoded <= 1,
+            "status should decode at most the newest compaction's own payload, got {large_decoded}"
+        );
+    }
+
+    /// The old regression form of #614: a corrupt, oversized payload on an
+    /// event type the summary never reads must not break status either.
+    #[test]
+    fn status_recovery_summary_tolerates_a_corrupt_unrelated_payload() {
+        let (_dir, state) = native_status_journal(0);
         let connection = rusqlite::Connection::open(state.native_journal()).unwrap();
         connection
             .execute(
