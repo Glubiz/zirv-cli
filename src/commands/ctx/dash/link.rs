@@ -165,6 +165,18 @@ impl RuntimeLink {
         Ok(())
     }
 
+    /// Terminates a runtime-owned session. Unlike [`Self::detach`], this
+    /// addresses the session itself rather than this dashboard's attachment.
+    pub fn stop(&mut self, session_id: &str) -> CtxResult<bool> {
+        let value = self
+            .client
+            .call(Method::SessionStop, json!({"session_id": session_id}))?;
+        value
+            .get("stopped")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "runtime link: session.stop response omitted boolean stopped".into())
+    }
+
     /// The rendered terminal of a runtime-owned pty session, for a dashboard
     /// that is painting it rather than owning it.
     pub fn screen(&mut self, session_id: &str) -> CtxResult<ScreenView> {

@@ -1973,6 +1973,9 @@ impl Pane {
         if self.pending_submit.is_some() || self.submit_confirmation.is_some() {
             return false;
         }
+        if self.native().is_some_and(|native| native.has_draft()) {
+            return false;
+        }
         injectable_from(
             self.state(),
             self.injected_awaiting_turn,
@@ -2164,7 +2167,9 @@ impl Pane {
     /// Issue #354, the sidebar's `writer` disclosure line: whether this pane
     /// currently holds the repo's write permit.
     pub fn holds_writer_permit(&self) -> bool {
-        self.writer_permit.is_some()
+        self.native()
+            .map(super::native_pane::NativePaneRuntime::holds_writer_permit)
+            .unwrap_or_else(|| self.writer_permit.is_some())
     }
 
     pub fn budget_tokens(&self) -> Option<u64> {
@@ -2735,6 +2740,11 @@ impl Pane {
     /// had already exited keeps its own exit code.
     pub fn stop_now(&mut self, code: i32) -> CtxResult<()> {
         self.poll_exit();
+        if let PaneKind::Native(native) = &mut self.kind {
+            native.stop(&self.state_dir)?;
+            self.kind = PaneKind::Ended;
+            self.exit_code = Some(code);
+        }
         self.finish_shutdown()?;
         if self.exit_code.is_none() {
             self.exit_code = Some(code);
@@ -6258,6 +6268,47 @@ pub(crate) mod tests {
             "old pane cleanup must not release its successor's permit"
         );
         assert!(!record_path.exists());
+    }
+
+    #[test]
+    fn native_roster_reports_live_writer_permit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let env = std::collections::HashMap::from([(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.display().to_string(),
+        )]);
+        let lookup = |key: &str| env.get(key).cloned();
+        let provider = format!(
+            "fixture:{}",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/runtime/native/helper-answer.json")
+                .display()
+        );
+        let mut pane = Pane::spawn_native(
+            &super::super::super::config::CtxConfig::default(),
+            &state,
+            &lookup,
+            &repo,
+            Verb::Dash,
+            "native".to_string(),
+            (80, 24),
+            super::super::native_pane::NativeDashboardSpec {
+                repo: repo.clone(),
+                role: "worker".to_string(),
+                route: None,
+                writing: true,
+                provider: Some(provider),
+            },
+        )
+        .expect("spawn native pane");
+
+        assert!(pane.holds_writer_permit());
+        pane.stop_now(0).expect("stop native pane");
+        assert!(!pane.holds_writer_permit());
     }
 
     /// M10: a drain stops once it has processed its byte budget and reports

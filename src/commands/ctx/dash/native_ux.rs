@@ -1888,16 +1888,6 @@ pub const SHORTCUTS: &[Shortcut] = &[
         focus: Some(Focus::Composer),
     },
     Shortcut {
-        keys: "@",
-        what: "file picker, restricted to this worktree",
-        focus: Some(Focus::Composer),
-    },
-    Shortcut {
-        keys: "!",
-        what: "run a shell command through the pane's process tool",
-        focus: Some(Focus::Composer),
-    },
-    Shortcut {
         keys: "ctrl+r",
         what: "expand the selected tool result",
         focus: Some(Focus::Transcript),
@@ -2039,16 +2029,10 @@ pub struct Completion {
 /// can already do, so the list never advertises a verb with no
 /// implementation behind it.
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/agents", "open the agent & task overview"),
-    ("/approve", "focus the pending approval dialog"),
-    ("/artifacts", "open the selected worker's bounded evidence"),
-    ("/compact", "compact this conversation now"),
-    (
-        "/follow-up",
-        "send a bounded follow-up to the selected worker",
-    ),
+    ("/clear", "clear queued native input"),
+    ("/compact", "report that native compaction is unavailable"),
     ("/help", "show the shortcut list"),
-    ("/status", "print the authoritative facts as JSON"),
+    ("/status", "show the authoritative session status"),
 ];
 
 pub fn slash_completions(draft: &str) -> Vec<Completion> {
@@ -2064,7 +2048,9 @@ pub fn slash_completions(draft: &str) -> Vec<Completion> {
         .collect()
 }
 
+#[cfg(test)]
 pub const FILE_COMPLETION_CAP: usize = 50;
+#[cfg(test)]
 const FILE_SCAN_CAP: usize = 4000;
 
 /// Resolves a relative candidate against `workdir` and refuses anything that
@@ -2072,6 +2058,7 @@ const FILE_SCAN_CAP: usize = 4000;
 /// change the answer between the check and the use, and a missing path is
 /// still judged): `..` is resolved lexically and any segment that would pop
 /// above the root is a rejection.
+#[cfg(test)]
 pub fn contained_ref(workdir: &Path, candidate: &str) -> Option<PathBuf> {
     let raw = Path::new(candidate);
     if raw.is_absolute() {
@@ -2099,6 +2086,7 @@ pub fn contained_ref(workdir: &Path, candidate: &str) -> Option<PathBuf> {
 /// inside it. Bounded twice: at most [`FILE_COMPLETION_CAP`] results, and at
 /// most `FILE_SCAN_CAP` directory entries examined, so a picker keystroke in
 /// a huge worktree costs a bounded amount of work rather than a full walk.
+#[cfg(test)]
 pub fn file_completions(draft: &str, workdir: &Path) -> Vec<Completion> {
     let token = draft
         .rsplit(char::is_whitespace)
@@ -2157,6 +2145,7 @@ pub fn file_completions(draft: &str, workdir: &Path) -> Vec<Completion> {
 /// bang. Never executed here: the caller routes it to the pane's own process
 /// tool, so it goes through exactly the same approval and safety policy as
 /// any other tool call.
+#[cfg(test)]
 pub fn shell_command(draft: &str) -> Option<&str> {
     let rest = draft.strip_prefix('!')?.trim();
     if rest.is_empty() { None } else { Some(rest) }
@@ -2272,6 +2261,9 @@ pub struct UxState {
     /// in the transcript forever, so without this the same dialog would
     /// re-open on every tick after it was answered.
     answered: std::collections::BTreeSet<String>,
+    /// False until a newly-opened approval has completed one draw. Input
+    /// already queued when the request arrived cannot answer an unseen dialog.
+    approval_visible: bool,
 }
 
 impl Default for UxState {
@@ -2298,6 +2290,7 @@ impl Default for UxState {
             budget: Budget::default(),
             refreshed_at: 0,
             answered: std::collections::BTreeSet::new(),
+            approval_visible: false,
         }
     }
 }
@@ -2386,6 +2379,7 @@ impl UxState {
             at: pending.request.asked_at,
         });
         self.approval = Some(ApprovalDialog::from_pending(pending));
+        self.approval_visible = false;
         self.focus = Focus::Approval;
     }
 
@@ -2413,7 +2407,13 @@ impl UxState {
             at: request.asked_at,
         });
         self.approval = Some(ApprovalDialog::new(request));
+        self.approval_visible = false;
         self.focus = Focus::Approval;
+    }
+
+    /// Marks the current approval as having appeared in a completed frame.
+    pub fn mark_approval_visible(&mut self) {
+        self.approval_visible = self.approval.is_some();
     }
 
     /// Closes the dialog, returns focus to the composer, and releases
@@ -2423,6 +2423,7 @@ impl UxState {
             self.answered.insert(dialog.request.id.clone());
         }
         self.approval = None;
+        self.approval_visible = false;
         self.focus = Focus::Composer;
         let released = self.deferred.resume(false);
         if let Some(notice) = DeferredDelivery::notice(&released) {
@@ -2440,6 +2441,9 @@ impl UxState {
         // else may claim a key, so there is no path from a stray keystroke
         // to an unnoticed approval.
         if let Some(dialog) = self.approval.as_mut() {
+            if !self.approval_visible {
+                return UxKey::Consumed;
+            }
             return match dialog_action(dialog, key) {
                 DialogAction::Moved | DialogAction::Ignored => UxKey::Consumed,
                 DialogAction::Decided(decision) => {
@@ -3359,6 +3363,25 @@ mod tests {
     }
 
     #[test]
+    fn a_key_queued_before_an_approval_cannot_answer_it() {
+        let mut ux = UxState::default();
+        let queued_before_request = KeyEvent::from(KeyCode::Enter);
+        ux.open_live_approval(approval_fixture("s"));
+        assert_eq!(
+            ux.handle_key(queued_before_request, true),
+            UxKey::Consumed,
+            "the request has not appeared in a completed frame yet"
+        );
+        assert!(ux.approval.is_some());
+
+        ux.mark_approval_visible();
+        assert!(matches!(
+            ux.handle_key(KeyEvent::from(KeyCode::Enter), true),
+            UxKey::Decided(_, ApprovalDecision::Allow)
+        ));
+    }
+
+    #[test]
     fn arbitrary_typed_text_can_never_answer_an_approval() {
         let mut dialog = ApprovalDialog::new(approval_fixture("s"));
         for ch in "yes ok sure Y".chars() {
@@ -3544,15 +3567,19 @@ mod tests {
     }
 
     #[test]
-    fn slash_completions_only_offer_commands_this_pane_implements() {
-        let completions = slash_completions("/a");
+    fn every_advertised_native_control_has_a_dispatch_path() {
+        let completions = slash_completions("/");
         let labels: Vec<&str> = completions
             .iter()
             .map(|completion| completion.label.as_str())
             .collect();
-        assert!(labels.contains(&"/agents"));
-        assert!(labels.contains(&"/approve"));
-        assert!(!labels.contains(&"/compact"));
+        assert_eq!(labels, ["/clear", "/compact", "/help", "/status"]);
+        for absent in ["/agents", "/approve", "/artifacts", "/follow-up"] {
+            assert!(!labels.contains(&absent));
+        }
+        for absent in ["@", "!"] {
+            assert!(!SHORTCUTS.iter().any(|shortcut| shortcut.keys == absent));
+        }
         assert!(slash_completions("/zzz").is_empty());
     }
 
@@ -3688,6 +3715,7 @@ mod tests {
             UxKey::Consumed
         );
         assert_eq!(ux.focus, Focus::Approval);
+        ux.mark_approval_visible();
         match ux.handle_key(key(KeyCode::Char('1')), true) {
             UxKey::Decided(request, decision) => {
                 assert_eq!(decision, ApprovalDecision::Allow);

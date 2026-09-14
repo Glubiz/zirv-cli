@@ -859,7 +859,7 @@ fn run_native<W: Write>(
     writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
 
     let state = super::state::StateDir::resolve(env)?;
-    let plain = render_native_session_plain(&state, &status.session, repo);
+    let plain = render_native_session_plain(&state, &status, repo);
     match plain {
         Ok(text) => {
             writeln!(w)?;
@@ -879,20 +879,24 @@ fn run_native<W: Write>(
 /// tool call, a diff or a test outcome looks like.
 fn render_native_session_plain(
     state: &super::state::StateDir,
-    session: &str,
+    status: &super::runtime::native::NativeFinalStatus,
     repo: &Path,
 ) -> CtxResult<String> {
     use super::dash::native_pane::{
         NativePresentation, StatusFacts, build_transcript, render_plain, resolve_billing,
     };
     use super::runtime::journal::{Journal, JournalSessionId};
-    use super::runtime::native::SessionState;
 
     let journal = Journal::open(state)?;
-    let session_id = JournalSessionId::new(session)?;
+    let session_id = JournalSessionId::new(status.session.clone())?;
     let identity = journal.session(&session_id)?;
     let conversation = journal.replay(&session_id)?;
     let view = build_transcript(&conversation);
+    let (session_state, blocked, unread_result) = plain_status_projection(
+        status.status,
+        status.blocked_reason.is_some(),
+        status.final_text.is_some(),
+    );
     let facts = StatusFacts {
         model: format!(
             "{}/{}",
@@ -901,10 +905,10 @@ fn render_native_session_plain(
         route: identity.route.route.to_string(),
         runtime: "native".to_string(),
         billing: resolve_billing(&identity.route, repo),
-        session_state: SessionState::Completed,
+        session_state,
         turn_state: None,
-        blocked: false,
-        unread_result: false,
+        blocked,
+        unread_result,
         notice: None,
         activity: None,
         cwd: repo.display().to_string(),
@@ -917,6 +921,22 @@ fn render_native_session_plain(
         &facts,
         100,
     ))
+}
+
+fn plain_status_projection(
+    status: super::runtime::native::NativeStatus,
+    blocked: bool,
+    unread: bool,
+) -> (super::runtime::native::SessionState, bool, bool) {
+    use super::runtime::native::{NativeStatus, SessionState};
+    let state = match status {
+        NativeStatus::Completed => SessionState::Completed,
+        NativeStatus::Interrupted => SessionState::Interrupted,
+        NativeStatus::Incomplete | NativeStatus::LimitReached | NativeStatus::Failed => {
+            SessionState::Failed
+        }
+    };
+    (state, blocked, unread)
 }
 
 /// Same supervised execution as [run_with], plus the per-harness accounting
@@ -3952,6 +3972,29 @@ fn resolved_runtime(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn plain_native_view_matches_structured_status() {
+        use super::super::runtime::native::{NativeStatus, SessionState};
+
+        for (status, expected) in [
+            (NativeStatus::Completed, SessionState::Completed),
+            (NativeStatus::Incomplete, SessionState::Failed),
+            (NativeStatus::Interrupted, SessionState::Interrupted),
+            (NativeStatus::LimitReached, SessionState::Failed),
+            (NativeStatus::Failed, SessionState::Failed),
+        ] {
+            assert_eq!(plain_status_projection(status, false, false).0, expected);
+        }
+        assert_eq!(
+            plain_status_projection(NativeStatus::Incomplete, true, false),
+            (SessionState::Failed, true, false)
+        );
+        assert_eq!(
+            plain_status_projection(NativeStatus::Completed, false, true),
+            (SessionState::Completed, false, true)
+        );
+    }
 
     /// PR #546 review finding 1: `run` used to resolve the configured
     /// runtime default against a hardcoded `"worker"`, so an exec launched

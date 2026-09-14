@@ -273,6 +273,34 @@ pub fn cap_transcript_items(view: TranscriptView, max_items: usize) -> Transcrip
 /// rather than growing without limit.
 pub const MAX_TRANSCRIPT_ITEMS: usize = 500;
 
+fn conversation_usage(conversation: &ConversationState) -> super::super::event::TranscriptUsage {
+    let mut total = super::super::event::TranscriptUsage::default();
+    for usage in conversation.usage.values() {
+        total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+        total.cache_creation_input_tokens = total
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        total.cache_read_input_tokens = total
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    }
+    total
+}
+
+/// Keeps only the replay watermark and immutable identity after the bounded
+/// transcript and aggregate usage have been reduced. Older content remains in
+/// the durable journal and is replayed only when its sequence changes.
+fn compact_retained_conversation(conversation: &mut ConversationState) {
+    conversation.messages.clear();
+    conversation.usage.clear();
+    conversation.tool_calls.clear();
+    conversation.executions.clear();
+    conversation.task_receipts.clear();
+    conversation.checkpoints.clear();
+    conversation.ended_reason = None;
+}
+
 fn build_tool_call_item(
     state: &ConversationState,
     message_id: String,
@@ -938,7 +966,7 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
         }
         "/help" => Some(
             "commands: /clear /compact /status \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C \
-             Ctrl+C quit, Shift+Tab cycle mode, @ file ref"
+             Ctrl+C quit, Shift+Tab cycle mode"
                 .to_string(),
         ),
         "/compact" => {
@@ -2329,7 +2357,7 @@ fn composer_hint_line(presentation: &NativePresentation) -> String {
     }
     format!(
         "? for shortcuts \u{b7} {mode}{queued_note} \u{b7} Enter submit \u{b7} Shift+Enter \
-         newline \u{b7} \u{2191} history \u{b7} @ file ref \u{b7} / commands \u{b7} Esc interrupt",
+         newline \u{b7} \u{2191} history \u{b7} / commands \u{b7} Esc interrupt",
         mode = presentation.mode.label(),
     )
 }
@@ -2362,21 +2390,7 @@ pub fn composer_block(
     let draft = &presentation.composer.draft;
     let completions = match native_ux::classify_entry(draft) {
         EntryMode::Slash => native_ux::slash_completions(draft),
-        EntryMode::File => match presentation.workdir.as_deref() {
-            Some(workdir) => native_ux::file_completions(draft, workdir),
-            None => Vec::new(),
-        },
-        EntryMode::Shell => native_ux::shell_command(draft)
-            .map(|command| {
-                vec![native_ux::Completion {
-                    insert: draft.clone(),
-                    label: command.to_string(),
-                    detail: "runs through this pane's process tool, under the same policy"
-                        .to_string(),
-                }]
-            })
-            .unwrap_or_default(),
-        EntryMode::Text => Vec::new(),
+        EntryMode::File | EntryMode::Shell | EntryMode::Text => Vec::new(),
     };
     for completion in completions.iter().take(COMPLETION_ROWS) {
         out.push(StyledLine(vec![
@@ -2642,17 +2656,16 @@ fn git_branch(repo: &Path) -> Option<String> {
 /// distillation and lives inside the worker thread's own
 /// `NativeSessionConfig`, not read back by this pane) -- see the design
 /// note for what a truer reading would need.
-fn context_left_pct(route: &RouteIdentity, conversation: &ConversationState) -> Option<u8> {
+fn context_left_pct(
+    route: &RouteIdentity,
+    usage: &super::super::event::TranscriptUsage,
+) -> Option<u8> {
     let window = super::super::provider::capability::declared(route.protocol, &route.model, None)
         .context_window?;
     if window == 0 {
         return None;
     }
-    let used: u64 = conversation
-        .usage
-        .values()
-        .map(|record| record.input_tokens + record.output_tokens)
-        .sum();
+    let used = usage.context_total().saturating_add(usage.output_tokens);
     let used_pct = used.saturating_mul(100) / window;
     Some(100u64.saturating_sub(used_pct).min(100) as u8)
 }
@@ -2892,6 +2905,9 @@ pub struct NativePaneRuntime {
     journal: Journal,
     presentation: NativePresentation,
     conversation: ConversationState,
+    /// Aggregate usage retained separately because the conversation body is
+    /// discarded after each view reduction.
+    recorded_usage: super::super::event::TranscriptUsage,
     transcript: TranscriptView,
     session_state: NativeSessionState,
     turn_state: Option<NativeTurnState>,
@@ -2967,6 +2983,8 @@ pub struct NativePaneRuntime {
     /// over the protocol) and therefore for an observer pane, which holds no
     /// in-process session to block in the first place.
     live_approval: Option<super::super::runtime::enforcement::ApprovalPrompt>,
+    #[cfg(test)]
+    journal_payload_reads: usize,
 }
 
 impl NativePaneRuntime {
@@ -2990,9 +3008,11 @@ impl NativePaneRuntime {
             env,
         )?;
         let journal = Journal::open(state)?;
-        let conversation = journal.replay(&session.session)?;
+        let mut conversation = journal.replay(&session.session)?;
         let transcript =
             cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
+        let recorded_usage = conversation_usage(&conversation);
+        compact_retained_conversation(&mut conversation);
         let billing = resolve_billing(&session.route, &spec.repo);
         let git_branch = git_branch(&spec.repo);
 
@@ -3021,10 +3041,13 @@ impl NativePaneRuntime {
             link_cursor: 0,
             idempotency_seq: 0,
             live_approval: None,
+            #[cfg(test)]
+            journal_payload_reads: 1,
             session: Some(session),
             journal,
             presentation,
             conversation,
+            recorded_usage,
             transcript,
             session_state: NativeSessionState::Idle,
             turn_state: None,
@@ -3060,9 +3083,11 @@ impl NativePaneRuntime {
         let session_id = JournalSessionId::new(facts.session_id.clone())
             .map_err(|error| format!("native chat: runtime session id: {error}"))?;
         let journal = Journal::open(state)?;
-        let conversation = journal.replay(&session_id)?;
+        let mut conversation = journal.replay(&session_id)?;
         let transcript =
             cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
+        let recorded_usage = conversation_usage(&conversation);
+        compact_retained_conversation(&mut conversation);
         let git_branch = git_branch(&repo);
 
         let mut presentation = NativePresentation {
@@ -3118,10 +3143,13 @@ impl NativePaneRuntime {
             link_cursor: 0,
             idempotency_seq: 0,
             live_approval: None,
+            #[cfg(test)]
+            journal_payload_reads: 1,
             session: None,
             journal,
             presentation,
             conversation,
+            recorded_usage,
             transcript,
             session_state: NativeSessionState::Idle,
             turn_state: None,
@@ -3176,7 +3204,7 @@ impl NativePaneRuntime {
     fn context_left(&self) -> Option<u8> {
         self.route
             .as_ref()
-            .and_then(|route| context_left_pct(route, &self.conversation))
+            .and_then(|route| context_left_pct(route, &self.recorded_usage))
     }
 
     /// Progress, for an in-process pane. A runtime-attached one learns the
@@ -3280,6 +3308,18 @@ impl NativePaneRuntime {
         self.ux.approval.is_some()
     }
 
+    /// Whether the operator is composing text that automatic delivery must
+    /// not replace.
+    pub fn has_draft(&self) -> bool {
+        !self.presentation.composer.draft.is_empty()
+    }
+
+    pub fn holds_writer_permit(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(InteractiveSession::holds_writer_permit)
+    }
+
     /// The model this conversation is actually running on, for the sidebar's
     /// own disclosure line. `None` for a runtime-attached pane, whose
     /// `SessionFacts` publishes no route identity -- an honest unknown rather
@@ -3292,18 +3332,7 @@ impl NativePaneRuntime {
     /// the session-spend accounting -- the same shape a wrapped pane reports
     /// from its transcript.
     pub fn measured_usage(&self) -> super::super::event::TranscriptUsage {
-        let mut total = super::super::event::TranscriptUsage::default();
-        for usage in self.conversation.usage.values() {
-            total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
-            total.cache_creation_input_tokens = total
-                .cache_creation_input_tokens
-                .saturating_add(usage.cache_creation_input_tokens);
-            total.cache_read_input_tokens = total
-                .cache_read_input_tokens
-                .saturating_add(usage.cache_read_input_tokens);
-            total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
-        }
-        total
+        self.recorded_usage
     }
 
     /// Issue #490 (N21 item A): the mail sweep's delivery path for a native
@@ -3314,6 +3343,9 @@ impl NativePaneRuntime {
     /// (`resolve_submit_target`) and can never be written into a retired
     /// generation.
     pub fn deliver(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        if self.has_draft() {
+            return Err("native pane: operator draft is still being composed".into());
+        }
         let text = if label.is_empty() {
             body.to_string()
         } else {
@@ -3859,6 +3891,13 @@ impl NativePaneRuntime {
     /// [`MAX_TRANSCRIPT_ITEMS`] so a very long session's per-tick cost (and
     /// the pane's own memory) stays flat rather than growing without bound.
     fn refresh_transcript(&mut self) {
+        let Ok((_first, last)) = self.journal.sequence_bounds(&self.session_id) else {
+            self.replay_failures = self.replay_failures.saturating_add(1);
+            return;
+        };
+        if last == self.conversation.last_sequence {
+            return;
+        }
         let Ok(conversation) = self.journal.replay(&self.session_id) else {
             // Issue #490 (item 4): a replay failure is a lost connection to
             // the durable record, not a reason to redraw a stale pane
@@ -3866,6 +3905,10 @@ impl NativePaneRuntime {
             self.replay_failures = self.replay_failures.saturating_add(1);
             return;
         };
+        #[cfg(test)]
+        {
+            self.journal_payload_reads += 1;
+        }
         // Issue #490: a recovered replay is a reconnect the operator should
         // see. Announced BEFORE the watermark check below, because a
         // reconnect that brought no new events is still a reconnect.
@@ -3878,13 +3921,12 @@ impl NativePaneRuntime {
                 0,
             ));
         }
-        if conversation.last_sequence == self.conversation.last_sequence {
-            return;
-        }
         let before = self.transcript.items.len();
-        self.conversation = conversation;
+        self.recorded_usage = conversation_usage(&conversation);
         self.transcript =
-            cap_transcript_items(build_transcript(&self.conversation), MAX_TRANSCRIPT_ITEMS);
+            cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
+        self.conversation = conversation;
+        compact_retained_conversation(&mut self.conversation);
         let grown = self.transcript.items.len().saturating_sub(before);
         if grown > 0 {
             self.presentation.scroll.on_items_appended(grown);
@@ -3931,12 +3973,10 @@ impl NativePaneRuntime {
     /// the design note.
     fn activity_facts(&self) -> Option<ActivityFacts> {
         let started = self.turn_started_at?;
-        let tokens: u64 = self
-            .conversation
-            .usage
-            .values()
-            .map(|record| record.input_tokens + record.output_tokens)
-            .sum();
+        let tokens = self
+            .recorded_usage
+            .context_total()
+            .saturating_add(self.recorded_usage.output_tokens);
         Some(ActivityFacts {
             elapsed: started.elapsed(),
             tokens,
@@ -4069,11 +4109,15 @@ impl NativePaneRuntime {
                 self.link_cursor = 0;
                 self.replay_failures = 0;
                 if let Ok(conversation) = self.journal.replay(&self.session_id) {
+                    #[cfg(test)]
+                    {
+                        self.journal_payload_reads += 1;
+                    }
+                    self.recorded_usage = conversation_usage(&conversation);
+                    self.transcript =
+                        cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
                     self.conversation = conversation;
-                    self.transcript = cap_transcript_items(
-                        build_transcript(&self.conversation),
-                        MAX_TRANSCRIPT_ITEMS,
-                    );
+                    compact_retained_conversation(&mut self.conversation);
                 }
             }
             Err(error) => {
@@ -4182,6 +4226,34 @@ impl NativePaneRuntime {
         if let Some(session) = self.session {
             session.shutdown();
         }
+    }
+
+    /// Stops the conversation itself, as distinct from closing the dashboard
+    /// and merely detaching from a persistent runtime-owned conversation.
+    pub fn stop(&mut self, state: &StateDir) -> CtxResult<()> {
+        persist_draft(
+            state,
+            &self.short,
+            &PersistedDraft::from_composer(&self.presentation.composer),
+        );
+        if let Some(link) = self.link.as_mut() {
+            link.stop(&self.session_id.to_string())?;
+        } else if let Some(session) = self.session.take() {
+            session.shutdown();
+            if self
+                .journal
+                .replay(&self.session_id)?
+                .ended_reason
+                .is_none()
+            {
+                return Err(
+                    "native pane: session did not reach a terminal state after stop".into(),
+                );
+            }
+        }
+        self.session_state = NativeSessionState::Interrupted;
+        self.ended = true;
+        Ok(())
     }
 }
 
@@ -4674,6 +4746,38 @@ mod tests {
     }
 
     #[test]
+    fn native_pane_memory_state_stays_bounded_over_long_history() {
+        use crate::commands::ctx::runtime::journal::MessageId;
+
+        let mut state = empty_state();
+        for index in 0..(MAX_TRANSCRIPT_ITEMS * 4) {
+            state.messages.push(StoredMessage {
+                sequence: seq(index as u64 + 1),
+                message_id: MessageId::new(format!("m-{index}")).unwrap(),
+                role: MessageRole::User,
+                blocks: Vec::new(),
+                text: Some(format!("turn {index}")),
+                steering: false,
+                usage: None,
+            });
+        }
+        state.last_sequence = seq((MAX_TRANSCRIPT_ITEMS * 4) as u64);
+        let view = cap_transcript_items(build_transcript(&state), MAX_TRANSCRIPT_ITEMS);
+        compact_retained_conversation(&mut state);
+
+        assert!(state.messages.is_empty());
+        assert!(state.tool_calls.is_empty());
+        assert!(state.executions.is_empty());
+        assert!(state.usage.is_empty());
+        assert_eq!(view.items.len(), MAX_TRANSCRIPT_ITEMS);
+        assert!(matches!(view.items[0], TranscriptItem::Elided { .. }));
+        assert!(matches!(
+            view.items.last(),
+            Some(TranscriptItem::User { text, .. }) if text == "turn 1999"
+        ));
+    }
+
+    #[test]
     fn replaying_the_same_journal_events_twice_yields_an_identical_transcript() {
         // Exercises the REAL N03 reducer (`Journal::replay`), not a hand-built
         // fixture: two independent journals fed the identical event sequence
@@ -5015,7 +5119,7 @@ mod tests {
     #[test]
     fn a_slash_draft_lists_commands_above_the_box() {
         let mut presentation = NativePresentation::default();
-        presentation.composer.draft = "/a".to_string();
+        presentation.composer.draft = "/".to_string();
         let text: Vec<String> = composer_block(
             &presentation,
             &facts(NativeSessionState::Idle, None, false, false),
@@ -5024,12 +5128,13 @@ mod tests {
         .iter()
         .map(StyledLine::to_plain_string)
         .collect();
-        assert!(text[0].contains("/agents"));
-        assert!(text.iter().any(|line| line.contains("/approve")));
+        assert!(text[0].contains("/clear"));
+        assert!(text.iter().any(|line| line.contains("/status")));
+        assert!(!text.iter().any(|line| line.contains("/agents")));
     }
 
     #[test]
-    fn a_bang_draft_says_it_runs_through_the_pane_process_tool() {
+    fn a_bang_draft_advertises_no_unwired_process_tool() {
         let mut presentation = NativePresentation::default();
         presentation.composer.draft = "!cargo build".to_string();
         let text = composer_block(
@@ -5041,8 +5146,12 @@ mod tests {
         .map(StyledLine::to_plain_string)
         .collect::<Vec<_>>()
         .join("\n");
-        assert!(text.contains("cargo build"));
-        assert!(text.contains("process tool"));
+        assert!(!text.contains("process tool"));
+        assert!(
+            text.lines()
+                .next()
+                .is_some_and(|line| line.starts_with('\u{256d}'))
+        );
     }
 
     #[test]
@@ -5866,7 +5975,7 @@ mod tests {
                 estimated: false,
             },
         );
-        let pct = context_left_pct(&route, &state).expect("declared window");
+        let pct = context_left_pct(&route, &conversation_usage(&state)).expect("declared window");
         assert_eq!(pct, 75, "a quarter of the window used leaves 75% free");
     }
 
@@ -6189,10 +6298,12 @@ mod tests {
             link_cursor: 0,
             idempotency_seq: 0,
             live_approval: None,
+            journal_payload_reads: 0,
             session: None,
             journal,
             presentation: NativePresentation::default(),
             conversation: empty_state(),
+            recorded_usage: Default::default(),
             transcript: TranscriptView::default(),
             session_state: NativeSessionState::Idle,
             turn_state: None,
@@ -6211,6 +6322,83 @@ mod tests {
             cwd: PathBuf::from("."),
             git_branch: None,
         }
+    }
+
+    #[test]
+    fn native_draft_queues_mail_and_nudge_until_submission() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut pane = pane_fixture(&state, "s1", "sess-1", 1, None);
+        let draft = "half-typed operator draft \u{1f642}";
+        pane.presentation.composer.draft = draft.to_string();
+        pane.presentation.composer.cursor = pane.presentation.composer.draft.len();
+
+        assert!(pane.deliver("mail", "message").is_err());
+        assert!(pane.deliver("nudge", "direction").is_err());
+        assert_eq!(
+            pane.presentation.composer.draft.as_bytes(),
+            draft.as_bytes()
+        );
+
+        pane.handle_composer_action(ComposerAction::Submit);
+        pane.deliver("mail", "message")
+            .expect("mail after submission");
+        pane.deliver("nudge", "direction")
+            .expect("nudge after submission");
+        assert!(
+            pane.presentation
+                .composer
+                .history
+                .iter()
+                .any(|entry| entry == "[mail] message")
+        );
+        assert!(
+            pane.presentation
+                .composer
+                .history
+                .iter()
+                .any(|entry| entry == "[nudge] direction")
+        );
+    }
+
+    #[test]
+    fn idle_native_pane_reads_no_unchanged_journal_payload() {
+        use crate::commands::ctx::runtime::journal::{EventScope, MessageId};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let identity = identity_for("sess-idle", 1);
+        let mut writer = Journal::open(&state).expect("journal");
+        writer.create_session(&identity).expect("session");
+        writer
+            .acknowledge_input(
+                &identity.session,
+                1,
+                &EventScope::default(),
+                MessageId::new("m-1").unwrap(),
+                "new output".to_string(),
+                false,
+                None,
+                1,
+            )
+            .expect("event");
+
+        let mut pane = pane_fixture(&state, "s1", "sess-idle", 1, None);
+        pane.refresh_transcript();
+        assert_eq!(pane.journal_payload_reads, 1);
+        for _ in 0..20 {
+            pane.refresh_transcript();
+            let _ = render_plain(
+                &pane.transcript,
+                &pane.presentation,
+                &pane.status_facts(),
+                80,
+            );
+        }
+        assert_eq!(
+            pane.journal_payload_reads, 1,
+            "unchanged ticks use only the constant-size sequence watermark query"
+        );
     }
 
     #[test]
@@ -6534,6 +6722,61 @@ mod tests {
                 "not exercised by this test",
             ))
         }
+    }
+
+    #[test]
+    fn dashboard_stop_terminates_native_pane_session() {
+        use crate::commands::ctx::provider::adapter::Cancellation;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let env = std::collections::HashMap::from([(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.display().to_string(),
+        )]);
+        let lookup = |key: &str| env.get(key).cloned();
+        let provider = format!(
+            "fixture:{}",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/runtime/native/helper-answer.json")
+                .display()
+        );
+        let mut pane = NativePaneRuntime::spawn(
+            &CtxConfig::default(),
+            &state,
+            &lookup,
+            NativeDashboardSpec {
+                repo,
+                role: "worker".to_string(),
+                route: None,
+                writing: true,
+                provider: Some(provider),
+            },
+        )
+        .expect("spawn native pane");
+        let session_id = pane.session_id.clone();
+        let cancellation = pane
+            .session
+            .as_ref()
+            .expect("in-process session")
+            .cancellation_flag();
+
+        pane.stop(&state).expect("Stop reports success");
+
+        assert!(cancellation.is_cancelled());
+        assert!(
+            Journal::open(&state)
+                .expect("journal")
+                .replay(&session_id)
+                .expect("replay")
+                .ended_reason
+                .is_some()
+        );
+        assert!(pane.ended);
+        assert_eq!(pane.session_state, NativeSessionState::Interrupted);
     }
 
     #[test]

@@ -3194,6 +3194,25 @@ pub struct InteractiveSession {
     submit_tx: mpsc::Sender<String>,
     progress_rx: mpsc::Receiver<InteractiveProgress>,
     worker: Option<std::thread::JoinHandle<()>>,
+    writer_permit_held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug)]
+struct ObservedWriterLease {
+    inner: Box<dyn super::enforcement::WriterLease>,
+    held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl super::enforcement::WriterLease for ObservedWriterLease {
+    fn covers(&self, worktree: &std::path::Path) -> bool {
+        self.inner.covers(worktree)
+    }
+}
+
+impl Drop for ObservedWriterLease {
+    fn drop(&mut self) {
+        self.held.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for InteractiveSession {
@@ -3233,6 +3252,16 @@ impl InteractiveSession {
     /// progress.
     pub fn next_approval(&self) -> Option<super::enforcement::ApprovalPrompt> {
         self.approval_prompts.try_recv().ok()
+    }
+
+    pub fn holds_writer_permit(&self) -> bool {
+        self.writer_permit_held
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn cancellation_flag(&self) -> Arc<CancellationFlag> {
+        Arc::clone(&self.cancel)
     }
 
     /// Issue #490 (N21 item B): interrupting also cancels whatever tool call
@@ -3480,11 +3509,15 @@ pub fn spawn_interactive(
     // unseated caller gets -- see `acquire_pane_writer_permit`'s own doc
     // comment for why this is the honest fence for a session whose identity
     // did not exist a moment ago.
+    let writer_permit_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if request.writing {
         match acquire_pane_writer_permit(&state, cfg.supervise.max_writers, &tree, &handle) {
             Ok(permit) => {
-                headless.writer =
-                    Some(Box::new(permit) as Box<dyn super::enforcement::WriterLease>);
+                writer_permit_held.store(true, std::sync::atomic::Ordering::Release);
+                headless.writer = Some(Box::new(ObservedWriterLease {
+                    inner: Box::new(permit),
+                    held: Arc::clone(&writer_permit_held),
+                }));
             }
             Err(refusal) => {
                 let reason = super::super::permit::describe_writer_refusal(
@@ -3518,6 +3551,7 @@ pub fn spawn_interactive(
         )?;
         tools = executor;
     }
+    let retained_writer = headless.writer.take();
 
     backend.attach_journal(journal);
     backend.adopt(&handle, session.clone())?;
@@ -3596,6 +3630,7 @@ pub fn spawn_interactive(
 
     let worker_approvals = Arc::clone(&approvals);
     let worker = std::thread::spawn(move || {
+        let _retained_writer = retained_writer;
         let mut backend = backend;
         let mut tools = tools;
         let env_fn = super::super::config::env_from_process();
@@ -3655,6 +3690,7 @@ pub fn spawn_interactive(
         submit_tx,
         progress_rx,
         worker: Some(worker),
+        writer_permit_held,
     })
 }
 
