@@ -5336,7 +5336,13 @@ mod tests {
         server: super::super::mcp::FixtureServer,
         max_inline_mcp_tools: usize,
     ) -> EndToEnd {
-        end_to_end_configured(policy, server, max_inline_mcp_tools, Default::default(), NetworkScope::Any)
+        end_to_end_configured(
+            policy,
+            server,
+            max_inline_mcp_tools,
+            Default::default(),
+            NetworkScope::Any,
+        )
     }
 
     fn end_to_end_with_effects(
@@ -5345,7 +5351,13 @@ mod tests {
         max_inline_mcp_tools: usize,
         effects: super::super::super::config::CapabilityEffectsConfig,
     ) -> EndToEnd {
-        end_to_end_configured(policy, server, max_inline_mcp_tools, effects, NetworkScope::Any)
+        end_to_end_configured(
+            policy,
+            server,
+            max_inline_mcp_tools,
+            effects,
+            NetworkScope::Any,
+        )
     }
 
     fn end_to_end_with_network_scope(
@@ -5354,7 +5366,13 @@ mod tests {
         max_inline_mcp_tools: usize,
         network: super::super::enforcement::NetworkScope,
     ) -> EndToEnd {
-        end_to_end_configured(policy, server, max_inline_mcp_tools, Default::default(), network)
+        end_to_end_configured(
+            policy,
+            server,
+            max_inline_mcp_tools,
+            Default::default(),
+            network,
+        )
     }
 
     fn end_to_end_configured(
@@ -5380,8 +5398,8 @@ mod tests {
             std::fs::create_dir_all(path).expect("create root");
         }
         let repo = std::fs::canonicalize(&repo).expect("canonical repo");
-        let claims = ResourceClaims::new(&repo, &repo, &state_root, &home, network)
-            .expect("claims");
+        let claims =
+            ResourceClaims::new(&repo, &repo, &state_root, &home, network).expect("claims");
         let writer = effects.repo_write.then(|| {
             Box::new(FixtureWriter(repo.clone()))
                 as Box<dyn crate::commands::ctx::runtime::enforcement::WriterLease>
