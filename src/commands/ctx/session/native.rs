@@ -44,6 +44,7 @@ use super::super::api::wire::{
     TaskOutcome,
 };
 use super::super::provider::adapter::CancellationFlag;
+use super::super::runtime::enforcement::ExecutionAction;
 use super::super::runtime::journal::{
     AssistantBlock, ConversationState, ExecutionState, Journal, JournalEvent, JournalSessionId,
     MessageRole, RouteIdentity, SeatId, SequenceId, SessionIdentity, TaskId, TaskReceiptState,
@@ -698,6 +699,47 @@ impl NativeSessions {
             .journal_mut()
             .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the journal was not attached"))?;
         for (request_id, request) in requests {
+            let (tool, action_kind, targets) = match &request.action {
+                ExecutionAction::ReadFile { .. } => ("read_file", "read", Vec::new()),
+                ExecutionAction::WriteFile { .. } => ("write_file", "write", Vec::new()),
+                ExecutionAction::WriteFileExact { .. } => ("write_file", "exact_write", Vec::new()),
+                ExecutionAction::Process { invocation, .. } => {
+                    let program = match invocation {
+                        super::super::runtime::enforcement::ProcessInvocation::Argv {
+                            program,
+                            ..
+                        }
+                        | super::super::runtime::enforcement::ProcessInvocation::Shell {
+                            program,
+                            ..
+                        } => program.clone(),
+                    };
+                    ("process", "execute", vec![program])
+                }
+                ExecutionAction::ProcessControl { handle, .. } => {
+                    ("process_control", "control", vec![handle.clone()])
+                }
+                ExecutionAction::OutputRead { id } => ("output_read", "read", vec![id.clone()]),
+                ExecutionAction::Knowledge { service, .. } => {
+                    ("knowledge", "service", vec![service.clone()])
+                }
+                ExecutionAction::Network { target } => (
+                    "network",
+                    "request",
+                    vec![match target.port {
+                        Some(port) => format!("{}://{}:{port}", target.scheme, target.host),
+                        None => format!("{}://{}", target.scheme, target.host),
+                    }],
+                ),
+                ExecutionAction::Mcp { server, tool, .. } => {
+                    ("mcp", "call", vec![format!("{server}/{tool}")])
+                }
+                ExecutionAction::ArtifactRead { .. } => ("artifact", "read", Vec::new()),
+                ExecutionAction::ArtifactWrite { .. } => ("artifact", "write", Vec::new()),
+                ExecutionAction::Delegate { role, .. } => {
+                    ("delegate", "delegate", vec![role.clone()])
+                }
+            };
             let task = TaskId::new(format!("approval-{request_id}"))
                 .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
             journal
@@ -710,7 +752,14 @@ impl NativeSessions {
                     serde_json::json!({
                         "kind": "approval_request",
                         "request_id": request_id,
-                        "request": request,
+                        "request": {
+                            "tool": tool,
+                            "action_kind": action_kind,
+                            "resolved_paths": request.resolved_paths,
+                            "targets": targets,
+                            "scope_digest": request.scope_digest,
+                            "policy_fingerprint": request.policy_fingerprint,
+                        },
                     }),
                     state::now_secs(),
                 )
@@ -1496,6 +1545,7 @@ mod tests {
     struct ApprovalEnvironment {
         state: StateDir,
         executions: AtomicUsize,
+        environment_value: Option<String>,
     }
 
     impl NativeEnvironment for ApprovalEnvironment {
@@ -1511,7 +1561,7 @@ mod tests {
         fn run(&self, turn: &QueuedTurn) -> CtxResult<()> {
             use crate::commands::ctx::runtime::enforcement::{
                 ApprovalOutcome, ApprovalRequest, ExecutionAction, ExecutionIdentity,
-                GenerationFence, StoredSeatFence,
+                GenerationFence, ProcessEffects, ProcessInvocation, StoredSeatFence,
             };
 
             let identity = ExecutionIdentity {
@@ -1522,9 +1572,23 @@ mod tests {
                 task: turn.task.clone(),
             };
             StoredSeatFence::new(self.state.clone()).verify(&identity)?;
-            let action = ExecutionAction::ReadFile {
-                path: turn.cwd.join("approved.txt"),
-            };
+            let action = self.environment_value.as_ref().map_or_else(
+                || ExecutionAction::ReadFile {
+                    path: turn.cwd.join("approved.txt"),
+                },
+                |value| ExecutionAction::Process {
+                    invocation: ProcessInvocation::Argv {
+                        program: "fixture-tool".to_string(),
+                        args: vec!["safe-argument".to_string()],
+                        cwd: turn.cwd.clone(),
+                        environment: std::collections::BTreeMap::from([(
+                            "PRIVATE_VALUE".to_string(),
+                            value.clone(),
+                        )]),
+                    },
+                    effects: ProcessEffects::default(),
+                },
+            );
             let policy_fingerprint = "policy-1".to_string();
             let claims_fingerprint = "claims-1".to_string();
             let resolved_paths = vec![turn.cwd.join("approved.txt")];
@@ -1567,11 +1631,15 @@ mod tests {
         }
     }
 
-    fn approval_host(root: &Path) -> (Arc<NativeSessions>, Arc<ApprovalEnvironment>) {
+    fn approval_host(
+        root: &Path,
+        environment_value: Option<&str>,
+    ) -> (Arc<NativeSessions>, Arc<ApprovalEnvironment>) {
         let state = StateDir::from_root(root.join("state"));
         let environment = Arc::new(ApprovalEnvironment {
             state: state.clone(),
             executions: AtomicUsize::new(0),
+            environment_value: environment_value.map(str::to_string),
         });
         let host = NativeSessions::new(
             state,
@@ -1760,7 +1828,7 @@ mod tests {
     #[test]
     fn hosted_native_tools_require_and_consume_protocol_approval() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (host, environment) = approval_host(tmp.path());
+        let (host, environment) = approval_host(tmp.path(), None);
         let facts = host.start(&spec(tmp.path(), "")).expect("start");
 
         host.submit(&facts.session_id, "first", false, None)
@@ -1807,7 +1875,7 @@ mod tests {
     #[test]
     fn fresh_hosted_native_session_installs_its_seat_before_tool_dispatch() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (host, environment) = approval_host(tmp.path());
+        let (host, environment) = approval_host(tmp.path(), None);
         let facts = host.start(&spec(tmp.path(), "")).expect("start");
         let state = StateDir::from_root(tmp.path().join("state"));
         let seat = super::super::super::seat::load(&state, &facts.short).expect("native seat");
@@ -1826,6 +1894,44 @@ mod tests {
         .expect("approval");
         wait_for_native_idle(&host, &facts.session_id);
         assert_eq!(environment.executions.load(Ordering::SeqCst), 1);
+    }
+
+    /// Issue #548: durable approval descriptors never contain process
+    /// environment values from the action being approved.
+    #[test]
+    fn hosted_approval_journal_redacts_process_environment_values() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = "private-env-value-548";
+        let (host, _) = approval_host(tmp.path(), Some(marker));
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+
+        host.submit(&facts.session_id, "run", false, None)
+            .expect("submit");
+        let (request_id, _) = wait_for_approval(&host, &facts.session_id, 0);
+        let encoded = {
+            let backend = host.backend();
+            let journal = journal_of(&backend).expect("journal");
+            let session = JournalSessionId::new(facts.session_id.clone()).expect("session id");
+            let events = journal
+                .events_after(&session, SequenceId(0), 64)
+                .expect("journal events");
+            let receipts: Vec<&serde_json::Value> = events
+                .iter()
+                .filter_map(|stored| match &stored.event {
+                    JournalEvent::TaskReceipt { receipt, .. } => Some(receipt),
+                    _ => None,
+                })
+                .collect();
+            serde_json::to_string(&receipts).expect("encoded journal")
+        };
+        assert!(
+            !encoded.contains(marker),
+            "environment value reached journal"
+        );
+        assert!(encoded.contains("policy-1"));
+        assert!(encoded.contains("fixture-tool"));
+        host.approve(&facts.session_id, &request_id, ApprovalDecision::Deny, None)
+            .expect("cleanup denial");
     }
 
     /// Issue #578: input acknowledged after the runner's last queue check
