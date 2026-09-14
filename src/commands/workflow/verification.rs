@@ -2939,7 +2939,10 @@ fn run_baseline_prune(repo: &Path, writer: &mut impl Write) -> CtxResult<i32> {
 pub struct RunArgs {
     #[arg(long)]
     pub repo: Option<PathBuf>,
-    /// Run only the named check; repeat for more than one.
+    /// Run only the named check; repeat for more than one. Narrows the
+    /// repository's discovered checks, or the built-in registry with
+    /// `--builtin`; the default combined report always carries the full
+    /// built-in section.
     #[arg(long = "check")]
     pub checks: Vec<String>,
     #[arg(long)]
