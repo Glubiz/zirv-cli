@@ -33,6 +33,7 @@
 //! never the worker's own conversation. A coordinator inspecting a worker
 //! therefore pays the manifest's bytes, not the worker's transcript's, no
 //! matter how long that worker ran.
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
@@ -364,6 +365,19 @@ pub fn build_overview(
 ) -> Overview {
     let mut rows: Vec<AgentRow> = Vec::new();
 
+    // Review finding 5 (PR #544): indexed once per call instead of a linear
+    // `.find` over every coordinator node for every delegation record --
+    // O(records + nodes) rather than O(records * nodes). `entry(..).or_
+    // insert` keeps the same "first match in `graph.nodes`'s own key
+    // order" semantics the replaced `.find` had, in the (should not
+    // happen) case two nodes ever name the same delegation.
+    let mut nodes_by_delegation: HashMap<&str, &coordinator::Node> = HashMap::new();
+    for node in graph.nodes.values() {
+        if let Some(delegation) = node.delegation.as_deref() {
+            nodes_by_delegation.entry(delegation).or_insert(node);
+        }
+    }
+
     for seat in seats {
         let state = match &seat.phase {
             seat::Phase::Parked { .. } => AgentState::Draining,
@@ -397,10 +411,9 @@ pub fn build_overview(
         let approval = approvals
             .iter()
             .find(|request| request.session == record.handle.worker_session);
-        let node = graph
-            .nodes
-            .values()
-            .find(|node| node.delegation.as_deref() == Some(record.handle.delegation.as_str()));
+        let node = nodes_by_delegation
+            .get(record.handle.delegation.as_str())
+            .copied();
         let state = classify_agent_state(record, node, approval.is_some());
         let result = record.result_path.as_ref().map(|path| ResultRef {
             delegation: record.handle.delegation.clone(),
@@ -1380,76 +1393,6 @@ impl ApprovalRequest {
     pub fn scope_text(&self) -> String {
         format!("{}: {}", self.tool, self.scope.text())
     }
-
-    /// Builds the dialog's request from the enforcement broker's OWN request.
-    ///
-    /// Not reachable from an in-process `spawn_interactive` session today:
-    /// `runtime::native::session_broker` constructs every native session's
-    /// broker with `ApprovalMode::Headless`, so such a session never yields a
-    /// grantable request -- see the design note. This is the path a
-    /// runtime-owned session's `session.approve` (protocol v1) uses, and it
-    /// is unit-tested directly (`the_dialog_scope_comes_from_the_brokers_own_
-    /// request`).
-    #[allow(dead_code)]
-    /// -- the one whose `scope_digest` the grant is signed against. Nothing
-    /// here re-derives or widens the scope: the tool name and the paths come
-    /// straight off `ExecutionAction`/`resolved_paths`, so the dialog can
-    /// never describe less authority than the grant actually carries.
-    /// `widen_to` is what the operator's "don't ask again" would cover,
-    /// supplied by the caller (normally the session's own workdir) and `None`
-    /// when no such standing grant is offered at all.
-    #[allow(dead_code)]
-    pub fn from_enforcement(
-        request: &super::super::runtime::enforcement::ApprovalRequest,
-        actor: impl Into<String>,
-        session: impl Into<String>,
-        widen_to: Option<PathBuf>,
-        preview: Vec<String>,
-    ) -> Self {
-        use super::super::runtime::enforcement::ExecutionAction;
-        let (tool, verb) = match &request.action {
-            ExecutionAction::ReadFile { .. } => ("Read", "read"),
-            ExecutionAction::WriteFile { .. } => ("Write", "write"),
-            ExecutionAction::Process { .. } => ("Bash", "run"),
-            ExecutionAction::ProcessControl { .. } => ("Process", "control"),
-            ExecutionAction::OutputRead { .. } => ("Output", "read"),
-            ExecutionAction::Knowledge { write: true, .. } => ("Knowledge", "write"),
-            ExecutionAction::Knowledge { .. } => ("Knowledge", "read"),
-            ExecutionAction::Network { .. } => ("Network", "reach"),
-            ExecutionAction::Mcp { .. } => ("Mcp", "call"),
-            ExecutionAction::ArtifactRead { .. } => ("Artifact", "read"),
-            ExecutionAction::ArtifactWrite { .. } => ("Artifact", "write"),
-            ExecutionAction::Delegate { .. } => ("Task", "delegate"),
-        };
-        let detail = match &request.action {
-            ExecutionAction::Process { invocation, .. } => format!("{invocation:?}"),
-            ExecutionAction::Network { target } => format!("{target:?}"),
-            ExecutionAction::Mcp { server, tool, .. } => format!("{server}/{tool}"),
-            ExecutionAction::Delegate { role, task } => format!("{role}: {task}"),
-            ExecutionAction::Knowledge {
-                service, operation, ..
-            } => format!("{service}.{operation}"),
-            _ => String::new(),
-        };
-        Self {
-            id: request.scope_digest.clone(),
-            session: session.into(),
-            tool: tool.to_string(),
-            scope: Scope {
-                verb: verb.to_string(),
-                paths: request.resolved_paths.clone(),
-                directory: widen_to,
-            },
-            actor: actor.into(),
-            reason: if detail.is_empty() {
-                format!("policy {}", request.policy_fingerprint)
-            } else {
-                detail
-            },
-            preview,
-            asked_at: request.created_at,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1513,9 +1456,11 @@ pub struct ApprovalDialog {
 }
 
 impl ApprovalDialog {
-    /// A fully grantable dialog. Paired with
-    /// [`ApprovalRequest::from_enforcement`], so it shares that function's
-    /// "not reachable from an in-process session yet" note.
+    /// A fully grantable dialog. Not reachable from an in-process session
+    /// today -- `runtime::native::session_broker` constructs every native
+    /// session's broker with `ApprovalMode::Headless` -- so this is
+    /// exercised directly by its own tests rather than through a live
+    /// pane; see the design note's "What is deferred".
     #[allow(dead_code)]
     pub fn new(request: ApprovalRequest) -> Self {
         Self {
@@ -3846,63 +3791,43 @@ mod tests {
         let records: Vec<delegation::Record> = (0..3_000)
             .map(|i| delegation_fixture(&format!("w{i:04}"), delegation::Phase::Running))
             .collect();
-        ux.refresh(
-            &coordinator::Coordinator::default(),
-            &records,
-            &[],
-            &[],
-            &pool_fixture(),
-            "api",
-            300,
-        );
+        // Review finding 5 (PR #544): `build_overview` used to `.find` every
+        // coordinator node for every record -- O(records * nodes). A
+        // populated graph with one node per record (3,000 * 3,000, the
+        // worst case the review named) is what would have made that
+        // quadratic; asserting the build COMPLETES and stays inside the
+        // row budget is the structural bound this design note's own
+        // section ("Bounds are asserted, not measured") uses everywhere
+        // else -- a wall-clock assertion on a shared box is noise, so this
+        // pins the output size, not the elapsed time.
+        let mut graph = coordinator::Coordinator::default();
+        for i in 0..3_000 {
+            let id = format!("w{i:04}");
+            graph.nodes.insert(
+                id.clone(),
+                coordinator::Node {
+                    task: id.clone(),
+                    delegation: Some(id),
+                    ..coordinator::Node::default()
+                },
+            );
+        }
+        ux.refresh(&graph, &records, &[], &[], &pool_fixture(), "api", 300);
         assert!(ux.panel_lines(120).len() <= ux.budget.max_lines + 1);
     }
 
     // ---------------- item 5/6: the broker bridge and headless parity ----
-
-    #[test]
-    fn the_dialog_scope_comes_from_the_brokers_own_request() {
-        use crate::commands::ctx::runtime::enforcement::{
-            ApprovalRequest as BrokerRequest, ExecutionAction, ExecutionIdentity,
-        };
-        let broker = BrokerRequest {
-            scope_digest: "digest-1".to_string(),
-            identity: ExecutionIdentity {
-                session: "sess-w1".to_string(),
-                short: "s7".to_string(),
-                generation: 2,
-                role: "implementer".to_string(),
-                task: Some("T2".to_string()),
-            },
-            action: ExecutionAction::WriteFile {
-                path: PathBuf::from("/repo/wt/src/journal.rs"),
-            },
-            policy_fingerprint: "pf".to_string(),
-            claims_fingerprint: "cf".to_string(),
-            resolved_paths: vec![PathBuf::from("/repo/wt/src/journal.rs")],
-            execution_scope_fingerprint: "ef".to_string(),
-            created_at: 140,
-        };
-        let request = ApprovalRequest::from_enforcement(
-            &broker,
-            "w1 implementer",
-            "sess-w1",
-            Some(PathBuf::from("/repo/wt")),
-            vec!["+ let cursor = committed;".to_string()],
-        );
-        assert_eq!(request.id, "digest-1");
-        assert_eq!(request.tool, "Write");
-        // The dialog's paths are the broker's RESOLVED paths, verbatim.
-        assert_eq!(request.scope.paths, broker.resolved_paths);
-        let dialog = ApprovalDialog::new(request);
-        let text = dialog
-            .lines(100)
-            .iter()
-            .map(StyledLine::to_plain_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("/repo/wt/src/journal.rs"));
-    }
+    //
+    // Review finding 8 (PR #544): `ApprovalRequest::from_enforcement` --
+    // and the test that exercised it, `the_dialog_scope_comes_from_the_
+    // brokers_own_request` -- were removed here as dead code with no
+    // production caller: `detect_pending_approval` is the one path that
+    // actually builds a dialog request today, from the journal's own
+    // recorded text, and the two cannot share a code path without an
+    // `enforcement::ApprovalRequest` to build from, which a journal replay
+    // does not have. See the design note's "What is deferred" for what the
+    // eventual live wiring (owned by the interactive-approvals work on
+    // `native/490-b`) will need to add back.
 
     #[test]
     fn the_headless_report_carries_the_same_values_the_panes_render() {

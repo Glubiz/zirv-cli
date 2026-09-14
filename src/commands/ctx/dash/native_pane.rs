@@ -1257,6 +1257,14 @@ pub struct NativePresentation {
     /// the process's current directory -- a pane with no declared worktree
     /// must not be able to complete a path outside one.
     pub workdir: Option<PathBuf>,
+    /// Review finding 3 (PR #544): true when this pane attached to a
+    /// runtime-owned session without the controller seat -- either
+    /// `RuntimeLink::attach` was refused outright, or it succeeded but
+    /// another client already holds control. A read-only pane offers no
+    /// send/steer/approve at all rather than attempting one that the
+    /// server's own controller check would refuse anyway; the composer's
+    /// hint line says so. Always `false` for an in-process pane.
+    pub observer: bool,
 }
 
 impl Default for NativePresentation {
@@ -1270,6 +1278,7 @@ impl Default for NativePresentation {
             unread: false,
             mode: ComposerMode::default(),
             workdir: None,
+            observer: false,
         }
     }
 }
@@ -2309,6 +2318,14 @@ fn composer_hint_line(presentation: &NativePresentation) -> String {
     } else {
         String::new()
     };
+    // Review finding 3 (PR #544): an observer pane offers no send/steer/
+    // approve at all -- the hint line says so instead of naming keys that
+    // would only queue input no one is going to deliver.
+    if presentation.observer {
+        return format!(
+            "? for shortcuts \u{b7} observer: read-only, the controller seat is held elsewhere{queued_note}"
+        );
+    }
     format!(
         "? for shortcuts \u{b7} {mode}{queued_note} \u{b7} Enter submit \u{b7} Shift+Enter \
          newline \u{b7} \u{2191} history \u{b7} @ file ref \u{b7} / commands \u{b7} Esc interrupt",
@@ -2728,6 +2745,10 @@ pub struct NativePaneRuntime {
     /// The journal cursor this pane has consumed through, so a reconnect
     /// carries on rather than re-reading the conversation.
     link_cursor: u64,
+    /// Review finding 6 (PR #544): a monotonic counter mixed into every
+    /// [`Self::next_idempotency_key`], so two submits minted in the same
+    /// millisecond never collide.
+    idempotency_seq: u64,
 }
 
 impl NativePaneRuntime {
@@ -2780,6 +2801,7 @@ impl NativePaneRuntime {
             attach: PaneAttach::InProcess,
             link: None,
             link_cursor: 0,
+            idempotency_seq: 0,
             session: Some(session),
             journal,
             presentation,
@@ -2812,7 +2834,7 @@ impl NativePaneRuntime {
     /// [`Self::interrupt`] and [`Self::decide_approval`].
     pub fn attach_runtime(
         state: &StateDir,
-        link: super::link::RuntimeLink,
+        mut link: super::link::RuntimeLink,
         facts: &super::super::api::wire::SessionFacts,
         repo: PathBuf,
     ) -> CtxResult<Self> {
@@ -2829,6 +2851,34 @@ impl NativePaneRuntime {
             ..NativePresentation::default()
         };
         load_draft(state, &facts.short).restore_onto(&mut presentation.composer);
+
+        // Review finding 3 (PR #544): register this pane as the session's
+        // controller instead of relying on the server's "nobody attached
+        // yet" bypass in `native_controller_check`, which stops applying
+        // silently the moment any other client attaches. A refusal, or a
+        // non-controller outcome, falls back to observer mode: no
+        // send/steer/approve is offered (`composer_hint_line`,
+        // `send_submit`, `interrupt`, `decide_approval`), and the failure is
+        // surfaced as a notice rather than swallowed.
+        let mut attach_notice = None;
+        match link.attach(&facts.session_id, true) {
+            Ok(attachment) => {
+                presentation.observer =
+                    attachment.role != super::super::api::wire::AttachRole::Controller;
+                if presentation.observer {
+                    attach_notice = Some(format!(
+                        "attach: observer only -- {} holds the controller seat",
+                        attachment.controller.as_deref().unwrap_or("another client")
+                    ));
+                }
+            }
+            Err(error) => {
+                presentation.observer = true;
+                attach_notice = Some(format!(
+                    "attach refused by the runtime: {error} -- falling back to observer mode"
+                ));
+            }
+        }
 
         let continuity = super::native_ux::Continuity::new(super::native_ux::SeatIdentity {
             short: facts.short.clone(),
@@ -2847,6 +2897,7 @@ impl NativePaneRuntime {
             },
             link: Some(link),
             link_cursor: 0,
+            idempotency_seq: 0,
             session: None,
             journal,
             presentation,
@@ -2864,7 +2915,7 @@ impl NativePaneRuntime {
             announced_rollover_at: 0,
             announced_terminal: BTreeSet::new(),
             ended: false,
-            notice: None,
+            notice: attach_notice,
             turn_started_at: None,
             cwd: repo,
             git_branch,
@@ -2923,19 +2974,43 @@ impl NativePaneRuntime {
     /// idempotency key, so a reconnect that resends cannot start a second
     /// turn), the in-process channel otherwise.
     fn send_submit(&mut self, text: &str) {
-        match (self.link.as_mut(), self.session.as_ref()) {
-            (Some(link), _) => {
-                let session_id = self.session_id.to_string();
-                let key = format!("{}-{}", self.short, now_ms_u64());
-                if let Err(error) = link.submit(&session_id, text, Some(&key)) {
-                    self.notice = Some(format!("submit refused by the runtime: {error}"));
-                }
-            }
-            (None, Some(session)) => {
-                let _ = session.submit(text.to_string());
-            }
-            (None, None) => {}
+        // Review finding 3 (PR #544): an observer pane (no controller seat)
+        // never attempts a send -- the server would refuse it anyway, and
+        // attempting it silently would contradict the hint line that just
+        // told the operator this pane is read-only.
+        if self.link.is_some() && self.presentation.observer {
+            self.notice = Some(
+                "submit unavailable: this pane holds no controller seat (observer mode)"
+                    .to_string(),
+            );
+            return;
         }
+        if self.link.is_some() {
+            let session_id = self.session_id.to_string();
+            // Review finding 6 (PR #544): `short-{now_ms}` alone can
+            // collide within the same millisecond (two queued sends
+            // draining back to back, or a fast double-Enter). Append a
+            // per-pane monotonic counter so two keys minted in the same
+            // tick are always distinct. Computed before borrowing
+            // `self.link` mutably below, since it needs `&mut self` too.
+            let key = self.next_idempotency_key();
+            if let Some(link) = self.link.as_mut()
+                && let Err(error) = link.submit(&session_id, text, Some(&key))
+            {
+                self.notice = Some(format!("submit refused by the runtime: {error}"));
+            }
+        } else if let Some(session) = self.session.as_ref() {
+            let _ = session.submit(text.to_string());
+        }
+    }
+
+    /// Review finding 6 (PR #544): this pane's own idempotency identity for
+    /// [`Self::send_submit`] -- `short-now_ms-seq`, where `seq` is a
+    /// monotonic counter that makes two keys minted in the same millisecond
+    /// distinct even though `now_ms_u64()` alone would not.
+    fn next_idempotency_key(&mut self) -> String {
+        self.idempotency_seq = self.idempotency_seq.wrapping_add(1);
+        format!("{}-{}-{}", self.short, now_ms_u64(), self.idempotency_seq)
     }
 
     pub fn ux(&self) -> &super::native_ux::UxState {
@@ -2985,6 +3060,14 @@ impl NativePaneRuntime {
                 queued,
             } = self.continuity.carry_across(next)
             {
+                // Review finding 1 (PR #544): `carry_across` only updates
+                // `self.continuity.seat` -- this pane's OWN identity
+                // (`self.session_id`/`self.generation`, read by every tick's
+                // journal replay, link polling and `current_identity`'s own
+                // guard) must be resynced too, or `resolve_submit_target`
+                // disagrees with `continuity.seat` forever after the first
+                // rollover. See `apply_retarget`.
+                self.apply_retarget(&to_session, generation);
                 self.ux.notices.push(super::native_ux::Notice {
                     kind: super::native_ux::NoticeKind::Rollover,
                     headline: format!("seat moved to generation {generation}"),
@@ -3125,6 +3208,26 @@ impl NativePaneRuntime {
         if body.is_empty() {
             return;
         }
+        // Review finding 2 (PR #544): route through the same current-session
+        // guard a composer submit uses (finding 1) rather than calling
+        // `delegation::send` unconditionally. `delegation::send` addresses
+        // its target by the worker's short id through the shared mailbox,
+        // not by this pane's own session/generation, so it cannot itself
+        // tell a live pane from a stale one -- that is this pane's own
+        // identity to know, not the mail path's.
+        if let super::native_ux::SubmitTarget::Hold { reason } =
+            super::native_ux::resolve_submit_target(&self.continuity, &self.current_identity())
+        {
+            self.ux.notices.push(super::native_ux::Notice {
+                kind: super::native_ux::NoticeKind::Rollover,
+                headline: format!(
+                    "follow-up to {delegation_id} held: this pane no longer owns the seat's session"
+                ),
+                detail: vec![reason],
+                at: now,
+            });
+            return;
+        }
         let headline =
             match delegation::send(&self.state, &self.repo, cfg, delegation_id, &body, now) {
                 Ok(delegation::Dispatch::Queued { reason, .. }) => {
@@ -3167,6 +3270,15 @@ impl NativePaneRuntime {
             // ITS request id -- the dashboard never mints a grant of its own,
             // and a note carries the "tell the agent what to do differently"
             // text of a denial.
+            // Review finding 3 (PR #544): an observer pane holds no
+            // controller seat -- approving or denying is not offered at
+            // all, per the same rule as submit/steer/interrupt.
+            ApprovalRoute::Protocol if self.presentation.observer => {
+                self.notice = Some(
+                    "approval unavailable: this pane holds no controller seat (observer mode)"
+                        .to_string(),
+                );
+            }
             ApprovalRoute::Protocol => {
                 let session_id = self.session_id.to_string();
                 let wire = match decision {
@@ -3191,9 +3303,34 @@ impl NativePaneRuntime {
             // `ApprovalMode::Headless` native session cannot (see the design
             // note).
             ApprovalRoute::Broker => match decision {
-                ApprovalDecision::Deny => {
-                    let _ = self.write_steering(&guidance);
-                }
+                // Review finding 7 (PR #544): a denial used to write
+                // steering off `self.session_id` unconditionally, with none
+                // of the generation guard finding 1's fix gives every other
+                // send/steer path. Route it through the same current-session
+                // resolution: held (never written into a retired
+                // generation) exactly like a composer submit is.
+                ApprovalDecision::Deny => match super::native_ux::resolve_submit_target(
+                    &self.continuity,
+                    &self.current_identity(),
+                ) {
+                    super::native_ux::SubmitTarget::Send { .. } => {
+                        let _ = self.write_steering(&guidance);
+                    }
+                    super::native_ux::SubmitTarget::Hold { reason } => {
+                        self.ux.notices.push(super::native_ux::Notice {
+                            kind: super::native_ux::NoticeKind::Rollover,
+                            headline: "denial held: this pane no longer owns the seat's session"
+                                .to_string(),
+                            detail: vec![reason],
+                            at: 0,
+                        });
+                        self.presentation.composer.queued.push(QueuedInput {
+                            text: guidance.clone(),
+                            steering: true,
+                            queued_at_ms: now_ms_u64(),
+                        });
+                    }
+                },
                 ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
                     self.ux.notices.push(super::native_ux::Notice {
                         kind: super::native_ux::NoticeKind::DeferredDelivery,
@@ -3448,6 +3585,20 @@ impl NativePaneRuntime {
         // must never let a keystroke land in the retired generation.
         let intent = match intent {
             SubmitIntent::Queue => SubmitIntent::Queue,
+            // Review finding 3 (PR #544): an observer pane offers no
+            // send/steer at all -- held exactly like a rollover mismatch,
+            // never attempted against a controller seat this pane does not
+            // hold.
+            _other if self.presentation.observer => {
+                self.ux.notices.push(super::native_ux::Notice {
+                    kind: super::native_ux::NoticeKind::Rollover,
+                    headline: "input held: this pane holds no controller seat (observer mode)"
+                        .to_string(),
+                    detail: Vec::new(),
+                    at: 0,
+                });
+                SubmitIntent::Queue
+            }
             other => match super::native_ux::resolve_submit_target(
                 &self.continuity,
                 &self.current_identity(),
@@ -3488,6 +3639,40 @@ impl NativePaneRuntime {
             short: self.short.clone(),
             session: self.session_id.to_string(),
             generation: self.generation,
+        }
+    }
+
+    /// Review finding 1 (PR #544): resyncs this pane's OWN identity after
+    /// `Continuity::carry_across` retargets the seat it watches. Without
+    /// this, `self.session_id`/`self.generation` stayed at their spawn-time
+    /// value forever -- `current_identity` kept disagreeing with
+    /// `self.continuity.seat` after the FIRST rollover, so
+    /// `resolve_submit_target` returned `Hold` on every submit/steer from
+    /// then on. Also resets the runtime-link cursor (a new session starts
+    /// its own durable event sequence at zero, so the old cursor means
+    /// nothing for it) and re-reads the journal for the new session id
+    /// immediately, rather than waiting for the next `tick()` to notice a
+    /// `last_sequence` that no longer describes this identity at all.
+    fn apply_retarget(&mut self, to_session: &str, generation: u64) {
+        match JournalSessionId::new(to_session.to_string()) {
+            Ok(session_id) => {
+                self.session_id = session_id;
+                self.generation = generation;
+                self.link_cursor = 0;
+                self.replay_failures = 0;
+                if let Ok(conversation) = self.journal.replay(&self.session_id) {
+                    self.conversation = conversation;
+                    self.transcript = cap_transcript_items(
+                        build_transcript(&self.conversation),
+                        MAX_TRANSCRIPT_ITEMS,
+                    );
+                }
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "rollover retarget: invalid session id {to_session}: {error}"
+                ));
+            }
         }
     }
 
@@ -3533,10 +3718,27 @@ impl NativePaneRuntime {
     }
 
     pub fn interrupt(&mut self) {
+        // Review finding 3 (PR #544): an observer pane holds no controller
+        // seat, so an interrupt would only be refused by the server -- say
+        // so directly rather than making the round trip.
+        if self.link.is_some() && self.presentation.observer {
+            self.notice = Some(
+                "interrupt unavailable: this pane holds no controller seat (observer mode)"
+                    .to_string(),
+            );
+            return;
+        }
         match (self.link.as_mut(), self.session.as_ref()) {
             (Some(link), _) => {
                 let session_id = self.session_id.to_string();
-                let _ = link.interrupt(&session_id);
+                // Review finding 4 (PR #544): a refused interrupt used to be
+                // silently swallowed. Surface it exactly like `send_submit`/
+                // `decide_approval` do -- an operator who pressed Esc and saw
+                // nothing happen has no way to tell "refused" from "still in
+                // flight" otherwise.
+                if let Err(error) = link.interrupt(&session_id) {
+                    self.notice = Some(format!("interrupt refused by the runtime: {error}"));
+                }
             }
             (None, Some(session)) => session.interrupt(),
             (None, None) => {}
@@ -5505,5 +5707,524 @@ mod tests {
             text.contains("standing context could not be compiled"),
             "got {text}"
         );
+    }
+
+    // =====================================================================
+    // PR #544 review findings 1, 2, 6, 7: a rollover must resync THIS
+    // pane's own identity, not just the continuity record, or every
+    // send/steer/follow-up path stays held forever after the first
+    // generation change.
+    // =====================================================================
+
+    fn identity_for(session: &str, generation: u64) -> SessionIdentity {
+        SessionIdentity {
+            session: crate::commands::ctx::runtime::journal::JournalSessionId::new(session)
+                .unwrap(),
+            generation,
+            ..sample_identity()
+        }
+    }
+
+    /// A minimal, directly-constructed pane for testing the rollover/
+    /// identity plumbing in isolation -- no spawned process and (unless a
+    /// link is passed) no runtime link, so this exercises exactly the bug
+    /// findings 1/2/6/7 named rather than any process or network machinery.
+    fn pane_fixture(
+        state: &StateDir,
+        short: &str,
+        session: &str,
+        generation: u64,
+        link: Option<super::super::link::RuntimeLink>,
+    ) -> NativePaneRuntime {
+        let journal = Journal::open(state).expect("open journal");
+        let session_id = JournalSessionId::new(session).expect("session id");
+        let continuity =
+            super::super::native_ux::Continuity::new(super::super::native_ux::SeatIdentity {
+                short: short.to_string(),
+                session: session.to_string(),
+                generation,
+            });
+        NativePaneRuntime {
+            short: short.to_string(),
+            session_id,
+            generation,
+            route: None,
+            attach: PaneAttach::InProcess,
+            link,
+            link_cursor: 0,
+            idempotency_seq: 0,
+            session: None,
+            journal,
+            presentation: NativePresentation::default(),
+            conversation: empty_state(),
+            transcript: TranscriptView::default(),
+            session_state: NativeSessionState::Idle,
+            turn_state: None,
+            billing: style::PLACEHOLDER.to_string(),
+            ux: super::super::native_ux::UxState::default(),
+            repo: PathBuf::from("."),
+            state: state.clone(),
+            continuity,
+            replay_failures: 0,
+            announced_recoveries: 0,
+            announced_rollover_at: 0,
+            announced_terminal: BTreeSet::new(),
+            ended: false,
+            notice: None,
+            turn_started_at: None,
+            cwd: PathBuf::from("."),
+            git_branch: None,
+        }
+    }
+
+    #[test]
+    fn a_rollover_resyncs_the_panes_own_identity_so_every_send_path_targets_the_new_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let mut pane = pane_fixture(&state, "s1", "sess-old", 1, None);
+
+        // What `refresh_records` observed: the seat's logical identity moved
+        // on. `Continuity::carry_across` (tested directly in native_ux.rs)
+        // already retargets `continuity.seat`; the bug finding 1 names is
+        // that nothing resynced the PANE's own `session_id`/`generation` to
+        // match it.
+        let next = super::super::native_ux::SeatIdentity {
+            short: "s1".to_string(),
+            session: "sess-new".to_string(),
+            generation: 2,
+        };
+        let (to_session, generation) = match pane.continuity.carry_across(next) {
+            super::super::native_ux::Retarget::Retargeted {
+                to_session,
+                generation,
+                ..
+            } => (to_session, generation),
+            super::super::native_ux::Retarget::Unchanged => panic!("expected a retarget"),
+        };
+
+        // Findings 1 + 7, "before": with the pane's own fields still stale,
+        // a composer submit is held -- never sent to the retired
+        // `sess-old` -- and a denial's steering guidance is held too.
+        pane.presentation.composer.draft = "before the retarget".to_string();
+        pane.presentation.composer.cursor = pane.presentation.composer.draft.len();
+        pane.handle_composer_action(ComposerAction::Submit);
+        assert_eq!(
+            pane.presentation.composer.queued.len(),
+            1,
+            "held, not sent to the retired session"
+        );
+        assert_eq!(
+            pane.presentation.composer.queued[0].text,
+            "before the retarget"
+        );
+
+        let request = super::super::native_ux::ApprovalRequest {
+            id: "tc-1".to_string(),
+            session: "sess-old".to_string(),
+            tool: "Bash".to_string(),
+            scope: super::super::native_ux::Scope {
+                verb: "run".to_string(),
+                paths: Vec::new(),
+                directory: None,
+            },
+            actor: "s1 \u{b7} orchestrator".to_string(),
+            reason: "policy".to_string(),
+            preview: Vec::new(),
+            asked_at: 0,
+        };
+        pane.decide_approval(
+            &request,
+            super::super::native_ux::ApprovalDecision::Deny,
+            false,
+        );
+        assert_eq!(
+            pane.presentation.composer.queued.len(),
+            2,
+            "finding 7: a denial's steering is held too, not written into the retired session"
+        );
+        assert!(pane.presentation.composer.queued[1].steering);
+
+        // Finding 2, "before": a worker follow-up is held with a notice and
+        // `delegation::send` is never reached -- the draft is untouched.
+        pane.presentation.composer.draft = "please retry with -v".to_string();
+        let notices_before = pane.ux.notices.recent(usize::MAX).len();
+        pane.follow_up("worker-1", &cfg, 0);
+        assert_eq!(
+            pane.presentation.composer.draft, "please retry with -v",
+            "finding 2: held, so the draft is never cleared"
+        );
+        assert!(pane.ux.notices.recent(usize::MAX).len() > notices_before);
+
+        // Apply the fix under test.
+        pane.apply_retarget(&to_session, generation);
+        assert_eq!(pane.session_id.to_string(), "sess-new");
+        assert_eq!(pane.generation, 2);
+        assert_eq!(
+            super::super::native_ux::resolve_submit_target(
+                &pane.continuity,
+                &pane.current_identity()
+            ),
+            super::super::native_ux::SubmitTarget::Send {
+                session: "sess-new".to_string(),
+                generation: 2,
+            },
+            "finding 1: the next submit targets the new session and is not held"
+        );
+
+        // "After": a composer submit is no longer held (still just the one
+        // item queued before the fix).
+        pane.presentation.composer.draft = "after the retarget".to_string();
+        pane.presentation.composer.cursor = pane.presentation.composer.draft.len();
+        pane.handle_composer_action(ComposerAction::Submit);
+        assert_eq!(
+            pane.presentation.composer.queued.len(),
+            2,
+            "sent, not queued, once the pane's own identity is resynced"
+        );
+
+        // "After": the follow-up guard no longer holds it -- it reaches
+        // `delegation::send` (which fails for lack of an on-disk record,
+        // distinct from being held by this pane's own guard).
+        pane.presentation.composer.draft = "please retry with -v again".to_string();
+        pane.follow_up("worker-1", &cfg, 0);
+        assert_eq!(
+            pane.presentation.composer.draft, "",
+            "finding 2: no longer held, so the draft is cleared once delegation::send is attempted"
+        );
+    }
+
+    #[test]
+    fn two_submits_in_the_same_tick_get_distinct_idempotency_keys() {
+        // Finding 6: `short-{now_ms}` alone can collide within the same
+        // millisecond. The per-pane counter makes two keys minted back to
+        // back distinct regardless of the clock's resolution.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut pane = pane_fixture(&state, "s1", "sess-1", 1, None);
+        let first = pane.next_idempotency_key();
+        let second = pane.next_idempotency_key();
+        assert_ne!(first, second);
+    }
+
+    // =====================================================================
+    // PR #544 review findings 3, 4: `attach_runtime` must actually call
+    // `RuntimeLink::attach`, fall back to observer mode when it is refused,
+    // and never swallow a refused interrupt.
+    // =====================================================================
+
+    fn wire_facts(
+        id: &str,
+        short: &str,
+        runtime: crate::commands::ctx::runtime::RuntimeKind,
+    ) -> crate::commands::ctx::api::wire::SessionFacts {
+        crate::commands::ctx::api::wire::SessionFacts {
+            session_id: id.to_string(),
+            short: short.to_string(),
+            runtime,
+            generation: 1,
+            surface: crate::commands::ctx::runtime::UiSurface::Headless,
+            state: crate::commands::ctx::api::wire::SessionState::Idle,
+            role: Some("orchestrator".to_string()),
+            agent: Some("claude".to_string()),
+            repo_slug: Some("zirv-cli".to_string()),
+            started_at: Some(1_757_000_000),
+            reachable: true,
+        }
+    }
+
+    /// A minimal `SessionHost` double: enough to prove `attach_runtime`
+    /// actually calls `RuntimeLink::attach` and registers as controller,
+    /// without a real pty. Every other method is unreachable by these
+    /// tests and refuses cleanly rather than panicking if that ever
+    /// changes.
+    #[derive(Debug, Default)]
+    struct FakeHost {
+        inner: std::sync::Mutex<FakeHostState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeHostState {
+        facts: Vec<crate::commands::ctx::api::wire::SessionFacts>,
+        controller: Option<String>,
+    }
+
+    impl FakeHost {
+        fn with(facts: Vec<crate::commands::ctx::api::wire::SessionFacts>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: std::sync::Mutex::new(FakeHostState {
+                    facts,
+                    controller: None,
+                }),
+            })
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeHostState> {
+            self.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl crate::commands::ctx::api::server::SessionHost for FakeHost {
+        fn sessions(&self) -> Vec<crate::commands::ctx::api::wire::SessionFacts> {
+            self.lock().facts.clone()
+        }
+
+        fn start(
+            &self,
+            _spec: &crate::commands::ctx::runtime::SessionSpec,
+        ) -> Result<
+            crate::commands::ctx::api::wire::SessionFacts,
+            crate::commands::ctx::api::wire::ApiError,
+        > {
+            Err(crate::commands::ctx::api::wire::ApiError::new(
+                crate::commands::ctx::api::wire::ErrorCode::Unsupported,
+                "the test host opens no terminals",
+            ))
+        }
+
+        fn attach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            mode: crate::commands::ctx::api::wire::AttachMode,
+            _size: Option<(u16, u16)>,
+        ) -> Result<
+            crate::commands::ctx::api::wire::Attachment,
+            crate::commands::ctx::api::wire::ApiError,
+        > {
+            let mut state = self.lock();
+            if mode == crate::commands::ctx::api::wire::AttachMode::Controller {
+                state.controller = Some(client_id.to_string());
+            }
+            let role = if state.controller.as_deref() == Some(client_id) {
+                crate::commands::ctx::api::wire::AttachRole::Controller
+            } else {
+                crate::commands::ctx::api::wire::AttachRole::Observer
+            };
+            Ok(crate::commands::ctx::api::wire::Attachment {
+                controller: state.controller.clone(),
+                clients: vec![client_id.to_string()],
+                rows: 24,
+                cols: 80,
+                role,
+            })
+        }
+
+        fn detach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+        ) -> Result<
+            crate::commands::ctx::api::wire::Attachment,
+            crate::commands::ctx::api::wire::ApiError,
+        > {
+            let mut state = self.lock();
+            if state.controller.as_deref() == Some(client_id) {
+                state.controller = None;
+            }
+            Ok(crate::commands::ctx::api::wire::Attachment {
+                controller: state.controller.clone(),
+                clients: Vec::new(),
+                rows: 24,
+                cols: 80,
+                role: crate::commands::ctx::api::wire::AttachRole::Detached,
+            })
+        }
+
+        fn takeover(
+            &self,
+            _session_id: &str,
+            _client_id: &str,
+        ) -> Result<
+            crate::commands::ctx::api::wire::Attachment,
+            crate::commands::ctx::api::wire::ApiError,
+        > {
+            Err(crate::commands::ctx::api::wire::ApiError::new(
+                crate::commands::ctx::api::wire::ErrorCode::Unsupported,
+                "not exercised by this test",
+            ))
+        }
+
+        fn resize(
+            &self,
+            _session_id: &str,
+            _client_id: &str,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<
+            crate::commands::ctx::api::wire::Attachment,
+            crate::commands::ctx::api::wire::ApiError,
+        > {
+            Err(crate::commands::ctx::api::wire::ApiError::new(
+                crate::commands::ctx::api::wire::ErrorCode::Unsupported,
+                "not exercised by this test",
+            ))
+        }
+
+        fn screen(
+            &self,
+            _session_id: &str,
+            _client_id: &str,
+        ) -> Result<
+            crate::commands::ctx::api::wire::ScreenView,
+            crate::commands::ctx::api::wire::ApiError,
+        > {
+            Err(crate::commands::ctx::api::wire::ApiError::new(
+                crate::commands::ctx::api::wire::ErrorCode::Unsupported,
+                "not exercised by this test",
+            ))
+        }
+
+        fn write_raw(
+            &self,
+            _session_id: &str,
+            _client_id: &str,
+            _bytes: &[u8],
+        ) -> Result<(), crate::commands::ctx::api::wire::ApiError> {
+            Err(crate::commands::ctx::api::wire::ApiError::new(
+                crate::commands::ctx::api::wire::ErrorCode::Unsupported,
+                "not exercised by this test",
+            ))
+        }
+
+        fn stop(
+            &self,
+            _session_id: &str,
+        ) -> Result<bool, crate::commands::ctx::api::wire::ApiError> {
+            Err(crate::commands::ctx::api::wire::ApiError::new(
+                crate::commands::ctx::api::wire::ErrorCode::Unsupported,
+                "not exercised by this test",
+            ))
+        }
+    }
+
+    #[test]
+    fn attach_runtime_falls_back_to_observer_mode_when_the_attach_is_refused() {
+        use crate::commands::ctx::api::server::{ApiServer, RunningServer, StaticSource};
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let facts = wire_facts("session-a", "s1", RuntimeKind::Native);
+
+        let mut setup_journal = Journal::open(&state).expect("open journal");
+        setup_journal
+            .create_session(&identity_for(&facts.session_id, facts.generation))
+            .expect("create session");
+
+        let endpoint = crate::commands::ctx::api::server::endpoint_for(&state);
+        let server = ApiServer::new(Box::new(StaticSource(vec![facts.clone()])), None);
+        let running =
+            RunningServer::start(&endpoint, std::sync::Arc::clone(&server)).expect("start");
+
+        let link =
+            super::super::link::RuntimeLink::connect(&state, true).expect("a runtime is listening");
+
+        // Review finding 3 (PR #544): `attach_runtime` used to never call
+        // `RuntimeLink::attach()` at all -- submit/interrupt/approve relied
+        // entirely on the server's "nobody attached yet" bypass. This bare
+        // server owns no terminal host, so the attach this pane now makes
+        // is refused, and the pane must fall back to a read-only observer
+        // rather than silently keep acting as if it held the controller
+        // seat.
+        let mut pane = NativePaneRuntime::attach_runtime(&state, link, &facts, PathBuf::from("."))
+            .expect("attach_runtime");
+
+        assert!(
+            pane.presentation.observer,
+            "a refused attach falls back to observer mode"
+        );
+        assert!(
+            pane.notice
+                .as_deref()
+                .is_some_and(|text| text.contains("attach refused")),
+            "the refusal is surfaced as a notice: {:?}",
+            pane.notice
+        );
+        assert!(
+            composer_hint_line(&pane.presentation).contains("observer"),
+            "the composer hint says this pane is read-only"
+        );
+
+        // No send is offered: a composer submit is held, never attempted
+        // over a link this pane does not control.
+        pane.presentation.composer.draft = "hello".to_string();
+        pane.presentation.composer.cursor = pane.presentation.composer.draft.len();
+        pane.handle_composer_action(ComposerAction::Submit);
+        assert_eq!(
+            pane.presentation.composer.queued.len(),
+            1,
+            "held, not sent, in observer mode"
+        );
+
+        // No interrupt is attempted either.
+        pane.notice = None;
+        pane.interrupt();
+        assert_eq!(
+            pane.notice.as_deref(),
+            Some("interrupt unavailable: this pane holds no controller seat (observer mode)"),
+            "no network call is attempted in observer mode"
+        );
+
+        pane.shutdown(&state);
+        drop(running);
+    }
+
+    #[test]
+    fn attach_runtime_registers_as_controller_and_a_refused_interrupt_is_surfaced() {
+        use crate::commands::ctx::api::server::{ApiServer, RunningServer, StaticSource};
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let facts = wire_facts("session-b", "s2", RuntimeKind::Native);
+
+        let mut setup_journal = Journal::open(&state).expect("open journal");
+        setup_journal
+            .create_session(&identity_for(&facts.session_id, facts.generation))
+            .expect("create session");
+
+        let endpoint = crate::commands::ctx::api::server::endpoint_for(&state);
+        let server = ApiServer::new(Box::new(StaticSource(vec![facts.clone()])), None);
+        server.attach_host(FakeHost::with(vec![facts.clone()]));
+        let running =
+            RunningServer::start(&endpoint, std::sync::Arc::clone(&server)).expect("start");
+
+        let link =
+            super::super::link::RuntimeLink::connect(&state, true).expect("a runtime is listening");
+
+        // Review finding 3 (PR #544): with a host that CAN honour the
+        // attach, this pane registers as the session's controller instead
+        // of relying on the server's "nobody attached yet" bypass.
+        let mut pane = NativePaneRuntime::attach_runtime(&state, link, &facts, PathBuf::from("."))
+            .expect("attach_runtime");
+        assert!(
+            !pane.presentation.observer,
+            "the attach succeeded as controller"
+        );
+        assert!(
+            pane.notice.is_none(),
+            "no fallback notice when the attach succeeds: {:?}",
+            pane.notice
+        );
+
+        // Review finding 4 (PR #544): this server owns no NATIVE
+        // conversations (only the generic terminal host above), so
+        // `session.interrupt` itself is refused. That refusal used to be
+        // swallowed by `let _ = link.interrupt(...)`; it must now reach the
+        // operator as a notice instead.
+        pane.interrupt();
+        assert!(
+            pane.notice
+                .as_deref()
+                .is_some_and(|text| text.contains("interrupt refused by the runtime")),
+            "a refused interrupt is surfaced, not swallowed: {:?}",
+            pane.notice
+        );
+
+        pane.shutdown(&state);
+        drop(running);
     }
 }
