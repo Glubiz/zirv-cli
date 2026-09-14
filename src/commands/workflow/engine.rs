@@ -5535,6 +5535,217 @@ mod tests {
         );
     }
 
+    /// Issue #610 scenario 3 (roadmap N05/N14/N15, review of #493): a real
+    /// multi-file change, driven through BOTH gates a Feature workflow has
+    /// -- Test (a real `--run-checks` execution) and Review (a real
+    /// unresolved finding, blocking, then resolved) and Verify (a second
+    /// real `--run-checks` execution) -- rather than exercising either gate
+    /// in isolation the way the surrounding tests in this module do. Every
+    /// step is the REAL production entry point (`run(&args, ...)`,
+    /// `advance_with_evidence`), never a stand-in for what the gate would
+    /// decide.
+    #[test]
+    fn a_real_multi_file_change_advances_only_once_test_review_and_verify_each_genuinely_pass() {
+        use super::super::review::{FindingDisposition, FindingSeverity, ReviewFinding};
+
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(repo.path().join("b.rs"), "fn b() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        // The real multi-file change this workflow is actually about.
+        std::fs::write(repo.path().join("a.rs"), "fn a() { println!(\"a\"); }\n").unwrap();
+        std::fs::write(repo.path().join("b.rs"), "fn b() { println!(\"b\"); }\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "touch two files"]);
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        let passing = if cfg!(windows) { "exit /b 0" } else { "exit 0" };
+        let failing = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
+        let write_check = |command: &str| {
+            std::fs::write(
+                repo.path().join(".zirv/verify.toml"),
+                format!(
+                    "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{command}'\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_check(passing);
+
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "touch two files".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        let review_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Review)
+            .expect("Medium risk must materialize a review step");
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .unwrap();
+        let verify_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .unwrap();
+        assert!(
+            test_index < review_index && review_index < verify_index,
+            "test, then review, then verify: {:?}",
+            state.steps.iter().map(|s| s.phase).collect::<Vec<_>>()
+        );
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let advance_args = || WorkflowArgs {
+            command: WorkflowSubcommand::Advance(AdvanceArgs {
+                id: id.clone(),
+                outcome: None,
+                run_checks: true,
+                repo: Some(repo.path().to_path_buf()),
+                json: false,
+                duration_ms: None,
+                agent: None,
+                model: None,
+                role: None,
+                input_tokens: None,
+                output_tokens: None,
+                workers: 0,
+                frontend_root: None,
+                accept_preexisting_findings: false,
+            }),
+        };
+
+        // Gate 1 (Test): a real passing check over the real two-file diff.
+        let mut out = Vec::new();
+        let code = run(&advance_args(), &mut out).unwrap();
+        assert_eq!(code, 0, "a passing test check must advance past Test");
+        let after_test = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(after_test.current().unwrap().phase, WorkflowPhase::Review);
+
+        // Gate 2 (Review): a real, unresolved finding blocks -- the same
+        // gate `a_finding_recorded_while_the_reviewer_ran_survives_the_
+        // evidence_write` proves records for real; this proves what the
+        // engine does with it.
+        let mut with_finding = after_test;
+        with_finding.review_findings.push(ReviewFinding {
+            id: "finding-1".into(),
+            severity: FindingSeverity::Major,
+            summary: "both files need a second look".into(),
+            path: Some("a.rs".into()),
+            line: None,
+            disposition: FindingDisposition::Open,
+            recommended_disposition: None,
+            created_at: 0,
+        });
+        save(&state_dir, &with_finding, true).unwrap();
+        let blocked = advance_with_evidence(
+            &state_dir,
+            with_finding.clone(),
+            StepOutcome::Success,
+            None,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            blocked.contains("final disposition"),
+            "an open finding must block review: {blocked}"
+        );
+
+        // Resolved for real: the review gate now passes, into Verify. Also
+        // needs one fresh independent review run recorded against the
+        // CURRENT diff's own fingerprint -- the same freshness check
+        // `fix_review_rounds_advance_only_for_a_changed_fingerprint` pins,
+        // computed here with the real production function rather than a
+        // guessed value.
+        let mut resolved = with_finding;
+        resolved.review_findings[0].disposition = FindingDisposition::Fixed;
+        let fingerprint = super::super::verification::change_fingerprint(&resolved.repo).unwrap();
+        resolved
+            .review_evidence
+            .push(super::super::review::ReviewRunEvidence {
+                id: "review-1".into(),
+                change_fingerprint: fingerprint,
+                adapter: "claude".into(),
+                review_round: 1,
+                completed_at: 0,
+                head_sha: None,
+                reviewed_tree_sha: None,
+                finding_dispositions: std::collections::BTreeMap::new(),
+            });
+        let after_review =
+            advance_with_evidence(&state_dir, resolved, StepOutcome::Success, None, false)
+                .expect("a resolved finding must let review pass");
+        assert_eq!(after_review.current().unwrap().phase, WorkflowPhase::Verify);
+        save(&state_dir, &after_review, true).unwrap();
+
+        // Gate 3 (Verify): a real failing check refuses this same diff...
+        write_check(failing);
+        let mut out = Vec::new();
+        let code = run(&advance_args(), &mut out).unwrap();
+        assert_eq!(code, 1, "a failing verify check must not advance");
+        let still_verify = load(&state_dir, repo.path(), &id).unwrap();
+        assert_eq!(
+            still_verify.current().unwrap().phase,
+            WorkflowPhase::Verify,
+            "a failing check must not advance the workflow"
+        );
+
+        // ...and a real passing check over the SAME multi-file diff finally
+        // clears it.
+        write_check(passing);
+        let mut out = Vec::new();
+        let code = run(&advance_args(), &mut out).unwrap();
+        assert_eq!(code, 0, "a passing verify check must advance past Verify");
+        let final_state = load(&state_dir, repo.path(), &id).unwrap();
+        assert_ne!(
+            final_state.current().map(|step| step.phase),
+            Some(WorkflowPhase::Verify),
+            "the workflow must have moved past verify: {:?}",
+            final_state.current()
+        );
+    }
+
     /// The mirror of the above: a failing check must print the failure and
     /// leave the workflow exactly where it was, rather than advancing on
     /// bad evidence.
