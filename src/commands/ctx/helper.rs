@@ -347,6 +347,44 @@ mod tests {
         assert!(answer.text.contains("## Task"), "got: {}", answer.text);
     }
 
+    /// Issue #492 (roadmap N23) item 3: the same proof, widened to EVERY
+    /// helper role an all-native installation has to serve -- the distiller
+    /// behind handoff, memory harvest, memory consolidation and the agent
+    /// loop's objective judge; `ask`; `optimize`; and the built-in agent
+    /// `seat`. One role passing says nothing about the others: each resolves
+    /// its own route, and a regression that reintroduced a vendor-CLI
+    /// dependency on any single one of them would otherwise only be found by
+    /// an operator with no harness installed. `PATH` is empty for all four.
+    #[test]
+    fn every_helper_role_answers_with_every_coding_harness_removed_from_path() {
+        for role in [ROLE_DISTILLER, ROLE_ASK, ROLE_OPTIMIZE, ROLE_SEAT] {
+            let repo = crate::commands::ctx::testenv::repo();
+            let home = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let _path = VarGuard::set(&[("PATH", Some(""))]);
+            let script = fixture("helper-answer.json");
+            let answer = run(
+                &HelperRequest {
+                    repo: repo.path(),
+                    prompt: "distill this",
+                    role,
+                    route: None,
+                    budget: HelperBudget::one_shot(30_000),
+                    provider: Some(&format!("fixture:{}", script.display())),
+                },
+                &env_for(state.path()),
+            )
+            .unwrap_or_else(|err| panic!("role {role} must answer natively: {err:?}"));
+            assert_eq!(answer.status, NativeStatus::Completed, "role {role}");
+            assert!(
+                answer.text.contains("## Task"),
+                "role {role} got: {}",
+                answer.text
+            );
+        }
+    }
+
     /// Issue #484 item 6: a read-only helper is read-only because the BROKER
     /// says so, not because the helper is asked nicely.
     ///
