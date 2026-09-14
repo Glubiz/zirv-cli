@@ -335,16 +335,16 @@ jobs:
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
             || { echo "filter matched no tests" >&2; exit 1; }
 
-  # CD is idempotent on an already-published version (the release step prints
-  # "release $TAG is already published; nothing to do" and skips the
-  # Homebrew/Chocolatey jobs), so an unbumped merge just deploys nothing --
-  # it does not fail. A bump is what makes a code change actually ship. So
-  # this only requires a version bump when the diff since the base branch
-  # touches a path that changes the shipped binary (src/, Cargo.toml,
-  # Cargo.lock, build.rs); a README/docs/CI-only PR passes unbumped.
+  # PRs into `release/**` integration branches share one pinned release
+  # version, so they are exempt. This check still guards every PR into main,
+  # where CD is idempotent on an already-published version and a bump is what
+  # makes a code change actually ship. It only requires a version bump when
+  # the diff since the base branch touches a path that changes the shipped
+  # binary (src/, Cargo.toml, Cargo.lock, build.rs); a README/docs/CI-only PR
+  # passes unbumped.
   version-bump:
     name: Version Bump Check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       # fetch-depth: 0 so `origin/${{ github.base_ref }}...HEAD` has a real
