@@ -16,14 +16,17 @@
 //!
 //! # Selection
 //!
-//! There is no new configuration key. A helper runs natively exactly when the
-//! operator's own native provider configuration names a route for that
-//! helper's ROLE (`[roles]` in `~/.zirv/native.toml`, or `--route`); otherwise
-//! [`available`] reports `false` and the caller keeps its existing harness
-//! path unchanged. That is the same `[roles]` selection `zirv ctx exec
-//! --runtime native` and `zirv agent --runtime native` already use, so a
-//! legacy session is never silently migrated and a native session never needs
-//! a harness binary.
+//! A helper runs natively when BOTH of two things are true: `role` resolves
+//! to [`runtime::RuntimeKind::Native`] through the same role-aware table
+//! `zirv ctx doctor` and every other launch surface read (`[runtime.roles]`,
+//! then `[runtime] default`, harness when neither is set -- issue #594,
+//! roadmap N22), AND the operator's native provider configuration names a
+//! route for that role (`[roles]` in `~/.zirv/native.toml`, or `--route`).
+//! Otherwise [`available`] reports `false` and the caller keeps its existing
+//! harness path unchanged. A native route with no matching runtime binding is
+//! therefore inert -- the same posture `zirv ctx doctor` already reports for
+//! the role -- so a legacy session is never silently migrated and a native
+//! session never needs a harness binary.
 //!
 //! # Read-only is the broker's decision, not this module's
 //!
@@ -40,6 +43,7 @@
 use std::path::Path;
 
 use super::config::EnvLookup;
+use super::runtime;
 use super::runtime::native::{self, NativeLimits, NativeStatus};
 
 /// The role a helper call resolves its route from. These are the `[roles]`
@@ -155,6 +159,20 @@ impl std::fmt::Display for HelperError {
 
 impl std::error::Error for HelperError {}
 
+/// Whether `role`'s own runtime binding resolves to native -- the SAME
+/// role-aware table `zirv ctx doctor` and every other launch surface read
+/// (`[runtime.roles]`, then `[runtime] default`, harness when neither is
+/// set). Issue #594 (roadmap N22): a native route existing in
+/// `~/.zirv/native.toml` is necessary but not sufficient for a helper to
+/// spend it -- an operator who has bound this role to `harness` (or left
+/// `[runtime]` unconfigured) must get the harness path, exactly what doctor
+/// already reports for the role, not a silent native dispatch that
+/// disagrees with it.
+fn runtime_role_is_native(repo: &Path, role: &str, env: EnvLookup<'_>) -> bool {
+    runtime::resolve_for_cli(runtime::CONFIGURED, repo, env, role)
+        .is_ok_and(|choice| choice.kind == runtime::RuntimeKind::Native)
+}
+
 /// Whether a helper for `role` has a native route on this machine.
 ///
 /// Answers from operator configuration alone -- no credential store, no
@@ -162,7 +180,7 @@ impl std::error::Error for HelperError {}
 /// before doing any work, and a missing credential still fails where it
 /// should: at the actual request.
 pub fn available(repo: &Path, role: &str, route: Option<&str>, env: EnvLookup<'_>) -> bool {
-    native::route_provider(repo, route, role, env).is_ok()
+    runtime_role_is_native(repo, role, env) && native::route_provider(repo, route, role, env).is_ok()
 }
 
 /// Runs one bounded, read-only native helper call and returns its text.
@@ -188,6 +206,18 @@ pub fn run(request: &HelperRequest<'_>, env: EnvLookup<'_>) -> Result<HelperAnsw
     // configured route for it would make the deterministic path unreachable on
     // a machine with no provider configuration at all.
     if request.provider.is_none() {
+        // Issue #594 (roadmap N22): the role-aware runtime table gates
+        // FIRST, before any native.toml route lookup -- see
+        // `runtime_role_is_native`. This must agree with `available` above,
+        // since callers such as `handoff::helper_answer` check `available`
+        // and then immediately call `run`.
+        if !runtime_role_is_native(request.repo, request.role, env) {
+            return Err(HelperError::Unconfigured(format!(
+                "role `{}` is not bound to the native runtime (add it to [runtime.roles] or set \
+                 [runtime] default = \"native\" in ~/.zirv/ctx.toml)",
+                request.role
+            )));
+        }
         native::route_provider(request.repo, request.route, request.role, env)
             .map_err(|error| HelperError::Unconfigured(error.to_string()))?;
     }
@@ -384,6 +414,90 @@ mod tests {
                 "role {role} got: {}",
                 answer.text
             );
+        }
+    }
+
+    /// Issue #594 (roadmap N22): a native route in `~/.zirv/native.toml`'s
+    /// `[roles]` must not be enough on its own -- the role's OWN binding in
+    /// `~/.zirv/ctx.toml`'s `[runtime.roles]` decides whether it may spend
+    /// that route at all, agreeing with `zirv ctx doctor`'s own per-role
+    /// resolution (`runtime::resolve(runtime::CONFIGURED, ..., role)`,
+    /// reused verbatim below -- the exact closure `doctor::diagnose` calls).
+    /// `distiller`/`optimize` are bound to `harness` despite a working native
+    /// route; `ask`/`seat` are bound to `native` -- a deliberately conflicting
+    /// mix, so the gate is proven in both directions rather than only "off".
+    #[test]
+    fn helpers_honor_runtime_role_bindings() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).unwrap();
+        // A working native route bound to EVERY helper role: before #594,
+        // this alone was enough to send all four native.
+        std::fs::write(
+            home.path().join(".zirv").join("native.toml"),
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n\
+             [route.a]\naccount='work'\nmodel='haiku'\n\
+             [roles]\ndistiller='a'\nask='a'\noptimize='a'\nseat='a'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            "[runtime.roles]\ndistiller='harness'\noptimize='harness'\nask='native'\nseat='native'\n",
+        )
+        .unwrap();
+
+        let env = env_for(state.path());
+        let cfg =
+            crate::commands::ctx::config::CtxConfig::load(repo.path(), &env).expect("load cfg");
+
+        for (role, expect_native) in [
+            (ROLE_DISTILLER, false),
+            (ROLE_OPTIMIZE, false),
+            (ROLE_ASK, true),
+            (ROLE_SEAT, true),
+        ] {
+            let doctor_choice = crate::commands::ctx::runtime::resolve(
+                crate::commands::ctx::runtime::CONFIGURED,
+                &cfg.runtime,
+                role,
+            )
+            .expect("resolve");
+            let doctor_says_native =
+                doctor_choice.kind == crate::commands::ctx::runtime::RuntimeKind::Native;
+            assert_eq!(doctor_says_native, expect_native, "role {role}: test setup");
+
+            let dispatch_says_native = available(repo.path(), role, None, &env);
+            assert_eq!(
+                dispatch_says_native, doctor_says_native,
+                "role {role}: helper::available must agree with doctor's own per-role \
+                 resolution, not native.toml's route binding alone"
+            );
+
+            if !expect_native {
+                // The role-table gate must refuse BEFORE `run` ever spends
+                // the configured native route -- proven by getting exactly
+                // `Unconfigured`, the same outcome an operator with no
+                // native.toml route at all sees, rather than attempting a
+                // real request against the harness-bound role's route.
+                let outcome = run(
+                    &HelperRequest {
+                        repo: repo.path(),
+                        prompt: "check the role binding",
+                        role,
+                        route: None,
+                        budget: HelperBudget::one_shot(1_000),
+                        provider: None,
+                    },
+                    &env,
+                );
+                assert!(
+                    matches!(outcome, Err(HelperError::Unconfigured(_))),
+                    "role {role} is bound to harness; run() must refuse before spending the \
+                     configured native route: {outcome:?}"
+                );
+            }
         }
     }
 
