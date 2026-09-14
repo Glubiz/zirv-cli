@@ -796,16 +796,12 @@ pub struct Pane {
     role: PromptRole,
     session_id: String,
     parser: vt100::Parser,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    /// P2/P3: this child's membership in the console-close pid registry and
-    /// its kill-on-close job object. Held for the child's whole life and
-    /// released by `shutdown`/`finish_shutdown` once the child is confirmed
-    /// gone -- so closing the dashboard's window, or killing the dashboard
-    /// outright, takes the pane's agent with it instead of orphaning it.
-    lifecycle: supervise::ChildGuard,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    /// Issue #490 (roadmap N21 item A): what actually drives this pane -- the
+    /// wrapped harness's own pty child, or an in-process native conversation.
+    /// Everything outside this field is common to both kinds, which is why
+    /// the dashboard's `Vec<Pane>` did not have to become a `Vec<PaneKind>`
+    /// for a native pane to live in it.
+    kind: PaneKind,
     /// Issue #330 (review finding 2): whether the last drain left this pane's
     /// reader channel unfinished -- it stopped on its share of the tick's
     /// budget rather than on an empty channel. `dash::reap_ended_panes` holds
@@ -814,7 +810,6 @@ pub struct Pane {
     /// still queued, and reaping it there would drop the one thing the
     /// operator most needs to see -- what the child said before it died.
     pending_output: bool,
-    server: Option<SignalServer>,
     guard: SessionGuard,
     state_dir: StateDir,
     /// When this pane last reported a turn boundary (`on_turn_signal`), and
@@ -1036,7 +1031,258 @@ pub struct Pane {
     delegation: Option<DelegationFacts>,
 }
 
+/// Issue #490 (roadmap N21 item A): what drives one dashboard pane.
+///
+/// The wrapped variant is the pane the dashboard has always had, with its
+/// process-owning parts moved verbatim into [`PtyPane`]; the native variant
+/// is `dash::native_pane`'s own in-process conversation driver. Everything a
+/// pane carries that is NOT about owning a process -- its title, role, verb,
+/// registry guard, budget, delegation, mail bookkeeping -- stays on [`Pane`]
+/// itself, so the ~164 call sites in `dash::mod` that ask a pane for its
+/// short id, state, spend or address are unchanged by this.
+///
+/// Only the handful of operations that genuinely differ branch on this:
+/// rendering (a vt100 grid versus the native renderer), input (the pty
+/// writer versus the composer), delivery (a visible injection versus the
+/// native submit path), and lifecycle (a quit sequence versus a session
+/// shutdown).
+pub enum PaneKind {
+    Wrapped(PtyPane),
+    Native(Box<super::native_pane::NativePaneRuntime>),
+    /// A native pane whose session has already been ended. Shutting a native
+    /// session down consumes its driver, and the release profile is
+    /// `panic = "abort"` so `Drop` cannot be relied on -- parking the pane
+    /// here is what makes `shutdown`/`finish_shutdown` idempotent for a
+    /// native pane without a second flag beside `done`.
+    Ended,
+}
+
+/// The process-owning half of a wrapped pane, verbatim from what [`Pane`]
+/// used to hold inline.
+pub struct PtyPane {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// P2/P3: this child's membership in the console-close pid registry and
+    /// its kill-on-close job object. Held for the child's whole life and
+    /// released by `shutdown`/`finish_shutdown` once the child is confirmed
+    /// gone -- so closing the dashboard's window, or killing the dashboard
+    /// outright, takes the pane's agent with it instead of orphaning it.
+    lifecycle: supervise::ChildGuard,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    server: Option<SignalServer>,
+}
+
+/// The one message every pty-only operation refuses a native pane with.
+pub(crate) const NOT_A_PTY_PANE: &str =
+    "dashboard pane: this is a native pane; it has no pty to write to";
+
 impl Pane {
+    /// Whether this pane is driven by an in-process native conversation
+    /// rather than a wrapped harness behind a pty.
+    pub fn is_native(&self) -> bool {
+        matches!(self.kind, PaneKind::Native(_))
+    }
+
+    pub fn native(&self) -> Option<&super::native_pane::NativePaneRuntime> {
+        match &self.kind {
+            PaneKind::Native(native) => Some(native),
+            _ => None,
+        }
+    }
+
+    pub fn native_mut(&mut self) -> Option<&mut super::native_pane::NativePaneRuntime> {
+        match &mut self.kind {
+            PaneKind::Native(native) => Some(native),
+            _ => None,
+        }
+    }
+
+    fn pty(&self) -> Option<&PtyPane> {
+        match &self.kind {
+            PaneKind::Wrapped(pty) => Some(pty),
+            _ => None,
+        }
+    }
+
+    fn pty_mut(&mut self) -> Option<&mut PtyPane> {
+        match &mut self.kind {
+            PaneKind::Wrapped(pty) => Some(pty),
+            _ => None,
+        }
+    }
+
+    /// The writer for a wrapped pane. A native pane has no pty at all, and
+    /// saying so explicitly is what keeps every byte-level path (key
+    /// forwarding, the quit sequence, a visible injection) from silently
+    /// doing nothing on one.
+    fn writer(&self) -> CtxResult<&Arc<Mutex<Box<dyn Write + Send>>>> {
+        match &self.kind {
+            PaneKind::Wrapped(pty) => Ok(&pty.writer),
+            _ => Err(NOT_A_PTY_PANE.into()),
+        }
+    }
+
+    /// Polls a wrapped pane's child. A native pane has no child, so it never
+    /// reports one exiting -- its own end is observed through `tick_native`.
+    fn pty_try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        match &mut self.kind {
+            PaneKind::Wrapped(pty) => pty.child.try_wait(),
+            _ => Ok(None),
+        }
+    }
+
+    fn release_lifecycle(&mut self) {
+        if let PaneKind::Wrapped(pty) = &mut self.kind {
+            pty.lifecycle.release();
+        }
+    }
+
+    /// Advances a native pane one tick and reports whether anything changed.
+    /// The wrapped pane's `drain` equivalent: it is the one place the
+    /// conversation is re-read, the approval channel is polled, and the
+    /// session's own end is turned into this pane's `exit_code` so
+    /// `dash::reap_ended_panes` retires a finished native pane by exactly the
+    /// same path it retires a finished wrapped one.
+    fn tick_native(&mut self) -> bool {
+        let PaneKind::Native(native) = &mut self.kind else {
+            return false;
+        };
+        let before = native.last_sequence();
+        native.tick();
+        let ended = native.ended;
+        let changed = native.last_sequence() != before;
+        if ended && self.exit_code.is_none() {
+            self.exit_code = Some(0);
+            self.exited_after = Some(self.launched_at.elapsed());
+        }
+        if changed {
+            self.last_output_at = Some(Instant::now());
+        }
+        changed
+    }
+
+    /// Ends a native pane's session exactly once. Idempotent, because both
+    /// `shutdown` and `finish_shutdown` can reach it and the release profile
+    /// is `panic = "abort"`, so neither may rely on `Drop`.
+    fn finish_native(&mut self) {
+        let state = self.state_dir.clone();
+        if let PaneKind::Native(_) = &self.kind {
+            // Replacing the driver with an already-ended one is how this stays
+            // idempotent without a second flag: the shutdown consumes the
+            // runtime, and what is left behind can only be shut down again as
+            // a no-op.
+            if let PaneKind::Native(native) = std::mem::replace(&mut self.kind, PaneKind::Ended) {
+                native.shutdown(&state);
+            }
+        }
+    }
+
+    /// Issue #490 (roadmap N21 item A): opens a NATIVE pane in the ordinary
+    /// dashboard.
+    ///
+    /// The conversation itself is opened by `dash::native_pane::
+    /// open_native_pane`, which is also what `resolve_attach` routes: an
+    /// operator with the persistent runtime gate on, a runtime that serves
+    /// native conversations and a live native seat for this repository gets a
+    /// runtime-ATTACHED pane, and everything else gets an in-process one.
+    /// That is why a restore comes back through here rather than through a
+    /// second code path of its own -- reopening a seat the runtime already
+    /// holds is exactly the two-supervisors failure `link::RUNTIME_OWNS_IT`
+    /// exists to prevent.
+    ///
+    /// The registry record is filed under the driver's OWN seat short id, so
+    /// the pane's mail/nudge address, the restore roster, the attention
+    /// projection and the budget sweep all key on the same identity the
+    /// native session registered for itself.
+    pub fn spawn_native(
+        cfg: &super::super::config::CtxConfig,
+        state: &StateDir,
+        env: super::super::config::EnvLookup<'_>,
+        repo: &Path,
+        verb: Verb,
+        title: String,
+        size: (u16, u16),
+        spec: super::native_pane::NativeDashboardSpec,
+    ) -> CtxResult<Pane> {
+        let (cols, rows) = size;
+        // An unrecognised role label is the orchestrator's, the same
+        // default a dashboard's own pane has always had.
+        let role = PromptRole::from_label(&spec.role).unwrap_or(PromptRole::Orchestrator);
+        let cwd = spec.repo.clone();
+        let native = super::native_pane::open_native_pane(cfg, state, env, spec)?;
+        // The design note's own rule, applied to the sidebar: an operator has
+        // to be able to tell at a glance whether closing this pane stops the
+        // conversation or merely detaches from it.
+        let title = match native.attach() {
+            super::native_pane::PaneAttach::Runtime { .. } => format!("{title} (runtime)"),
+            super::native_pane::PaneAttach::InProcess => title,
+        };
+        let session_id = native.journal_session();
+        let agent_name = super::super::runtime::RuntimeKind::Native
+            .as_str()
+            .to_string();
+
+        let guard = SessionGuard::register(
+            state,
+            Record::new(&session_id, &agent_name, repo, verb)
+                .with_stable_short(native.short())
+                .with_role(role.label()),
+        );
+
+        Ok(Pane {
+            title,
+            agent_name,
+            verb,
+            role,
+            session_id,
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
+            kind: PaneKind::Native(Box::new(native)),
+            pending_output: false,
+            guard,
+            state_dir: state.clone(),
+            last_signal_at: None,
+            last_output_at: None,
+            // A native pane has no turn-signal socket and no quiet-window
+            // heuristic: `state()` reads the driver's own session state
+            // directly, which is authoritative rather than inferred.
+            turn_signal_capable: true,
+            idle_quiet: Duration::from_millis(0),
+            last_local_input_at: None,
+            injected_awaiting_turn: false,
+            user_typed_since_turn: false,
+            exit_code: None,
+            launched_at: Instant::now(),
+            exited_after: None,
+            done: false,
+            report_to: None,
+            intake_dir: None,
+            work_group_id: None,
+            budget_tokens: None,
+            measured_usage: None,
+            launch_model: None,
+            reservation_id: None,
+            budget_soft_warned: false,
+            budget_grace_given: false,
+            deadline: None,
+            parent_session: None,
+            report_reminder_sent: false,
+            settled_mail_sent: false,
+            stalled_mail_sent: false,
+            mail_block_log: None,
+            result_schema: None,
+            pending_submit: None,
+            submit_confirmation: None,
+            delivery_sender: None,
+            last_injection_at: Instant::now(),
+            launch_mode: super::super::adapters::LaunchMode::Interactive,
+            writer_permit: None,
+            cwd,
+            owns_cwd: false,
+            delegation: None,
+        })
+    }
+
     /// Spawns `spec.argv` behind a ConPTY/pty sized `size` (`(cols, rows)`,
     /// matching `wrap::window_size`'s own convention), binds this pane's own
     /// turn-signal socket at `state.socket_for(&spec.session_id)`, and
@@ -1269,13 +1515,15 @@ impl Pane {
             role,
             session_id,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
-            master,
-            child,
-            lifecycle,
-            writer,
-            rx,
+            kind: PaneKind::Wrapped(PtyPane {
+                master,
+                child,
+                lifecycle,
+                writer,
+                rx,
+                server,
+            }),
             pending_output: false,
-            server,
             guard,
             state_dir: state.clone(),
             last_signal_at: None,
@@ -1359,7 +1607,14 @@ impl Pane {
     /// see [`drain_into`].
     pub fn drain_with_budget(&mut self, budget: usize) -> (bool, bool, usize) {
         self.poll_exit();
-        let (any, more, used) = drain_into(&self.rx, &mut self.parser, budget);
+        let (any, more, used) = match &self.kind {
+            PaneKind::Wrapped(pty) => drain_into(&pty.rx, &mut self.parser, budget),
+            // A native pane has no reader channel: its conversation lives in
+            // the journal and `tick_native` is what re-reads it. It spends
+            // none of the tick's shared parsing budget, so how many native
+            // panes a mixed roster holds never costs a wrapped pane latency.
+            _ => (self.tick_native(), false, 0),
+        };
         self.pending_output = more;
         if any {
             // O1: recorded, not acted on. Whether these bytes mean "a new turn
@@ -1652,7 +1907,7 @@ impl Pane {
     /// (Task 9) a visible injected line.
     pub fn write_input(&mut self, bytes: &[u8]) -> CtxResult<()> {
         let mut writer = self
-            .writer
+            .writer()?
             .lock()
             .map_err(|_| "dashboard pane: writer lock poisoned")?;
         writer.write_all(bytes)?;
@@ -1663,12 +1918,14 @@ impl Pane {
     /// Resizes both the pty and the `vt100` parser, so the two never
     /// disagree about how big this pane's screen is.
     pub fn resize(&mut self, rows: u16, cols: u16) -> CtxResult<()> {
-        self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        if let Some(pty) = self.pty_mut() {
+            pty.master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+        }
         self.parser.screen_mut().set_size(rows, cols);
         Ok(())
     }
@@ -1677,6 +1934,20 @@ impl Pane {
     /// `drain`/`on_turn_signal`/`poll_exit` -- no I/O of its own, so it is
     /// cheap enough to call every frame.
     pub fn state(&self) -> PaneState {
+        // Issue #490 (N21 item A): a native pane's state is a FACT its driver
+        // holds (the session state, plus whether an approval is outstanding),
+        // not something inferred from output quiet windows and turn signals a
+        // native conversation does not have.
+        if let Some(native) = self.native() {
+            return match self.exit_code {
+                Some(code) => PaneState::Ended(code),
+                None if native.busy() || native.blocked() => PaneState::Working,
+                None => PaneState::Idle,
+            };
+        }
+        if matches!(self.kind, PaneKind::Ended) {
+            return PaneState::Ended(self.exit_code.unwrap_or(0));
+        }
         state_from(
             pane_is_idle(
                 self.turn_signal_capable,
@@ -1719,8 +1990,17 @@ impl Pane {
     /// same reason `wrap::InjectionState::on_turn` clears its own.
     pub fn on_turn_signal(&mut self) {
         self.poll_exit();
-        if let Some(server) = &self.server {
-            while server.try_recv().is_some() {
+        let signalled = self.pty().is_some_and(|pty| {
+            let mut seen = false;
+            if let Some(server) = pty.server.as_ref() {
+                while server.try_recv().is_some() {
+                    seen = true;
+                }
+            }
+            seen
+        });
+        {
+            if signalled {
                 self.last_signal_at = Some(Instant::now());
                 self.pending_submit = None;
                 self.submit_confirmation = None;
@@ -1734,6 +2014,14 @@ impl Pane {
     /// This pane's registry short id -- its nudge/mail address.
     pub fn short(&self) -> &str {
         self.guard.short()
+    }
+
+    /// Issue #490 (N21 item A): whether the operator's keystrokes go to a pty
+    /// writer or to the native composer/UX router. The dashboard's key
+    /// routing asks this rather than inspecting the kind itself, so a native
+    /// control can never be offered on a wrapped pane by accident.
+    pub fn accepts_native_controls(&self) -> bool {
+        self.is_native()
     }
 
     pub fn title(&self) -> &str {
@@ -1776,7 +2064,13 @@ impl Pane {
     /// segment reads this for the focused pane instead of assuming every
     /// alive pane is supervised.
     pub fn reachable(&self) -> bool {
-        self.server.is_some()
+        match &self.kind {
+            PaneKind::Wrapped(pty) => pty.server.is_some(),
+            // A native pane is reached directly -- there is no socket to bind
+            // and nothing that can fail to bind, so it is never the degraded
+            // "visible but unsupervised" session a failed bind produces.
+            _ => true,
+        }
     }
 
     pub(crate) fn started_at(&self) -> u64 {
@@ -1847,13 +2141,23 @@ impl Pane {
     /// Read-only: nothing outside this module may re-point a live pane's
     /// model, which would make the row disagree with the running child.
     pub fn launch_model(&self) -> Option<&str> {
-        self.launch_model.as_deref()
+        // A native pane knows its route first-hand; a runtime-attached one
+        // honestly knows nothing, and says so rather than guessing.
+        match self.native() {
+            Some(native) => native.launch_model(),
+            None => self.launch_model.as_deref(),
+        }
     }
 
     /// Issue #354, the sidebar's `budget` disclosure line: the last usage
     /// snapshot the budget sweep measured, or `None` before the first one.
     pub fn measured_usage(&self) -> Option<super::super::event::TranscriptUsage> {
-        self.measured_usage
+        // A native pane's usage is journalled by its own session, so it
+        // never waits on the budget sweep's transcript read.
+        match self.native() {
+            Some(native) => Some(native.measured_usage()),
+            None => self.measured_usage,
+        }
     }
 
     /// Issue #354, the sidebar's `writer` disclosure line: whether this pane
@@ -2035,7 +2339,7 @@ impl Pane {
     /// real child (`permit::HeavyPermit::set_child_pid`) rather than the
     /// dashboard's own pid.
     pub fn child_pid(&self) -> Option<u32> {
-        self.child.process_id()
+        self.pty().and_then(|pty| pty.child.process_id())
     }
 
     /// Issue #264 (EXTRA): records the writer permit this pane holds for its
@@ -2143,9 +2447,24 @@ impl Pane {
     /// [`Self::write_operator_input`] if the operator starts typing into this
     /// pane before the deadline arrives on its own.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        // Issue #490 (N21 item A): delivery to a native pane goes through its
+        // own submit path, never a pty injection -- there is no composer to
+        // type into and no carriage return to send afterwards. It is complete
+        // on the spot (the text is committed to the conversation), so none of
+        // the two-phase submit bookkeeping below applies to it.
+        if let PaneKind::Native(native) = &mut self.kind {
+            native.deliver(label, body)?;
+            let now = Instant::now();
+            self.last_local_input_at = Some(now);
+            self.injected_awaiting_turn = true;
+            self.last_injection_at = now;
+            self.submit_confirmation = None;
+            self.delivery_sender = None;
+            return Ok(());
+        }
         {
             let mut writer = self
-                .writer
+                .writer()?
                 .lock()
                 .map_err(|_| "dashboard pane: writer lock poisoned")?;
             let sink: &mut dyn Write = &mut **writer;
@@ -2196,7 +2515,7 @@ impl Pane {
         }
         {
             let mut writer = self
-                .writer
+                .writer()?
                 .lock()
                 .map_err(|_| "dashboard pane: writer lock poisoned")?;
             let sink: &mut dyn Write = &mut **writer;
@@ -2213,6 +2532,28 @@ impl Pane {
     }
 
     pub(crate) fn screen_tail(&mut self) -> String {
+        // Issue #490 (N21 item A): a native pane has no vt100 grid; its tail
+        // is the tail of the transcript the same renderer draws, so a stall
+        // report or a screening excerpt describes what the operator sees.
+        if let Some(native) = self.native() {
+            let (view, presentation) = native.view();
+            let lines = super::native_pane::render_lines(view, presentation);
+            let tail: Vec<String> = lines
+                .iter()
+                .rev()
+                .take(20)
+                .map(super::native_pane::StyledLine::to_plain_string)
+                .collect();
+            let tail = tail.into_iter().rev().collect::<Vec<_>>().join(
+                "
+",
+            );
+            let mut start = tail.len().saturating_sub(2048);
+            while !tail.is_char_boundary(start) {
+                start += 1;
+            }
+            return tail[start..].to_string();
+        }
         let offset = self.scrollback();
         self.parser.screen_mut().set_scrollback(0);
         let contents = self.screen().contents();
@@ -2275,20 +2616,26 @@ impl Pane {
         // every release below AND made `finish_shutdown` -- guarded by the
         // same flag -- a permanent no-op. A pane whose quit failed is
         // precisely the pane that still needs escalating.
-        {
-            let mut writer = self
-                .writer
-                .lock()
-                .map_err(|_| "dashboard pane: writer lock poisoned")?;
-            let sink: &mut dyn Write = &mut **writer;
-            wrap::quit_child(sink, &mut self.child, quit_sequence, QUIT_GRACE)?;
+        match &mut self.kind {
+            PaneKind::Wrapped(pty) => {
+                let mut writer = pty
+                    .writer
+                    .lock()
+                    .map_err(|_| "dashboard pane: writer lock poisoned")?;
+                let sink: &mut dyn Write = &mut **writer;
+                wrap::quit_child(sink, &mut pty.child, quit_sequence, QUIT_GRACE)?;
+            }
+            // A native pane has no child to ask politely: ending it is
+            // `InteractiveSession::shutdown` (or a `session.detach` for a
+            // runtime-owned one), which `finish_native` performs once.
+            _ => self.finish_native(),
         }
         self.done = true;
         // P2/P3: the child is gone (or as gone as `quit_child` could make
         // it), so it must leave the console-close registry and its job handle
         // must close -- an explicit call, not `Drop`, because the release
         // profile is `panic = "abort"`.
-        self.lifecycle.release();
+        self.release_lifecycle();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
         // Issue #358: the seat is an address for a live session, released
         // alongside every other per-session artifact this pane owns. A
@@ -2348,13 +2695,18 @@ impl Pane {
             // byte into the pty master: conhost broadcasts those to every
             // client of the pseudoconsole (see `wrap::quit_child`).
             #[cfg(not(unix))]
-            if let Some(pid) = self.child.process_id() {
+            if let Some(pid) = self.child_pid() {
                 supervise::kill_tree(pid);
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            match &mut self.kind {
+                PaneKind::Wrapped(pty) => {
+                    let _ = pty.child.kill();
+                    let _ = pty.child.wait();
+                }
+                _ => self.finish_native(),
+            }
         }
-        self.lifecycle.release();
+        self.release_lifecycle();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
         // Issue #358: the seat is an address for a live session, released
         // alongside every other per-session artifact this pane owns. A
@@ -2419,6 +2771,18 @@ impl Pane {
         repo: &Path,
         size: (u16, u16),
     ) -> CtxResult<()> {
+        // Issue #490 (N21 item A): a handover swaps one WRAPPED harness child
+        // for another. A native pane's route moves through the runtime's own
+        // rollover (N19's `rollover_runtime`, which carries the conversation
+        // across a generation), so refusing here is the honest answer rather
+        // than silently doing nothing to a pane that has no child at all.
+        if !matches!(self.kind, PaneKind::Wrapped(_)) {
+            return Err(
+                "dashboard pane: a native pane has no harness child to hand over; its \
+                        route moves through the runtime rollover instead"
+                    .into(),
+            );
+        }
         // Whether the packet has to ride along with the resume. A swap back
         // onto the harness this pane is ALREADY running (issue #440's
         // source recovery) does not: that conversation holds everything the
@@ -2510,7 +2874,7 @@ impl Pane {
         });
         let mut turn_env = super::super::handover::build_turn_env(
             new_adapter.as_ref(),
-            self.server.as_ref(),
+            self.pty().and_then(|pty| pty.server.as_ref()),
             &self.session_id,
             repo,
             role,
@@ -2623,20 +2987,20 @@ impl Pane {
         // much live pane's record while the old child is being killed and no
         // new one exists yet.
         self.guard.adopt_child_pid(std::process::id());
-        {
-            let mut writer_guard = self
+        if let PaneKind::Wrapped(pty) = &mut self.kind {
+            let mut writer_guard = pty
                 .writer
                 .lock()
                 .map_err(|_| "dashboard pane: writer lock poisoned")?;
             let sink: &mut dyn Write = &mut **writer_guard;
-            wrap::quit_child(sink, &mut self.child, &quit_sequence, QUIT_GRACE)?;
+            wrap::quit_child(sink, &mut pty.child, &quit_sequence, QUIT_GRACE)?;
         }
         // The old child is gone (or as gone as `quit_child` could make it),
         // so it leaves the console-close registry and its job handle closes
         // -- the same explicit release `shutdown` performs, except this pane
         // is not itself ending: the new child's own guard, adopted above, is
-        // committed into `self.lifecycle` right below.
-        self.lifecycle.release();
+        // committed into this pane's new backend right below.
+        self.release_lifecycle();
 
         if let Some(child_pid) = child.process_id() {
             self.guard.adopt_child_pid(child_pid);
@@ -2686,11 +3050,21 @@ impl Pane {
         };
 
         self.agent_name = new_agent_name;
-        self.master = master;
-        self.child = child;
-        self.lifecycle = lifecycle;
-        self.writer = writer;
-        self.rx = rx;
+        // The turn-signal socket is this pane's own and survives the swap:
+        // the successor is told the same socket path, so the server moves to
+        // the new backend rather than being rebound.
+        let server = match &mut self.kind {
+            PaneKind::Wrapped(pty) => pty.server.take(),
+            _ => None,
+        };
+        self.kind = PaneKind::Wrapped(PtyPane {
+            master,
+            child,
+            lifecycle,
+            writer,
+            rx,
+            server,
+        });
         // A fresh channel has nothing outstanding on it: whatever the old
         // child left queued died with its receiver.
         self.pending_output = false;
@@ -2757,7 +3131,7 @@ impl Pane {
         if self.exit_code.is_some() {
             return;
         }
-        if let Ok(Some(status)) = self.child.try_wait() {
+        if let Ok(Some(status)) = self.pty_try_wait() {
             self.exit_code = Some(status.exit_code() as i32);
             self.exited_after = Some(self.launched_at.elapsed());
         }
@@ -4245,14 +4619,16 @@ pub(crate) mod tests {
         )
         .expect("spawn");
 
-        let writer = Arc::clone(&pane.writer);
+        let writer = Arc::clone(pane.writer().expect("a wrapped pane has a writer"));
         let _ = std::thread::spawn(move || {
             let _held = writer.lock().expect("lock");
             panic!("poison the pane writer");
         })
         .join();
         assert!(
-            pane.writer.is_poisoned(),
+            pane.writer()
+                .expect("a wrapped pane has a writer")
+                .is_poisoned(),
             "sanity: the writer lock is poisoned"
         );
 
@@ -4577,14 +4953,16 @@ pub(crate) mod tests {
         )
         .expect("spawn");
 
-        let writer = Arc::clone(&pane.writer);
+        let writer = Arc::clone(pane.writer().expect("a wrapped pane has a writer"));
         let _ = std::thread::spawn(move || {
             let _held = writer.lock().expect("lock");
             panic!("poison the pane writer");
         })
         .join();
         assert!(
-            pane.writer.is_poisoned(),
+            pane.writer()
+                .expect("a wrapped pane has a writer")
+                .is_poisoned(),
             "sanity: the writer lock is poisoned, so the polite quit must fail"
         );
 
@@ -5291,9 +5669,11 @@ pub(crate) mod tests {
             )
             .expect("spawn");
             let capture = tmp.path().join("input");
-            pane.writer = Arc::new(Mutex::new(Box::new(
-                std::fs::File::create(&capture).expect("capture"),
-            )));
+            if let PaneKind::Wrapped(pty) = &mut pane.kind {
+                pty.writer = Arc::new(Mutex::new(Box::new(
+                    std::fs::File::create(&capture).expect("capture"),
+                )));
+            }
             pane.inject_visible("mail", "hello").expect("inject");
             pane.submit_pending().expect("submit");
             let submitted = pane.submit_confirmation.expect("confirmation").0;

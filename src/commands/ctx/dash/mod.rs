@@ -3634,6 +3634,13 @@ fn on_quit(
             // SESSION_ENV` -- without this, a quit/restore round-trip
             // silently downgraded a genuine worker's steering mail to peer.
             parent_session: pane.parent_session().map(str::to_string),
+            // Issue #490 (roadmap N21 item A): which KIND of pane this was, so
+            // the restore reopens it through `open_native_pane`/
+            // `resolve_attach` rather than trying to relaunch an argv a native
+            // pane never had. The generation is recorded beside it so a
+            // restore that comes back on a different one is visible.
+            native: pane.is_native(),
+            native_generation: pane.native().map(|native| native.generation()).unwrap_or(0),
         })
         .collect();
     let panes_for_roster = merge_unoffered(live, unoffered);
@@ -6368,6 +6375,59 @@ fn fulfill_spawn_request(
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(SpawnRefusal::policy(reason));
     }
+    // Issue #490 (roadmap N21 item A): a request naming the NATIVE runtime
+    // opens a native pane instead of a wrapped harness child. Everything
+    // above this point has already run -- the argv guard, the repo gate, the
+    // workdir roots, the pane cap, the delegation depth cap and the operator's
+    // own agent allowlist -- and the pane's own session takes it from there:
+    // `spawn_interactive` acquires its writer lease against this seat's own
+    // generation and its execution broker is the effect-time authority, so a
+    // native worker is fenced by N04 rather than by a harness's argv.
+    //
+    // What this path deliberately does NOT do is the wrapped path's
+    // harness-shaped accounting -- the reroute search, the per-provider token
+    // reservation, the work-group token ledger and the pane deadline are all
+    // keyed to an adapter and a transcript a native session does not have. A
+    // request that asks for any of them is refused here rather than accepted
+    // and silently unaccounted.
+    if req
+        .agent
+        .eq_ignore_ascii_case(super::runtime::RuntimeKind::Native.as_str())
+    {
+        if req.work_group_id.is_some() || req.budget_tokens.is_some() || req.timeout_secs.is_some()
+        {
+            return Err(SpawnRefusal::policy(
+                "a native pane cannot yet be spawned inside a work group or under a token/time                  ceiling: those are accounted from a harness transcript this session does not                  have"
+                    .to_string(),
+            ));
+        }
+        let title = format!("wrk native {}", requested_role.label());
+        let mut pane = Pane::spawn_native(
+            cfg,
+            state,
+            &super::config::env_from_process(),
+            repo,
+            sessions::Verb::Dash,
+            title,
+            size,
+            native_pane::NativeDashboardSpec {
+                repo: spawn_cwd.clone(),
+                role: requested_role.label().to_string(),
+                route: req.model.clone(),
+                // A worker delegation is writing work; a read-only request is
+                // expressed by the pane's own broker refusing every write,
+                // which is the same answer `--mode read-only` produces.
+                writing: req.mode == super::permit::WorkerMode::Writing,
+            },
+        )
+        .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
+        pane.set_report_to(report_to_for(req, cfg));
+        pane.set_parent_session(verified_parent.clone());
+        let short = pane.short().to_string();
+        panes.push(pane);
+        nudge_queues.push(VecDeque::new());
+        return Ok((short, Vec::new(), None));
+    }
     let requested_adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
 
@@ -9035,6 +9095,47 @@ fn spawn_restored_pane(
     errors: &mut ErrorLog,
     deferred_restore: &mut Vec<roster::RosterPane>,
 ) {
+    // Issue #490 (roadmap N21 item A): a native pane comes back through the
+    // SAME seam a fresh one opens on -- `open_native_pane`, and therefore
+    // `resolve_attach`. That is the whole point of routing the restore here
+    // rather than reconstructing a session: if the persistent runtime is
+    // still holding this seat's conversation, the restored pane attaches to
+    // it instead of opening a second in-process supervisor over it.
+    if candidate.native {
+        match Pane::spawn_native(
+            cfg,
+            state,
+            &super::config::env_from_process(),
+            repo,
+            sessions::Verb::Dash,
+            candidate.title.clone(),
+            size,
+            native_pane::NativeDashboardSpec {
+                repo: repo.to_path_buf(),
+                role: candidate.role.clone(),
+                route: None,
+                writing: true,
+            },
+        ) {
+            Ok(mut pane) => {
+                pane.set_report_to(candidate.report_to.clone());
+                if candidate.report_reminder_sent {
+                    pane.mark_report_reminder_sent();
+                }
+                pane.settled_mail_sent = candidate.settled_mail_sent;
+                pane.set_work_group_id(candidate.work_group_id.clone());
+                pane.set_budget_tokens(candidate.budget_tokens);
+                pane.set_parent_session(candidate.parent_session.clone());
+                panes.push(pane);
+                nudge_queues.push(VecDeque::new());
+            }
+            Err(e) => {
+                push_error(errors, format!("restore {}: {e}", candidate.short));
+                deferred_restore.push(candidate.clone());
+            }
+        }
+        return;
+    }
     let adapter = match adapters::select(Some(&candidate.agent), &[], cfg) {
         Ok(adapter) => adapter,
         Err(e) => {
@@ -10439,12 +10540,19 @@ fn sync_quiet_heuristic_attention(
 /// whatever additional panes get spawned along the way. Nesting is the
 /// caller's job (`chat.rs::run_with` checks `sessions::nesting_refusal`
 /// before calling this at all).
+/// Issue #490 (roadmap N21 item A): how often a native pane re-reads the
+/// durable records its overview, usage strip and notices are built from. Two
+/// seconds, not every frame: the records are a fleet's, not a conversation's,
+/// and none of them change between two consecutive 150 ms frames.
+const NATIVE_RECORD_REFRESH_SECS: u64 = 2;
+
 pub fn run_dashboard(
     cfg: &CtxConfig,
     repo: &Path,
     env: EnvLookup<'_>,
     state: &StateDir,
     first: PaneSpec,
+    first_native: Option<native_pane::NativeDashboardSpec>,
     force_pace: bool,
 ) -> CtxResult<i32> {
     let mut errors = ErrorLog::default();
@@ -10489,14 +10597,24 @@ pub fn run_dashboard(
     // Issue #160 finding 2 (2026-08-28): `build_turn_env` itself now pushes
     // the pin from the `LaunchMode` passed in, so this call site no longer
     // pushes it separately.
-    let (mut turn_env, turn_env_err) = build_turn_env(
-        cfg,
-        state,
-        repo,
-        &agent_name,
-        &session_id,
-        super::adapters::LaunchMode::Interactive,
-    );
+    // Issue #490 (roadmap N21 item A): a native first pane spawns no child
+    // process at all, so there is no environment to build for one -- and
+    // resolving a wrapped adapter for `native` would only produce a spurious
+    // error line. Everything below this that a native pane DOES need (the
+    // spawn-request channel, the owner pid, the restore roster) is built the
+    // same way either way.
+    let (mut turn_env, turn_env_err) = if first_native.is_some() {
+        (Vec::new(), None)
+    } else {
+        build_turn_env(
+            cfg,
+            state,
+            repo,
+            &agent_name,
+            &session_id,
+            super::adapters::LaunchMode::Interactive,
+        )
+    };
     if let Some(e) = turn_env_err {
         push_error(&mut errors, e);
     }
@@ -10648,16 +10766,34 @@ pub fn run_dashboard(
     // that can still fail outright owes it the same cleanup every other exit
     // path performs. Before this, a first pane that would not spawn left
     // `<state>/dash/<short>-<token>/` behind on every attempt.
-    let first_pane = match Pane::spawn(
-        first,
-        state,
-        repo,
-        repo,
-        size,
-        &turn_env,
-        turn_signal_capable_for(cfg, &agent_name),
-        Duration::from_millis(cfg.dash.idle_quiet_ms),
-    ) {
+    // Issue #490 (roadmap N21 item A): `zirv chat --runtime native` opens its
+    // conversation as the FIRST PANE of the ordinary dashboard rather than in
+    // a loop of its own, so the header, the sidebar, the roster, the mail
+    // sweep, the spawn channel and every other dashboard surface apply to it
+    // unchanged -- and a second, wrapped pane can be spawned beside it.
+    let first_spawn = match first_native {
+        Some(spec) => Pane::spawn_native(
+            cfg,
+            state,
+            env,
+            repo,
+            first.verb,
+            first.title.clone(),
+            size,
+            spec,
+        ),
+        None => Pane::spawn(
+            first,
+            state,
+            repo,
+            repo,
+            size,
+            &turn_env,
+            turn_signal_capable_for(cfg, &agent_name),
+            Duration::from_millis(cfg.dash.idle_quiet_ms),
+        ),
+    };
+    let first_pane = match first_spawn {
         Ok(mut pane) => {
             pane.set_intake_dir(first_pane_channel);
             pane
@@ -10894,6 +11030,13 @@ pub fn run_dashboard(
     // `Some` both while a drag is in progress and, after release, for
     // whatever stays highlighted until the next `Down` clears it.
     let mut selection: Option<Selection> = None;
+    // Issue #490 (roadmap N21 item A): the native pane key contract's own
+    // Ctrl+C quit-confirmation clock, held by the dashboard because the pane
+    // it belongs to may be swapped out from under it (focus moves, a pane is
+    // reaped). One clock for the roster, not one per pane: an operator only
+    // ever presses Ctrl+C in the pane they are looking at, and arming it in
+    // one pane and confirming it in another must not quit anything.
+    let mut native_ctrl_c: Option<Instant> = None;
     // The adaptive input-poll wait's own clock (`input_poll_wait`): refreshed
     // only on a keyboard/mouse event read from crossterm, not on pane output --
     // a streaming response or an animated spinner must not hold the loop in
@@ -11100,6 +11243,23 @@ pub fn run_dashboard(
         }
         for pane in panes.iter_mut() {
             pane.on_turn_signal();
+        }
+        // Issue #490 (roadmap N21 item A): a native pane's multi-agent
+        // surfaces (the overview, the usage strip, notices, the worker
+        // inspection) are read from durable records on their OWN cadence, not
+        // on every frame -- a fleet's coordinator graph, delegation receipts,
+        // seat records and pool view are far more expensive than a
+        // conversation's own journal, and none of them change between two
+        // consecutive frames.
+        {
+            let now = super::state::now_secs();
+            for pane in panes.iter_mut() {
+                if let Some(native) = pane.native_mut()
+                    && now.saturating_sub(native.ux().refreshed_at) >= NATIVE_RECORD_REFRESH_SECS
+                {
+                    native.refresh_records(cfg, env, now);
+                }
+            }
         }
         // Issue #440: ahead of EVERY step below that can release a seat --
         // the two enforcement sweeps (`Pane::shutdown`/`stop_now`) and the
@@ -12616,11 +12776,62 @@ pub fn run_dashboard(
                                     // until it reports the next one. A line injected
                                     // on top of a half-composed prompt submits it.
                                     InputVerdict::ToChild(bytes) => {
-                                        if !bytes.is_empty()
-                                            && let Some(pane) = panes.get_mut(focused)
-                                            && let Err(e) = pane.write_operator_input(&bytes)
-                                        {
-                                            push_error(&mut errors, format!("write_input: {e}"));
+                                        // Issue #490 (roadmap N21 item A):
+                                        // input routing is the second place a
+                                        // mixed roster parts company. A wrapped
+                                        // pane gets the encoded BYTES through
+                                        // its pty writer; a native pane gets
+                                        // the KEY, through the same router
+                                        // `zirv chat --runtime native` uses --
+                                        // so the composer, the approval dialog
+                                        // and the overview cursor all work
+                                        // identically in either loop, and none
+                                        // of those controls is reachable on a
+                                        // wrapped pane at all.
+                                        let routed_native = panes
+                                            .get_mut(focused)
+                                            .and_then(|pane| pane.native_mut())
+                                            .map(|native| {
+                                                native_pane::handle_native_key(
+                                                    native,
+                                                    key,
+                                                    &mut native_ctrl_c,
+                                                    false,
+                                                    cfg.session.persistent,
+                                                    cfg,
+                                                )
+                                            });
+                                        match routed_native {
+                                            // Ctrl+Q (or a double Ctrl+C)
+                                            // inside a native pane closes THAT
+                                            // pane, not the dashboard: the
+                                            // dashboard has its own prefixed
+                                            // quit, and a pane's own quit
+                                            // binding must never take the
+                                            // whole fleet with it.
+                                            Some(native_pane::NativeKey::Quit) => {
+                                                if let Some(pane) = panes.get_mut(focused)
+                                                    && let Err(e) = pane.stop_now(0)
+                                                {
+                                                    push_error(
+                                                        &mut errors,
+                                                        format!("native pane quit: {e}"),
+                                                    );
+                                                }
+                                            }
+                                            Some(native_pane::NativeKey::Consumed) => {}
+                                            None => {
+                                                if !bytes.is_empty()
+                                                    && let Some(pane) = panes.get_mut(focused)
+                                                    && let Err(e) =
+                                                        pane.write_operator_input(&bytes)
+                                                {
+                                                    push_error(
+                                                        &mut errors,
+                                                        format!("write_input: {e}"),
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                     InputVerdict::Dash(DashAction::LiteralPrefix) => {
@@ -12982,6 +13193,26 @@ pub fn run_dashboard(
                         // with `mouse_capture` true.
                         Ok(Event::Mouse(mouse)) => {
                             input_errors = 0;
+                            // Issue #490 (roadmap N21 item A): #354's
+                            // clickable rows, for a native pane's overview. A
+                            // click inside the panel column selects the agent
+                            // whose rendered lines it landed in and never
+                            // scrolls, submits or forwards anything -- and a
+                            // wrapped pane never reaches it, so the native
+                            // control is not offered where it has no meaning.
+                            if matches!(mouse.kind, MouseEventKind::Down(_))
+                                && let Some(native) =
+                                    panes.get_mut(focused).and_then(Pane::native_mut)
+                            {
+                                let main = effective_main(full, sidebar_cols, zoomed);
+                                native_pane::click_overview_row(
+                                    native,
+                                    main,
+                                    mouse.column,
+                                    mouse.row,
+                                );
+                                continue;
+                            }
                             let delta = match mouse.kind {
                                 MouseEventKind::ScrollUp => WHEEL_STEP,
                                 MouseEventKind::ScrollDown => -WHEEL_STEP,
@@ -13210,6 +13441,21 @@ pub fn run_dashboard(
                                     }
                                 }
                                 _ => {}
+                            }
+                        }
+                        // Issue #490 (roadmap N21 item A): a bracketed paste
+                        // into a native pane goes to its composer as one
+                        // insertion, never key by key -- which is what keeps a
+                        // pasted multi-line block from submitting on its first
+                        // newline. A wrapped pane's child does its own paste
+                        // handling over the pty, unchanged.
+                        Ok(Event::Paste(text)) => {
+                            input_errors = 0;
+                            if let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
+                            {
+                                native.handle_composer_action(
+                                    native_pane::ComposerAction::InsertText(text),
+                                );
                             }
                         }
                         Ok(_) => input_errors = 0,
@@ -13513,28 +13759,57 @@ pub fn run_dashboard(
                     .as_ref()
                     .filter(|sel| sel.pane_short == pane.short())
                     .map(|sel| normalize_selection(sel.anchor, sel.end));
-                ui::render_grid(f, main_area, pane.screen(), selection_range);
-                // Why the grid is not moving, when it is not moving because
-                // the operator scrolled it. Drawn after the grid so it sits on
-                // top, and before any overlay so a dialog still owns the
-                // screen.
-                ui::render_scroll_marker(f, main_area, pane.scrollback());
-                // HIGH-1: the focused pane's own caret. ratatui hides the
-                // cursor on every frame whose `cursor_position` is left unset,
-                // so without this there is no caret anywhere for the whole
-                // session. An overlay is drawn on top below, but the caret is
-                // only set for the bare grid: an open dialog owns the screen.
-                //
-                // Suppressed while scrolled back as well: `cursor_position` is
-                // the *live* cursor and knows nothing about the scrollback
-                // offset, so a caret drawn from it would land on an unrelated
-                // row of history. tmux hides the cursor in copy mode for the
-                // same reason.
-                if matches!(overlay, ui::Overlay::None)
-                    && pane.scrollback() == 0
-                    && let Some(pos) = ui::grid_cursor_position(main_area, pane.screen())
-                {
-                    f.set_cursor_position(pos);
+                // Issue #490 (roadmap N21 item A): a native pane draws its own
+                // conversation inside this frame's chrome. Everything around
+                // it -- the header, the sidebar, the rule, the footer, the
+                // overlay -- is the dashboard's and is drawn by the same code
+                // either way, so this is the ONE place the two pane kinds part
+                // company on rendering. `render_native_pane` owns only the
+                // interior, exactly as `render_grid` never draws a border of
+                // its own.
+                if let Some(native) = pane.native() {
+                    let facts = native.status_facts();
+                    let (view, presentation) = native.view();
+                    // The whole native frame INSIDE the dashboard's main area:
+                    // the conversation, the agent/task overview beside it, the
+                    // usage/health provenance strip beneath it, and whichever
+                    // modal is open. Which of those exist at all is
+                    // `native_ux::resolve_layout`'s decision against the area
+                    // it is actually given, so the same code draws every
+                    // terminal size with no size-specific branch here.
+                    native_pane::render_native_dashboard(
+                        f,
+                        main_area,
+                        view,
+                        presentation,
+                        &facts,
+                        native.ux(),
+                    );
+                } else {
+                    ui::render_grid(f, main_area, pane.screen(), selection_range);
+                    // Why the grid is not moving, when it is not moving because
+                    // the operator scrolled it. Drawn after the grid so it sits
+                    // on top, and before any overlay so a dialog still owns the
+                    // screen.
+                    ui::render_scroll_marker(f, main_area, pane.scrollback());
+                    // HIGH-1: the focused pane's own caret. ratatui hides the
+                    // cursor on every frame whose `cursor_position` is left
+                    // unset, so without this there is no caret anywhere for the
+                    // whole session. An overlay is drawn on top below, but the
+                    // caret is only set for the bare grid: an open dialog owns
+                    // the screen.
+                    //
+                    // Suppressed while scrolled back as well: `cursor_position`
+                    // is the *live* cursor and knows nothing about the
+                    // scrollback offset, so a caret drawn from it would land on
+                    // an unrelated row of history. tmux hides the cursor in
+                    // copy mode for the same reason.
+                    if matches!(overlay, ui::Overlay::None)
+                        && pane.scrollback() == 0
+                        && let Some(pos) = ui::grid_cursor_position(main_area, pane.screen())
+                    {
+                        f.set_cursor_position(pos);
+                    }
                 }
             }
             ui::render_overlay(f, main_area, &overlay, render_tick);
