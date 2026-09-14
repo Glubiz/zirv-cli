@@ -1241,6 +1241,13 @@ impl NativeSessions {
             generation: handle.generation,
             task: None,
             route: route_identity,
+            // Issue #639: this service's own persistent-runtime sessions are
+            // reattached by `resume_entry` from THIS SAME registry's own
+            // recorded `cwd` (`NativeEntry::cwd`/`restore_cwd`), a different
+            // mechanism from the CLI's `--resume <id>` (`runtime::native::
+            // run_session`'s own affinity check) -- recorded here so this
+            // session's row carries the same field either way.
+            repo: spec.cwd.clone(),
             created_at: state::now_secs(),
             completed_at: None,
         };

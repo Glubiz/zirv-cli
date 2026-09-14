@@ -4710,6 +4710,7 @@ mod tests {
                     id: "claude-opus-4".to_string(),
                 },
             },
+            repo: std::path::PathBuf::from("/native-test-repo"),
             created_at: 0,
             completed_at: None,
         }
