@@ -830,6 +830,12 @@ fn run_native<W: Write>(
     if let Some(timeout_secs) = args.timeout_secs {
         limits.max_wall_ms = timeout_secs.saturating_mul(1000);
     }
+    // Issue #637: was accepted by clap but never read on the native path, so
+    // `--budget-tokens` silently did nothing (`--max-tool-calls` on the same
+    // request correctly stopped the loop).
+    if let Some(budget_tokens) = args.budget_tokens {
+        limits.max_budget_tokens = Some(budget_tokens);
+    }
     let mut request = super::runtime::native::HeadlessRequest {
         repo,
         prompt: prompt.trim(),
