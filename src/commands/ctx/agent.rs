@@ -275,6 +275,12 @@ pub struct AgentArgs {
     /// `<name>`. Mirrors `zirv ctx exec --route`.
     #[arg(long)]
     pub route: Option<String>,
+    /// Internal conversation identity selected by the delegation service.
+    #[arg(skip)]
+    pub session_id: Option<String>,
+    /// Internal cancellation shared with the delegation service.
+    #[arg(skip)]
+    pub cancellation: Option<std::sync::Arc<super::provider::adapter::CancellationFlag>>,
 }
 
 /// The same defaults clap itself applies, so the many call sites that build
@@ -312,6 +318,8 @@ impl Default for AgentArgs {
             json: false,
             runtime: super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
+            session_id: None,
+            cancellation: None,
         }
     }
 }
@@ -1710,7 +1718,7 @@ pub const PRINCIPAL_ENV: &str = "ZIRV_PRINCIPAL";
 /// outright, `None` included, so a stray inherited [`ENVELOPE_ENV`]/
 /// [`PRINCIPAL_ENV`] from further up this process's own delegation chain can
 /// never leak into a worker whose own envelope was computed fresh here.
-fn envelope_env<'a>(
+pub(crate) fn envelope_env<'a>(
     env: EnvLookup<'a>,
     envelope_json: Option<String>,
     principal: Option<String>,
@@ -4147,7 +4155,10 @@ pub fn run_with<W: Write>(
         adapters::LaunchMode::Headless,
     )
     .degraded_capabilities();
-    let worker_session = SessionId::new_v4().to_string();
+    let worker_session = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| SessionId::new_v4().to_string());
     // Issue #170: this delegation binds `args.group` (if any) to the child
     // about to run headlessly as its SubOrchestrator -- first-claim-wins, so
     // a group shared by an operator across several `--group` invocations is
@@ -4435,6 +4446,7 @@ pub fn run_with<W: Write>(
         // harness-handover restart can move it to the new provider mid-run
         // -- see `ExecArgs::reservation_id`'s own doc comment.
         reservation_id: reservation_id.clone(),
+        cancellation: args.cancellation.clone(),
         ..Default::default()
     };
 
@@ -4946,7 +4958,7 @@ pub fn run_with<W: Write>(
             mode: DelegationMode::Inline,
             state: delegation_state,
             exit_code: Some(code),
-            session: Some(super::sessions::short_id(&worker_session)),
+            session: Some(worker_session.clone()),
             task: args.task.clone(),
             workdir: Some(launch_repo.clone()),
             result_path,
@@ -7423,6 +7435,8 @@ mod tests {
             json: false,
             runtime: super::super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
+            session_id: None,
+            cancellation: None,
         }
     }
 

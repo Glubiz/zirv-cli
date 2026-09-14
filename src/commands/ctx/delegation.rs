@@ -892,14 +892,6 @@ pub fn interrupt(state: &StateDir, repo: &Path, delegation: &str, now: u64) -> C
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
     record.cancel_requested = true;
-    if !record.phase.is_terminal() {
-        record.phase = Phase::Cancelled;
-        record.revision = record.revision.saturating_add(1);
-        if let Some(attempt) = record.attempts.last_mut() {
-            attempt.phase = Phase::Cancelled;
-            attempt.ended_at = Some(now);
-        }
-    }
     record.updated_at = now;
     save(state, repo, &record)?;
     Ok(record)
@@ -916,6 +908,12 @@ pub fn close(state: &StateDir, repo: &Path, delegation: &str, now: u64) -> CtxRe
     let Some(mut record) = load(state, repo, delegation) else {
         return Err(format!("no delegation {delegation:?} in this repository").into());
     };
+    if !record.phase.is_terminal() {
+        return Err(format!(
+            "delegation {delegation:?} is still running; wait for its terminal acknowledgement before closing"
+        )
+        .into());
+    }
     if let Some((provider, id)) = record.reservation.take() {
         let _ = super::reservation::release(state, &provider, &id);
     }
@@ -1033,7 +1031,7 @@ pub fn drain_all(state: &StateDir, repo: &Path, cfg: &CtxConfig, now: u64) -> us
 /// run it. Everything here is data a parent can legitimately ask for; nothing
 /// is a grant (`mode`, `path_scope` and the rest are narrowed against the
 /// parent's own envelope by `agent::run_with`, never widened by asking).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LaunchRequest {
     pub runtime: RuntimeKind,
     /// The harness name (harness runtime) or the provider route (native).
@@ -1046,6 +1044,12 @@ pub struct LaunchRequest {
     pub read_only: bool,
     pub budget_tokens: Option<u64>,
     pub max_tool_calls: Option<u32>,
+    /// Conversation identity assigned by the delegation service, never model input.
+    pub worker_session: Option<String>,
+    /// Remaining depth granted by the coordinator's bounds check.
+    pub delegated_depth: Option<u8>,
+    /// Live cancellation observed by both native and wrapped launchers.
+    pub cancellation: std::sync::Arc<super::provider::adapter::CancellationFlag>,
 }
 
 /// What a launcher observed. `receipt` is the delegating command's own
@@ -1095,6 +1099,9 @@ impl WorkerLauncher for AgentLauncher {
             },
             json: true,
             runtime: request.runtime.to_string(),
+            session_id: request.worker_session.clone(),
+            cancellation: Some(request.cancellation.clone()),
+            depth: request.delegated_depth,
             ..Default::default()
         };
         let mut out: Vec<u8> = Vec::new();
@@ -1105,13 +1112,62 @@ impl WorkerLauncher for AgentLauncher {
             &super::config::env_from_process(),
         )?;
         let receipt = String::from_utf8_lossy(&out).trim().to_string();
+        let parsed = serde_json::from_str::<serde_json::Value>(&receipt).ok();
+        let session = parsed
+            .as_ref()
+            .and_then(|value| value.get("session"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         Ok(LaunchedWorker {
             exit_code: code,
-            session: String::new(),
-            short: String::new(),
+            short: super::sessions::short_id(&session),
+            session,
             receipt: (!receipt.is_empty()).then_some(receipt),
         })
     }
+}
+
+fn bind_launched_worker(
+    state: &StateDir,
+    repo: &Path,
+    delegation: &str,
+    worker: &LaunchedWorker,
+    now: u64,
+) -> CtxResult<Record> {
+    let _lock = lock_delegation(state, repo, delegation)?;
+    let Some(mut record) = load(state, repo, delegation) else {
+        return Err(format!("no delegation {delegation:?} in this repository").into());
+    };
+    if !worker.session.is_empty() {
+        record.handle.worker_session.clone_from(&worker.session);
+    }
+    if !worker.short.is_empty() {
+        record.handle.short.clone_from(&worker.short);
+    }
+    if let Some(attempt) = record.attempts.last_mut() {
+        attempt
+            .worker_session
+            .clone_from(&record.handle.worker_session);
+        attempt.short.clone_from(&record.handle.short);
+    }
+    record.updated_at = now;
+    save(state, repo, &record)?;
+    Ok(record)
+}
+
+fn launch_is_acknowledgement(worker: &LaunchedWorker) -> bool {
+    worker
+        .receipt
+        .as_deref()
+        .and_then(|receipt| serde_json::from_str::<serde_json::Value>(receipt).ok())
+        .and_then(|value| {
+            value
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|state| state == "launched")
 }
 
 /// A [`WorkerLauncher`] that starts nothing and records what it was asked
@@ -1189,7 +1245,7 @@ pub fn delegate(
     request: &LaunchRequest,
     parent: &Parent<'_>,
     now: u64,
-) -> CtxResult<(Record, Publication)> {
+) -> CtxResult<(Record, Option<Publication>)> {
     // Issue #488 (item 4): a superseded generation may not start work, and a
     // successor whose rollover is prepared but not yet committed may not
     // either. This is FIRST -- ahead of the bounds check and far ahead of the
@@ -1214,19 +1270,23 @@ pub fn delegate(
     // The one field a role identity may narrow. Cloned rather than mutated
     // in place: the caller's request is what it asked for, and what actually
     // ran has to be readable as a separate fact.
+    let delegation_id = uuid::Uuid::new_v4().simple().to_string();
+    let worker_session = format!("{delegation_id}-worker");
+    let cancellation = std::sync::Arc::new(super::provider::adapter::CancellationFlag::default());
     let request = &LaunchRequest {
         read_only: !grant.write,
+        worker_session: Some(worker_session.clone()),
+        delegated_depth: Some(grant.depth),
+        cancellation: cancellation.clone(),
         ..request.clone()
     };
 
-    let delegation_id = uuid::Uuid::new_v4().simple().to_string();
-    let worker_session = format!("{delegation_id}-worker");
     let handle = WorkerHandle {
         delegation: delegation_id.clone(),
         attempt: 1,
         runtime: request.runtime,
         worker_session: worker_session.clone(),
-        short: parent.short.to_string(),
+        short: super::sessions::short_id(&worker_session),
         role: request.role.clone(),
         task: request.task.clone(),
         group: request.group.clone(),
@@ -1236,8 +1296,6 @@ pub fn delegate(
             .clone()
             .unwrap_or_else(|| repo.to_path_buf()),
     };
-    let launched = record_launch(state, repo, handle, parent.session.map(str::to_string), now)?;
-
     // The coordinator's own graph, written beside the launch receipt: which
     // task this delegation answers for, which role took it and on which
     // runtime. A crash between here and the outcome leaves a node a resumed
@@ -1261,11 +1319,23 @@ pub fn delegate(
             now,
         );
     };
-    match parent.generation {
+    let launched = match parent.generation {
         Some(generation) => {
-            super::coordinator::update_fenced(state, repo, parent.short, generation, dispatch)?;
+            super::coordinator::update_fenced(state, repo, parent.short, generation, |graph| {
+                let launched = record_launch(
+                    state,
+                    repo,
+                    handle.clone(),
+                    parent.session.map(str::to_string),
+                    now,
+                )?;
+                dispatch(graph);
+                Ok(launched)
+            })?
         }
         None => {
+            let launched =
+                record_launch(state, repo, handle, parent.session.map(str::to_string), now)?;
             dispatch(&mut graph);
             // Review finding on issue #485: the launch receipt above is what
             // is authoritative, so a coordinator-graph store failure must
@@ -1288,13 +1358,49 @@ pub fn delegate(
                     },
                 );
             }
+            launched
+        }
+    };
+
+    let launch_guard = match parent.generation {
+        Some(generation) => super::seat::lock_generation(state, parent.short, generation)?,
+        None => None,
+    };
+    let watcher_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let state = state.clone();
+        let repo = repo.to_path_buf();
+        let delegation = delegation_id.clone();
+        let cancellation = cancellation.clone();
+        let done = watcher_done.clone();
+        std::thread::spawn(move || {
+            use super::provider::adapter::Cancellation as _;
+            while !done.load(std::sync::atomic::Ordering::Acquire) && !cancellation.is_cancelled() {
+                if load(&state, &repo, &delegation).is_some_and(|record| record.cancel_requested) {
+                    cancellation.cancel();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })
+    };
+    let outcome = launcher.launch(request);
+    watcher_done.store(true, std::sync::atomic::Ordering::Release);
+    let _ = watcher.join();
+    drop(launch_guard);
+    if let Ok(worker) = &outcome {
+        bind_launched_worker(state, repo, &delegation_id, worker, now)?;
+        if launch_is_acknowledgement(worker) {
+            let record = load(state, repo, &delegation_id).unwrap_or(launched);
+            return Ok((record, None));
         }
     }
-
-    let outcome = launcher.launch(request);
+    let cancelled = super::provider::adapter::Cancellation::is_cancelled(cancellation.as_ref());
     let (phase, exit_code, summary) = match &outcome {
         Ok(worker) => (
-            if worker.exit_code == 0 {
+            if cancelled {
+                Phase::Cancelled
+            } else if worker.exit_code == 0 {
                 Phase::Completed
             } else {
                 Phase::Failed
@@ -1316,7 +1422,7 @@ pub fn delegate(
         now,
     )?;
     let record = load(state, repo, &delegation_id).unwrap_or(launched);
-    Ok((record, publication))
+    Ok((record, Some(publication)))
 }
 
 #[cfg(test)]
@@ -1745,9 +1851,112 @@ mod tests {
             .push("exec-1: apply_patch outcome unknown".to_string());
         save(&state, &repo, &record).expect("save");
         let after = interrupt(&state, &repo, "delegb", 5).expect("interrupt");
-        assert_eq!(after.phase, Phase::Cancelled);
+        assert_eq!(after.phase, Phase::Launched);
         assert!(after.cancel_requested);
         assert_eq!(after.unknown_tool_outcomes.len(), 1);
+    }
+
+    #[test]
+    fn interrupt_stops_the_addressed_worker_before_close_releases_resources() {
+        let (_dir, state, repo, _cfg) = fixture();
+        record_launch(
+            &state,
+            &repo,
+            handle("issue573", RuntimeKind::Native),
+            None,
+            1,
+        )
+        .expect("launch");
+        record_ownership(
+            &state,
+            &repo,
+            "issue573",
+            Some(("provider".to_string(), "reservation".to_string())),
+            Some(repo.clone()),
+            2,
+        )
+        .expect("ownership");
+
+        let interrupted = interrupt(&state, &repo, "issue573", 3).expect("interrupt");
+        assert!(interrupted.cancel_requested);
+        assert_eq!(interrupted.phase, Phase::Launched);
+        assert!(
+            close(&state, &repo, "issue573", 4).is_err(),
+            "close must wait for the worker's terminal acknowledgement"
+        );
+        let held = load(&state, &repo, "issue573").expect("record");
+        assert!(held.reservation.is_some());
+        assert!(held.write_claim.is_some());
+
+        #[derive(Debug)]
+        struct CancelAwareLauncher(std::sync::Arc<std::sync::Mutex<Vec<RuntimeKind>>>);
+
+        impl WorkerLauncher for CancelAwareLauncher {
+            fn launch(&mut self, request: &LaunchRequest) -> CtxResult<LaunchedWorker> {
+                use super::super::provider::adapter::Cancellation as _;
+                while !request.cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                self.0.lock().expect("seen lock").push(request.runtime);
+                Ok(LaunchedWorker {
+                    exit_code: 130,
+                    session: request.worker_session.clone().unwrap_or_default(),
+                    short: request
+                        .worker_session
+                        .as_deref()
+                        .map(super::super::sessions::short_id)
+                        .unwrap_or_default(),
+                    receipt: Some("{\"state\":\"exited_no_report\"}".to_string()),
+                })
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for runtime in [RuntimeKind::Native, RuntimeKind::Harness] {
+            let state_worker = state.clone();
+            let repo_worker = repo.clone();
+            let cfg = CtxConfig::default();
+            let seen_worker = seen.clone();
+            let mut request = launch_request(super::super::team::IMPLEMENTER, false);
+            request.runtime = runtime;
+            request.task = Some(format!("cancel-{runtime}"));
+            let task = request.task.clone();
+            let worker = std::thread::spawn(move || {
+                delegate(
+                    &state_worker,
+                    &repo_worker,
+                    &cfg,
+                    &mut CancelAwareLauncher(seen_worker),
+                    &request,
+                    &coordinator_parent(),
+                    10,
+                )
+                .map_err(|error| error.to_string())
+            });
+
+            let delegation = (0..100)
+                .find_map(|_| {
+                    let found = list(&state, &repo)
+                        .into_iter()
+                        .find(|record| record.handle.task == task);
+                    if found.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    found.map(|record| record.handle.delegation)
+                })
+                .expect("launch receipt");
+            interrupt(&state, &repo, &delegation, 11).expect("interrupt live worker");
+            let (terminal, _) = worker
+                .join()
+                .expect("worker joins")
+                .expect("delegate returns");
+            assert_eq!(terminal.phase, Phase::Cancelled);
+            close(&state, &repo, &delegation, 12).expect("terminal worker closes");
+        }
+        let observed = seen.lock().expect("seen lock");
+        assert_eq!(observed.len(), 2);
+        assert!(observed.contains(&RuntimeKind::Harness));
+        assert!(observed.contains(&RuntimeKind::Native));
     }
 
     #[test]
@@ -2006,6 +2215,11 @@ mod tests {
             read_only,
             budget_tokens: None,
             max_tool_calls: None,
+            worker_session: None,
+            delegated_depth: None,
+            cancellation: std::sync::Arc::new(
+                super::super::provider::adapter::CancellationFlag::default(),
+            ),
         }
     }
 
@@ -2135,6 +2349,102 @@ mod tests {
             node.state,
             super::super::coordinator::NodeState::Delegated,
             "the node stays delegated until its receipt is CONSUMED, not merely published"
+        );
+    }
+
+    #[test]
+    fn delegation_handle_resumes_the_launched_worker_conversation() {
+        #[derive(Debug)]
+        struct ConversationLauncher;
+
+        impl WorkerLauncher for ConversationLauncher {
+            fn launch(&mut self, _request: &LaunchRequest) -> CtxResult<LaunchedWorker> {
+                Ok(LaunchedWorker {
+                    exit_code: 0,
+                    session: "actual-worker-conversation".to_string(),
+                    short: "actual01".to_string(),
+                    receipt: Some("{\"state\":\"reported\"}".to_string()),
+                })
+            }
+        }
+
+        let (_dir, state, repo, cfg) = fixture();
+        let (record, _) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut ConversationLauncher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &coordinator_parent(),
+            10,
+        )
+        .expect("delegate");
+        assert_eq!(record.handle.worker_session, "actual-worker-conversation");
+        assert_eq!(record.handle.short, "actual01");
+        assert_eq!(
+            follow_up(
+                &state,
+                &repo,
+                &cfg,
+                &record.handle.delegation,
+                "continue",
+                11
+            )
+            .expect("follow up"),
+            Continuation::Resume {
+                journal_session: "actual-worker-conversation".to_string(),
+                attempt: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn dashboard_spawn_ack_does_not_complete_delegation() {
+        #[derive(Debug)]
+        struct DashboardAckLauncher;
+
+        impl WorkerLauncher for DashboardAckLauncher {
+            fn launch(&mut self, _request: &LaunchRequest) -> CtxResult<LaunchedWorker> {
+                Ok(LaunchedWorker {
+                    exit_code: 0,
+                    session: "dashboard-worker".to_string(),
+                    short: "dash0001".to_string(),
+                    receipt: Some("{\"state\":\"launched\"}".to_string()),
+                })
+            }
+        }
+
+        let (_dir, state, repo, cfg) = fixture();
+        let (running, publication) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut DashboardAckLauncher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &coordinator_parent(),
+            10,
+        )
+        .expect("delegate");
+        assert_eq!(running.phase, Phase::Launched);
+        assert!(publication.is_none());
+
+        publish_terminal(
+            &state,
+            &repo,
+            &cfg,
+            &running.handle.delegation,
+            Phase::Completed,
+            Some(0),
+            Some("worker receipt".to_string()),
+            None,
+            11,
+        )
+        .expect("terminal worker receipt");
+        assert_eq!(
+            load(&state, &repo, &running.handle.delegation)
+                .expect("record")
+                .phase,
+            Phase::Completed
         );
     }
 

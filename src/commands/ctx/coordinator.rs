@@ -351,15 +351,15 @@ pub fn update_fenced<T>(
     repo: &Path,
     seat_short: &str,
     generation: u64,
-    mutate: impl FnOnce(&mut Coordinator) -> T,
-) -> Result<T, super::seat::StaleGeneration> {
-    super::seat::guard(state, seat_short, generation)?;
+    mutate: impl FnOnce(&mut Coordinator) -> CtxResult<T>,
+) -> CtxResult<T> {
+    let _generation = super::seat::lock_generation(state, seat_short, generation)?;
     let mut record = load(state, repo);
-    let out = mutate(&mut record);
+    let out = mutate(&mut record)?;
     // A store that fails is a disk fault, not a fencing verdict: the fence
     // answered, and reporting a write failure as a stale generation would
     // tell an operator their seat moved when it did not.
-    let _ = store(state, repo, &record);
+    store(state, repo, &record)?;
     Ok(out)
 }
 
@@ -428,11 +428,8 @@ pub fn consume_pending(
     record: &mut Coordinator,
     now: u64,
 ) -> CtxResult<Vec<Pending>> {
-    let mut consumed = Vec::new();
-    for entry in pending(state, repo, record) {
-        if !delegation::consume_delivery(state, repo, &entry.delegation, &entry.identity)? {
-            continue;
-        }
+    let entries = pending(state, repo, record);
+    for entry in &entries {
         let settled = match (entry.phase, entry.exit_code) {
             ("completed", Some(0)) | ("completed", None) => NodeState::Completed,
             ("cancelled", _) => NodeState::Cancelled,
@@ -443,13 +440,23 @@ pub fn consume_pending(
             .as_ref()
             .map(|path| path.display().to_string());
         record.settled(&entry.task, settled, evidence.as_deref(), now);
-        consumed.push(entry);
+    }
+    if !entries.is_empty() {
+        store(state, repo, record)?;
+    }
+
+    let mut consumed = Vec::new();
+    for entry in entries {
+        if delegation::consume_delivery(state, repo, &entry.delegation, &entry.identity)? {
+            consumed.push(entry);
+        }
     }
     if !consumed.is_empty() {
         record.decide(
             &format!("consumed {} pending worker receipt(s)", consumed.len()),
             now,
         );
+        store(state, repo, record)?;
     }
     Ok(consumed)
 }
@@ -752,6 +759,31 @@ mod tests {
         assert_eq!(outstanding, ["d-todo"]);
     }
 
+    #[test]
+    fn crash_between_receipt_consumption_and_graph_store_recovers_once() {
+        let (_dir, state, repo) = fixture();
+        let mut record = Coordinator::default();
+        record.dispatched("issue574", team::IMPLEMENTER, "native", "issue574", 1);
+        publish(&state, &repo, "issue574", 0);
+
+        std::fs::create_dir_all(state.root()).expect("state root");
+        std::fs::write(state.coordinator(), b"blocks coordinator directory")
+            .expect("inject graph-store failure");
+        assert!(consume_pending(&state, &repo, &mut record, 2).is_err());
+
+        std::fs::remove_file(state.coordinator()).expect("remove fault");
+        store(&state, &repo, &record).expect("store graph");
+        let mut restarted = load(&state, &repo);
+        let consumed = consume_pending(&state, &repo, &mut restarted, 3).expect("recover");
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(restarted.nodes["issue574"].state, NodeState::Completed);
+        assert!(
+            consume_pending(&state, &repo, &mut restarted, 4)
+                .expect("replay")
+                .is_empty()
+        );
+    }
+
     /// Item 7: cancelling stops what has not started and leaves what has, so
     /// a live worker's receipt is still consumed rather than lost.
     #[test]
@@ -842,6 +874,7 @@ mod tests {
         let write = |generation: u64, what: &str| {
             update_fenced(&state, &repo, &short, generation, |record| {
                 record.decide(what, 1);
+                Ok(())
             })
         };
 
@@ -860,14 +893,26 @@ mod tests {
         // CRASH POINT 1: prepared, never committed.
         assert!(write(1, "source keeps the seat").is_ok());
         let refused = write(prepared, "successor jumps the gun").expect_err("fenced");
-        assert_eq!(refused.reason, seat::StaleReason::Uncommitted);
+        assert_eq!(
+            refused
+                .downcast_ref::<seat::StaleGeneration>()
+                .expect("typed stale refusal")
+                .reason,
+            seat::StaleReason::Uncommitted
+        );
 
         seat::commit(&state, &short, prepared, "native-session", 3).expect("commit");
 
         // CRASH POINT 2: committed, and the swap is total.
         assert!(write(prepared, "successor owns the graph").is_ok());
         let refused = write(1, "source writes after being replaced").expect_err("fenced");
-        assert_eq!(refused.reason, seat::StaleReason::Superseded);
+        assert_eq!(
+            refused
+                .downcast_ref::<seat::StaleGeneration>()
+                .expect("typed stale refusal")
+                .reason,
+            seat::StaleReason::Superseded
+        );
 
         let record = load(&state, &repo);
         let written: Vec<&str> = record
@@ -884,5 +929,73 @@ mod tests {
             ],
             "no fenced write reached the graph"
         );
+    }
+
+    #[test]
+    fn rollover_racing_graph_and_writer_effects_admits_only_new_generation() {
+        use crate::commands::ctx::{permit, seat};
+        let (_dir, state, repo) = fixture();
+        let session = "55355355-5555-4555-8555-555555555555";
+        let short = crate::commands::ctx::sessions::short_id(session);
+        seat::register(
+            &state,
+            &short,
+            session,
+            "claude",
+            None,
+            "anthropic",
+            team::COORDINATOR,
+            false,
+            1,
+        )
+        .expect("register");
+        let prepared = seat::prepare_onto(
+            &state,
+            &short,
+            "native",
+            None,
+            RuntimeKind::Native,
+            seat::Cause::Manual,
+            2,
+        )
+        .expect("prepare");
+
+        seat::guard(&state, &short, 1).expect("old check observes authority");
+        seat::commit(&state, &short, prepared, "successor", 3).expect("commit wins race");
+
+        assert!(
+            update_fenced(&state, &repo, &short, 1, |graph| {
+                graph.decide("stale", 4);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(load(&state, &repo).decisions.is_empty());
+        let tree = std::fs::canonicalize(&repo).expect("tree");
+        assert!(matches!(
+            permit::acquire_writer(
+                &state,
+                1,
+                "stale",
+                &tree,
+                Some(permit::SeatFence {
+                    short: &short,
+                    generation: 1,
+                }),
+            ),
+            Err(permit::WriterRefusal::StaleSeat { .. })
+        ));
+        let writer = permit::acquire_writer(
+            &state,
+            1,
+            "successor",
+            &tree,
+            Some(permit::SeatFence {
+                short: &short,
+                generation: prepared,
+            }),
+        )
+        .expect("new generation owns writer effect");
+        drop(writer);
     }
 }

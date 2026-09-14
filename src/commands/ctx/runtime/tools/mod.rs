@@ -1489,6 +1489,12 @@ impl NativeToolClient {
         }
     }
 
+    pub(crate) fn lock_generation(
+        &self,
+    ) -> Result<Box<dyn super::enforcement::GenerationLease>, super::enforcement::BrokerError> {
+        self.broker.lock_generation()
+    }
+
     /// Replaces the worker launcher the `delegate` tool uses. Exists so a
     /// deterministic test can drive the whole delegation tool surface without
     /// starting a real worker; production always keeps the default.
@@ -1541,6 +1547,24 @@ impl NativeToolClient {
     }
 
     pub fn execute(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        grant: Option<&ApprovalGrant>,
+        journal: Option<JournalExecution<'_>>,
+    ) -> ToolReceipt {
+        let generation = match self.broker.lock_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                return failed_receipt(name, RetryPolicy::NeverAfterStart, error.into(), now_ms());
+            }
+        };
+        let receipt = self.execute_unfenced(name, arguments, grant, journal);
+        drop(generation);
+        receipt
+    }
+
+    pub(crate) fn execute_unfenced(
         &mut self,
         name: &str,
         arguments: Value,
@@ -2190,6 +2214,11 @@ impl NativeToolClient {
             read_only: args.mode == delegation::ToolMode::ReadOnly,
             budget_tokens: args.budget_tokens,
             max_tool_calls: args.max_tool_calls,
+            worker_session: None,
+            delegated_depth: None,
+            cancellation: std::sync::Arc::new(
+                crate::commands::ctx::provider::adapter::CancellationFlag::default(),
+            ),
         };
         let identity = self.broker.identity().clone();
         // Issue #485 (roadmap N16): the delegating seat's ROLE comes off the
@@ -2230,8 +2259,8 @@ impl NativeToolClient {
             "phase": record.phase.as_str(),
             "task": record.handle.task,
             "exit_code": record.exit_code,
-            "delivery": publication.identity,
-            "mailed": publication.mailed,
+            "delivery": publication.as_ref().map(|publication| &publication.identity),
+            "mailed": publication.is_some_and(|publication| publication.mailed),
         }))
     }
 

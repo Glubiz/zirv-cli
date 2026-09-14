@@ -702,6 +702,21 @@ fn tree_claim_path(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("tree-{}.json", tree_claim_hash(key)))
 }
 
+struct TreeClaimLock(std::fs::File);
+
+impl Drop for TreeClaimLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_tree_claim(dir: &Path, key: &str) -> Result<TreeClaimLock, WriterRefusal> {
+    let path = dir.join(format!("tree-{}.lock", tree_claim_hash(key)));
+    let file = super::group::open_lock_file(&path).map_err(|_| WriterRefusal::PoolExhausted)?;
+    file.lock().map_err(|_| WriterRefusal::PoolExhausted)?;
+    Ok(TreeClaimLock(file))
+}
+
 /// Review finding (2026-09): makes "is another live writer already holding
 /// this tree?" and "claim it" ONE atomic filesystem operation, closing a
 /// race the former read-then-create check in [`acquire_writer`] left open --
@@ -722,6 +737,7 @@ fn tree_claim_path(dir: &Path, key: &str) -> PathBuf {
 /// first attempt.
 fn claim_tree(dir: &Path, key: &str, record: &PermitRecord) -> Result<PathBuf, WriterRefusal> {
     let _ = state::create_private_dir_all(dir);
+    let _lock = lock_tree_claim(dir, key)?;
     let path = tree_claim_path(dir, key);
     let Ok(json) = serde_json::to_string_pretty(record) else {
         return Err(WriterRefusal::PoolExhausted);
@@ -817,13 +833,25 @@ pub fn acquire_writer(
     // above the seat's for the whole prepare->commit window). Either way, a
     // process with no seat env and no seat record is not fenced at all, so a
     // bare terminal, a CI job and a worker outside any seat are unaffected.
-    let verdict = match fence {
-        Some(fence) => super::seat::guard(state, fence.short, fence.generation),
-        None => super::seat::guard_from_env(state),
+    let _generation = match fence {
+        Some(fence) => match super::seat::lock_generation(state, fence.short, fence.generation) {
+            Ok(guard) => guard,
+            Err(error) => {
+                if let Some(stale) = error.downcast_ref::<super::seat::StaleGeneration>() {
+                    return Err(WriterRefusal::StaleSeat {
+                        stale: stale.clone(),
+                    });
+                }
+                return Err(WriterRefusal::PoolExhausted);
+            }
+        },
+        None => {
+            if let Err(stale) = super::seat::guard_from_env(state) {
+                return Err(WriterRefusal::StaleSeat { stale });
+            }
+            None
+        }
     };
-    if let Err(stale) = verdict {
-        return Err(WriterRefusal::StaleSeat { stale });
-    }
     let dir = writer_permits_dir(state);
     let key = tree_key(tree);
     let record = PermitRecord {
@@ -1772,6 +1800,56 @@ mod tests {
             acquire_writer(&state, 1, "worker-b", &tree, None).is_ok(),
             "a dead owner's tree claim must be swept, freeing the tree"
         );
+    }
+
+    #[test]
+    fn concurrent_stale_writer_sweep_admits_exactly_one_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let tree = tmp.path().join("repo");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+        let key = tree_key(&tree);
+        let dir = tree_claims_dir(&state);
+        state::create_private_dir_all(&dir).expect("mkdir");
+        let stale = PermitRecord {
+            pid: crate::commands::ctx::testenv::dead_pid(),
+            pid_start_time: None,
+            child_start_time: None,
+            child_pid: None,
+            label: "dead".to_string(),
+            acquired_at: 1,
+            kind: PermitKind::Writer,
+            tree: Some(tree.clone()),
+        };
+        create_new_private(
+            &tree_claim_path(&dir, &key),
+            &serde_json::to_string_pretty(&stale).expect("serialize"),
+        )
+        .expect("stale claim");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |label: &'static str| {
+            let state = state.clone();
+            let tree = tree.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                acquire_writer(&state, 2, label, &tree, None)
+            })
+        };
+        let first = spawn("first");
+        let second = spawn("second");
+        barrier.wait();
+        let results = [first.join().expect("first"), second.join().expect("second")];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = results.into_iter().find_map(Result::ok).expect("winner");
+        assert_eq!(live_writer_records(&state).len(), 1);
+        let claim: PermitRecord = serde_json::from_str(
+            &std::fs::read_to_string(tree_claim_path(&dir, &key)).expect("winner claim"),
+        )
+        .expect("parse winner claim");
+        assert!(matches!(claim.label.as_str(), "first" | "second"));
+        drop(winner);
     }
 
     /// `live_writer_records` must keep returning exactly the pool slots it

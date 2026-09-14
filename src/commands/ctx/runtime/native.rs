@@ -284,6 +284,14 @@ pub trait ToolExecutor: std::fmt::Debug + Send {
     /// `ToolReceiptState::OutcomeUnknown` is how an executor says it cannot
     /// tell.
     fn execute(&mut self, call: &NativeToolCall) -> ToolReceipt;
+
+    fn generation_lease(&self) -> CtxResult<Option<Box<dyn super::enforcement::GenerationLease>>> {
+        Ok(None)
+    }
+
+    fn execute_with_generation_lease(&mut self, call: &NativeToolCall) -> ToolReceipt {
+        self.execute(call)
+    }
 }
 
 /// The production [`ToolExecutor`]: N05's own client.
@@ -312,6 +320,15 @@ impl ToolExecutor for ClientToolExecutor {
     fn execute(&mut self, call: &NativeToolCall) -> ToolReceipt {
         self.client
             .execute(&call.name, call.arguments.clone(), None, None)
+    }
+
+    fn generation_lease(&self) -> CtxResult<Option<Box<dyn super::enforcement::GenerationLease>>> {
+        self.client.lock_generation().map(Some).map_err(Into::into)
+    }
+
+    fn execute_with_generation_lease(&mut self, call: &NativeToolCall) -> ToolReceipt {
+        self.client
+            .execute_unfenced(&call.name, call.arguments.clone(), None, None)
     }
 }
 
@@ -1380,6 +1397,7 @@ impl<'a> NativeLoop<'a> {
         scope: &EventScope,
         calls: &[NativeToolCall],
     ) -> CtxResult<Vec<ToolOutcome>> {
+        let generation_lease = self.tools.generation_lease()?;
         let definitions = self.tools.definitions();
         let by_name: BTreeMap<&str, &ToolDefinition> =
             definitions.iter().map(|d| (d.name.as_str(), d)).collect();
@@ -1505,9 +1523,11 @@ impl<'a> NativeLoop<'a> {
         }
 
         // Provider-declared order, whatever order execution finished in.
-        Ok((0..prepared.len())
+        let outcomes = (0..prepared.len())
             .filter_map(|index| outcomes.remove(&index))
-            .collect())
+            .collect();
+        drop(generation_lease);
+        Ok(outcomes)
     }
 
     /// Runs one prepared call, with the tool-retry budget applied only where
@@ -1518,7 +1538,7 @@ impl<'a> NativeLoop<'a> {
         loop {
             attempts += 1;
             self.transition(scope, &execution, ToolState::Started, None, None)?;
-            let receipt = self.tools.execute(&entry.call);
+            let receipt = self.tools.execute_with_generation_lease(&entry.call);
             let (state, content, is_error) = classify(&receipt);
             // The shared after-tool service decides whether this result is
             // worth replacing. `Replace` stores the WHOLE result as a journal
@@ -2593,6 +2613,10 @@ pub struct HeadlessRequest<'a> {
     pub route: Option<&'a str>,
     pub role: &'a str,
     pub limits: NativeLimits,
+    /// Conversation identity assigned by a delegation service for a new session.
+    pub session_id: Option<&'a str>,
+    /// Cancellation shared with the delegation record watcher, when delegated.
+    pub cancellation: Option<Arc<CancellationFlag>>,
     /// An existing native journal session to continue instead of starting a
     /// new one. See [`resume_journal`] for what a resume owes first.
     pub resume: Option<&'a str>,
@@ -2860,17 +2884,31 @@ pub fn run_session<W: std::io::Write>(
             (handle, session)
         }
         None => {
-            let handle = backend.start(&SessionSpec {
-                runtime: RuntimeKind::Native,
-                role: request.role.to_string(),
-                agent: None,
-                provider_route: Some(route.route.clone()),
-                model: Some(route.model.id.clone()),
-                surface: UiSurface::Headless,
-                cwd: request.repo.to_path_buf(),
-                prompt: request.prompt.to_string(),
-                extra_args: Vec::new(),
-            })?;
+            let handle = match request.session_id {
+                Some(logical_id) => SessionHandle {
+                    runtime: RuntimeKind::Native,
+                    logical_id: logical_id.to_string(),
+                    short: super::super::sessions::short_id(logical_id),
+                    generation: 1,
+                    role: request.role.to_string(),
+                    surface: UiSurface::Headless,
+                    conversation: Some(BackendConversationRef {
+                        agent: RuntimeKind::Native.as_str().to_string(),
+                        conversation: logical_id.to_string(),
+                    }),
+                },
+                None => backend.start(&SessionSpec {
+                    runtime: RuntimeKind::Native,
+                    role: request.role.to_string(),
+                    agent: None,
+                    provider_route: Some(route.route.clone()),
+                    model: Some(route.model.id.clone()),
+                    surface: UiSurface::Headless,
+                    cwd: request.repo.to_path_buf(),
+                    prompt: request.prompt.to_string(),
+                    extra_args: Vec::new(),
+                })?,
+            };
             let session = JournalSessionId::new(handle.logical_id.clone())?;
             journal.create_session(&SessionIdentity {
                 session: session.clone(),
@@ -2949,8 +2987,10 @@ pub fn run_session<W: std::io::Write>(
     if !request.prompt.is_empty() {
         backend.submit(&handle, request.prompt)?;
     }
-    let cancel = backend
-        .cancellation(&handle)
+    let cancel = request
+        .cancellation
+        .clone()
+        .or_else(|| backend.cancellation(&handle))
         .unwrap_or_else(|| std::sync::Arc::new(CancellationFlag::default()));
 
     // Issue #486: the compaction envelope for this run. The capacity is the
@@ -3473,6 +3513,8 @@ pub fn spawn_interactive(
         route: request.route.as_deref(),
         role: &request.role,
         limits: request.limits,
+        session_id: None,
+        cancellation: None,
         resume: None,
         provider: request.provider.as_deref(),
         fixture_tools: None,
@@ -3807,6 +3849,8 @@ pub fn run_hosted_turns<W: std::io::Write>(
         route: turn.route,
         role: turn.role,
         limits: turn.limits,
+        session_id: None,
+        cancellation: None,
         resume: None,
         provider: turn.provider,
         fixture_tools: turn.fixture_tools,
@@ -4306,6 +4350,8 @@ mod tests {
             route: None,
             role: "orchestrator",
             limits: NativeLimits::default(),
+            session_id: None,
+            cancellation: None,
             resume: None,
             provider: None,
             fixture_tools: None,
@@ -5724,6 +5770,8 @@ mod tests {
             route: None,
             role: "worker",
             limits: NativeLimits::default(),
+            session_id: None,
+            cancellation: None,
             resume: Some("native-session-crashed"),
             provider: Some(&provider),
             fixture_tools: None,
@@ -6582,6 +6630,8 @@ mod tests {
             route: None,
             role: team::COORDINATOR,
             limits: NativeLimits::default(),
+            session_id: None,
+            cancellation: None,
             resume: None,
             provider: Some(&provider),
             fixture_tools: None,
@@ -6613,6 +6663,8 @@ mod tests {
             route: None,
             role: team::COORDINATOR,
             limits: NativeLimits::default(),
+            session_id: None,
+            cancellation: None,
             resume: None,
             provider: Some(&provider),
             fixture_tools: None,

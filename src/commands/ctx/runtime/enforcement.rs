@@ -417,7 +417,24 @@ impl PolicySource for ConfigPolicySource {
 
 pub trait GenerationFence: std::fmt::Debug + Send + Sync {
     fn verify(&self, identity: &ExecutionIdentity) -> Result<(), BrokerError>;
+
+    fn lock(&self, identity: &ExecutionIdentity) -> Result<Box<dyn GenerationLease>, BrokerError> {
+        self.verify(identity)?;
+        Ok(Box::new(UnlockedGenerationLease))
+    }
 }
+
+pub trait GenerationLease: Send {}
+
+struct UnlockedGenerationLease;
+
+impl GenerationLease for UnlockedGenerationLease {}
+
+struct StoredGenerationLease {
+    _guard: super::super::seat::GenerationGuard,
+}
+
+impl GenerationLease for StoredGenerationLease {}
 
 /// Effect-time fence backed by the canonical persisted seat store.
 #[derive(Clone, Debug)]
@@ -459,6 +476,23 @@ impl GenerationFence for StoredSeatFence {
             )));
         }
         Ok(())
+    }
+
+    fn lock(&self, identity: &ExecutionIdentity) -> Result<Box<dyn GenerationLease>, BrokerError> {
+        match seat::lock_generation(&self.state, &identity.short, identity.generation) {
+            Ok(Some(guard)) => Ok(Box::new(StoredGenerationLease { _guard: guard })),
+            Ok(None) => Err(BrokerError::Identity(format!(
+                "seat {} no longer exists",
+                identity.short
+            ))),
+            Err(error) => match error.downcast_ref::<seat::StaleGeneration>() {
+                Some(stale) => Err(BrokerError::StaleGeneration {
+                    expected: stale.current,
+                    got: stale.presented,
+                }),
+                None => Err(BrokerError::Internal(error.to_string())),
+            },
+        }
     }
 }
 
@@ -1161,6 +1195,10 @@ impl ExecutionBroker {
         grant: Option<&ApprovalGrant>,
     ) -> Result<Authorization, BrokerError> {
         self.authorize_at(action, grant, super::super::state::now_secs())
+    }
+
+    pub fn lock_generation(&self) -> Result<Box<dyn GenerationLease>, BrokerError> {
+        self.fence.lock(&self.identity)
     }
 
     pub fn authorize_at(
