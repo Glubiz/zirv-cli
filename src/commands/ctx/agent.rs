@@ -263,7 +263,12 @@ pub struct AgentArgs {
     /// Everything else about the delegation is unchanged: the same task
     /// claim, worktree allocation, writer permit, envelope narrowing, token
     /// reservation, result contract, receipt and report-back mail.
-    #[arg(long, default_value = "harness")]
+    ///
+    /// The default, `configured` (issue #491), means "whatever `[runtime]` in
+    /// `~/.zirv/ctx.toml` says for this `--role`, harness when it says
+    /// nothing"; `zirv ctx agent::run` resolves it to one of the two literal
+    /// values before anything else in this module sees it.
+    #[arg(long, default_value = super::runtime::CONFIGURED)]
     pub runtime: String,
     /// Native runtime only: which `[route]` from the operator's own native
     /// provider configuration this worker spends, overriding the positional
@@ -5032,7 +5037,22 @@ fn append_execution_segments(
 pub fn run<W: Write>(args: &AgentArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env)
+    // Issue #491: same seam as `exec::run` -- the operator's opt-in
+    // `[runtime]` default becomes an explicit backend here, at the CLI entry,
+    // so `run_with` and every receipt below it still see one of exactly two
+    // literal values. A `--role` this delegation names picks the row.
+    let choice = super::runtime::resolve_for_cli(
+        &args.runtime,
+        &repo,
+        &env,
+        args.role.as_deref().unwrap_or("worker"),
+    )?;
+    if let Some(note) = &choice.note {
+        eprintln!("zirv ctx agent: {note}");
+    }
+    let mut args = args.clone();
+    args.runtime = choice.kind.as_str().to_string();
+    run_with(&args, w, &repo, &env)
 }
 
 #[cfg(test)]

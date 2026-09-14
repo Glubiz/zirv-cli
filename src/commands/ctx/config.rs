@@ -2269,6 +2269,39 @@ pub struct HarnessLimits {
     pub reserve_headroom_pct: Option<f64>,
 }
 
+/// Issue #491 (roadmap N22): which backend a session gets when the caller did
+/// not name one. `zirv ctx exec`/`zirv ctx agent` default their `--runtime`
+/// flag to the literal `configured`, and `zirv chat` with no `--runtime` at
+/// all means the same thing: consult this table, fall back to the harness.
+///
+/// Opt-in by construction. An absent `[runtime]` table, an absent `default`
+/// and an unparsable value all resolve to `harness` -- the behaviour every
+/// build before N22 had -- so an existing operator config keeps running the
+/// legacy backend until they say otherwise, and saying otherwise is one key.
+/// Switching back is deleting that key (or `zirv ctx config migrate
+/// --downgrade`, which restores the pre-migration document wholesale).
+///
+/// The WHOLE `[runtime]` table is `REPO_FORBIDDEN`, the same reasoning
+/// `[capabilities]` carries: a checked-out repository moving this operator's
+/// sessions onto their metered native provider accounts is pure widening, and
+/// there is no narrowing half to allow -- "run on the harness instead" is not
+/// a safety property a repo gets to assert either, because the operator's
+/// harness account is just as spendable.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// `"native"` or `"harness"`. Unset (the default) means `harness`.
+    /// Deliberately a plain `String` rather than a typed enum: an unknown
+    /// value here must degrade to the harness with a doctor finding, never
+    /// abort the whole config load of a machine whose zirv is older than the
+    /// value someone wrote.
+    pub default: Option<String>,
+    /// Per-role overrides, keyed by the same role names `[roles]` in
+    /// `native.toml` uses (`orchestrator`, `worker`, `reviewer`, ...). A role
+    /// named here outranks `default`.
+    pub roles: std::collections::BTreeMap<String, String>,
+}
+
 /// Issue #483 (roadmap N14): the non-shell capabilities a native session has
 /// no host harness to inherit -- MCP servers, web search/fetch, browser
 /// automation.
@@ -2508,6 +2541,9 @@ pub struct CtxConfig {
     /// Issue #483's configured MCP/web/browser integrations. The whole table
     /// is `REPO_FORBIDDEN`; see [`CapabilitiesConfig`].
     pub capabilities: CapabilitiesConfig,
+    /// Issue #491's opt-in native runtime default. The whole table is
+    /// `REPO_FORBIDDEN`; see [`RuntimeConfig`].
+    pub runtime: RuntimeConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -3302,6 +3338,9 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["capabilities", "enabled"],
         EnvKind::Bool,
     ),
+    // Issue #491: the operator's opt-in native default, and the spelling
+    // `REPO_FORBIDDEN` names when it rejects a repo layer's `[runtime]` table.
+    ("ZIRV_CTX_RUNTIME", &["runtime", "default"], EnvKind::Str),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -4468,6 +4507,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // pure widening, and "repo-owned config may only narrow" leaves nothing
     // for it to legitimately say.
     (&["capabilities"], "ZIRV_CTX_CAPABILITIES"),
+    // Issue #491: the WHOLE `[runtime]` table, as one prefix entry, same
+    // reasoning as `[capabilities]` right above -- this decides which
+    // provider account a session with no explicit `--runtime` spends, and a
+    // checked-out repository redirecting that is pure widening in either
+    // direction. `~/.zirv/ctx.toml`, `ZIRV_CTX_RUNTIME` and the `--runtime`
+    // flag remain the only ways to set it.
+    (&["runtime"], "ZIRV_CTX_RUNTIME"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
