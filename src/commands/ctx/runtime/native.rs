@@ -1922,8 +1922,19 @@ struct PreparedCall {
 
 struct DiscardingSink;
 
+/// Issue #613: counts deltas the production sink actually received, without
+/// retaining any of them. Test-only -- it exists so a test can prove the
+/// loop still streams every delta through `stream_once` while holding none
+/// of them, rather than trusting `DiscardingSink`'s zero size alone.
+#[cfg(test)]
+static DISCARDED_DELTA_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl EventSink for DiscardingSink {
-    fn push(&mut self, _event: ProviderStreamEvent) {}
+    fn push(&mut self, _event: ProviderStreamEvent) {
+        #[cfg(test)]
+        DISCARDED_DELTA_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn accumulate(total: &mut ProviderUsage, delta: &ProviderUsage) {
@@ -4397,17 +4408,83 @@ mod tests {
         }
     }
 
+    /// Issue #613: drives a real turn through `NativeLoop::run_to_completion`
+    /// (which calls the private `stream_once`, exactly like production) with
+    /// a fixture response streamed as thousands of large deltas. The
+    /// production sink must receive every delta -- this is not a vacuous
+    /// pass -- while retaining none of them, and the assembled response
+    /// committed to the journal must still be the complete, correct text.
     #[test]
     fn native_streaming_does_not_retain_unused_deltas() {
-        let mut sink = DiscardingSink;
-        for index in 0..10_000 {
-            sink.push(ProviderStreamEvent::TextDelta {
-                index,
-                text: "streamed output that is already present in the final response".repeat(8),
-            });
-        }
+        use std::sync::atomic::Ordering;
 
-        assert_eq!(std::mem::size_of_val(&sink), 0);
+        DISCARDED_DELTA_COUNT.store(0, Ordering::Relaxed);
+
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let full_text = "streamed output that is already present in the final response ".repeat(64);
+        // One delta per character guarantees the fixture's own chunker
+        // (`split_into`) hands back exactly this many deltas -- thousands of
+        // small, large-in-aggregate pushes through the production sink.
+        let delta_count = full_text.chars().count();
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(&format!(
+                r#"{{"turns":[{{"model":"fixture-anthropic-model","blocks":[{{"type":"text","text":{text},"deltas":{deltas}}}]}}]}}"#,
+                text = serde_json::to_string(&full_text).unwrap(),
+                deltas = delta_count,
+            ))
+            .unwrap(),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let clock = || 1_000u64;
+        let status = {
+            let mut driver = NativeLoop::new(
+                config_for(session.clone(), route),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge("go", false).expect("acknowledge");
+            driver.run_to_completion().expect("turn completes")
+        };
+        assert_eq!(status.status, NativeStatus::Completed);
+
+        // The sink counts every stream event (message-start/stop framing
+        // too, not only text deltas), so the observed count is the text
+        // delta count plus a small constant of framing events -- never
+        // fewer than the scripted text deltas themselves.
+        let observed = DISCARDED_DELTA_COUNT.load(Ordering::Relaxed);
+        assert!(
+            observed >= delta_count,
+            "expected the production sink to see every one of the {delta_count} scripted text \
+             deltas (plus framing events), got {observed}"
+        );
+        assert_eq!(
+            std::mem::size_of::<DiscardingSink>(),
+            0,
+            "the sink that receives every delta must retain none of them"
+        );
+
+        let replayed = journal.replay(&session).expect("replay");
+        let assistant_text: Vec<String> = replayed
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                AssistantBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistant_text,
+            vec![full_text],
+            "the assembled response must stay correct even though the loop discards every delta"
+        );
     }
 
     /// Issue #484 (roadmap N15) item 3: workflow and methodology adoption is
