@@ -1813,15 +1813,31 @@ facts, `/compact` is an honest inert stub. `@` file references
 (`resolve_file_refs`, containment-checked against the workdir) and a
 `!`-prefixed shell line are not wired into this loop yet.
 
-This is a separate, single-pane dashboard mode from the wrapped-harness
-dashboard `zirv chat` opens without `--runtime native` — it does not (yet)
-mix a native pane into that dashboard's own multi-pane `Vec<Pane>`, so mail
-sweep, budget accounting, attention projection and the restore roster are
-unaffected by this flag. The view model (the reducer from the journal to a
-transcript, the composer, the renderers) is `dash::native_pane`, covered by
-deterministic tests with no terminal required; see
-[`docs/design/2026-09-13-native-pane.md`](docs/design/2026-09-13-native-pane.md)
-for the design and exactly what mixed-pane integration is still owed.
+`--runtime native` is **not** a separate dashboard any more: the native
+conversation opens as the **first pane of the ordinary dashboard**, so one
+process holds wrapped and native panes together. A pane carries its kind
+(`dash::pane::PaneKind`); everything around it — the header, the sidebar
+roster, the spawn-request channel, the mail sweep, attention, the budget
+sweep, the footer spend and the restore roster — is the dashboard's own and
+applies to both kinds unchanged. Only four things differ by kind: the pane
+renders as a `vt100` grid or as the native frame, a keystroke reaches the
+pty writer or the native composer/router (a native control is never offered
+on a wrapped pane, and vice versa), mail is delivered as a visible pty
+injection or through the native **submit path** (so it is subject to the same
+rollover/generation guard the operator's own `Enter` is), and ending it sends
+a harness quit sequence or shuts the session down. `zirv agent <role>
+--runtime native` from inside the dashboard opens a native **worker** pane
+the same way; such a request is refused, rather than accepted and silently
+unaccounted, when it asks for a work group or a token/time ceiling, which are
+accounted from a harness transcript a native session does not have. The
+restore roster records each pane's kind, and a native pane comes back through
+the same attachment decision a fresh one makes — so a dashboard restarting
+while the persistent runtime still holds the conversation re-attaches to it
+rather than opening a second supervisor over it. The view model (the reducer
+from the journal to a transcript, the composer, the renderers) is
+`dash::native_pane`, covered by deterministic tests with no terminal
+required; see
+[`docs/design/2026-09-13-native-pane.md`](docs/design/2026-09-13-native-pane.md).
 
 **The pane's own surfaces (issue #490).** Beside the conversation the pane
 draws an **agent & task overview** built from the coordinator graph, the
@@ -1842,9 +1858,19 @@ focus, scrollback and acknowledged input survive all three, and a
 submission is refused outright when the logical seat has moved on
 underneath the pane. An approval is rendered as a numbered dialog carrying
 the exact scope, answered only with `1`–`3`, the arrows, `Enter` or `Esc` —
-never from the composer, which queues while blocked. A native session whose
-broker runs in headless approval mode is shown the deny option only, rather
-than a "Yes" that would quietly fail. `?` lists every binding, `Tab` moves
+never from the composer, which queues while blocked. **Answering "Yes" is
+real for an in-process session:** its execution broker runs in interactive
+approval mode, raises a typed request carrying the exact tool, scope and
+actor, and BLOCKS that tool call until the dialog answers. `1` runs it once;
+`2` runs it and stops asking for that **exact** tool+scope for the rest of
+this session only (never persisted, never widened to a directory, and only
+offered when the scope can be stated exactly); `3` refuses the call with the
+operator's guidance, which is also committed as steering so the running loop
+picks it up. `Esc` is `3`. Interrupting the turn cancels whatever is blocked
+on the dialog: the call fails closed and a later answer releases nothing. A
+**headless** session is unchanged — it is shown the deny option only, rather
+than a "Yes" that would quietly fail — and repository-owned configuration can
+only narrow this, never grant it. `?` lists every binding, `Tab` moves
 focus, `Esc` interrupts (or closes a dialog first), and a double `Ctrl+C`
 quits. The composer itself is a bordered box with a `>` marker and a hint
 line naming what `Enter` does right now, and `/`, `@` and `!` open the
