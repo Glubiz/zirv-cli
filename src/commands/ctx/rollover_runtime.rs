@@ -755,6 +755,19 @@ impl std::fmt::Display for SuccessorRefusal {
 /// gate and the subagent settlement for free. Returns the successor's own
 /// session identity.
 pub trait SuccessorLauncher {
+    /// Whether this seam can start `plan` AT ALL, asked before anything is
+    /// settled or given up -- so a seam with no backend for the plan's
+    /// runtime costs the source nothing by refusing.
+    ///
+    /// The default admits everything, which is right for a seam that can
+    /// start every direction it is handed. `wrap.rs` overrides it: it
+    /// supervises a harness child and has no native backend, and settling
+    /// this seat's subagents for a swap that is then refused would retire
+    /// workers on behalf of a rollover that never happened.
+    fn admits(&self, _plan: &SuccessorPlan) -> Result<(), SuccessorRefusal> {
+        Ok(())
+    }
+
     fn launch(&mut self, plan: &SuccessorPlan) -> Result<String, SuccessorRefusal>;
 }
 
@@ -814,7 +827,9 @@ pub fn plan_successor(
 ///
 /// The single production seam a rollover's execution admission goes through:
 ///
-/// 1. this seat's subagents are settled first ([`settle_subagents`]) -- a
+/// 0. the seam is asked whether it can take this plan at all
+///    ([`SuccessorLauncher::admits`]), before anything is settled;
+/// 1. this seat's subagents are settled ([`settle_subagents`]) -- a
 ///    worker the source launched is finished, stopped or explicitly retained
 ///    under the seat's own address BEFORE anything takes the seat, so it can
 ///    never end up owned by two generations at once;
@@ -833,6 +848,9 @@ pub fn launch_successor(
     drain: Drain,
     now: u64,
 ) -> Result<String, SuccessorRefusal> {
+    // Admission first: a seam that cannot take this plan must not have this
+    // seat's subagents settled on its behalf.
+    launcher.admits(plan)?;
     settle_subagents(state, repo, &plan.short, parent_session, drain, now);
     launcher.launch(plan)
 }
