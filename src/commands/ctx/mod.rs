@@ -27,6 +27,7 @@ pub mod dash;
 pub mod delegation;
 pub mod diagnostics;
 pub mod discover;
+pub mod doctor;
 pub mod drift;
 pub mod envelope;
 pub mod event;
@@ -573,6 +574,15 @@ pub enum CtxVerb {
     /// unavailable or unverified, with the diagnosis for anything missing
     /// (issue #483). `--probe` contacts each MCP server to verify it.
     Capabilities(capabilities_cmd::CapabilitiesArgs),
+    /// Diagnose native readiness (issue #491): for every role, which backend
+    /// an unflagged session gets and why, which route it would spend, and
+    /// every problem sorted into exactly one named class -- missing auth
+    /// material, inaccessible model, missing tool, unsupported isolation,
+    /// service failure or upstream entitlement limit. Redacted like `ctx
+    /// snapshot`, so the output is safe to paste into a bug report. Exits 1
+    /// when a role that would run natively has no usable route. `--live`
+    /// additionally contacts each provider's model-list endpoint.
+    Doctor(doctor::DoctorArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -704,6 +714,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Learn(a) => learn::run(a, &mut out),
         CtxVerb::Api(a) => api::run(a, &mut out),
         CtxVerb::Capabilities(a) => capabilities_cmd::run(a, &mut out),
+        CtxVerb::Doctor(a) => doctor::run(a, &mut out),
     };
 
     match result {

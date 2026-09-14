@@ -449,7 +449,13 @@ fn apply_probe(
     probe: &dyn Probe,
 ) {
     match probe.models(&endpoint.base_url, spec, credential) {
-        ProbeResult::Unreachable(problem) => report.problems.push(problem),
+        // Prefixed, not raw: a transport error's own text ("connection
+        // refused") names neither what was being reached nor that reaching it
+        // is what failed, and `doctor::classify` has to be able to tell a
+        // service failure from a missing key by reading it.
+        ProbeResult::Unreachable(problem) => report
+            .problems
+            .push(format!("endpoint unreachable: {problem}")),
         ProbeResult::Http {
             status: 200,
             model_ids,

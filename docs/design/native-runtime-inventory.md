@@ -73,6 +73,7 @@ criterion).
 | `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |
 | `ctx config` | shared |  |
 | `ctx discover` | N03 (#472) | reads the compaction ledger to size Bash tool-result bloat |
+| `ctx doctor` | N22 (#491) | native-readiness diagnosis: per role, which backend an unflagged session gets and why, which route it would spend, and every problem sorted into exactly one of missing auth material / inaccessible model / missing tool / unsupported isolation / service failure / upstream entitlement. Gathers only from owners that already exist (`provider::inventory`, `runtime::capabilities`, `runtime::enforcement::PlatformIsolation`, `adapters::ADAPTERS`); calls no model; redacts every rendered string through `snapshot::redact_text` |
 | `ctx exec` | N09 (#478) |  |
 | `ctx explain-status` | shared |  |
 | `ctx forget` | N06 (#475) | native `memory_forget` reuses the same locked store and journal semantics |
