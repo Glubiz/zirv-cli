@@ -1834,6 +1834,8 @@ fn migrate(conn: &Connection) -> JournalResult<()> {
              ON native_events(session_id, execution_id, sequence);
          CREATE INDEX native_events_task
              ON native_events(session_id, task_id, sequence);
+         CREATE INDEX IF NOT EXISTS native_events_type
+             ON native_events(session_id, event_type, sequence);
          CREATE TABLE native_stream_frames (
              session_id TEXT NOT NULL REFERENCES native_sessions(session_id) ON DELETE CASCADE,
              stream_id TEXT NOT NULL,
@@ -2329,7 +2331,27 @@ fn read_events_after(
     Ok(events)
 }
 
+/// Issue #614: counts every `payload_json` decode, so a test can prove
+/// reporting surfaces such as `ctx status` read a bounded projection instead
+/// of decoding a whole session's history. Test-only; production pays no
+/// cost for it.
+#[cfg(test)]
+pub(crate) static DECODED_PAYLOAD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_decoded_payload_count() {
+    DECODED_PAYLOAD_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn decoded_payload_count() -> usize {
+    DECODED_PAYLOAD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn decode_event(raw: RawEvent) -> JournalResult<StoredEvent> {
+    #[cfg(test)]
+    DECODED_PAYLOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sequence = rust_u64(raw.sequence, "sequence")?;
     let event: JournalEvent = serde_json::from_str(&raw.payload).map_err(|error| {
         JournalError::Corrupt(format!("event payload at sequence {sequence}: {error}"))
