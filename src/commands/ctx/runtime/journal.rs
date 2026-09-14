@@ -1511,6 +1511,56 @@ impl Journal {
         read_events(&self.conn, session)
     }
 
+    /// Counts one event kind without reading or decoding its payloads.
+    /// Reporting surfaces use this projection when they need an all-time
+    /// count but not the full conversation history.
+    pub fn event_type_count(
+        &self,
+        session: &JournalSessionId,
+        event_type: &str,
+    ) -> JournalResult<usize> {
+        let _ = self.session(session)?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM native_events WHERE session_id = ?1 AND event_type = ?2",
+            params![session.as_str(), event_type],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count)
+            .map_err(|_| JournalError::Corrupt(format!("invalid {event_type} event count {count}")))
+    }
+
+    /// The newest event of one kind, decoding at most one payload.
+    pub fn latest_event_of_type(
+        &self,
+        session: &JournalSessionId,
+        event_type: &str,
+    ) -> JournalResult<Option<StoredEvent>> {
+        let _ = self.session(session)?;
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT sequence, generation, event_type, turn_id, attempt_id, task_id,
+                        payload_json, committed_at
+                 FROM native_events WHERE session_id = ?1 AND event_type = ?2
+                 ORDER BY sequence DESC LIMIT 1",
+                params![session.as_str(), event_type],
+                |row| {
+                    Ok(RawEvent {
+                        sequence: row.get(0)?,
+                        generation: row.get(1)?,
+                        event_type: row.get(2)?,
+                        turn: row.get(3)?,
+                        attempt: row.get(4)?,
+                        task: row.get(5)?,
+                        payload: row.get(6)?,
+                        committed_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        raw.map(decode_event).transpose()
+    }
+
     /// One bounded page of a session's durable events, strictly newer than
     /// `after`.
     ///

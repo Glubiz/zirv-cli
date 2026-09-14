@@ -709,46 +709,84 @@ impl RecoveryHistory {
     }
 }
 
+/// The bounded recovery projection needed by status: all-time counts plus
+/// the newest compaction, without decoding unrelated conversation events.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RecoverySummary {
+    pub compactions: usize,
+    pub resumes: usize,
+    pub last_compaction: Option<CompactionRecord>,
+}
+
+impl RecoverySummary {
+    pub fn is_empty(&self) -> bool {
+        self.compactions == 0 && self.resumes == 0
+    }
+}
+
+fn compaction_record(stored: &super::journal::StoredEvent) -> Option<CompactionRecord> {
+    let JournalEvent::Checkpoint {
+        kind,
+        portable_state,
+        ..
+    } = &stored.event
+    else {
+        return None;
+    };
+    let parsed = serde_json::from_value::<PortableCheckpoint>(portable_state.clone()).ok();
+    Some(CompactionRecord {
+        sequence: stored.sequence.0,
+        kind: format!("{kind:?}").to_lowercase(),
+        reason: parsed
+            .as_ref()
+            .map(|checkpoint| checkpoint.reason.clone())
+            .unwrap_or_else(|| "unreadable checkpoint".to_string()),
+        covers_through: parsed
+            .as_ref()
+            .map(|checkpoint| checkpoint.covers_through)
+            .unwrap_or(0),
+        summary_source: parsed
+            .as_ref()
+            .map(|checkpoint| checkpoint.summary.source.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        created_at: stored.committed_at,
+    })
+}
+
 pub fn history(journal: &Journal, session: &JournalSessionId) -> CtxResult<RecoveryHistory> {
     let mut out = RecoveryHistory::default();
     for stored in journal.events(session)? {
-        match stored.event {
-            JournalEvent::Checkpoint {
-                kind,
-                portable_state,
-                ..
-            } => {
-                let parsed =
-                    serde_json::from_value::<PortableCheckpoint>(portable_state.clone()).ok();
-                out.compactions.push(CompactionRecord {
-                    sequence: stored.sequence.0,
-                    kind: format!("{kind:?}").to_lowercase(),
-                    reason: parsed
-                        .as_ref()
-                        .map(|checkpoint| checkpoint.reason.clone())
-                        .unwrap_or_else(|| "unreadable checkpoint".to_string()),
-                    covers_through: parsed
-                        .as_ref()
-                        .map(|checkpoint| checkpoint.covers_through)
-                        .unwrap_or(0),
-                    summary_source: parsed
-                        .as_ref()
-                        .map(|checkpoint| checkpoint.summary.source.clone())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    created_at: stored.committed_at,
-                });
+        match &stored.event {
+            JournalEvent::Checkpoint { .. } => {
+                if let Some(record) = compaction_record(&stored) {
+                    out.compactions.push(record);
+                }
             }
             JournalEvent::GenerationAdvanced { previous, current } => {
                 out.resumes.push(ResumeRecord {
                     sequence: stored.sequence.0,
-                    previous_generation: previous,
-                    generation: current,
+                    previous_generation: *previous,
+                    generation: *current,
                 })
             }
             _ => {}
         }
     }
     Ok(out)
+}
+
+pub fn history_summary(
+    journal: &Journal,
+    session: &JournalSessionId,
+) -> CtxResult<RecoverySummary> {
+    Ok(RecoverySummary {
+        compactions: journal.event_type_count(session, "checkpoint")?,
+        resumes: journal.event_type_count(session, "generation_advanced")?,
+        last_compaction: journal
+            .latest_event_of_type(session, "checkpoint")?
+            .as_ref()
+            .and_then(compaction_record),
+    })
 }
 
 // -- continuation planning ------------------------------------------------

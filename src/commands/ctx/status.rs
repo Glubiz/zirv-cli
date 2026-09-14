@@ -2122,7 +2122,7 @@ fn native_recovery_lines(state: &StateDir) -> Vec<String> {
     };
     let mut lines = Vec::new();
     for session in sessions.iter().rev().take(NATIVE_RECOVERY_SESSIONS) {
-        let Ok(history) = compaction::history(&journal, session) else {
+        let Ok(history) = compaction::history_summary(&journal, session) else {
             continue;
         };
         if history.is_empty() {
@@ -2130,10 +2130,9 @@ fn native_recovery_lines(state: &StateDir) -> Vec<String> {
         }
         let mut line = format!(
             "native {session}: {} compaction(s), {} resume(s)",
-            history.compactions.len(),
-            history.resumes.len()
+            history.compactions, history.resumes
         );
-        if let Some(last) = history.compactions.last() {
+        if let Some(last) = history.last_compaction.as_ref() {
             line.push_str(&format!(
                 "; last {} through sequence {} ({} summary)",
                 last.reason, last.covers_through, last.summary_source
@@ -2598,10 +2597,7 @@ mod tests {
         assert!(!state.native_journal().exists());
     }
 
-    /// Issue #486: a compacted native session reports its count and the
-    /// reason for its newest compaction, read straight off the journal.
-    #[test]
-    fn the_native_recovery_section_names_the_newest_compaction_reason() {
+    fn native_status_journal() -> (tempfile::TempDir, StateDir) {
         use crate::commands::ctx::provider::{
             AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
         };
@@ -2675,12 +2671,39 @@ mod tests {
         .unwrap();
         drop(journal);
 
+        (dir, state)
+    }
+
+    /// Issue #486: a compacted native session reports its count and the
+    /// reason for its newest compaction, read straight off the journal.
+    #[test]
+    fn the_native_recovery_section_names_the_newest_compaction_reason() {
+        let (_dir, state) = native_status_journal();
+
         let lines = native_recovery_lines(&state);
         assert_eq!(lines.len(), 1, "got {lines:?}");
         assert!(lines[0].contains("native native-status-1"), "{}", lines[0]);
         assert!(lines[0].contains("1 compaction(s)"), "{}", lines[0]);
         assert!(lines[0].contains("token_pressure"), "{}", lines[0]);
         assert!(lines[0].contains("structural summary"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn status_recovery_summary_reads_bounded_history() {
+        let (_dir, state) = native_status_journal();
+        let connection = rusqlite::Connection::open(state.native_journal()).unwrap();
+        connection
+            .execute(
+                "UPDATE native_events SET payload_json = ?1 WHERE event_type = 'input_acknowledged'",
+                ["not-json".repeat(128 * 1024)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let lines = native_recovery_lines(&state);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].contains("1 compaction(s)"), "{}", lines[0]);
+        assert!(lines[0].contains("token_pressure"), "{}", lines[0]);
     }
 
     /// Issue #312: the pure rendering half of `--breakdown`, exercised
