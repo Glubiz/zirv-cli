@@ -833,21 +833,23 @@ mod tests {
     /// Issue #582 (roadmap N05): `apply_patch` validated its precondition
     /// once at the start and then performed an unconditional atomic rename,
     /// so an edit landing in the window between the two silently overwrote
-    /// it. Proved with a real race rather than a pre-arranged mismatch,
-    /// since a single-threaded call can never let the destination change
-    /// out from under itself: a background writer is synchronized on the
-    /// one externally observable side effect `write_atomic_bytes_if_
-    /// unchanged` produces before it ever re-reads the destination -- the
-    /// temp sibling's directory entry, created by `open()` well before its
-    /// content is flushed -- so it always lands the external write before
-    /// that re-read. The patch content is large enough that flushing it
-    /// leaves a wide margin for the busy-polling writer to win.
+    /// it.
+    ///
+    /// Review round 2: a real background writer racing on the temp
+    /// sibling's directory entry (its previous form) proved non-
+    /// deterministic under CI (#630) -- a yield-loop racer can legitimately
+    /// lose the race, at which point `apply_patch` correctly succeeds and
+    /// the test's own assumption is simply wrong for that run. This uses
+    /// `state::set_pre_rename_hook` instead: no threads, no timing, no
+    /// possibility of losing a race -- the external write runs synchronously
+    /// from inside the exact point (after `write_atomic_bytes_if_unchanged`'s
+    /// own re-verify, immediately before the rename) a real concurrent write
+    /// would have to land in to be caught at all.
     #[test]
     fn patch_refuses_edit_racing_final_replace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("racy.txt");
-        let filler = "filler line to widen the temp-file write window\n".repeat(200_000);
-        let original = format!("{filler}old-marker\n");
+        let original = "old-marker\n".to_string();
         std::fs::write(&path, &original).expect("write");
         let expected_sha256 = sha256(original.as_bytes());
         let args = ApplyPatchArgs {
@@ -862,37 +864,13 @@ mod tests {
         };
 
         let external_bytes = b"external edit landed mid-replace".to_vec();
-        let racer_dir = dir.path().to_path_buf();
-        let racer_target = path.clone();
-        let racer_bytes = external_bytes.clone();
-        let racer = std::thread::spawn(move || -> bool {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                let Ok(entries) = std::fs::read_dir(&racer_dir) else {
-                    std::thread::yield_now();
-                    continue;
-                };
-                let found_temp_sibling = entries.filter_map(|entry| entry.ok()).any(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with('.') && name.contains(".tmp-"))
-                });
-                if found_temp_sibling {
-                    std::fs::write(&racer_target, &racer_bytes).expect("racing write");
-                    return true;
-                }
-                std::thread::yield_now();
-            }
-            false
+        let hook_path = path.clone();
+        let hook_bytes = external_bytes.clone();
+        let _hook = crate::commands::ctx::state::set_pre_rename_hook(move || {
+            std::fs::write(&hook_path, &hook_bytes).expect("racing write from the hook");
         });
 
         let error = apply_patch(&path, &args).expect_err("racing edit must be refused");
-        let raced = racer.join().expect("racer thread");
-        assert!(
-            raced,
-            "race harness never observed the temp sibling in time; widen the margin"
-        );
         assert_eq!(error.code, ToolErrorCode::PreconditionFailed);
         assert_eq!(
             std::fs::read(&path).expect("read"),
@@ -903,57 +881,32 @@ mod tests {
 
     /// Review round 1 on #582's fix: `write_file`'s replace path had the
     /// same check-then-unconditional-`write_atomic_bytes` race
-    /// `apply_patch` had, just not covered by a test. Mirrors
-    /// `patch_refuses_edit_racing_final_replace` exactly -- same
-    /// temp-sibling-appearance synchronization, same shape of assertions --
-    /// against `write_file` instead.
+    /// `apply_patch` had, just not covered by a test. Review round 2: mirrors
+    /// `patch_refuses_edit_racing_final_replace`'s deterministic hook-based
+    /// synchronization, not its previous (non-deterministic under CI, #630)
+    /// real-race form.
     #[test]
     fn write_file_refuses_edit_racing_final_replace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("racy-write.txt");
-        let filler = "filler line to widen the temp-file write window\n".repeat(200_000);
-        let original = format!("{filler}before\n");
+        let original = "before\n".to_string();
         std::fs::write(&path, &original).expect("write");
         let args = WriteFileArgs {
             path: path.clone(),
-            content: format!("{filler}after\n"),
+            content: "after\n".into(),
             expected_sha256: Some(sha256(original.as_bytes())),
             create_only: false,
             idempotency_key: "write-race-1".into(),
         };
 
         let external_bytes = b"external edit landed mid-replace".to_vec();
-        let racer_dir = dir.path().to_path_buf();
-        let racer_target = path.clone();
-        let racer_bytes = external_bytes.clone();
-        let racer = std::thread::spawn(move || -> bool {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                let Ok(entries) = std::fs::read_dir(&racer_dir) else {
-                    std::thread::yield_now();
-                    continue;
-                };
-                let found_temp_sibling = entries.filter_map(|entry| entry.ok()).any(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with('.') && name.contains(".tmp-"))
-                });
-                if found_temp_sibling {
-                    std::fs::write(&racer_target, &racer_bytes).expect("racing write");
-                    return true;
-                }
-                std::thread::yield_now();
-            }
-            false
+        let hook_path = path.clone();
+        let hook_bytes = external_bytes.clone();
+        let _hook = crate::commands::ctx::state::set_pre_rename_hook(move || {
+            std::fs::write(&hook_path, &hook_bytes).expect("racing write from the hook");
         });
 
         let error = write_file(&path, &args).expect_err("racing edit must be refused");
-        let raced = racer.join().expect("racer thread");
-        assert!(
-            raced,
-            "race harness never observed the temp sibling in time; widen the margin"
-        );
         assert_eq!(error.code, ToolErrorCode::PreconditionFailed);
         assert_eq!(
             std::fs::read(&path).expect("read"),
