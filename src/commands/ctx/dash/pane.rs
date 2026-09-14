@@ -6360,4 +6360,300 @@ pub(crate) mod tests {
         pane.shutdown("")
             .expect("shutdown after finish_shutdown is a no-op");
     }
+
+    // =====================================================================
+    // Issue #490 (roadmap N21 item A): a mixed roster -- wrapped and native
+    // panes in ONE dashboard's pane vector.
+    //
+    // Every test below builds a REAL native pane (`Pane::spawn_native`)
+    // against `runtime::fixture::FixtureProvider`, so the routing assertions
+    // are made against the same `PaneKind` the dashboard actually holds
+    // rather than against a stand-in.
+    // =====================================================================
+
+    /// A state dir, a repo tree for the writer lease to claim, and the env
+    /// lookup that resolves the former -- the same shape
+    /// `runtime::native::tests::interactive_shutdown_fixture` uses.
+    fn native_pane_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        StateDir,
+        std::collections::HashMap<String, String>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_root = tmp.path().join("state");
+        let state = StateDir::from_root(state_root.clone());
+        let env: std::collections::HashMap<String, String> = [(
+            super::super::super::state::STATE_ENV.to_string(),
+            state_root.to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        (tmp, repo, state, env)
+    }
+
+    fn native_spec(repo: &Path) -> super::super::native_pane::NativeDashboardSpec {
+        super::super::native_pane::NativeDashboardSpec {
+            repo: repo.to_path_buf(),
+            role: "worker".to_string(),
+            route: None,
+            // Not writing: a writer lease needs a linked worktree, and this
+            // fixture's repo is a bare temp directory. The pane kind, its
+            // routing and its delivery path are what these tests are about.
+            writing: false,
+            provider: Some(format!(
+                "fixture:{}",
+                super::super::super::runtime::fixture::fixture_root()
+                    .join("helper-answer.json")
+                    .display()
+            )),
+        }
+    }
+
+    fn spawn_native_test_pane(
+        state: &StateDir,
+        env: &std::collections::HashMap<String, String>,
+        repo: &Path,
+    ) -> Pane {
+        let lookup = |key: &str| env.get(key).cloned();
+        Pane::spawn_native(
+            &super::super::super::config::CtxConfig::default(),
+            state,
+            &lookup,
+            repo,
+            Verb::Dash,
+            "wrk native".to_string(),
+            (80, 24),
+            native_spec(repo),
+        )
+        .expect("a native pane opens")
+    }
+
+    #[test]
+    fn a_mixed_roster_holds_both_pane_kinds_and_renders_each_its_own_way() {
+        let (_tmp, repo_dir, state, env) = native_pane_fixture();
+        let repo = repo_dir.path();
+
+        let mut spec = test_spec("31111111-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let wrapped = Pane::spawn(
+            spec,
+            &state,
+            repo,
+            repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("wrapped pane");
+        let native = spawn_native_test_pane(&state, &env, repo);
+
+        // ONE vector, two kinds -- the whole point of the retrofit.
+        let mut panes = vec![wrapped, native];
+        assert_eq!(
+            panes.iter().map(Pane::is_native).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        // Rendering dispatch: the wrapped pane has a vt100 grid and no native
+        // driver; the native pane has a driver and its own transcript view.
+        assert!(panes[0].native().is_none());
+        assert_eq!(panes[0].screen().size(), (24, 80));
+        let (view, _presentation) = panes[1].native().expect("driver").view();
+        assert!(view.items.is_empty(), "a fresh conversation has no items");
+
+        // Both report the identity the roster, mail and attention key on.
+        assert!(!panes[0].short().is_empty());
+        assert!(!panes[1].short().is_empty());
+        assert_ne!(panes[0].short(), panes[1].short());
+
+        for pane in panes.iter_mut() {
+            let _ = pane.stop_now(0);
+        }
+    }
+
+    #[test]
+    fn focus_routes_a_key_to_the_focused_panes_own_kind() {
+        let (_tmp, repo_dir, state, env) = native_pane_fixture();
+        let repo = repo_dir.path();
+        let mut spec = test_spec("32111111-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let wrapped = Pane::spawn(
+            spec,
+            &state,
+            repo,
+            repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("wrapped pane");
+        let native = spawn_native_test_pane(&state, &env, repo);
+        let mut panes = vec![wrapped, native];
+
+        // Focus on the native pane: the key reaches the composer, not a pty.
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let mut ctrl_c = None;
+        let routed = panes[1].native_mut().map(|native| {
+            super::super::native_pane::handle_native_key(
+                native,
+                key,
+                &mut ctrl_c,
+                false,
+                false,
+                &super::super::super::config::CtxConfig::default(),
+            )
+        });
+        assert_eq!(routed, Some(super::super::native_pane::NativeKey::Consumed));
+        assert_eq!(
+            panes[1]
+                .native()
+                .expect("driver")
+                .view()
+                .1
+                .composer
+                .draft
+                .as_str(),
+            "x",
+            "the key went to the native composer"
+        );
+
+        // Focus on the wrapped pane: there is no native driver to route to at
+        // all, so the dashboard falls through to the pty writer.
+        assert!(panes[0].native_mut().is_none());
+        panes[0]
+            .write_operator_input(b"x")
+            .expect("the wrapped pane takes bytes");
+
+        for pane in panes.iter_mut() {
+            let _ = pane.stop_now(0);
+        }
+    }
+
+    #[test]
+    fn a_wrapped_pane_is_never_offered_a_native_control() {
+        let (_tmp, repo_dir, state, _env) = native_pane_fixture();
+        let repo = repo_dir.path();
+        let mut spec = test_spec("33111111-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            repo,
+            repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("wrapped pane");
+
+        assert!(!pane.is_native());
+        assert!(!pane.accepts_native_controls());
+        assert!(pane.native().is_none());
+        assert!(pane.native_mut().is_none());
+        // And the pty-only surface still works on it, which is the other half
+        // of the same rule: neither kind silently gets the other's controls.
+        assert!(pane.writer().is_ok());
+        let _ = pane.stop_now(0);
+    }
+
+    #[test]
+    fn mail_to_a_native_pane_goes_through_its_submit_path_not_a_pty_injection() {
+        let (_tmp, repo_dir, state, env) = native_pane_fixture();
+        let repo = repo_dir.path();
+        let mut pane = spawn_native_test_pane(&state, &env, repo);
+
+        // The mail sweep's own call. On a wrapped pane this types a visible
+        // line and arms a deferred carriage return; on a native pane it must
+        // reach the composer's submit path instead -- there is nothing to type
+        // into and no `\r` to send.
+        pane.inject_visible("mail", "please review the seat fence")
+            .expect("delivery");
+
+        let native = pane.native().expect("driver");
+        let (_view, presentation) = native.view();
+        assert!(
+            presentation.composer.draft.is_empty(),
+            "the message was submitted, not left sitting in the draft"
+        );
+        assert!(
+            !pane.has_pending_submit(),
+            "a native delivery arms no two-phase pty submit"
+        );
+        assert!(
+            pane.writer().is_err(),
+            "and there is no pty writer it could have been typed into"
+        );
+        let _ = pane.stop_now(0);
+    }
+
+    #[test]
+    fn a_native_pane_refuses_a_harness_handover_and_reports_its_own_facts() {
+        let (_tmp, repo_dir, state, env) = native_pane_fixture();
+        let repo = repo_dir.path();
+        let mut pane = spawn_native_test_pane(&state, &env, repo);
+
+        // Budget/attention/roster facts: a native pane answers all three.
+        assert_eq!(pane.state(), PaneState::Idle);
+        assert!(pane.reachable(), "a native pane binds no socket to fail on");
+        assert!(pane.child_pid().is_none());
+        assert!(
+            pane.measured_usage().is_some(),
+            "usage comes from the session's own journal, not a transcript read"
+        );
+        assert_eq!(
+            pane.session_id(),
+            pane.native().expect("driver").journal_session(),
+        );
+
+        // A handover swaps one wrapped harness child for another; a native
+        // pane has none, and says so rather than silently doing nothing.
+        let error = pane
+            .handover(
+                &super::super::super::config::CtxConfig::default(),
+                &super::super::super::handover::HandoverRequest {
+                    target_agent: "claude".to_string(),
+                    target_model: None,
+                    force: true,
+                    requested_at: 0,
+                    interactive: false,
+                    automatic: false,
+                    generation: None,
+                    structural_only: false,
+                    resume_session: None,
+                },
+                &super::super::super::handoff::Handoff::default(),
+                PromptRole::Worker,
+                repo,
+                (80, 24),
+            )
+            .expect_err("a native pane has no harness child");
+        assert!(
+            error.to_string().contains("no harness child"),
+            "unexpected refusal: {error}"
+        );
+        let _ = pane.stop_now(0);
+    }
+
+    #[test]
+    fn ending_a_native_pane_is_idempotent_and_retires_it_like_any_other() {
+        let (_tmp, repo_dir, state, env) = native_pane_fixture();
+        let repo = repo_dir.path();
+        let mut pane = spawn_native_test_pane(&state, &env, repo);
+        let short = pane.short().to_string();
+        let record_path = state.sessions().join(format!("{short}.json"));
+        assert!(record_path.exists(), "the record exists while it runs");
+
+        pane.stop_now(7).expect("stop_now");
+        assert_eq!(pane.state(), PaneState::Ended(7));
+        assert!(!record_path.exists(), "the record is released");
+        // Both halves are idempotent, exactly as they are for a wrapped pane.
+        pane.finish_shutdown().expect("idempotent");
+        pane.shutdown("").expect("idempotent");
+    }
 }

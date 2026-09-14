@@ -586,4 +586,35 @@ mod tests {
             "got {argv:?}"
         );
     }
+
+    /// Issue #490 (roadmap N21 item A): the restore roster has to remember
+    /// WHICH KIND of pane an entry was, because the two come back by
+    /// different routes -- a wrapped pane by relaunching its argv, a native
+    /// one through `open_native_pane`, whose `resolve_attach` decides all
+    /// over again whether the persistent runtime already holds the seat.
+    #[test]
+    fn a_roster_records_the_pane_kind_and_an_older_roster_reads_as_wrapped() {
+        let mut roster = sample_roster();
+        roster.panes[1].native = true;
+        roster.panes[1].native_generation = 3;
+        let json = serde_json::to_string(&roster).expect("serialize");
+        let back: Roster = serde_json::from_str(&json).expect("deserialize");
+        assert!(!back.panes[0].native);
+        assert!(back.panes[1].native);
+        assert_eq!(back.panes[1].native_generation, 3);
+
+        // An entry written by a build from before this field existed has no
+        // way to say it was native, and every such pane WAS wrapped -- so
+        // absence reads as wrapped rather than failing to parse.
+        let older = serde_json::json!({
+            "agent": "claude",
+            "session_id": "11111111-2222-4333-8444-555555555555",
+            "role": "orchestrator",
+            "short": "aaaa1111",
+            "title": "orch",
+        });
+        let entry: RosterPane = serde_json::from_value(older).expect("older entry parses");
+        assert!(!entry.native);
+        assert_eq!(entry.native_generation, 0);
+    }
 }
