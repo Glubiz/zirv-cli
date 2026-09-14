@@ -590,6 +590,7 @@ pub struct NativeLoop<'a> {
     journal: &'a mut Journal,
     cancel: Arc<CancellationFlag>,
     now_ms: &'a dyn Fn() -> u64,
+    sleep_ms: &'a dyn Fn(u64),
     env: EnvLookup<'a>,
     counter: u64,
     started_ms: u64,
@@ -644,6 +645,29 @@ impl<'a> NativeLoop<'a> {
         now_ms: &'a dyn Fn() -> u64,
         env: EnvLookup<'a>,
     ) -> Self {
+        Self::new_with_sleep(
+            config,
+            provider,
+            tools,
+            journal,
+            cancel,
+            now_ms,
+            &sleep_for_ms,
+            env,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_sleep(
+        config: NativeSessionConfig,
+        provider: &'a dyn ProviderAdapter,
+        tools: &'a mut dyn ToolExecutor,
+        journal: &'a mut Journal,
+        cancel: Arc<CancellationFlag>,
+        now_ms: &'a dyn Fn() -> u64,
+        sleep_ms: &'a dyn Fn(u64),
+        env: EnvLookup<'a>,
+    ) -> Self {
         let started_ms = now_ms();
         Self {
             config,
@@ -652,6 +676,7 @@ impl<'a> NativeLoop<'a> {
             journal,
             cancel,
             now_ms,
+            sleep_ms,
             env,
             counter: 0,
             started_ms,
@@ -692,6 +717,22 @@ impl<'a> NativeLoop<'a> {
 
     fn cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    fn wait_for_retry(&self, delay_ms: u64) -> bool {
+        if self.elapsed_ms().saturating_add(delay_ms) > self.config.limits.max_wall_ms {
+            return false;
+        }
+        let mut remaining = delay_ms;
+        while remaining > 0 {
+            if self.cancelled() {
+                return false;
+            }
+            let slice = remaining.min(50);
+            (self.sleep_ms)(slice);
+            remaining -= slice;
+        }
+        !self.cancelled()
     }
 
     fn note(&mut self, kind: &'static str, id: impl Into<String>, detail: impl Into<String>) {
@@ -1146,6 +1187,7 @@ impl<'a> NativeLoop<'a> {
                     return Ok(Some(response));
                 }
                 Err(failure) => {
+                    let failure = self.provider.redact_failure(failure);
                     if self.cancelled() {
                         return Ok(None);
                     }
@@ -1158,6 +1200,14 @@ impl<'a> NativeLoop<'a> {
                             format!("attempt-{attempt}"),
                             failure.message.clone(),
                         );
+                        if let Some(delay_ms) = failure.retry.after_ms
+                            && !self.wait_for_retry(delay_ms)
+                        {
+                            if self.cancelled() {
+                                return Ok(None);
+                            }
+                            return Err(failure);
+                        }
                         continue;
                     }
                     return Err(failure);
@@ -1239,7 +1289,7 @@ impl<'a> NativeLoop<'a> {
             outcome.state = TurnState::Requesting;
             let request = self.build_request()?;
             let mut events: Vec<ProviderStreamEvent> = Vec::new();
-            let response = match self.stream_once(&request, &mut events) {
+            let mut response = match self.stream_once(&request, &mut events) {
                 Ok(Some(response)) => response,
                 Ok(None) => {
                     outcome.state = TurnState::Interrupted;
@@ -1283,6 +1333,11 @@ impl<'a> NativeLoop<'a> {
                     return Ok(outcome);
                 }
             };
+            if response.finish_reason == FinishReason::Refusal {
+                response
+                    .content
+                    .retain(|block| !matches!(block, ProviderContent::ToolUse { .. }));
+            }
             if response.finish_reason == FinishReason::ContextWindowExceeded {
                 // The provider answered but said the window was exceeded. The
                 // reply is already committed below; the count makes the next
@@ -2031,6 +2086,10 @@ fn collect_text(content: &[ProviderContent]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn sleep_for_ms(millis: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(millis));
 }
 
 /// The complete tool calls in one response, in the provider's declared order.
@@ -4651,6 +4710,39 @@ mod tests {
     }
 
     #[test]
+    fn filtered_and_refused_provider_responses_never_execute_tools() {
+        for protocol in [Protocol::OpenAiChatCompatible, Protocol::AwsBedrock] {
+            let route = route_for(protocol, "fixture-model");
+            let (_dir, mut journal, session) = journal_for(&route);
+            let provider = FixtureProvider::new(
+                fixture_target(protocol, "fixture-model"),
+                FixtureScript::from_json(
+                    r#"{"turns":[{"model":"fixture-model","finish_reason":"refusal","blocks":[{"type":"refusal","text":"blocked"},{"type":"tool_use","id":"call_read_src","name":"file_read","input":{"path":"src/lib.rs"}}]}]}"#,
+                )
+                .unwrap(),
+            );
+            let mut tools =
+                FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+            let clock = || 1_000u64;
+            let outcome = {
+                let mut driver = NativeLoop::new(
+                    config_for(session, route),
+                    &provider,
+                    &mut tools,
+                    &mut journal,
+                    Arc::new(CancellationFlag::default()),
+                    &clock,
+                    &no_env,
+                );
+                driver.acknowledge("go", false).unwrap();
+                driver.run_turn().unwrap()
+            };
+            assert_eq!(outcome.finish_reason, Some(FinishReason::Refusal));
+            assert!(tools.calls.is_empty(), "tool ran for {protocol:?}");
+        }
+    }
+
+    #[test]
     fn interleaved_text_and_tool_blocks_keep_the_declared_result_order() {
         let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
         let (_dir, mut journal, session) = journal_for(&route);
@@ -4711,6 +4803,48 @@ mod tests {
     }
 
     #[test]
+    fn native_retry_waits_for_adapter_delay() {
+        use std::cell::Cell;
+
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(
+                r#"{"turns":[{"failure":{"class":"rate_limited","message":"slow down","retryable":true,"after_ms":750}},{"model":"fixture-anthropic-model","blocks":[{"type":"text","text":"done"}]}]}"#,
+            )
+            .unwrap(),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let now = Cell::new(1_000u64);
+        let clock = || now.get();
+        let slept = Cell::new(0u64);
+        let sleep = |millis| {
+            assert_eq!(provider.consumed(), 1, "retry began before its delay");
+            slept.set(slept.get() + millis);
+            now.set(now.get() + millis);
+        };
+        let mut cfg = config_for(session, route);
+        cfg.limits.response_retry_budget = 1;
+        let status = {
+            let mut driver = NativeLoop::new_with_sleep(
+                cfg,
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &sleep,
+                &no_env,
+            );
+            driver.acknowledge("go", false).unwrap();
+            driver.run_to_completion().unwrap()
+        };
+        assert_eq!(slept.get(), 750);
+        assert_eq!(status.status, NativeStatus::Completed);
+    }
+
+    #[test]
     fn a_disconnect_past_the_retry_budget_fails_explicitly() {
         let (status, _) = run_fixture(
             Protocol::AnthropicMessages,
@@ -4722,6 +4856,45 @@ mod tests {
         );
         assert_eq!(status.status, NativeStatus::Failed);
         assert!(status.failure.unwrap().contains("connection reset"));
+    }
+
+    #[test]
+    fn provider_error_messages_are_redacted_before_status_journal_and_logs() {
+        let raw = "sk-upstream-echo-must-not-persist";
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(&format!(
+                r#"{{"turns":[{{"failure":{{"class":"provider","message":"rejected {raw}"}}}}]}}"#
+            ))
+            .unwrap(),
+        );
+        let mut tools = FixtureToolExecutor::new(tool_script("tools-investigate-edit-test.json"));
+        let clock = || 1_000u64;
+        let status = {
+            let mut driver = NativeLoop::new(
+                config_for(session.clone(), route),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &clock,
+                &no_env,
+            );
+            driver.acknowledge("go", false).unwrap();
+            driver.run_to_completion().unwrap()
+        };
+
+        let status_output = serde_json::to_string(&status).unwrap();
+        let journal_output = format!("{:?}", journal.replay(&session).unwrap());
+        let log_output = serde_json::to_string(&status.evidence).unwrap();
+        for surface in [&status_output, &journal_output, &log_output] {
+            assert!(
+                !surface.contains(raw),
+                "raw upstream text reached {surface}"
+            );
+        }
     }
 
     /// Issue #492 (roadmap N23) item 4, journal-commit failure: a durable

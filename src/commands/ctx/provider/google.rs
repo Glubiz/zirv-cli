@@ -43,8 +43,8 @@ use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
 use super::probe::is_plaintext_non_loopback;
 use super::transport::{
-    MAX_ERROR_BODY_BYTES, StreamTimeouts, WORKER_READ_POLL, parse_retry_after_ms, read_sse_line,
-    supervise, target_scope,
+    MAX_ERROR_BODY_BYTES, ResponseLimits, StreamTimeouts, WORKER_READ_POLL,
+    check_response_block_cap, parse_retry_after_ms, read_sse_line, supervise, target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId};
 use crate::commands::ctx::config::EnvLookup;
@@ -339,6 +339,10 @@ impl ProviderAdapter for GoogleAdapter {
 
     fn target(&self) -> &ProviderTarget {
         &self.target
+    }
+
+    fn redact_failure(&self, failure: ProviderFailure) -> ProviderFailure {
+        super::adapter::redact_failure(failure, &[self.credential.secret.expose()])
     }
 
     fn stream(
@@ -644,6 +648,17 @@ fn validate_content_relationships(request: &ProviderRequest) -> Result<(), Provi
                                     .into(),
                             ));
                         }
+                    } else if attached_to == "text" {
+                        let next_is_text = message
+                            .content
+                            .get(index + 1)
+                            .is_some_and(|next| matches!(next, ProviderContent::Text { .. }));
+                        if !next_is_text {
+                            return Err(config_error(
+                                "a signed-text marker must immediately precede its text part"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
                 ProviderContent::RedactedThinking { .. } => {
@@ -714,10 +729,21 @@ fn encode_contents(request: &ProviderRequest) -> Result<Vec<Value>, ProviderFail
         std::collections::BTreeMap::new();
     for message in &request.messages {
         let mut parts: Vec<Value> = Vec::with_capacity(message.content.len());
-        let mut pending_signature: Option<String> = None;
+        let mut pending_signature: Option<(String, String)> = None;
         for block in &message.content {
             match block {
-                ProviderContent::Text { text } => parts.push(json!({"text": text})),
+                ProviderContent::Text { text } => {
+                    let mut part = json!({"text": text});
+                    if let Some((attached_to, sig)) = pending_signature.take() {
+                        if attached_to != "text" {
+                            return Err(config_error(
+                                "a function-call signature was not followed by its call".into(),
+                            ));
+                        }
+                        part["thoughtSignature"] = Value::String(sig);
+                    }
+                    parts.push(part);
+                }
                 ProviderContent::Thinking {
                     thinking,
                     signature,
@@ -726,8 +752,8 @@ fn encode_contents(request: &ProviderRequest) -> Result<Vec<Value>, ProviderFail
                         thought_signature_envelope(signature).ok_or_else(|| {
                             config_error("thought block lost its Google signature envelope".into())
                         })?;
-                    if attached_to == "function_call" {
-                        pending_signature = Some(sig);
+                    if attached_to == "function_call" || attached_to == "text" {
+                        pending_signature = Some((attached_to, sig));
                     } else {
                         let mut part = json!({"text": thinking, "thought": true});
                         if !sig.is_empty() {
@@ -738,8 +764,13 @@ fn encode_contents(request: &ProviderRequest) -> Result<Vec<Value>, ProviderFail
                 }
                 ProviderContent::ToolUse { id, name, input } => {
                     call_names.insert(id.clone(), name.clone());
-                    let mut part = json!({"functionCall": {"name": name, "args": input}});
-                    if let Some(sig) = pending_signature.take() {
+                    let mut part = json!({"functionCall": {"id": id, "name": name, "args": input}});
+                    if let Some((attached_to, sig)) = pending_signature.take() {
+                        if attached_to != "function_call" {
+                            return Err(config_error(
+                                "a signed-text marker was not followed by text".into(),
+                            ));
+                        }
                         part["thoughtSignature"] = Value::String(sig);
                     }
                     parts.push(part);
@@ -759,7 +790,11 @@ fn encode_contents(request: &ProviderRequest) -> Result<Vec<Value>, ProviderFail
                     } else {
                         json!({"content": content})
                     };
-                    parts.push(json!({"functionResponse": {"name": name, "response": response}}));
+                    parts.push(json!({"functionResponse": {
+                        "id": tool_use_id,
+                        "name": name,
+                        "response": response
+                    }}));
                 }
                 ProviderContent::RedactedThinking { .. } => {
                     return Err(config_error(
@@ -825,15 +860,25 @@ fn parse_sse<R: BufRead>(
     let mut accumulator = Accumulator::default();
     let mut data = String::new();
     let mut line = String::new();
+    let mut limits = ResponseLimits::new();
     loop {
         let read = read_sse_line(&mut reader, &mut line, "Google", cancellation, target)?;
+        limits.record_bytes("Google", read)?;
         if read == 0 {
             flush_data(&mut data, &mut accumulator, sink, target)?;
+            check_response_block_cap(
+                "Google",
+                accumulator.completed.len() + usize::from(accumulator.open.is_some()),
+            )?;
             break;
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             flush_data(&mut data, &mut accumulator, sink, target)?;
+            check_response_block_cap(
+                "Google",
+                accumulator.completed.len() + usize::from(accumulator.open.is_some()),
+            )?;
             line.clear();
             continue;
         }
@@ -962,7 +1007,12 @@ fn process_part(
                 format!("Gemini function call `{name}` args are not a JSON object"),
             ));
         }
-        let id = format!("call_{}", accumulator.tool_call_counter);
+        let id = function_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("call_{}", accumulator.tool_call_counter));
         accumulator.tool_call_counter += 1;
         let index = accumulator.completed.len();
         sink.push(ProviderStreamEvent::ToolInputDelta {
@@ -986,6 +1036,43 @@ fn process_part(
             .get("thoughtSignature")
             .and_then(Value::as_str)
             .map(str::to_string);
+        if !thought && let Some(signature) = signature {
+            flush_open(accumulator, sink)?;
+            let signature_index = accumulator.completed.len();
+            accumulator.completed.push(ProviderContent::Thinking {
+                thinking: String::new(),
+                signature: OpaqueProviderData::new(json!({
+                    "type": "gemini_thought_signature",
+                    "attached_to": "text",
+                    "thought_signature": signature,
+                })),
+            });
+            sink.push(ProviderStreamEvent::BlockCompleted {
+                index: signature_index,
+            });
+            let index = accumulator.completed.len();
+            accumulator.completed.push(ProviderContent::Text {
+                text: text.to_string(),
+            });
+            sink.push(ProviderStreamEvent::TextDelta {
+                index,
+                text: text.to_string(),
+            });
+            sink.push(ProviderStreamEvent::BlockCompleted { index });
+            return Ok(());
+        }
+        if thought
+            && signature.is_some()
+            && matches!(
+                &accumulator.open,
+                Some(OpenBlock::Thought {
+                    signature: Some(_),
+                    ..
+                })
+            )
+        {
+            flush_open(accumulator, sink)?;
+        }
         let continues = matches!(
             (&accumulator.open, thought),
             (Some(OpenBlock::Thought { .. }), true) | (Some(OpenBlock::Text(_)), false)
@@ -1377,7 +1464,7 @@ mod tests {
     use crate::commands::ctx::provider::{
         AccountId, BillingPoolId, EndpointId, ModelId, ProviderId,
     };
-    use crate::commands::ctx::runtime::journal::AssistantBlock;
+    use crate::commands::ctx::runtime::journal::{AssistantBlock, ToolCallId};
     use crate::commands::ctx::runtime::tools::ToolRegistry;
 
     macro_rules! fixture {
@@ -1857,6 +1944,35 @@ mod tests {
     }
 
     #[test]
+    fn gemini_signed_parts_round_trip_without_merging() {
+        let response = parse(
+            "data: {\"responseId\":\"signed\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"visible\",\"thoughtSignature\":\"sig-text\"},{\"text\":\"first\",\"thought\":true,\"thoughtSignature\":\"sig-first\"},{\"text\":\"second\",\"thought\":true,\"thoughtSignature\":\"sig-second\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        )
+        .unwrap();
+        let stored = serde_json::to_string(&journal_blocks(&response.content).unwrap()).unwrap();
+        let restored: Vec<AssistantBlock> = serde_json::from_str(&stored).unwrap();
+        let replayed: Vec<ProviderContent> = restored.iter().filter_map(replayed_content).collect();
+        let mut continued = request();
+        continued.messages.push(ProviderMessage {
+            role: ProviderMessageRole::Assistant,
+            content: replayed,
+        });
+        let body = adapter("https://generativelanguage.googleapis.com".into())
+            .encode_request(&continued)
+            .unwrap()
+            .body;
+        let parts = body["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["text"], "visible");
+        assert_eq!(parts[0]["thoughtSignature"], "sig-text");
+        assert_eq!(parts[0].get("thought"), None);
+        assert_eq!(parts[1]["text"], "first");
+        assert_eq!(parts[1]["thoughtSignature"], "sig-first");
+        assert_eq!(parts[2]["text"], "second");
+        assert_eq!(parts[2]["thoughtSignature"], "sig-second");
+    }
+
+    #[test]
     fn function_response_parts_are_encoded_by_name_looked_up_from_the_matching_call() {
         let mut continued = request();
         continued.messages.push(ProviderMessage {
@@ -1905,6 +2021,50 @@ mod tests {
             validate_content_relationships(&unknown).unwrap_err().class,
             FailureClass::Configuration
         );
+    }
+
+    #[test]
+    fn gemini_function_call_id_round_trips_through_tool_response() {
+        let response = parse(
+            "data: {\"responseId\":\"r1\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"provider-call-a\",\"name\":\"file_read\",\"args\":{\"path\":\"a\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+        )
+        .unwrap();
+        let ProviderContent::ToolUse { id, name, input } = response.content[0].clone() else {
+            panic!("expected tool call");
+        };
+        assert_eq!(id, "provider-call-a");
+
+        let mut continued = request();
+        continued.messages.push(ProviderMessage {
+            role: ProviderMessageRole::Assistant,
+            content: vec![ProviderContent::ToolUse {
+                id: id.clone(),
+                name,
+                input,
+            }],
+        });
+        continued.messages.push(ProviderMessage {
+            role: ProviderMessageRole::User,
+            content: vec![ProviderContent::ToolResult {
+                tool_use_id: id,
+                content: "ok".into(),
+                is_error: false,
+            }],
+        });
+        let body = adapter("https://generativelanguage.googleapis.com".into())
+            .encode_request(&continued)
+            .unwrap()
+            .body;
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionCall"]["id"],
+            "provider-call-a"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "provider-call-a"
+        );
+        ToolCallId::new("provider-call-a").expect("provider id is journal-safe");
+        ToolCallId::new("provider-call-b").expect("next response id is distinct and journal-safe");
     }
 
     #[test]

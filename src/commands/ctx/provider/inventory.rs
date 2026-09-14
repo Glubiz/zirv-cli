@@ -335,7 +335,7 @@ impl Inventory {
                 continue;
             }
 
-            let credential = resolve_account_credential(account, spec, env, store, now);
+            let credential = resolve_account_credential(account, spec, profile, env, store, now);
             let credential = match credential {
                 Ok(Some(credential)) => {
                     report.state = RouteState::Credentialed;
@@ -361,7 +361,14 @@ impl Inventory {
                         report.endpoint
                     ));
                 } else {
-                    apply_probe(&mut report, endpoint, spec, credential.as_ref(), probe);
+                    apply_probe(
+                        &mut report,
+                        endpoint,
+                        spec,
+                        profile,
+                        credential.as_ref(),
+                        probe,
+                    );
                 }
             }
             routes.push(report);
@@ -418,6 +425,7 @@ fn endpoint_report(endpoint: &ResolvedEndpoint) -> EndpointReport {
 fn resolve_account_credential(
     account: &super::config::AccountConfig,
     spec: &super::ProviderSpec,
+    profile: Option<&super::profiles::RouteProfile>,
     env: EnvLookup<'_>,
     store: &dyn CredentialStore,
     now: u64,
@@ -427,11 +435,12 @@ fn resolve_account_credential(
             .map(Some)
             .map_err(|error| error.to_string());
     }
-    if spec.default_credential_env.is_empty() {
+    let profile_env = profile.map_or(&[][..], |profile| profile.credential_env);
+    if spec.default_credential_env.is_empty() && profile_env.is_empty() {
         return Ok(None);
     }
     let mut last_error = None;
-    for name in spec.default_credential_env {
+    for name in spec.default_credential_env.iter().chain(profile_env) {
         let reference = CredentialRef::Env((*name).to_string());
         match resolve(&reference, env, store, now) {
             Ok(credential) => return Ok(Some(credential)),
@@ -445,10 +454,17 @@ fn apply_probe(
     report: &mut RouteReport,
     endpoint: &ResolvedEndpoint,
     spec: &super::ProviderSpec,
+    profile: Option<&super::profiles::RouteProfile>,
     credential: Option<&Credential>,
     probe: &dyn Probe,
 ) {
-    match probe.models(&endpoint.base_url, spec, credential) {
+    let Some(url) = super::probe::models_url(&endpoint.base_url, spec, profile) else {
+        report
+            .problems
+            .push("provider has no models-list endpoint".into());
+        return;
+    };
+    match probe.models(&url, spec, credential) {
         // Prefixed, not raw: a transport error's own text ("connection
         // refused") names neither what was being reached nor that reaching it
         // is what failed, and `doctor::classify` has to be able to tell a
@@ -968,6 +984,48 @@ model='sonnet'
                 .routes
                 .iter()
                 .all(|route| route.profile.is_some() && route.support == Support::Native)
+        );
+    }
+
+    #[test]
+    fn compatible_inventory_matches_adapter_auth_and_model_list_url() {
+        let cfg = config(
+            "schema=1
+             [endpoint.deepseek]
+             provider='openai-compatible'
+             vendor='deepseek'
+             base_url='https://gateway.example/v1'
+             [account.deepseek]
+             provider='openai-compatible'
+             [route.deepseek]
+             account='deepseek'
+             endpoint='deepseek'
+             model='deepseek-v4-pro'",
+        );
+        let env = |name: &str| (name == "DEEPSEEK_API_KEY").then(|| "test-key".to_string());
+        let probe = FakeProbe::new(ProbeResult::Http {
+            status: 200,
+            model_ids: vec!["deepseek-v4-pro".into()],
+        });
+        let inventory = Inventory::build(&cfg, &env, &FakeStore::default(), 0, Some(&probe));
+        assert_eq!(inventory.routes[0].state, RouteState::Authenticated);
+        assert_eq!(
+            probe.calls(),
+            [("https://gateway.example/v1/models".into(), true)]
+        );
+
+        let (_, runtime_credential) = super::super::adapter::resolve_target(
+            &cfg,
+            &RouteId::new("deepseek").unwrap(),
+            &env,
+            &FakeStore::default(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_credential.unwrap().secret.expose(),
+            "test-key",
+            "inventory and runtime must use the profile environment variable"
         );
     }
 

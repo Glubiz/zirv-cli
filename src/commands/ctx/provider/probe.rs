@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::credential::Credential;
+use super::profiles::RouteProfile;
 use super::{AuthScheme, Protocol, ProviderSpec};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,11 +92,7 @@ impl Probe for HttpProbe {
         spec: &ProviderSpec,
         credential: Option<&Credential>,
     ) -> ProbeResult {
-        let Some(path) = spec.models_list_path else {
-            return ProbeResult::Unreachable("provider has no models-list endpoint".into());
-        };
-        let url = format!("{}{}", endpoint_url.trim_end_matches('/'), path);
-        let mut request = self.agent.get(&url);
+        let mut request = self.agent.get(endpoint_url);
         if let Some(credential) = credential {
             match spec.auth {
                 AuthScheme::Header {
@@ -146,6 +143,37 @@ impl Probe for HttpProbe {
             Err(error) => ProbeResult::Unreachable(error.to_string()),
         }
     }
+}
+
+pub(crate) fn models_url(
+    base_url: &str,
+    spec: &ProviderSpec,
+    profile: Option<&RouteProfile>,
+) -> Option<String> {
+    let path = if spec.protocol == Protocol::OpenAiChatCompatible {
+        let request_path = profile?.path;
+        let prefix = request_path.strip_suffix("/chat/completions")?;
+        format!("{prefix}/models")
+    } else {
+        spec.models_list_path?.to_string()
+    };
+    Some(join_url_path(base_url, &path))
+}
+
+pub(crate) fn join_url_path(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let first = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let duplicate = format!("/{first}");
+    let path = if base.ends_with(&duplicate) {
+        path.strip_prefix(&duplicate).unwrap_or(path)
+    } else {
+        path
+    };
+    format!("{base}{path}")
 }
 
 fn parse_model_ids(protocol: Protocol, body: &str) -> Vec<String> {

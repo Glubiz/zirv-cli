@@ -441,12 +441,29 @@ impl ProviderFailure {
 pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
     fn protocol(&self) -> Protocol;
     fn target(&self) -> &ProviderTarget;
+    fn redact_failure(&self, failure: ProviderFailure) -> ProviderFailure {
+        redact_failure(failure, &[])
+    }
     fn stream(
         &self,
         request: &ProviderRequest,
         cancellation: &dyn Cancellation,
         sink: &mut dyn EventSink,
     ) -> Result<ProviderResponse, ProviderFailure>;
+}
+
+pub(crate) fn redact_failure(mut failure: ProviderFailure, secrets: &[&str]) -> ProviderFailure {
+    for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
+        failure.message = failure.message.replace(secret, "[redacted]");
+        failure.provider_request_id = failure
+            .provider_request_id
+            .map(|id| id.replace(secret, "[redacted]"));
+    }
+    failure.message = crate::commands::ctx::pace::redact_for_log(&failure.message);
+    failure.provider_request_id = failure
+        .provider_request_id
+        .map(|id| crate::commands::ctx::pace::redact_for_log(&id));
+    failure
 }
 
 pub(crate) fn resolve_target(

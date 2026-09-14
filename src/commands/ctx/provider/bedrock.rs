@@ -39,8 +39,8 @@ use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
 use super::profiles::{RouteProfile, profile_for};
 use super::transport::{
-    MAX_ERROR_BODY_BYTES, StreamTimeouts, WORKER_READ_POLL, parse_retry_after_ms, supervise,
-    target_scope,
+    MAX_ERROR_BODY_BYTES, ResponseLimits, StreamTimeouts, WORKER_READ_POLL,
+    check_response_block_cap, parse_retry_after_ms, supervise, target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId, Support};
 use crate::commands::ctx::config::EnvLookup;
@@ -362,6 +362,14 @@ impl ProviderAdapter for BedrockAdapter {
         &self.target
     }
 
+    fn redact_failure(&self, failure: ProviderFailure) -> ProviderFailure {
+        let mut secrets = vec![self.credentials.secret_access_key.as_str()];
+        if let Some(token) = self.credentials.session_token.as_deref() {
+            secrets.push(token);
+        }
+        super::adapter::redact_failure(failure, &secrets)
+    }
+
     fn stream(
         &self,
         request: &ProviderRequest,
@@ -622,6 +630,18 @@ pub(crate) struct Frame {
     pub(crate) message_type: Option<String>,
     pub(crate) exception_type: Option<String>,
     pub(crate) payload: Vec<u8>,
+    wire_len: usize,
+}
+
+fn event_stream_crc32(parts: &[&[u8]]) -> u32 {
+    let mut crc = !0u32;
+    for byte in parts.iter().flat_map(|part| part.iter()) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
 }
 
 /// Reads one frame, or `None` at a clean end of stream.
@@ -633,6 +653,12 @@ pub(crate) fn read_frame<R: Read>(
     let mut prelude = [0u8; 12];
     if !read_exact(reader, &mut prelude, cancellation, target)? {
         return Ok(None);
+    }
+    let prelude_crc = u32::from_be_bytes([prelude[8], prelude[9], prelude[10], prelude[11]]);
+    if event_stream_crc32(&[&prelude[..8]]) != prelude_crc {
+        return Err(invalid_stream(
+            "Bedrock event-stream prelude CRC mismatch".into(),
+        ));
     }
     let total = u32::from_be_bytes([prelude[0], prelude[1], prelude[2], prelude[3]]) as usize;
     let headers_len = u32::from_be_bytes([prelude[4], prelude[5], prelude[6], prelude[7]]) as usize;
@@ -647,6 +673,18 @@ pub(crate) fn read_frame<R: Read>(
             "Bedrock event-stream frame ended mid-message".into(),
         ));
     }
+    let crc_at = rest.len() - 4;
+    let message_crc = u32::from_be_bytes([
+        rest[crc_at],
+        rest[crc_at + 1],
+        rest[crc_at + 2],
+        rest[crc_at + 3],
+    ]);
+    if event_stream_crc32(&[&prelude, &rest[..crc_at]]) != message_crc {
+        return Err(invalid_stream(
+            "Bedrock event-stream message CRC mismatch".into(),
+        ));
+    }
     let headers = &rest[..headers_len];
     // The last four bytes of the message are its CRC; see the module note.
     let payload = rest[headers_len..rest.len() - 4].to_vec();
@@ -656,6 +694,7 @@ pub(crate) fn read_frame<R: Read>(
         message_type: decoded.get(":message-type").cloned(),
         exception_type: decoded.get(":exception-type").cloned(),
         payload,
+        wire_len: total,
     }))
 }
 
@@ -781,7 +820,9 @@ pub(crate) fn parse_event_stream<R: Read>(
     target: &ProviderTarget,
 ) -> Result<ProviderResponse, ProviderFailure> {
     let mut accumulator = Accumulator::default();
+    let mut limits = ResponseLimits::new();
     while let Some(frame) = read_frame(&mut reader, cancellation, target)? {
+        limits.record_bytes(PROVIDER, frame.wire_len)?;
         sink.push(ProviderStreamEvent::ProtocolActivity);
         let value: Value = if frame.payload.is_empty() {
             Value::Null
@@ -806,6 +847,10 @@ pub(crate) fn parse_event_stream<R: Read>(
             continue;
         };
         process_event(event, &value, &mut accumulator, sink, target)?;
+        check_response_block_cap(
+            PROVIDER,
+            accumulator.blocks.len() + accumulator.completed.len(),
+        )?;
     }
     finish_response(accumulator, request_id, target.model.id.clone())
 }
@@ -1019,9 +1064,12 @@ fn finish_response(
         ));
     }
     let mut content: Vec<ProviderContent> = accumulator.completed.into_values().collect();
-    let truncated = stop_reason == "max_tokens";
+    let non_executable = matches!(
+        stop_reason.as_str(),
+        "max_tokens" | "content_filtered" | "guardrail_intervened"
+    );
     let mut omitted = Vec::new();
-    if truncated {
+    if non_executable {
         // A truncated turn never hands the runtime an executable call.
         content.retain(|block| match block {
             ProviderContent::ToolUse { id, .. } => {
@@ -1223,11 +1271,17 @@ mod tests {
 
     const MODEL: &str = "anthropic.claude-sonnet-5-v1:0";
 
-    /// Builds one real AWS event-stream frame around `payload`, with the
-    /// `:event-type` and `:message-type` string headers a live stream
-    /// carries. The CRC fields are present but zero: this transport does not
-    /// verify them (see the module note), and a fixture that pretended to
-    /// would only be testing the fixture generator.
+    fn fixture_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
+    }
+
     fn frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         let mut headers = Vec::new();
         for (name, value) in [(":event-type", event_type), (":message-type", "event")] {
@@ -1241,10 +1295,12 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(&u32::try_from(total).unwrap().to_be_bytes());
         out.extend_from_slice(&u32::try_from(headers.len()).unwrap().to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes());
+        let prelude_crc = fixture_crc32(&out);
+        out.extend_from_slice(&prelude_crc.to_be_bytes());
         out.extend_from_slice(&headers);
         out.extend_from_slice(payload);
-        out.extend_from_slice(&0u32.to_be_bytes());
+        let message_crc = fixture_crc32(&out);
+        out.extend_from_slice(&message_crc.to_be_bytes());
         out
     }
 
@@ -1445,6 +1501,22 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_rejects_bad_prelude_and_message_crc() {
+        let valid = frame("messageStop", br#"{"stopReason":"end_turn"}"#);
+        for offset in [8, valid.len() - 1] {
+            let mut corrupted = valid.clone();
+            corrupted[offset] ^= 1;
+            let error = read_frame(
+                &mut corrupted.as_slice(),
+                &NeverCancelled,
+                &target("https://bedrock-runtime.us-east-1.amazonaws.com".into()),
+            )
+            .unwrap_err();
+            assert_eq!(error.class, FailureClass::InvalidStream);
+        }
+    }
+
+    #[test]
     fn a_uuid_typed_header_does_not_desync_the_string_header_that_follows_it() {
         // Header value type 9 is a 16-byte UUID, not a 4-byte int32 (type 4).
         // Coalescing the two widths would skip only 4 of the UUID's 16 bytes,
@@ -1476,7 +1548,8 @@ mod tests {
         let mut prelude = Vec::new();
         prelude.extend_from_slice(&20u32.to_be_bytes()); // total: in range
         prelude.extend_from_slice(&1_000u32.to_be_bytes()); // headers_len: far past total
-        prelude.extend_from_slice(&0u32.to_be_bytes());
+        let crc = fixture_crc32(&prelude);
+        prelude.extend_from_slice(&crc.to_be_bytes());
         let error = read_frame(
             &mut prelude.as_slice(),
             &NeverCancelled,
@@ -1492,7 +1565,8 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1_000u32.to_be_bytes()); // total: far past what follows
         bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes.extend_from_slice(&0u32.to_be_bytes());
+        let crc = fixture_crc32(&bytes);
+        bytes.extend_from_slice(&crc.to_be_bytes());
         bytes.extend_from_slice(&[0u8; 10]); // much less than total - 12
         let error = read_frame(
             &mut bytes.as_slice(),
