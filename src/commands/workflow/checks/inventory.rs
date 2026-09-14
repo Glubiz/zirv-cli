@@ -126,6 +126,7 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
     }
 
     let mut entry_count = 0usize;
+    let mut documented_entries = std::collections::BTreeSet::new();
     for row in &entry_rows {
         let Some(path) = row.get(1).and_then(|cell| backticked(cell)) else {
             problems.push(format!("entry-point row has no backticked Path: {row:?}"));
@@ -136,6 +137,7 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
             continue;
         };
         let owner = row.get(3).map(String::as_str).unwrap_or("").trim();
+        documented_entries.insert((path.clone(), symbol.clone()));
         if !valid_owner(owner) {
             problems.push(format!(
                 "`{path}` `{symbol}`: owner `{owner}` is not `shared`, `harness-backend`, or \
@@ -163,6 +165,25 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
         entry_count += 1;
     }
 
+    match discovered_model_entry_points(repo) {
+        Ok(discovered) => {
+            for entry in discovered {
+                let documented = documented_entries.iter().any(|(path, symbol)| {
+                    path == &entry.path
+                        && (symbol == &entry.function || symbol == &entry.call_symbol)
+                });
+                if !documented {
+                    problems.push(format!(
+                        "`{}::{}` is a discovered model-calling entry point but missing from \
+                         `{ENTRY_POINTS_HEADING}`",
+                        entry.path, entry.function
+                    ));
+                }
+            }
+        }
+        Err(err) => problems.push(format!("could not scan model-calling entry points: {err}")),
+    }
+
     if problems.is_empty() {
         BuiltinCheckResult::pass(
             ID,
@@ -178,6 +199,140 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
     } else {
         BuiltinCheckResult::fail(ID, PROVES, FIX, ORIGIN, problems.join("; "))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DiscoveredEntryPoint {
+    path: String,
+    function: String,
+    call_symbol: String,
+}
+
+/// Discovers production model-call seams using the same marker vocabulary
+/// documented in the inventory's second table. Adapter implementations,
+/// update self-replacement and inline test modules are intentionally outside
+/// that table's definition and therefore outside this scan too.
+fn discovered_model_entry_points(
+    repo: &Path,
+) -> Result<std::collections::BTreeSet<DiscoveredEntryPoint>, String> {
+    let mut files = Vec::new();
+    collect_rust_files(&repo.join("src"), &mut files)?;
+    files.sort();
+
+    let function =
+        Regex::new(r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
+            .expect("static pattern");
+    let tests = Regex::new(r"(?m)#\[cfg\(test\)\]\s*mod\s+tests\s*\{").expect("static pattern");
+    let mut discovered = std::collections::BTreeSet::new();
+
+    for file in files {
+        let relative = file
+            .strip_prefix(repo)
+            .map_err(|err| format!("cannot relativize {}: {err}", file.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.contains("/adapters/") || relative == "src/commands/update.rs" {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&file)
+            .map_err(|err| format!("cannot read {}: {err}", file.display()))?;
+        let production = tests
+            .find(&contents)
+            .map(|found| &contents[..found.start()])
+            .unwrap_or(&contents);
+        let mut enclosing = None;
+        for line in production.lines() {
+            let code = line.split("//").next().unwrap_or("");
+            if let Some(found) = function.captures(code).and_then(|captures| captures.get(1)) {
+                enclosing = Some(found.as_str().to_string());
+            }
+            let marker = model_call_marker(code);
+            if let (Some(function), Some(call_symbol)) = (enclosing.as_ref(), marker) {
+                if excluded_model_call(&relative, function) {
+                    continue;
+                }
+                discovered.insert(DiscoveredEntryPoint {
+                    path: relative.clone(),
+                    function: function.clone(),
+                    call_symbol: call_symbol.to_string(),
+                });
+            }
+        }
+    }
+    Ok(discovered)
+}
+
+/// Marker-shaped code that the inventory definition explicitly does not
+/// treat as a model entry point: command probes/builders already owned by
+/// their spawning caller, binary inspection/self-service, and the dormant
+/// runtime facade that no clap command reaches.
+fn excluded_model_call(path: &str, function: &str) -> bool {
+    matches!(
+        (path, function),
+        (
+            "src/commands/ctx/dash/mod.rs",
+            "task_prompt_fallback_is_safe"
+        ) | (
+            "src/commands/ctx/exec.rs",
+            "headless_resume_launch" | "prompt_delivery_via_stdin"
+        ) | ("src/commands/ctx/measure.rs", "current_binary_mtime")
+            | (
+                "src/commands/ctx/run_loop.rs",
+                "prompt_delivery_via_stdin" | "zirv_invocation"
+            )
+            | ("src/commands/ctx/runtime/harness.rs", "start" | "submit")
+            | ("src/commands/ctx/session/host.rs", "resume_argv")
+            | ("src/commands/ctx/session/mod.rs", "spawn_service")
+            | ("src/commands/ctx/wrap.rs", "relaunch_command")
+            | (
+                "src/commands/workflow/checks/inventory.rs",
+                "model_call_marker" | "perform_blocking"
+            )
+    )
+}
+
+fn model_call_marker(line: &str) -> Option<&'static str> {
+    const CALLS: [(&str, &str); 7] = [
+        ("interactive_cmd(", "interactive_cmd"),
+        ("headless_cmd(", "headless_cmd"),
+        ("headless_cmd_stdin(", "headless_cmd_stdin"),
+        ("headless_resume_cmd(", "headless_resume_cmd"),
+        ("distiller_cmd(", "distiller_cmd"),
+        ("dispatch_agent(", "dispatch_agent"),
+        ("current_exe(", "current_exe"),
+    ];
+    for (needle, symbol) in CALLS {
+        if line.contains(needle) {
+            return Some(symbol);
+        }
+    }
+    if line.contains(".stream(") {
+        return Some("stream");
+    }
+    if line.contains("fn perform_blocking(") {
+        return Some("perform_blocking");
+    }
+    None
+}
+
+fn collect_rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|err| format!("cannot read source directory {}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("cannot read entry in {}: {err}", dir.display()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|err| format!("cannot inspect {}: {err}", entry.path().display()))?;
+        if kind.is_dir() {
+            collect_rust_files(&entry.path(), out)?;
+        } else if kind.is_file()
+            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("rs")
+        {
+            out.push(entry.path());
+        }
+    }
+    Ok(())
 }
 
 /// The depth-1/depth-2 verb set of the real command surface, read straight
@@ -400,6 +555,38 @@ mod tests {
             result.details.contains("does not appear verbatim"),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn removing_a_real_runtime_entry_point_row_fails_inventory() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        super::super::write_manifest(repo.path(), "zirv");
+        let runtime = repo.path().join("src/commands/ctx/runtime");
+        std::fs::create_dir_all(&runtime).expect("mkdir runtime");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/ctx/runtime/native.rs"),
+            runtime.join("native.rs"),
+        )
+        .expect("copy real native runtime");
+
+        let row = "| Native agent loop | `src/commands/ctx/runtime/native.rs` | `stream_once` | \
+                   N09 (#478) |  |";
+        let complete = passing_doc(repo.path()).replace(
+            "|---|---|---|---|---|",
+            &format!("|---|---|---|---|---|\n{row}"),
+        );
+        write_doc(repo.path(), &complete);
+        assert_eq!(run(repo.path()).outcome, super::super::BuiltinOutcome::Pass);
+
+        write_doc(repo.path(), &complete.replace(&format!("{row}\n"), ""));
+        let result = run(repo.path());
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Fail,
+            "{result:?}"
+        );
+        assert!(result.details.contains("stream_once"), "{result:?}");
+        assert!(result.details.contains("discovered"), "{result:?}");
     }
 
     /// The doc's `Path` cell is repo-owned, UNTRUSTED text: an absolute path
