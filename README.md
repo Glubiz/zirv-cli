@@ -2141,7 +2141,10 @@ zirv ctx objective close      # stops further dispatch; work already running sti
 
 Setting an objective is how you steer — it redirects the coordinator and lifts
 a previous stop. Closing it stops further dispatch while leaving work already
-delegated answerable, so its results are still collected.
+delegated answerable, so its results are still collected. `objective close`
+refuses (exit 1) unless a fresh, passing final verification for the
+repository already exists — completion is asserted only by a passing
+verification gate, never by prose.
 
 The decisions behind this step are in
 [`docs/design/2026-09-13-native-orchestrator.md`](docs/design/2026-09-13-native-orchestrator.md).
@@ -3008,9 +3011,11 @@ transcript text and no continuation data by construction.
 spends API billing only: a Claude.ai or ChatGPT subscription is an entitlement
 for that vendor's own CLI, and its login token is refused as a native
 credential (`credential set` refuses those store refs before it reads a
-secret). Accounts that share quota share a `pool`, and `zirv ctx spend` and
-the usage windows aggregate per pool, so two accounts on one plan are not
-double-counted.
+secret). Accounts that share quota share a `pool`, and the usage windows
+(`zirv ctx usage`) aggregate per pool, so two accounts on one plan are not
+double-counted. `zirv ctx spend --by` groups the delegation ledger by
+`harness`, `model`, `task-class`, or `worker` instead -- it has no `pool`
+dimension of its own.
 
 **Choosing the default.** `~/.zirv/ctx.toml`'s `[runtime]` table decides which
 backend a session gets when the command line does not say:
