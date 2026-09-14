@@ -98,16 +98,15 @@ Two separate findings, of different severity:
    `zirv ctx exec --runtime harness` does, `exec.rs:1721`) disappears from
    these tools the same way, on the very next `list()` call after it exits
    cleanly.
-2. **A plain headless `zirv ctx exec --runtime native` run is invisible
-   even while LIVE -- a real, separate gap; reported, not fixed (out of
-   scope; the seat will decide).** `runtime::native::run_session` (the
-   entry point `zirv ctx exec --runtime native` calls) never calls
+2. **A plain headless `zirv ctx exec --runtime native` run was invisible
+   even while LIVE -- a real, separate gap.** `runtime::native::run_session`
+   (the entry point `zirv ctx exec --runtime native` calls) never called
    `sessions::SessionGuard::register`/`Record::new` at all -- unlike the
    harness path above, and unlike dashboard-hosted native panes
    (`dash/pane.rs:1499,1531`) and the persistent-runtime service
    (`session/native.rs:618-628`), which both DO register. So no `<state>/
-   sessions/<short>.json` ever exists for a plain native exec, live or
-   finished, and `explain-status`/`ask`/`session.list` see nothing
+   sessions/<short>.json` ever existed for a plain native exec, live or
+   finished, and `explain-status`/`ask`/`session.list` saw nothing
    regardless of liveness -- not a sweep-timing issue, a registration gap
    specific to the plain headless CLI entry point.
 
@@ -115,6 +114,19 @@ Confirmed empirically (scratch state dir, `--provider fixture:...
 helper-answer.json`): after the run, `<short>.seat.json` and `<short>.
 conversation` exist, no `<short>.json`, and `zirv ctx explain-status
 <short>` answers "no sessions are registered".
+
+**Follow-up (same day, same worktree): filed as #645 and fixed.** Finding
+2 above was reported but explicitly left unfixed in this chunk's original
+scope; the coordinator filed it as issue #645 and asked for it to be
+closed in this same worktree/branch. `run_session` now registers a
+`sessions::SessionGuard` right after the seat/journal identity is
+established (fresh or resumed), reusing the exact record shape
+`session::native::NativeSessions::register` already builds (`Verb::Exec`,
+`.unreachable()`), scoped to `Accounting::Seat` (excludes a delegated
+`native_worker` run, which already owns its own visibility/settlement),
+with `stamp_in_flight`/`clear_in_flight` around `run_to_completion`
+mirroring `exec.rs`'s own crash-witness/retention semantics. See
+`runtime::native::tests::a_live_headless_native_run_appears_in_the_registry_and_disappears_after`.
 
 ## What is verified, and by what
 
@@ -125,16 +137,18 @@ conversation` exist, no `<short>.json`, and `zirv ctx explain-status
   (fixture level, pre-existing, still passes) -- #638.
 - `runtime::native::tests::resume_from_a_different_repository_is_refused_and_names_the_recorded_origin`,
   `runtime::native::tests::resume_from_the_same_repository_is_unaffected` -- #639.
-- D1: code inspection (`sessions::resolve_prefix`, `list_with_retention`,
-  `api::server::RegistrySource`/`facts_from_record`, `runtime::native::
-  run_session`, `dash/pane.rs`, `session/native.rs`) plus one empirical
-  scratch-state repro with the debug binary. No new automated test: D1 is
-  an investigation, not a fix, per this chunk's brief.
+- D1 (finding 1, finished-session parity): code inspection
+  (`sessions::resolve_prefix`, `list_with_retention`,
+  `api::server::RegistrySource`/`facts_from_record`) plus one empirical
+  scratch-state repro with the debug binary.
+- D1 (finding 2, live-invisibility) / #645:
+  `runtime::native::tests::a_live_headless_native_run_appears_in_the_registry_and_disappears_after`.
 
 ## What is NOT verified / NOT done
 
-- D1's live-native-invisibility gap is reported, not fixed -- explicitly
-  out of scope for this chunk.
+- D1's live-native-invisibility gap was reported, not fixed, in this
+  chunk's original scope -- explicitly out of scope at the time; closed by
+  the same-day follow-up as #645 (see above).
 - The two other headless-native `SessionIdentity` call sites this chunk
   touched only to keep the build green (`session/native.rs`'s persistent-
   runtime service, `spawn_interactive`) record `repo` but were not given
