@@ -468,6 +468,7 @@ pub struct RuntimeHost {
     #[cfg(test)]
     shutdown_entered: std::sync::atomic::AtomicBool,
     sessions: Mutex<BTreeMap<String, HostSession>>,
+    stopping: Mutex<BTreeMap<String, SessionFacts>>,
 }
 
 impl std::fmt::Debug for HostSession {
@@ -507,6 +508,7 @@ impl RuntimeHost {
             #[cfg(test)]
             shutdown_entered: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
+            stopping: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -521,6 +523,13 @@ impl RuntimeHost {
         // a session table, not a half-written invariant, and refusing every
         // later call would turn one panic into a dead runtime.
         match self.sessions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn lock_stopping(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, SessionFacts>> {
+        match self.stopping.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -842,6 +851,12 @@ impl RuntimeHost {
     ) -> Result<T, ApiError> {
         let mut sessions = self.lock();
         let Some(session) = sessions.get_mut(session_id) else {
+            if self.lock_stopping().contains_key(session_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Busy,
+                    format!("session {session_id} is stopping"),
+                ));
+            }
             return Err(ApiError::new(
                 ErrorCode::UnknownSession,
                 format!("no session {session_id} on this runtime"),
@@ -853,7 +868,13 @@ impl RuntimeHost {
 
 impl SessionHost for RuntimeHost {
     fn sessions(&self) -> Vec<SessionFacts> {
-        self.lock().values().map(HostSession::facts).collect()
+        let sessions = self.lock();
+        let stopping = self.lock_stopping();
+        sessions
+            .values()
+            .map(HostSession::facts)
+            .chain(stopping.values().cloned())
+            .collect()
     }
 
     fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
@@ -1011,6 +1032,12 @@ impl SessionHost for RuntimeHost {
         let mut session = {
             let mut sessions = self.lock();
             let Some(session) = sessions.get(session_id) else {
+                if self.lock_stopping().contains_key(session_id) {
+                    return Err(ApiError::new(
+                        ErrorCode::Busy,
+                        format!("session {session_id} is stopping"),
+                    ));
+                }
                 return Err(ApiError::new(
                     ErrorCode::UnknownSession,
                     format!("no session {session_id} on this runtime"),
@@ -1019,6 +1046,8 @@ impl SessionHost for RuntimeHost {
             if session.ended {
                 return Ok(false);
             }
+            self.lock_stopping()
+                .insert(session_id.to_string(), session.facts());
             match sessions.remove(session_id) {
                 Some(session) => session,
                 None => {
@@ -1052,6 +1081,7 @@ impl SessionHost for RuntimeHost {
         let cap = self.ended_cap();
         let mut sessions = self.lock();
         sessions.insert(session_id.to_string(), session);
+        self.lock_stopping().remove(session_id);
         prune_ended(&mut sessions, cap);
         drop(sessions);
         self.persist_topology();
@@ -1474,6 +1504,33 @@ mod tests {
             "an unrelated list waited behind child shutdown: {:?}",
             started.elapsed()
         );
+        worker.join().expect("stop thread").expect("stop");
+    }
+
+    /// Issue #608: while terminal shutdown runs outside the table lock, the
+    /// session remains explicitly stopping rather than becoming unknown.
+    #[test]
+    fn operation_during_shutdown_grace_reports_stopping_not_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "60860861-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSTOPPING"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSTOPPING");
+
+        let stopping = Arc::clone(&host);
+        let owned_id = id.to_string();
+        let worker = std::thread::spawn(move || stopping.stop(&owned_id));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !host.shutdown_entered_for_test() {
+            assert!(Instant::now() < deadline, "shutdown did not begin");
+            std::thread::yield_now();
+        }
+        let error = host
+            .attach(id, "late-client", AttachMode::Observer, None)
+            .expect_err("a stopping session refuses new operations");
+        assert_eq!(error.code, ErrorCode::Busy);
+        assert!(error.message.contains("stopping"));
         worker.join().expect("stop thread").expect("stop");
     }
 

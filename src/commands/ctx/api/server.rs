@@ -20,7 +20,7 @@
 //!   real session registry or a fixed list. Nothing else in zirv is
 //!   reachable through the protocol.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -286,6 +286,7 @@ struct Inner {
     /// session, so `controller_changed` is emitted once per real change
     /// rather than once per attachment call.
     controllers: BTreeMap<String, Option<String>>,
+    live_attachments: BTreeSet<(String, String)>,
 }
 
 impl Inner {
@@ -377,6 +378,7 @@ impl ApiServer {
                 subscribers: Vec::new(),
                 reported: BTreeMap::new(),
                 controllers: BTreeMap::new(),
+                live_attachments: BTreeSet::new(),
             }),
             backend: Mutex::new(backend),
             source,
@@ -1624,8 +1626,67 @@ impl ApiServer {
             while let Some(request) = connection.read_frame::<Request>()? {
                 let subscribing = request.method == Method::EventsSubscribe
                     && request.version == PROTOCOL_VERSION;
-                let response = self.handle(&request);
+                let attachment = if request.version == PROTOCOL_VERSION
+                    && matches!(
+                        request.method,
+                        Method::SessionAttach | Method::SessionTakeover | Method::SessionDetach
+                    ) {
+                    match (
+                        request.params.get("session_id").and_then(Value::as_str),
+                        request.params.get("client_id").and_then(Value::as_str),
+                    ) {
+                        (Some(session_id), Some(client_id)) => {
+                            Some((session_id.to_string(), client_id.to_string()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let locally_owned = attachment
+                    .as_ref()
+                    .is_some_and(|attachment| attachments.contains(attachment));
+                let mut reserved = false;
+                let refused = if matches!(
+                    request.method,
+                    Method::SessionAttach | Method::SessionTakeover
+                ) && !locally_owned
+                    && let Some(attachment) = attachment.as_ref()
+                {
+                    let mut inner = self.lock();
+                    if inner.live_attachments.insert(attachment.clone()) {
+                        reserved = true;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    request.method == Method::SessionDetach
+                        && attachment.is_some()
+                        && !locally_owned
+                };
+                let response = if refused {
+                    Response {
+                        version: PROTOCOL_VERSION,
+                        id: request.id.clone(),
+                        revision: self.revision(),
+                        outcome: Outcome::Error {
+                            error: ApiError::new(
+                                ErrorCode::Busy,
+                                "this client attachment belongs to another live connection",
+                            ),
+                        },
+                    }
+                } else {
+                    self.handle(&request)
+                };
                 let accepted = matches!(response.outcome, Outcome::Ok { .. });
+                if reserved
+                    && !accepted
+                    && let Some(attachment) = attachment.as_ref()
+                {
+                    self.lock().live_attachments.remove(attachment);
+                }
                 if accepted
                     && matches!(
                         request.method,
@@ -1649,6 +1710,9 @@ impl ApiServer {
                 {
                     attachments
                         .retain(|entry| entry != &(session_id.to_string(), client_id.to_string()));
+                    self.lock()
+                        .live_attachments
+                        .remove(&(session_id.to_string(), client_id.to_string()));
                 }
                 let after_revision = subscription_start(&request.params);
                 let receiver = if subscribing && accepted {
@@ -1669,6 +1733,9 @@ impl ApiServer {
         for (session_id, client_id) in attachments {
             let _ =
                 self.detach_result(&json!({ "session_id": session_id, "client_id": client_id }));
+            self.lock()
+                .live_attachments
+                .remove(&(session_id, client_id));
         }
         result
     }
@@ -2498,6 +2565,22 @@ mod tests {
                 }),
             )
             .expect("first attach");
+        let mut duplicate = Client::connect(&endpoint).expect("duplicate client");
+        let refusal = duplicate
+            .call_raw(&Request::new(
+                "duplicate-attach",
+                Method::SessionAttach,
+                json!({
+                    "session_id": HOSTED,
+                    "client_id": "crashed",
+                    "mode": "controller"
+                }),
+            ))
+            .expect("duplicate response");
+        let Outcome::Error { error } = refusal.outcome else {
+            panic!("a second live socket claimed the same attachment")
+        };
+        assert_eq!(error.code, ErrorCode::Busy);
         drop(first);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2523,6 +2606,7 @@ mod tests {
         assert_eq!(host.lock().controller.as_deref(), Some("replacement"));
         assert!(host.lock().stopped.is_empty(), "disconnect is not stop");
         assert_eq!(host.sessions()[0].session_id, HOSTED);
+        drop(duplicate);
     }
 
     /// Capability negotiation, the direction that matters: a server with no
