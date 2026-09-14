@@ -90,7 +90,11 @@ transcript does not contain enough evidence to answer some or all of it, say so 
 /// tool errors and the last verification run stay empty: nothing here
 /// attempts the same tool-shape classification an adapter's own
 /// `structural_context` does, only the conversation itself.
-fn native_structural_context(state: &StateDir, session: &str) -> CtxResult<StructuralContext> {
+fn native_structural_context(
+    state: &StateDir,
+    session: &str,
+    last_n: usize,
+) -> CtxResult<StructuralContext> {
     use super::runtime::journal::{AssistantBlock, Journal, JournalSessionId, MessageRole};
 
     let journal = Journal::open(state)?;
@@ -123,6 +127,20 @@ fn native_structural_context(state: &StateDir, session: &str) -> CtxResult<Struc
             }
         }
     }
+    // Review round 1 on #598: this used to forward the whole replayed
+    // conversation unbounded, unlike the harness branch right beside it,
+    // which caps with `cfg.handoff.tail_items` via each adapter's own
+    // `structural_context(jsonl, last_n)`. Same cap, same truncation shape
+    // (`keep_last`, mirrored from `adapters::claude::keep_last`, which is
+    // not exported): newest `last_n` entries kept, oldest dropped from the
+    // front.
+    fn keep_last<T>(items: &mut Vec<T>, last_n: usize) {
+        if items.len() > last_n {
+            items.drain(..items.len() - last_n);
+        }
+    }
+    keep_last(&mut ctx.user_messages, last_n);
+    keep_last(&mut ctx.assistant_texts, last_n);
     Ok(ctx)
 }
 
@@ -220,7 +238,7 @@ fn run_with_provider<W: Write>(
     // so asking about (and answering from) a native session never needs a
     // harness adapter, or one on PATH, at all.
     let answer = if record.agent == super::runtime::RuntimeKind::Native.as_str() {
-        let ctx = native_structural_context(&state, &record.session)?;
+        let ctx = native_structural_context(&state, &record.session, cfg.handoff.tail_items)?;
         let prompt = ask_prompt(&ctx, &args.question);
         native_ask_answer(repo, &cfg, env, &prompt, timeout, provider_override)
             .map_err(|e| format!("zirv ctx ask: distiller failed: {e}"))?
@@ -561,7 +579,8 @@ mod tests {
 
         // Reading half: the journal's own known content reaches the prompt
         // `ask` builds, with no harness adapter involved at all.
-        let ctx = native_structural_context(&state, session_id).expect("native structural context");
+        let ctx =
+            native_structural_context(&state, session_id, 5).expect("native structural context");
         assert!(
             ctx.user_messages
                 .iter()
@@ -613,5 +632,125 @@ mod tests {
         .expect("ask must answer a native session with no harness on PATH");
         assert_eq!(code, 0);
         assert!(!out.is_empty());
+    }
+
+    /// Review round 1 on #598: `native_structural_context` forwarded the
+    /// whole replayed conversation, unlike the harness branch right beside
+    /// it, which caps with `cfg.handoff.tail_items` via each adapter's own
+    /// `structural_context(jsonl, last_n)`. Seeds more turns than the
+    /// default cap and asserts only the newest `tail_items` of each survive,
+    /// oldest-dropped, newest-last -- the exact `keep_last` shape a harness
+    /// adapter's own capped fields already get.
+    #[test]
+    fn ctx_ask_bounds_native_history_to_tail_items() {
+        use crate::commands::ctx::provider::{
+            AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
+        };
+        use crate::commands::ctx::runtime::journal::{
+            AssistantBlock, EventScope, Journal, JournalSessionId, MessageId, RouteIdentity,
+            SeatId, SessionIdentity,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir);
+
+        let session_id = "55555555-6666-7777-8888-999999999999";
+        let journal_session = JournalSessionId::new(session_id).unwrap();
+        let mut journal = Journal::open(&state).expect("open journal");
+        journal
+            .create_session(&SessionIdentity {
+                session: journal_session.clone(),
+                seat: SeatId::new("seat-ask-tail").unwrap(),
+                generation: 1,
+                task: None,
+                route: RouteIdentity {
+                    route: RouteId::new("ask-route").unwrap(),
+                    provider: ProviderId::new("openai").unwrap(),
+                    endpoint: EndpointId::new("openai").unwrap(),
+                    account: AccountId::new("ask-account").unwrap(),
+                    billing_pool: BillingPoolId::new("ask-pool").unwrap(),
+                    protocol: Protocol::OpenAiResponses,
+                    model: ModelId {
+                        vendor: "openai".into(),
+                        id: "gpt-5".into(),
+                    },
+                },
+                created_at: 1,
+                completed_at: None,
+            })
+            .expect("create session");
+        let scope = EventScope::default();
+        let tail_items = CtxConfig::default().handoff.tail_items;
+        let turns = tail_items + 5;
+        for i in 0..turns {
+            journal
+                .acknowledge_input(
+                    &journal_session,
+                    1,
+                    &scope,
+                    MessageId::new(format!("msg-user-{i}")).unwrap(),
+                    format!("turn-{i} user request"),
+                    false,
+                    None,
+                    u64::try_from(i * 2 + 1).unwrap(),
+                )
+                .expect("acknowledge input");
+            journal
+                .record_assistant_message(
+                    &journal_session,
+                    1,
+                    &scope,
+                    MessageId::new(format!("msg-assistant-{i}")).unwrap(),
+                    vec![AssistantBlock::Text {
+                        text: format!("turn-{i} assistant reply"),
+                    }],
+                    None,
+                    None,
+                    u64::try_from(i * 2 + 2).unwrap(),
+                )
+                .expect("record assistant message");
+        }
+        drop(journal);
+
+        let ctx = native_structural_context(&state, session_id, tail_items)
+            .expect("native structural context");
+        assert_eq!(
+            ctx.user_messages.len(),
+            tail_items,
+            "user_messages must be capped to tail_items, not the whole history"
+        );
+        assert_eq!(
+            ctx.assistant_texts.len(),
+            tail_items,
+            "assistant_texts must be capped to tail_items, not the whole history"
+        );
+        let kept_user: Vec<usize> = (turns - tail_items..turns).collect();
+        for i in &kept_user {
+            assert!(
+                ctx.user_messages
+                    .iter()
+                    .any(|m| m.contains(&format!("turn-{i} "))),
+                "the newest turns must survive the cap: missing turn-{i} in {:?}",
+                ctx.user_messages
+            );
+        }
+        for i in 0..(turns - tail_items) {
+            assert!(
+                !ctx.user_messages
+                    .iter()
+                    .any(|m| m.contains(&format!("turn-{i} "))),
+                "the oldest turns must be dropped by the cap: found turn-{i} in {:?}",
+                ctx.user_messages
+            );
+        }
+        assert!(
+            ctx.user_messages
+                .last()
+                .unwrap()
+                .contains(&format!("turn-{}", turns - 1)),
+            "the newest turn must be last, not just present: {:?}",
+            ctx.user_messages
+        );
     }
 }
