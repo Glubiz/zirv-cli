@@ -574,4 +574,133 @@ mod tests {
         // asking for one specific thing.
         assert!(resolve("natve", &cfg, "worker").is_err());
     }
+
+    /// Issue #492 (roadmap N23) item 3 and its "mixed-runtime operation and
+    /// return to legacy defaults remain usable" criterion, end to end on one
+    /// board: a wrapped seat and a native seat sit side by side, exchange
+    /// directed mail in both directions, and then the operator takes the
+    /// configured default back to the harness.
+    ///
+    /// The return is the half that is easy to get wrong, so it is what the
+    /// assertions are about: flipping the default must change only what an
+    /// UNFLAGGED session resolves to. Both seats keep their own runtime,
+    /// each conversation reference still resolves under the runtime that
+    /// recorded it and under no other, and the mail each seat had not read
+    /// yet is still there to read exactly once. Nothing about a return to
+    /// legacy defaults may cost an operator state they already had.
+    #[test]
+    fn a_mixed_board_exchanges_mail_and_survives_a_return_to_the_harness_default() {
+        use super::super::config::CtxConfig;
+        use super::super::state::StateDir;
+        use super::super::{mail, seat, sessions};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+
+        let seats = [
+            (
+                "11111111-1111-4000-8000-000000000000",
+                "native",
+                RuntimeKind::Native,
+            ),
+            (
+                "22222222-2222-4000-8000-000000000000",
+                "claude",
+                RuntimeKind::Harness,
+            ),
+        ];
+        let mut shorts = Vec::new();
+        for (session, agent, runtime) in seats {
+            let short = sessions::short_id(session);
+            seat::register(
+                &state,
+                &short,
+                session,
+                agent,
+                Some("standard"),
+                "anthropic",
+                "worker",
+                false,
+                400,
+            )
+            .expect("register");
+            let mut record = seat::load(&state, &short).expect("seat");
+            record.runtime = runtime;
+            seat::store(&state, &record).expect("store");
+            sessions::record_conversation_on(
+                &state,
+                &short,
+                agent,
+                session,
+                &format!("{agent}-conversation"),
+                runtime,
+            );
+            shorts.push(short);
+        }
+
+        // One directed message each way, across the runtime boundary.
+        for (from, to) in [(0usize, 1usize), (1, 0)] {
+            let msg = mail::Message {
+                from_session: shorts[from].clone(),
+                from_agent: seats[from].1.to_string(),
+                to: "any".to_string(),
+                to_session: Some(shorts[to].clone()),
+                sent: 1_700_000_000 + from as u64,
+                body: format!("from {} to {}", seats[from].1, seats[to].1),
+            };
+            mail::store(&state, slug, &msg, &cfg).expect("store mail");
+        }
+        for (index, short) in shorts.iter().enumerate() {
+            let waiting = mail::list(&state, slug, None, Some(short)).expect("list");
+            assert_eq!(
+                waiting.len(),
+                1,
+                "each seat sees exactly the message addressed to it: {index} {waiting:?}"
+            );
+        }
+
+        // The operator takes the default back to the harness.
+        let returned = runtime_config("");
+        for role in ["worker", "reviewer", "orchestrator"] {
+            let choice = resolve(CONFIGURED, &returned, role).expect("resolve");
+            assert_eq!(
+                choice.kind,
+                RuntimeKind::Harness,
+                "an unflagged {role} session is back on the harness"
+            );
+        }
+
+        // ...and every piece of state both seats already had is untouched.
+        for (index, (session, agent, runtime)) in seats.into_iter().enumerate() {
+            let short = &shorts[index];
+            let record = seat::load(&state, short).expect("seat survives the return");
+            assert_eq!(record.runtime, runtime, "{agent} keeps its own runtime");
+            assert_eq!(
+                sessions::native_conversation(&state, short, agent, session, runtime).as_deref(),
+                Some(format!("{agent}-conversation").as_str()),
+                "{agent} still resolves its own conversation"
+            );
+            let other = match runtime {
+                RuntimeKind::Native => RuntimeKind::Harness,
+                _ => RuntimeKind::Native,
+            };
+            assert_eq!(
+                sessions::native_conversation(&state, short, agent, session, other),
+                None,
+                "{agent}'s conversation is never handed to the other runtime"
+            );
+            let waiting = mail::list(&state, slug, None, Some(short)).expect("list after");
+            assert_eq!(waiting.len(), 1, "{agent}'s unread mail survives the return");
+            mail::consume_and_log(&state, slug, &waiting[0].0, short, "exec", "exec:test")
+                .expect("consume once");
+            assert!(
+                mail::list(&state, slug, None, Some(short))
+                    .expect("list again")
+                    .is_empty(),
+                "{agent} is not handed the same message twice"
+            );
+        }
+    }
 }

@@ -301,6 +301,40 @@ jobs:
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
             || { echo "filter matched no tests" >&2; exit 1; }
 
+      # Issue #492 (roadmap N23): the mixed-runtime proof and the four
+      # fault-injection invariants run on every supported OS, not only on the
+      # Linux test job -- a seat fence, an approval channel and a mailbox are
+      # all filesystem-and-process shaped, which is exactly the kind of
+      # contract that holds on one platform and not another. Same
+      # stale-filter guard as the steps above: each filter must match at
+      # least one passing test.
+      - name: Verify Mixed Runtime And Fault Invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filter in \
+            a_mixed_board_exchanges_mail_and_survives_a_return_to_the_harness_default \
+            a_fenced_generation_commits_nothing_and_runs_no_effect \
+            a_prompt_channel_dropped_while_a_call_is_blocked_grants_nothing \
+            queued_mail_survives_every_rollover_direction_and_is_delivered_exactly_once \
+            every_direction_and_trigger_commits_without_losing_acknowledged_state; do
+            cargo test --bin zirv "$filter" -- --test-threads=1 2>&1 | tee result.txt
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+              || { echo "filter $filter matched no tests" >&2; exit 1; }
+          done
+
+      # The parity matrix is a release gate, so it is checked where the
+      # release is built, on every OS: ZCHK-NATIVE-PARITY reads
+      # docs/design/native-parity.md against the runtime inventory and the
+      # real tree and fails on any row that claims more than its evidence.
+      - name: Verify Native Parity Matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv checks::parity:: -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
+
   # CD is idempotent on an already-published version (the release step prints
   # "release $TAG is already published; nothing to do" and skips the
   # Homebrew/Chocolatey jobs), so an unbumped merge just deploys nothing --
