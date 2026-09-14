@@ -449,6 +449,105 @@ pub fn harness_admission(
     )
 }
 
+/// The three breaker records one NATIVE route depends on, in the scopes
+/// `route::FailureRouting` files its evidence under: the endpoint host, the
+/// credential (account), and the credential/model pair.
+///
+/// Issue #554: this is what "the breaker is keyed per route" means in
+/// practice. The three keys are separate records on purpose -- an endpoint
+/// outage denies every route on that host, a rejected credential denies only
+/// that account, and a model-access failure denies only that model -- so a
+/// caller asking "may this route run" has to consult all three.
+pub fn native_route_keys(identity: &super::route::RouteIdentity) -> Vec<RouteKey> {
+    use super::health::RouteScope;
+
+    let mut keys = vec![
+        RouteKey::scoped(RouteScope::Endpoint, &identity.endpoint),
+        RouteKey::scoped(RouteScope::Credential, &identity.credential),
+    ];
+    if let Some(model) = &identity.model {
+        keys.push(RouteKey::scoped(
+            RouteScope::Model,
+            &format!("{}/{model}", identity.credential),
+        ));
+    }
+    keys
+}
+
+/// Whether one native route may be given work right now: the STRICTEST of
+/// its three scoped verdicts ([`native_route_keys`]). A deny outranks a
+/// degradation, which outranks an in-flight trial, which outranks `Allow`.
+pub fn native_admission(
+    state: &StateDir,
+    identity: &super::route::RouteIdentity,
+    now: u64,
+    policy: &HealthPolicy,
+) -> Admission {
+    if !policy.enabled {
+        return Admission::Allow;
+    }
+    let mut verdict = Admission::Allow;
+    for key in native_route_keys(identity) {
+        let candidate = named(
+            &key.label(),
+            health::admission(&load(state, &key, now), now, policy),
+        );
+        verdict = match (&verdict, &candidate) {
+            (Admission::Deny { .. }, _) => verdict,
+            (_, Admission::Deny { .. }) => candidate,
+            (Admission::Degraded { .. }, _) => verdict,
+            (_, Admission::Degraded { .. }) => candidate,
+            (Admission::Trial, _) => verdict,
+            _ => candidate,
+        };
+    }
+    verdict
+}
+
+/// Folds one finished native run's outcome into the PERSISTENT breaker
+/// (issue #554).
+///
+/// `routing` is the pure verdict the loop already reached
+/// (`NativeFinalStatus::failure_routing`), so nothing is re-derived here: a
+/// failure that is not health evidence at all -- a rate limit, a context
+/// overflow, a refusal, a cancellation -- has no `breaker_key` and therefore
+/// touches no record, which is exactly what keeps those four from tripping
+/// the breaker an endpoint outage owns.
+///
+/// A run with no routing at all SUCCEEDED, so every scope it depended on
+/// gets its success folded in -- that is what lets a half-open trial heal.
+pub fn record_native_outcome(
+    state: &StateDir,
+    identity: &super::route::RouteIdentity,
+    routing: Option<&super::route::FailureRouting>,
+    now: u64,
+    policy: &HealthPolicy,
+) {
+    if !policy.enabled {
+        return;
+    }
+    let model = identity.model.as_deref();
+    match routing {
+        Some(routing) => {
+            if let Some((key, class)) = routing.breaker_key() {
+                observe_and_persist(
+                    state,
+                    &key,
+                    &Observed::new(class, Some(now), None),
+                    model,
+                    now,
+                    policy,
+                );
+            }
+        }
+        None => {
+            for key in native_route_keys(identity) {
+                record_success_and_persist(state, &key, model, now, policy);
+            }
+        }
+    }
+}
+
 /// Every stored route with something to say -- an aged-out `Healthy` record
 /// is skipped, so this is the set `zirv ctx status` renders. Sorted by
 /// harness so callers (and their tests) see a stable order.
