@@ -512,6 +512,37 @@ pub struct NativeFinalStatus {
     pub exit_code: i32,
 }
 
+/// Test-only: makes [`NativeLoop::run_to_completion`] fail hard once this
+/// many turns have completed. See its own call site for why the seam exists.
+#[cfg(test)]
+pub(crate) const ABORT_AFTER_TURNS_ENV: &str = "ZIRV_CTX_NATIVE_ABORT_AFTER_TURNS";
+
+/// A hard loop failure that still has real spend attached (issue #554,
+/// integration review).
+///
+/// `NativeLoop::run_to_completion` can fail outright -- a journal write, a
+/// transport that cannot be rebuilt -- after earlier turns of the SAME loop
+/// have already been billed by the provider. Those tokens are spent whatever
+/// happens next, so the error carries the status that names them and every
+/// caller settles it before propagating. Implements `std::error::Error`, so
+/// a caller with nothing to settle can still write `?` exactly as before.
+#[derive(Debug)]
+pub struct AbortedRun {
+    /// What this loop had already billed when it failed. Boxed because a
+    /// full final status dwarfs the success value it shares a `Result` with,
+    /// and an abort is the rare path.
+    pub status: Box<NativeFinalStatus>,
+    pub error: String,
+}
+
+impl std::fmt::Display for AbortedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for AbortedRun {}
+
 // -- the loop ------------------------------------------------------------
 
 /// Everything the loop needs that is not a live borrow.
@@ -725,6 +756,12 @@ impl<'a> NativeLoop<'a> {
             reconciliation: super::super::route::Reconciliation::default(),
             failure_routing: None,
         }
+    }
+
+    /// One environment value, through this loop's own injected lookup.
+    #[cfg(test)]
+    fn env_value(&self, key: &str) -> Option<String> {
+        (self.env)(key)
     }
 
     /// A fresh id for one journal record.
@@ -1768,14 +1805,25 @@ impl<'a> NativeLoop<'a> {
 
     /// Runs turns until the model stops asking for tools, a bound is hit, or
     /// an interrupt lands, then builds the final status.
-    pub fn run_to_completion(&mut self) -> CtxResult<NativeFinalStatus> {
-        let mut last;
+    pub fn run_to_completion(&mut self) -> Result<NativeFinalStatus, AbortedRun> {
+        let mut last = None;
         let mut limit: Option<LimitKind> = None;
         let mut failure: Option<String> = None;
         let mut interrupted = false;
 
         loop {
-            let outcome = self.run_turn()?;
+            // Issue #554 (integration review): a HARD error -- not a captured
+            // `TurnState::Failed`, which the match below already handles --
+            // used to return straight out of the loop. Every token earlier
+            // turns of this same loop had already been billed for was then
+            // never settled: the estimate was released and the real spend
+            // vanished from `zirv ctx spend`. The abort now carries a status
+            // built from exactly what was billed, so the caller settles it
+            // before propagating.
+            let outcome = match self.run_turn() {
+                Ok(outcome) => outcome,
+                Err(error) => return Err(self.abort(last, error)),
+            };
             match outcome.state {
                 TurnState::Completed => {
                     last = Some(outcome);
@@ -1784,7 +1832,11 @@ impl<'a> NativeLoop<'a> {
                     // reached no delivery boundary inside it, and the next
                     // boundary is exactly here. Running another turn is what
                     // makes `max_turns` a bound on something real.
-                    if self.queued_input()?.is_empty() {
+                    let queued = match self.queued_input() {
+                        Ok(queued) => queued,
+                        Err(error) => return Err(self.abort(last, error)),
+                    };
+                    if queued.is_empty() {
                         break;
                     }
                 }
@@ -1806,7 +1858,86 @@ impl<'a> NativeLoop<'a> {
             }
         }
 
+        // The one hard-error fault seam this loop has, and it exists only in
+        // test builds. The real hard errors are a journal write and a
+        // transport rebuild; neither is reachable with the fixture provider,
+        // and the behaviour under test -- that usage already billed by
+        // EARLIER turns is still settled -- needs a hard error that lands
+        // after at least one billed turn. `#[cfg(test)]`, read off this
+        // loop's own `env`, so no production type gains a field for it.
+        #[cfg(test)]
+        if self
+            .env_value(ABORT_AFTER_TURNS_ENV)
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|after| self.turns >= after)
+        {
+            return Err(self.abort(last, "injected hard loop failure".into()));
+        }
+
         self.finalize(last, limit, failure, interrupted)
+            .map_err(|error| AbortedRun {
+                status: Box::new(self.billed_status(&error.to_string())),
+                error: error.to_string(),
+            })
+    }
+
+    /// The abort one hard loop error produces: the error itself, plus the
+    /// status carrying everything this loop had already billed for.
+    ///
+    /// `finalize` is tried first -- it is the richer answer, with the
+    /// reconciliation and the journal's own view of what is outstanding. It
+    /// reads the journal, so it can fail too; a synthesized status is the
+    /// fallback, because the tokens are spent either way and the one thing
+    /// that must not happen is losing them.
+    fn abort(
+        &mut self,
+        last: Option<TurnOutcome>,
+        error: Box<dyn std::error::Error>,
+    ) -> AbortedRun {
+        let reason = error.to_string();
+        let status = self
+            .finalize(last, None, Some(reason.clone()), false)
+            .unwrap_or_else(|_| self.billed_status(&reason));
+        AbortedRun {
+            status: Box::new(status),
+            error: reason,
+        }
+    }
+
+    /// The minimum status a settlement needs: this loop's identity and what
+    /// it actually spent. Used only when `finalize` itself cannot run.
+    fn billed_status(&self, reason: &str) -> NativeFinalStatus {
+        NativeFinalStatus {
+            schema_version: FINAL_STATUS_SCHEMA_VERSION,
+            runtime: RuntimeKind::Native.as_str(),
+            status: NativeStatus::Failed,
+            session: self.config.session.to_string(),
+            route: self.config.route.route.to_string(),
+            provider: self.config.route.provider.to_string(),
+            endpoint: self.config.route.endpoint.to_string(),
+            account: self.config.route.account.to_string(),
+            billing_pool: self.config.route.billing_pool.to_string(),
+            configured_model: self.config.route.model.id.clone(),
+            served_model: self.served_model.clone(),
+            turns: self.turns,
+            requests: self.requests,
+            tool_calls: self.tool_calls,
+            usage: self.usage.clone(),
+            reconciliation: self.reconciliation.clone(),
+            finish_reason: None,
+            final_text: None,
+            incomplete_tools: Vec::new(),
+            outcome_unknown_tools: Vec::new(),
+            queued_input: Vec::new(),
+            limit: None,
+            failure: Some(reason.to_string()),
+            failure_routing: self.failure_routing.clone(),
+            blocked_reason: None,
+            compactions: self.compactions.clone(),
+            compaction_decision: self.last_decision.clone(),
+            evidence: self.evidence.clone(),
+            exit_code: NativeStatus::Failed.exit_code(),
+        }
     }
 
     /// Builds the structured final status from durable facts.
@@ -3277,7 +3408,25 @@ pub fn run_session<W: std::io::Write>(
             &now_ms,
             env,
         );
-        driver.run_to_completion()?
+        // Issue #554 (integration review): a hard abort still carries what
+        // this loop already billed. Settle it before the error propagates --
+        // for a SEAT here, and for a caller-owned run by handing the abort
+        // on so `native_worker` settles it with its own delegation identity.
+        match driver.run_to_completion() {
+            Ok(status) => status,
+            Err(aborted) => {
+                if request.accounting == Accounting::Seat {
+                    super::super::native_account::settle_seat_turn(
+                        &state,
+                        &cfg,
+                        &aborted.status,
+                        reservation.take().as_ref(),
+                        super::super::mail::session_identity(env).as_deref(),
+                    );
+                }
+                return Err(Box::new(aborted));
+            }
+        }
     };
 
     if let Some(journal) = backend.journal_mut() {
@@ -4081,14 +4230,20 @@ pub fn spawn_interactive(
                     }
                     let _ = progress_tx.send(InteractiveProgress::Idle);
                 }
-                Err(error) => {
-                    // The turn never produced a status, so there is nothing to
-                    // settle against -- release the estimate rather than
-                    // leaving it outstanding against the pool forever.
-                    if let Some((pool, id)) = &turn_reservation {
-                        let _ = super::super::reservation::release(&worker_state, pool, id);
-                    }
-                    let _ = progress_tx.send(InteractiveProgress::Failed(error.to_string()));
+                Err(aborted) => {
+                    // Issue #554 (integration review): a hard abort is not an
+                    // empty turn. Whatever the provider already billed inside
+                    // it is spent, so it settles exactly as a completed turn
+                    // does -- which also resolves the estimate, rather than
+                    // releasing an estimate and dropping the real spend.
+                    super::super::native_account::settle_seat_turn(
+                        &worker_state,
+                        &worker_cfg,
+                        &aborted.status,
+                        turn_reservation.as_ref(),
+                        Some(worker_handle.short.as_str()),
+                    );
+                    let _ = progress_tx.send(InteractiveProgress::Failed(aborted.error));
                 }
             }
         }
@@ -4297,7 +4452,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
         &now_ms,
         env,
     );
-    driver.run_to_completion()
+    driver.run_to_completion().map_err(Into::into)
 }
 
 /// Resolves the provider transport, the tool executor and the route identity
@@ -6643,6 +6798,75 @@ mod tests {
         assert!(
             row.input_tokens + row.output_tokens > 0,
             "with the tokens the provider actually metered"
+        );
+    }
+
+    /// Issue #554 (integration review): a HARD loop error still settles the
+    /// usage earlier turns of the same loop were already billed for.
+    ///
+    /// `run_to_completion` used to return straight out of the loop on a hard
+    /// `Err` -- not a captured `TurnState::Failed`, which it always handled
+    /// -- so the estimate was released and the real spend vanished from
+    /// `zirv ctx spend`. Driven through `run_session`, the production entry,
+    /// with the loop's own `#[cfg(test)]` abort seam standing in for the two
+    /// real hard-error paths (a journal write and a transport rebuild),
+    /// neither of which the fixture provider can produce.
+    #[test]
+    fn a_hard_turn_error_still_settles_usage_from_earlier_turns() {
+        use crate::commands::ctx::log;
+
+        let (repo, state, _tree, mut env) = interactive_shutdown_fixture();
+        // One good turn is billed, then the next one aborts hard.
+        env.insert(ABORT_AFTER_TURNS_ENV.to_string(), "1".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        let provider = format!(
+            "fixture:{}",
+            fixture_root().join("helper-answer.json").display()
+        );
+
+        let failed = run_session(
+            &mut HeadlessRequest {
+                repo: repo.path(),
+                prompt: "do the thing",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: None,
+                provider: Some(&provider),
+                fixture_tools: None,
+                task: None,
+                writer: None,
+                accounting: Accounting::Seat,
+            },
+            &mut Vec::new(),
+            &lookup,
+        );
+        let error = failed.expect_err("the injected hard error must propagate");
+        let aborted = error
+            .downcast_ref::<AbortedRun>()
+            .expect("a hard abort carries what the loop already billed");
+        let billed = aborted.status.usage.input_tokens + aborted.status.usage.output_tokens;
+        assert!(
+            billed > 0,
+            "the fixture must actually bill a turn before the abort, or this asserts nothing"
+        );
+
+        let rows = log::read_delegations(&state, 20);
+        let row = rows
+            .iter()
+            .find(|row| row.session == aborted.status.session)
+            .expect("an aborted run still reaches the ledger zirv ctx spend reads");
+        assert_eq!(
+            row.input_tokens + row.output_tokens,
+            billed,
+            "carrying the tokens the earlier turn was billed for, not zero"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, &aborted.status.billing_pool, 0),
+            0,
+            "and the estimate is settled, not merely released"
         );
     }
 
