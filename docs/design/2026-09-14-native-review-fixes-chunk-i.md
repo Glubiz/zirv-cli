@@ -49,6 +49,16 @@ existing model, do not stand a second one beside it.*
 - **Spend.** `settle_native_run` appends one `log::Delegation` row, which is
   the ledger `zirv ctx spend` reads. Without it a native worker's usage
   existed only inside its own JSON status.
+- **Every path, not one (review round 1).** The accounting lives in
+  `native_account`, lifted out of `native_worker` so all three ways a native
+  request reaches a provider owe the same four things: the delegated worker,
+  the operator's own dashboard-hosted pane
+  (`runtime::native::spawn_interactive`, accounting PER TURN -- a pane is
+  long-lived, and a seat whose spend only landed when it closed would be
+  invisible to `zirv ctx spend` for its whole life) and the headless
+  `zirv ctx exec` run (`run_session`, accounting per session). Three copies of
+  an accounting rule is how two of them end up disagreeing about what an
+  account actually spent.
 
 ### #552 — every rollover direction launches a successor
 
@@ -102,6 +112,28 @@ one's name:
 Nothing in this half is `#[cfg(unix)]`; both backends compile and run on every
 platform CI covers.
 
+**`wrap.rs`'s seam (review round 1).** `perform_handover_swap` called
+`handover::resolve_swap_launch` unconditionally, so a wrap seat whose rollover
+resolved to a NATIVE successor was swapped onto `req.target_agent` anyway -- a
+route the rollover never chose, spending an account it never authorised. It now
+goes through the same `rollover_runtime::launch_successor`, with a
+`WrapSwapLauncher` whose `admits` takes the harness direction and refuses every
+other. `SuccessorLauncher` gained that `admits` hook precisely for this: a seam
+that cannot take a plan must not have this seat's subagents settled on its
+behalf, so admission is asked BEFORE `settle_subagents` (the default admits
+everything, so the dashboard seam is unchanged). The refusal is returned before
+the old child is touched, so the seat parks on its current harness with its
+handoff already stored -- item 7, rather than a mis-swap.
+
+The wrap change is ~45 platform-neutral lines at the top of
+`perform_handover_swap` plus the launcher type; no `#[cfg(unix)]` block was
+added or modified. `wrap.rs` itself is not `#[cfg(unix)]` -- its ~30 PTY TESTS
+are -- so everything added here compiles and runs on Windows, and
+`wrap_rollover_to_native_never_selects_a_harness_swap` exercises the decision
+directly. What could NOT be verified on this machine is the code the gate sits
+in front of: every line of `perform_handover_swap` after the gate needs a live
+pty, and CI is the evidence for those.
+
 ### #580 — no acknowledged input is ever dropped
 
 `checkpoint::build` no longer truncates `acknowledged_input`. Length is bounded
@@ -140,6 +172,9 @@ fallback at all. The claim itself is refused either way.
 - `rollover_runtime::tests::every_rollover_direction_launches_one_successor`
 - `dash::tests::a_native_successor_actually_opens_as_a_live_pane_on_the_same_seat`
 - `dash::tests::a_harness_successor_takes_the_seat_from_a_native_source`
+- `runtime::native::tests::interactive_native_turns_record_health_and_settle_pool_spend`
+- `runtime::native::tests::headless_native_exec_records_health_and_settles_pool_spend`
+- `wrap::tests::wrap_rollover_to_native_never_selects_a_harness_swap`
 - `agent::tests::the_dashboard_hosting_this_caller_is_preferred_over_a_newer_foreign_one`
 - `agent::tests::a_restarted_hosted_seats_chat_record_still_names_its_dashboard_for_this_repo`
 - `agent::tests::a_foreign_repo_refusal_tries_the_next_live_dashboard_before_running_inline`
@@ -151,8 +186,18 @@ fallback at all. The claim itself is refused either way.
   the dashboard seam, so `SuccessorRefusal` is down to `LaunchFailed` — and
   every backend builds its successor completely before taking anything away,
   so that always leaves the source holding the seat (item 7).
-- **`wrap.rs`'s own swap seam is untouched.** Its ~30 `#[cfg(unix)]` PTY tests
-  cannot be compiled on the Windows machine this was developed on.
+- **`wrap.rs` can only PARK on a native successor, not launch one.** The gate
+  above stops the mis-swap; giving a wrap seat a real native successor means
+  ending the pty session and opening a native one in the same terminal, which
+  is a `wrap` lifecycle change in code whose ~30 PTY tests cannot be compiled
+  on the Windows machine this was developed on.
+- **The #554 seams have no row of their own in the parity record.** Both of its
+  matrices are closed 1:1 sets -- one row per inventory command verb, one per
+  model-calling call site -- and `native_placement`/`settle_native_run`/
+  `capacity_snapshot_with_native`/`native_admission` are neither. The evidence
+  is recorded on the verb rows that actually own those paths (`ctx spend`,
+  `ctx exec`, `ctx chat`) instead; a free-standing row is rejected by
+  `ZCHK-NATIVE-PARITY` as a stale one.
 - **Native rows still rank on `Unknown`.** A native route reports no
   per-minute readings, so its four non-window dimensions remain labelled
   estimates. Ranking native routes against harnesses needs those readings
