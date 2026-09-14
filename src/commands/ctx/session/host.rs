@@ -56,16 +56,7 @@ const QUIT_GRACE: Duration = Duration::from_secs(3);
 /// `dash::pane`'s own per-tick budget discipline.
 const PUMP_BUDGET_BYTES: usize = 512 * 1024;
 
-/// How many ENDED sessions a runtime keeps in its table.
-///
-/// An ended session has already let go of its pty, its writer, its reader
-/// channel, its turn-signal endpoint and (on an explicit stop) its registry
-/// record -- see [`HostSession::retire`]. What is left is its final rendered
-/// screen, so a client that was watching can still read the last frame and
-/// `zirv session list` can still show what just happened. This cap is what
-/// stops a service that has been up for a week from remembering every session
-/// it ever ran: past it, the oldest ended entries are dropped entirely.
-pub const MAX_ENDED_SESSIONS: usize = 16;
+pub use super::MAX_ENDED_SESSIONS;
 
 /// Drops the oldest ended sessions past `cap`. Live sessions are never
 /// touched, whatever the cap is: this bounds HISTORY, not concurrency.
