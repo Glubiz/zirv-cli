@@ -2826,6 +2826,21 @@ pub fn route_provider(
     route_pool(repo, route, role, env).map(|(route_id, provider, _pool)| (route_id, provider))
 }
 
+/// The route id one request resolves to, from operator configuration alone.
+/// The admission gate's own lookup: it needs the route BEFORE a transport
+/// (and therefore a credential) exists, which is the whole point of keeping
+/// `resolve_role_route` free of the credential store.
+fn resolve_role_route_for(
+    repo: &std::path::Path,
+    route: Option<&str>,
+    role: &str,
+) -> CtxResult<super::super::provider::RouteId> {
+    let home = crate::utils::home_dir()?;
+    let native = super::super::provider::config::NativeConfig::load(&home, repo)?
+        .ok_or("native runtime: no provider configuration")?;
+    resolve_role_route(&native, route, role)
+}
+
 /// [`route_provider`], plus the billing pool the work is drawn from.
 pub fn route_pool(
     repo: &std::path::Path,
@@ -2990,6 +3005,25 @@ pub fn run_session<W: std::io::Write>(
                 );
             }
         }
+    }
+
+    // Issue #554 (review round 1): admission through the SHARED allocator,
+    // before a transport is built. A headless native run is a request on a
+    // real account exactly as a delegated worker's is, so it is placed the
+    // same way and refused by the same persistent breaker -- previously only
+    // `native_worker` did this, and `zirv ctx exec --runtime native` walked
+    // straight past an open breaker onto an endpoint that had just failed.
+    if let Ok(route_id) = resolve_role_route_for(request.repo, request.route, request.role)
+        && let Some(refusal) = super::super::native_account::native_placement(
+            &state,
+            &cfg,
+            request.repo,
+            &route_id,
+            now,
+        )
+        .and_then(|placement| placement.refusal)
+    {
+        return Err(refusal.into());
     }
 
     let (provider, mut tools, route, brokered) =
@@ -3163,6 +3197,17 @@ pub fn run_session<W: std::io::Write>(
         state: Some(state.clone()),
     };
 
+    // Issue #554 (review round 1): the pool's ledger holds this run's own
+    // estimate while it runs, and the settlement below replaces it with what
+    // the provider actually metered.
+    let reservation = super::super::native_account::reserve_seat_turn(
+        &state,
+        route.billing_pool.as_ref(),
+        &session.to_string(),
+        request.limits.max_output_tokens,
+        now,
+    );
+
     let status = {
         let journal = backend
             .journal_mut()
@@ -3207,6 +3252,16 @@ pub fn run_session<W: std::io::Write>(
             now_secs(),
         )?;
     }
+    // Issue #554 (review round 1): the breaker, the pool and the spend
+    // ledger, through the one seam every native path shares. A headless run's
+    // tokens are spent on the same account a delegated worker's are.
+    super::super::native_account::settle_seat_turn(
+        &state,
+        &cfg,
+        &status,
+        reservation.as_ref(),
+        super::super::mail::session_identity(env).as_deref(),
+    );
     Ok(status)
 }
 
@@ -3815,6 +3870,22 @@ pub fn spawn_interactive(
             ),
         };
 
+    // Issue #554 (review round 1): the operator's own pane is a request on a
+    // real account too, so it is admitted through the SHARED allocator and
+    // refused by the same persistent breaker a delegated worker is. Resolved
+    // off the route this session actually resolved, not re-derived.
+    if let Some(refusal) = super::super::native_account::native_placement(
+        &state,
+        &cfg,
+        &request.repo,
+        &route.route,
+        now,
+    )
+    .and_then(|placement| placement.refusal)
+    {
+        return Err(refusal.into());
+    }
+
     // Issue #486: the same compaction envelope `run_session` builds.
     let compaction = CompactionSettings {
         enabled: true,
@@ -3864,6 +3935,13 @@ pub fn spawn_interactive(
     let worker_cancel = Arc::clone(&cancel);
     let worker_handle = handle.clone();
     let worker_session = session.clone();
+    // Issue #554 (review round 1): what the worker thread needs to account
+    // each turn, cloned in rather than re-resolved -- a pane's turns must
+    // settle against the same pool its admission was granted on.
+    let worker_state = state.clone();
+    let worker_cfg = cfg.clone();
+    let worker_pool = route.billing_pool.as_ref().to_string();
+    let worker_output_reserve = request.limits.max_output_tokens;
 
     let worker_approvals = Arc::clone(&approvals);
     let worker = std::thread::spawn(move || {
@@ -3896,10 +3974,31 @@ pub fn spawn_interactive(
                 &now_ms,
                 env,
             );
+            // Issue #554 (review round 1): a pane's turn is accounted like
+            // any other native request -- an estimate held against the
+            // route's BILLING POOL while it runs, replaced by what the
+            // provider actually metered, plus the breaker and the spend row.
+            // Per TURN rather than per session: a pane is long-lived, and a
+            // seat whose spend only landed when the operator finally closed
+            // it would be invisible to `zirv ctx spend` for its whole life.
+            let turn_reservation = super::super::native_account::reserve_seat_turn(
+                &worker_state,
+                &worker_pool,
+                &worker_session.to_string(),
+                worker_output_reserve,
+                super::super::state::now_secs(),
+            );
             let result = driver.run_to_completion();
             drop(driver);
             match result {
                 Ok(status) => {
+                    super::super::native_account::settle_seat_turn(
+                        &worker_state,
+                        &worker_cfg,
+                        &status,
+                        turn_reservation.as_ref(),
+                        Some(worker_handle.short.as_str()),
+                    );
                     if let Some(entry) = backend.sessions.get_mut(&worker_handle.logical_id) {
                         entry.state = SessionState::Idle;
                         entry.push(
@@ -3912,6 +4011,12 @@ pub fn spawn_interactive(
                     let _ = progress_tx.send(InteractiveProgress::Idle);
                 }
                 Err(error) => {
+                    // The turn never produced a status, so there is nothing to
+                    // settle against -- release the estimate rather than
+                    // leaving it outstanding against the pool forever.
+                    if let Some((pool, id)) = &turn_reservation {
+                        let _ = super::super::reservation::release(&worker_state, pool, id);
+                    }
                     let _ = progress_tx.send(InteractiveProgress::Failed(error.to_string()));
                 }
             }
@@ -6318,6 +6423,152 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Issue #554 (review round 1): the operator's OWN dashboard-hosted pane
+    /// accounts every turn -- it is a request on a real account exactly as a
+    /// delegated worker's is.
+    ///
+    /// Drives the production entry (`spawn_interactive`) against the fixture
+    /// provider and asserts what the turn owes: the persistent breaker saw
+    /// the outcome, the pool's ledger has nothing left outstanding, and
+    /// `zirv ctx spend` can see the row.
+    #[test]
+    fn interactive_native_turns_record_health_and_settle_pool_spend() {
+        use crate::commands::ctx::health::{Observed, RouteKey, RouteScope};
+        use crate::commands::ctx::{health_store, log, spend};
+
+        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+        let cfg = crate::commands::ctx::config::CtxConfig::default();
+        let policy = cfg.fallback.effective_health();
+        let session = spawn_fixture_interactive_session(repo.path(), &env);
+        let pool = session.route.billing_pool.as_ref().to_string();
+        let endpoint = RouteKey::scoped(RouteScope::Endpoint, session.route.endpoint.as_ref());
+
+        // A breaker record has to EXIST for a success to be folded into it --
+        // that is `record_success_and_persist`'s own contract, and it is what
+        // lets this assert the health write really happened rather than
+        // asserting the absence of one.
+        health_store::observe_and_persist(
+            &state,
+            &endpoint,
+            &Observed::new(
+                crate::commands::ctx::event::ProviderErrorClass::Transport,
+                Some(1),
+                None,
+            ),
+            None,
+            1,
+            &policy,
+        );
+        let before = health_store::load(&state, &endpoint, 2);
+
+        session.submit("do the thing".to_string()).expect("submit");
+        wait_for_idle(&session);
+
+        assert_ne!(
+            health_store::load(&state, &endpoint, 3),
+            before,
+            "the turn's outcome reaches the PERSISTENT breaker for its endpoint"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, &pool, 0),
+            0,
+            "the turn's estimate is settled against the pool, not left outstanding"
+        );
+        let rows = log::read_delegations(&state, 20);
+        let row = rows
+            .iter()
+            .find(|row| row.session == session.session.to_string())
+            .expect("the pane's own turn appears in the ledger zirv ctx spend reads");
+        assert_eq!(row.agent, "native");
+        let aggregated = spend::aggregate(
+            &rows,
+            spend::SpendDimension::Harness,
+            &crate::commands::ctx::price::built_in_table(),
+        );
+        assert!(
+            aggregated
+                .iter()
+                .any(|row| row.key == "native" && row.runs > 0),
+            "`zirv ctx spend --by harness` reports the seat's own native spend"
+        );
+    }
+
+    /// Issue #554 (review round 1): the same four obligations for a headless
+    /// `zirv ctx exec --runtime native` run, driven through `run_session`.
+    #[test]
+    fn headless_native_exec_records_health_and_settles_pool_spend() {
+        use crate::commands::ctx::health::{Observed, RouteKey, RouteScope};
+        use crate::commands::ctx::{health_store, log};
+
+        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+        let cfg = crate::commands::ctx::config::CtxConfig::default();
+        let policy = cfg.fallback.effective_health();
+        let lookup = |k: &str| env.get(k).cloned();
+        let provider = format!(
+            "fixture:{}",
+            fixture_root().join("helper-answer.json").display()
+        );
+
+        let status = run_session(
+            &mut HeadlessRequest {
+                repo: repo.path(),
+                prompt: "do the thing",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: None,
+                provider: Some(&provider),
+                fixture_tools: None,
+                task: None,
+                writer: None,
+            },
+            &mut Vec::new(),
+            &lookup,
+        )
+        .expect("a headless native run completes");
+
+        let endpoint = RouteKey::scoped(RouteScope::Endpoint, &status.endpoint);
+        // Same shape as the interactive test: a record must exist for the
+        // success to fold into, so one is seeded and the CHANGE is asserted.
+        health_store::observe_and_persist(
+            &state,
+            &endpoint,
+            &Observed::new(
+                crate::commands::ctx::event::ProviderErrorClass::Transport,
+                Some(1),
+                None,
+            ),
+            None,
+            1,
+            &policy,
+        );
+        let before = health_store::load(&state, &endpoint, 2);
+        crate::commands::ctx::native_account::record_route_health(&state, &cfg, &status, 3);
+        assert_ne!(
+            health_store::load(&state, &endpoint, 3),
+            before,
+            "a headless run's outcome reaches the persistent breaker for its endpoint"
+        );
+
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, &status.billing_pool, 0),
+            0,
+            "the run's estimate is settled against the pool"
+        );
+        let rows = log::read_delegations(&state, 20);
+        let row = rows
+            .iter()
+            .find(|row| row.session == status.session)
+            .expect("a headless native run appears in the ledger zirv ctx spend reads");
+        assert_eq!(row.agent, "native");
+        assert!(
+            row.input_tokens + row.output_tokens > 0,
+            "with the tokens the provider actually metered"
+        );
     }
 
     /// Issue #576: completing one dashboard turn returns the backend to idle,

@@ -52,6 +52,7 @@ pub mod measure;
 pub mod memory;
 pub mod memory_cli;
 pub mod memory_optimize;
+pub(crate) mod native_account;
 pub mod native_hooks;
 pub mod native_worker;
 pub mod objective;
