@@ -160,6 +160,8 @@ pub struct QueuedTurn {
     pub route: Option<String>,
     pub task: Option<String>,
     pub cancel: Arc<CancellationFlag>,
+    pub approvals: Arc<super::super::runtime::enforcement::InteractiveApprovals>,
+    pub pending_wake: Arc<AtomicBool>,
 }
 
 /// The production environment: the shared native agent loop, with the writer
@@ -225,6 +227,7 @@ impl NativeEnvironment for ProviderEnvironment {
             fixture_tools: None,
             task: turn.task.clone(),
             writer,
+            approvals: Some(Arc::clone(&turn.approvals)),
             cancel: Arc::clone(&turn.cancel),
         };
         let mut notes = Vec::new();
@@ -256,10 +259,11 @@ struct NativeSession {
     /// table's mutex because the runner clears it from its own thread, without
     /// taking the table lock a protocol call may be holding.
     running: Arc<AtomicBool>,
-    /// Approval decisions this session's controller has made, by request id.
-    /// Durable in the journal as well (see [`NativeSessions::approve`]); this
-    /// is the copy a live turn can read without a database round trip.
-    approvals: BTreeMap<String, ApprovalDecision>,
+    /// Set by every durable acknowledgement and consumed by the runner.
+    pending_wake: Arc<AtomicBool>,
+    approvals: Arc<super::super::runtime::enforcement::InteractiveApprovals>,
+    approval_prompts: std::sync::mpsc::Receiver<super::super::runtime::enforcement::ApprovalPrompt>,
+    pending_approvals: BTreeMap<String, super::super::runtime::enforcement::ApprovalPrompt>,
     clients: Vec<String>,
     controller: Option<String>,
     /// Set on a restore: the predecessor generation this one continues from.
@@ -335,6 +339,8 @@ impl NativeSession {
             route: self.route.clone(),
             task: self.task.clone(),
             cancel: Arc::clone(&self.cancel),
+            approvals: Arc::clone(&self.approvals),
+            pending_wake: Arc::clone(&self.pending_wake),
         }
     }
 }
@@ -560,10 +566,22 @@ impl NativeSessions {
                 conversation: entry.session_id.clone(),
             }),
         };
+        store_native_seat(
+            &self.state,
+            &handle,
+            &entry.role,
+            &resumed.identity.route,
+            state::now_secs(),
+        )?;
         self.backend().adopt(&handle, session.clone())?;
         let cwd = restore_cwd(entry, &std::env::current_dir()?);
         let record = self.register(&handle, &entry.role, &cwd);
         let unknown: Vec<String> = resumed.reconciled.iter().map(ToString::to_string).collect();
+        let (approvals, approval_prompts) =
+            super::super::runtime::enforcement::InteractiveApprovals::new(
+                Arc::new(super::super::runtime::enforcement::ApprovalAuthority::new()),
+                format!("protocol {}", handle.short),
+            );
         self.lock().insert(
             entry.session_id.clone(),
             NativeSession {
@@ -577,7 +595,10 @@ impl NativeSessions {
                 guard: record,
                 cancel: Arc::new(CancellationFlag::default()),
                 running: Arc::new(AtomicBool::new(false)),
-                approvals: BTreeMap::new(),
+                pending_wake: Arc::new(AtomicBool::new(false)),
+                approvals,
+                approval_prompts,
+                pending_approvals: BTreeMap::new(),
                 clients: Vec::new(),
                 controller: None,
                 restored_from: Some(resumed.previous_generation),
@@ -619,16 +640,83 @@ impl NativeSessions {
             // second conversation on one journal.
             return;
         }
+        turn.approvals.resume();
         let environment = Arc::clone(&self.environment);
         if self.inline_turns.load(Ordering::Relaxed) {
-            let _ = environment.run(&turn);
+            loop {
+                turn.pending_wake.store(false, Ordering::Release);
+                let _ = environment.run(&turn);
+                if !turn.pending_wake.swap(false, Ordering::AcqRel) {
+                    break;
+                }
+            }
             running.store(false, Ordering::Release);
             return;
         }
         std::thread::spawn(move || {
-            let _ = environment.run(&turn);
-            running.store(false, Ordering::Release);
+            loop {
+                turn.pending_wake.store(false, Ordering::Release);
+                let _ = environment.run(&turn);
+                if turn.pending_wake.swap(false, Ordering::AcqRel) {
+                    continue;
+                }
+                running.store(false, Ordering::Release);
+                if turn.pending_wake.swap(false, Ordering::AcqRel)
+                    && running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
         });
+    }
+
+    fn collect_pending_approvals(&self, session_id: &str) -> Result<(), ApiError> {
+        let mut sessions = self.lock();
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Err(ApiError::new(
+                ErrorCode::UnknownSession,
+                format!("no native session {session_id} on this runtime"),
+            ));
+        };
+        let mut requests = Vec::new();
+        while let Ok(prompt) = session.approval_prompts.try_recv() {
+            let request = prompt.request().clone();
+            let request_id = request.scope_digest.clone();
+            session.pending_approvals.insert(request_id.clone(), prompt);
+            requests.push((request_id, request));
+        }
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let journal_session = session.journal_session.clone();
+        let generation = session.handle.generation;
+        let mut backend = self.backend();
+        let journal = backend
+            .journal_mut()
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the journal was not attached"))?;
+        for (request_id, request) in requests {
+            let task = TaskId::new(format!("approval-{request_id}"))
+                .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+            journal
+                .record_task_receipt(
+                    &journal_session,
+                    generation,
+                    &Default::default(),
+                    task,
+                    TaskReceiptState::Accepted,
+                    serde_json::json!({
+                        "kind": "approval_request",
+                        "request_id": request_id,
+                        "request": request,
+                    }),
+                    state::now_secs(),
+                )
+                .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn with_session<T>(
@@ -686,6 +774,45 @@ pub fn restore_cwd(entry: &NativeEntry, fallback: &Path) -> PathBuf {
     }
 }
 
+fn store_native_seat(
+    state_dir: &StateDir,
+    handle: &SessionHandle,
+    role: &str,
+    route: &RouteIdentity,
+    now: u64,
+) -> CtxResult<()> {
+    super::super::seat::store(
+        state_dir,
+        &super::super::seat::Seat {
+            short: handle.short.clone(),
+            session: handle.logical_id.clone(),
+            generation: handle.generation,
+            agent: RuntimeKind::Native.as_str().to_string(),
+            model: Some(route.model.id.clone()),
+            provider: route.provider.to_string(),
+            role: role.to_string(),
+            pinned: false,
+            phase: Default::default(),
+            visited: Vec::new(),
+            last_rollover_at: None,
+            pending: None,
+            displaced: None,
+            created_at: now,
+            updated_at: now,
+            runtime: RuntimeKind::Native,
+        },
+    )?;
+    sessions::record_conversation_on(
+        state_dir,
+        &handle.short,
+        RuntimeKind::Native.as_str(),
+        &handle.logical_id,
+        &handle.logical_id,
+        RuntimeKind::Native,
+    );
+    Ok(())
+}
+
 impl NativeHost for NativeSessions {
     fn sessions(&self) -> Vec<SessionFacts> {
         self.lock().values().map(NativeSession::facts).collect()
@@ -735,7 +862,7 @@ impl NativeHost for NativeSessions {
         steering: bool,
         idempotency: Option<&str>,
     ) -> Result<InputAck, ApiError> {
-        let (handle, turn, running) = {
+        let (handle, turn, running, pending_wake) = {
             let sessions = self.lock();
             let Some(session) = sessions.get(session_id) else {
                 return Err(ApiError::new(
@@ -753,6 +880,7 @@ impl NativeHost for NativeSessions {
                 session.handle.clone(),
                 session.queued_turn(),
                 Arc::clone(&session.running),
+                Arc::clone(&session.pending_wake),
             )
         };
         // Durable FIRST, under the caller's own idempotency identity, and only
@@ -763,6 +891,7 @@ impl NativeHost for NativeSessions {
             .accept_input(&handle, input, steering, idempotency)
             .map_err(|error| backend_error(error.as_ref()))?;
         if !ack.duplicate {
+            pending_wake.store(true, Ordering::Release);
             self.wake(turn, running);
         }
         Ok(InputAck {
@@ -776,6 +905,7 @@ impl NativeHost for NativeSessions {
             if !session.running.load(Ordering::Acquire) {
                 return Ok(false);
             }
+            session.approvals.cancel();
             session.cancel.cancel();
             Ok(true)
         })
@@ -788,10 +918,26 @@ impl NativeHost for NativeSessions {
         decision: ApprovalDecision,
         note: Option<&str>,
     ) -> Result<bool, ApiError> {
-        let journal_session = self.with_session(session_id, |session| {
-            session.approvals.insert(request_id.to_string(), decision);
-            Ok(session.journal_session.clone())
+        self.collect_pending_approvals(session_id)?;
+        let (journal_session, prompt) = self.with_session(session_id, |session| {
+            Ok((
+                session.journal_session.clone(),
+                session.pending_approvals.remove(request_id),
+            ))
         })?;
+        let Some(prompt) = prompt else {
+            return Ok(false);
+        };
+        let interactive_decision = match decision {
+            ApprovalDecision::Allow => {
+                super::super::runtime::enforcement::InteractiveDecision::Once
+            }
+            ApprovalDecision::Deny | ApprovalDecision::Unknown => {
+                super::super::runtime::enforcement::InteractiveDecision::Deny {
+                    guidance: note.unwrap_or("operator denied this action").to_string(),
+                }
+            }
+        };
         // Durable as well as in memory: an approval is an authority decision,
         // and an authority decision that existed only in a process's memory
         // would be unauditable the moment that process went away.
@@ -823,7 +969,7 @@ impl NativeHost for NativeSessions {
                 state::now_secs(),
             )
             .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
-        Ok(true)
+        Ok(prompt.decide(interactive_decision))
     }
 
     fn task_result(
@@ -886,6 +1032,7 @@ impl NativeHost for NativeSessions {
     }
 
     fn journal(&self, session_id: &str, after: u64, limit: usize) -> Result<NativePage, ApiError> {
+        self.collect_pending_approvals(session_id)?;
         let journal_session =
             self.with_session(session_id, |session| Ok(session.journal_session.clone()))?;
         let backend = self.backend();
@@ -994,6 +1141,7 @@ impl NativeHost for NativeSessions {
             // model call was still streaming would otherwise leave the runner
             // writing into a journal the operator has just ended.
             session.cancel.cancel();
+            session.approvals.close();
             session.ended = true;
             session.ended_at = Some(state::now_secs());
             session.clients.clear();
@@ -1054,10 +1202,22 @@ impl NativeSessions {
             .journal_mut()
             .ok_or("native runtime: the journal was not attached")?
             .create_session(&identity)?;
+        store_native_seat(
+            &self.state,
+            &handle,
+            role,
+            &identity.route,
+            state::now_secs(),
+        )?;
         backend.adopt(&handle, journal_session.clone())?;
         drop(backend);
 
         let guard = self.register(&handle, role, &spec.cwd);
+        let (approvals, approval_prompts) =
+            super::super::runtime::enforcement::InteractiveApprovals::new(
+                Arc::new(super::super::runtime::enforcement::ApprovalAuthority::new()),
+                format!("protocol {}", handle.short),
+            );
         let session = NativeSession {
             handle: handle.clone(),
             journal_session,
@@ -1069,7 +1229,10 @@ impl NativeSessions {
             guard,
             cancel: Arc::new(CancellationFlag::default()),
             running: Arc::new(AtomicBool::new(false)),
-            approvals: BTreeMap::new(),
+            pending_wake: Arc::new(AtomicBool::new(false)),
+            approvals,
+            approval_prompts,
+            pending_approvals: BTreeMap::new(),
             clients: Vec::new(),
             controller: None,
             restored_from: None,
@@ -1184,6 +1347,15 @@ fn event_detail(event: &JournalEvent) -> Option<String> {
             }
             .to_string(),
         ),
+        JournalEvent::TaskReceipt { receipt, .. }
+            if receipt.get("kind").and_then(serde_json::Value::as_str)
+                == Some("approval_request") =>
+        {
+            receipt
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        }
         JournalEvent::GenerationAdvanced { previous, current } => {
             Some(format!("{previous} -> {current}"))
         }
@@ -1320,6 +1492,157 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ApprovalEnvironment {
+        state: StateDir,
+        executions: AtomicUsize,
+    }
+
+    impl NativeEnvironment for ApprovalEnvironment {
+        fn route_identity(
+            &self,
+            _repo: &Path,
+            _route: Option<&str>,
+            _role: &str,
+        ) -> CtxResult<RouteIdentity> {
+            TestEnvironment::default().route_identity(Path::new("."), None, "worker")
+        }
+
+        fn run(&self, turn: &QueuedTurn) -> CtxResult<()> {
+            use crate::commands::ctx::runtime::enforcement::{
+                ApprovalOutcome, ApprovalRequest, ExecutionAction, ExecutionIdentity,
+                GenerationFence, StoredSeatFence,
+            };
+
+            let identity = ExecutionIdentity {
+                session: turn.session.clone(),
+                short: turn.seat_short.clone(),
+                generation: turn.generation,
+                role: turn.role.clone(),
+                task: turn.task.clone(),
+            };
+            StoredSeatFence::new(self.state.clone()).verify(&identity)?;
+            let action = ExecutionAction::ReadFile {
+                path: turn.cwd.join("approved.txt"),
+            };
+            let policy_fingerprint = "policy-1".to_string();
+            let claims_fingerprint = "claims-1".to_string();
+            let resolved_paths = vec![turn.cwd.join("approved.txt")];
+            let execution_scope_fingerprint = "scope-1".to_string();
+            #[derive(Serialize)]
+            struct Scope<'a> {
+                identity: &'a ExecutionIdentity,
+                action: &'a ExecutionAction,
+                policy_fingerprint: &'a str,
+                claims_fingerprint: &'a str,
+                resolved_paths: &'a [PathBuf],
+                execution_scope_fingerprint: &'a str,
+            }
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(serde_json::to_vec(&Scope {
+                identity: &identity,
+                action: &action,
+                policy_fingerprint: &policy_fingerprint,
+                claims_fingerprint: &claims_fingerprint,
+                resolved_paths: &resolved_paths,
+                execution_scope_fingerprint: &execution_scope_fingerprint,
+            })?);
+            let request = ApprovalRequest {
+                scope_digest: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+                identity,
+                action,
+                policy_fingerprint,
+                claims_fingerprint,
+                resolved_paths,
+                execution_scope_fingerprint,
+                created_at: state::now_secs(),
+            };
+            if matches!(
+                turn.approvals.request(&request, state::now_secs()),
+                ApprovalOutcome::Granted(_)
+            ) {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    fn approval_host(root: &Path) -> (Arc<NativeSessions>, Arc<ApprovalEnvironment>) {
+        let state = StateDir::from_root(root.join("state"));
+        let environment = Arc::new(ApprovalEnvironment {
+            state: state.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let host = NativeSessions::new(
+            state,
+            "default",
+            "instance-approval",
+            Arc::clone(&environment) as Arc<dyn NativeEnvironment>,
+        )
+        .expect("native host");
+        (host, environment)
+    }
+
+    fn wait_for_approval(host: &NativeSessions, session_id: &str, after: u64) -> (String, u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let page = host.journal(session_id, after, 64).expect("journal page");
+            if let Some(event) = page
+                .events
+                .iter()
+                .find(|event| event.kind == "task_receipt" && event.detail.is_some())
+            {
+                return (event.detail.clone().expect("request id"), page.cursor);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "approval request was never published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_native_idle(host: &NativeSessions, session_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if host
+                .sessions()
+                .iter()
+                .any(|facts| facts.session_id == session_id && facts.state == SessionState::Idle)
+            {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "turn stayed busy");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[derive(Debug)]
+    struct ShutdownBoundaryEnvironment {
+        checked: std::sync::Barrier,
+        release: std::sync::Barrier,
+        runs: AtomicUsize,
+    }
+
+    impl NativeEnvironment for ShutdownBoundaryEnvironment {
+        fn route_identity(
+            &self,
+            repo: &Path,
+            route: Option<&str>,
+            role: &str,
+        ) -> CtxResult<RouteIdentity> {
+            TestEnvironment::default().route_identity(repo, route, role)
+        }
+
+        fn run(&self, _turn: &QueuedTurn) -> CtxResult<()> {
+            if self.runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.checked.wait();
+                self.release.wait();
+            }
+            Ok(())
+        }
+    }
+
     fn host_for(root: &Path) -> (Arc<NativeSessions>, Arc<TestEnvironment>) {
         let state = StateDir::from_root(root.join("state"));
         let environment = Arc::new(TestEnvironment::default());
@@ -1429,6 +1752,123 @@ mod tests {
             environment.runs().len(),
             1,
             "and exactly one turn was queued"
+        );
+    }
+
+    /// Issue #548: protocol approvals are observable, consumed once, and
+    /// bound to the exact pending action.
+    #[test]
+    fn hosted_native_tools_require_and_consume_protocol_approval() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, environment) = approval_host(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+
+        host.submit(&facts.session_id, "first", false, None)
+            .expect("first submit");
+        let (request_id, cursor) = wait_for_approval(&host, &facts.session_id, 0);
+        assert_eq!(environment.executions.load(Ordering::SeqCst), 0);
+        assert!(
+            host.approve(
+                &facts.session_id,
+                &request_id,
+                ApprovalDecision::Deny,
+                Some("no")
+            )
+            .expect("deny")
+        );
+        wait_for_native_idle(&host, &facts.session_id);
+        assert_eq!(environment.executions.load(Ordering::SeqCst), 0);
+
+        host.submit(&facts.session_id, "second", false, None)
+            .expect("second submit");
+        let (request_id, cursor) = wait_for_approval(&host, &facts.session_id, cursor);
+        assert!(
+            host.approve(
+                &facts.session_id,
+                &request_id,
+                ApprovalDecision::Allow,
+                None
+            )
+            .expect("allow")
+        );
+        wait_for_native_idle(&host, &facts.session_id);
+        assert_eq!(environment.executions.load(Ordering::SeqCst), 1);
+
+        host.submit(&facts.session_id, "third", false, None)
+            .expect("third submit");
+        let (request_id, _) = wait_for_approval(&host, &facts.session_id, cursor);
+        assert_eq!(environment.executions.load(Ordering::SeqCst), 1);
+        host.approve(&facts.session_id, &request_id, ApprovalDecision::Deny, None)
+            .expect("cleanup denial");
+    }
+
+    /// Issue #548: opening the hosted session installs the exact native seat
+    /// before its first approved effect reaches the generation fence.
+    #[test]
+    fn fresh_hosted_native_session_installs_its_seat_before_tool_dispatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (host, environment) = approval_host(tmp.path());
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let seat = super::super::super::seat::load(&state, &facts.short).expect("native seat");
+        assert_eq!(seat.runtime, RuntimeKind::Native);
+        assert_eq!(seat.generation, facts.generation);
+
+        host.submit(&facts.session_id, "run", false, None)
+            .expect("submit");
+        let (request_id, _) = wait_for_approval(&host, &facts.session_id, 0);
+        host.approve(
+            &facts.session_id,
+            &request_id,
+            ApprovalDecision::Allow,
+            None,
+        )
+        .expect("approval");
+        wait_for_native_idle(&host, &facts.session_id);
+        assert_eq!(environment.executions.load(Ordering::SeqCst), 1);
+    }
+
+    /// Issue #578: input acknowledged after the runner's last queue check
+    /// starts a successor without requiring another external wake.
+    #[test]
+    fn input_acknowledged_during_runner_shutdown_is_driven() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let environment = Arc::new(ShutdownBoundaryEnvironment {
+            checked: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+            runs: AtomicUsize::new(0),
+        });
+        let host = NativeSessions::new(
+            state,
+            "default",
+            "instance-boundary",
+            Arc::clone(&environment) as Arc<dyn NativeEnvironment>,
+        )
+        .expect("host");
+        let facts = host.start(&spec(tmp.path(), "")).expect("start");
+
+        host.submit(&facts.session_id, "first", false, None)
+            .expect("first submit");
+        environment.checked.wait();
+        host.submit(&facts.session_id, "second", false, None)
+            .expect("boundary submit");
+        environment.release.wait();
+        wait_for_native_idle(&host, &facts.session_id);
+
+        assert_eq!(
+            environment.runs.load(Ordering::SeqCst),
+            2,
+            "the acknowledged boundary input must drive a successor turn"
+        );
+        let history = host.history(&facts.session_id, 0, 64).expect("history");
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .filter(|entry| entry.role == HistoryRole::User)
+                .count(),
+            2
         );
     }
 

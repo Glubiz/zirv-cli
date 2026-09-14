@@ -465,6 +465,8 @@ pub struct RuntimeHost {
     /// An atomic rather than a constructor parameter so a test can lower it
     /// without every caller having to carry a knob nothing else sets.
     ended_cap: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    shutdown_entered: std::sync::atomic::AtomicBool,
     sessions: Mutex<BTreeMap<String, HostSession>>,
 }
 
@@ -502,6 +504,8 @@ impl RuntimeHost {
             scrollback_rows,
             history,
             ended_cap: std::sync::atomic::AtomicUsize::new(MAX_ENDED_SESSIONS),
+            #[cfg(test)]
+            shutdown_entered: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
         })
     }
@@ -755,6 +759,12 @@ impl RuntimeHost {
             .store(cap, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    fn shutdown_entered_for_test(&self) -> bool {
+        self.shutdown_entered
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Test seam: whether this session still holds any part of a terminal.
     #[cfg(test)]
     pub fn holds_terminal_for_test(&self, session_id: &str) -> Option<bool> {
@@ -998,48 +1008,54 @@ impl SessionHost for RuntimeHost {
     }
 
     fn stop(&self, session_id: &str) -> Result<bool, ApiError> {
-        let stopped = self.locked(session_id, |session| {
+        let mut session = {
+            let mut sessions = self.lock();
+            let Some(session) = sessions.get(session_id) else {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    format!("no session {session_id} on this runtime"),
+                ));
+            };
             if session.ended {
                 return Ok(false);
             }
-            // The EXISTING ladder, unchanged: the harness's own quit sequence
-            // first, then escalation. Reached only from `session.stop`, i.e.
-            // only for a session the operator chose to stop.
-            let quit = adapter_by_name(&session.agent)
-                .map(|adapter| adapter.quit_sequence().to_string())
-                .unwrap_or_default();
-            let quit = quit.as_str();
-            // The harness's own quit sequence needs the writer; a session
-            // whose writer is already gone still goes through the rest of the
-            // ladder, against a sink that discards it.
-            let mut discard = std::io::sink();
-            let sink: &mut dyn Write = match session.writer.as_mut() {
-                Some(writer) => &mut **writer,
-                None => &mut discard,
-            };
-            let _ = wrap::quit_child(sink, &mut session.child, quit, QUIT_GRACE);
-            session.lifecycle.release();
-            // The registry entry goes with the process it described -- but
-            // only here, on the operator's explicit stop. `detach` does not
-            // reach this, and neither does the service's own shutdown unless
-            // the operator asked for `--stop-sessions`.
-            session.guard.release();
-            wrap::unpublish_socket_path(&self.state, &session.id);
-            session.clients.clear();
-            session.controller = None;
-            // The pty master, the writer and the reader channel go here, with
-            // the process they belonged to. Without this, every stop/restart
-            // cycle on a long-lived runtime leaked a pseudoterminal and its
-            // scrollback, and `zirv session list` grew forever.
-            session.retire(state::now_secs());
-            Ok(true)
-        })?;
-        if stopped {
-            let cap = self.ended_cap();
-            prune_ended(&mut self.lock(), cap);
-            self.persist_topology();
-        }
-        Ok(stopped)
+            match sessions.remove(session_id) {
+                Some(session) => session,
+                None => {
+                    return Err(ApiError::new(
+                        ErrorCode::UnknownSession,
+                        format!("no session {session_id} on this runtime"),
+                    ));
+                }
+            }
+        };
+        #[cfg(test)]
+        self.shutdown_entered
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let quit = adapter_by_name(&session.agent)
+            .map(|adapter| adapter.quit_sequence().to_string())
+            .unwrap_or_default();
+        let mut discard = std::io::sink();
+        let sink: &mut dyn Write = match session.writer.as_mut() {
+            Some(writer) => &mut **writer,
+            None => &mut discard,
+        };
+        let _ = wrap::quit_child(sink, &mut session.child, &quit, QUIT_GRACE);
+        session.lifecycle.release();
+        session.guard.release();
+        wrap::unpublish_socket_path(&self.state, &session.id);
+        session.clients.clear();
+        session.controller = None;
+        session.retire(state::now_secs());
+
+        let cap = self.ended_cap();
+        let mut sessions = self.lock();
+        sessions.insert(session_id.to_string(), session);
+        prune_ended(&mut sessions, cap);
+        drop(sessions);
+        self.persist_topology();
+        Ok(true)
     }
 }
 
@@ -1430,6 +1446,35 @@ mod tests {
                 .any(|(record, _)| record.session == id),
             "an explicitly stopped session releases its registry record"
         );
+    }
+
+    /// Issue #608: one child's full quit grace never holds the shared table
+    /// mutex needed to list or open unrelated sessions.
+    #[test]
+    fn slow_child_shutdown_does_not_block_other_session_operations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "60860860-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSLOW"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSLOW");
+
+        let stopping = Arc::clone(&host);
+        let id = id.to_string();
+        let worker = std::thread::spawn(move || stopping.stop(&id));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !host.shutdown_entered_for_test() {
+            assert!(Instant::now() < deadline, "shutdown did not begin");
+            std::thread::yield_now();
+        }
+        let started = Instant::now();
+        let _ = host.sessions();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "an unrelated list waited behind child shutdown: {:?}",
+            started.elapsed()
+        );
+        worker.join().expect("stop thread").expect("stop");
     }
 
     /// The operator's trailing arguments survive the whole protocol path.
