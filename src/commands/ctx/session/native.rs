@@ -59,10 +59,7 @@ use super::super::runtime::{
 use super::super::state::{self, StateDir};
 use super::super::{prompt::PromptRole, sessions};
 
-/// How many ENDED native sessions the table keeps, for the same reason
-/// `host::MAX_ENDED_SESSIONS` exists: a runtime up for a week must not list
-/// every conversation it has ever run. Live sessions are never pruned.
-pub const MAX_ENDED_NATIVE_SESSIONS: usize = 16;
+pub use super::MAX_ENDED_SESSIONS;
 
 /// One entry of the durable native topology.
 ///
@@ -386,7 +383,7 @@ impl NativeSessions {
             backend: Mutex::new(backend),
             sessions: Mutex::new(BTreeMap::new()),
             environment,
-            ended_cap: AtomicUsize::new(MAX_ENDED_NATIVE_SESSIONS),
+            ended_cap: AtomicUsize::new(MAX_ENDED_SESSIONS),
             inline_turns: AtomicBool::new(false),
         }))
     }

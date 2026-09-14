@@ -35,6 +35,22 @@ pub mod namespace;
 pub mod native;
 pub mod service;
 
+/// How many ENDED sessions one runtime table keeps.
+///
+/// An ended session has already let go of everything that costs anything --
+/// a pty entry its pty, writer, reader channel, turn-signal endpoint and
+/// registry record (`host::HostSession::retire`); a native entry its worker
+/// and its transport. What is left is the last rendered frame, so a client
+/// that was watching can still read it and `zirv session list` can still
+/// show what just happened. This cap is what stops a service that has been
+/// up for a week from remembering every session it ever ran: past it, the
+/// oldest ended entries are dropped entirely. Live sessions are never pruned.
+///
+/// ONE constant for both tables ([`host`] and [`native`]): they answer the
+/// same question about the same service, and two separately written `16`s
+/// tied together only by a doc comment is how they end up different.
+pub const MAX_ENDED_SESSIONS: usize = 16;
+
 use std::io::{IsTerminal, Write};
 
 use clap::{Args, Parser, Subcommand};
