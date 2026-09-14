@@ -377,10 +377,35 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            // The worker never ran. Release everything this delegation took,
-            // publish the failure (so a parent waiting on it is not left
-            // waiting forever), and respawn-guard the task card exactly as
-            // the harness fork does for a launch failure.
+            // Issue #554 (integration review): "the worker never ran" is only
+            // true for a LAUNCH failure. A loop that aborted after billing
+            // real turns carries what it spent (`AbortedRun`), and those
+            // tokens are spent whatever happens next -- so they settle here,
+            // with this delegation's own identity, before anything is torn
+            // down. `delegation::close` below would otherwise merely release
+            // the estimate and the real spend would vanish from
+            // `zirv ctx spend`.
+            if let Some(aborted) = error.downcast_ref::<super::runtime::native::AbortedRun>() {
+                native_account::settle_native_run(
+                    state,
+                    cfg,
+                    &aborted.status,
+                    &Settlement {
+                        reservation: reservation.as_ref(),
+                        group: args.group.as_deref(),
+                        reserved_ceiling,
+                        parent_session: parent_session.as_deref(),
+                        principal: &child_envelope.principal,
+                        envelope_sha256: envelope::digest(&child_envelope).ok().as_deref(),
+                        mode: Some(args.mode),
+                        exit_code: aborted.status.exit_code,
+                    },
+                );
+            }
+            // Release everything else this delegation took, publish the
+            // failure (so a parent waiting on it is not left waiting
+            // forever), and respawn-guard the task card exactly as the
+            // harness fork does for a launch failure.
             let _ = delegation::publish_terminal(
                 state,
                 repo,
