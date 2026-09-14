@@ -5124,6 +5124,7 @@ mod tests {
                 fixture_tools: None,
                 task: None,
                 writer: None,
+                accounting: crate::commands::ctx::runtime::native::Accounting::Seat,
             },
             &mut notices,
             &env,

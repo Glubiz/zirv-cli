@@ -241,6 +241,7 @@ pub fn run(request: &HelperRequest<'_>, env: EnvLookup<'_>) -> Result<HelperAnsw
             task: None,
             // The read-only mechanism. See the module documentation.
             writer: None,
+            accounting: native::Accounting::Seat,
         },
         &mut notices,
         env,
