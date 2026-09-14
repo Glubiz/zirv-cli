@@ -39,14 +39,11 @@
 //! narrow pane, follow-mode scrolling) is covered by tests that construct a
 //! view model directly and never touch a terminal.
 use std::collections::BTreeSet;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -3094,6 +3091,98 @@ impl NativePaneRuntime {
         format!("{}-{}-{}", self.short, now_ms_u64(), self.idempotency_seq)
     }
 
+    // -- issue #490 (N21 item A): what a `dash::pane::Pane` asks a native
+    //    driver for, so a native pane can live in the ordinary dashboard's
+    //    pane vector beside wrapped ones. -----------------------------------
+
+    /// The seat short id this pane answers at -- its mail/nudge address, and
+    /// the id the restore roster and the budget/attention sweeps key on. The
+    /// same short id `runtime::native::spawn_interactive` registered the seat
+    /// under, never a second one minted here.
+    pub fn short(&self) -> &str {
+        &self.short
+    }
+
+    /// The journal session backing this conversation.
+    pub fn journal_session(&self) -> String {
+        self.session_id.to_string()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Where this conversation lives -- see [`PaneAttach`]. A runtime-owned
+    /// pane is detached on shutdown rather than stopped, which is exactly
+    /// what a restore needs to know.
+    pub fn attach(&self) -> &PaneAttach {
+        &self.attach
+    }
+
+    /// The journal sequence this pane has rendered through. The dashboard's
+    /// drain uses it as "did anything change this tick" without needing to
+    /// know anything else about the conversation.
+    pub fn last_sequence(&self) -> u64 {
+        self.conversation.last_sequence.0
+    }
+
+    /// Whether a turn is running right now.
+    pub fn busy(&self) -> bool {
+        matches!(self.session_state, NativeSessionState::Running)
+    }
+
+    /// Whether this pane is waiting on a human -- an open approval dialog.
+    /// Distinct from [`Self::busy`] for the reason the design note gives:
+    /// both stop a session, only one is waiting on an operator.
+    pub fn blocked(&self) -> bool {
+        self.ux.approval.is_some()
+    }
+
+    /// The model this conversation is actually running on, for the sidebar's
+    /// own disclosure line. `None` for a runtime-attached pane, whose
+    /// `SessionFacts` publishes no route identity -- an honest unknown rather
+    /// than a guess.
+    pub fn launch_model(&self) -> Option<&str> {
+        self.route.as_ref().map(|route| route.model.id.as_str())
+    }
+
+    /// The conversation's own measured token usage, for the budget sweep and
+    /// the session-spend accounting -- the same shape a wrapped pane reports
+    /// from its transcript.
+    pub fn measured_usage(&self) -> super::super::event::TranscriptUsage {
+        let mut total = super::super::event::TranscriptUsage::default();
+        for usage in self.conversation.usage.values() {
+            total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+            total.cache_creation_input_tokens = total
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens);
+            total.cache_read_input_tokens = total
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens);
+            total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+        }
+        total
+    }
+
+    /// Issue #490 (N21 item A): the mail sweep's delivery path for a native
+    /// pane. A wrapped pane is typed into and then submitted with a carriage
+    /// return; a native pane has no composer to type into, so the message
+    /// goes through the SAME submit path the operator's own Enter uses --
+    /// which means it is subject to the same rollover/generation guard
+    /// (`resolve_submit_target`) and can never be written into a retired
+    /// generation.
+    pub fn deliver(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        let text = if label.is_empty() {
+            body.to_string()
+        } else {
+            format!("[{label}] {body}")
+        };
+        self.presentation.composer.draft = text;
+        self.presentation.composer.cursor = self.presentation.composer.draft.len();
+        self.handle_composer_action(ComposerAction::Submit);
+        Ok(())
+    }
+
     pub fn ux(&self) -> &super::native_ux::UxState {
         &self.ux
     }
@@ -3951,11 +4040,204 @@ impl NativePaneRuntime {
     }
 }
 
+/// Issue #490 (roadmap N21 item A): #354's clickable overview rows, for a
+/// native pane living inside the ordinary dashboard.
+///
+/// `area` is the pane's own main area, so the panel column is computed
+/// against what was actually drawn rather than against the whole terminal --
+/// a dashboard with a sidebar would otherwise map every click one panel to
+/// the left. A click outside the panel (or on a layout with no panel at all)
+/// selects nothing, which is the same "not ours" answer the single-pane loop
+/// gave.
+pub fn click_overview_row(pane: &mut NativePaneRuntime, area: Rect, column: u16, row: u16) -> bool {
+    let width = area.width as usize;
+    let height = area.height as usize;
+    if !super::native_ux::resolve_layout(width, height).overview {
+        return false;
+    }
+    if column < area.x || row <= area.y {
+        return false;
+    }
+    let panel_x = area.x as usize + width.saturating_sub(super::native_ux::OVERVIEW_WIDTH);
+    if (column as usize) < panel_x {
+        return false;
+    }
+    let line = (row - area.y) as usize - 1;
+    let Some(id) = pane
+        .ux()
+        .overview
+        .row_at_line(line, super::native_ux::OVERVIEW_WIDTH)
+        .map(|row| row.id.clone())
+    else {
+        return false;
+    };
+    pane.ux_mut().overview.reselect(&id);
+    pane.ux_mut().focus = super::native_ux::Focus::Overview;
+    true
+}
+
+/// What a key press did to a native pane, from its host loop's point of view.
+///
+/// Issue #490 (roadmap N21 item A): the key contract lives in ONE function so
+/// the single-pane `zirv chat --runtime native` loop and the ordinary
+/// dashboard's mixed roster can never drift on what `Esc`, `Ctrl+C`,
+/// `Ctrl+R`, `Tab` or a digit means inside a native pane. A wrapped pane
+/// never reaches it at all, which is what "native controls are offered only
+/// on a native pane" means in practice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeKey {
+    /// Handled by the pane. The host loop does nothing else with it.
+    Consumed,
+    /// The operator asked to close this pane (Ctrl+Q, or a second Ctrl+C
+    /// inside [`CTRL_C_QUIT_WINDOW`]).
+    Quit,
+}
+
+/// The native pane's whole key contract, beyond the composer's own (see
+/// [`key_to_action`]).
+///
+/// `Ctrl+Q` quits immediately (the draft is persisted by the caller's
+/// shutdown, kept for backward compatibility); `Esc` interrupts the current
+/// turn without quitting -- unless a modal (an approval dialog, a worker
+/// inspection, the shortcut list) is open, which the first `Esc` closes;
+/// `Ctrl+C` no longer interrupts by itself, it only arms a quit confirmation
+/// and quits on a SECOND `Ctrl+C` within [`CTRL_C_QUIT_WINDOW`] (see
+/// [`ctrl_c_confirms_quit`]); `Ctrl+R` toggles the most recent tool call's
+/// expanded state regardless of focus; `Shift+Tab` cycles [`ComposerMode`];
+/// plain `Tab` swaps focus; `Up`/`Down` scroll the transcript when no
+/// composer action claims them. Everything else goes through
+/// `UxState::handle_key`, which decides between the open modal, the overview,
+/// the transcript and the composer.
+pub fn handle_native_key(
+    pane: &mut NativePaneRuntime,
+    key: KeyEvent,
+    last_ctrl_c: &mut Option<std::time::Instant>,
+    overview_visible: bool,
+    persistent: bool,
+    cfg: &CtxConfig,
+) -> NativeKey {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if ctrl && key.code == KeyCode::Char('q') {
+        return NativeKey::Quit;
+    }
+    // Operator direction (PR #531 follow-up): `Esc` owns interrupt now;
+    // `Ctrl+C` only arms/confirms a quit -- see `ctrl_c_confirms_quit`'s own
+    // doc comment.
+    //
+    // Issue #490 refines only WHEN that applies: while a modal is open (an
+    // approval dialog, a worker inspection, the shortcut list) `Esc` closes it
+    // first, and only a second `Esc` reaches the turn.
+    if key.code == KeyCode::Esc && !pane.ux().modal_open() {
+        *last_ctrl_c = None;
+        pane.interrupt();
+        return NativeKey::Consumed;
+    }
+    if ctrl && key.code == KeyCode::Char('c') {
+        let now = std::time::Instant::now();
+        if ctrl_c_confirms_quit(*last_ctrl_c, now, CTRL_C_QUIT_WINDOW) {
+            return NativeKey::Quit;
+        }
+        *last_ctrl_c = Some(now);
+        return NativeKey::Consumed;
+    }
+    *last_ctrl_c = None;
+    // `Ctrl+R` toggles the most recent tool call's expanded state regardless
+    // of focus -- the same action the composer's own `e`/`Enter`-while-
+    // `Transcript`-focused binding below reaches, just reachable from either
+    // region (matching the "(ctrl+r to expand)" hint `render_tool_call` shows
+    // on a collapsed result).
+    if ctrl && key.code == KeyCode::Char('r') {
+        toggle_most_recent_tool_call(pane);
+        return NativeKey::Consumed;
+    }
+    // `Shift+Tab` cycles the composer's decorative mode label; most terminals
+    // report it as `BackTab` rather than `Tab` with the shift modifier set, so
+    // both are accepted.
+    if key.code == KeyCode::BackTab || (shift && key.code == KeyCode::Tab) {
+        let presentation = pane.presentation_mut();
+        presentation.mode = presentation.mode.next();
+        return NativeKey::Consumed;
+    }
+    // Plain Tab swaps which region has focus; every other key's meaning
+    // depends on that focus, exactly the split the composer's own key contract
+    // already assumes (Up/Down at a logical-line edge mean "browse submit
+    // history" only when the composer itself has focus -- a
+    // `Transcript`-focused Up/Down here means "scroll").
+    if key.code == KeyCode::Tab {
+        let presentation = pane.presentation_mut();
+        presentation.focus = match presentation.focus {
+            PaneFocus::Composer => PaneFocus::Transcript,
+            PaneFocus::Transcript => PaneFocus::Composer,
+        };
+        return NativeKey::Consumed;
+    }
+    // Issue #490: everything the dashboard's own regions claim -- Tab focus,
+    // `?`, `a`, the overview cursor, the open modal -- goes through one
+    // router, which also decides whether the key belongs to the composer or
+    // the transcript. The pane-global bindings above (Ctrl+Q, Esc, Ctrl+C,
+    // Ctrl+R, Shift+Tab) have already had their say and never reach it.
+    match pane.ux_mut().handle_key(key, overview_visible) {
+        super::native_ux::UxKey::Consumed => return NativeKey::Consumed,
+        super::native_ux::UxKey::Quit => return NativeKey::Quit,
+        super::native_ux::UxKey::Interrupt => {
+            pane.interrupt();
+            return NativeKey::Consumed;
+        }
+        super::native_ux::UxKey::Inspect(id) => {
+            pane.open_inspection(&id);
+            return NativeKey::Consumed;
+        }
+        super::native_ux::UxKey::FollowUp(id) => {
+            pane.follow_up(&id, cfg, now_secs());
+            return NativeKey::Consumed;
+        }
+        super::native_ux::UxKey::Decided(request, decision) => {
+            pane.decide_approval(&request, decision, persistent);
+            return NativeKey::Consumed;
+        }
+        super::native_ux::UxKey::Transcript => {
+            let total = pane.view().0.items.len().max(1);
+            match key.code {
+                KeyCode::Up => pane.presentation_mut().scroll.scroll_up(1, total),
+                KeyCode::Down => pane.presentation_mut().scroll.scroll_down(1),
+                KeyCode::PageUp => pane.presentation_mut().scroll.scroll_up(10, total),
+                KeyCode::PageDown => pane.presentation_mut().scroll.scroll_down(10),
+                KeyCode::Home => pane.presentation_mut().scroll.scroll_up(total, total),
+                KeyCode::End => {
+                    let presentation = pane.presentation_mut();
+                    presentation.scroll.jump_to_bottom();
+                    presentation.mark_seen();
+                }
+                // Expands/collapses the most recent tool call -- the same
+                // action `Ctrl+R` reaches from any focus, via the one helper.
+                KeyCode::Char('e') | KeyCode::Enter => {
+                    toggle_most_recent_tool_call(pane);
+                }
+                _ => {}
+            }
+        }
+        super::native_ux::UxKey::Composer => {
+            // Keep the two focus models in step: `UxState` owns the
+            // dashboard's focus, `NativePresentation` owns the pane's own
+            // composer/transcript split.
+            pane.presentation_mut().focus = PaneFocus::Composer;
+            if let Some(action) = key_to_action(key) {
+                pane.handle_composer_action(action);
+            }
+        }
+    }
+    if pane.ux().focus == super::native_ux::Focus::Transcript {
+        pane.presentation_mut().focus = PaneFocus::Transcript;
+    }
+    NativeKey::Consumed
+}
+
 /// Issue #490 + N20: opens the pane on whichever transport
 /// [`resolve_attach`] selects. Kept separate from [`run_native_dashboard`]
 /// so the decision is one small, readable function rather than a branch
 /// buried in a terminal-setup sequence.
-fn open_native_pane(
+pub(crate) fn open_native_pane(
     cfg: &CtxConfig,
     state: &StateDir,
     env: EnvLookup<'_>,
@@ -3975,288 +4257,15 @@ fn open_native_pane(
     }
 }
 
-/// A dedicated, single-pane dashboard loop for a native session -- `zirv
-/// chat --runtime native`'s own entry point. Reuses `dash::mod`'s existing
-/// terminal-setup/teardown helpers verbatim (same `install_panic_hook`/
-/// `enable_raw_mode`/`EnterAlternateScreen`/`push_keyboard_enhancement`/
-/// `teardown_terminal`/`restore_panic_hook` sequence `run_dashboard` itself
-/// uses) rather than reimplementing raw-mode handling a second time, so
-/// there is exactly one place in this codebase that enters/leaves raw mode
-/// and the alternate screen.
-///
-/// **Key contract**, beyond the composer's own (see [`key_to_action`]):
-/// `Ctrl+Q` quits immediately (persisting the draft first, kept for
-/// backward compatibility); `Esc` interrupts the current turn without
-/// quitting (operator direction, PR #531 follow-up -- Claude Code's own
-/// convention); `Ctrl+C` no longer interrupts by itself, it only arms a
-/// quit confirmation, and quits on a SECOND `Ctrl+C` within
-/// [`CTRL_C_QUIT_WINDOW`] of the first (see [`ctrl_c_confirms_quit`]);
-/// `Ctrl+R` toggles the most recent tool call's expanded state regardless
-/// of which region has focus (the composer's own `e`/`Enter`-while-
-/// `Transcript`-focused binding still works too); `Shift+Tab` cycles
-/// [`ComposerMode`] (decorative only -- see its own doc comment); `Up`/
-/// `Down` scroll the transcript when no composer action claims them.
-///
-/// Deferred (documented in the design note, not implemented by this
-/// round): an interactive `@` fuzzy file picker (`resolve_file_refs` is
-/// tested and containment-safe but still unwired into this loop, unchanged
-/// from before this round) and a `!`-prefixed shell line through the
-/// process tool (the interactive session has no direct-exec path that
-/// bypasses a model turn today; adding one is an architecture change, not
-/// a rendering/key-contract one).
-pub fn run_native_dashboard(
-    cfg: &CtxConfig,
-    state: &StateDir,
-    env: EnvLookup<'_>,
-    spec: NativeDashboardSpec,
-) -> CtxResult<i32> {
-    // Issue #490 + N20: attach through the persistent runtime when the
-    // operator has opted in, something is listening, it serves native
-    // conversations, and it already holds a live native seat for this
-    // repository -- otherwise open our own in-process session, which is a
-    // working mode rather than a failure (`link::ownership`'s own rule).
-    let mut pane = open_native_pane(cfg, state, env, spec)?;
-    let mut last_ctrl_c: Option<std::time::Instant> = None;
-
-    let previous_panic_hook = super::install_panic_hook();
-    if let Err(error) = crossterm::terminal::enable_raw_mode() {
-        super::restore_panic_hook(&previous_panic_hook);
-        pane.shutdown(state);
-        return Err(format!("native chat: enable_raw_mode failed: {error}").into());
-    }
-    if let Err(error) = crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)
-    {
-        super::teardown_terminal(false);
-        super::restore_panic_hook(&previous_panic_hook);
-        pane.shutdown(state);
-        return Err(format!("native chat: EnterAlternateScreen failed: {error}").into());
-    }
-    let keyboard_enhancement_pushed = super::push_keyboard_enhancement();
-    // Mouse reporting, written as the same raw bytes the wrapped dashboard
-    // uses (`term::dash_mouse_on_bytes`) rather than crossterm's
-    // `EnableMouseCapture` -- see `dash::mod::run_dashboard`'s own comment for
-    // why `?1003` is deliberately avoided. Best-effort: a terminal that will
-    // not report mouse events still has every keyboard binding.
-    let mouse_on = cfg.dash.mouse
-        && io::Write::write_all(&mut io::stdout(), super::super::term::dash_mouse_on_bytes())
-            .and_then(|()| io::Write::flush(&mut io::stdout()))
-            .is_ok();
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = match Terminal::new(backend) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            super::teardown_terminal(keyboard_enhancement_pushed);
-            super::restore_panic_hook(&previous_panic_hook);
-            pane.shutdown(state);
-            return Err(format!("native chat: terminal init failed: {error}").into());
-        }
-    };
-
-    // Issue #490 (item 4): records are re-read on their own cadence, not on
-    // every 150 ms frame -- a fleet's coordinator graph, delegation receipts,
-    // seat records and pool view are far more expensive than this session's
-    // own journal, and none of them change between two consecutive frames.
-    const RECORD_REFRESH_SECS: u64 = 2;
-    let persistent = cfg.session.persistent;
-
-    let exit_code = 'outer: loop {
-        pane.tick();
-        let now = now_secs();
-        if now.saturating_sub(pane.ux().refreshed_at) >= RECORD_REFRESH_SECS {
-            pane.refresh_records(cfg, env, now);
-        }
-        let _ = terminal.draw(|f| {
-            let facts = pane.status_facts();
-            let area = f.area();
-            let (view, presentation) = pane.view();
-            render_native_dashboard(f, area, view, presentation, &facts, pane.ux());
-        });
-        if pane.ended {
-            break 'outer 0;
-        }
-        if matches!(event::poll(Duration::from_millis(150)), Ok(true)) {
-            match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                    if ctrl && key.code == KeyCode::Char('q') {
-                        break 'outer 0;
-                    }
-                    // Operator direction (PR #531 follow-up): `Esc` owns
-                    // interrupt now; `Ctrl+C` only arms/confirms a quit --
-                    // see `ctrl_c_confirms_quit`'s own doc comment.
-                    //
-                    // Issue #490 refines only WHEN that applies: while a
-                    // modal is open (an approval dialog, a worker inspection,
-                    // the shortcut list) `Esc` closes it first, and only a
-                    // second `Esc` reaches the turn. Nothing else changes.
-                    if key.code == KeyCode::Esc && !pane.ux().modal_open() {
-                        last_ctrl_c = None;
-                        pane.interrupt();
-                        continue 'outer;
-                    }
-                    if ctrl && key.code == KeyCode::Char('c') {
-                        let now = std::time::Instant::now();
-                        if ctrl_c_confirms_quit(last_ctrl_c, now, CTRL_C_QUIT_WINDOW) {
-                            break 'outer 0;
-                        }
-                        last_ctrl_c = Some(now);
-                        continue 'outer;
-                    }
-                    last_ctrl_c = None;
-                    // `Ctrl+R` toggles the most recent tool call's expanded
-                    // state regardless of focus -- the same action the
-                    // composer's own `e`/`Enter`-while-`Transcript`-focused
-                    // binding below reaches, just reachable from either
-                    // region (matching the "(ctrl+r to expand)" hint
-                    // `render_tool_call` shows on a collapsed result).
-                    if ctrl && key.code == KeyCode::Char('r') {
-                        toggle_most_recent_tool_call(&mut pane);
-                        continue 'outer;
-                    }
-                    // `Shift+Tab` cycles the composer's decorative mode
-                    // label; most terminals report it as `BackTab` rather
-                    // than `Tab` with the shift modifier set, so both are
-                    // accepted.
-                    if key.code == KeyCode::BackTab || (shift && key.code == KeyCode::Tab) {
-                        let presentation = pane.presentation_mut();
-                        presentation.mode = presentation.mode.next();
-                        continue 'outer;
-                    }
-                    // Plain Tab swaps which region has focus; every other
-                    // key's meaning depends on that focus, exactly the
-                    // split the composer's own key contract already
-                    // assumes (Up/Down at a logical-line edge mean "browse
-                    // submit history" only when the composer itself has
-                    // focus -- a `Transcript`-focused Up/Down here means
-                    // "scroll").
-                    if key.code == KeyCode::Tab {
-                        let presentation = pane.presentation_mut();
-                        presentation.focus = match presentation.focus {
-                            PaneFocus::Composer => PaneFocus::Transcript,
-                            PaneFocus::Transcript => PaneFocus::Composer,
-                        };
-                        continue 'outer;
-                    }
-                    // Issue #490: everything the dashboard's own regions claim
-                    // -- Tab focus, `?`, `a`, the overview cursor, the open
-                    // modal -- goes through one router, which also decides
-                    // whether the key belongs to the composer or the
-                    // transcript. The pane-global bindings above (Ctrl+Q,
-                    // Esc, Ctrl+C, Ctrl+R, Shift+Tab) have already had their
-                    // say and never reach it.
-                    let overview_visible = super::native_ux::resolve_layout(
-                        terminal
-                            .size()
-                            .map(|size| size.width as usize)
-                            .unwrap_or(80),
-                        terminal
-                            .size()
-                            .map(|size| size.height as usize)
-                            .unwrap_or(24),
-                    )
-                    .overview;
-                    match pane.ux_mut().handle_key(key, overview_visible) {
-                        super::native_ux::UxKey::Consumed => continue 'outer,
-                        super::native_ux::UxKey::Quit => break 'outer 0,
-                        super::native_ux::UxKey::Interrupt => {
-                            pane.interrupt();
-                            continue 'outer;
-                        }
-                        super::native_ux::UxKey::Inspect(id) => {
-                            pane.open_inspection(&id);
-                            continue 'outer;
-                        }
-                        super::native_ux::UxKey::FollowUp(id) => {
-                            pane.follow_up(&id, cfg, now_secs());
-                            continue 'outer;
-                        }
-                        super::native_ux::UxKey::Decided(request, decision) => {
-                            pane.decide_approval(&request, decision, persistent);
-                            continue 'outer;
-                        }
-                        super::native_ux::UxKey::Transcript => {
-                            let total = pane.view().0.items.len().max(1);
-                            match key.code {
-                                KeyCode::Up => pane.presentation_mut().scroll.scroll_up(1, total),
-                                KeyCode::Down => pane.presentation_mut().scroll.scroll_down(1),
-                                KeyCode::PageUp => {
-                                    pane.presentation_mut().scroll.scroll_up(10, total)
-                                }
-                                KeyCode::PageDown => pane.presentation_mut().scroll.scroll_down(10),
-                                KeyCode::Home => {
-                                    pane.presentation_mut().scroll.scroll_up(total, total)
-                                }
-                                KeyCode::End => {
-                                    let presentation = pane.presentation_mut();
-                                    presentation.scroll.jump_to_bottom();
-                                    presentation.mark_seen();
-                                }
-                                // Expands/collapses the most recent tool call
-                                // -- the same action `Ctrl+R` reaches from
-                                // any focus, via the one helper.
-                                KeyCode::Char('e') | KeyCode::Enter => {
-                                    toggle_most_recent_tool_call(&mut pane);
-                                }
-                                _ => {}
-                            }
-                        }
-                        super::native_ux::UxKey::Composer => {
-                            // Keep the two focus models in step: `UxState`
-                            // owns the dashboard's focus, `NativePresentation`
-                            // owns the pane's own composer/transcript split.
-                            pane.presentation_mut().focus = PaneFocus::Composer;
-                            if let Some(action) = key_to_action(key) {
-                                pane.handle_composer_action(action);
-                            }
-                        }
-                    }
-                    if pane.ux().focus == super::native_ux::Focus::Transcript {
-                        pane.presentation_mut().focus = PaneFocus::Transcript;
-                    }
-                }
-                Ok(Event::Paste(text)) => {
-                    pane.handle_composer_action(ComposerAction::InsertText(text));
-                }
-                // #354's clickable rows, for the overview: a click inside the
-                // panel column selects the agent whose rendered lines it
-                // landed in, and never scrolls or submits anything.
-                Ok(Event::Mouse(mouse)) if matches!(mouse.kind, event::MouseEventKind::Down(_)) => {
-                    let size = terminal.size().ok();
-                    let width = size.map(|size| size.width as usize).unwrap_or(80);
-                    let height = size.map(|size| size.height as usize).unwrap_or(24);
-                    let plan = super::native_ux::resolve_layout(width, height);
-                    if !plan.overview {
-                        continue 'outer;
-                    }
-                    let panel_x = width.saturating_sub(super::native_ux::OVERVIEW_WIDTH);
-                    if (mouse.column as usize) < panel_x || mouse.row == 0 {
-                        continue 'outer;
-                    }
-                    let id = pane
-                        .ux()
-                        .overview
-                        .row_at_line(mouse.row as usize - 1, super::native_ux::OVERVIEW_WIDTH)
-                        .map(|row| row.id.clone());
-                    if let Some(id) = id {
-                        pane.ux_mut().overview.reselect(&id);
-                        pane.ux_mut().focus = super::native_ux::Focus::Overview;
-                    }
-                }
-                _ => {}
-            }
-        }
-    };
-
-    if mouse_on {
-        let _ = io::Write::write_all(&mut io::stdout(), super::super::term::dash_reset_bytes());
-        let _ = io::Write::flush(&mut io::stdout());
-    }
-    super::teardown_terminal(keyboard_enhancement_pushed);
-    super::restore_panic_hook(&previous_panic_hook);
-    pane.shutdown(state);
-    Ok(exit_code)
-}
+// Issue #490 (roadmap N21 item A): the dedicated single-pane loop that used
+// to live here is gone. `zirv chat --runtime native` opens its conversation
+// as the FIRST PANE of the ordinary dashboard (`dash::run_dashboard`), so
+// there is one event loop, one raw-mode/alternate-screen sequence and one key
+// contract ([`handle_native_key`]) for wrapped and native panes alike -- and a
+// native pane sits in the same roster, mail sweep, attention projection,
+// budget sweep and restore roster as every wrapped one. [`open_native_pane`]
+// above is what `dash::pane::Pane::spawn_native` calls, so the attachment
+// decision ([`resolve_attach`]) is unchanged and still the only one.
 
 #[cfg(test)]
 mod tests {

@@ -369,16 +369,33 @@ fn run_native_chat<E: Write>(
     // `run_with`'s own nesting refusal (F2) already ran, before `cfg` was
     // even loaded, and covers this branch too -- not repeated here.
     let state = StateDir::resolve(env)?;
-    dash::native_pane::run_native_dashboard(
+    // Issue #490 (roadmap N21 item A): the native conversation is the FIRST
+    // PANE of the ordinary dashboard now, not a loop of its own. Everything
+    // the dashboard already provides -- the sidebar roster, the mail sweep,
+    // attention, the spawn-request channel, the restore roster, the footer
+    // spend -- therefore applies to it unchanged, and a wrapped harness pane
+    // can be spawned beside it in the same process.
+    let session = uuid::Uuid::new_v4().to_string();
+    dash::run_dashboard(
         cfg,
-        &state,
+        repo,
         env,
-        dash::native_pane::NativeDashboardSpec {
+        &state,
+        dash::PaneSpec {
+            agent_name: super::runtime::RuntimeKind::Native.as_str().to_string(),
+            argv: Vec::new(),
+            role: super::prompt::PromptRole::Orchestrator,
+            verb: super::sessions::Verb::Chat,
+            session_id: session,
+            title: "orch".to_string(),
+        },
+        Some(dash::native_pane::NativeDashboardSpec {
             repo: repo.to_path_buf(),
             role: "orchestrator".to_string(),
             route: None,
             writing: true,
-        },
+        }),
+        args.force_pace,
     )
 }
 
@@ -592,7 +609,7 @@ pub fn run_with<W: Write, E: Write>(
             session.as_str(),
             args.simple,
         )?;
-        return dash::run_dashboard(&cfg, repo, &env, &state, pane, args.force_pace);
+        return dash::run_dashboard(&cfg, repo, &env, &state, pane, None, args.force_pace);
     }
 
     // Ineligible because the dashboard is on but the terminal is too small
