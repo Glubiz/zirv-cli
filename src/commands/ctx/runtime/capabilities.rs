@@ -998,6 +998,7 @@ impl CapabilityServices {
     fn factory(
         &self,
         server: &super::super::config::McpServerConfig,
+        broker: &super::enforcement::ExecutionBroker,
     ) -> Result<Arc<dyn super::mcp::TransportFactory>, CapabilityError> {
         if let Some(override_factory) = self.transport_overrides.get(&server.name) {
             return Ok(Arc::clone(override_factory));
@@ -1010,7 +1011,10 @@ impl CapabilityServices {
                         format!("server `{}` has an empty stdio command", server.name),
                     )));
                 }
-                Arc::new(super::mcp::StdioFactory::new(server.clone()))
+                Arc::new(
+                    super::mcp::StdioFactory::new(server.clone(), broker)
+                        .map_err(|error| CapabilityError::Backend(error.to_string()))?,
+                )
             }
             super::super::config::McpTransportConfig::Http { url, credential } => {
                 let reference = credential.clone();
@@ -1034,7 +1038,11 @@ impl CapabilityServices {
     /// The connected client for `name`, connecting on first use. A server
     /// that is not configured, not enabled, or whose credential did not
     /// resolve is a typed `Unavailable`, never a client that looks connected.
-    pub fn client(&mut self, name: &str) -> Result<&mut super::mcp::McpClient, CapabilityError> {
+    pub fn client(
+        &mut self,
+        name: &str,
+        broker: &super::enforcement::ExecutionBroker,
+    ) -> Result<&mut super::mcp::McpClient, CapabilityError> {
         if !self.clients.contains_key(name) {
             let server = self
                 .config
@@ -1047,7 +1055,7 @@ impl CapabilityServices {
                         format!("no enabled [[capabilities.mcp]] entry is named `{name}`"),
                     ))
                 })?;
-            let factory = self.factory(&server)?;
+            let factory = self.factory(&server, broker)?;
             let client = super::mcp::McpClient::connect(
                 &server.name,
                 factory,

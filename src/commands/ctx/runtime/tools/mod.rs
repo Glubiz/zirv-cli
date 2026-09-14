@@ -1512,7 +1512,7 @@ impl NativeToolClient {
         let names = services.server_names();
         let budget = services.max_inline_mcp_tools();
         for name in names {
-            let Ok(client) = services.client(&name) else {
+            let Ok(client) = services.client(&name, &self.broker) else {
                 continue;
             };
             if client.catalogue().len() > budget {
@@ -1779,7 +1779,7 @@ impl NativeToolClient {
             ParsedTool::McpDescribe(args) => {
                 let value = self
                     .services
-                    .client(&args.server)
+                    .client(&args.server, &self.broker)
                     .map_err(ToolError::from)?
                     .catalogue_mut()
                     .describe(&args.tool)
@@ -2548,7 +2548,7 @@ impl NativeToolClient {
         };
         let mut servers = Vec::new();
         for name in names {
-            match self.services.client(&name) {
+            match self.services.client(&name, &self.broker) {
                 Ok(client) => servers.push(json!({
                     "server": name,
                     "state": "available",
@@ -2573,7 +2573,7 @@ impl NativeToolClient {
         };
         let result = self
             .services
-            .client(&args.server)
+            .client(&args.server, &self.broker)
             .map_err(ToolError::from)?
             .call_tool(
                 &args.tool,

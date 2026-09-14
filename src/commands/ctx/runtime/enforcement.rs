@@ -1506,29 +1506,19 @@ impl ExecutionBroker {
                         "{platform}: {reason}"
                     )));
                 }
-                resolved_paths.push(self.validate_read(invocation.cwd())?);
+                let (resolved_cwd, sandbox_policy) = self.process_policy(invocation, effects)?;
+                resolved_paths.push(resolved_cwd);
+                process_sandbox = Some(sandbox_policy);
                 required.push(Capability::ShellExec);
                 if effects.repo_write || effects.git_metadata_write {
                     required.push(Capability::RepoFsWrite);
                     needs_writer = true;
                 }
                 if effects.outside_write {
-                    if self.claims.outside_write_roots.is_empty() {
-                        return Err(BrokerError::Scope(
-                            "process requested outside writes without an outside-write resource claim"
-                                .to_string(),
-                        ));
-                    }
                     required.push(Capability::OutsideRepoFsWrite);
                     needs_writer = true;
                 }
                 if effects.network {
-                    if !matches!(self.claims.network, NetworkScope::Any) {
-                        return Err(BrokerError::Scope(
-                            "arbitrary processes may use network only with an unrestricted operator network scope; use a brokered network tool for host-scoped access"
-                                .to_string(),
-                        ));
-                    }
                     required.push(Capability::Network);
                 }
                 if effects.git_push_or_destructive {
@@ -1552,8 +1542,6 @@ impl ExecutionBroker {
                     Verdict::Ask => required.push(Capability::Approval),
                     Verdict::Allow => {}
                 }
-                self.validate_process_environment(invocation.environment())?;
-                process_sandbox = Some(self.process_policy(invocation, effects)?);
             }
         }
 
@@ -1671,11 +1659,23 @@ impl ExecutionBroker {
         Ok(())
     }
 
-    fn process_policy(
+    pub(crate) fn process_policy(
         &self,
         invocation: &ProcessInvocation,
         effects: &ProcessEffects,
-    ) -> Result<ProcessSandboxPolicy, BrokerError> {
+    ) -> Result<(PathBuf, ProcessSandboxPolicy), BrokerError> {
+        let resolved_cwd = self.validate_read(invocation.cwd())?;
+        self.validate_process_environment(invocation.environment())?;
+        if (effects.repo_write || effects.git_metadata_write || effects.outside_write)
+            && self
+                .writer
+                .as_ref()
+                .is_none_or(|writer| !writer.covers(&self.claims.worktree_root))
+        {
+            return Err(BrokerError::WriterPermit(
+                "a live writer permit for this exact worktree is required".to_string(),
+            ));
+        }
         let mut read_roots = self.claims.read_roots.clone();
         let mut write_roots = Vec::new();
         if effects.repo_write {
@@ -1690,7 +1690,19 @@ impl ExecutionBroker {
             write_roots.extend(self.claims.git_write_roots.clone());
         }
         if effects.outside_write {
+            if self.claims.outside_write_roots.is_empty() {
+                return Err(BrokerError::Scope(
+                    "process requested outside writes without an outside-write resource claim"
+                        .to_string(),
+                ));
+            }
             write_roots.extend(self.claims.outside_write_roots.clone());
+        }
+        if effects.network && !matches!(self.claims.network, NetworkScope::Any) {
+            return Err(BrokerError::Scope(
+                "arbitrary processes may use network only with an unrestricted operator network scope; use a brokered network tool for host-scoped access"
+                    .to_string(),
+            ));
         }
         let mut environment = if effects.clean_environment {
             BTreeMap::new()
@@ -1709,25 +1721,28 @@ impl ExecutionBroker {
                 }
             }
         }
-        Ok(ProcessSandboxPolicy {
-            read_roots: dedup_paths(read_roots),
-            write_roots: dedup_paths(write_roots),
-            masked_roots: self
-                .claims
-                .protected_roots
-                .iter()
-                .filter(|protected| {
-                    !self
-                        .claims
-                        .git_write_roots
-                        .iter()
-                        .any(|git_root| path_within(git_root, protected))
-                })
-                .cloned()
-                .collect(),
-            network: effects.network,
-            environment,
-        })
+        Ok((
+            resolved_cwd,
+            ProcessSandboxPolicy {
+                read_roots: dedup_paths(read_roots),
+                write_roots: dedup_paths(write_roots),
+                masked_roots: self
+                    .claims
+                    .protected_roots
+                    .iter()
+                    .filter(|protected| {
+                        !self
+                            .claims
+                            .git_write_roots
+                            .iter()
+                            .any(|git_root| path_within(git_root, protected))
+                    })
+                    .cloned()
+                    .collect(),
+                network: effects.network,
+                environment,
+            },
+        ))
     }
 }
 
@@ -2720,6 +2735,29 @@ mod tests {
             assert!(!outside_output.status.success());
             assert_ne!(outside_output.stdout, b"outside");
         }
+    }
+
+    #[test]
+    fn stdio_mcp_policy_uses_broker_claims_and_masks_protected_paths() {
+        // Issue #555.
+        let fixture = fixture(EffectivePolicy::default(), ApprovalMode::Headless, false);
+        let protected = std::fs::canonicalize(fixture._root.path().join("state"))
+            .expect("canonical protected path");
+        let invocation = ProcessInvocation::Argv {
+            program: "mcp-server".to_string(),
+            args: Vec::new(),
+            cwd: fixture.worktree.clone(),
+            environment: BTreeMap::new(),
+        };
+
+        let (_, policy) = fixture
+            .broker
+            .process_policy(&invocation, &ProcessEffects::default())
+            .expect("MCP policy");
+
+        assert!(policy.read_roots.contains(&fixture.worktree));
+        assert!(policy.masked_roots.contains(&protected));
+        assert!(!policy.read_roots.contains(&protected));
     }
 
     #[test]

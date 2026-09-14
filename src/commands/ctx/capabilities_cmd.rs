@@ -47,13 +47,26 @@ pub fn run(args: &CapabilitiesArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let mut rows = capabilities::discover(&cfg, &repo);
     let mut probes = Vec::new();
     if args.probe {
-        let mut services = CapabilityServices::from_config(
-            &cfg,
+        let env = |key: &str| std::env::var(key).ok();
+        let state = state::StateDir::resolve(&env)?;
+        let home = crate::utils::home_dir()?;
+        let broker = super::runtime::native::session_broker(
             &repo,
-            &|key| std::env::var(key).ok(),
-            state::now_secs(),
-        );
-        probes = probe_servers(&mut services);
+            &state,
+            &home,
+            &cfg,
+            super::runtime::enforcement::ExecutionIdentity {
+                session: "capabilities-probe".to_string(),
+                short: "probe".to_string(),
+                generation: 0,
+                role: "probe".to_string(),
+                task: None,
+            },
+            None,
+            None,
+        )?;
+        let mut services = CapabilityServices::from_config(&cfg, &repo, &env, state::now_secs());
+        probes = probe_servers(&mut services, &broker);
         services.shutdown();
         apply_probe(&mut rows, &probes);
     }
@@ -135,11 +148,14 @@ pub fn run(args: &CapabilitiesArgs, writer: &mut impl Write) -> CtxResult<i32> {
     }
 }
 
-fn probe_servers(services: &mut CapabilityServices) -> Vec<serde_json::Value> {
+fn probe_servers(
+    services: &mut CapabilityServices,
+    broker: &super::runtime::enforcement::ExecutionBroker,
+) -> Vec<serde_json::Value> {
     services
         .server_names()
         .into_iter()
-        .map(|name| match services.client(&name) {
+        .map(|name| match services.client(&name, broker) {
             Ok(client) => json!({
                 "server": name,
                 "state": "available",
