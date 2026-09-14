@@ -49,6 +49,16 @@ existing model, do not stand a second one beside it.*
 - **Spend.** `settle_native_run` appends one `log::Delegation` row, which is
   the ledger `zirv ctx spend` reads. Without it a native worker's usage
   existed only inside its own JSON status.
+- **One owner per run (review round 2).** `HeadlessRequest::accounting` names
+  it: `Seat` means `run_session` places, reserves and settles; `CallerOwned`
+  means `native_worker` already did, with a delegation identity `run_session`
+  does not have (the principal, the envelope digest, the work group, the
+  worker mode). Round 1 had both doing all three, so every delegated worker
+  double-reserved one pool and wrote two spend rows. Two owners is not belt
+  and braces -- it is an account reported as spending double what it did.
+  `run_session`'s estimate is now held in a drop guard, so the two `?`s
+  between taking it and settling it release it instead of leaving the pool
+  short forever.
 - **Every path, not one (review round 1).** The accounting lives in
   `native_account`, lifted out of `native_worker` so all three ways a native
   request reaches a provider owe the same four things: the delegated worker,
