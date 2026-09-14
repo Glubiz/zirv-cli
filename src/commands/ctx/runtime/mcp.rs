@@ -229,10 +229,20 @@ impl StdioTransport {
         let mut line = serde_json::to_string(frame)
             .map_err(|error| McpError::Protocol(format!("could not encode request: {error}")))?;
         line.push('\n');
-        stdin
+        let written = stdin
             .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush())
-            .map_err(|error| McpError::Transport(format!("could not write to MCP server: {error}")))
+            .and_then(|()| stdin.flush());
+        match written {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A server that exits before the first frame lands (a broken
+                // pipe) usually explained itself on stderr; give the reader
+                // the same beat the closed-stdout path does so the
+                // diagnostic is on the error either way.
+                std::thread::sleep(Duration::from_millis(50));
+                Err(self.with_stderr(format!("could not write to MCP server: {error}")))
+            }
+        }
     }
 
     /// Appends the child's redacted stderr tail to a transport error, so a
