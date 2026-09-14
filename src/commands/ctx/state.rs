@@ -596,6 +596,95 @@ pub(crate) fn write_atomic_bytes(
     }
 }
 
+/// Same atomic write as [`write_atomic_bytes`], but re-verifies `path`'s
+/// SHA-256 immediately before the `rename` replaces it, refusing the
+/// replace when it no longer matches `expected_before_sha256`. Issue #582
+/// (roadmap N05): a patch's own hash-then-replace precondition was
+/// otherwise validated once at the start and never re-checked, so a write
+/// that landed in the window between that check and the (potentially slow,
+/// for a large replacement) unconditional rename was silently overwritten.
+/// Checking again right here, as close to the rename as this function can
+/// get, narrows that window to the two syscalls between the check and the
+/// rename -- a plain filesystem `rename` gives no cross-process
+/// transactional guard to close it entirely.
+///
+/// Returns the destination's current sha256 when the write was refused for
+/// that reason (the temp file is discarded either way); `None` on a
+/// successful replace. A dedicated function rather than a parameter on
+/// [`write_atomic_bytes`]: that function's other callers persist
+/// machine-local/session state where an unconditional replace is exactly
+/// the intended semantics, and this adds one extra read plus a full-file
+/// hash that only a stale-content-sensitive caller like `apply_patch`
+/// should pay for.
+pub(crate) fn write_atomic_bytes_if_unchanged(
+    path: &Path,
+    contents: &[u8],
+    force_owner_only: bool,
+    expected_before_sha256: &str,
+) -> std::io::Result<Option<String>> {
+    use std::io::Write;
+
+    let tmp = temp_sibling(path);
+
+    let write_tmp = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        if force_owner_only {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        #[cfg(unix)]
+        if force_owner_only {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        if !force_owner_only
+            && let Ok(metadata) = std::fs::symlink_metadata(path)
+            && metadata.is_file()
+        {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(contents)?;
+        file.flush()
+    };
+
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    let current = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    let current_sha256 = hex_sha256(&current);
+    if current_sha256 != expected_before_sha256 {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(Some(current_sha256));
+    }
+
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(None),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Writes `contents` to `path` atomically. On Unix the file is 0600, forced
 /// on the fresh temp regardless of umask, so writing over an operator's
 /// pre-existing world-readable file still yields a private one.
