@@ -197,18 +197,22 @@ pub struct DoctorInput<'a> {
 pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
     let mut findings = Vec::new();
     let mut roles = Vec::new();
+    let resolve_role = |role: &str| {
+        runtime::resolve(runtime::CONFIGURED, input.runtime, role).unwrap_or(
+            runtime::RuntimeChoice {
+                kind: runtime::RuntimeKind::Harness,
+                source: runtime::RuntimeSource::BuiltIn,
+                note: None,
+            },
+        )
+    };
 
     if let Some(inventory) = input.inventory {
         for row in &inventory.access {
             if input.role_filter.is_some_and(|role| row.role != role) {
                 continue;
             }
-            let choice = runtime::resolve(runtime::CONFIGURED, input.runtime, &row.role)
-                .unwrap_or(runtime::RuntimeChoice {
-                    kind: runtime::RuntimeKind::Harness,
-                    source: runtime::RuntimeSource::BuiltIn,
-                    note: None,
-                });
+            let choice = resolve_role(&row.role);
             roles.push(RoleRow {
                 role: row.role.clone(),
                 runtime: choice.kind.as_str().to_string(),
@@ -277,6 +281,39 @@ pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
             }
         }
     } else {
+        // No native configuration at all is still worth a role table: "which
+        // backend would an unflagged session get" is answerable before any
+        // provider is declared, and it is the first thing an operator
+        // migrating to native wants to see.
+        for role in super::provider::inventory::DEFAULT_ROLES
+            .iter()
+            .copied()
+            .chain(input.runtime.roles.keys().map(String::as_str))
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if input.role_filter.is_some_and(|filter| role != filter) {
+                continue;
+            }
+            let choice = resolve_role(role);
+            let native_wanted = choice.kind == runtime::RuntimeKind::Native;
+            roles.push(RoleRow {
+                role: role.to_string(),
+                runtime: choice.kind.as_str().to_string(),
+                runtime_source: choice.source.as_str().to_string(),
+                route: None,
+                state: "unconfigured".to_string(),
+            });
+            if native_wanted {
+                findings.push(Finding {
+                    kind: FindingKind::MissingTool,
+                    severity: Severity::Blocking,
+                    subject: format!("role {role}"),
+                    detail: "configured to run natively, but there is no native provider \
+                             configuration; run `zirv ctx provider init`"
+                        .to_string(),
+                });
+            }
+        }
         findings.push(Finding {
             kind: FindingKind::MissingTool,
             severity: Severity::Advisory,
@@ -665,6 +702,36 @@ mod tests {
             vec![FindingKind::MissingAuthMaterial],
             "{route_findings:?}"
         );
+    }
+
+    /// Before any provider is declared, the report still answers the first
+    /// question a migrating operator has -- and an operator who switched the
+    /// default to native with nothing configured is BLOCKED, not merely
+    /// advised.
+    #[test]
+    fn an_unconfigured_machine_still_reports_the_backend_each_role_would_get() {
+        let runtime: super::super::config::RuntimeConfig =
+            toml::from_str("default = 'native'\n").expect("runtime table");
+        let report = diagnose(&DoctorInput {
+            native_configured: false,
+            inventory: None,
+            integrations: &[],
+            isolation: &PlatformIsolation::Unavailable {
+                platform: "test".into(),
+                reason: "none".into(),
+            },
+            harnesses_present: Vec::new(),
+            runtime: &runtime,
+            role_filter: None,
+        });
+        let worker = report
+            .roles
+            .iter()
+            .find(|row| row.role == "worker")
+            .expect("worker row");
+        assert_eq!(worker.runtime, "native");
+        assert_eq!(worker.runtime_source, "runtime.default");
+        assert!(report.blocking(), "{:?}", report.findings);
     }
 
     /// A missing integration is a missing TOOL, and an unavailable one never

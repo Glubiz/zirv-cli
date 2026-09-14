@@ -603,7 +603,8 @@ to the section that documents it in depth.
   printing a compact, reversible summary; `compile` prints or measures the
   composed session prompt. See [Verbs](#verbs).
 - **Configuration and instruction hygiene** — `config` shows or edits the
-  operator's `~/.zirv/ctx.toml`; `provider` (`init`/`list`/`check`/
+  operator's `~/.zirv/ctx.toml`, and `config migrate`/`--downgrade` versions
+  that file with a backup and a documented way back; `provider` (`init`/`list`/`check`/
   `credential set`) configures and inspects opt-in native provider
   routes, accounts and credentials; `context` (`sync`/`lint`/`status`)
   manages the canonical instruction-file layer; `optimize` reports
@@ -621,6 +622,16 @@ to the section that documents it in depth.
   configured MCP server to verify it; `--require` gates a script on the same
   admission rule the workflow engine applies. See [Native configured
   capabilities](#native-configured-capabilities).
+- **Native readiness** — `doctor` diagnoses whether this machine can run a
+  native session: per role, which backend an unflagged session gets and which
+  authority decided it, which route it would spend, and every problem sorted
+  into exactly one of `missing-auth-material`, `inaccessible-model`,
+  `missing-tool`, `unsupported-isolation`, `service-failure` or
+  `upstream-entitlement` — so a missing native adapter is never dismissed as
+  an entitlement problem. Writes nothing; `--live` additionally contacts each
+  provider's model-list endpoint. Redacted like `snapshot`, so the output is
+  safe to paste into a bug report. See [Native setup, diagnosis and
+  rollback](#native-setup-diagnosis-and-rollback).
 - **Local runtime protocol** — `api` (`schema`/`serve`/`call`) publishes zirv's
   versioned local control surface: an owner-only unix socket or Windows named
   pipe carrying NDJSON requests, replies and event subscriptions, with a
@@ -1513,6 +1524,8 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
+| `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+| `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 
 ### Runtime backends
 
@@ -2552,7 +2565,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
-`handover`, any `session.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
+`handover`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
 `score.model_context_tokens`); doing so is an error
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
@@ -2755,11 +2768,20 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `session.scrollback_rows` | `ZIRV_CTX_SESSION_SCROLLBACK_ROWS` |
 | `session.stale_after_secs` | `ZIRV_CTX_SESSION_STALE_AFTER_SECS` |
 | `capabilities` | `ZIRV_CTX_CAPABILITIES` |
+| `runtime` | `ZIRV_CTX_RUNTIME` |
 
 `capabilities` is listed as a whole table rather than key by key: every key
 under it names an MCP server command zirv spawns, a remote endpoint it
 authenticates to, a credential reference, or a browser binary it launches, so
 there is no narrowing half a repository checkout could legitimately set.
+
+`runtime` is a whole table for the same reason, in both directions: it decides
+which provider account a session with no explicit `--runtime` spends, and a
+checkout moving that onto the operator's metered native routes — or off them
+— is widening either way. `ZIRV_CTX_RUNTIME` sets `runtime.default`
+(`harness` or `native`); per-role overrides live in `[runtime.roles]` in
+`~/.zirv/ctx.toml`. See [Native setup, diagnosis and
+rollback](#native-setup-diagnosis-and-rollback).
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -2913,6 +2935,132 @@ The optional repository layer `<repo>/.zirv/native.toml` may contain only
 intersected with the operator's set, so a checkout can narrow access but
 cannot add accounts, endpoints, routes, role bindings, credentials, or
 permissions.
+
+#### Native setup, diagnosis and rollback
+
+A fresh machine needs no coding harness installed to run native sessions. The
+whole path is four commands:
+
+```bash
+zirv ctx provider init                       # write ~/.zirv/native.toml
+$EDITOR ~/.zirv/native.toml                  # declare account, route, roles
+zirv ctx provider credential set work        # store the secret out of band
+zirv ctx doctor                              # verify, class by class
+zirv ctx exec --runtime native -- "…"        # first native run
+```
+
+`zirv ctx doctor [--role <role>] [--live] [--json]` is the readiness command.
+For every role it prints which backend an unflagged session would get and
+which authority decided that (`flag`, `runtime.roles`, `runtime.default`,
+`built-in`), which route it would spend, and how far that route got up the
+evidence ladder. Every problem it finds is sorted into exactly one class,
+because the operator's next action is different for each:
+
+| Class | What it means | What to do |
+|---|---|---|
+| `missing-auth-material` | No API key resolved for the account, or the one that resolved was rejected | Set the `env:`/`store:`/`file:` reference, or `zirv ctx provider credential set <account>` |
+| `inaccessible-model` | Auth material works; this model is not one this account may call | Pick a model the account is entitled to, or fix the alias |
+| `missing-tool` | A binary, MCP server or configured integration is absent — including a native adapter zirv has not shipped yet | Install/configure it; a missing adapter is a zirv gap with a tracking issue, never an entitlement excuse |
+| `unsupported-isolation` | No verified process containment on this platform | Install `bwrap` (Linux); on Windows there is no verified backend yet, and sandboxed invocations are refused rather than run unconfined |
+| `service-failure` | The endpoint is configured and credentialed but did not answer | Check the endpoint URL, the network, and the provider's status |
+| `upstream-entitlement` | A genuine upstream limitation, not a zirv gap: a subscription-billed account, or a vendor surface that exists only inside that vendor's CLI | Use an API-billed account, or keep that surface on the harness backend |
+
+The doctor writes nothing and exits `1` only when a role that *would* run
+natively has no usable route. Its output is redacted the way `zirv ctx
+snapshot` is — every line is screened for credential shapes, high-entropy and
+opaque runs, and any line that opens like a conversation turn is replaced
+outright — so a doctor dump is safe to paste into a bug report. It carries no
+transcript text and no continuation data by construction.
+
+**Billing.** A route's `billing` is `api` or `subscription`. Native operation
+spends API billing only: a Claude.ai or ChatGPT subscription is an entitlement
+for that vendor's own CLI, and its login token is refused as a native
+credential (`credential set` refuses those store refs before it reads a
+secret). Accounts that share quota share a `pool`, and `zirv ctx spend` and
+the usage windows aggregate per pool, so two accounts on one plan are not
+double-counted.
+
+**Choosing the default.** `~/.zirv/ctx.toml`'s `[runtime]` table decides which
+backend a session gets when the command line does not say:
+
+```toml
+# ~/.zirv/ctx.toml
+[runtime]
+default = "native"        # or "harness"; absent means "harness"
+
+[runtime.roles]
+reviewer = "native"       # per-role override, outranks `default`
+worker = "harness"
+```
+
+An explicit `--runtime harness|native` always wins over both. `zirv ctx exec`
+and `zirv ctx agent` default that flag to `configured`, which is exactly "ask
+this table"; `zirv chat` with no `--runtime` resolves the same way at the
+`orchestrator` role. A value this build does not recognise degrades to the
+harness with a one-line note rather than failing the command — `zirv ctx
+doctor` is where it is reported. The whole `[runtime]` table is
+`REPO_FORBIDDEN` (see [Trust boundary](#trust-boundary)).
+
+**Migration and rollback.** `zirv ctx config migrate [--to harness|native]
+[--dry-run]` brings `~/.zirv/ctx.toml` to schema 2 — the `[runtime]` table
+above — backing the previous document up to
+`~/.zirv/ctx.toml.pre-schema-2.bak` and recording the schema in a sidecar
+`~/.zirv/ctx.migration.toml`. The marker is deliberately *not* a key inside
+`ctx.toml`: that file is parsed with unknown keys rejected, so an older zirv
+binary would refuse the whole configuration rather than ignore one key.
+Running the migration twice writes nothing the second time and says so, so a
+re-run can never overwrite the real pre-migration backup.
+
+`zirv ctx config migrate --downgrade` restores that backup byte for byte (or,
+with no backup, removes the `[runtime]` table), and deletes both markers. It
+is the supported way back to an older zirv: install the older binary *after*
+downgrading, since an older binary cannot parse `[runtime]` either. Nothing
+else is part of the transaction — `~/.zirv/native.toml`, native journals, and
+the harness conversation references those journals carry are all outside the
+file being migrated and survive a round trip in either direction. Both modes
+can run concurrently on one machine throughout: a native and a wrapped
+session share the state directory, session registry, mail, task cards and
+cost ledger.
+
+#### Entitlement limitations versus implementation gaps
+
+These are not the same thing and zirv never conflates them. An *entitlement
+limitation* is something the upstream vendor does not sell zirv access to; an
+*implementation gap* is work zirv has not done, and every one of them has a
+tracking issue. `zirv ctx doctor` classifies the first as
+`upstream-entitlement` and the second as `missing-tool`, and
+`docs/design/native-parity.md` lists both exhaustively. The current lists:
+
+Genuine upstream entitlement limitations:
+
+- **Subscription plans are not API entitlements.** A Claude.ai or ChatGPT
+  subscription cannot be spent through a direct provider API call. Native
+  routes on a subscription-billed account stop at `configured` with that
+  problem named, and the harness backend remains the way to spend it.
+- **Harness login tokens are refused as credentials.** Reusing the vendor
+  CLI's stored login for direct API calls is outside what that token is
+  issued for; `credential set` refuses those store refs before reading a
+  secret.
+- **Vendor-CLI-only surfaces.** `zirv ctx wrap` supervises a vendor TUI by
+  definition, and `zirv ctx handover` swaps one vendor CLI for another; a
+  native session has neither. Changing a native seat's model is `[roles]`
+  configuration, not a handover.
+- **Model entitlement per account.** A model absent from an account's own
+  model list is that account's entitlement, reported as
+  `inaccessible-model`; zirv cannot grant it.
+
+Implementation gaps (zirv's own work, each tracked):
+
+- **Route profiles with no adapter yet** are reported as `missing-tool` with
+  their tracking issue in the message, explicitly as "a zirv gap, not an
+  upstream entitlement limit".
+- **Windows process isolation.** There is no verified restricted-token/
+  AppContainer helper shipped, so `PlatformIsolation::detect` reports
+  unavailable on Windows and sandboxed invocations are refused rather than
+  run unconfined. Linux (`bwrap`) and macOS (`sandbox-exec`) are supported.
+- **Live-provider validation.** Every parity row is fixture- or
+  service-level; the `validated` rung of the evidence ladder is not reachable
+  until the N19 validation pass records a real one.
 
 #### Native compaction
 

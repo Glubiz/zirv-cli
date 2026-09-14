@@ -508,17 +508,21 @@ fn apply_probe(
     }
 }
 
+/// The seat roles every access report covers even when `[roles]` names none
+/// of them, so "this role has no native route" is a stated fact rather than a
+/// missing row. Shared with `ctx::doctor`, which reports the same roles
+/// before there is any native configuration at all to build an inventory
+/// from.
+pub const DEFAULT_ROLES: &[&str] = &[
+    "orchestrator",
+    "sub-orchestrator",
+    "worker",
+    "reviewer",
+    "distiller",
+];
+
 fn access_matrix(cfg: &NativeConfig, reports: &[RouteReport]) -> AccessMatrix {
-    let mut roles: BTreeSet<String> = [
-        "orchestrator",
-        "sub-orchestrator",
-        "worker",
-        "reviewer",
-        "distiller",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    let mut roles: BTreeSet<String> = DEFAULT_ROLES.iter().copied().map(str::to_string).collect();
     roles.extend(cfg.roles.keys().cloned());
     roles
         .into_iter()
