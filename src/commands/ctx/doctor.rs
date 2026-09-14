@@ -565,12 +565,40 @@ fn run_with(
     now: u64,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
-    let native = NativeConfig::load(home, repo)?;
+    let isolation = PlatformIsolation::detect();
+    // Issue #567 (roadmap N22): an invalid `native.toml` can quote the very
+    // value that broke it back verbatim -- a route id or role value the
+    // operator wrote in it -- so this is routed through the SAME text/json
+    // rendering (and its per-field `redacted()` calls) every other doctor
+    // finding already gets, rather than propagated as a bare `Err` that
+    // bypasses that redaction layer entirely.
+    let native = match NativeConfig::load(home, repo) {
+        Ok(native) => native,
+        Err(error) => {
+            let report = DoctorReport {
+                native_configured: false,
+                harnesses_present: Vec::new(),
+                isolation: isolation.mechanism().to_string(),
+                roles: Vec::new(),
+                findings: vec![Finding {
+                    kind: FindingKind::MissingTool,
+                    severity: Severity::Blocking,
+                    subject: "native.toml".to_string(),
+                    detail: error.to_string(),
+                }],
+            };
+            if args.json {
+                render_json(&report, w)?;
+            } else {
+                render_text(&report, w)?;
+            }
+            return Ok(1);
+        }
+    };
     let inventory = native
         .as_ref()
         .map(|native| Inventory::build(native, env, store, now, probe));
     let integrations = super::runtime::capabilities::discover(&cfg, repo);
-    let isolation = PlatformIsolation::detect();
     // Issue #597 (roadmap N22): `ready()` is fail-open by design (see
     // `adapters::resolve_program`'s own doc comment) -- a program that
     // resolves to nothing at all is not an error there, since ordinary
@@ -1061,5 +1089,73 @@ mod tests {
         .expect("doctor");
         let value: serde_json::Value = serde_json::from_slice(&out).expect("json output");
         assert_eq!(value["harnesses_present"], serde_json::json!([]), "{value}");
+    }
+
+    /// Issue #567 (roadmap N22): when `native.toml` fails to load, the
+    /// resulting `CtxResult` error can quote the very value that broke it
+    /// back verbatim -- an operator's own `[roles]` key and value, which
+    /// here are deliberately shaped like a secret and a transcript excerpt.
+    /// Neither raw value may survive into either rendering mode: this is the
+    /// one path that used to bypass doctor's own redaction layer entirely by
+    /// propagating the error with `?` instead of rendering it.
+    #[test]
+    fn doctor_redacts_invalid_native_toml_in_text_and_json() {
+        let secret_route = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let transcript_role = "leaked [INST] context";
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let repo = test_repo();
+        // A role naming a route nothing declares is a validation error
+        // (`roles.{role} references undeclared route {route}`) that
+        // interpolates both the role KEY and the route VALUE verbatim.
+        write_native(
+            home.path(),
+            &format!("schema=1\n[roles]\n\"{transcript_role}\" = '{secret_route}'\n"),
+        );
+        for json in [false, true] {
+            let mut out = Vec::new();
+            let code = run_with(
+                &DoctorArgs {
+                    repo: Some(repo.path().to_path_buf()),
+                    role: None,
+                    live: false,
+                    json,
+                },
+                &mut out,
+                home.path(),
+                repo.path(),
+                &|_| None,
+                &FakeStore::default(),
+                None,
+                0,
+            )
+            .expect("doctor");
+            assert_eq!(code, 1, "an invalid native.toml blocks");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                !text.contains(secret_route),
+                "json={json}: secret-shaped route leaked: {text}"
+            );
+            assert!(
+                !text.contains(transcript_role),
+                "json={json}: transcript-shaped role leaked: {text}"
+            );
+            assert!(
+                !text.contains("leaked"),
+                "json={json}: transcript-shaped role leaked: {text}"
+            );
+            // The classification itself still survives redaction: the
+            // report names WHICH flags fired (a credential shape, a
+            // role-marker) without ever repeating the raw text that
+            // triggered them.
+            assert!(
+                text.contains("credential shape") || text.contains("redacted"),
+                "json={json}: lost the classification entirely: {text}"
+            );
+            assert!(
+                text.contains("native.toml"),
+                "json={json}: lost the subject entirely: {text}"
+            );
+        }
     }
 }
