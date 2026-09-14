@@ -13202,18 +13202,38 @@ pub fn run_dashboard(
                             // scrolls, submits or forwards anything -- and a
                             // wrapped pane never reaches it, so the native
                             // control is not offered where it has no meaning.
-                            if matches!(mouse.kind, MouseEventKind::Down(_))
-                                && let Some(native) =
-                                    panes.get_mut(focused).and_then(Pane::native_mut)
+                            //
+                            // PR #545 review finding 3: the WHEEL is routed
+                            // here too. A native pane has no vt100 grid and no
+                            // pty scrollback, so the wrapped path below moved a
+                            // buffer that is never rendered while the
+                            // transcript the operator is looking at sat still.
+                            // Both gestures now reach the one scroll position
+                            // a native pane actually has, the same state its
+                            // own Up/Down/PageUp/PageDown keys move.
+                            if let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
                             {
-                                let main = effective_main(full, sidebar_cols, zoomed);
-                                native_pane::click_overview_row(
-                                    native,
-                                    main,
-                                    mouse.column,
-                                    mouse.row,
-                                );
-                                continue;
+                                match mouse.kind {
+                                    MouseEventKind::Down(_) => {
+                                        let main = effective_main(full, sidebar_cols, zoomed);
+                                        native_pane::click_overview_row(
+                                            native,
+                                            main,
+                                            mouse.column,
+                                            mouse.row,
+                                        );
+                                        continue;
+                                    }
+                                    MouseEventKind::ScrollUp => {
+                                        native_pane::wheel_scroll(native, WHEEL_STEP);
+                                        continue;
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        native_pane::wheel_scroll(native, -WHEEL_STEP);
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
                             }
                             let delta = match mouse.kind {
                                 MouseEventKind::ScrollUp => WHEEL_STEP,
