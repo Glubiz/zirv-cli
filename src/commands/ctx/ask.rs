@@ -80,11 +80,121 @@ transcript does not contain enough evidence to answer some or all of it, say so 
     )
 }
 
+/// The same [`StructuralContext`] shape [`ask_prompt`] expects, built
+/// directly from a native session's own durable journal (issue #598,
+/// roadmap N15) instead of routing through a harness `AgentAdapter`, which
+/// does not exist for `agent: "native"` sessions in the first place.
+/// [`super::runtime::journal::Journal::replay`] is the existing pure
+/// event-to-conversation projection -- reused here rather than re-deriving
+/// user/assistant turns from raw events a second time. Files read/modified,
+/// tool errors and the last verification run stay empty: nothing here
+/// attempts the same tool-shape classification an adapter's own
+/// `structural_context` does, only the conversation itself.
+fn native_structural_context(state: &StateDir, session: &str) -> CtxResult<StructuralContext> {
+    use super::runtime::journal::{AssistantBlock, Journal, JournalSessionId, MessageRole};
+
+    let journal = Journal::open(state)?;
+    let journal_session = JournalSessionId::new(session.to_string())?;
+    let conversation = journal.replay(&journal_session)?;
+
+    let mut ctx = StructuralContext::default();
+    for message in &conversation.messages {
+        match message.role {
+            MessageRole::User => {
+                if let Some(text) = &message.text {
+                    ctx.user_messages.push(text.clone());
+                }
+            }
+            MessageRole::Assistant => {
+                let text = message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        AssistantBlock::Text { text } | AssistantBlock::Refusal { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    ctx.assistant_texts.push(text);
+                }
+            }
+        }
+    }
+    Ok(ctx)
+}
+
+/// Answers `prompt` for a native ask target: tries the operator's own
+/// native `[roles]` route for [`helper::ROLE_ASK`] first -- the same
+/// native-first, harness-second order every other helper call goes
+/// through (`handoff::helper_answer`) -- and falls back to the operator's
+/// default harness adapter only if that native attempt is unconfigured or
+/// fails.
+///
+/// `helper_answer` itself cannot be reused here: it takes its harness
+/// fallback adapter eagerly, as `&dyn AgentAdapter`, which would force
+/// resolving one (`adapters::select`) before even trying the native route
+/// -- exactly the harness dependency this exists to avoid for a native
+/// target whose native answer succeeds. Resolving the fallback lazily,
+/// only once native is confirmed unconfigured or failed, is the one
+/// difference from `helper_answer`'s own body below.
+fn native_ask_answer(
+    repo: &Path,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    prompt: &str,
+    timeout: Duration,
+    provider_override: Option<&str>,
+) -> CtxResult<String> {
+    use super::helper::{self, HelperBudget, HelperRequest, ROLE_ASK};
+
+    match helper::run(
+        &HelperRequest {
+            repo,
+            prompt,
+            role: ROLE_ASK,
+            route: None,
+            budget: HelperBudget::one_shot(timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+            provider: provider_override,
+        },
+        env,
+    ) {
+        Ok(answer) => return Ok(answer.text),
+        Err(helper::HelperError::Unconfigured(_)) => {}
+        Err(error) => {
+            crate::output::warn(format!(
+                "native ask helper failed ({error}); falling back to the harness distiller"
+            ));
+        }
+    }
+    let adapter = adapters::select(None, &[], cfg)?;
+    let model = resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
+    super::handoff::run_model(adapter.as_ref(), &model, prompt, timeout)
+}
+
 pub fn run_with<W: Write>(
     args: &AskArgs,
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    run_with_provider(args, w, repo, env, None)
+}
+
+/// [`run_with`], with the native distiller's transport overridable
+/// (`provider_override`, the same `fixture:<path>` shape
+/// [`super::helper::HelperRequest::provider`] accepts) so a test can drive
+/// the native-first answer path deterministically. Production's only caller
+/// ([`run_with`]) always passes `None`, leaving the operator's own `[roles]`
+/// configuration as the one thing that decides it.
+fn run_with_provider<W: Write>(
+    args: &AskArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    provider_override: Option<&str>,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
     let state = StateDir::resolve(env)?;
@@ -100,46 +210,62 @@ pub fn run_with<W: Write>(
         )
     })?;
 
-    let adapter = adapters::select(Some(record.agent.as_str()), &[], &cfg)?;
-    if !adapter.capabilities().events {
-        return Err(format!(
-            "zirv ctx ask: {} has no verified event parsing; nothing to ask about",
-            adapter.name()
-        )
-        .into());
-    }
-
-    let transcript_path = adapter.transcript_path(&SessionRef {
-        id: SessionId::parse(&record.session),
-        cwd: record.repo.clone(),
-    });
-    // Read-only: the transcript is never written, moved, or truncated --
-    // only ever read into memory here, exactly once.
-    let jsonl = std::fs::read_to_string(&transcript_path).unwrap_or_default();
-    if jsonl.trim().is_empty() {
-        return Err(format!(
-            "zirv ctx ask: no transcript yet for session {}",
-            record.short
-        )
-        .into());
-    }
-
-    let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
-    let model = resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
-    let prompt = ask_prompt(&ctx, &args.question);
     let timeout = Duration::from_secs(cfg.handoff.timeout_secs);
-    // Unlike `distill_or_structural`, a failure here is never masked behind
-    // a mechanical fallback -- there is no structural equivalent of "answer
-    // a free-form question," so the operator sees exactly why the distiller
-    // could not answer instead of a misleadingly confident guess.
-    let answer = helper_answer(
-        crate::commands::ctx::helper::ROLE_ASK,
-        adapter.as_ref(),
-        &model,
-        &prompt,
-        timeout,
-    )
-    .map_err(|e| format!("zirv ctx ask: distiller failed: {e}"))?;
+
+    // Issue #598 (roadmap N15): a native session records its agent as
+    // `"native"`, which is not a coding harness -- `adapters::select` was
+    // correctly refusing it, leaving `ctx ask` unable to inspect a native
+    // session at all. Read it through its own durable journal instead, and
+    // answer it natively too when the operator has a route for `ROLE_ASK`,
+    // so asking about (and answering from) a native session never needs a
+    // harness adapter, or one on PATH, at all.
+    let answer = if record.agent == super::runtime::RuntimeKind::Native.as_str() {
+        let ctx = native_structural_context(&state, &record.session)?;
+        let prompt = ask_prompt(&ctx, &args.question);
+        native_ask_answer(repo, &cfg, env, &prompt, timeout, provider_override)
+            .map_err(|e| format!("zirv ctx ask: distiller failed: {e}"))?
+    } else {
+        let adapter = adapters::select(Some(record.agent.as_str()), &[], &cfg)?;
+        if !adapter.capabilities().events {
+            return Err(format!(
+                "zirv ctx ask: {} has no verified event parsing; nothing to ask about",
+                adapter.name()
+            )
+            .into());
+        }
+
+        let transcript_path = adapter.transcript_path(&SessionRef {
+            id: SessionId::parse(&record.session),
+            cwd: record.repo.clone(),
+        });
+        // Read-only: the transcript is never written, moved, or truncated --
+        // only ever read into memory here, exactly once.
+        let jsonl = std::fs::read_to_string(&transcript_path).unwrap_or_default();
+        if jsonl.trim().is_empty() {
+            return Err(format!(
+                "zirv ctx ask: no transcript yet for session {}",
+                record.short
+            )
+            .into());
+        }
+
+        let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+        let model = resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
+        let prompt = ask_prompt(&ctx, &args.question);
+        // Unlike `distill_or_structural`, a failure here is never masked
+        // behind a mechanical fallback -- there is no structural equivalent
+        // of "answer a free-form question," so the operator sees exactly why
+        // the distiller could not answer instead of a misleadingly
+        // confident guess.
+        helper_answer(
+            crate::commands::ctx::helper::ROLE_ASK,
+            adapter.as_ref(),
+            &model,
+            &prompt,
+            timeout,
+        )
+        .map_err(|e| format!("zirv ctx ask: distiller failed: {e}"))?
+    };
     let answer = answer.trim().to_string();
 
     if args.json {
@@ -350,5 +476,142 @@ mod tests {
             message.contains("nosuchsession"),
             "the error must name the prefix that was typed: {message}"
         );
+    }
+
+    /// Issue #598 (roadmap N15): a native session records its agent as
+    /// `"native"`, which `adapters::select` correctly refuses -- it is not
+    /// a coding harness -- so `ctx ask` used to hard-fail on exactly the
+    /// sessions it should be able to inspect. Proven at both seams this fix
+    /// touches: a real journal `ask` never wrote to is read through
+    /// `native_structural_context` and its known content reaches the
+    /// prompt `ask_prompt` builds from it; then the full `ctx ask` command
+    /// (registry resolution included) answers a native target end to end
+    /// with `PATH` empty -- never falling to `adapters::select`, which
+    /// would error immediately with nothing on PATH.
+    #[test]
+    fn ctx_ask_reads_native_session_without_harness_adapter() {
+        use crate::commands::ctx::provider::{
+            AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
+        };
+        use crate::commands::ctx::runtime::journal::{
+            AssistantBlock, EventScope, Journal, JournalSessionId, MessageId, RouteIdentity,
+            SeatId, SessionIdentity,
+        };
+        use crate::commands::ctx::testenv::VarGuard;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+
+        let session_id = "44444444-5555-6666-8777-888888888888";
+        let journal_session = JournalSessionId::new(session_id).unwrap();
+        let mut journal = Journal::open(&state).expect("open journal");
+        journal
+            .create_session(&SessionIdentity {
+                session: journal_session.clone(),
+                seat: SeatId::new("seat-ask").unwrap(),
+                generation: 1,
+                task: None,
+                route: RouteIdentity {
+                    route: RouteId::new("ask-route").unwrap(),
+                    provider: ProviderId::new("openai").unwrap(),
+                    endpoint: EndpointId::new("openai").unwrap(),
+                    account: AccountId::new("ask-account").unwrap(),
+                    billing_pool: BillingPoolId::new("ask-pool").unwrap(),
+                    protocol: Protocol::OpenAiResponses,
+                    model: ModelId {
+                        vendor: "openai".into(),
+                        id: "gpt-5".into(),
+                    },
+                },
+                created_at: 1,
+                completed_at: None,
+            })
+            .expect("create session");
+        let scope = EventScope::default();
+        journal
+            .acknowledge_input(
+                &journal_session,
+                1,
+                &scope,
+                MessageId::new("msg-user-1").unwrap(),
+                "ship the webhook retry handler".into(),
+                false,
+                None,
+                1,
+            )
+            .expect("acknowledge input");
+        journal
+            .record_assistant_message(
+                &journal_session,
+                1,
+                &scope,
+                MessageId::new("msg-assistant-1").unwrap(),
+                vec![AssistantBlock::Text {
+                    text: "Shipped the webhook retry handler with exponential backoff.".into(),
+                }],
+                None,
+                None,
+                2,
+            )
+            .expect("record assistant message");
+        drop(journal);
+
+        // Reading half: the journal's own known content reaches the prompt
+        // `ask` builds, with no harness adapter involved at all.
+        let ctx = native_structural_context(&state, session_id).expect("native structural context");
+        assert!(
+            ctx.user_messages
+                .iter()
+                .any(|m| m.contains("ship the webhook retry handler")),
+            "the user message must come from the journal: {:?}",
+            ctx.user_messages
+        );
+        assert!(
+            ctx.assistant_texts
+                .iter()
+                .any(|m| m.contains("exponential backoff")),
+            "the assistant text must come from the journal: {:?}",
+            ctx.assistant_texts
+        );
+        let prompt = ask_prompt(&ctx, "what did the session ship");
+        assert!(prompt.contains("ship the webhook retry handler"));
+        assert!(prompt.contains("exponential backoff"));
+
+        // Answering half: the full command, registry resolution included,
+        // completes for a native target with PATH empty -- `adapters::
+        // select` would error immediately on an empty PATH, so reaching a
+        // successful answer proves the native branch, not the harness one,
+        // ran.
+        let record = Record::new(session_id, "native", &repo, Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+        let _path = VarGuard::set(&[("PATH", Some(""))]);
+
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("runtime")
+            .join("native")
+            .join("helper-answer.json");
+        let env = env_map(&[(STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = AskArgs {
+            session: short,
+            question: "what did the session ship".to_string(),
+            json: false,
+        };
+        let mut out = Vec::new();
+        let code = run_with_provider(
+            &args,
+            &mut out,
+            &repo,
+            &|k| env.get(k).cloned(),
+            Some(&format!("fixture:{}", script.display())),
+        )
+        .expect("ask must answer a native session with no harness on PATH");
+        assert_eq!(code, 0);
+        assert!(!out.is_empty());
     }
 }
