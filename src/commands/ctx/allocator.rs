@@ -1154,6 +1154,7 @@ mod tests {
             // is looked up by, which is the whole point of the distinction.
             provider: pool.to_string(),
             offer: Some(RouteOffer {
+                route: name.to_string(),
                 identity: identity.clone(),
                 capabilities: Default::default(),
                 billing: super::super::route::BillingPosture::Api,

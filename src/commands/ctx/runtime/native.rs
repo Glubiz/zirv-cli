@@ -493,6 +493,14 @@ pub struct NativeFinalStatus {
     pub queued_input: Vec<String>,
     pub limit: Option<LimitKind>,
     pub failure: Option<String>,
+    /// Issue #487 (item 4) / #554: WHICH SCOPE the failure above is evidence
+    /// about, decided purely by `route::route_failure`. The loop writes no
+    /// health record itself -- the decision is pure and replayable, and the
+    /// durable breaker write belongs to the supervisor that owns a state
+    /// directory (`native_worker::record_route_health`). `None` when the run
+    /// did not fail on a provider failure at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_routing: Option<super::super::route::FailureRouting>,
     pub blocked_reason: Option<String>,
     /// Issue #486: the compactions this run committed, oldest first, and the
     /// newest compaction decision -- including one that was only advice.
@@ -636,6 +644,10 @@ pub struct NativeLoop<'a> {
     /// replays, both present the same request twice; folding it twice would
     /// double the pool's usage and the spend readout with it.
     reconciliation: super::super::route::Reconciliation,
+    /// Issue #554: the scope the newest provider failure is evidence about,
+    /// carried out on [`NativeFinalStatus::failure_routing`] so the
+    /// supervisor can fold it into the persistent breaker.
+    failure_routing: Option<super::super::route::FailureRouting>,
 }
 
 impl std::fmt::Debug for NativeLoop<'_> {
@@ -711,6 +723,7 @@ impl<'a> NativeLoop<'a> {
             compactions: Vec::new(),
             last_decision: None,
             reconciliation: super::super::route::Reconciliation::default(),
+            failure_routing: None,
         }
     }
 
@@ -1333,6 +1346,11 @@ impl<'a> NativeLoop<'a> {
                     // reaches a breaker. `breaker_key` is `None` for exactly
                     // the classes that are not health evidence.
                     let routing = self.failure_routing(&failure);
+                    // #554: carried out on the final status so the
+                    // supervisor folds it into the PERSISTENT breaker. The
+                    // loop stays pure about health: it decides, it does not
+                    // write.
+                    self.failure_routing = Some(routing.clone());
                     let breaker = match routing.breaker_key() {
                         Some((key, class)) => {
                             format!("health evidence for {} as {class:?}", key.label())
@@ -1901,6 +1919,7 @@ impl<'a> NativeLoop<'a> {
             queued_input: queued,
             limit,
             failure,
+            failure_routing: self.failure_routing.clone(),
             blocked_reason,
             compactions: self.compactions.clone(),
             compaction_decision: self.last_decision.clone(),
@@ -2755,23 +2774,41 @@ fn resolve_role_route(
     }
 }
 
-/// The route this request will spend, and the PROVIDER whose reservation
-/// ledger it spends against -- resolved from operator configuration alone.
+/// The route this request will spend, the PROVIDER it belongs to, and the
+/// BILLING POOL whose reservation ledger it spends against -- resolved from
+/// operator configuration alone.
 ///
 /// Issue #479 (roadmap N10): a delegated native worker has to reserve its
-/// token ceiling against the same per-provider ledger a legacy delegation
-/// reserves against (`ctx::reservation`), and that reservation is taken
-/// BEFORE the run, so it cannot wait for the route resolution
-/// [`build_transport`] performs. This deliberately touches no credential
-/// store and no network: it reads `[route]`/`[account]` and answers, so a
-/// missing or expired credential fails where it should -- at the actual
-/// request -- and not at accounting time.
+/// token ceiling against the same ledger a legacy delegation reserves against
+/// (`ctx::reservation`), and that reservation is taken BEFORE the run, so it
+/// cannot wait for the route resolution [`build_transport`] performs. This
+/// deliberately touches no credential store and no network: it reads
+/// `[route]`/`[account]` and answers, so a missing or expired credential
+/// fails where it should -- at the actual request -- and not at accounting
+/// time.
+///
+/// Issue #554: the pool is returned ALONGSIDE the provider, not instead of
+/// it, because they answer different questions. The provider names the vendor
+/// (which usage window a reading belongs to); the pool names the balance the
+/// work is actually drawn from (`NativeConfig::account_pool`), which is what
+/// a reservation must be keyed by -- two routes on one account share one
+/// balance, and two accounts at one vendor do not.
 pub fn route_provider(
     repo: &std::path::Path,
     route: Option<&str>,
     role: &str,
     env: EnvLookup<'_>,
 ) -> CtxResult<(super::super::provider::RouteId, String)> {
+    route_pool(repo, route, role, env).map(|(route_id, provider, _pool)| (route_id, provider))
+}
+
+/// [`route_provider`], plus the billing pool the work is drawn from.
+pub fn route_pool(
+    repo: &std::path::Path,
+    route: Option<&str>,
+    role: &str,
+    env: EnvLookup<'_>,
+) -> CtxResult<(super::super::provider::RouteId, String, String)> {
     use super::super::provider::config::NativeConfig;
 
     let home = crate::utils::home_dir()?;
@@ -2784,13 +2821,18 @@ pub fn route_provider(
     })?;
     let _ = env;
     let route_id = resolve_role_route(&native, route, role)?;
-    let provider = native
+    let account_id = native
         .routes
         .get(&route_id)
-        .and_then(|route| native.accounts.get(&route.account))
+        .map(|route| route.account.clone())
+        .ok_or_else(|| format!("native runtime: route `{route_id}` names no configured account"))?;
+    let provider = native
+        .accounts
+        .get(&account_id)
         .map(|account| account.provider.to_string())
         .ok_or_else(|| format!("native runtime: route `{route_id}` names no configured account"))?;
-    Ok((route_id, provider))
+    let pool = native.account_pool(&account_id).as_ref().to_string();
+    Ok((route_id, provider, pool))
 }
 
 /// The durable route identity a new native conversation is filed under

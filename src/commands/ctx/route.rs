@@ -393,6 +393,13 @@ impl BillingPosture {
 /// rather than a scattering of `if`s across the ranking loop.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RouteOffer {
+    /// The operator's own route id (`[route.<id>]`). Issue #554: the shared
+    /// allocator ranks rows BY NAME, so the seam that asks it to place a
+    /// native route has to be able to name the row it means -- and the route
+    /// id is the only name an operator ever types. Empty for an offer built
+    /// outside [`offers_from_config`].
+    #[serde(default)]
+    pub route: String,
     pub identity: RouteIdentity,
     pub capabilities: BTreeSet<Capability>,
     pub billing: BillingPosture,
@@ -558,13 +565,12 @@ pub fn eligible(offer: &RouteOffer, demand: &Demand) -> Result<(), Ineligible> {
 /// (`provider::capability::declared`), which is the only place that vendor
 /// fact is stated.
 ///
-/// Not yet called from production code: the snapshot producer that turns
-/// these into `allocator::HarnessCapacity` rows lands with the step that
-/// gives native routes their per-minute usage readings, and until it does
-/// there is nothing for a native row's capacity dimensions to report. Kept
-/// `pub` and exercised by this module's own tests now -- the same
-/// task-ordering shape `allocator::plan` already documents for itself.
-#[allow(dead_code)]
+/// Issue #554: `fallback::capacity_snapshot_with_native` is the production
+/// consumer -- it turns these into `allocator::HarnessCapacity` rows so a
+/// native request goes through the SAME `place` a harness delegation does.
+/// A native route still reports no per-minute readings of its own, so its
+/// four non-window dimensions are labelled estimates rather than free
+/// capacity (`headroom`'s own rule).
 pub fn offers_from_config(config: &super::provider::config::NativeConfig) -> Vec<RouteOffer> {
     use super::provider::{BillingClass, capability};
 
@@ -619,6 +625,7 @@ pub fn offers_from_config(config: &super::provider::config::NativeConfig) -> Vec
                 add(declared.continuation, Capability::ReplayableReasoning);
             }
             RouteOffer {
+                route: route_id.as_ref().to_string(),
                 identity: RouteIdentity {
                     runtime: RuntimeKind::Native,
                     provider: provider.clone().unwrap_or_default(),
@@ -1032,6 +1039,7 @@ mod tests {
     #[test]
     fn ineligible_routes_are_named_by_their_own_reason() {
         let base = RouteOffer {
+            route: "opus".to_string(),
             identity: identity(),
             capabilities: [Capability::ToolCalls, Capability::Streaming]
                 .into_iter()
@@ -1102,6 +1110,7 @@ mod tests {
     #[test]
     fn a_route_billed_outside_the_authorization_is_refused_not_silently_taken() {
         let paid = RouteOffer {
+            route: "opus".to_string(),
             identity: identity(),
             capabilities: BTreeSet::new(),
             billing: BillingPosture::Api,
