@@ -3374,6 +3374,38 @@ pub fn run_session<W: std::io::Write>(
     // recorded under the runtime it belongs to.
     record_seat_conversation(&state, &handle, &session);
 
+    // Issue #645: a live headless native run (`zirv ctx exec --runtime
+    // native`) must appear in the session registry exactly like a live
+    // headless harness run does (`exec.rs`'s own `SessionGuard::register`,
+    // ~line 1721) -- `explain-status`/`ask`/`nudge`/`kill`/`session.list`
+    // all read that registry (`sessions::list`), never the seat/journal
+    // this session already writes regardless. Same record shape a
+    // dashboard-hosted native conversation registers under
+    // (`session::native::NativeSessions::register`): native binds no
+    // turn-signal socket at all, so `.unreachable()` is the honest answer
+    // here too. Scoped to `Accounting::Seat` -- the doc comment on that
+    // variant already calls it "every operator-facing entry point",
+    // covering this plain exec AND a bounded helper call the same way a
+    // human-launched session is covered; `CallerOwned` (a delegated
+    // `native_worker` run) is deliberately excluded, since the caller that
+    // placed it already owns its own visibility and settlement. The guard
+    // lives for the rest of this function and deregisters on every exit
+    // path via `Drop`, the same as every other `SessionGuard` in this
+    // crate -- no explicit `release()` needed here, since nothing in this
+    // function runs after the guard should already be gone.
+    let mut registry_guard = (request.accounting == Accounting::Seat).then(|| {
+        let mut record = super::super::sessions::Record::new(
+            &handle.logical_id,
+            RuntimeKind::Native.as_str(),
+            request.repo,
+            super::super::sessions::Verb::Exec,
+        )
+        .with_role(request.role)
+        .unreachable();
+        record.runtime = RuntimeKind::Native;
+        super::super::sessions::SessionGuard::register(&state, record)
+    });
+
     if brokered {
         // The broker is built here, after the seat record exists, because its
         // own fence reads that record at every effect.
@@ -3498,12 +3530,26 @@ pub fn run_session<W: std::io::Write>(
             &now_ms,
             env,
         );
+        // Issue #645: stamped immediately before the turn actually runs, the
+        // same edge `exec.rs`'s own per-cycle spawn stamps at. Left standing
+        // on the abort/error arm below on purpose -- a record still carrying
+        // it after ITS OWN process is gone is exactly the crash witness
+        // `list_with_retention`'s retention window exists for; cleared only
+        // once this run is known to have reached a clean boundary.
+        if let Some(guard) = registry_guard.as_mut() {
+            guard.stamp_in_flight(super::super::sessions::Verb::Exec.as_str(), 0);
+        }
         // Issue #554 (integration review): a hard abort still carries what
         // this loop already billed. Settle it before the error propagates --
         // for a SEAT here, and for a caller-owned run by handing the abort
         // on so `native_worker` settles it with its own delegation identity.
         match driver.run_to_completion() {
-            Ok(status) => status,
+            Ok(status) => {
+                if let Some(guard) = registry_guard.as_mut() {
+                    guard.clear_in_flight();
+                }
+                status
+            }
             Err(aborted) => {
                 if request.accounting == Accounting::Seat {
                     super::super::native_account::settle_seat_turn(
@@ -7022,6 +7068,97 @@ mod tests {
                 .any(|row| row.key == "native" && row.runs > 0),
             "`zirv ctx spend --by harness` reports the seat's own native spend"
         );
+    }
+
+    /// Issue #645: a live headless native run (`zirv ctx exec --runtime
+    /// native`, driven through `run_session`, the real entry point) must
+    /// appear in the session registry -- `explain-status`/`ask`/`nudge`/
+    /// `kill`/`session.list` all read it, and previously saw nothing for
+    /// this path even while it was running. `run_session` exposes no delay
+    /// hook, so this drives it on a real background thread against a
+    /// multi-turn, multi-tool-call fixture (real synchronous journal disk
+    /// writes per turn), and polls the registry from the main thread for a
+    /// bounded window -- long enough to reliably observe it mid-flight
+    /// without making the test depend on exact timing. The test's own state
+    /// dir is otherwise empty, so ANY record appearing is this run's own.
+    #[test]
+    fn a_live_headless_native_run_appears_in_the_registry_and_disappears_after() {
+        use crate::commands::ctx::sessions;
+
+        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+        let repo_path = repo.path().to_path_buf();
+        let provider = format!(
+            "fixture:{}",
+            fixture_root()
+                .join("compaction-long-session.json")
+                .display()
+        );
+        let fixture_tools = fixture_root().join("tools-investigate-edit-test.json");
+
+        let worker = std::thread::spawn(move || {
+            let lookup = |k: &str| env.get(k).cloned();
+            // `CtxResult`'s error side (`Box<dyn Error>`) is not `Send`, so
+            // it cannot cross the `JoinHandle` boundary as-is -- flattened
+            // to its `Display` text here, which is all this test needs.
+            run_session(
+                &mut HeadlessRequest {
+                    repo: &repo_path,
+                    prompt: "fix the failing test",
+                    route: None,
+                    role: "worker",
+                    limits: NativeLimits::default(),
+                    session_id: None,
+                    cancellation: None,
+                    resume: None,
+                    provider: Some(&provider),
+                    fixture_tools: Some(&fixture_tools),
+                    task: None,
+                    writer: None,
+                    accounting: Accounting::Seat,
+                },
+                &mut Vec::new(),
+                &lookup,
+            )
+            .map_err(|error| error.to_string())
+        });
+
+        let mut seen_live: Option<sessions::Record> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some((record, _)) = sessions::list(&state)
+                .into_iter()
+                .find(|(_, liveness)| *liveness == sessions::Liveness::Live)
+            {
+                seen_live = Some(record);
+                break;
+            }
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let status = worker
+            .join()
+            .expect("the run_session thread must not panic")
+            .expect("a headless native run completes");
+
+        let record = seen_live.expect("the live run must have appeared in the registry");
+        assert_eq!(record.agent, "native");
+        assert_eq!(record.verb, sessions::Verb::Exec);
+        assert_eq!(record.runtime, RuntimeKind::Native);
+        assert_eq!(record.role.as_deref(), Some("worker"));
+        assert!(
+            !record.reachable,
+            "a native session binds no turn-signal socket"
+        );
+
+        let after = sessions::list(&state);
+        assert!(
+            after.is_empty(),
+            "the registry record must be gone once the run finished: {after:?}"
+        );
+        assert_eq!(status.status, NativeStatus::Completed);
     }
 
     /// Issue #554 (review round 1): the same four obligations for a headless
