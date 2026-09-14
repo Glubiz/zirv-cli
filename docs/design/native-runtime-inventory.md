@@ -213,6 +213,7 @@ installed binary during self-update; never spawns it).
 | Dash pane restore | `src/commands/ctx/dash/roster.rs` | `restore_argv` | N11 (#480) | rebuilds a verified resume argv for a restored dashboard pane |
 | Dash pane initial spawn | `src/commands/ctx/dash/pane.rs` | `spawn` | N11 (#480) |  |
 | Dash pane harness handover | `src/commands/ctx/dash/pane.rs` | `handover` | N16 (#485) | swaps the harness under a live pane, same session identity |
+| Dash pane swap launch builder | `src/commands/ctx/dash/pane.rs` | `build_swap_launch` | N19 (#488) | derives one successor launch (argv, turn env, knobs); shared by the in-place handover and the open-then-retire successor seam (#552) |
 | Dash spawn-request fulfillment | `src/commands/ctx/dash/mod.rs` | `fulfill_spawn_request` | N11 (#480) | services a worker/pane spawn request from mail or a dispatch |
 | Headless exec spawn | `src/commands/ctx/exec.rs` | `run_with_clock_inner` | N09 (#478) | `zirv ctx exec`'s main headless spawn via `supervise::spawn_tapped` |
 | Headless in-place resume/compact | `src/commands/ctx/exec.rs` | `compact_in_place` | N09 (#478) | resumes a headless session in place to compact it |

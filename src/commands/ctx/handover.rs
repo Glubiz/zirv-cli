@@ -459,15 +459,44 @@ pub fn build_turn_env(
     target_model: Option<&str>,
     generation: Option<u64>,
 ) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = server
-        .map(|server| {
+    build_turn_env_at(
+        new_adapter,
+        server.map(super::signal::SignalServer::path),
+        session_id,
+        repo,
+        role,
+        target_model,
+        generation,
+    )
+}
+
+/// [`build_turn_env`], against a turn-signal socket PATH rather than a bound
+/// server (issue #552).
+///
+/// An in-place swap has the live server in hand, so it passes that. A
+/// successor that does not exist yet does not -- but the path is
+/// `StateDir::socket_for(session_id)`, deterministic from the successor's own
+/// session identity, so the env can be built before the pane binds it. Both
+/// spellings reach the identical `register_turn_signal` call.
+#[allow(clippy::too_many_arguments)]
+pub fn build_turn_env_at(
+    new_adapter: &dyn adapters::AgentAdapter,
+    socket: Option<&Path>,
+    session_id: &str,
+    repo: &Path,
+    role: super::prompt::PromptRole,
+    target_model: Option<&str>,
+    generation: Option<u64>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = socket
+        .map(|socket| {
             new_adapter
                 .register_turn_signal(
                     &super::event::SessionRef {
                         id: super::event::SessionId::parse(session_id),
                         cwd: repo.to_path_buf(),
                     },
-                    server.path(),
+                    socket,
                 )
                 .env
         })

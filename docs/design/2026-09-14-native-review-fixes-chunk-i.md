@@ -139,6 +139,7 @@ fallback at all. The claim itself is refused either way.
 - `native_worker::tests::native_requests_allocate_record_health_and_reconcile_pool_spend`
 - `rollover_runtime::tests::every_rollover_direction_launches_one_successor`
 - `dash::tests::a_native_successor_actually_opens_as_a_live_pane_on_the_same_seat`
+- `dash::tests::a_harness_successor_takes_the_seat_from_a_native_source`
 - `agent::tests::the_dashboard_hosting_this_caller_is_preferred_over_a_newer_foreign_one`
 - `agent::tests::a_restarted_hosted_seats_chat_record_still_names_its_dashboard_for_this_repo`
 - `agent::tests::a_foreign_repo_refusal_tries_the_next_live_dashboard_before_running_inline`
@@ -146,18 +147,10 @@ fallback at all. The claim itself is refused either way.
 
 ## What is deferred
 
-- **`native -> harness` has no successor backend at the dashboard seam.**
-  The three directions with either a native target or a wrapped source are
-  live; the fourth is not. `Pane::handover` swaps a harness child *in place*
-  and correctly refuses a native pane (there is no child to swap), and this
-  seam has no wrapped-successor *spawn* of its own — the argv and turn-env a
-  pty pane needs are derived inside `Pane::handover`, not exposed as a
-  standalone builder that `Pane::spawn` could be handed. So the launcher names
-  it as a typed `NoBackend`: the source keeps the seat with all of its durable
-  state (item 7) instead of failing opaquely. The missing seam is exactly one
-  function — lift `Pane::handover`'s argv/turn-env derivation out into
-  something that produces a `PaneSpec` plus env, which the native branch's
-  existing open-then-retire shape can then use unchanged.
+- **Nothing about the four directions.** All four launch a live successor at
+  the dashboard seam, so `SuccessorRefusal` is down to `LaunchFailed` — and
+  every backend builds its successor completely before taking anything away,
+  so that always leaves the source holding the seat (item 7).
 - **`wrap.rs`'s own swap seam is untouched.** Its ~30 `#[cfg(unix)]` PTY tests
   cannot be compiled on the Windows machine this was developed on.
 - **Native rows still rank on `Unknown`.** A native route reports no

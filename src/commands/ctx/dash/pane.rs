@@ -113,6 +113,24 @@ pub struct PaneSpec {
     pub title: String,
 }
 
+/// Everything one live swap's successor launch carries, derived once by
+/// [`Pane::build_swap_launch`] (issue #552).
+///
+/// Two consumers, one derivation: [`Pane::handover`] replaces a pane's child
+/// in place with it, and `dash::PaneSuccessorLauncher` hands it to
+/// [`Pane::spawn_on_seat`] when the source pane has no child to replace.
+pub(crate) struct SwapLaunch {
+    pub spec: PaneSpec,
+    pub turn_env: Vec<(String, String)>,
+    pub quit_sequence: String,
+    /// The successor adapter's own provider, carried rather than re-derived:
+    /// this pane's token reservation moves onto it, and `AgentAdapter::
+    /// provider` is the answer the adapter itself gives.
+    pub provider: String,
+    pub turn_signal_capable: bool,
+    pub idle_quiet: Duration,
+}
+
 /// How long after a turn signal the child may keep producing output without
 /// that output being read as "a new turn started". A harness redraws its own
 /// prompt, its status line and often the whole viewport right after finishing
@@ -1332,6 +1350,39 @@ impl Pane {
         turn_signal_capable: bool,
         idle_quiet: Duration,
     ) -> CtxResult<Pane> {
+        Self::spawn_on_seat(
+            spec,
+            state,
+            cwd,
+            repo,
+            size,
+            turn_env,
+            turn_signal_capable,
+            idle_quiet,
+            None,
+        )
+    }
+
+    /// [`Pane::spawn`], with an optional SEAT to register under (issue #552).
+    ///
+    /// `None` derives the registry short id from the spec's session id, which
+    /// is every ordinary spawn. `Some` is a rollover successor taking over an
+    /// existing seat: it keeps that seat's stable short id -- the address
+    /// mail, `zirv ctx nudge` and `zirv ctx status` resolve, which by design
+    /// does not move across a rollover -- while running a brand-new session
+    /// of its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_on_seat(
+        spec: PaneSpec,
+        state: &StateDir,
+        cwd: &Path,
+        repo: &Path,
+        size: (u16, u16),
+        turn_env: &[(String, String)],
+        turn_signal_capable: bool,
+        idle_quiet: Duration,
+        seat_short: Option<&str>,
+    ) -> CtxResult<Pane> {
         let PaneSpec {
             agent_name,
             argv,
@@ -1446,6 +1497,10 @@ impl Pane {
         }
 
         let mut record = Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
+        // Issue #552: a rollover successor answers to the seat's own address.
+        if let Some(seat_short) = seat_short {
+            record = record.with_stable_short(seat_short);
+        }
         // `Record::new` stamps `std::process::id()` -- the dashboard's own pid,
         // identical for every pane, so liveness could not tell one pane's child
         // from another's. Stamp the child's real pid instead. `process_id`
@@ -2804,6 +2859,168 @@ impl Pane {
         Ok(())
     }
 
+    /// Everything a live swap's SUCCESSOR launch needs, derived once
+    /// (issue #552).
+    ///
+    /// Lifted verbatim out of [`Pane::handover`]'s own body so the two ways a
+    /// successor can be started share one derivation: `handover` replaces
+    /// this pane's child IN PLACE with it, and `dash::PaneSuccessorLauncher`
+    /// hands it to [`Pane::spawn_on_seat`] when the source is a native pane
+    /// with no child to replace. Nothing about the in-place path changed --
+    /// the same `handover::resolve_swap_launch`/`build_turn_env` seams, the
+    /// same `prompt::interactive_handoff_prompt` delivery, the same resume
+    /// rule -- it is now simply named.
+    ///
+    /// `session_id` is the identity the successor runs under: this pane's own
+    /// for an in-place swap (the conversation moves, the identity does not),
+    /// and a fresh one for a successor that is a new pane. `socket` is the
+    /// turn-signal socket that identity's child should report on -- the live
+    /// server for an in-place swap, and `StateDir::socket_for(session_id)`
+    /// (which `Pane::spawn` goes on to bind) for a fresh one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_swap_launch(
+        &self,
+        cfg: &super::super::config::CtxConfig,
+        req: &super::super::handover::HandoverRequest,
+        handoff_note: &super::super::handoff::Handoff,
+        role: PromptRole,
+        repo: &Path,
+        session_id: &str,
+        socket: Option<&Path>,
+        title: String,
+    ) -> CtxResult<SwapLaunch> {
+        // Whether the packet has to ride along with the resume. A swap back
+        // onto the harness this pane is ALREADY running (issue #440's
+        // source recovery) does not: that conversation holds everything the
+        // packet could only summarise, and nothing happened outside it. A
+        // swap onto a DIFFERENT harness whose conversation is being resumed
+        // is a RETURN from a park -- that conversation missed the whole
+        // interim harness's turn, so the packet is exactly what it lacks.
+        let same_harness = req.target_agent.eq_ignore_ascii_case(self.agent());
+        let carries_handoff = !same_harness;
+        let (new_adapter, mut extra) =
+            super::super::handover::resolve_swap_launch(cfg, req, carries_handoff)?;
+        // Whether `resolve_swap_launch` above actually appended this
+        // adapter's resume flags -- the same shared answer, so the argv and
+        // the prompt decision below cannot disagree.
+        let resuming = super::super::handover::resumes_conversation(
+            new_adapter.as_ref(),
+            req,
+            carries_handoff,
+        );
+        let new_argv: Vec<String> = {
+            // Issue #220: the same off-argv delivery `wrap`'s own restart uses
+            // -- a handover packet is multi-line too, so on a Windows `.cmd`
+            // install it was refused by `guard_cmd_shim_reparse` below and a
+            // large one could overflow the command line outright.
+            let command = if resuming {
+                // Delta review: claude applies its system-prompt flag per
+                // INVOCATION, so a resumed session keeps its whole
+                // conversation but would lose zirv's role layer for the rest
+                // of its life unless this relaunch carries it again.
+                extra.extend(super::super::prompt::role_layer_args(
+                    new_adapter.as_ref(),
+                    role,
+                    &cfg.prompt,
+                    &self.state_dir,
+                    session_id,
+                ));
+                if carries_handoff {
+                    // A return to a parked conversation: resume flags AND
+                    // the interim harness's own packet, which is the only
+                    // record of what happened while this conversation was
+                    // parked.
+                    let prompt_text = super::super::prompt::interactive_handoff_prompt(
+                        new_adapter.as_ref(),
+                        &[],
+                        &mut extra,
+                        &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
+                        &self.state_dir,
+                        session_id,
+                    );
+                    new_adapter.interactive_cmd(Some(&prompt_text), &extra)
+                } else {
+                    // Issue #440's source recovery: the role layer only --
+                    // no handoff text, no positional prompt.
+                    new_adapter.interactive_cmd(None, &extra)
+                }
+            } else {
+                let prompt_text = super::super::prompt::interactive_handoff_prompt(
+                    new_adapter.as_ref(),
+                    &[],
+                    &mut extra,
+                    &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
+                    &self.state_dir,
+                    session_id,
+                );
+                new_adapter.interactive_cmd(Some(&prompt_text), &extra)
+            };
+            std::iter::once(command.get_program().to_string_lossy().to_string())
+                .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
+                .collect()
+        };
+        // NON-GOAL residual (2026-08-28, filed rather than silently
+        // omitted): `handover::build_turn_env` does not push the durable
+        // interactive-launch pin, so `self.launch_mode` still reads this
+        // pane's ORIGINAL spawn mode after a handover even though the
+        // successor child below never actually receives the pin either
+        // way. Out of scope for issue #160's fix round, which named exactly
+        // three call sites (`fulfill_spawn_request`, `run_dashboard`'s
+        // first pane, `restored_pane_turn_env`), all in `dash::mod`, not
+        // this one -- a pane that both underwent a handover AND survives a
+        // later dashboard restore is the only case this residual reaches.
+        // Finding #10 (issue #358 review): the successor must carry a
+        // fencing generation of its own -- see `handover::build_turn_env`'s
+        // own doc comment. `req.generation` is the PREPARED generation an
+        // automatic swap's `seat::commit` is about to promote to `Seat::
+        // generation`; a manual swap opens no transaction and never changes
+        // it, so it falls back to whatever is on disk right now.
+        let successor_generation = req.generation.or_else(|| {
+            super::super::seat::load(&self.state_dir, self.short()).map(|seat| seat.generation)
+        });
+        let mut turn_env = super::super::handover::build_turn_env_at(
+            new_adapter.as_ref(),
+            socket,
+            session_id,
+            repo,
+            role,
+            req.target_model.as_deref(),
+            successor_generation,
+        );
+        // Issue #249/#250 review (Fix 3): `build_turn_env` scrubs and
+        // rebuilds the turn-signal/agent/seat-model env from scratch but has
+        // no knowledge of this pane's own parent lineage, so without this the
+        // successor child's own real process env would carry no
+        // `PARENT_SESSION_ENV` at all -- a nested `zirv ctx` call inside it
+        // (e.g. `zirv ctx inbox`) would then render this same pane's own
+        // parent's mail as ordinary peer mail, even though this dashboard's
+        // own sweep (`Pane::parent_session`, unaffected by a handover) still
+        // labels it steering. Mirrors `dash::mod::fulfill_spawn_request`'s
+        // own push of the identical pair from `verified_parent` at first
+        // spawn.
+        if let Some(parent) = self.parent_session() {
+            turn_env.push((
+                super::super::agent::PARENT_SESSION_ENV.to_string(),
+                parent.to_string(),
+            ));
+        }
+        Ok(SwapLaunch {
+            spec: PaneSpec {
+                agent_name: new_adapter.name().to_string(),
+                argv: new_argv,
+                role,
+                verb: self.verb,
+                session_id: session_id.to_string(),
+                title,
+            },
+            turn_env,
+            quit_sequence: new_adapter.quit_sequence().to_string(),
+            provider: new_adapter.provider().to_string(),
+            turn_signal_capable: new_adapter.capabilities().turn_signal,
+            idle_quiet: Duration::from_millis(cfg.dash.idle_quiet_ms),
+        })
+    }
+
     /// Issue #84: swaps this pane's harness/model in place, keeping its
     /// registry short id (the same socket, the same mail/nudge address) --
     /// only the pty, the child, its job/console-close guard, the writer, the
@@ -2846,125 +3063,31 @@ impl Pane {
                     .into(),
             );
         }
-        // Whether the packet has to ride along with the resume. A swap back
-        // onto the harness this pane is ALREADY running (issue #440's
-        // source recovery) does not: that conversation holds everything the
-        // packet could only summarise, and nothing happened outside it. A
-        // swap onto a DIFFERENT harness whose conversation is being resumed
-        // is a RETURN from a park -- that conversation missed the whole
-        // interim harness's turn, so the packet is exactly what it lacks.
-        let same_harness = req.target_agent.eq_ignore_ascii_case(self.agent());
-        let carries_handoff = !same_harness;
-        let (new_adapter, mut extra) =
-            super::super::handover::resolve_swap_launch(cfg, req, carries_handoff)?;
-        // Whether `resolve_swap_launch` above actually appended this
-        // adapter's resume flags -- the same shared answer, so the argv and
-        // the prompt decision below cannot disagree.
-        let resuming = super::super::handover::resumes_conversation(
-            new_adapter.as_ref(),
+        let launch = self.build_swap_launch(
+            cfg,
             req,
-            carries_handoff,
-        );
-        let new_argv: Vec<String> = {
-            // Issue #220: the same off-argv delivery `wrap`'s own restart uses
-            // -- a handover packet is multi-line too, so on a Windows `.cmd`
-            // install it was refused by `guard_cmd_shim_reparse` below and a
-            // large one could overflow the command line outright.
-            let command = if resuming {
-                // Delta review: claude applies its system-prompt flag per
-                // INVOCATION, so a resumed session keeps its whole
-                // conversation but would lose zirv's role layer for the rest
-                // of its life unless this relaunch carries it again.
-                extra.extend(super::super::prompt::role_layer_args(
-                    new_adapter.as_ref(),
-                    role,
-                    &cfg.prompt,
-                    &self.state_dir,
-                    &self.session_id,
-                ));
-                if carries_handoff {
-                    // A return to a parked conversation: resume flags AND
-                    // the interim harness's own packet, which is the only
-                    // record of what happened while this conversation was
-                    // parked.
-                    let prompt_text = super::super::prompt::interactive_handoff_prompt(
-                        new_adapter.as_ref(),
-                        &[],
-                        &mut extra,
-                        &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
-                        &self.state_dir,
-                        &self.session_id,
-                    );
-                    new_adapter.interactive_cmd(Some(&prompt_text), &extra)
-                } else {
-                    // Issue #440's source recovery: the role layer only --
-                    // no handoff text, no positional prompt.
-                    new_adapter.interactive_cmd(None, &extra)
-                }
-            } else {
-                let prompt_text = super::super::prompt::interactive_handoff_prompt(
-                    new_adapter.as_ref(),
-                    &[],
-                    &mut extra,
-                    &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
-                    &self.state_dir,
-                    &self.session_id,
-                );
-                new_adapter.interactive_cmd(Some(&prompt_text), &extra)
-            };
-            std::iter::once(command.get_program().to_string_lossy().to_string())
-                .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
-                .collect()
-        };
-        // NON-GOAL residual (2026-08-28, filed rather than silently
-        // omitted): `handover::build_turn_env` does not push the durable
-        // interactive-launch pin, so `self.launch_mode` still reads this
-        // pane's ORIGINAL spawn mode after a handover even though the
-        // successor child below never actually receives the pin either
-        // way. Out of scope for issue #160's fix round, which named exactly
-        // three call sites (`fulfill_spawn_request`, `run_dashboard`'s
-        // first pane, `restored_pane_turn_env`), all in `dash::mod`, not
-        // this one -- a pane that both underwent a handover AND survives a
-        // later dashboard restore is the only case this residual reaches.
-        // Finding #10 (issue #358 review): the successor must carry a
-        // fencing generation of its own -- see `handover::build_turn_env`'s
-        // own doc comment. `req.generation` is the PREPARED generation an
-        // automatic swap's `seat::commit` is about to promote to `Seat::
-        // generation`; a manual swap opens no transaction and never changes
-        // it, so it falls back to whatever is on disk right now.
-        let successor_generation = req.generation.or_else(|| {
-            super::super::seat::load(&self.state_dir, self.short()).map(|seat| seat.generation)
-        });
-        let mut turn_env = super::super::handover::build_turn_env(
-            new_adapter.as_ref(),
-            self.pty().and_then(|pty| pty.server.as_ref()),
-            &self.session_id,
-            repo,
+            handoff_note,
             role,
-            req.target_model.as_deref(),
-            successor_generation,
-        );
-        // Issue #249/#250 review (Fix 3): `build_turn_env` scrubs and
-        // rebuilds the turn-signal/agent/seat-model env from scratch but has
-        // no knowledge of this pane's own parent lineage, so without this the
-        // successor child's own real process env would carry no
-        // `PARENT_SESSION_ENV` at all -- a nested `zirv ctx` call inside it
-        // (e.g. `zirv ctx inbox`) would then render this same pane's own
-        // parent's mail as ordinary peer mail, even though this dashboard's
-        // own sweep (`Pane::parent_session`, unaffected by a handover) still
-        // labels it steering. Mirrors `dash::mod::fulfill_spawn_request`'s
-        // own push of the identical pair from `verified_parent` at first
-        // spawn.
-        if let Some(parent) = self.parent_session() {
-            turn_env.push((
-                super::super::agent::PARENT_SESSION_ENV.to_string(),
-                parent.to_string(),
-            ));
-        }
-        let quit_sequence = new_adapter.quit_sequence().to_string();
-        let new_agent_name = new_adapter.name().to_string();
-        let turn_signal_capable = new_adapter.capabilities().turn_signal;
-        let idle_quiet = Duration::from_millis(cfg.dash.idle_quiet_ms);
+            repo,
+            &self.session_id.clone(),
+            self.pty()
+                .and_then(|pty| pty.server.as_ref())
+                .map(super::super::signal::SignalServer::path),
+            self.title.clone(),
+        )?;
+        let SwapLaunch {
+            spec:
+                PaneSpec {
+                    agent_name: new_agent_name,
+                    argv: new_argv,
+                    ..
+                },
+            turn_env,
+            quit_sequence,
+            provider: new_provider,
+            turn_signal_capable,
+            idle_quiet,
+        } = launch;
 
         // Finding #2: every fallible step for the *successor* runs first,
         // before the old child is touched at all. Previously the old child
@@ -3094,10 +3217,9 @@ impl Pane {
         if let Some(old_id) = self.reservation_id.take() {
             let _ = super::super::reservation::release(&self.state_dir, &old_provider, &old_id);
         }
-        let new_provider = new_adapter.provider();
         self.reservation_id = match super::super::reservation::reserve(
             &self.state_dir,
-            new_provider,
+            &new_provider,
             &self.session_id,
             self.budget_tokens().unwrap_or(0),
             super::super::state::now_secs(),

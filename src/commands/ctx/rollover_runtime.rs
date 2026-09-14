@@ -734,25 +734,15 @@ pub struct SuccessorPlan {
 /// seat with its durable state intact (item 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SuccessorRefusal {
-    /// The plan named a runtime the seam that was asked has no backend for.
-    NoBackend {
-        runtime: RuntimeKind,
-        reason: String,
-    },
-    /// The launch itself failed.
+    /// The launch itself failed. Every seam builds its successor completely
+    /// before it takes anything away from the source, so this always means
+    /// the source is still there and still holding the seat.
     LaunchFailed(String),
 }
 
 impl std::fmt::Display for SuccessorRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoBackend { runtime, reason } => {
-                write!(
-                    f,
-                    "no {} successor backend here: {reason}",
-                    runtime.as_str()
-                )
-            }
             Self::LaunchFailed(reason) => write!(f, "the successor did not start: {reason}"),
         }
     }
