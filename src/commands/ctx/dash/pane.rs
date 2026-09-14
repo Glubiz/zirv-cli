@@ -4484,6 +4484,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -4574,6 +4576,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -4740,6 +4744,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         pane.handover(
             &cfg,
@@ -5070,6 +5076,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -5169,6 +5177,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -5253,6 +5263,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: Some(parked_conversation.to_string()),
+            target_runtime: None,
+            target_route: None,
         };
 
         pane.handover(
@@ -5356,6 +5368,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: true,
             resume_session: Some(session_id.to_string()),
+            target_runtime: None,
+            target_route: None,
         };
 
         pane.handover(
@@ -5468,6 +5482,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -5555,6 +5571,8 @@ pub(crate) mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -6702,6 +6720,8 @@ pub(crate) mod tests {
                     generation: None,
                     structural_only: false,
                     resume_session: None,
+                    target_runtime: None,
+                    target_route: None,
                 },
                 &super::super::super::handoff::Handoff::default(),
                 PromptRole::Worker,

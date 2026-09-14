@@ -272,6 +272,35 @@ pub struct HandoverRequest {
     /// exactly what that fallback cannot carry.
     #[serde(default)]
     pub resume_session: Option<String>,
+    /// Issue #552: the RUNTIME the successor must actually be started on.
+    /// `harness` (the default, and what every pre-#552 request means) starts
+    /// a supervised harness child; `native` starts a native session on
+    /// [`Self::target_route`]. Without this the live swap seams resolved a
+    /// harness adapter unconditionally, so no rollover direction with a
+    /// native target could ever launch the thing it had decided on.
+    #[serde(default)]
+    pub target_runtime: Option<String>,
+    /// The native route a `target_runtime = native` successor runs. Ignored
+    /// for a harness successor, which is named by [`Self::target_agent`].
+    #[serde(default)]
+    pub target_route: Option<String>,
+}
+
+impl HandoverRequest {
+    /// The runtime this request's successor must be started on. Anything
+    /// other than an explicit `native` is a harness, which is what every
+    /// request written before issue #552 means and the only kind of row
+    /// `fallback.order` can name.
+    pub fn successor_runtime(&self) -> super::runtime::RuntimeKind {
+        match self.target_runtime.as_deref() {
+            Some(name)
+                if name.eq_ignore_ascii_case(super::runtime::RuntimeKind::Native.as_str()) =>
+            {
+                super::runtime::RuntimeKind::Native
+            }
+            _ => super::runtime::RuntimeKind::Harness,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -595,6 +624,8 @@ pub fn run_with<W: Write>(
         generation: None,
         structural_only: false,
         resume_session: None,
+        target_runtime: None,
+        target_route: None,
     };
     // T4 (C-3): a previous handover attempt (or an automatic rollover that
     // wrote one before this fix) can leave an ack sitting next to the
@@ -992,6 +1023,8 @@ mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         write_request(&state, "abcd1234", &req).expect("write");
         let claimed = take_request(&state, "abcd1234").expect("present");
@@ -1109,6 +1142,8 @@ mod tests {
             generation: None,
             structural_only: false,
             resume_session: Some("conv-1".to_string()),
+            target_runtime: None,
+            target_route: None,
         };
         let (adapter, extra) = resolve_swap_launch(&cfg, &req, true).expect("resolves");
         assert!(
@@ -1143,6 +1178,8 @@ mod tests {
             generation: None,
             structural_only: false,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let (_, extra) = resolve_swap_launch(&cfg, &req, true).expect("resolves");
         assert!(
@@ -1171,6 +1208,8 @@ mod tests {
             generation: None,
             structural_only: true,
             resume_session: None,
+            target_runtime: None,
+            target_route: None,
         };
         let (_, extra) = resolve_swap_launch(&cfg, &cold, true).expect("resolves");
         assert!(
@@ -1180,6 +1219,8 @@ mod tests {
 
         let resumed = HandoverRequest {
             resume_session: Some(session.to_string()),
+            target_runtime: None,
+            target_route: None,
             ..cold
         };
         let (_, extra) = resolve_swap_launch(&cfg, &resumed, true).expect("resolves");

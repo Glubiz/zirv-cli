@@ -648,8 +648,9 @@ pub fn disposition(record: &delegation::Record, drain: Drain, owner: &str) -> Di
 /// unresolved effect is exactly what a cancel must not erase. A `Retained`
 /// worker's record is re-saved unchanged apart from its updated timestamp,
 /// which is what makes the retention itself durable rather than an assumption.
-/// See [`Disposition`] for why this has no in-tree caller yet.
-#[allow(dead_code)]
+/// Issue #552: [`launch_successor`] is its production caller -- settling this
+/// seat's subagents is part of ADMITTING the successor, not a step a swap
+/// seam has to remember.
 pub fn settle_subagents(
     state: &StateDir,
     repo: &Path,
@@ -687,6 +688,163 @@ pub fn settle_subagents(
         out.push((record.handle.delegation.clone(), verdict));
     }
     out
+}
+
+// -- the successor launch seam (issue #552) --------------------------------
+
+/// One live swap's successor, fully decided before anything is started.
+///
+/// Issue #552: the four runtime DIRECTIONS are one field, not four code
+/// paths. `from`/`to` are the resolved runtimes of the session leaving the
+/// seat and the one taking it, so a seam cannot accidentally start a harness
+/// child for a native successor (which is exactly what every live swap seam
+/// did before this existed: `handover::resolve_swap_launch` resolves an
+/// adapter unconditionally).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessorPlan {
+    pub from: RuntimeKind,
+    pub to: RuntimeKind,
+    /// The seat's stable short id. It does NOT change across a rollover --
+    /// that is the whole point of a seat address (`sessions::SessionGuard::
+    /// refresh_session`'s own doc comment) -- so the successor answers to the
+    /// same mail, nudge and `zirv ctx status` identity the source did.
+    pub short: String,
+    /// The generation the successor runs under: the one `seat::commit`
+    /// promotes. Every write the successor makes is fenced on it.
+    pub generation: u64,
+    /// The harness this successor runs, for a `to == Harness` plan.
+    pub target_agent: Option<String>,
+    pub target_model: Option<String>,
+    /// The native route this successor runs, for a `to == Native` plan.
+    pub target_route: Option<String>,
+    /// The provider conversation the successor resumes, when it legally may.
+    pub resume_session: Option<String>,
+    /// Acknowledged input the source never folded into a provider request.
+    /// Carried verbatim: criterion 2 forbids losing an operator's turn, and
+    /// a successor that is not handed this owes it and does not know.
+    pub acknowledged_input: Vec<String>,
+    /// Task claims the source still holds, carried under the same generation.
+    pub claims: Vec<String>,
+    /// Set when the boundary carried an ambiguous effect. The successor is
+    /// admitted but HALTED: it must reconcile before acting.
+    pub halted_for: Option<String>,
+}
+
+/// Why no successor was started. Every variant leaves the SOURCE holding the
+/// seat with its durable state intact (item 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessorRefusal {
+    /// The plan named a runtime the seam that was asked has no backend for.
+    NoBackend {
+        runtime: RuntimeKind,
+        reason: String,
+    },
+    /// The launch itself failed.
+    LaunchFailed(String),
+}
+
+impl std::fmt::Display for SuccessorRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoBackend { runtime, reason } => {
+                write!(
+                    f,
+                    "no {} successor backend here: {reason}",
+                    runtime.as_str()
+                )
+            }
+            Self::LaunchFailed(reason) => write!(f, "the successor did not start: {reason}"),
+        }
+    }
+}
+
+/// The backend one live swap seam provides so [`launch_successor`] can start
+/// exactly one successor without knowing how.
+///
+/// A seam implements this once and gets the direction dispatch, the halt
+/// gate and the subagent settlement for free. Returns the successor's own
+/// session identity.
+pub trait SuccessorLauncher {
+    fn launch(&mut self, plan: &SuccessorPlan) -> Result<String, SuccessorRefusal>;
+}
+
+/// Builds the plan for one live swap, from the boundary the source already
+/// reached (issue #552).
+///
+/// PURE. Every direction is decided here, from `from`/`to`, so the four
+/// combinations are one table rather than four seams that can drift.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_successor(
+    from: RuntimeKind,
+    to: RuntimeKind,
+    short: &str,
+    generation: u64,
+    target_agent: Option<&str>,
+    target_model: Option<&str>,
+    target_route: Option<&str>,
+    resume_session: Option<&str>,
+    boundary: Option<&Boundary>,
+) -> SuccessorPlan {
+    SuccessorPlan {
+        from,
+        to,
+        short: short.to_string(),
+        generation,
+        // A harness successor is named by an agent; a native one by a route.
+        // Stated per direction rather than carried through blindly, so a
+        // native target can never end up with a harness adapter name and a
+        // harness target can never be handed a route id.
+        target_agent: match to {
+            RuntimeKind::Native => None,
+            _ => target_agent.map(str::to_string),
+        },
+        target_model: target_model.map(str::to_string),
+        target_route: match to {
+            RuntimeKind::Native => target_route.map(str::to_string),
+            _ => None,
+        },
+        // A provider's opaque continuation belongs to one conversation on one
+        // runtime. Crossing runtimes therefore never resumes: the successor
+        // rebuilds from the portable checkpoint instead (the design note's
+        // §2.4 table, enforced here rather than trusted).
+        resume_session: if from == to {
+            resume_session.map(str::to_string)
+        } else {
+            None
+        },
+        acknowledged_input: boundary
+            .map(|b| b.pending_input.clone())
+            .unwrap_or_default(),
+        claims: boundary.map(|b| b.claims.clone()).unwrap_or_default(),
+        halted_for: boundary.and_then(Boundary::reconciliation_note),
+    }
+}
+
+/// Starts EXACTLY ONE successor for one live swap (issue #552).
+///
+/// The single production seam a rollover's execution admission goes through:
+///
+/// 1. this seat's subagents are settled first ([`settle_subagents`]) -- a
+///    worker the source launched is finished, stopped or explicitly retained
+///    under the seat's own address BEFORE anything takes the seat, so it can
+///    never end up owned by two generations at once;
+/// 2. the successor is started once, through the seam's own backend;
+/// 3. a plan carrying an ambiguous effect starts its successor HALTED
+///    (`SuccessorPlan::halted_for`), never unaware -- criterion 4.
+///
+/// Returns the successor's own session identity. A refusal leaves the source
+/// holding the seat: nothing here removes the source's state.
+pub fn launch_successor(
+    state: &StateDir,
+    repo: &Path,
+    launcher: &mut dyn SuccessorLauncher,
+    plan: &SuccessorPlan,
+    parent_session: Option<&str>,
+    drain: Drain,
+    now: u64,
+) -> Result<String, SuccessorRefusal> {
+    settle_subagents(state, repo, &plan.short, parent_session, drain, now);
+    launcher.launch(plan)
 }
 
 // -- items 7 and 8: the durable rollover record ----------------------------
@@ -1071,6 +1229,7 @@ mod tests {
         runtime: route::RuntimeKind,
     ) -> RouteOffer {
         RouteOffer {
+            route: format!("{provider}-route"),
             identity: RouteIdentity {
                 runtime,
                 provider: provider.to_string(),
@@ -1903,6 +2062,142 @@ mod tests {
             }
         }
         (short, Some(journal_session))
+    }
+
+    /// Issue #552: every rollover direction actually STARTS a successor, and
+    /// starts exactly one.
+    ///
+    /// Drives the production seam (`launch_successor`) for all four runtime
+    /// pairs with a recording launcher standing in for the seam's own
+    /// backend -- which is where a dashboard pane's pty swap plugs in
+    /// (`dash::PaneSuccessorLauncher`). What is asserted is what the seam
+    /// itself owes: one successor per direction, the seat's short id
+    /// unchanged, the acknowledged input the source never delivered handed
+    /// on, and the successor halted when an ambiguous effect came with it.
+    #[test]
+    fn every_rollover_direction_launches_one_successor() {
+        struct Recorder {
+            launched: Vec<SuccessorPlan>,
+        }
+        impl SuccessorLauncher for Recorder {
+            fn launch(&mut self, plan: &SuccessorPlan) -> Result<String, SuccessorRefusal> {
+                self.launched.push(plan.clone());
+                Ok(format!("successor-for-{}", plan.short))
+            }
+        }
+
+        for (index, (source, target)) in runtimes().into_iter().enumerate() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).expect("mkdir repo");
+            let session = format!("{index:04x}0000-1111-4000-8000-000000000000");
+            let (short, journal_session) = source_session(&state, &session, source);
+
+            // A native source reaches a real boundary over a real journal: an
+            // acknowledged input it never delivered, and an effect that began
+            // and never reported.
+            let boundary = journal_session.as_ref().map(|journal_session| {
+                let mut journal = Journal::open(&state).expect("journal");
+                reach_boundary(
+                    &mut journal,
+                    journal_session,
+                    1,
+                    Drain::Quiesced,
+                    &CheckpointContext {
+                        hard_constraints: Vec::new(),
+                        task: Some("task-1".to_string()),
+                        workflow: None,
+                        reason: "rollover".to_string(),
+                    },
+                    500,
+                )
+                .expect("boundary")
+            });
+
+            let plan = plan_successor(
+                source,
+                target,
+                &short,
+                7,
+                Some("claude"),
+                Some("claude-sonnet-4-5"),
+                Some("anthropic-route"),
+                Some("source-conversation"),
+                boundary.as_ref(),
+            );
+            let mut recorder = Recorder {
+                launched: Vec::new(),
+            };
+            let successor = launch_successor(
+                &state,
+                &repo,
+                &mut recorder,
+                &plan,
+                Some(&session),
+                Drain::Quiesced,
+                600,
+            )
+            .expect("every direction starts its successor");
+
+            assert_eq!(
+                recorder.launched.len(),
+                1,
+                "exactly one successor for {source:?} -> {target:?}, never zero and never two"
+            );
+            let launched = &recorder.launched[0];
+            assert_eq!(launched.from, source);
+            assert_eq!(launched.to, target);
+            assert_eq!(
+                launched.short, short,
+                "the seat's short id is its address and survives the rollover"
+            );
+            assert_eq!(successor, format!("successor-for-{short}"));
+            assert_eq!(launched.generation, 7, "under the committed generation");
+            match target {
+                RuntimeKind::Native => {
+                    assert_eq!(launched.target_route.as_deref(), Some("anthropic-route"));
+                    assert_eq!(
+                        launched.target_agent, None,
+                        "a native successor is named by a route, never by a harness"
+                    );
+                }
+                _ => {
+                    assert_eq!(launched.target_agent.as_deref(), Some("claude"));
+                    assert_eq!(
+                        launched.target_route, None,
+                        "a harness successor is named by an agent, never by a route"
+                    );
+                }
+            }
+            if source == target {
+                assert_eq!(
+                    launched.resume_session.as_deref(),
+                    Some("source-conversation"),
+                    "a same-runtime successor may resume the conversation it inherits"
+                );
+            } else {
+                assert_eq!(
+                    launched.resume_session, None,
+                    "a provider envelope never crosses runtimes"
+                );
+            }
+            if let Some(boundary) = &boundary {
+                assert_eq!(
+                    launched.acknowledged_input, boundary.pending_input,
+                    "acknowledged input the source never delivered is handed on verbatim"
+                );
+                assert!(
+                    !launched.acknowledged_input.is_empty(),
+                    "the fixture owes the successor an input, or this asserts nothing"
+                );
+                assert_eq!(launched.claims, boundary.claims);
+                assert!(
+                    launched.halted_for.is_some(),
+                    "an effect that began and never reported halts the successor"
+                );
+            }
+        }
     }
 
     /// Criteria 1 and 2, for every direction and every trigger that moves the

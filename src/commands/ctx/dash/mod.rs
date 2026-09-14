@@ -3869,6 +3869,50 @@ fn push_error(errors: &mut ErrorLog, message: String) {
     errors.record(message, Instant::now());
 }
 
+/// The dashboard's own successor backend (issue #552).
+///
+/// A harness successor is the in-place pty swap `Pane::handover` has always
+/// performed. A NATIVE successor has no backend at this seam yet: a native
+/// pane is opened by `Pane::spawn_native`, which mints its own session rather
+/// than replacing a live pane's child in place, so claiming it here would be
+/// claiming a mechanism that does not exist. It is a typed `NoBackend`
+/// refusal instead, which leaves the source holding the seat with all of its
+/// durable state -- `rollover_runtime`'s own item 7.
+struct PaneSuccessorLauncher<'a> {
+    pane: &'a mut Pane,
+    cfg: &'a CtxConfig,
+    req: &'a handover::HandoverRequest,
+    note: &'a handoff::Handoff,
+    role: prompt::PromptRole,
+    repo: &'a Path,
+    size: (u16, u16),
+}
+
+impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
+    fn launch(
+        &mut self,
+        plan: &super::rollover_runtime::SuccessorPlan,
+    ) -> Result<String, super::rollover_runtime::SuccessorRefusal> {
+        use super::rollover_runtime::SuccessorRefusal;
+
+        if plan.to == super::runtime::RuntimeKind::Native {
+            return Err(SuccessorRefusal::NoBackend {
+                runtime: plan.to,
+                reason: "a dashboard pane replaces a harness child in place; opening a native \
+                         session in its place is not yet implemented, so the source keeps the \
+                         seat"
+                    .to_string(),
+            });
+        }
+        self.pane
+            .handover(
+                self.cfg, self.req, self.note, self.role, self.repo, self.size,
+            )
+            .map(|()| self.pane.session_id().to_string())
+            .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()))
+    }
+}
+
 /// Issue #84: the `Ctrl+A o` picker's confirm action. Distills a handoff
 /// packet through the exact same machinery `wrap::perform_handover_swap`
 /// uses (`handoff::distill_or_structural` against the pane's own current
@@ -3952,8 +3996,56 @@ fn handover_pane(
         prompt::PromptRole::Worker
     };
     let size = pane.screen().size();
-    match pane.handover(cfg, req, &note, role, repo, (size.1, size.0)) {
-        Ok(()) => true,
+    // Issue #552: every live swap starts its successor through the ONE
+    // production seam, `rollover_runtime::launch_successor` -- so the
+    // direction (harness->harness, harness->native, native->harness,
+    // native->native) decides which backend runs, this seat's subagents are
+    // settled before anything takes the seat, and an ambiguous tool effect
+    // halts the successor instead of being replayed by it.
+    let from = if pane.is_native() {
+        super::runtime::RuntimeKind::Native
+    } else {
+        super::runtime::RuntimeKind::Harness
+    };
+    let plan = super::rollover_runtime::plan_successor(
+        from,
+        req.successor_runtime(),
+        pane.short(),
+        req.generation
+            .or_else(|| super::seat::load(state, pane.short()).map(|seat| seat.generation))
+            .unwrap_or(1),
+        Some(&req.target_agent),
+        req.target_model.as_deref(),
+        req.target_route.as_deref(),
+        req.resume_session.as_deref(),
+        super::rollover_runtime::load(state, pane.short())
+            .and_then(|record| record.boundary)
+            .as_ref(),
+    );
+    let parent_session = pane.session_id().to_string();
+    let mut launcher = PaneSuccessorLauncher {
+        pane,
+        cfg,
+        req,
+        note: &note,
+        role,
+        repo,
+        size: (size.1, size.0),
+    };
+    match super::rollover_runtime::launch_successor(
+        state,
+        repo,
+        &mut launcher,
+        &plan,
+        Some(&parent_session),
+        if req.structural_only {
+            super::rollover_runtime::Drain::Forced
+        } else {
+            super::rollover_runtime::Drain::Quiesced
+        },
+        super::state::now_secs(),
+    ) {
+        Ok(_) => true,
         Err(e) => {
             // `Pane::handover` assembles the successor completely before it
             // touches the old child, so a failure here leaves the pane
@@ -4191,6 +4283,8 @@ fn settle_pending_rollover(
                             generation: None,
                             structural_only: true,
                             resume_session: resume.clone(),
+                            target_runtime: None,
+                            target_route: None,
                         },
                         cfg,
                         repo,
@@ -6318,8 +6412,7 @@ fn fulfill_spawn_request(
         };
         if mismatched {
             return Err(SpawnRefusal::policy(format!(
-                "a spawn request may only name the session it was sent from as its parent; this \
-                 one arrived on {} and claimed '{claimed}'",
+                "a spawn request may only name the session it was sent from as its parent; this                  one arrived on {} and claimed '{claimed}'",
                 match requester {
                     Some(requester) => format!("session {requester}'s own channel"),
                     None => "a channel that proves no session identity".to_string(),
@@ -12196,6 +12289,8 @@ pub fn run_dashboard(
                                                             generation: None,
                                                             structural_only: false,
                                                             resume_session: None,
+                                                            target_runtime: None,
+                                                            target_route: None,
                                                         },
                                                         cfg,
                                                         repo,
