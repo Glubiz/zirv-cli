@@ -38,7 +38,16 @@ const MAX_TEXT_BYTES: usize = 4096;
 /// How many items one list may carry. The OLDEST entries are dropped first
 /// for narrative lists, and the NEWEST are never dropped for anything that
 /// records an obligation.
+///
+/// `acknowledged_input` is deliberately NOT one of those lists: see
+/// [`bound_acknowledged_input`].
 const MAX_ITEMS: usize = 64;
+/// Total budget for the carried text of `acknowledged_input` (issue #580).
+/// A checkpoint must keep EVERY acknowledged turn -- an operator instruction
+/// is not narrative -- so length is bounded by eliding the text of the oldest
+/// already-delivered turns instead of by dropping turns. The elided text
+/// stays resolvable through the journal by `message_id`.
+const MAX_ACKNOWLEDGED_TEXT_BYTES: usize = MAX_ITEMS * MAX_TEXT_BYTES;
 
 /// The route a checkpoint was taken on, in portable string form. Compared
 /// field-by-field against a target route to decide whether a resume may keep
@@ -80,6 +89,12 @@ pub struct AcknowledgedInput {
     /// `true` while this input has not yet been folded into a provider
     /// request. A restored session must still deliver it.
     pub pending: bool,
+    /// `true` when `text` was spilled to keep the checkpoint bounded: the
+    /// turn itself is still recorded, and its verbatim text is read back from
+    /// the journal by `message_id`. Never set on a `pending` input, which is
+    /// still owed and therefore needs its text.
+    #[serde(default)]
+    pub text_elided: bool,
 }
 
 /// A task this session holds, from the journal's own receipts. A reference,
@@ -322,6 +337,7 @@ pub fn build(
             text,
             steering: message.steering,
             pending: message.sequence > delivered_through,
+            text_elided: false,
         });
     }
 
@@ -417,7 +433,8 @@ pub fn build(
     truncate_oldest(&mut receipts, MAX_ITEMS);
     truncate_newest_kept(&mut outstanding_tools, MAX_ITEMS);
     truncate_oldest(&mut evidence, MAX_ITEMS);
-    truncate_newest_kept(&mut acknowledged_input, MAX_ITEMS);
+    // NOT truncated: every acknowledged turn survives, bounded by bytes.
+    bound_acknowledged_input(&mut acknowledged_input);
 
     PortableCheckpoint {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
@@ -444,6 +461,34 @@ pub fn build(
         outstanding_tools,
         evidence,
         summary,
+    }
+}
+
+/// Bounds the acknowledged-input list by BYTES, never by entry count
+/// (issue #580).
+///
+/// Every acknowledged turn stays in the list, in order, with its id,
+/// sequence, steering flag and pending flag intact. When the carried text
+/// exceeds [`MAX_ACKNOWLEDGED_TEXT_BYTES`] the OLDEST already-delivered
+/// turns give up their text first -- marked `text_elided`, so a reader knows
+/// to resolve it from the journal by `message_id` rather than believing the
+/// turn said nothing. A `pending` turn is never elided: it is still owed, and
+/// a restored session has to deliver its words.
+fn bound_acknowledged_input(items: &mut [AcknowledgedInput]) {
+    let mut total: usize = items.iter().map(|input| input.text.len()).sum();
+    if total <= MAX_ACKNOWLEDGED_TEXT_BYTES {
+        return;
+    }
+    for input in items.iter_mut() {
+        if total <= MAX_ACKNOWLEDGED_TEXT_BYTES {
+            return;
+        }
+        if input.pending || input.text.is_empty() {
+            continue;
+        }
+        total -= input.text.len();
+        input.text.clear();
+        input.text_elided = true;
     }
 }
 
@@ -779,6 +824,40 @@ mod tests {
         assert_eq!(checkpoint.objective.as_deref(), Some("objective"));
         assert_eq!(checkpoint.pending_input().len(), 1);
         assert_eq!(checkpoint.pending_input()[0].text, "late steering");
+    }
+
+    #[test]
+    fn portable_checkpoint_preserves_more_than_64_acknowledged_inputs() {
+        let mut state = empty_state(session_identity("s1", route_identity()));
+        // 65 distinct acknowledged turns: one more than the old MAX_ITEMS cap,
+        // which used to drop the oldest and silently lose operator input.
+        let turns = 65u64;
+        state.messages = (1..=turns)
+            .map(|sequence| user(sequence, &format!("instruction {sequence}")))
+            .collect();
+        state.last_sequence = SequenceId(turns);
+        let checkpoint = build(
+            &state,
+            SequenceId(turns),
+            SequenceId(turns),
+            &CheckpointId::new("cp-1").expect("id"),
+            &CheckpointContext::default(),
+            structural(),
+            10,
+        );
+        let json = serde_json::to_string(&checkpoint).expect("serialize");
+        let restored: PortableCheckpoint = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.acknowledged_input.len(), turns as usize);
+        for (index, input) in restored.acknowledged_input.iter().enumerate() {
+            let sequence = index as u64 + 1;
+            assert_eq!(input.sequence, sequence, "order is preserved");
+            assert_eq!(input.message_id, format!("msg-{sequence}"));
+            assert!(
+                !input.text_elided,
+                "nothing is elided under the byte budget"
+            );
+            assert_eq!(input.text, format!("instruction {sequence}"));
+        }
     }
 
     #[test]
