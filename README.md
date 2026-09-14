@@ -1652,8 +1652,11 @@ controls are checked locally; authentication, entitlement, model access,
 context limits, rate limits, overloads, timeouts, cancellation, refusals, and
 usage/cache classes remain typed. Opaque continuation material is replayed
 verbatim but excluded from diagnostics. Versioned fixtures and an ignored,
-credential-gated live contract test cover the provider boundary; N09 owns
-wiring this adapter into the durable agent loop. The transport contract is in
+credential-gated live contract test (`cargo test --ignored
+live_anthropic_messages_contract`, needing `ANTHROPIC_API_KEY` and
+`ZIRV_ANTHROPIC_LIVE_MODEL` — an exact, entitled model id) cover the provider
+boundary; N09 owns wiring this adapter into the durable agent loop. The
+transport contract is in
 [`docs/design/2026-09-12-native-anthropic-provider.md`](docs/design/2026-09-12-native-anthropic-provider.md).
 
 The second direct-model adapter speaks OpenAI's Responses API the same way --
@@ -1669,8 +1672,10 @@ typed error rather than a completion. Only a Platform API key is accepted: a
 ChatGPT/Codex subscription login is refused with an entitlement error instead
 of being billed as API usage. Controls are validated against exact API model
 ids -- a Codex harness model id is not assumed to be a Responses model. The
-routes are fixture-verified with live validation still pending; the contract
-is in
+routes are fixture-verified, with live validation available through an
+ignored, credential-gated test (`cargo test --ignored
+live_openai_responses_contract`, needing `OPENAI_API_KEY` and
+`ZIRV_OPENAI_LIVE_MODEL`); the contract is in
 [`docs/design/2026-09-12-native-openai-provider.md`](docs/design/2026-09-12-native-openai-provider.md).
 
 The third direct-model adapter speaks Google's Gemini `generateContent`/
@@ -1693,7 +1698,10 @@ OAuth login (`~/.gemini`) is refused outright, by path and by credential
 shape, with an actionable `Entitlement` failure -- the same posture as
 OpenAI's subscription refusal. The Vertex profile is declared but only just
 promoted from `Support::Planned` to `Support::Native` in N02's capability
-table; both routes are fixture-verified with live validation still pending.
+table; both routes are fixture-verified, with live validation of the
+Developer API profile available through an ignored, credential-gated test
+(`cargo test --ignored live_google_generative_ai_contract`, needing
+`GEMINI_API_KEY` and `ZIRV_GOOGLE_LIVE_MODEL`).
 The contract, and how to add or retire a protocol profile, is in
 [`docs/design/2026-09-13-native-google-provider.md`](docs/design/2026-09-13-native-google-provider.md).
 
@@ -1708,7 +1716,10 @@ zirv ctx exec --runtime native --route work-sonnet --role worker -- fix the fail
 zirv ctx exec --runtime native --resume 9d2f… --prompt "now update the docs"
 ```
 
-Flags: `--runtime harness|native` (default `harness`), `--route <id>` (a
+Flags: `--runtime harness|native` (default `configured` — the operator's own
+`~/.zirv/ctx.toml` `[runtime]` table decides; unconfigured resolves to
+`harness` — see [Choosing the default](#native-setup-diagnosis-and-rollback)),
+`--route <id>` (a
 `[route]` from the operator's native provider configuration; defaults to the
 `[roles]` entry for `--role`), `--role <role>` (default `worker`; selects
 that default route and the repository-write posture its tools run under),
@@ -1784,10 +1795,13 @@ driving an in-process, multi-turn native session on a background thread:
 
 ```
 zirv chat --runtime native
-zirv chat --runtime native --route work-sonnet
 ```
 
-`--runtime native` refuses every wrapped-harness-only flag (`--agent`,
+`zirv chat` takes no `--route` or `--view` flag (those are `zirv ctx exec
+--runtime native`'s own) — the native pane always spends the `orchestrator`
+role's route (`[runtime.roles].orchestrator`, or `[roles].orchestrator` in
+`~/.zirv/native.toml` with no per-role runtime override). `--runtime native`
+refuses every wrapped-harness-only flag (`--agent`,
 `--simple`, `--resume`, `--pin-harness`, a trailing `extra` argv) rather than
 silently ignoring them, and refuses without an interactive terminal on both
 stdin and stdout. The transcript renders Claude Code-style: assistant text
@@ -1918,8 +1932,11 @@ zirv agent work-sonnet "run the failing test and report" --runtime native --task
 zirv agent claude "review this diff" --mode read-only          # unchanged: the harness fork
 ```
 
-Flags: `--runtime harness|native` (default `harness`) and `--route <id>`,
-the same two flags and the same two values `zirv ctx exec` already takes.
+Flags: `--runtime harness|native` (default `configured`, resolved the same
+way `zirv ctx exec`'s does — see
+[Choosing the default](#native-setup-diagnosis-and-rollback)) and
+`--route <id>`, the same two flags and the same two values `zirv ctx exec`
+already takes.
 **Without `--runtime native` nothing changes** -- the harness delegation is
 reached by the same code, in the same order, with the same arguments. With
 it, the positional `<name>` names the provider **route** rather than a

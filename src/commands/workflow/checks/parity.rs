@@ -909,4 +909,26 @@ mod tests {
             "{result:?}"
         );
     }
+
+    /// Issue #616 (roadmap N22): `ZIRV_ANTHROPIC_LIVE_MODEL`,
+    /// `ZIRV_OPENAI_LIVE_MODEL` and `ZIRV_GOOGLE_LIVE_MODEL` are the
+    /// operator-facing env vars the ignored live contract tests in
+    /// anthropic.rs/openai.rs/google.rs read (alongside each vendor's own
+    /// `<VENDOR>_API_KEY`), and README.md is the one place a `zirv`
+    /// operator looks for them -- they must be documented there, not just
+    /// discoverable by reading the test source. Not a new check family: a
+    /// direct read of the real README, the same real-repo pattern
+    /// `the_real_repo_parity_matrix_passes` already uses above.
+    #[test]
+    fn readme_documents_every_live_model_env_var() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme = std::fs::read_to_string(repo.join("README.md")).expect("README.md");
+        for var in [
+            "ZIRV_ANTHROPIC_LIVE_MODEL",
+            "ZIRV_OPENAI_LIVE_MODEL",
+            "ZIRV_GOOGLE_LIVE_MODEL",
+        ] {
+            assert!(readme.contains(var), "README.md must document {var}");
+        }
+    }
 }

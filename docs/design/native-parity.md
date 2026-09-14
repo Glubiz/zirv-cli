@@ -319,4 +319,4 @@ owner, and an entitlement limitation names why it is not ours.
 | Windows process isolation (restricted token / AppContainer helper) | N04 (#473); no verified backend shipped | `doctor` class `unsupported-isolation`; `enforcement` refuses a sandboxed invocation rather than running it unconfined |
 | Harness-transcript rot parsing for native sessions | N09 (#478) | the native journal projects into the same scoring vocabulary; a *harness* transcript parser stays adapter-specific |
 | Writable built-in agent seats on the native seat dispatcher | by design, #484 -- a writable seat is a delegated worker with a real permit | `agents::tests::a_writable_seat_is_refused_by_the_native_dispatcher` |
-| Live-provider validation of every row in this document | N19 (#488) | the `live-validated` rung is unreachable; no row here claims it, and it is the one release blocker above |
+| Live-provider validation of every row in this document | N23 (#492) | the `live-validated` rung is unreachable; no row here claims it, and it is the one release blocker above |
