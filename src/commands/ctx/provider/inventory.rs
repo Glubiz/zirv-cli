@@ -1030,6 +1030,35 @@ model='sonnet'
     }
 
     #[test]
+    fn minimax_inventory_reports_declared_models_endpoint_issue_589() {
+        let cfg = config(
+            "schema=1
+             [endpoint.minimax]
+             provider='openai-compatible'
+             vendor='minimax'
+             [account.minimax]
+             provider='openai-compatible'
+             [route.minimax]
+             account='minimax'
+             endpoint='minimax'
+             model='minimax-m2.7'",
+        );
+        let env = |name: &str| (name == "MINIMAX_API_KEY").then(|| "test-key".to_string());
+        let probe = FakeProbe::new(ProbeResult::Http {
+            status: 200,
+            model_ids: vec!["minimax-m2.7".into()],
+        });
+
+        let inventory = Inventory::build(&cfg, &env, &FakeStore::default(), 0, Some(&probe));
+
+        assert_eq!(inventory.routes[0].state, RouteState::Authenticated);
+        assert_eq!(
+            probe.calls(),
+            [("https://api.minimax.io/v1/models".into(), true)]
+        );
+    }
+
+    #[test]
     fn inventory_never_claims_validated_in_n02() {
         let cfg = config(
             "schema=1\n[account.work]\nprovider='anthropic'\n[route.work]\naccount='work'\nmodel='sonnet'\n",
