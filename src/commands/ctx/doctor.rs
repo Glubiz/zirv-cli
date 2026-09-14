@@ -208,22 +208,52 @@ pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
     };
 
     if let Some(inventory) = input.inventory {
-        for row in &inventory.access {
-            if input.role_filter.is_some_and(|role| row.role != role) {
+        // Issue #597 (roadmap N22): the role table this reports on is the
+        // union of `native.toml`'s own `[roles]` (`inventory.access`, built
+        // by `provider::inventory::access_matrix`) and `ctx.toml`'s
+        // `[runtime.roles]` -- a role bound ONLY in the latter (an operator's
+        // custom role with no native route configured at all yet) must still
+        // get a row and a resolution, exactly as the no-inventory-at-all
+        // branch below already gives it.
+        let role_names: std::collections::BTreeSet<&str> = inventory
+            .access
+            .iter()
+            .map(|row| row.role.as_str())
+            .chain(input.runtime.roles.keys().map(String::as_str))
+            .collect();
+        for role in role_names {
+            if input.role_filter.is_some_and(|filter| role != filter) {
                 continue;
             }
-            let choice = resolve_role(&row.role);
+            let access_row = inventory.access.iter().find(|row| row.role == role);
+            let choice = resolve_role(role);
+            let route = access_row.and_then(|row| row.route.as_ref().map(ToString::to_string));
+            let state =
+                access_row.map_or_else(|| "unconfigured".to_string(), |row| row.state_text.clone());
             roles.push(RoleRow {
-                role: row.role.clone(),
+                role: role.to_string(),
                 runtime: choice.kind.as_str().to_string(),
                 runtime_source: choice.source.as_str().to_string(),
-                route: row.route.as_ref().map(ToString::to_string),
-                state: row.state_text.clone(),
+                route: route.clone(),
+                state,
             });
+            // A configured value this build does not recognise degrades to
+            // the harness rather than aborting (`runtime::resolve`'s own
+            // doc), and THIS is where that degradation is reported -- never
+            // blocking, since the degraded session still runs, just not on
+            // the backend the operator's config meant to name.
+            if let Some(note) = &choice.note {
+                findings.push(Finding {
+                    kind: classify(note),
+                    severity: Severity::Advisory,
+                    subject: format!("role {role}"),
+                    detail: note.clone(),
+                });
+            }
             // A role with no route at all is only blocking for an operator
             // who has asked for native somewhere: on a harness-default
             // machine it is simply "native is not set up for this role yet".
-            if row.route.is_none() {
+            if route.is_none() {
                 let native_wanted = choice.kind == runtime::RuntimeKind::Native;
                 findings.push(Finding {
                     kind: FindingKind::MissingTool,
@@ -232,7 +262,7 @@ pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
                     } else {
                         Severity::Advisory
                     },
-                    subject: format!("role {}", row.role),
+                    subject: format!("role {role}"),
                     detail: "no native route configured; add a `[route]` and name it under \
                              `[roles]` in ~/.zirv/native.toml"
                         .to_string(),
@@ -240,10 +270,14 @@ pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
             }
         }
         for route in &inventory.routes {
-            let bound = inventory
-                .access
-                .iter()
-                .any(|row| row.route.as_ref() == Some(&route.route));
+            // Bound -- and therefore blocking -- only when a role that
+            // ACTUALLY resolves to native names this route: a role left on
+            // (or degraded to) the harness never spends it, so a problem on
+            // it costs that role nothing, whatever `native.toml` says.
+            let bound = roles.iter().any(|row| {
+                row.route.as_deref() == Some(route.route.as_ref())
+                    && row.runtime == runtime::RuntimeKind::Native.as_str()
+            });
             if input.role_filter.is_some()
                 && !roles
                     .iter()
@@ -306,6 +340,14 @@ pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
                 route: None,
                 state: "unconfigured".to_string(),
             });
+            if let Some(note) = &choice.note {
+                findings.push(Finding {
+                    kind: classify(note),
+                    severity: Severity::Advisory,
+                    subject: format!("role {role}"),
+                    detail: note.clone(),
+                });
+            }
             if native_wanted {
                 findings.push(Finding {
                     kind: FindingKind::MissingTool,
@@ -529,9 +571,21 @@ fn run_with(
         .map(|native| Inventory::build(native, env, store, now, probe));
     let integrations = super::runtime::capabilities::discover(&cfg, repo);
     let isolation = PlatformIsolation::detect();
+    // Issue #597 (roadmap N22): `ready()` is fail-open by design (see
+    // `adapters::resolve_program`'s own doc comment) -- a program that
+    // resolves to nothing at all is not an error there, since ordinary
+    // launch code needs "not found" raised by the OS at spawn time, not
+    // guessed early. Doctor asks a different question ("is this genuinely
+    // installed"), so it layers `program_is_present` -- the strictly
+    // stronger check that ACTUALLY looks for the binary -- on top of, never
+    // in place of, `ready()`: an adapter still has to be otherwise ready
+    // (e.g. an attached endpoint override's credential env var still has to
+    // be named) as well as have its program findable on disk.
     let harnesses_present = super::adapters::all(cfg.agent_bin.as_deref())
         .into_iter()
-        .filter(|adapter| adapter.ready().is_ok())
+        .filter(|adapter| {
+            adapter.ready().is_ok() && super::adapters::program_is_present(adapter.program())
+        })
         .map(|adapter| adapter.name().to_string())
         .collect();
     let report = diagnose(&DoctorInput {
@@ -863,5 +917,149 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("worker\tnative\truntime.default"), "{text}");
         assert_eq!(code, 0, "{text}");
+    }
+
+    /// Issue #597 (roadmap N22): four things readiness got wrong, pinned
+    /// together because they all show up on the SAME report -- enumerate the
+    /// actual runtime role table including a role present ONLY in
+    /// `[runtime.roles]` (no native.toml `[roles]` entry at all), block a
+    /// route problem only for the role that actually resolves to native
+    /// (never a role pinned to harness even though a route names it), keep
+    /// the degradation note when a configured runtime value this build does
+    /// not recognise falls back to the harness, and report only GENUINELY
+    /// installed harnesses rather than `ready()`'s own deliberately
+    /// fail-open verdict (see `adapters::resolve_program`'s doc comment) --
+    /// confirmed with `PATH` empty, where every command probe fails.
+    #[test]
+    fn doctor_matches_runtime_resolution_for_custom_and_harness_roles() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let repo = test_repo();
+        // `worker`/`reviewer` both bind a route with the SAME credential
+        // problem; `custom` names no native.toml route at all.
+        // `[runtime.roles]` pins `worker` to harness (despite its own bound
+        // route `a`) and `reviewer`/`custom` to native; `custom` exists ONLY
+        // in `[runtime.roles]`.
+        write_native(
+            home.path(),
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:ABSENT_KEY'\n\
+             [route.a]\naccount='work'\nmodel='sonnet'\n\
+             [route.b]\naccount='work'\nmodel='haiku'\n\
+             [roles]\nworker='a'\nreviewer='b'\n",
+        );
+        let native = NativeConfig::load(home.path(), repo.path())
+            .expect("native config")
+            .expect("some");
+        let inventory = Inventory::build(&native, &|_| None, &FakeStore::default(), 0, None);
+        let runtime: super::super::config::RuntimeConfig = toml::from_str(
+            "default = 'astral'\n[roles]\nworker = 'harness'\nreviewer = 'native'\ncustom = 'native'\n",
+        )
+        .expect("runtime table");
+        let report = diagnose(&DoctorInput {
+            native_configured: true,
+            inventory: Some(&inventory),
+            integrations: &[],
+            isolation: &PlatformIsolation::Unavailable {
+                platform: "test".into(),
+                reason: "no verified containment here".into(),
+            },
+            harnesses_present: Vec::new(),
+            runtime: &runtime,
+            role_filter: None,
+        });
+
+        // 1. Custom-role enumeration: `custom` gets a row though it names no
+        //    native.toml route at all, and blocks (native wanted, no route).
+        let custom = report
+            .roles
+            .iter()
+            .find(|row| row.role == "custom")
+            .expect("custom role row");
+        assert_eq!(custom.runtime, "native");
+        assert_eq!(custom.route, None);
+        assert!(
+            report.findings.iter().any(|f| f.subject == "role custom"
+                && f.kind == FindingKind::MissingTool
+                && f.severity == Severity::Blocking),
+            "{:?}",
+            report.findings
+        );
+
+        // 2. A route problem blocks only the role that actually resolves to
+        //    native: `worker` is pinned to harness despite naming route
+        //    `a`, so `a`'s credential problem is advisory; `reviewer`
+        //    resolves native and names route `b`, so `b`'s identical
+        //    problem blocks.
+        let route_a = report
+            .findings
+            .iter()
+            .find(|f| f.subject == "route a" && f.kind == FindingKind::MissingAuthMaterial)
+            .expect("route a finding");
+        assert_eq!(
+            route_a.severity,
+            Severity::Advisory,
+            "{:?}",
+            report.findings
+        );
+        let route_b = report
+            .findings
+            .iter()
+            .find(|f| f.subject == "route b" && f.kind == FindingKind::MissingAuthMaterial)
+            .expect("route b finding");
+        assert_eq!(
+            route_b.severity,
+            Severity::Blocking,
+            "{:?}",
+            report.findings
+        );
+
+        // 3. Degradation note: `orchestrator` names nothing in
+        //    `[runtime.roles]`, so it falls to `[runtime] default =
+        //    'astral'`, a value this build does not recognise -- degraded
+        //    to the harness WITH a note, and the note must survive into a
+        //    finding rather than being dropped.
+        let orchestrator = report
+            .roles
+            .iter()
+            .find(|row| row.role == "orchestrator")
+            .expect("orchestrator role row");
+        assert_eq!(orchestrator.runtime, "harness");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.subject == "role orchestrator"
+                    && f.detail.contains("astral")
+                    && f.severity == Severity::Advisory),
+            "{:?}",
+            report.findings
+        );
+
+        assert!(report.blocking(), "{:?}", report.findings);
+
+        // 4. Installed vs registered: with `PATH` empty, every command
+        //    probe fails, so `harnesses_present` must be empty -- not every
+        //    registered adapter, which is what `ready()` alone (fail-open
+        //    by design) would report.
+        let _path = crate::commands::ctx::testenv::VarGuard::set(&[("PATH", Some(""))]);
+        let mut out = Vec::new();
+        run_with(
+            &DoctorArgs {
+                repo: Some(repo.path().to_path_buf()),
+                role: None,
+                live: false,
+                json: true,
+            },
+            &mut out,
+            home.path(),
+            repo.path(),
+            &|_| None,
+            &FakeStore::default(),
+            None,
+            0,
+        )
+        .expect("doctor");
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("json output");
+        assert_eq!(value["harnesses_present"], serde_json::json!([]), "{value}");
     }
 }
