@@ -1453,6 +1453,7 @@ pub struct NativeToolClient {
     /// the tool and the CLI verb are one code path with one set of gates. A
     /// test substitutes a launcher that starts nothing.
     launcher: Box<dyn crate::commands::ctx::delegation::WorkerLauncher>,
+    launch_env: BTreeMap<String, String>,
     services: CapabilityServices,
 }
 
@@ -1485,7 +1486,20 @@ impl NativeToolClient {
             limits,
             processes,
             launcher,
+            launch_env: BTreeMap::new(),
             services: CapabilityServices::default(),
+        }
+    }
+
+    pub(crate) fn install_launch_env(&mut self, env: crate::commands::ctx::config::EnvLookup<'_>) {
+        self.launch_env.clear();
+        for key in [
+            crate::commands::ctx::agent::ENVELOPE_ENV,
+            crate::commands::ctx::agent::PRINCIPAL_ENV,
+        ] {
+            if let Some(value) = env(key) {
+                self.launch_env.insert(key.to_string(), value);
+            }
         }
     }
 
@@ -2216,6 +2230,8 @@ impl NativeToolClient {
             max_tool_calls: args.max_tool_calls,
             worker_session: None,
             delegated_depth: None,
+            parent_envelope: None,
+            parent_principal: None,
             cancellation: std::sync::Arc::new(
                 crate::commands::ctx::provider::adapter::CancellationFlag::default(),
             ),
@@ -2227,11 +2243,17 @@ impl NativeToolClient {
         // performs for this session -- so the bounds this launch is judged
         // against and the ones the launch itself later enforces are one
         // answer, not two. Neither is reachable from model output.
-        let depth = crate::commands::ctx::agent::resolve_parent_envelope(&cfg, &|key| {
-            std::env::var(key).ok()
+        let parent_envelope = crate::commands::ctx::agent::resolve_parent_envelope(&cfg, &|key| {
+            self.launch_env.get(key).cloned()
         })
-        .map_err(|reason| ToolError::new(ToolErrorCode::AuthorizationDenied, reason))?
-        .delegation_depth;
+        .map_err(|reason| ToolError::new(ToolErrorCode::AuthorizationDenied, reason))?;
+        let mut request = request;
+        request.parent_envelope = Some(
+            crate::commands::ctx::envelope::canonical_json(&parent_envelope)
+                .map_err(ToolError::external)?,
+        );
+        request.parent_principal = Some(parent_envelope.principal.clone());
+        let depth = parent_envelope.delegation_depth;
         let (record, publication) = service::delegate(
             &self.state,
             &self.repo,
@@ -4295,6 +4317,48 @@ mod tests {
             assert_eq!(record.handle.task.as_deref(), Some("task-7"));
             assert_eq!(record.attempts.len(), 1);
         }
+    }
+
+    #[test]
+    fn nested_native_delegation_uses_the_narrowed_child_environment() {
+        let mut fixture = delegation_fixture(0);
+        let mut wide = crate::commands::ctx::agent::root_envelope(&CtxConfig::default());
+        wide.delegation_depth = 3;
+        wide.network = true;
+        let mut child = wide.clone();
+        child.principal = "root/child".to_string();
+        child.paths = vec![crate::commands::ctx::envelope::PathScope::new("src")];
+        child.network = false;
+        child.delegation_depth = 1;
+        let wide_json = crate::commands::ctx::envelope::canonical_json(&wide).expect("wide");
+        let child_json = crate::commands::ctx::envelope::canonical_json(&child).expect("child");
+        let parent_env = |key: &str| {
+            (key == crate::commands::ctx::agent::ENVELOPE_ENV).then(|| wide_json.clone())
+        };
+        let child_env = crate::commands::ctx::agent::envelope_env(
+            &parent_env,
+            Some(child_json),
+            Some(child.principal.clone()),
+        );
+        fixture.client.install_launch_env(&child_env);
+
+        let receipt = call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({"brief":"nested work","runtime":"native"}),
+        );
+        assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+        let launches = fixture.launches.lock().expect("launches");
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].delegated_depth, Some(0));
+        let installed: crate::commands::ctx::envelope::WorkerEnvelope = serde_json::from_str(
+            launches[0]
+                .parent_envelope
+                .as_deref()
+                .expect("parent envelope"),
+        )
+        .expect("installed envelope");
+        assert_eq!(installed, child);
     }
 
     #[test]
