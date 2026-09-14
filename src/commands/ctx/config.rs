@@ -10028,6 +10028,61 @@ mod tests {
         );
     }
 
+    /// Issue #491: the whole `[runtime]` table is operator-only, in BOTH
+    /// directions -- a checkout must not be able to move this operator's
+    /// unflagged sessions onto their metered native routes, and "run on the
+    /// harness instead" is not a safety property a checkout gets to assert
+    /// either, because the harness account is just as spendable. Both the
+    /// table-level `default` and a per-role entry are refused, by the
+    /// table's own name -- a whole-table entry matches on the prefix, so the
+    /// refusal says `runtime`, the same way `capabilities` does.
+    #[test]
+    fn repo_layer_cannot_set_runtime_default_or_roles() {
+        for (case, toml) in [
+            ("default", "[runtime]\ndefault = \"native\"\n"),
+            ("roles", "[runtime.roles]\nworker = \"native\"\n"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = match CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("a repo may not set runtime.{case}"),
+            };
+            assert!(err.contains("`runtime`"), "runtime.{case}: got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_RUNTIME"),
+                "runtime.{case} names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: the operator's own layer still sets
+    /// it, which is the whole point of the key -- only the checkout is
+    /// refused.
+    #[test]
+    fn the_operator_may_set_a_native_runtime_default_from_home_config() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[runtime]\ndefault = \"native\"\n[runtime.roles]\nworker = \"harness\"\n",
+        )
+        .expect("write");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.runtime.default.as_deref(), Some("native"));
+        assert_eq!(
+            cfg.runtime.roles.get("worker").map(String::as_str),
+            Some("harness")
+        );
+    }
+
     /// Issue #268: `workflow.allow_empty_verify` is operator-only, same
     /// asymmetry as `auto_spawn_on_gate` above -- a repo checkout must not
     /// be able to declare its own missing/empty `verify.toml` a pass.

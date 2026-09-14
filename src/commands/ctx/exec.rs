@@ -3922,7 +3922,7 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     // default becomes an explicit backend, so everything below -- `run_with`,
     // the native branch, `script_runner`'s own direct callers -- keeps seeing
     // one of exactly two literal values and never has to resolve anything.
-    let choice = super::runtime::resolve_for_cli(&args.runtime, &repo, &env, "worker")?;
+    let choice = resolved_runtime(args, &repo, &env)?;
     if let Some(note) = &choice.note {
         eprintln!("zirv ctx exec: {note}");
     }
@@ -3931,10 +3931,64 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     run_with(&args, w, &repo, &env)
 }
 
+/// Issue #491: the `[runtime]` resolution `run` applies before anything
+/// downstream sees a runtime value at all.
+///
+/// Split out of `run` for one reason: the ROLE it keys on is a real decision,
+/// and hardcoding `"worker"` here would silently resolve `zirv ctx exec
+/// --role reviewer` against the `worker` row of `[runtime.roles]`. `args.role`
+/// is this run's own seat role -- the same key `agent::run` passes -- and a
+/// test pins that rather than the resolution ladder underneath it (which
+/// `runtime::tests` already owns).
+fn resolved_runtime(
+    args: &ExecArgs,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<super::runtime::RuntimeChoice> {
+    super::runtime::resolve_for_cli(&args.runtime, repo, env, &args.role)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// PR #546 review finding 1: `run` used to resolve the configured
+    /// runtime default against a hardcoded `"worker"`, so an exec launched
+    /// as some other seat read the wrong row of `[runtime.roles]`. The
+    /// resolution has to key on THIS run's `--role`.
+    #[test]
+    fn exec_resolves_the_configured_default_against_its_own_role() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let repo = super::super::testenv::repo();
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            "[runtime.roles]\nreviewer = 'native'\nworker = 'harness'\n",
+        )
+        .expect("ctx.toml");
+
+        let choice_for = |role: &str| {
+            let args = ExecArgs {
+                runtime: super::super::runtime::CONFIGURED.to_string(),
+                role: role.to_string(),
+                ..Default::default()
+            };
+            resolved_runtime(&args, repo.path(), &|_| None).expect("resolve")
+        };
+
+        let reviewer = choice_for("reviewer");
+        assert_eq!(reviewer.kind, super::super::runtime::RuntimeKind::Native);
+        assert_eq!(
+            reviewer.source,
+            super::super::runtime::RuntimeSource::RoleTable
+        );
+        assert_eq!(
+            choice_for("worker").kind,
+            super::super::runtime::RuntimeKind::Harness
+        );
+    }
 
     // -- issue #478: the native runtime through the shipped CLI path -------
 

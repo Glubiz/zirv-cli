@@ -266,17 +266,40 @@ jobs:
             exit 1
           fi
 
-      # The helper-model and team paths that must work with no harness at
-      # all: if any of them still shelled out to a vendor CLI, these would be
-      # the tests that noticed.
+      # The three filtered runs below each guard against the same failure a
+      # substring filter always has: a rename makes it match zero tests, and
+      # libtest reports "0 passed" as a SUCCESS. Each captures its output and
+      # requires at least one passing test, so a stale filter fails loudly
+      # here instead of turning the step into a green no-op. Portable across
+      # all three runners: plain `tee`/`grep -E` under `shell: bash`, and
+      # `pipefail` so a genuine test failure is not masked by the pipe.
+      #
+      # The first is the helper-model and team path that must work with no
+      # harness at all: if any of them still shelled out to a vendor CLI,
+      # these are the tests that would notice.
       - name: Verify Every Helper Path Runs Without A Harness
-        run: cargo test --bin zirv every_coding_harness -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv every_coding_harness -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
 
       - name: Verify Native Diagnosis Contracts
-        run: cargo test --bin zirv ctx::doctor:: -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv ctx::doctor:: -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
 
       - name: Verify Config Migration Contracts
-        run: cargo test --bin zirv ctx::config_cmd:: -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv ctx::config_cmd:: -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
 
   # CD is idempotent on an already-published version (the release step prints
   # "release $TAG is already published; nothing to do" and skips the
