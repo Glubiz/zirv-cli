@@ -7575,6 +7575,64 @@ mod tests {
         assert_eq!(run.calls, vec!["call_1", "call_2", "call_3"]);
     }
 
+    /// Issue #638 (CLI-config level, not just the fixture test above): drives
+    /// the SAME fixture through [`run_session`] -- the real `zirv ctx exec
+    /// --runtime native` entry point exec.rs calls -- with no
+    /// `retain_recent_messages` override at all, so this proves the CLI's
+    /// actual default `CompactionSettings` (built fresh in `run_session`,
+    /// independent of the `config_for` test helper above) recovers rather
+    /// than failing twice. Before the fix, `RETAIN_RECENT_MESSAGES` (4) kept
+    /// this fixture's whole 3-turn history inside the retained tail, so
+    /// `checkpoint::boundary` found nothing to compact and the run failed
+    /// with the SAME `context_overflow` a second time; no in-tree test had
+    /// ever exercised the untouched default (every compaction test overrides
+    /// it to 2), so the gap between the CLI's defaults and the fixture test
+    /// above went unnoticed.
+    #[test]
+    fn headless_native_exec_recovers_a_first_turn_overflow_with_the_cli_defaults() {
+        let (repo, _state, _tree, env) = interactive_shutdown_fixture();
+        let lookup = |k: &str| env.get(k).cloned();
+        let provider = format!(
+            "fixture:{}",
+            fixture_root().join("compaction-overflow-recovery.json").display()
+        );
+        let fixture_tools = fixture_root().join("tools-investigate-edit-test.json");
+
+        let status = run_session(
+            &mut HeadlessRequest {
+                repo: repo.path(),
+                prompt: "fix the failing test",
+                route: None,
+                role: "worker",
+                limits: NativeLimits::default(),
+                session_id: None,
+                cancellation: None,
+                resume: None,
+                provider: Some(&provider),
+                fixture_tools: Some(&fixture_tools),
+                task: None,
+                writer: None,
+                accounting: Accounting::Seat,
+            },
+            &mut Vec::new(),
+            &lookup,
+        )
+        .expect("a headless native run completes");
+
+        assert_eq!(
+            status.status,
+            NativeStatus::Completed,
+            "evidence: {:?}",
+            status.evidence
+        );
+        assert_eq!(status.compactions.len(), 1);
+        assert!(
+            status.compactions[0].reason.contains("context_overflow"),
+            "reason was {:?}",
+            status.compactions[0].reason
+        );
+    }
+
     /// An advisory policy reports and does nothing. The narrowing has to be
     /// load-bearing or it is decorative.
     #[test]
