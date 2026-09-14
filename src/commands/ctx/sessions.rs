@@ -836,6 +836,20 @@ impl SessionGuard {
         &self.record.short
     }
 
+    /// Gives up this guard's claim on its registry record WITHOUT removing
+    /// anything (issue #552).
+    ///
+    /// One case only: a rollover successor has registered under the SAME
+    /// short id -- the seat's stable address, which by design does not move
+    /// across a rollover -- and the source is retired afterwards. Letting the
+    /// source's guard run its ordinary `release` there would delete the
+    /// record file the successor has just written, so the address would
+    /// answer for nobody. Disowning states the truth instead: this guard no
+    /// longer speaks for that address, and something else does.
+    pub fn disown(&mut self) {
+        self.released = true;
+    }
+
     /// Idempotent, like `RawGuard::restore`.
     pub fn release(&mut self) {
         if self.released {

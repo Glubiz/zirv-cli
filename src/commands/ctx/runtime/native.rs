@@ -2273,6 +2273,68 @@ impl NativeBackend {
         self.journal = Some(journal);
     }
 
+    /// [`RuntimeBackend::start`], with an optional SEAT to start on
+    /// (issue #552).
+    ///
+    /// `None` mints a fresh short id and generation 1, which is every
+    /// ordinary start. `Some` starts a brand-new conversation that takes over
+    /// an existing seat: a rollover successor keeps the seat's stable short
+    /// id -- that address is what mail, `zirv ctx nudge` and `zirv ctx status`
+    /// resolve, and by design it does not move across a rollover -- and runs
+    /// under the generation `seat::commit` promoted, which is what every
+    /// fence on its writes compares against. The logical session id is still
+    /// fresh: this is a NEW conversation, not a resumed one.
+    pub fn start_on_seat(
+        &mut self,
+        spec: &SessionSpec,
+        seat: Option<(&str, u64)>,
+    ) -> CtxResult<SessionHandle> {
+        if spec.runtime != RuntimeKind::Native {
+            return Err(RuntimeError::Unsupported(format!(
+                "native backend cannot start a `{}` session",
+                spec.runtime
+            ))
+            .into());
+        }
+        let logical_id = uuid::Uuid::new_v4().to_string();
+        let (short, generation) = match seat {
+            Some((short, generation)) if !short.is_empty() => {
+                (short.to_string(), generation.max(1))
+            }
+            _ => (logical_id.chars().take(8).collect::<String>(), 1),
+        };
+        let handle = SessionHandle {
+            runtime: RuntimeKind::Native,
+            logical_id: logical_id.clone(),
+            short: short.clone(),
+            generation,
+            role: spec.role.clone(),
+            surface: spec.surface,
+            conversation: Some(BackendConversationRef {
+                agent: RuntimeKind::Native.as_str().to_string(),
+                conversation: logical_id.clone(),
+            }),
+        };
+        let mut record = NativeSessionRecord {
+            short,
+            generation,
+            role: spec.role.clone(),
+            surface: spec.surface,
+            state: SessionState::Idle,
+            cancel: Arc::new(CancellationFlag::default()),
+            events: Vec::new(),
+            journal_session: None,
+        };
+        record.push(
+            &logical_id,
+            super::protocol::RuntimeEvent::Started {
+                session: handle.clone(),
+            },
+        );
+        self.sessions.insert(logical_id, record);
+        Ok(handle)
+    }
+
     /// Registers an EXISTING handle under this backend and binds it to the
     /// journal session its conversation lives in.
     ///
@@ -2514,45 +2576,7 @@ impl RuntimeBackend for NativeBackend {
     }
 
     fn start(&mut self, spec: &SessionSpec) -> CtxResult<SessionHandle> {
-        if spec.runtime != RuntimeKind::Native {
-            return Err(RuntimeError::Unsupported(format!(
-                "native backend cannot start a `{}` session",
-                spec.runtime
-            ))
-            .into());
-        }
-        let logical_id = uuid::Uuid::new_v4().to_string();
-        let short: String = logical_id.chars().take(8).collect();
-        let handle = SessionHandle {
-            runtime: RuntimeKind::Native,
-            logical_id: logical_id.clone(),
-            short: short.clone(),
-            generation: 1,
-            role: spec.role.clone(),
-            surface: spec.surface,
-            conversation: Some(BackendConversationRef {
-                agent: RuntimeKind::Native.as_str().to_string(),
-                conversation: logical_id.clone(),
-            }),
-        };
-        let mut record = NativeSessionRecord {
-            short,
-            generation: 1,
-            role: spec.role.clone(),
-            surface: spec.surface,
-            state: SessionState::Idle,
-            cancel: Arc::new(CancellationFlag::default()),
-            events: Vec::new(),
-            journal_session: None,
-        };
-        record.push(
-            &logical_id,
-            super::protocol::RuntimeEvent::Started {
-                session: handle.clone(),
-            },
-        );
-        self.sessions.insert(logical_id, record);
-        Ok(handle)
+        self.start_on_seat(spec, None)
     }
 
     /// A submit is only ever accepted by an idle session. Driving the turn is
@@ -3299,6 +3323,16 @@ pub struct InteractiveRequest {
     /// caller today) resolves the real configuration exactly as before this
     /// field existed.
     pub provider: Option<String>,
+    /// Issue #552: the SEAT this session is taking over, as
+    /// `(short, generation)`.
+    ///
+    /// `None` -- every ordinary pane -- mints a fresh short id and starts at
+    /// generation 1. `Some` is a rollover successor: it keeps the seat's
+    /// stable short id (the address mail, nudge and status resolve, which by
+    /// design does not move across a rollover) and runs under the generation
+    /// `seat::commit` promoted, so every fence on its writes compares against
+    /// the right one. The conversation itself is still brand new.
+    pub seat: Option<(String, u64)>,
 }
 
 /// One update from the worker thread, coarse on purpose: `dash::
@@ -3647,17 +3681,26 @@ pub fn spawn_interactive(
     let mut journal = Journal::open(&state)?;
     let mut backend = NativeBackend::new();
 
-    let handle = backend.start(&SessionSpec {
-        runtime: RuntimeKind::Native,
-        role: request.role.clone(),
-        agent: None,
-        provider_route: Some(route.route.clone()),
-        model: Some(route.model.id.clone()),
-        surface: UiSurface::DashboardPane,
-        cwd: request.repo.clone(),
-        prompt: String::new(),
-        extra_args: Vec::new(),
-    })?;
+    // Issue #552: a rollover successor starts ON the seat it is taking over,
+    // so the address and the committed generation are the seat's, not a
+    // freshly minted pair nothing was fenced against.
+    let handle = backend.start_on_seat(
+        &SessionSpec {
+            runtime: RuntimeKind::Native,
+            role: request.role.clone(),
+            agent: None,
+            provider_route: Some(route.route.clone()),
+            model: Some(route.model.id.clone()),
+            surface: UiSurface::DashboardPane,
+            cwd: request.repo.clone(),
+            prompt: String::new(),
+            extra_args: Vec::new(),
+        },
+        request
+            .seat
+            .as_ref()
+            .map(|(short, generation)| (short.as_str(), *generation)),
+    )?;
     let session = JournalSessionId::new(handle.logical_id.clone())?;
     journal.create_session(&SessionIdentity {
         session: session.clone(),
@@ -6250,6 +6293,7 @@ mod tests {
                 task: None,
                 writing: true,
                 provider: Some(provider),
+                seat: None,
             },
             &lookup,
         )

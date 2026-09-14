@@ -2593,6 +2593,20 @@ pub struct NativeDashboardSpec {
     /// provider configuration. `None` on every production call site, which
     /// resolves the real configuration exactly as before this field existed.
     pub provider: Option<String>,
+    /// Issue #552: the SEAT this pane is taking over, as
+    /// `(short, generation)` -- set only by a rollover successor
+    /// (`dash::PaneSuccessorLauncher`). It keeps the seat's stable short id
+    /// and runs under the generation `seat::commit` promoted. It also forces
+    /// the in-process spawn: a successor is a NEW conversation under a
+    /// committed generation, never an attach to whatever a persistent runtime
+    /// already holds for this repository.
+    pub seat: Option<(String, u64)>,
+    /// Issue #552: what the successor is told first -- the handoff packet,
+    /// every acknowledged input the source never delivered, and the
+    /// reconciliation it is halted on. Submitted as this session's first
+    /// turn, which is the only way a fresh native conversation can be handed
+    /// what the source still owed.
+    pub initial_input: Option<String>,
 }
 
 /// The billing label (`"api"`/`"subscription"`) for `route`'s own account,
@@ -3022,6 +3036,7 @@ impl NativePaneRuntime {
                 task: None,
                 writing: spec.writing,
                 provider: spec.provider.clone(),
+                seat: spec.seat.clone(),
             },
             env,
         )?;
@@ -3048,6 +3063,16 @@ impl NativePaneRuntime {
             session: session.session.to_string(),
             generation: session.handle.generation,
         });
+
+        // Issue #552: what the source still owed, handed to the successor as
+        // its first turn. Submitted AFTER the opening replay, so this pane is
+        // fully built before a turn can start under it; the pane re-reads the
+        // journal every tick, so the input appears on the next one.
+        if let Some(initial) = spec.initial_input.as_deref()
+            && !initial.trim().is_empty()
+        {
+            let _ = session.submit(initial.to_string());
+        }
 
         Ok(Self {
             short: session.handle.short.clone(),
@@ -4615,6 +4640,14 @@ pub(crate) fn open_native_pane(
     env: EnvLookup<'_>,
     spec: NativeDashboardSpec,
 ) -> CtxResult<NativePaneRuntime> {
+    // Issue #552: a rollover successor never attaches. It is a brand-new
+    // conversation taking a seat under a generation that was just committed;
+    // attaching to whatever the persistent runtime already holds for this
+    // repository would put the OLD conversation back in the seat the
+    // rollover just moved.
+    if spec.seat.is_some() {
+        return NativePaneRuntime::spawn(cfg, state, env, spec);
+    }
     let mut link = super::link::RuntimeLink::connect(state, cfg.session.persistent);
     let seat = link.as_mut().and_then(|link| {
         let slug = super::super::state::repo_slug(&spec.repo);
@@ -6926,6 +6959,8 @@ mod tests {
                 route: None,
                 writing: true,
                 provider: Some(provider),
+                seat: None,
+                initial_input: None,
             },
         )
         .expect("spawn native pane");
@@ -6993,6 +7028,8 @@ mod tests {
                 route: None,
                 writing: true,
                 provider: Some(provider),
+                seat: None,
+                initial_input: None,
             },
         )
         .expect("spawn native pane");
