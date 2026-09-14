@@ -194,6 +194,90 @@ jobs:
       - name: Verify Native Coding Tool Contract
         run: 'cargo test --bin zirv runtime::tools:: -- --test-threads=1'
 
+  # Issue #491 (roadmap N22): the installation acceptance criterion. A fresh
+  # machine on each supported OS must be able to configure native operation
+  # and be told, accurately, what is missing -- with NO coding harness
+  # installed. GitHub runners ship none, and the first step asserts that
+  # rather than assuming it, so the job would fail loudly if an image ever
+  # started shipping one.
+  native-install-platforms:
+    name: Native Install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Assert No Coding Harness Is Installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          for harness in claude codex; do
+            if command -v "$harness" >/dev/null 2>&1; then
+              echo "$harness is on PATH; this job must run with none installed" >&2
+              exit 1
+            fi
+          done
+          echo "no coding harness on PATH"
+
+      - name: Build Binary
+        run: cargo build --bin zirv
+
+      # The packaged runtime is one binary: no extra native component is
+      # downloaded, unpacked or installed on any platform. This walks the
+      # whole first-run path on that binary alone -- write the provider
+      # template, read the inventory back, and diagnose readiness -- so a
+      # packaging regression that left a component out would surface here as
+      # a failing command rather than as a broken install in the wild.
+      - name: Native Setup And Doctor With No Harness Installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/debug/zirv"
+          [ -x "$bin" ] || bin="./target/debug/zirv.exe"
+          "$bin" ctx provider init
+          "$bin" ctx provider init          # idempotent: create-only
+          "$bin" ctx provider list
+          "$bin" ctx doctor --json
+          "$bin" ctx capabilities --json
+
+      # Update/downgrade: the operator config is migrated forward, the second
+      # run is a no-op, and the downgrade restores the pre-migration document
+      # so an older binary can still read it.
+      - name: Config Migration Round Trip
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/debug/zirv"
+          [ -x "$bin" ] || bin="./target/debug/zirv.exe"
+          "$bin" ctx config migrate --to native
+          "$bin" ctx config migrate --to native | grep -q unchanged
+          "$bin" ctx config show runtime.default | grep -q native
+          "$bin" ctx config migrate --downgrade
+          if "$bin" ctx config show runtime.default >/dev/null 2>&1; then
+            echo "runtime.default survived the downgrade" >&2
+            exit 1
+          fi
+
+      # The helper-model and team paths that must work with no harness at
+      # all: if any of them still shelled out to a vendor CLI, these would be
+      # the tests that noticed.
+      - name: Verify Every Helper Path Runs Without A Harness
+        run: cargo test --bin zirv every_coding_harness -- --test-threads=1
+
+      - name: Verify Native Diagnosis Contracts
+        run: cargo test --bin zirv ctx::doctor:: -- --test-threads=1
+
+      - name: Verify Config Migration Contracts
+        run: cargo test --bin zirv ctx::config_cmd:: -- --test-threads=1
+
   # CD is idempotent on an already-published version (the release step prints
   # "release $TAG is already published; nothing to do" and skips the
   # Homebrew/Chocolatey jobs), so an unbumped merge just deploys nothing --
