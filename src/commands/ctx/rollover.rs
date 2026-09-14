@@ -848,7 +848,7 @@ pub fn evaluate(
                     );
                     Evaluation::Rollover {
                         request: HandoverRequest {
-                            target_agent: agent,
+                            target_agent: agent.clone(),
                             target_model: model,
                             // A hard-blocked seat cannot wait for a clean
                             // turn boundary that may never come; a proactive
@@ -871,6 +871,13 @@ pub fn evaluate(
                             // parked. `None` for any other target, which has
                             // no conversation of its own here.
                             resume_session,
+                            // Issue #552: the successor's RUNTIME travels on
+                            // the request, so the live swap seam starts what
+                            // this evaluation actually decided on rather
+                            // than a harness child unconditionally.
+                            target_runtime: Some(successor_runtime.as_str().to_string()),
+                            target_route: (successor_runtime == RuntimeKind::Native)
+                                .then(|| agent.clone()),
                         },
                         generation,
                         cause,
@@ -1647,6 +1654,10 @@ pub fn on_resume(
     let candidate = placement
         .selected
         .filter(|candidate| !candidate.name.eq_ignore_ascii_case(&current.agent))?;
+    // Issue #552: the runtime and the name the successor is actually started
+    // on, resolved once from the same snapshot `prepare_onto` reads below.
+    let target_runtime = runtime_of(&snapshot, &candidate.name);
+    let target_name = candidate.name.clone();
     let cause = seat::Cause::Reactive {
         detail: "capacity resumed on another harness".to_string(),
         observed_at: now,
@@ -1686,6 +1697,10 @@ pub fn on_resume(
         // the seat back onto the harness it was displaced from resumes that
         // harness's own conversation.
         resume_session,
+        // Issue #552: a return names the runtime it is returning TO, for
+        // the same reason a forward rollover does.
+        target_runtime: Some(target_runtime.as_str().to_string()),
+        target_route: (target_runtime == RuntimeKind::Native).then(|| target_name.clone()),
     })
 }
 
