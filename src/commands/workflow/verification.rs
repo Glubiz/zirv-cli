@@ -3093,6 +3093,59 @@ fn write_builtin_lines(
     Ok(())
 }
 
+/// Issue #640: resolves `--check` against the builtin registry (case-
+/// insensitive exact id match), in `ALL_IDS` order regardless of the order
+/// given on the command line. An empty filter means "every id". A name that
+/// matches nothing is a hard error naming every valid id -- the builtin path
+/// used to silently ignore an unknown `--check` and run (and pass) the whole
+/// registry instead.
+fn resolve_builtin_check_ids(checks: &[String]) -> CtxResult<Vec<&'static str>> {
+    if checks.is_empty() {
+        return Ok(super::checks::ALL_IDS.to_vec());
+    }
+    let unknown: Vec<&str> = checks
+        .iter()
+        .filter(|requested| {
+            !super::checks::ALL_IDS
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(requested))
+        })
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown --check id(s): {} -- known built-in ids: {}",
+            unknown.join(", "),
+            super::checks::ALL_IDS.join(", ")
+        )
+        .into());
+    }
+    Ok(super::checks::ALL_IDS
+        .iter()
+        .copied()
+        .filter(|id| {
+            checks
+                .iter()
+                .any(|requested| id.eq_ignore_ascii_case(requested))
+        })
+        .collect())
+}
+
+/// `zirv verify --builtin --dry-run`'s output: just the ids that would run,
+/// never invoking a single check function -- mirrors `CheckStatus::DryRun`'s
+/// "preview, not evidence" contract for the repo-supplied path.
+fn write_builtin_dry_run(writer: &mut impl Write, ids: &[&str], json: bool) -> CtxResult<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut *writer, ids)?;
+        writeln!(writer)?;
+    } else {
+        for id in ids {
+            writeln!(writer, "{}\twould-run", scrub_line(id))?;
+        }
+    }
+    Ok(())
+}
+
 /// `zirv verify --builtin`'s own output: just the builtin registry, no
 /// `.zirv/verify.toml`/discovered checks at all.
 fn write_builtin_report(
@@ -3156,14 +3209,29 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
             ));
         }
     }
-    let builtins = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude);
-    // `NotApplicable` counts as passing: most of these checks read zirv's own
-    // files, and their absence in another repository is a fact about that
-    // repository, not a failed invariant. `Inconclusive` still blocks (issue
-    // #268's degraded-gate ban).
-    let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
-
+    // Issue #640: `--builtin` has its own fast path so `--check`/`--dry-run`
+    // can narrow it without ever running (or reporting a stale pass for) the
+    // checks the caller did not ask for.
     if args.builtin {
+        let selected_ids = resolve_builtin_check_ids(&args.run.checks)?;
+        if args.run.dry_run {
+            if let Err(error) = write_builtin_dry_run(writer, &selected_ids, args.run.json) {
+                if !is_broken_pipe(error.as_ref()) {
+                    return Err(error);
+                }
+                crate::output::warn("verification output was cut short (broken pipe)");
+            }
+            return Ok(0);
+        }
+        let builtins: Vec<_> = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude)
+            .into_iter()
+            .filter(|check| selected_ids.contains(&check.id))
+            .collect();
+        // `NotApplicable` counts as passing: most of these checks read
+        // zirv's own files, and their absence in another repository is a
+        // fact about that repository, not a failed invariant.
+        // `Inconclusive` still blocks (issue #268's degraded-gate ban).
+        let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
         if let Err(error) = write_builtin_report(writer, &builtins, args.run.json) {
             if !is_broken_pipe(error.as_ref()) {
                 return Err(error);
@@ -3172,6 +3240,13 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
         }
         return Ok(if builtins_passed { 0 } else { 1 });
     }
+
+    let builtins = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude);
+    // `NotApplicable` counts as passing: most of these checks read zirv's own
+    // files, and their absence in another repository is a fact about that
+    // repository, not a failed invariant. `Inconclusive` still blocks (issue
+    // #268's degraded-gate ban).
+    let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
 
     let mut report = run_mode(
         &repo,
@@ -3510,6 +3585,104 @@ mod tests {
             "a non-zirv repository with a passing verify.toml must exit 0: {}",
             String::from_utf8_lossy(&output)
         );
+    }
+
+    /// Issue #640: `zirv verify --builtin --check <id>` used to ignore the
+    /// filter entirely and report every builtin check. A lowercase id proves
+    /// the match is case-insensitive, per the brief.
+    #[test]
+    fn builtin_check_filter_runs_only_the_named_check() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let mut output = Vec::new();
+        with_state(state_root.path(), || {
+            run_verify(
+                &VerifyArgs {
+                    run: RunArgs {
+                        repo: Some(repo.path().to_path_buf()),
+                        checks: vec![super::super::checks::eol::ID.to_lowercase()],
+                        dry_run: false,
+                        json: true,
+                    },
+                    builtin: true,
+                },
+                &mut output,
+            )
+            .expect("verify runs")
+        });
+        let builtins: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
+        let ids: Vec<&str> = builtins
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|check| check["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![super::super::checks::eol::ID],
+            "only the named check must run: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    /// Issue #640: an unknown `--check` id used to silently run (and pass)
+    /// the whole builtin registry instead of erroring.
+    #[test]
+    fn builtin_check_filter_rejects_an_unknown_id() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let mut output = Vec::new();
+        let error = with_state(state_root.path(), || {
+            run_verify(
+                &VerifyArgs {
+                    run: RunArgs {
+                        repo: Some(repo.path().to_path_buf()),
+                        checks: vec!["ZCHK-DOES-NOT-EXIST".to_string()],
+                        dry_run: false,
+                        json: true,
+                    },
+                    builtin: true,
+                },
+                &mut output,
+            )
+            .expect_err("an unknown check id must error")
+        });
+        let message = error.to_string();
+        assert!(message.contains("ZCHK-DOES-NOT-EXIST"), "{message}");
+        for id in super::super::checks::ALL_IDS {
+            assert!(
+                message.contains(id),
+                "known id {id} missing from: {message}"
+            );
+        }
+        assert!(output.is_empty(), "an error run must not print a report");
+    }
+
+    /// Issue #640: `--builtin --dry-run` used to ignore `dry_run` altogether
+    /// and execute every check. It must only list what would run.
+    #[test]
+    fn builtin_dry_run_lists_without_executing() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let mut output = Vec::new();
+        let code = with_state(state_root.path(), || {
+            run_verify(
+                &VerifyArgs {
+                    run: RunArgs {
+                        repo: Some(repo.path().to_path_buf()),
+                        checks: vec![super::super::checks::eol::ID.to_string()],
+                        dry_run: true,
+                        json: true,
+                    },
+                    builtin: true,
+                },
+                &mut output,
+            )
+            .expect("verify runs")
+        });
+        assert_eq!(code, 0);
+        let ids: Vec<String> = serde_json::from_slice(&output).expect("valid json");
+        assert_eq!(ids, vec![super::super::checks::eol::ID.to_string()]);
     }
 
     /// A command that appends a marker to `path` (outside the repo) each time
