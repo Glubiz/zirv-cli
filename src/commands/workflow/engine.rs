@@ -2464,10 +2464,14 @@ fn cap_workflow_context(rendered: String, max_bytes: usize) -> String {
 /// change set and by nothing else. A duplicate rule here would be a second
 /// definition of "done" that could drift from the real one.
 ///
-/// Never fails the session: an unreadable state directory, an absent workflow
-/// or an unresolvable branch all mean "nothing to gate on". A gate that
-/// blocked a session because it could not read a file would be worse than no
-/// gate at all.
+/// Fails open only up to the point of deciding whether there is anything to
+/// gate on at all: an unreadable state directory, an absent workflow, or an
+/// unresolvable branch all mean "nothing to gate on", the same as a step
+/// outside Test/Verify. Once that decision is made and this step's
+/// completion genuinely depends on fresh verification evidence, a failure
+/// reading THAT evidence fails closed instead (issue #599, roadmap N15):
+/// silently treating an unreadable record as passing would defeat the gate
+/// for exactly the sessions it exists to stop.
 pub fn native_completion_gate(state_dir: &StateDir, repo: &Path) -> Option<String> {
     let state = load_active(state_dir, repo).ok().flatten()?;
     if !matches!(
@@ -2484,21 +2488,38 @@ pub fn native_completion_gate(state_dir: &StateDir, repo: &Path) -> Option<Strin
         return None;
     }
     let final_only = step.phase == super::skill::WorkflowPhase::Verify;
-    let fresh = super::verification::latest_is_fresh_and_passing(
-        state_dir,
-        &state.repo,
-        final_only,
-        Some(&state.branch),
-    )
-    .unwrap_or(true);
-    if fresh {
-        return None;
-    }
     let command = if final_only {
         "zirv verify"
     } else {
         "zirv test changed"
     };
+    // Issue #599 (roadmap N15): this differs from the state-load fallback
+    // above on purpose. By this point the gate has already committed to
+    // needing fresh evidence for a Test/Verify step -- unlike an unreadable
+    // state directory or an absent workflow, where there is nothing to gate
+    // on at all, a read error HERE means the evidence this step's
+    // completion depends on could not be evaluated. Treating that as
+    // "assume it passed" (`.unwrap_or(true)`) let missing permissions,
+    // corruption, or any other evidence-read failure silently satisfy the
+    // gate; failing closed with the error surfaced is the only reading that
+    // keeps "fresh passing evidence" meaning what it says.
+    let fresh = match super::verification::latest_is_fresh_and_passing(
+        state_dir,
+        &state.repo,
+        final_only,
+        Some(&state.branch),
+    ) {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            return Some(format!(
+                "zirv workflow: step '{}' of workflow '{}' could not read its verification evidence ({error}); run `{command}` and record the result before finishing",
+                step.id, state.id
+            ));
+        }
+    };
+    if fresh {
+        return None;
+    }
     Some(format!(
         "zirv workflow: step '{}' of workflow '{}' has no fresh passing evidence for the current change set; run `{command}` and record the result before finishing",
         step.id, state.id
@@ -5189,6 +5210,55 @@ mod tests {
         assert!(
             advance_with_evidence(&state_dir, loaded, StepOutcome::Success, None, false).is_err(),
             "an unrelated worktree's evidence must never advance this workflow"
+        );
+    }
+
+    /// Issue #599 (roadmap N15): `native_completion_gate` used to read as
+    /// `latest_is_fresh_and_passing(..).unwrap_or(true)` -- any error reading
+    /// the persisted verification record (missing permissions, corruption,
+    /// any other read failure) was treated as "fresh and passing" and opened
+    /// the gate. Corrupts the record directly (invalid JSON behind a valid
+    /// `latest` pointer) rather than through `save_report`, so the gate hits
+    /// a genuine read error rather than "no evidence yet" (which correctly
+    /// stays a normal, worded "no fresh passing evidence" block, not this
+    /// one).
+    #[test]
+    fn workflow_completion_refuses_unreadable_verification_evidence() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let test_index = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Test)
+            .expect("fixture has a Test step");
+        state.completed_steps = state.steps[..test_index]
+            .iter()
+            .map(|step| step.id.clone())
+            .collect();
+        state.current_step = test_index;
+        state.status = WorkflowStatus::Running;
+        save(&state_dir, &state, true).unwrap();
+
+        let report_dir = state_dir.verification().join(repo_slug(repo.path()));
+        create_private_dir_all(&report_dir).unwrap();
+        write_private(&report_dir.join("corrupt.json"), "not valid json").unwrap();
+        write_private(&report_dir.join("latest"), "corrupt.json").unwrap();
+
+        let blocked = native_completion_gate(&state_dir, repo.path())
+            .expect("an unreadable verification record must block completion, not silently pass");
+        assert!(
+            blocked.contains("could not read its verification evidence"),
+            "the gate must surface the evidence read error, not just say evidence is missing or stale: {blocked}"
         );
     }
 
