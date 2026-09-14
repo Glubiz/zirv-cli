@@ -655,18 +655,43 @@ pub(crate) fn write_atomic_bytes_if_unchanged(
         return Err(e);
     }
 
-    let current = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+    let verify = |tmp: &Path| -> std::io::Result<Option<String>> {
+        let current = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                let _ = std::fs::remove_file(tmp);
+                return Err(e);
+            }
+        };
+        let current_sha256 = hex_sha256(&current);
+        if current_sha256 != expected_before_sha256 {
+            let _ = std::fs::remove_file(tmp);
+            return Ok(Some(current_sha256));
         }
+        Ok(None)
     };
-    let current_sha256 = hex_sha256(&current);
-    if current_sha256 != expected_before_sha256 {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(Some(current_sha256));
+
+    if let Some(hash) = verify(&tmp)? {
+        return Ok(Some(hash));
+    }
+
+    // Test-only seam (issue #582 review round 2): a yield-loop racer proved
+    // non-deterministic under CI (#630 -- the racer sometimes lost the race
+    // entirely, and `apply_patch` legitimately succeeded). A no-op here in
+    // every non-test build; in a test, this is the exact point -- after the
+    // check above, before the rename below -- a real concurrent write would
+    // need to land in to be caught, so a test can perform that write
+    // directly instead of racing a real thread against real disk I/O.
+    call_pre_rename_hook();
+
+    // Re-verify one more time, immediately before the rename itself: the
+    // hook above is a no-op in production, so this repeats the same check
+    // with nothing having changed in between (accepted, tiny cost, paid
+    // only by this already-more-expensive stale-content-sensitive path) --
+    // but it is what actually catches whatever a test's hook just did.
+    if let Some(hash) = verify(&tmp)? {
+        return Ok(Some(hash));
     }
 
     match std::fs::rename(&tmp, path) {
@@ -677,6 +702,47 @@ pub(crate) fn write_atomic_bytes_if_unchanged(
         }
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    static PRE_RENAME_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs [`write_atomic_bytes_if_unchanged`]'s test-only pre-rename hook
+/// for the current thread and returns a guard that clears it on drop --
+/// including on a panicking assertion, the same reason `testenv::EnvGuard`
+/// restores on every path. Nextest isolates each test into its own process,
+/// but this repo's own serial gate (`cargo test -- --test-threads=1`) runs
+/// every test on one thread in one process, so a hook a test forgot to
+/// clear would otherwise leak into whichever test ran next.
+#[cfg(test)]
+pub(crate) fn set_pre_rename_hook(hook: impl FnMut() + 'static) -> PreRenameHookGuard {
+    PRE_RENAME_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    PreRenameHookGuard
+}
+
+#[cfg(test)]
+pub(crate) struct PreRenameHookGuard;
+
+#[cfg(test)]
+impl Drop for PreRenameHookGuard {
+    fn drop(&mut self) {
+        PRE_RENAME_HOOK.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn call_pre_rename_hook() {
+    PRE_RENAME_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn call_pre_rename_hook() {}
 
 fn hex_sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
