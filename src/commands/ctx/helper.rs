@@ -180,7 +180,8 @@ fn runtime_role_is_native(repo: &Path, role: &str, env: EnvLookup<'_>) -> bool {
 /// before doing any work, and a missing credential still fails where it
 /// should: at the actual request.
 pub fn available(repo: &Path, role: &str, route: Option<&str>, env: EnvLookup<'_>) -> bool {
-    runtime_role_is_native(repo, role, env) && native::route_provider(repo, route, role, env).is_ok()
+    runtime_role_is_native(repo, role, env)
+        && native::route_provider(repo, route, role, env).is_ok()
 }
 
 /// Runs one bounded, read-only native helper call and returns its text.
