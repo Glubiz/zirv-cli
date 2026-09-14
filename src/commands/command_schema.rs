@@ -164,6 +164,11 @@ const MUTATING: &[&str] = &[
     // a remote one over the network. Classified by what the verb CAN do, like
     // `ctx api call` right below.
     "zirv ctx capabilities",
+    // Issue #491: `zirv ctx doctor` writes nothing at all, but `--live`
+    // contacts each configured provider's model-list endpoint with that
+    // account's own auth material. Classified by what the verb CAN do, like
+    // `ctx capabilities` right above.
+    "zirv ctx doctor",
     // Issue #353. Both bind the local runtime endpoint and write its
     // state-directory marker file, and `api call` can carry a mutating
     // protocol method (`session.start|stop|send_input`). Classified by what
@@ -186,6 +191,9 @@ const MUTATING: &[&str] = &[
     "zirv ctx chat",
     "zirv ctx config set",
     "zirv ctx config add",
+    // Issue #491: rewrites `~/.zirv/ctx.toml`, writes a backup beside it and
+    // a schema marker; `--downgrade` restores that backup.
+    "zirv ctx config migrate",
     "zirv ctx agent",
     "zirv ctx handoff",
     "zirv ctx resume",
