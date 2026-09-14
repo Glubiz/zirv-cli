@@ -21,6 +21,23 @@ use crate::commands::ctx::supervise::{self, ChildGuard};
 const MAX_WAIT_MS: u64 = 60_000;
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 const MAX_COMPLETED: usize = 128;
+/// Hard per-stream ceiling on bytes a reader thread will ever pull off a
+/// process's stdout/stderr/PTY pipe, independent of whether -- or how often
+/// -- a caller polls. Issue #583 (roadmap N05): without this, a reader kept
+/// feeding an unbounded channel for as long as the child kept writing, so a
+/// chatty or malicious child could grow zirv's own memory without bound.
+const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+/// Hard per-stream ceiling on newline-delimited lines, alongside
+/// [`MAX_STREAM_BYTES`]: a byte cap alone does not bound a stream of many
+/// small lines the same way, since each `read()` can still return a full
+/// buffer of tiny lines as one chunk.
+const MAX_STREAM_LINES: usize = 50_000;
+/// Bound on how long `finish` waits for one reader thread to join. Issue
+/// #583 (roadmap N05): a reader blocks in `read()` until its pipe's write
+/// end is fully closed, which a descendant that outlives the direct child
+/// and keeps holding the pipe can prevent forever -- `finish` must still
+/// return so cleanup never hangs the whole process manager on that reader.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,6 +205,18 @@ impl std::fmt::Debug for ProcessChild {
 }
 
 impl ProcessChild {
+    /// The OS pid, usable from another thread with no borrow on `self` --
+    /// the one piece of state the deadline watchdog needs (issue #583 /
+    /// roadmap N05): it terminates by pid alone, via
+    /// [`supervise::terminate_pid`], never touching `ManagedProcess`/
+    /// `ProcessChild` itself.
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Standard { child, .. } => Some(child.id()),
+            Self::Pty { child, .. } => child.process_id(),
+        }
+    }
+
     fn try_wait(&mut self) -> Result<Option<i32>, ToolError> {
         match self {
             Self::Standard { child, guard, .. } => {
@@ -279,6 +308,21 @@ struct ManagedProcess {
     exit_code: Option<i32>,
     interactive: bool,
     heavy_permit: Option<HeavyPermit>,
+    /// Sends once to cancel the deadline watchdog thread (issue #583 /
+    /// roadmap N05) as soon as this process reaches a terminal state by any
+    /// other path (self-detected timeout, natural exit, or an explicit
+    /// `terminate`), so the watchdog never fires a redundant (though
+    /// harmless -- `kill_tree` on an exited pid is a no-op) kill later.
+    /// `None` when no `timeout_ms` was given, so no watchdog was spawned.
+    watchdog_stop: Option<Sender<()>>,
+}
+
+impl ManagedProcess {
+    fn cancel_watchdog(&mut self) {
+        if let Some(stop) = self.watchdog_stop.take() {
+            let _ = stop.send(());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -363,6 +407,28 @@ impl ProcessManager {
             &self.limits.extra_verbatim,
             self.limits.compact_search,
         );
+        // Issue #583 (roadmap N05): the deadline must fire even if nobody
+        // ever calls `poll`/`wait` again, so it cannot live inside
+        // `update_process` alone. This watchdog owns only the bare pid, not
+        // the `Child`/`ManagedProcess`, so it needs no lock over state this
+        // struct's normal methods mutate; `cancel_watchdog` stops it as soon
+        // as the process reaches a terminal state by any other path.
+        let watchdog_stop = args.timeout_ms.zip(child.pid()).map(|(timeout_ms, pid)| {
+            let (stop_tx, stop_rx) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                match stop_rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Cancelled, or the `ManagedProcess` (and its
+                        // `watchdog_stop` sender) was dropped -- either way
+                        // the process was already handled elsewhere.
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        supervise::terminate_pid(pid, TERMINATE_GRACE);
+                    }
+                }
+            });
+            stop_tx
+        });
         self.processes.insert(
             handle.clone(),
             ManagedProcess {
@@ -380,6 +446,7 @@ impl ProcessManager {
                 exit_code: None,
                 interactive: args.interactive,
                 heavy_permit,
+                watchdog_stop,
             },
         );
         self.idempotency
@@ -443,6 +510,7 @@ impl ProcessManager {
             process.child.terminate()?;
             process.state = ProcessState::Cancelled;
             process.exit_code = None;
+            process.cancel_watchdog();
         }
         let (output, pending) = finish(process, &limits, limits.max_inline_bytes)?;
         Ok(snapshot(process, output, pending))
@@ -579,10 +647,23 @@ fn spawn_reader<R: Read + Send + 'static>(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buffer = [0u8; 8192];
+        let mut total_bytes = 0usize;
+        let mut total_lines = 0usize;
         loop {
+            // Issue #583 (roadmap N05): stop pulling more of this stream once
+            // either hard ceiling is crossed, independent of whether -- or
+            // how often -- a caller drains the channel. A byte-only cap does
+            // not bound a stream of many small lines the same way a child
+            // could still flood: each `read()` can return a full buffer of
+            // short lines as one chunk under the byte cap.
+            if total_bytes >= MAX_STREAM_BYTES || total_lines >= MAX_STREAM_LINES {
+                return;
+            }
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => return,
                 Ok(read) => {
+                    total_bytes += read;
+                    total_lines += buffer[..read].iter().filter(|&&byte| byte == b'\n').count();
                     if sender
                         .send(StreamChunk {
                             stream,
@@ -612,12 +693,14 @@ fn update_process(
         process.child.terminate()?;
         process.state = ProcessState::TimedOut;
         process.exit_code = None;
+        process.cancel_watchdog();
         return finish(process, limits, limits.max_inline_bytes);
     }
     let (mut output, mut pending) = drain(process, limits.max_inline_bytes)?;
     if let Some(code) = process.child.try_wait()? {
         process.state = ProcessState::Exited;
         process.exit_code = Some(code);
+        process.cancel_watchdog();
         let used: usize = output.iter().map(|chunk| chunk.text.len()).sum();
         let (tail, tail_pending) = finish(
             process,
@@ -636,7 +719,7 @@ fn finish(
     inline_budget: usize,
 ) -> Result<(Vec<ProcessOutputChunk>, usize), ToolError> {
     for reader in process.readers.drain(..) {
-        let _ = reader.join();
+        join_reader_bounded(reader);
     }
     let drained = drain(process, inline_budget)?;
     process.heavy_permit.take();
@@ -654,6 +737,25 @@ fn finish(
         );
     }
     Ok(drained)
+}
+
+/// Waits up to [`READER_JOIN_TIMEOUT`] for `reader` to finish, rather than
+/// `reader.join()` directly. A reader blocks in `read()` until its pipe's
+/// write end is fully closed, which any descendant still holding it --
+/// spawned by the child, outliving it, ignoring termination -- can prevent
+/// forever; `finish` (and everything synchronous above it: `poll`, `wait`,
+/// `terminate`) must still return on a bounded budget (issue #583 / roadmap
+/// N05). The actual join happens on a detached proxy thread so this
+/// function's own wait is a plain bounded channel receive: if the reader
+/// really is stuck forever, the proxy leaks (one idle thread) rather than
+/// this call.
+fn join_reader_bounded(reader: JoinHandle<()>) {
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let _ = reader.join();
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.recv_timeout(READER_JOIN_TIMEOUT);
 }
 
 fn drain(
@@ -896,5 +998,104 @@ mod tests {
             .expect("second");
         assert_eq!(first.handle, second.handle);
         manager.terminate(&first.handle).expect("terminate");
+    }
+
+    /// Issue #583 (roadmap N05): one process-lifecycle test, parameterised
+    /// over the three pathological children each bound below has to survive
+    /// -- an unpolled deadline, an oversized/no-newline stream, and a
+    /// descendant that outlives the direct child and keeps its pipe open.
+    /// `#[cfg(unix)]` like every other real-process test in this module (it
+    /// needs `sh`/`setsid`, neither available on this Windows dev box) --
+    /// verified on Linux, not here; see the PR/report for that run.
+    #[cfg(unix)]
+    #[test]
+    fn process_lifecycle_bounds_timeout_output_and_cleanup() {
+        enum Scenario {
+            UnpolledTimeout,
+            OversizedNoNewlineStream,
+            DescendantIgnoresTermination,
+        }
+
+        for scenario in [
+            Scenario::UnpolledTimeout,
+            Scenario::OversizedNoNewlineStream,
+            Scenario::DescendantIgnoresTermination,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(dir.path().join("state"));
+            let mut manager = ProcessManager::new(state, dir.path().to_path_buf(), limits());
+
+            match scenario {
+                Scenario::UnpolledTimeout => {
+                    let mut start = args(dir.path(), "unpolled-timeout");
+                    start.timeout_ms = Some(200);
+                    let snapshot = manager
+                        .start(shell_launch(dir.path(), "sleep 5 && touch marker"), &start)
+                        .expect("start");
+                    assert_eq!(snapshot.state, ProcessState::Running);
+                    // No poll/wait call anywhere in this window: only the
+                    // watchdog, never caller polling, can be what kills it.
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    assert!(
+                        !dir.path().join("marker").exists(),
+                        "the watchdog must terminate the process before it reaches \
+                         `touch marker`, with no poll/wait call in between"
+                    );
+                    let after = manager.poll(&snapshot.handle).expect("poll after the fact");
+                    assert_ne!(after.state, ProcessState::Running);
+                }
+                Scenario::OversizedNoNewlineStream => {
+                    let start = args(dir.path(), "oversized-stream");
+                    let snapshot = manager
+                        .start(
+                            shell_launch(dir.path(), "head -c 9000000 /dev/zero | tr '\\0' 'a'"),
+                            &start,
+                        )
+                        .expect("start");
+                    let mut delivered = 0usize;
+                    for _ in 0..40 {
+                        let snap = manager.poll(&snapshot.handle).expect("poll");
+                        delivered += snap
+                            .output
+                            .iter()
+                            .map(|chunk| chunk.byte_len)
+                            .sum::<usize>()
+                            + snap.pending_output_bytes;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    assert!(
+                        delivered <= MAX_STREAM_BYTES + 8192,
+                        "the reader must stop at the byte ceiling instead of buffering \
+                         the whole 9 MB, single-line stream unbounded: delivered {delivered}"
+                    );
+                    let _ = manager.terminate(&snapshot.handle);
+                }
+                Scenario::DescendantIgnoresTermination => {
+                    let start = args(dir.path(), "descendant-survives");
+                    let snapshot = manager
+                        .start(
+                            shell_launch(
+                                dir.path(),
+                                "setsid sh -c 'sleep 30' >/dev/null 2>&1 & disown; exit 0",
+                            ),
+                            &start,
+                        )
+                        .expect("start");
+                    // Give the detached grandchild time to start and inherit
+                    // the pipe before the direct child exits.
+                    std::thread::sleep(Duration::from_millis(300));
+                    let before = Instant::now();
+                    let stopped = manager.terminate(&snapshot.handle).expect(
+                        "terminate must return even though the grandchild keeps the pipe open",
+                    );
+                    assert!(
+                        before.elapsed() < Duration::from_secs(8),
+                        "finish must join its readers on a bounded budget, not hang on a \
+                         descendant that outlives the direct child and keeps the pipe open"
+                    );
+                    assert_ne!(stopped.state, ProcessState::Running);
+                }
+            }
+        }
     }
 }
