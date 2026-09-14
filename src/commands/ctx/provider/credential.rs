@@ -358,6 +358,12 @@ impl CredentialStore for FakeStore {
 pub struct CommandSpec {
     pub program: &'static str,
     pub args: Vec<String>,
+    /// Extra `(name, value)` environment variables set on the child, on top
+    /// of whatever it already inherits. Issue #642: `windows_get_command`/
+    /// `windows_set_command` use this to pass the store item id, since
+    /// PowerShell's `-Command <script>` appends any positional argv entry to
+    /// the script text instead of populating `$args`.
+    pub envs: Vec<(String, String)>,
     pub stdin: Option<String>,
     pub inherit_stdin: bool,
 }
@@ -387,6 +393,7 @@ impl CommandRunner for ProcessRunner {
         let mut command = Command::new(spec.program);
         command
             .args(&spec.args)
+            .envs(spec.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if spec.inherit_stdin {
@@ -522,6 +529,7 @@ fn current_get_command(_item: &str) -> CommandSpec {
     CommandSpec {
         program: "unsupported",
         args: vec![],
+        envs: Vec::new(),
         stdin: None,
         inherit_stdin: false,
     }
@@ -543,6 +551,7 @@ pub fn macos_get_command(item: &str) -> CommandSpec {
             item.into(),
             "-w".into(),
         ],
+        envs: Vec::new(),
         stdin: None,
         inherit_stdin: false,
     }
@@ -554,6 +563,7 @@ pub fn macos_set_command(item: &str, secret: &str, interactive: bool) -> Command
         return CommandSpec {
             program: "security",
             args: vec!["-i".into()],
+            envs: Vec::new(),
             stdin: Some(format!(
                 "add-generic-password -U -s {} -a {} -w {}\n",
                 macos_interactive_arg("zirv-native"),
@@ -574,6 +584,7 @@ pub fn macos_set_command(item: &str, secret: &str, interactive: bool) -> Command
             item.into(),
             "-w".into(),
         ],
+        envs: Vec::new(),
         stdin: None,
         inherit_stdin: true,
     }
@@ -604,6 +615,7 @@ pub fn linux_get_command(item: &str) -> CommandSpec {
             "item".into(),
             item.into(),
         ],
+        envs: Vec::new(),
         stdin: None,
         inherit_stdin: false,
     }
@@ -622,15 +634,32 @@ pub fn linux_set_command(item: &str, secret: &str) -> CommandSpec {
             "item".into(),
             item.into(),
         ],
+        envs: Vec::new(),
         stdin: Some(secret.to_string()),
         inherit_stdin: false,
     }
 }
 
+// Issue #642: PowerShell's `-Command <script>` treats every remaining argv
+// entry as MORE script text, not as `$args` -- unlike `-Command { <scriptblock>
+// } arg1 arg2`, a bare string command never populates `$args` from the
+// command line at all. The item id used to be appended as a positional argv
+// entry, so the script failed to parse: `Unexpected token 'test-item' in
+// expression or statement`, and every `store:` ref was non-functional on
+// Windows. Both scripts now read the item from `$env:ZIRV_CRED_ITEM`
+// instead, set via `CommandSpec::envs` -- the secret itself keeps going over
+// stdin, unchanged.
+//
+// `Add-Type -AssemblyName System.Security` is likewise required, not
+// decorative: a bare `-NoProfile -NonInteractive` PowerShell host does not
+// have `System.Security.dll` loaded by default, so
+// `[Security.Cryptography.ProtectedData]` resolves to "Unable to find type"
+// without it -- verified on this machine (Windows 11 Pro, PowerShell 5.1)
+// once the argv fix above let the script actually reach this line.
 #[cfg(any(test, target_os = "windows"))]
-const WINDOWS_READ_SCRIPT: &str = r#"$p=Join-Path $env:LOCALAPPDATA ('zirv\native-credentials\'+$args[0]+'.dpapi'); if(!(Test-Path $p)){exit 3}; $b=[IO.File]::ReadAllBytes($p); $d=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser'); [Text.Encoding]::UTF8.GetString($d)"#;
+const WINDOWS_READ_SCRIPT: &str = r#"Add-Type -AssemblyName System.Security; $p=Join-Path $env:LOCALAPPDATA ('zirv\native-credentials\'+$env:ZIRV_CRED_ITEM+'.dpapi'); if(!(Test-Path $p)){exit 3}; $b=[IO.File]::ReadAllBytes($p); $d=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser'); [Text.Encoding]::UTF8.GetString($d)"#;
 #[cfg(any(test, target_os = "windows"))]
-const WINDOWS_WRITE_SCRIPT: &str = r#"$d=Join-Path $env:LOCALAPPDATA 'zirv\native-credentials'; [IO.Directory]::CreateDirectory($d)|Out-Null; $s=[Console]::In.ReadToEnd(); $b=[Text.Encoding]::UTF8.GetBytes($s); $e=[Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser'); [IO.File]::WriteAllBytes((Join-Path $d ($args[0]+'.dpapi')),$e)"#;
+const WINDOWS_WRITE_SCRIPT: &str = r#"Add-Type -AssemblyName System.Security; $d=Join-Path $env:LOCALAPPDATA 'zirv\native-credentials'; [IO.Directory]::CreateDirectory($d)|Out-Null; $s=[Console]::In.ReadToEnd(); $b=[Text.Encoding]::UTF8.GetBytes($s); $e=[Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser'); [IO.File]::WriteAllBytes((Join-Path $d ($env:ZIRV_CRED_ITEM+'.dpapi')),$e)"#;
 
 #[cfg(any(test, target_os = "windows"))]
 pub fn windows_get_command(item: &str) -> CommandSpec {
@@ -641,8 +670,8 @@ pub fn windows_get_command(item: &str) -> CommandSpec {
             "-NonInteractive".into(),
             "-Command".into(),
             WINDOWS_READ_SCRIPT.into(),
-            item.into(),
         ],
+        envs: vec![("ZIRV_CRED_ITEM".to_string(), item.to_string())],
         stdin: None,
         inherit_stdin: false,
     }
@@ -657,8 +686,8 @@ pub fn windows_set_command(item: &str, secret: &str) -> CommandSpec {
             "-NonInteractive".into(),
             "-Command".into(),
             WINDOWS_WRITE_SCRIPT.into(),
-            item.into(),
         ],
+        envs: vec![("ZIRV_CRED_ITEM".to_string(), item.to_string())],
         stdin: Some(secret.to_string()),
         inherit_stdin: false,
     }
@@ -809,12 +838,23 @@ mod tests {
             &windows_get.args[..3],
             ["-NoProfile", "-NonInteractive", "-Command"]
         );
-        assert_eq!(windows_get.args.last().map(String::as_str), Some("work"));
+        // Issue #642: no argv entry follows `-Command` -- PowerShell would
+        // otherwise append it to the script text instead of populating
+        // `$args`. The item travels through `envs` instead.
+        assert_eq!(windows_get.args.len(), 4, "no positional after -Command");
+        assert_eq!(
+            windows_get.envs,
+            [("ZIRV_CRED_ITEM".to_string(), "work".to_string())]
+        );
         assert_eq!(
             &windows.args[..3],
             ["-NoProfile", "-NonInteractive", "-Command"]
         );
-        assert_eq!(windows.args.last().map(String::as_str), Some("work"));
+        assert_eq!(windows.args.len(), 4, "no positional after -Command");
+        assert_eq!(
+            windows.envs,
+            [("ZIRV_CRED_ITEM".to_string(), "work".to_string())]
+        );
         assert_eq!(windows.stdin.as_deref(), Some("secret"));
         assert!(!windows.args.contains(&"secret".into()));
     }
