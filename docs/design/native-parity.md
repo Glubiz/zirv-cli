@@ -49,8 +49,8 @@ document may claim a rung it has not earned:
 | `live-validated` | a recorded run against a real provider endpoint, with the recording committed under `docs/benchmarks/`. **No row in this document claims this rung.** |
 | `legacy-only` | there is no native path, and the `Requires` cell says why. Every one of these is an entitlement limitation, not an unfinished feature -- see the two tables at the end. |
 
-Current distribution, counted by the check itself: 98 `unit`, 35
-`integration`, 17 `ci-matrix`, 8 `legacy-only`, 0 `live-validated`, across
+Current distribution, counted by the check itself: 98 `unit`, 34
+`integration`, 18 `ci-matrix`, 8 `legacy-only`, 0 `live-validated`, across
 158 capabilities (121 command verbs, 37 model-calling call sites).
 
 ## Release blockers
@@ -104,7 +104,7 @@ means it runs on any supported OS with no provider configured at all.
 | `ctx config` | `ctx::config` + `ctx::config_cmd` schema 2 | same zirv code | none | `config_cmd::tests::invalid_edits_leave_file_untouched_including_separate_policy_sections`, `CI: Config Migration Round Trip` | `ci-matrix` |
 | `ctx discover` | `ctx::discover` over the compaction ledger | same zirv code | none | `discover::tests::measured_vs_estimated_classification_matches_the_ledger_join_exactly` | `unit` |
 | `ctx doctor` | `ctx::doctor::diagnose` | same zirv code on both runtimes | none | `doctor::tests::a_doctor_names_each_failure_class_from_a_real_inventory`, `CI: Verify Native Diagnosis Contracts` | `ci-matrix` |
-| `ctx exec` | `native::run_headless` | `exec::run_with_clock_inner` + vendor CLI | any configured native route | `runtime::native::tests::a_whole_native_session_runs_with_an_empty_path_and_no_harness_binary`, `exec::tests::exec_resolves_the_configured_default_against_its_own_role` | `integration` |
+| `ctx exec` | `native::run_headless` | `exec::run_with_clock_inner` + vendor CLI | any configured native route | `runtime::native::tests::a_whole_native_session_runs_with_an_empty_path_and_no_harness_binary`, `exec::tests::exec_resolves_the_configured_default_against_its_own_role`, `tools::tests::a_real_native_worker_and_every_helper_role_complete_with_every_registered_harness_canaried_and_uninvoked`, `CI: Verify The Harness-Free Install Proof` | `ci-matrix` |
 | `ctx explain-status` | `ctx::attention` | same zirv code | none | `attention::tests::explain_status_reports_projection_reason_and_skipped_fallbacks` | `unit` |
 | `ctx forget` | `ctx::memory` + native `memory_forget` tool | same zirv code | none | `memory::tests::forget_removes_one_key_and_forget_all_empties_the_bank` | `unit` |
 | `ctx group` | `ctx::group` + native `group_create`/`group_status` tools | same zirv code | none | `tools::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services`, `group::tests::a_work_group_round_trips_through_state_and_lists` | `integration` |
@@ -124,7 +124,7 @@ means it runs on any supported OS with no provider configured at all.
 | `ctx provider` | `provider::inventory` + `provider::credential` | not applicable -- native-only surface | none | `provider_cmd::tests::credential_set_refuses_harness_login_stores_before_reading_or_writing`, `CI: Native Setup And Doctor With No Harness Installed` | `ci-matrix` |
 | `ctx recall` | `ctx::memory` + native `memory_recall` tool | same zirv code | none | `memory::tests::ctx_recall_merges_both_banks_and_labels_each_entrys_provenance` | `unit` |
 | `ctx remember` | `ctx::memory` + native `memory_remember` tool | same zirv code | none | `memory::tests::remembering_an_existing_key_replaces_the_entry_rather_than_duplicating_it` | `unit` |
-| `ctx resume` | `native::resume_journal` | `resume::launch_command` + vendor CLI | any configured native route | `runtime::native::tests::a_resume_reconciles_a_started_execution_and_fences_the_old_generation`, `resume::tests::an_unknown_adapter_preserves_the_crash_witness` | `integration` |
+| `ctx resume` | `native::resume_journal` | `resume::launch_command` + vendor CLI | any configured native route | `runtime::native::tests::a_resume_reconciles_a_started_execution_and_fences_the_old_generation`, `resume::tests::an_unknown_adapter_preserves_the_crash_witness`, `runtime::native::tests::a_resume_with_a_reconcile_notice_writes_exactly_one_json_object_to_stdout` | `integration` |
 | `ctx run` | `runtime::tools` reuses the same store and permits | same zirv code | none | `ctx::output::tests::the_summary_respects_the_byte_cap_and_still_carries_the_retrieval_line` | `unit` |
 | `ctx safety` | `runtime::enforcement` re-evaluates the same classifier | same zirv code | none | `safety::tests::evaluate_candidate_outcome_matches_the_existing_fold_for_a_single_candidate` | `unit` |
 | `ctx savings` | `ctx::ledger` | same zirv code | none | `ledger::tests::savings_on_an_empty_ledger_prints_a_no_rows_line_and_exits_zero` | `unit` |

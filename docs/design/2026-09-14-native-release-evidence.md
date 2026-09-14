@@ -50,11 +50,12 @@ against the vendor's endpoint. See §3.
 | Config migrate forward / downgrade round trip | yes | yes | yes | `Native Install` job, `Config Migration Round Trip` + `Verify Config Migration Contracts` |
 | Every helper role (distiller, ask, optimize, seat) with an empty `PATH` | yes | yes | yes | `Native Install` job, `Verify Every Helper Path Runs Without A Harness`; `helper::tests::every_helper_role_answers_with_every_coding_harness_removed_from_path` |
 | A whole coordinating team with every coding harness absent | yes | yes | yes | same job/step; `tools::tests::an_all_native_team_runs_a_workflow_with_every_coding_harness_absent` |
+| A REAL native worker and every helper role, with a CANARY executable standing in for every registered harness name (not just `claude`/`codex`) | yes | yes | yes | `Native Install` job, `Verify The Harness-Free Install Proof`; `tools::tests::a_real_native_worker_and_every_helper_role_complete_with_every_registered_harness_canaried_and_uninvoked` (issue #609, roadmap N22) |
 | Mixed board (wrapped + native) and return to the harness default | yes | yes | yes | `Native Install` job, `Verify Mixed Runtime And Fault Invariants`; `runtime::tests::a_mixed_board_exchanges_mail_and_survives_a_return_to_the_harness_default` |
 | Fault invariants (seat fence, approval channel, queued mail, every rollover direction) | yes | yes | yes | same step; see [`native-parity.md`](native-parity.md) "The four invariants" |
 | Native coding tools (closed registry, file tools, bounded output, process lifecycle) | yes | yes | yes | `Native Tools` job |
 | Execution enforcement / broker contract | yes | yes | yes | `Native Enforcement` job |
-| Verified process isolation for a sandboxed invocation | yes | yes | **no** | `runtime::enforcement::PlatformIsolation::detect`; on Windows the broker REFUSES a sandboxed invocation rather than running it unconfined (`enforcement::tests::unavailable_process_isolation_never_falls_back_to_a_plain_spawn`). Tracked as an implementation gap, N04 (#473) |
+| Verified process isolation for a sandboxed invocation | yes | yes | **no** | `runtime::enforcement::PlatformIsolation::detect`; on Windows the broker REFUSES a sandboxed invocation rather than running it unconfined (`enforcement::tests::unavailable_process_isolation_never_falls_back_to_a_plain_spawn`, which hand-feeds an `Unavailable` value, and `enforcement::tests::a_process_action_is_refused_by_this_machines_own_real_platform_isolation_detection`, added by issue #610, which calls `detect()` for real on this machine and pins the exact Windows verdict). Tracked as an implementation gap, N04 (#473) |
 | Interactive PTY supervision of a native session | n/a | n/a | n/a | there is no vendor TUI under a native seat; `zirv chat --runtime native` is the interactive surface |
 
 ## 2. What is verified, and by what
@@ -83,6 +84,19 @@ tree -- `ZCHK-NATIVE-PARITY` fails the build if one stops existing.
   `provider::inventory`'s own tests together with the `Native Install` job,
   which runs `zirv ctx provider list` and `zirv ctx doctor --json` on a
   machine the job has already asserted has no coding harness installed.
+  Issue #609 (roadmap N22) closed the remaining gap in the team test above:
+  the coordinator's own delegate tool call cannot be driven through a real
+  dispatched worker deterministically (`HeadlessRequest::provider`, the
+  operator-only fixture override, is deliberately never threaded onto a
+  model-facing `LaunchRequest`), so `an_all_native_team_runs_a_workflow_with_
+  every_coding_harness_absent` still substitutes `RecordingLauncher` for that
+  one seam. `tools::tests::a_real_native_worker_and_every_helper_role_
+  complete_with_every_registered_harness_canaried_and_uninvoked` closes it
+  from the other side: it drives the REAL production worker entry point
+  (`runtime::native::run_session`) and every helper role to completion, with
+  a CANARY executable -- not an empty `PATH` -- standing in for every name
+  `ctx::adapters::ADAPTERS` registers, and asserts none of the eight ever
+  ran. `Verify The Harness-Free Install Proof` runs it on all three OSes.
 - **Mixed runtime and the way back.**
   `tools::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services`
   (one board, both runtimes, one graph) and
