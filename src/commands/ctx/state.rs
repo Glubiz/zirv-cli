@@ -1659,6 +1659,60 @@ mod tests {
             .expect("reader thread panicked on a partial read");
     }
 
+    /// Review round 1 on #582's fix: a direct unit test of the guard itself,
+    /// covering the three cases its doc comment promises -- the race tests
+    /// on `apply_patch`/`write_file` only exercise the "mismatch" branch,
+    /// synchronized on real thread timing; this pins all three
+    /// deterministically, with no threads at all.
+    #[test]
+    fn write_atomic_bytes_if_unchanged_covers_its_three_outcomes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("guarded.txt");
+
+        // Unchanged: the destination still matches what the caller
+        // validated, so the replace goes through.
+        std::fs::write(&path, "before").expect("seed");
+        let before_sha = hex_sha256(b"before");
+        let result = write_atomic_bytes_if_unchanged(&path, b"after", false, &before_sha)
+            .expect("io must succeed");
+        assert_eq!(result, None, "an unchanged destination must be replaced");
+        assert_eq!(std::fs::read(&path).expect("read"), b"after");
+
+        // Mismatch: the destination changed since the caller's own
+        // precondition check landed on `before_sha` -- refused, and the
+        // external bytes must survive untouched.
+        std::fs::write(&path, "raced").expect("simulate an external edit");
+        let result = write_atomic_bytes_if_unchanged(&path, b"clobber", false, &before_sha)
+            .expect("io must succeed");
+        assert_eq!(
+            result,
+            Some(hex_sha256(b"raced")),
+            "a changed destination must be refused and report its current hash"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"raced",
+            "the racing external edit must survive, never the refused replacement"
+        );
+
+        // Missing destination vs. a non-empty expected hash: a destination
+        // that vanished since the caller's check is exactly as much "the
+        // destination changed" as one whose content differs, and must be
+        // refused the same way rather than treated as a fresh create.
+        let missing = tmp.path().join("never-existed.txt");
+        let result = write_atomic_bytes_if_unchanged(&missing, b"content", false, &before_sha)
+            .expect("io must succeed");
+        assert_eq!(
+            result,
+            Some(hex_sha256(b"")),
+            "a missing destination must report the empty-bytes hash, not silently write"
+        );
+        assert!(
+            !missing.exists(),
+            "a refused write must never create the destination"
+        );
+    }
+
     /// Unlike `write_private`, `write_shared` must not force 0600: it writes
     /// ordinary repository content, so it should get whatever permissions a
     /// plain file write in the same directory would (whatever the process
