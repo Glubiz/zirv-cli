@@ -6418,6 +6418,7 @@ fn fulfill_spawn_request(
                 // expressed by the pane's own broker refusing every write,
                 // which is the same answer `--mode read-only` produces.
                 writing: req.mode == super::permit::WorkerMode::Writing,
+                provider: None,
             },
         )
         .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
@@ -9115,6 +9116,7 @@ fn spawn_restored_pane(
                 role: candidate.role.clone(),
                 route: None,
                 writing: true,
+                provider: None,
             },
         ) {
             Ok(mut pane) => {

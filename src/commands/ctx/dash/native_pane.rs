@@ -2430,31 +2430,93 @@ pub fn composer_block(
         Tone::Muted,
     ));
 
+    out.push(composer_hint_row(presentation, facts, width));
+    out
+}
+
+/// Issue #490 (N21, operator direction): the mock's hint line, three columns
+/// spread across the composer's own width -- `? for shortcuts` hard left, the
+/// mode and what `Enter` does centred, `\u{29d7} N queued` hard right and only
+/// when something IS queued.
+///
+/// Laid out here rather than by the renderer so the exact character positions
+/// are asserted by a deterministic test at every terminal width the mock
+/// draws, and so `render_plain` and a real terminal cannot disagree about
+/// them.
+fn composer_hint_row(
+    presentation: &NativePresentation,
+    facts: &StatusFacts,
+    width: usize,
+) -> StyledLine {
     let queued = presentation.composer.queued.len();
     let mode = match classify_submit_intent(facts) {
-        SubmitIntent::Immediate => "enter sends",
-        SubmitIntent::Steer => "enter steers this turn",
-        SubmitIntent::Queue => "blocked \u{2014} enter queues",
+        SubmitIntent::Immediate => format!("{} (shift+tab)", presentation.mode.label()),
+        SubmitIntent::Steer => "enter steers this turn (shift+tab)".to_string(),
+        SubmitIntent::Queue => "blocked \u{2014} enter queues (shift+tab)".to_string(),
     };
-    out.push(StyledLine(vec![
+    // Full form first; the narrow floor (the mock's own 40-column frame)
+    // drops each column to its shortest honest spelling rather than letting
+    // any of the three fall off the edge.
+    let mut left = "  ? for shortcuts".to_string();
+    let mut mid = mode;
+    let mut right = if queued > 0 {
+        format!("\u{29d7} {queued} queued")
+    } else {
+        String::new()
+    };
+    let fits = |left: &str, mid: &str, right: &str| {
+        style::display_width(left) + style::display_width(mid) + style::display_width(right) + 2
+            <= width
+    };
+    if !fits(&left, &mid, &right) {
+        left = "  ?".to_string();
+        mid = mid
+            .split(" (shift+tab)")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        right = if queued > 0 {
+            format!("\u{29d7}{queued}")
+        } else {
+            String::new()
+        };
+    }
+    while !fits(&left, &mid, &right) && !mid.is_empty() {
+        mid.pop();
+    }
+    let left_w = style::display_width(&left);
+    let mid_w = style::display_width(&mid);
+    let right_w = style::display_width(&right);
+    // The centre column is centred on the WHOLE line, then clamped so it can
+    // never overlap either side -- at the narrow floor the three simply abut.
+    let centre_start = width.saturating_sub(mid_w) / 2;
+    let lead = centre_start
+        .max(left_w + 1)
+        .saturating_sub(left_w)
+        .min(width.saturating_sub(left_w + mid_w + right_w));
+    let tail = width.saturating_sub(left_w + lead + mid_w + right_w);
+    StyledLine(vec![
         StyledSpan {
-            text: "  ? for shortcuts".to_string(),
+            text: left,
             tone: Tone::Muted,
         },
         StyledSpan {
-            text: format!("   {mode}"),
+            text: " ".repeat(lead),
             tone: Tone::Muted,
         },
         StyledSpan {
-            text: if queued > 0 {
-                format!("   \u{29d7} {queued} queued")
-            } else {
-                String::new()
-            },
+            text: mid,
+            tone: Tone::Muted,
+        },
+        StyledSpan {
+            text: " ".repeat(tail),
+            tone: Tone::Muted,
+        },
+        StyledSpan {
+            text: right,
             tone: Tone::Warn,
         },
-    ]));
-    out
+    ])
 }
 
 /// Renders the exact same view model as plain text, for a non-TTY/headless
@@ -2502,6 +2564,12 @@ pub struct NativeDashboardSpec {
     /// from `chat.rs`'s own call; a future read-only spawn path (a native
     /// reviewer pane, say) would pass `false`.
     pub writing: bool,
+    /// `runtime::native::InteractiveRequest::provider`'s own escape hatch,
+    /// threaded through so a deterministic test can open a REAL native pane
+    /// against `fixture::FixtureProvider` instead of the operator's native
+    /// provider configuration. `None` on every production call site, which
+    /// resolves the real configuration exactly as before this field existed.
+    pub provider: Option<String>,
 }
 
 /// The billing label (`"api"`/`"subscription"`) for `route`'s own account,
@@ -2615,8 +2683,9 @@ pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64) -> String {
     let spinner = ACTIVITY_SPINNER_FRAMES[(millis / 120) as usize % ACTIVITY_SPINNER_FRAMES.len()];
     let verb = ACTIVITY_VERBS[(millis / 2_500) as usize % ACTIVITY_VERBS.len()];
     format!(
-        "{spinner} {verb}\u{2026} ({secs}s \u{b7} \u{2191} {tokens} tokens \u{b7} esc to interrupt)",
-        secs = elapsed.as_secs(),
+        "{spinner} {verb}\u{2026} (esc to interrupt \u{b7} {elapsed} \u{b7} \u{2193} {tokens} tokens)",
+        elapsed = elapsed_text(elapsed),
+        tokens = token_text(tokens),
     )
 }
 
@@ -2688,6 +2757,29 @@ fn dialog_request_from_broker(
             .map(|path| path.display().to_string())
             .collect(),
         asked_at: request.created_at,
+    }
+}
+
+/// The mock's own elapsed reading: `1m 12s` past a minute, `48s` below one,
+/// `1h 04m` past an hour. Never a bare second count once it stops being
+/// readable as one.
+fn elapsed_text(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// The mock's own token reading: `3.4k` past a thousand, the plain count
+/// below one. Truncating, never rounding up -- a token total that reads
+/// higher than it is, is the one direction an operator cannot check.
+fn token_text(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        1_000..=999_999 => format!("{}.{}k", tokens / 1_000, (tokens % 1_000) / 100),
+        _ => format!("{}.{}M", tokens / 1_000_000, (tokens % 1_000_000) / 100_000),
     }
 }
 
@@ -2843,7 +2935,7 @@ impl NativePaneRuntime {
                 limits: native::NativeLimits::default(),
                 task: None,
                 writing: spec.writing,
-                provider: None,
+                provider: spec.provider.clone(),
             },
             env,
         )?;
@@ -4799,7 +4891,15 @@ mod tests {
         assert!(text[1].contains("> keep the shim"));
         assert!(text[2].starts_with('\u{2570}'));
         assert!(text[3].contains("? for shortcuts"));
-        assert!(text[3].contains("enter sends"));
+        // The mock's centre column is the composer MODE plus the key that
+        // cycles it, not a restatement of what Enter does -- that is only
+        // spelled out when Enter does something other than send.
+        assert!(text[3].contains("(shift+tab)"), "{:?}", text[3]);
+        assert!(
+            text[3].contains(ComposerMode::Default.label()),
+            "{:?}",
+            text[3]
+        );
         // Every box row is exactly the pane's width.
         for row in &text[..3] {
             assert_eq!(style::display_width(row), 60, "row {row:?} is not 60 wide");
@@ -5620,10 +5720,16 @@ mod tests {
 
     #[test]
     fn activity_line_text_carries_real_elapsed_seconds_tokens_and_the_interrupt_hint() {
+        // The mock's own reading: `(esc to interrupt · <elapsed> · ↓ <tokens>)`,
+        // with a minute-aware elapsed and a `k`-scaled token count.
         let text = activity_line_text(std::time::Duration::from_secs(12), 1_234);
-        assert!(text.contains("12s"), "{text:?}");
-        assert!(text.contains("1234 tokens"), "{text:?}");
-        assert!(text.contains("esc to interrupt"), "{text:?}");
+        assert!(
+            text.contains("(esc to interrupt \u{b7} 12s \u{b7} \u{2193} 1.2k tokens)"),
+            "{text:?}"
+        );
+        let longer = activity_line_text(std::time::Duration::from_secs(72), 420);
+        assert!(longer.contains("1m 12s"), "{longer:?}");
+        assert!(longer.contains("\u{2193} 420 tokens"), "{longer:?}");
     }
 
     #[test]
@@ -6474,5 +6580,153 @@ mod tests {
 
         pane.shutdown(&state);
         drop(running);
+    }
+
+    // =====================================================================
+    // Operator direction (2026-09-14): the regenerated mock
+    // `docs/design/mocks/2026-09-13-native-pane.html` is the acceptance
+    // target. One snapshot-style test per terminal size the mock draws,
+    // pinning its LAYOUT SKELETON -- the composer's box rows, the hint
+    // line's three columns and the activity line's exact reading -- from
+    // fixed fixture facts, with no clock, no terminal and no session.
+    //
+    // The skeleton, not the prose: what these assert is that a row that
+    // should be a full-width box border IS one at that width, that the hint
+    // line's three columns are laid out left/centre/right and never overflow,
+    // and that the activity line reads exactly as the mock draws it. A
+    // wording change to a verb or a mode label is not a layout regression and
+    // is deliberately not pinned here.
+    // =====================================================================
+
+    /// Every terminal size the mock draws, narrow floor first.
+    const MOCK_WIDTHS: [usize; 4] = [40, 80, 120, 200];
+
+    fn mock_presentation(queued: usize) -> NativePresentation {
+        let mut presentation = NativePresentation::default();
+        presentation.composer.draft = "keep the old constructor as a deprecated shim".to_string();
+        presentation.composer.queued = (0..queued)
+            .map(|i| QueuedInput {
+                text: format!("queued {i}"),
+                steering: false,
+                queued_at_ms: i as u64,
+            })
+            .collect();
+        presentation
+    }
+
+    fn skeleton(width: usize, queued: usize) -> Vec<String> {
+        composer_block(
+            &mock_presentation(queued),
+            &facts(NativeSessionState::Idle, None, false, false),
+            width,
+        )
+        .iter()
+        .map(StyledLine::to_plain_string)
+        .collect()
+    }
+
+    #[test]
+    fn the_composer_box_matches_the_mock_at_every_terminal_size() {
+        for width in MOCK_WIDTHS {
+            let rows = skeleton(width, 1);
+            let top = &rows[0];
+            let bottom = &rows[rows.len() - 2];
+            assert!(
+                top.starts_with('\u{256d}') && top.ends_with('\u{256e}'),
+                "{width}: the box opens with the mock's rounded corners: {top:?}"
+            );
+            assert!(
+                bottom.starts_with('\u{2570}') && bottom.ends_with('\u{256f}'),
+                "{width}: the box closes with the mock's rounded corners: {bottom:?}"
+            );
+            for row in &rows[..rows.len() - 1] {
+                assert_eq!(
+                    style::display_width(row),
+                    width,
+                    "{width}: a box row is not the full width: {row:?}"
+                );
+            }
+            assert!(
+                rows[1].contains("> keep the old constructor"),
+                "{width}: the draft row carries the mock's `>` marker: {:?}",
+                rows[1]
+            );
+        }
+    }
+
+    #[test]
+    fn the_hint_line_keeps_its_three_columns_at_every_terminal_size() {
+        for width in MOCK_WIDTHS {
+            let rows = skeleton(width, 1);
+            let hint = rows.last().expect("hint line").clone();
+            assert!(
+                style::display_width(&hint) <= width,
+                "{width}: the hint line overflows: {hint:?}"
+            );
+            // Left column, hard left.
+            assert!(
+                hint.starts_with("  ?"),
+                "{width}: the shortcut hint is hard left: {hint:?}"
+            );
+            // Right column, hard right, and only because something is queued.
+            assert!(
+                hint.trim_end().ends_with("queued") || hint.trim_end().ends_with("\u{29d7}1"),
+                "{width}: the queue count is hard right: {hint:?}"
+            );
+            // Centre column, between the two and touching neither.
+            let centre = ComposerMode::Default.label();
+            let centre = centre.split(' ').next().expect("a mode label word");
+            let at = hint.find(centre).unwrap_or_else(|| {
+                panic!("{width}: the mode is missing from the hint line: {hint:?}")
+            });
+            assert!(
+                at > 3,
+                "{width}: the mode column must not touch the left one: {hint:?}"
+            );
+            // And with nothing queued the right column is absent entirely,
+            // never rendered as a zero.
+            let empty = skeleton(width, 0);
+            let hint = empty.last().expect("hint line");
+            assert!(
+                !hint.contains('\u{29d7}'),
+                "{width}: an empty queue is absent, not `0 queued`: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_activity_line_matches_the_mocks_exact_reading() {
+        // The mock's own frame: `✻ Wrangling… (esc to interrupt · 1m 12s · ↓ 3.4k tokens)`.
+        let text = activity_line_text(std::time::Duration::from_secs(72), 3_400);
+        let (_spinner, rest) = text.split_once(' ').expect("a spinner then the verb");
+        assert!(
+            rest.ends_with("(esc to interrupt \u{b7} 1m 12s \u{b7} \u{2193} 3.4k tokens)"),
+            "{text:?}"
+        );
+        assert!(
+            rest.split('\u{2026}')
+                .next()
+                .is_some_and(|verb| !verb.is_empty() && !verb.contains('(')),
+            "a rotating verb precedes the ellipsis: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_mock_sizes_all_resolve_a_layout_that_keeps_the_conversation() {
+        // The mock's own panel story: 40 columns has neither sidebar nor
+        // overview, 80 has neither, 120 has the sidebar, 200 has both -- and
+        // the conversation is never starved at any of them.
+        let expected = [
+            (40, false, false),
+            (80, false, false),
+            (120, true, false),
+            (200, true, true),
+        ];
+        for (width, sidebar, overview) in expected {
+            let plan = super::super::native_ux::resolve_layout(width, 40);
+            assert_eq!(plan.sidebar, sidebar, "{width}: sidebar");
+            assert_eq!(plan.overview, overview, "{width}: overview");
+            assert!(plan.main_width >= 20, "{width}: the pane is never starved");
+        }
     }
 }
