@@ -82,7 +82,9 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
     let parity_path = repo.join(PARITY_PATH);
     let inventory = match std::fs::read_to_string(&inventory_path) {
         Ok(text) => text,
-        Err(err) => return inconclusive(format!("cannot read {}: {err}", inventory_path.display())),
+        Err(err) => {
+            return inconclusive(format!("cannot read {}: {err}", inventory_path.display()));
+        }
     };
     let parity = match std::fs::read_to_string(&parity_path) {
         Ok(text) => text,
@@ -452,7 +454,8 @@ mod tests {
 
     #[test]
     fn an_evidence_free_row_that_is_not_a_declared_blocker_fails() {
-        let dir = fixture(&PASSING_ROWS.replace("`checks::tests::a_real_test` | `unit`", "-- | `unit`"));
+        let dir =
+            fixture(&PASSING_ROWS.replace("`checks::tests::a_real_test` | `unit`", "-- | `unit`"));
         let result = outcome(&dir);
         assert_eq!(
             result.outcome,
@@ -467,7 +470,8 @@ mod tests {
     /// check reports it as a blocker in its own details.
     #[test]
     fn an_evidence_free_row_named_as_a_release_blocker_passes_and_is_counted() {
-        let dir = fixture(&PASSING_ROWS.replace("`checks::tests::a_real_test` | `unit`", "-- | `unit`"));
+        let dir =
+            fixture(&PASSING_ROWS.replace("`checks::tests::a_real_test` | `unit`", "-- | `unit`"));
         let parity = std::fs::read_to_string(dir.path().join(PARITY_PATH)).expect("parity");
         std::fs::write(
             dir.path().join(PARITY_PATH),
@@ -495,15 +499,17 @@ mod tests {
             super::super::BuiltinOutcome::Fail,
             "{result:?}"
         );
-        assert!(result.details.contains("WHY there is no native"), "{result:?}");
+        assert!(
+            result.details.contains("WHY there is no native"),
+            "{result:?}"
+        );
     }
 
     #[test]
     fn a_ci_citation_that_names_no_real_step_fails() {
-        let dir = fixture(&PASSING_ROWS.replace(
-            "`checks::tests::a_real_test`",
-            "`CI: A Job Nobody Wrote`",
-        ));
+        let dir = fixture(
+            &PASSING_ROWS.replace("`checks::tests::a_real_test`", "`CI: A Job Nobody Wrote`"),
+        );
         let result = outcome(&dir);
         assert_eq!(
             result.outcome,
@@ -518,10 +524,8 @@ mod tests {
     /// refused rather than read.
     #[test]
     fn an_evidence_pointer_outside_the_benchmark_directory_fails() {
-        let dir = fixture(&PASSING_ROWS.replace(
-            "`checks::tests::a_real_test`",
-            "`../../etc/passwd`",
-        ));
+        let dir =
+            fixture(&PASSING_ROWS.replace("`checks::tests::a_real_test`", "`../../etc/passwd`"));
         let result = outcome(&dir);
         assert_eq!(
             result.outcome,

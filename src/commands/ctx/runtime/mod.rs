@@ -692,7 +692,11 @@ mod tests {
                 "{agent}'s conversation is never handed to the other runtime"
             );
             let waiting = mail::list(&state, slug, None, Some(short)).expect("list after");
-            assert_eq!(waiting.len(), 1, "{agent}'s unread mail survives the return");
+            assert_eq!(
+                waiting.len(),
+                1,
+                "{agent}'s unread mail survives the return"
+            );
             mail::consume_and_log(&state, slug, &waiting[0].0, short, "exec", "exec:test")
                 .expect("consume once");
             assert!(
