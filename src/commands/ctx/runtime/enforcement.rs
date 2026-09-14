@@ -2779,8 +2779,10 @@ mod tests {
     fn stdio_mcp_policy_uses_broker_claims_and_masks_protected_paths() {
         // Issue #555.
         let fixture = fixture(EffectivePolicy::default(), ApprovalMode::Headless, false);
-        let protected = std::fs::canonicalize(fixture._root.path().join("state"))
-            .expect("canonical protected path");
+        // Normalize exactly as the claims do: on Windows a bare canonicalize
+        // keeps the `\\?\` prefix the broker strips, so the paths never match.
+        let protected = normalize_scope_path(&fixture._root.path().join("state"))
+            .expect("normalized protected path");
         let invocation = ProcessInvocation::Argv {
             program: "mcp-server".to_string(),
             args: Vec::new(),
@@ -2793,7 +2795,8 @@ mod tests {
             .process_policy(&invocation, &ProcessEffects::default())
             .expect("MCP policy");
 
-        assert!(policy.read_roots.contains(&fixture.worktree));
+        let worktree = normalize_scope_path(&fixture.worktree).expect("normalized worktree");
+        assert!(policy.read_roots.contains(&worktree));
         assert!(policy.masked_roots.contains(&protected));
         assert!(!policy.read_roots.contains(&protected));
     }
