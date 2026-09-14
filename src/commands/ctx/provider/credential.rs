@@ -867,6 +867,24 @@ mod tests {
             command.stdin.as_deref(),
             Some("add-generic-password -U -s \"zirv-native\" -a \"work\" -w \"piped-value\"\n")
         );
+
+        // Spaces, embedded quotes and backslashes must survive the tool's own
+        // command parser: quotes and backslashes are escaped, spaces are kept.
+        store
+            .set("work", "sp ace \"quoted\" back\\slash")
+            .expect("store succeeds");
+        let command = recorded
+            .lock()
+            .expect("recording lock")
+            .clone()
+            .expect("command");
+        assert_eq!(command.args, ["-i"]);
+        assert_eq!(
+            command.stdin.as_deref(),
+            Some(
+                "add-generic-password -U -s \"zirv-native\" -a \"work\" -w \"sp ace \\\"quoted\\\" back\\\\slash\"\n"
+            )
+        );
     }
 
     #[cfg(unix)]
