@@ -115,6 +115,13 @@ pub struct NativeLimits {
     pub max_tool_calls: u32,
     pub max_wall_ms: u64,
     pub max_output_tokens: u64,
+    /// Token ceiling for the whole run (issue #637; mirrors `--budget-tokens`
+    /// on the harness path, `exec::ExecArgs::budget_tokens`). Checkpoints
+    /// once at `agent::BUDGET_SOFT_FRACTION` of the ceiling (an evidence
+    /// note, not a stop) and stops at the ceiling itself. `None` is
+    /// unbounded, the default -- a plain `zirv ctx exec --runtime native`
+    /// with no `--budget-tokens` must run exactly as before.
+    pub max_budget_tokens: Option<u64>,
     /// How much of ONE tool result may go back to the model inline. Anything
     /// larger is stored whole as a journal artifact and replaced with a
     /// bounded head/tail extract naming its retrieval id, so a single huge
@@ -140,6 +147,7 @@ impl Default for NativeLimits {
             max_tool_calls: 512,
             max_wall_ms: 60 * 60 * 1000,
             max_output_tokens: 16_384,
+            max_budget_tokens: None,
             max_tool_result_bytes: 64 * 1024,
             first_event_ms: 60_000,
             idle_ms: 120_000,
@@ -157,6 +165,8 @@ pub enum LimitKind {
     RequestsPerTurn,
     ToolCalls,
     WallClock,
+    /// Issue #637: `--budget-tokens` on the native runtime.
+    Tokens,
 }
 
 impl LimitKind {
@@ -166,6 +176,7 @@ impl LimitKind {
             LimitKind::RequestsPerTurn => "requests_per_turn",
             LimitKind::ToolCalls => "tool_calls",
             LimitKind::WallClock => "wall_clock",
+            LimitKind::Tokens => "tokens",
         }
     }
 }
@@ -657,6 +668,10 @@ pub struct NativeLoop<'a> {
     requests: u32,
     tool_calls: u32,
     usage: ProviderUsage,
+    /// Issue #637: fires once, the first time spend crosses
+    /// `agent::BUDGET_SOFT_FRACTION` of `limits.max_budget_tokens`, so the
+    /// checkpoint evidence note is not repeated on every later request.
+    budget_soft_warned: bool,
     served_model: Option<String>,
     evidence: Vec<NativeEvidence>,
     /// Provider context-overflow refusals seen in this loop. A refused
@@ -748,6 +763,7 @@ impl<'a> NativeLoop<'a> {
             requests: 0,
             tool_calls: 0,
             usage: ProviderUsage::default(),
+            budget_soft_warned: false,
             served_model: None,
             evidence: Vec::new(),
             overflows: 0,
@@ -1465,6 +1481,35 @@ impl<'a> NativeLoop<'a> {
             }
             outcome.finish_reason = Some(response.finish_reason.clone());
 
+            // Issue #637: the same soft-checkpoint/stop semantics
+            // `--budget-tokens` documents on the harness path
+            // (`agent::budget_state`), enforced here rather than upstream in
+            // `exec.rs` because only the loop knows cumulative spend as it
+            // grows request by request. Checked AFTER the barrier above, so
+            // the assistant message and its usage are always committed
+            // first -- a budget verdict never erases a real turn, mirroring
+            // the `ToolCalls` ceiling just below.
+            if let Some(ceiling) = self.config.limits.max_budget_tokens {
+                let spent = native_token_spend(&self.usage);
+                if spent >= ceiling {
+                    outcome.state = TurnState::Failed;
+                    outcome.limit = Some(LimitKind::Tokens);
+                    return Ok(outcome);
+                }
+                let soft = (ceiling as f64 * super::super::agent::BUDGET_SOFT_FRACTION) as u64;
+                if spent >= soft && !self.budget_soft_warned {
+                    self.budget_soft_warned = true;
+                    self.note(
+                        "budget_soft_checkpoint",
+                        turn.to_string(),
+                        format!(
+                            "token budget checkpoint: {spent}/{ceiling} tokens spent -- \
+                             wrapping up soon"
+                        ),
+                    );
+                }
+            }
+
             let calls = tool_uses(&response.content);
             if calls.is_empty() {
                 outcome.state = TurnState::Completed;
@@ -2099,6 +2144,19 @@ fn accumulate(total: &mut ProviderUsage, delta: &ProviderUsage) {
     if let Some(reasoning) = delta.reasoning_tokens {
         total.reasoning_tokens = Some(total.reasoning_tokens.unwrap_or(0) + reasoning);
     }
+}
+
+/// Issue #637: the same "real spend" figure `agent::token_spend` computes
+/// for a harness transcript (`TranscriptUsage::context_total() +
+/// output_tokens`), over this loop's own [`ProviderUsage`] accumulator --
+/// uncached input plus both cache classes plus output, never a guess at what
+/// the provider actually billed.
+fn native_token_spend(usage: &ProviderUsage) -> u64 {
+    usage
+        .input_tokens
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.output_tokens)
 }
 
 /// Wall-clock milliseconds. Only the entry points that have no injected clock
@@ -5966,6 +6024,55 @@ mod tests {
         );
         assert_eq!(status.status, NativeStatus::LimitReached);
         assert_eq!(status.limit, Some(LimitKind::ToolCalls));
+    }
+
+    /// Issue #637: `--budget-tokens` was accepted by clap and threaded into
+    /// `agent::WorkerBudget` on the harness path, but never read on the
+    /// native path (`NativeLimits` had no field for it at all), so
+    /// `zirv ctx exec --runtime native --budget-tokens <tiny>` ran to
+    /// completion regardless of spend. The fixture's first response alone
+    /// already spends 160 tokens (120 input + 40 output), over a ceiling of
+    /// 50, so this proves the loop now stops on the very first request
+    /// rather than running the fixture to `Completed`.
+    #[test]
+    fn the_token_budget_ceiling_stops_the_loop_and_names_itself() {
+        let (status, _) = run_fixture(
+            Protocol::AnthropicMessages,
+            "fixture-anthropic-model",
+            "anthropic-investigate-edit-test.json",
+            "tools-investigate-edit-test.json",
+            "go",
+            |cfg| cfg.limits.max_budget_tokens = Some(50),
+        );
+        assert_eq!(status.status, NativeStatus::LimitReached);
+        assert_eq!(status.limit, Some(LimitKind::Tokens));
+        assert_eq!(status.exit_code, super::super::super::exec::EXIT_BUDGET_EXHAUSTED);
+    }
+
+    /// Issue #637: the soft checkpoint fires once, as evidence, strictly
+    /// before the hard stop -- never a stop by itself. Ceiling 175 makes the
+    /// first response (spend 160) cross the soft threshold
+    /// (`160 >= 175 * BUDGET_SOFT_FRACTION` = 140) without yet reaching the
+    /// ceiling, so the loop must continue into a second request, which then
+    /// crosses 175 and stops there.
+    #[test]
+    fn the_token_budget_soft_checkpoint_notes_once_before_the_hard_stop() {
+        let (status, _) = run_fixture(
+            Protocol::AnthropicMessages,
+            "fixture-anthropic-model",
+            "anthropic-investigate-edit-test.json",
+            "tools-investigate-edit-test.json",
+            "go",
+            |cfg| cfg.limits.max_budget_tokens = Some(175),
+        );
+        assert_eq!(status.status, NativeStatus::LimitReached);
+        assert_eq!(status.limit, Some(LimitKind::Tokens));
+        let checkpoints: Vec<_> = status
+            .evidence
+            .iter()
+            .filter(|e| e.kind == "budget_soft_checkpoint")
+            .collect();
+        assert_eq!(checkpoints.len(), 1, "evidence: {:?}", status.evidence);
     }
 
     #[test]
