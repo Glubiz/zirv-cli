@@ -1452,21 +1452,31 @@ pub struct ApprovalDialog {
     /// then quietly failing -- see [`PendingApproval::grantable`].
     pub grantable: bool,
     pub unavailable_reason: Option<String>,
+    /// Issue #490 (N21 item B): whether the broker behind this dialog can
+    /// remember an answer for this EXACT tool+scope for the rest of this
+    /// session. True only for a live in-process request, whose
+    /// `enforcement::ApprovalRequest::scope_digest` is what would be
+    /// remembered -- an exact, statable scope, which is why it may be offered
+    /// at all. Never true for a transcript-derived request: the journal does
+    /// not carry the digest the broker fenced.
+    pub session_remember: bool,
     selected: usize,
 }
 
 impl ApprovalDialog {
-    /// A fully grantable dialog. Not reachable from an in-process session
-    /// today -- `runtime::native::session_broker` constructs every native
-    /// session's broker with `ApprovalMode::Headless` -- so this is
-    /// exercised directly by its own tests rather than through a live
-    /// pane; see the design note's "What is deferred".
-    #[allow(dead_code)]
+    /// A fully grantable dialog over a LIVE broker request -- one whose tool
+    /// call is blocked on the answer right now. Reached through
+    /// [`UxState::open_live_approval`], from the `enforcement::
+    /// ApprovalPrompt` `native_pane::NativePaneRuntime::poll_live_approval`
+    /// drains. The request it is built from carries the broker's own
+    /// `scope_digest`, which is what makes the session-scoped "don't ask
+    /// again" option below exact rather than a widening.
     pub fn new(request: ApprovalRequest) -> Self {
         Self {
             request,
             grantable: true,
             unavailable_reason: None,
+            session_remember: true,
             selected: 0,
         }
     }
@@ -1476,6 +1486,7 @@ impl ApprovalDialog {
             request: pending.request,
             grantable: pending.grantable,
             unavailable_reason: pending.unavailable_reason,
+            session_remember: false,
             selected: 0,
         }
     }
@@ -1503,6 +1514,19 @@ impl ApprovalDialog {
                     "Yes, and don't ask again for {} in {}",
                     self.request.tool,
                     dir.display()
+                ),
+            ));
+        } else if self.session_remember {
+            // Issue #490 (N21 item B): the session-scoped form. It widens
+            // nothing -- it suppresses the next request whose scope digest is
+            // byte-identical, and only until this session ends -- so the
+            // label says exactly that rather than naming a directory the
+            // request never carried.
+            options.push((
+                ApprovalDecision::AllowAlways,
+                format!(
+                    "Yes, and don't ask again for this exact {} scope in this session",
+                    self.request.tool
                 ),
             ));
         }
@@ -2365,6 +2389,33 @@ impl UxState {
         self.focus = Focus::Approval;
     }
 
+    /// Issue #490 (N21 item B): opens the dialog for a LIVE broker request --
+    /// one whose tool call is blocked on the answer right now, rather than one
+    /// reconstructed from a refusal the journal already recorded. It is
+    /// grantable by construction (there is a gate waiting on it) and it may
+    /// offer the session-scoped "don't ask again", because the broker's own
+    /// scope digest is what would be remembered.
+    ///
+    /// Idempotent for the same request id, like [`Self::sync_approval`]: the
+    /// pane polls its prompt channel on every tick.
+    pub fn open_live_approval(&mut self, request: ApprovalRequest) {
+        if self
+            .approval
+            .as_ref()
+            .is_some_and(|open| open.request.id == request.id)
+        {
+            return;
+        }
+        self.notices.push(Notice {
+            kind: NoticeKind::DeferredDelivery,
+            headline: format!("approval needed: {}", request.scope_text()),
+            detail: vec![request.actor.clone()],
+            at: request.asked_at,
+        });
+        self.approval = Some(ApprovalDialog::new(request));
+        self.focus = Focus::Approval;
+    }
+
     /// Closes the dialog, returns focus to the composer, and releases
     /// anything deferred while it was open.
     pub fn close_approval(&mut self) -> Vec<Deferred> {
@@ -2613,6 +2664,70 @@ mod tests {
             preview: vec!["+ let cursor = committed;".to_string()],
             asked_at: 140,
         }
+    }
+
+    // -- issue #490 (N21 item B): the live in-process dialog ---------------
+
+    #[test]
+    fn a_live_broker_request_offers_a_session_scoped_remember_naming_no_directory() {
+        let mut request = approval_fixture("sess-1");
+        // A live broker request carries no directory to widen to -- the
+        // digest is the scope, so the option names the scope, not a tree.
+        request.scope.directory = None;
+        let dialog = ApprovalDialog::new(request);
+        let options = dialog.options();
+        assert_eq!(options.len(), 3, "yes / remember / no");
+        assert_eq!(options[1].0, ApprovalDecision::AllowAlways);
+        assert!(
+            options[1]
+                .1
+                .contains("this exact Write scope in this session"),
+            "the remember option must state its own scope: {}",
+            options[1].1
+        );
+        assert!(
+            !options[1].1.contains("in /"),
+            "a session-scoped remember never claims a directory: {}",
+            options[1].1
+        );
+    }
+
+    #[test]
+    fn a_transcript_derived_request_never_offers_a_standing_grant() {
+        let mut request = approval_fixture("sess-1");
+        request.scope.directory = None;
+        let dialog = ApprovalDialog::from_pending(PendingApproval {
+            tool_call_id: "call-1".to_string(),
+            request,
+            grantable: true,
+            unavailable_reason: None,
+        });
+        let options = dialog.options();
+        assert_eq!(options.len(), 2, "yes / no only: {options:?}");
+        assert!(
+            options
+                .iter()
+                .all(|(decision, _)| *decision != ApprovalDecision::AllowAlways),
+            "a journal-derived request carries no digest to remember"
+        );
+    }
+
+    #[test]
+    fn opening_the_same_live_approval_twice_opens_one_dialog() {
+        let mut ux = UxState::default();
+        let request = approval_fixture("sess-1");
+        ux.open_live_approval(request.clone());
+        let notices = ux.notices.len();
+        ux.open_live_approval(request);
+        assert_eq!(ux.notices.len(), notices, "one request, one notice");
+        assert_eq!(ux.focus, Focus::Approval);
+        assert!(ux.approval.as_ref().is_some_and(|open| open.grantable));
+        assert!(
+            ux.approval
+                .as_ref()
+                .is_some_and(|open| open.session_remember),
+            "a live request can be remembered for the session"
+        );
     }
 
     // ---------------- item 1: the overview ----------------
@@ -3190,13 +3305,32 @@ mod tests {
     }
 
     #[test]
-    fn a_request_without_a_directory_never_offers_dont_ask_again() {
+    fn a_request_without_a_directory_never_offers_a_directory_wide_grant() {
         let mut request = approval_fixture("s");
         request.scope.directory = None;
-        let dialog = ApprovalDialog::new(request);
-        assert_eq!(dialog.options().len(), 2);
+        // Issue #490 (N21 item B): a live broker request may still offer the
+        // session-scoped remember (its scope digest states the scope exactly),
+        // but it must never describe a directory the request did not carry --
+        // that is the option whose scope cannot be stated.
+        let dialog = ApprovalDialog::new(request.clone());
         assert!(
-            !dialog
+            dialog
+                .options()
+                .iter()
+                .all(|(_, label)| !label.contains("/repo/wt")),
+            "no option may name a tree the request never carried"
+        );
+        // Without a digest to remember either, there is no standing grant at
+        // all -- the pre-#490 rule, unchanged for a journal-derived request.
+        let derived = ApprovalDialog::from_pending(PendingApproval {
+            tool_call_id: "call-1".to_string(),
+            request,
+            grantable: true,
+            unavailable_reason: None,
+        });
+        assert_eq!(derived.options().len(), 2);
+        assert!(
+            !derived
                 .options()
                 .iter()
                 .any(|(decision, _)| *decision == ApprovalDecision::AllowAlways)
@@ -3818,16 +3952,22 @@ mod tests {
 
     // ---------------- item 5/6: the broker bridge and headless parity ----
     //
-    // Review finding 8 (PR #544): `ApprovalRequest::from_enforcement` --
-    // and the test that exercised it, `the_dialog_scope_comes_from_the_
-    // brokers_own_request` -- were removed here as dead code with no
-    // production caller: `detect_pending_approval` is the one path that
-    // actually builds a dialog request today, from the journal's own
-    // recorded text, and the two cannot share a code path without an
+    // Review finding 8 (PR #544): `ApprovalRequest::from_enforcement` -- and
+    // the test that exercised it -- were removed from THIS module as dead
+    // code with no production caller. `detect_pending_approval` is the one
+    // path here that builds a dialog request, from the journal's own recorded
+    // text, and the two cannot share a code path without an
     // `enforcement::ApprovalRequest` to build from, which a journal replay
-    // does not have. See the design note's "What is deferred" for what the
-    // eventual live wiring (owned by the interactive-approvals work on
-    // `native/490-b`) will need to add back.
+    // does not have.
+    //
+    // Issue #490 (N21 item B) supplied the live wiring finding 8 anticipated,
+    // and deliberately did NOT bring the conversion back here: the module that
+    // owns an `enforcement::ApprovalPrompt` owns it, as
+    // `native_pane::dialog_request_from_broker` beside its one caller
+    // (`poll_live_approval`), tested there by
+    // `a_live_dialog_request_carries_the_brokers_own_digest_and_paths`. This
+    // module stays a view model over durable records and keeps no
+    // `enforcement` dependency of its own.
 
     #[test]
     fn the_headless_report_carries_the_same_values_the_panes_render() {

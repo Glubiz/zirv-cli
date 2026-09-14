@@ -2623,6 +2623,77 @@ pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64) -> String {
     )
 }
 
+/// Issue #490 (N21 item B): the dialog's request, built from the enforcement
+/// broker's OWN request -- the one whose `scope_digest` the grant is signed
+/// against.
+///
+/// Nothing here re-derives or widens the scope: the tool name and the paths
+/// come straight off `ExecutionAction`/`resolved_paths`, so the dialog can
+/// never describe less authority than the grant actually carries. No
+/// directory widening is offered at all, because the digest is the exact
+/// thing a session-scoped "don't ask again" remembers, and inventing a
+/// directory the request never carried is precisely what
+/// `native_ux::detect_pending_approval` already refuses to do.
+///
+/// It lives here, not in `dash::native_ux`, for review finding 8's own
+/// reason (PR #544): that module is a view model over durable records and
+/// keeps no `enforcement` dependency. This module is the one that owns an
+/// `enforcement::ApprovalPrompt`, and this is its only caller.
+fn dialog_request_from_broker(
+    request: &super::super::runtime::enforcement::ApprovalRequest,
+    actor: impl Into<String>,
+    session: impl Into<String>,
+) -> super::native_ux::ApprovalRequest {
+    use super::super::runtime::enforcement::ExecutionAction;
+    let (tool, verb) = match &request.action {
+        ExecutionAction::ReadFile { .. } => ("Read", "read"),
+        ExecutionAction::WriteFile { .. } => ("Write", "write"),
+        ExecutionAction::Process { .. } => ("Bash", "run"),
+        ExecutionAction::ProcessControl { .. } => ("Process", "control"),
+        ExecutionAction::OutputRead { .. } => ("Output", "read"),
+        ExecutionAction::Knowledge { write: true, .. } => ("Knowledge", "write"),
+        ExecutionAction::Knowledge { .. } => ("Knowledge", "read"),
+        ExecutionAction::Network { .. } => ("Network", "reach"),
+        ExecutionAction::Mcp { .. } => ("Mcp", "call"),
+        ExecutionAction::ArtifactRead { .. } => ("Artifact", "read"),
+        ExecutionAction::ArtifactWrite { .. } => ("Artifact", "write"),
+        ExecutionAction::Delegate { .. } => ("Task", "delegate"),
+    };
+    let detail = match &request.action {
+        ExecutionAction::Process { invocation, .. } => format!("{invocation:?}"),
+        ExecutionAction::Network { target } => format!("{target:?}"),
+        ExecutionAction::Mcp { server, tool, .. } => format!("{server}/{tool}"),
+        ExecutionAction::Delegate { role, task } => format!("{role}: {task}"),
+        ExecutionAction::Knowledge {
+            service, operation, ..
+        } => format!("{service}.{operation}"),
+        _ => String::new(),
+    };
+    super::native_ux::ApprovalRequest {
+        id: request.scope_digest.clone(),
+        session: session.into(),
+        tool: tool.to_string(),
+        scope: super::native_ux::Scope {
+            verb: verb.to_string(),
+            paths: request.resolved_paths.clone(),
+            directory: None,
+        },
+        actor: actor.into(),
+        reason: if detail.is_empty() {
+            format!("policy {}", request.policy_fingerprint)
+        } else {
+            detail
+        },
+        preview: request
+            .resolved_paths
+            .iter()
+            .take(super::native_ux::APPROVAL_PREVIEW_LINES)
+            .map(|path| path.display().to_string())
+            .collect(),
+        asked_at: request.created_at,
+    }
+}
+
 /// Issue #490 (N20 integration): where a native pane's conversation actually
 /// lives.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2749,6 +2820,14 @@ pub struct NativePaneRuntime {
     /// [`Self::next_idempotency_key`], so two submits minted in the same
     /// millisecond never collide.
     idempotency_seq: u64,
+    /// Issue #490 (N21 item B): the LIVE approval request this pane's own
+    /// in-process broker is blocked on, held for exactly as long as the dialog
+    /// is open. `Some` means a tool call is parked on the operator right now;
+    /// answering it consumes the prompt, so a decision is applied once and
+    /// only once. Always `None` for a runtime-attached pane (which answers
+    /// over the protocol) and therefore for an observer pane, which holds no
+    /// in-process session to block in the first place.
+    live_approval: Option<super::super::runtime::enforcement::ApprovalPrompt>,
 }
 
 impl NativePaneRuntime {
@@ -2802,6 +2881,7 @@ impl NativePaneRuntime {
             link: None,
             link_cursor: 0,
             idempotency_seq: 0,
+            live_approval: None,
             session: Some(session),
             journal,
             presentation,
@@ -2898,6 +2978,7 @@ impl NativePaneRuntime {
             link: Some(link),
             link_cursor: 0,
             idempotency_seq: 0,
+            live_approval: None,
             session: None,
             journal,
             presentation,
@@ -3306,54 +3387,73 @@ impl NativePaneRuntime {
                     self.notice = Some(format!("approval refused by the runtime: {error}"));
                 }
             }
-            // The in-process broker. A denial is a complete action -- the
-            // guidance is committed as steering and the running loop picks it
-            // up between requests; an allow is only ever OFFERED when the
-            // session's broker can actually issue a grant, which today's
-            // `ApprovalMode::Headless` native session cannot (see the design
-            // note).
-            ApprovalRoute::Broker => match decision {
-                // Review finding 7 (PR #544): a denial used to write
-                // steering off `self.session_id` unconditionally, with none
-                // of the generation guard finding 1's fix gives every other
-                // send/steer path. Route it through the same current-session
-                // resolution: held (never written into a retired
-                // generation) exactly like a composer submit is.
-                ApprovalDecision::Deny => match super::native_ux::resolve_submit_target(
-                    &self.continuity,
-                    &self.current_identity(),
-                ) {
-                    super::native_ux::SubmitTarget::Send { .. } => {
-                        let _ = self.write_steering(&guidance);
+            // Review finding 3 (PR #544), extended to the broker route by
+            // issue #490's own live-approval path: an observer pane holds no
+            // controller seat, so consent is not its to give by EITHER route.
+            // A live prompt is deliberately left parked rather than answered
+            // or dropped -- the controller's own pane still holds it, and a
+            // tool call that fails closed because a bystander said no is
+            // exactly the outcome observer mode exists to prevent.
+            ApprovalRoute::Broker if self.presentation.observer => {
+                self.notice = Some(
+                    "approval unavailable: this pane holds no controller seat (observer mode)"
+                        .to_string(),
+                );
+            }
+            // The in-process broker. Issue #490 (N21 item B): when a LIVE
+            // request is held, the decision goes straight back to the tool
+            // call that is blocked on it -- Yes releases it once,
+            // "don't ask again" also remembers this exact scope for the rest
+            // of the session, and No fails the call with the operator's own
+            // guidance AND commits that guidance as steering so the loop picks
+            // it up between requests. A decision is applied exactly once: the
+            // prompt is consumed here and cannot be answered again.
+            ApprovalRoute::Broker => {
+                match self.live_approval.take() {
+                    Some(prompt) => {
+                        use super::super::runtime::enforcement::InteractiveDecision;
+                        if decision == ApprovalDecision::Deny {
+                            self.commit_denial_guidance(&guidance);
+                        }
+                        let answer = match decision {
+                            ApprovalDecision::Allow => InteractiveDecision::Once,
+                            ApprovalDecision::AllowAlways => InteractiveDecision::Remember,
+                            ApprovalDecision::Deny => InteractiveDecision::Deny {
+                                guidance: guidance.clone(),
+                            },
+                        };
+                        if !prompt.decide(answer) {
+                            // The call was already cancelled (an interrupt, or
+                            // the session ended) -- nothing was released, and
+                            // saying so is better than implying the tool ran.
+                            self.notice = Some(format!(
+                                "the approval for {} was already cancelled; nothing ran",
+                                request.scope_text()
+                            ));
+                        }
                     }
-                    super::native_ux::SubmitTarget::Hold { reason } => {
-                        self.ux.notices.push(super::native_ux::Notice {
-                            kind: super::native_ux::NoticeKind::Rollover,
-                            headline: "denial held: this pane no longer owns the seat's session"
-                                .to_string(),
-                            detail: vec![reason],
-                            at: 0,
-                        });
-                        self.presentation.composer.queued.push(QueuedInput {
-                            text: guidance.clone(),
-                            steering: true,
-                            queued_at_ms: now_ms_u64(),
-                        });
-                    }
-                },
-                ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
-                    self.ux.notices.push(super::native_ux::Notice {
-                        kind: super::native_ux::NoticeKind::DeferredDelivery,
-                        headline: format!(
-                            "approval {} via {route:?} \u{2014} {}",
-                            decision.as_str(),
-                            request.scope_text()
-                        ),
-                        detail: Vec::new(),
-                        at: 0,
-                    });
+                    // No live request: the dialog was reconstructed from a
+                    // refusal the journal already recorded, so a denial's
+                    // guidance is still a complete action and an allow has
+                    // nothing left to release.
+                    None => match decision {
+                        ApprovalDecision::Deny => self.commit_denial_guidance(&guidance),
+                        ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
+                            self.ux.notices.push(super::native_ux::Notice {
+                                kind: super::native_ux::NoticeKind::DeferredDelivery,
+                                headline: format!(
+                                    "approval {} via {route:?} \u{2014} {} (the call it belonged \
+                                     to is no longer waiting)",
+                                    decision.as_str(),
+                                    request.scope_text()
+                                ),
+                                detail: Vec::new(),
+                                at: 0,
+                            });
+                        }
+                    },
                 }
-            },
+            }
         }
         for item in released {
             self.ux.notices.push(super::native_ux::Notice {
@@ -3362,6 +3462,40 @@ impl NativePaneRuntime {
                 detail: vec![item.body],
                 at: 0,
             });
+        }
+    }
+
+    /// Review finding 7 (PR #544): a denial's guidance used to be written as
+    /// steering off `self.session_id` unconditionally, with none of the
+    /// generation guard finding 1 gives every other send/steer path. It is
+    /// routed through the same current-session resolution instead: held --
+    /// never written into a retired generation -- exactly as a composer
+    /// submit is, and re-targeted to the seat's CURRENT session when the pane
+    /// is carried across a rollover.
+    ///
+    /// Issue #490 (N21 item B) shares it between both denial paths: the live
+    /// in-process request blocked on the operator right now, and the one
+    /// reconstructed from a refusal the journal already recorded. Both commit
+    /// the same guidance under the same guard.
+    fn commit_denial_guidance(&mut self, guidance: &str) {
+        match super::native_ux::resolve_submit_target(&self.continuity, &self.current_identity()) {
+            super::native_ux::SubmitTarget::Send { .. } => {
+                let _ = self.write_steering(guidance);
+            }
+            super::native_ux::SubmitTarget::Hold { reason } => {
+                self.ux.notices.push(super::native_ux::Notice {
+                    kind: super::native_ux::NoticeKind::Rollover,
+                    headline: "denial held: this pane no longer owns the seat's session"
+                        .to_string(),
+                    detail: vec![reason],
+                    at: 0,
+                });
+                self.presentation.composer.queued.push(QueuedInput {
+                    text: guidance.to_string(),
+                    steering: true,
+                    queued_at_ms: now_ms_u64(),
+                });
+            }
         }
     }
 
@@ -3442,16 +3576,46 @@ impl NativePaneRuntime {
             }
         }
         self.refresh_transcript();
+        let actor = format!("{} \u{b7} {}", self.short, "orchestrator");
+        // Issue #490 (N21 item B): a LIVE request outranks a transcript-
+        // derived one. A tool call is blocked on this answer right now, the
+        // request carries the broker's own scope digest, and the dialog it
+        // opens can actually grant -- so it is polled first and, while it is
+        // held, the journal-derived detector is not allowed to replace it with
+        // a reconstruction of an older refusal.
+        self.poll_live_approval(&actor);
+        if self.live_approval.is_some() {
+            return;
+        }
         // Issue #490 (item 5): `blocked` is now a fact read from what the
         // journal recorded -- the broker's own approval refusal on a tool
         // call -- rather than the hardcoded `false` N11 shipped.
-        let actor = format!("{} \u{b7} {}", self.short, "orchestrator");
         let pending = super::native_ux::detect_pending_approval(
             &self.transcript.items,
             &self.session_id.to_string(),
             &actor,
         );
         self.ux.sync_approval(pending);
+    }
+
+    /// Issue #490 (N21 item B): drains at most one live approval request from
+    /// the in-process broker and opens the operator's dialog for it. Never
+    /// blocks, and never replaces a dialog that is already open -- the prompt
+    /// behind that one is still parked on an answer.
+    fn poll_live_approval(&mut self, actor: &str) {
+        if self.live_approval.is_some() {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let Some(prompt) = session.next_approval() else {
+            return;
+        };
+        let request =
+            dialog_request_from_broker(prompt.request(), actor, self.session_id.to_string());
+        self.live_approval = Some(prompt);
+        self.ux.open_live_approval(request);
     }
 
     /// PR #531 review finding 4: this used to do a full journal replay AND a
@@ -3752,6 +3916,16 @@ impl NativePaneRuntime {
             }
             (None, Some(session)) => session.interrupt(),
             (None, None) => {}
+        }
+        // Issue #490 (N21 item B): an interrupt cancels the tool call that is
+        // blocked on the operator too. `InteractiveSession::interrupt` has
+        // already cancelled the gate, so dropping the prompt here releases
+        // nothing -- it only stops the dashboard from drawing a dialog whose
+        // call has already failed closed, and stops a later answer from being
+        // delivered to a call that is gone.
+        if self.live_approval.take().is_some() {
+            let _ = self.ux.close_approval();
+            self.notice = Some("the pending approval was cancelled by the interrupt".to_string());
         }
     }
 
@@ -4747,6 +4921,60 @@ mod tests {
         assert_eq!(approval_route(true && true), ApprovalRoute::Protocol);
         assert_eq!(approval_route(true && false), ApprovalRoute::Broker);
         assert_eq!(approval_route(false), ApprovalRoute::Broker);
+    }
+
+    /// Review finding 8 (PR #544) removed `ApprovalRequest::from_enforcement`
+    /// from `dash::native_ux` as dead code; issue #490's live-approval path
+    /// needs the conversion, so it lives here instead -- beside its one
+    /// caller, in the module that owns an `enforcement::ApprovalPrompt`. This
+    /// is what that move owes: the dialog describes exactly the authority the
+    /// grant is signed against, and never a directory the request never
+    /// carried.
+    #[test]
+    fn a_live_dialog_request_carries_the_brokers_own_digest_and_paths() {
+        use crate::commands::ctx::runtime::enforcement::{
+            ApprovalRequest as BrokerRequest, ExecutionAction, ExecutionIdentity,
+        };
+        let broker = BrokerRequest {
+            scope_digest: "digest-1".to_string(),
+            identity: ExecutionIdentity {
+                session: "sess-w1".to_string(),
+                short: "s7".to_string(),
+                generation: 2,
+                role: "implementer".to_string(),
+                task: Some("T2".to_string()),
+            },
+            action: ExecutionAction::WriteFile {
+                path: PathBuf::from("/repo/wt/src/journal.rs"),
+            },
+            policy_fingerprint: "pf".to_string(),
+            claims_fingerprint: "cf".to_string(),
+            resolved_paths: vec![PathBuf::from("/repo/wt/src/journal.rs")],
+            execution_scope_fingerprint: "ef".to_string(),
+            created_at: 140,
+        };
+        let request = dialog_request_from_broker(&broker, "w1 implementer", "sess-w1");
+        // The id IS the digest the grant is signed against, so answering this
+        // dialog can only ever release this exact scope.
+        assert_eq!(request.id, "digest-1");
+        assert_eq!(request.tool, "Write");
+        assert_eq!(request.scope.paths, broker.resolved_paths);
+        assert_eq!(request.asked_at, 140);
+        assert!(
+            request.scope.directory.is_none(),
+            "no directory the request never carried"
+        );
+        // And the dialog built from it offers the session-scoped remember,
+        // which names its own scope rather than a tree.
+        let dialog = super::super::native_ux::ApprovalDialog::new(request);
+        assert!(dialog.session_remember);
+        assert!(
+            dialog
+                .lines(100)
+                .iter()
+                .map(|line| line.to_plain_string())
+                .any(|line| line.contains("/repo/wt/src/journal.rs"))
+        );
     }
 
     // The in-flight spinner/verb/elapsed/interrupt-hint line is the head's
@@ -5763,6 +5991,7 @@ mod tests {
             link,
             link_cursor: 0,
             idempotency_seq: 0,
+            live_approval: None,
             session: None,
             journal,
             presentation: NativePresentation::default(),
