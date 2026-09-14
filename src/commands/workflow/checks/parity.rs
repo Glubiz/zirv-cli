@@ -10,9 +10,12 @@
 //! - an inventory capability (a clap verb, or a model-calling call site) has
 //!   no parity row, or a parity row names a capability the inventory does
 //!   not have;
-//! - a row cites a test name that appears nowhere in `src/`, a CI step that
-//!   appears nowhere in `.github/workflows/ci.yaml`, or a `docs/benchmarks/`
-//!   file that is not committed;
+//! - a row cites a test that does not exist *in the module it names* (the
+//!   citation's module path is resolved to a real file under `src/`, and the
+//!   `fn` has to be in THAT file -- a bare name that happens to exist
+//!   somewhere else in the tree is not evidence for this row), a CI step that
+//!   is not a `- name:` step in `.github/workflows/ci.yaml`, or a
+//!   `docs/benchmarks/` file that is not committed;
 //! - a row claims the `live-validated` rung without a recorded evidence file
 //!   under `docs/benchmarks/`;
 //! - a row that is not `legacy-only` carries no evidence at all and is not
@@ -27,7 +30,7 @@
 //! parsing is reused from that module, not reimplemented.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::BuiltinCheckResult;
 use super::inventory::{
@@ -40,11 +43,12 @@ const PROVES: &str = "every capability in docs/design/native-runtime-inventory.m
      docs/design/native-parity.md whose evidence really exists in the tree, and no row claims a \
      rung its evidence does not support";
 const FIX: &str = "add or correct the row in docs/design/native-parity.md -- every inventory verb \
-     and every model-calling call site needs one row naming a real test (its final `::` segment \
-     must exist as an `fn` in src/), a real `CI: <step>` from .github/workflows/ci.yaml, or a \
-     committed docs/benchmarks/ file; `live-validated` needs the benchmark pointer, \
-     `legacy-only` needs a reason in its Requires cell, and an evidence-free row must be listed \
-     under `## Release blockers`";
+     and every model-calling call site needs one row naming a real test as \
+     `<module path>::tests::<fn>`, where the module path resolves to exactly one file under src/ \
+     and that file declares the fn; or a real `CI: <step>` naming a `- name:` step in \
+     .github/workflows/ci.yaml; or a committed docs/benchmarks/ file. `live-validated` needs the \
+     benchmark pointer, `legacy-only` needs a reason in its Requires cell, and an evidence-free \
+     row must be listed under `## Release blockers`";
 const ORIGIN: &str = "issue #492 (N23): the roadmap may only close on an HONESTLY scored parity \
      record -- a matrix nothing checks is a claim, and the acceptance criterion is that no row \
      claims more than its evidence";
@@ -106,8 +110,8 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
     };
 
     let declared_blockers = release_blockers(&parity);
-    let symbols = source_symbols(&repo.join("src"));
-    let ci = std::fs::read_to_string(repo.join(CI_PATH)).unwrap_or_default();
+    let mut modules = SourceModules::scan(repo);
+    let ci = ci_step_names(&std::fs::read_to_string(repo.join(CI_PATH)).unwrap_or_default());
 
     let mut problems = Vec::new();
     let mut documented: BTreeSet<String> = BTreeSet::new();
@@ -167,7 +171,7 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
                 let step = step.trim();
                 if step.is_empty() || !ci.contains(step) {
                     problems.push(format!(
-                        "`{capability}`: CI evidence `{step}` does not appear in {CI_PATH}"
+                        "`{capability}`: CI evidence `{step}` is not a `- name:` step in {CI_PATH}"
                     ));
                 }
             } else if citation.contains('/') {
@@ -183,13 +187,8 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
                 } else {
                     has_benchmark = true;
                 }
-            } else {
-                let name = citation.rsplit("::").next().unwrap_or(citation);
-                if !symbols.contains(name) {
-                    problems.push(format!(
-                        "`{capability}`: cited test `{citation}` does not exist in src/"
-                    ));
-                }
+            } else if let Err(problem) = modules.verify(citation) {
+                problems.push(format!("`{capability}`: {problem}"));
             }
         }
         if rung == "live-validated" && !has_benchmark {
@@ -291,48 +290,206 @@ fn backticked_all(cell: &str) -> Vec<String> {
     out
 }
 
-/// Every `fn <name>` declared anywhere under `src/`. Read once per run: a
-/// cited test name is checked against this set rather than by grepping the
-/// tree per citation.
-fn source_symbols(src: &Path) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let mut stack = vec![src.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                collect_fn_names(&text, &mut names);
+/// The step names `.github/workflows/ci.yaml` declares, read as whole
+/// `- name: <step>` lines rather than as substrings of the file.
+///
+/// Review round 1: matching a `CI:` citation against the raw YAML meant any
+/// fragment of any line -- a job id, a `run:` word, a comment -- counted as
+/// evidence that a CI step exists, which is the same over-claim the whole
+/// check exists to prevent. A step is a list item, so only list items count.
+fn ci_step_names(ci: &str) -> BTreeSet<String> {
+    ci.lines()
+        .filter_map(|line| line.trim().strip_prefix("- name:"))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// The module path -> file map of the real source tree, plus a memoised set
+/// of the `fn` names each resolved file declares.
+///
+/// Review round 1: checking a cited test by its bare final segment against
+/// one flat set of every `fn` name under `src/` meant
+/// `totally::fake::module::a_real_test` passed as long as SOME function
+/// called `a_real_test` existed anywhere. A citation's module path is the
+/// part that says *where the evidence is*, so it is resolved to an actual
+/// file and the `fn` must be in that file.
+struct SourceModules {
+    repo: PathBuf,
+    /// `(module path segments, repo-relative file path)`, one entry per
+    /// `.rs` file under `src/`. `x/mod.rs` and `x.rs` both have module path
+    /// `..::x`, which is exactly how Rust resolves them.
+    modules: Vec<(Vec<String>, PathBuf)>,
+    declared: BTreeMap<PathBuf, BTreeSet<String>>,
+}
+
+impl SourceModules {
+    fn scan(repo: &Path) -> Self {
+        let src = repo.join("src");
+        let mut modules = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !path.extension().is_some_and(|ext| ext == "rs") {
+                    continue;
+                }
+                let Ok(relative) = path.strip_prefix(repo) else {
+                    continue;
+                };
+                let mut segments: Vec<String> = relative
+                    .with_extension("")
+                    .components()
+                    .filter_map(|component| match component {
+                        std::path::Component::Normal(name) => {
+                            Some(name.to_string_lossy().into_owned())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                // Drop the leading `src`, and `mod`/`main`/`lib` file stems,
+                // so `src/commands/ctx/mod.rs` is `commands::ctx`.
+                if segments.first().is_some_and(|first| first == "src") {
+                    segments.remove(0);
+                }
+                if segments
+                    .last()
+                    .is_some_and(|last| matches!(last.as_str(), "mod" | "main" | "lib"))
+                {
+                    segments.pop();
+                }
+                modules.push((segments, relative.to_path_buf()));
             }
+        }
+        Self {
+            repo: repo.to_path_buf(),
+            modules,
+            declared: BTreeMap::new(),
+        }
+    }
+
+    /// `Ok(())` when `citation` resolves to exactly one file that declares
+    /// the cited `fn`; otherwise the problem, naming the resolved path.
+    fn verify(&mut self, citation: &str) -> Result<(), String> {
+        let Some((module, name)) = split_citation(citation) else {
+            return Err(format!(
+                "cited test `{citation}` names no module -- cite it as \
+                 `<module path>::tests::<fn>` so the evidence can be located"
+            ));
+        };
+        let matches: Vec<PathBuf> = self
+            .modules
+            .iter()
+            .filter(|(path, _)| ends_with_module(path, &module))
+            .map(|(_, file)| file.clone())
+            .collect();
+        match matches.as_slice() {
+            [] => Err(format!(
+                "cited test `{citation}`: no file under src/ has the module path `{}`",
+                module.join("::")
+            )),
+            [file] => {
+                if self.declares(file, name) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "cited test `{citation}`: {} declares no `fn {name}`",
+                        file.display()
+                    ))
+                }
+            }
+            many => Err(format!(
+                "cited test `{citation}`: the module path `{}` is ambiguous ({}) -- lengthen it",
+                module.join("::"),
+                many.iter()
+                    .map(|file| file.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    fn declares(&mut self, file: &Path, name: &str) -> bool {
+        if !self.declared.contains_key(file) {
+            let text = std::fs::read_to_string(self.repo.join(file)).unwrap_or_default();
+            self.declared
+                .insert(file.to_path_buf(), declared_fn_names(&text));
+        }
+        self.declared
+            .get(file)
+            .is_some_and(|names| names.contains(name))
+    }
+}
+
+/// Splits `commands::ctx::runtime::native::tests::foo` into the module path
+/// `[commands, ctx, runtime, native]` and the fn name `foo`. A leading
+/// `crate` and every trailing `tests` segment are dropped: `tests` is an
+/// inline `#[cfg(test)]` module, not a file of its own.
+fn split_citation(citation: &str) -> Option<(Vec<&str>, &str)> {
+    let mut parts: Vec<&str> = citation
+        .split("::")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let name = parts.pop()?;
+    while parts.first().is_some_and(|first| *first == "crate") {
+        parts.remove(0);
+    }
+    while parts.last().is_some_and(|last| *last == "tests") {
+        parts.pop();
+    }
+    (!parts.is_empty()).then_some((parts, name))
+}
+
+/// Whether `path` ends with `module` -- so a citation may name as much or as
+/// little of the module path as it takes to be unambiguous, and
+/// `commands::` may be spelled or left off.
+fn ends_with_module(path: &[String], module: &[&str]) -> bool {
+    path.len() >= module.len()
+        && path[path.len() - module.len()..]
+            .iter()
+            .zip(module)
+            .all(|(have, want)| have == want)
+}
+
+/// Every `fn <name>` this file declares, at any visibility.
+fn declared_fn_names(text: &str) -> BTreeSet<String> {
+    const PREFIXES: &[&str] = &[
+        "fn ",
+        "pub fn ",
+        "pub(crate) fn ",
+        "pub(super) fn ",
+        "async fn ",
+        "pub async fn ",
+        "const fn ",
+        "pub const fn ",
+        "unsafe fn ",
+    ];
+    let mut names = BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        for prefix in PREFIXES {
+            let Some(rest) = trimmed.strip_prefix(prefix) else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+            break;
         }
     }
     names
-}
-
-fn collect_fn_names(text: &str, names: &mut BTreeSet<String>) {
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("fn ").or_else(|| {
-            trimmed
-                .strip_prefix("pub fn ")
-                .or_else(|| trimmed.strip_prefix("async fn "))
-        }) else {
-            continue;
-        };
-        let name: String = rest
-            .chars()
-            .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
-            .collect();
-        if !name.is_empty() {
-            names.insert(name);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -359,17 +516,49 @@ mod tests {
          -- | `legacy-only` |\n\
          | `verify` | shared | shared | none | `checks::tests::a_real_test` | `unit` |\n";
 
+    /// The fixture tree is a miniature of the real one, because the check
+    /// now RESOLVES a citation's module path: `helper::tests::a_real_test`
+    /// has to land on `src/commands/ctx/helper.rs` and
+    /// `checks::tests::a_real_test` on `src/commands/workflow/checks/mod.rs`.
+    /// `other.rs` exists so a test can cite a name that really does exist in
+    /// the tree, from a module that does not declare it.
     fn fixture(rows: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         super::super::write_manifest(repo, "zirv");
         std::fs::create_dir_all(repo.join("docs/design")).expect("mkdir docs");
-        std::fs::create_dir_all(repo.join("src/commands")).expect("mkdir src");
+        std::fs::create_dir_all(repo.join("src/commands/ctx")).expect("mkdir ctx");
+        std::fs::create_dir_all(repo.join("src/commands/workflow/checks")).expect("mkdir checks");
         std::fs::create_dir_all(repo.join(".github/workflows")).expect("mkdir ci");
         std::fs::write(repo.join(INVENTORY_PATH), INVENTORY).expect("inventory");
         std::fs::write(repo.join(PARITY_PATH), matrix(rows)).expect("parity");
-        std::fs::write(repo.join("src/commands/a.rs"), "fn a_real_test() {}\n").expect("src");
-        std::fs::write(repo.join(CI_PATH), "name: Native Install\n").expect("ci");
+        std::fs::write(
+            repo.join("src/commands/ctx/helper.rs"),
+            "fn run() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a_real_test() {}\n}\n",
+        )
+        .expect("helper");
+        std::fs::write(
+            repo.join("src/commands/workflow/checks/mod.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn a_real_test() {}\n}\n",
+        )
+        .expect("checks");
+        std::fs::write(
+            repo.join("src/commands/ctx/other.rs"),
+            "fn something_else() {}\n",
+        )
+        .expect("other");
+        std::fs::write(
+            repo.join(CI_PATH),
+            concat!(
+                "jobs:\n",
+                "  native-install-platforms:\n",
+                "    name: Native Install (matrix)\n",
+                "    steps:\n",
+                "      - name: Native Setup And Doctor With No Harness Installed\n",
+                "        run: zirv ctx doctor --json\n",
+            ),
+        )
+        .expect("ci");
         dir
     }
 
@@ -414,7 +603,42 @@ mod tests {
             "{result:?}"
         );
         assert!(result.details.contains("a_test_nobody_wrote"), "{result:?}");
-        assert!(result.details.contains("does not exist"), "{result:?}");
+        assert!(result.details.contains("declares no `fn"), "{result:?}");
+    }
+
+    /// Review round 1, the reason the flat name set had to go: a citation is
+    /// evidence about ONE module. A name that really is a test somewhere
+    /// else in the tree (`ctx::helper`'s own `a_real_test`, here) proves
+    /// nothing about the module the row points a reader at, and the failure
+    /// must name the file that was actually resolved.
+    #[test]
+    fn a_real_test_name_under_the_wrong_module_path_fails() {
+        let dir = fixture(&PASSING_ROWS.replace("checks::tests::", "other::tests::"));
+        let result = outcome(&dir);
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Fail,
+            "{result:?}"
+        );
+        assert!(result.details.contains("other.rs"), "{result:?}");
+        assert!(
+            result.details.contains("declares no `fn a_real_test`"),
+            "{result:?}"
+        );
+    }
+
+    /// A module path that names no file at all is a different failure from a
+    /// file that simply lacks the fn, and says so.
+    #[test]
+    fn a_citation_naming_no_module_at_all_fails() {
+        let dir = fixture(&PASSING_ROWS.replace("checks::tests::", "totally::fake::module::"));
+        let result = outcome(&dir);
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Fail,
+            "{result:?}"
+        );
+        assert!(result.details.contains("no file under src/"), "{result:?}");
     }
 
     /// The whole point of the rung vocabulary: `live-validated` is the one
@@ -517,6 +741,45 @@ mod tests {
             "{result:?}"
         );
         assert!(result.details.contains("A Job Nobody Wrote"), "{result:?}");
+    }
+
+    /// Review round 1: `CI:` evidence used to be a substring search over the
+    /// whole YAML, so a prefix of a real step -- or a job id, or a word out
+    /// of a `run:` block -- passed as proof that a step exists. Only whole
+    /// `- name:` step lines count, so a shortened name fails even though
+    /// every character of it is present in the file.
+    #[test]
+    fn a_partial_ci_step_name_fails() {
+        let dir = fixture(&PASSING_ROWS.replace(
+            "`checks::tests::a_real_test`",
+            "`CI: Native Setup And Doctor`",
+        ));
+        let result = outcome(&dir);
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Fail,
+            "{result:?}"
+        );
+        assert!(
+            result.details.contains("is not a `- name:` step"),
+            "{result:?}"
+        );
+    }
+
+    /// ...and the whole step name still passes, so the rule narrows the
+    /// match rather than breaking the citation form.
+    #[test]
+    fn a_whole_ci_step_name_passes() {
+        let dir = fixture(&PASSING_ROWS.replace(
+            "`checks::tests::a_real_test`",
+            "`CI: Native Setup And Doctor With No Harness Installed`",
+        ));
+        let result = outcome(&dir);
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Pass,
+            "{result:?}"
+        );
     }
 
     /// The `Evidence` cell is repo-owned, UNTRUSTED text, and the check opens
