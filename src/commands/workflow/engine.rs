@@ -21,6 +21,34 @@ pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
 const MAX_STEP_ATTEMPTS: u8 = 3;
 const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
 
+/// Marks a `[skill ...]` provenance header this compiler itself emitted,
+/// placed right after the newline and before `[skill `. Repository skill
+/// bodies are untrusted text rendered into the same buffer; without a
+/// boundary marker only the compiler can produce, a body containing a
+/// newline followed by a hand-typed `[skill fake@1; source=built-in]` line
+/// would be indistinguishable from a real header once `ctx::runtime::context`
+/// scans the rendered text for fragment boundaries. `render_current_context`
+/// strips this exact byte from every skill body before insertion (see
+/// [`sanitize_skill_body`]), so it can never appear anywhere except where
+/// this function put it (issue #557 / roadmap N06).
+pub const SKILL_HEADER_SENTINEL: char = '\u{1}';
+
+/// Neutralises the compiler's own header-boundary sentinel inside untrusted
+/// skill body text so a repository skill can never forge a
+/// `[skill ...; source=...]` provenance header by embedding one in its own
+/// instructions (issue #557 / roadmap N06).
+fn sanitize_skill_body(body: &str) -> std::borrow::Cow<'_, str> {
+    if body.contains(SKILL_HEADER_SENTINEL) {
+        std::borrow::Cow::Owned(
+            body.chars()
+                .filter(|&c| c != SKILL_HEADER_SENTINEL)
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
+}
+
 const INTENT_TEMPLATE: &str = r#"# Intent
 
 ## Problem
@@ -2551,8 +2579,9 @@ pub fn render_current_context(
             }
             let body = refusal_for(&skill.manifest.id, headless)
                 .unwrap_or_else(|| skill.manifest.instructions.trim());
+            let body = sanitize_skill_body(body);
             rendered.push_str(&format!(
-                "\n[skill {}@{}; source={}]\n{}\n",
+                "\n{SKILL_HEADER_SENTINEL}[skill {}@{}; source={}]\n{}\n",
                 skill.manifest.id, skill.manifest.version, skill.source, body
             ));
         }
