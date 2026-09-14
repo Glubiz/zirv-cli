@@ -1048,6 +1048,10 @@ pub struct LaunchRequest {
     pub worker_session: Option<String>,
     /// Remaining depth granted by the coordinator's bounds check.
     pub delegated_depth: Option<u8>,
+    /// The delegating native session's installed envelope. Production launchers
+    /// overlay this on their process environment before resolving the child.
+    pub parent_envelope: Option<String>,
+    pub parent_principal: Option<String>,
     /// Live cancellation observed by both native and wrapped launchers.
     pub cancellation: std::sync::Arc<super::provider::adapter::CancellationFlag>,
 }
@@ -1105,12 +1109,13 @@ impl WorkerLauncher for AgentLauncher {
             ..Default::default()
         };
         let mut out: Vec<u8> = Vec::new();
-        let code = super::agent::run_with(
-            &args,
-            &mut out,
-            &self.repo,
-            &super::config::env_from_process(),
-        )?;
+        let process_env = super::config::env_from_process();
+        let launch_env = super::agent::envelope_env(
+            &process_env,
+            request.parent_envelope.clone(),
+            request.parent_principal.clone(),
+        );
+        let code = super::agent::run_with(&args, &mut out, &self.repo, &launch_env)?;
         let receipt = String::from_utf8_lossy(&out).trim().to_string();
         let parsed = serde_json::from_str::<serde_json::Value>(&receipt).ok();
         let session = parsed
@@ -1385,17 +1390,20 @@ pub fn delegate(
         std::thread::spawn(move || {
             use super::provider::adapter::Cancellation as _;
             while !done.load(std::sync::atomic::Ordering::Acquire) && !cancellation.is_cancelled() {
-                if load(&state, &repo, &delegation).is_some_and(|record| record.cancel_requested) {
-                    cancellation.cancel();
-                    break;
+                match load(&state, &repo, &delegation) {
+                    Some(record) if record.cancel_requested => {
+                        cancellation.cancel();
+                        break;
+                    }
+                    Some(record) if record.phase.is_terminal() => break,
+                    Some(_) => {}
+                    None => break,
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         })
     };
     let outcome = launcher.launch(request);
-    watcher_done.store(true, std::sync::atomic::Ordering::Release);
-    let _ = watcher.join();
     drop(launch_guard);
     if let Ok(worker) = &outcome {
         bind_launched_worker(state, repo, &delegation_id, worker, now)?;
@@ -1404,6 +1412,8 @@ pub fn delegate(
             return Ok((record, None));
         }
     }
+    watcher_done.store(true, std::sync::atomic::Ordering::Release);
+    let _ = watcher.join();
     let cancelled = super::provider::adapter::Cancellation::is_cancelled(cancellation.as_ref());
     let (phase, exit_code, summary) = match &outcome {
         Ok(worker) => (
@@ -2226,6 +2236,8 @@ mod tests {
             max_tool_calls: None,
             worker_session: None,
             delegated_depth: None,
+            parent_envelope: None,
+            parent_principal: None,
             cancellation: std::sync::Arc::new(
                 super::super::provider::adapter::CancellationFlag::default(),
             ),
@@ -2455,6 +2467,68 @@ mod tests {
                 .expect("record")
                 .phase,
             Phase::Completed
+        );
+    }
+
+    #[test]
+    fn interrupt_after_dashboard_launch_ack_cancels_the_worker() {
+        #[derive(Debug)]
+        struct DashboardAckLauncher {
+            cancellation: std::sync::Arc<
+                std::sync::Mutex<
+                    Option<std::sync::Arc<super::super::provider::adapter::CancellationFlag>>,
+                >,
+            >,
+        }
+
+        impl WorkerLauncher for DashboardAckLauncher {
+            fn launch(&mut self, request: &LaunchRequest) -> CtxResult<LaunchedWorker> {
+                *self.cancellation.lock().expect("cancellation") =
+                    Some(request.cancellation.clone());
+                Ok(LaunchedWorker {
+                    exit_code: 0,
+                    session: "dashboard-worker".to_string(),
+                    short: "dash0001".to_string(),
+                    receipt: Some("{\"state\":\"launched\"}".to_string()),
+                })
+            }
+        }
+
+        let (_dir, state, repo, cfg) = fixture();
+        let cancellation = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut launcher = DashboardAckLauncher {
+            cancellation: cancellation.clone(),
+        };
+        let (running, _) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &launch_request(super::super::team::IMPLEMENTER, false),
+            &coordinator_parent(),
+            10,
+        )
+        .expect("delegate");
+
+        interrupt(&state, &repo, &running.handle.delegation, 11).expect("interrupt");
+        let flag = cancellation
+            .lock()
+            .expect("cancellation")
+            .clone()
+            .expect("worker cancellation");
+        use super::super::provider::adapter::Cancellation as _;
+        for _ in 0..100 {
+            if flag.is_cancelled() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(flag.is_cancelled(), "the live worker was not cancelled");
+        assert_eq!(
+            load(&state, &repo, &running.handle.delegation)
+                .expect("record")
+                .phase,
+            Phase::Launched
         );
     }
 

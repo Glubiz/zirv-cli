@@ -710,8 +710,8 @@ impl Drop for TreeClaimLock {
     }
 }
 
-fn lock_tree_claim(dir: &Path, key: &str) -> Result<TreeClaimLock, WriterRefusal> {
-    let path = dir.join(format!("tree-{}.lock", tree_claim_hash(key)));
+fn lock_tree_claim(dir: &Path) -> Result<TreeClaimLock, WriterRefusal> {
+    let path = dir.join(".lock");
     let file = super::group::open_lock_file(&path).map_err(|_| WriterRefusal::PoolExhausted)?;
     file.lock().map_err(|_| WriterRefusal::PoolExhausted)?;
     Ok(TreeClaimLock(file))
@@ -737,7 +737,7 @@ fn lock_tree_claim(dir: &Path, key: &str) -> Result<TreeClaimLock, WriterRefusal
 /// first attempt.
 fn claim_tree(dir: &Path, key: &str, record: &PermitRecord) -> Result<PathBuf, WriterRefusal> {
     let _ = state::create_private_dir_all(dir);
-    let _lock = lock_tree_claim(dir, key)?;
+    let _lock = lock_tree_claim(dir)?;
     let path = tree_claim_path(dir, key);
     let Ok(json) = serde_json::to_string_pretty(record) else {
         return Err(WriterRefusal::PoolExhausted);
@@ -1850,6 +1850,24 @@ mod tests {
         .expect("parse winner claim");
         assert!(matches!(claim.label.as_str(), "first" | "second"));
         drop(winner);
+    }
+
+    #[test]
+    fn distinct_tree_claims_share_one_bounded_lock_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        for index in 0..8 {
+            let tree = tmp.path().join(format!("repo-{index}"));
+            std::fs::create_dir_all(&tree).expect("mkdir");
+            drop(acquire_writer(&state, 1, "worker", &tree, None).expect("writer"));
+        }
+
+        let lock_files = std::fs::read_dir(tree_claims_dir(&state))
+            .expect("tree claims")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".lock"))
+            .count();
+        assert_eq!(lock_files, 1);
     }
 
     /// `live_writer_records` must keep returning exactly the pool slots it

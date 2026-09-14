@@ -2954,7 +2954,7 @@ pub fn run_session<W: std::io::Write>(
     if brokered {
         // The broker is built here, after the seat record exists, because its
         // own fence reads that record at every effect.
-        let executor = brokered_tools(request, &state, &home, &cfg, &handle, None)?;
+        let executor = brokered_tools(request, &state, &home, &cfg, &handle, None, env)?;
         tools = executor;
     }
 
@@ -3622,6 +3622,7 @@ pub fn spawn_interactive(
             &cfg,
             &handle,
             Some(Arc::clone(&approvals)),
+            env,
         )?;
         tools = executor;
     }
@@ -3873,7 +3874,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
         }),
     };
     if brokered {
-        tools = brokered_tools(&mut request, &state, &home, &cfg, &handle, None)?;
+        tools = brokered_tools(&mut request, &state, &home, &cfg, &handle, None, env)?;
     }
 
     let compaction = CompactionSettings {
@@ -4085,6 +4086,7 @@ fn brokered_tools(
     cfg: &super::super::config::CtxConfig,
     handle: &SessionHandle,
     approvals: Option<Arc<super::enforcement::InteractiveApprovals>>,
+    env: EnvLookup<'_>,
 ) -> CtxResult<Box<dyn ToolExecutor>> {
     use super::enforcement::ExecutionIdentity;
     use super::tools::ToolLimits;
@@ -4104,14 +4106,15 @@ fn brokered_tools(
         &super::super::config::env_from_process(),
         super::super::state::now_secs(),
     );
+    let mut client = NativeToolClient::new(
+        broker,
+        state.clone(),
+        request.repo.to_path_buf(),
+        ToolLimits::from_config(cfg),
+    );
+    client.install_launch_env(env);
     Ok(Box::new(ClientToolExecutor::new(
-        NativeToolClient::new(
-            broker,
-            state.clone(),
-            request.repo.to_path_buf(),
-            ToolLimits::from_config(cfg),
-        )
-        .with_capabilities(services),
+        client.with_capabilities(services),
     )))
 }
 
