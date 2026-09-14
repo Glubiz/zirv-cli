@@ -184,7 +184,13 @@ pub fn resolve(
     let configured = cfg
         .roles
         .get(role)
-        .map(|value| (value, RuntimeSource::RoleTable, format!("runtime.roles.{role}")))
+        .map(|value| {
+            (
+                value,
+                RuntimeSource::RoleTable,
+                format!("runtime.roles.{role}"),
+            )
+        })
         .or_else(|| {
             cfg.default.as_ref().map(|value| {
                 (

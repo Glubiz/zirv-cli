@@ -130,8 +130,9 @@ fn migrate(
         }
         let restored = match std::fs::read_to_string(&backup) {
             Ok(restored) => restored,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => strip_runtime_table(&text)?
-                .unwrap_or_else(|| text.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                strip_runtime_table(&text)?.unwrap_or_else(|| text.clone())
+            }
             Err(e) => return Err(e.into()),
         };
         config::validate_operator_document(&restored)

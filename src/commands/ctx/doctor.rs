@@ -244,7 +244,10 @@ pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
                 .access
                 .iter()
                 .any(|row| row.route.as_ref() == Some(&route.route));
-            if input.role_filter.is_some() && !roles.iter().any(|row| row.route.as_deref() == Some(route.route.as_ref()))
+            if input.role_filter.is_some()
+                && !roles
+                    .iter()
+                    .any(|row| row.route.as_deref() == Some(route.route.as_ref()))
             {
                 continue;
             }
