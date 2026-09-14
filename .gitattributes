@@ -44,3 +44,8 @@
 # executed by `sh`/`cmd` verbatim, same reason as noisy-output.sh/.cmd above.
 /tests/fixtures/mcp-hang-server.sh text eol=lf
 /tests/fixtures/mcp-hang-server.cmd text eol=crlf
+
+# Issue #493 final pass: the protocol v1 fixtures are compared byte-for-byte
+# after a serde round trip (runtime/protocol.rs every_*_fixture_round_trips),
+# so a CRLF checkout on Windows (core.autocrlf=true) fails them. Pin to LF.
+/tests/fixtures/runtime/** text eol=lf
