@@ -3882,6 +3882,7 @@ pub fn run_with<W: Write>(
                 cfg: &cfg,
                 parent_envelope: &parent_envelope,
                 result_schema: result_schema.as_ref(),
+                provider_override: None,
             },
             w,
             env,

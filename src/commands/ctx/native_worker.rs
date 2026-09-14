@@ -64,6 +64,13 @@ pub(crate) struct Request<'a> {
     pub cfg: &'a CtxConfig,
     pub parent_envelope: &'a envelope::WorkerEnvelope,
     pub result_schema: Option<&'a Schema>,
+    /// `runtime::native::HeadlessRequest::provider`'s own escape hatch, one
+    /// level up: `Some("fixture:<path>")` opens this worker against the
+    /// deterministic fixture provider instead of the operator's real native
+    /// configuration, so a test can drive this whole function end to end.
+    /// `None` on every production call site (`agent::run_with`), which is
+    /// why a delegation can never silently swap its worker's provider.
+    pub provider_override: Option<String>,
 }
 
 /// Harness-runtime flags a native session has nothing to do with. Refused
@@ -349,13 +356,16 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             resume: None,
             // Operator-only transport overrides belong to `zirv ctx exec`,
             // which is where an operator types them. A delegation never
-            // silently swaps its worker's provider for a fixture.
-            provider: None,
+            // silently swaps its worker's provider for a fixture -- see
+            // `Request::provider_override`, which is `None` for every
+            // production caller.
+            provider: request.provider_override.as_deref(),
             fixture_tools: None,
             task: args.task.clone(),
             writer: writer_permit.map(|permit| {
                 Box::new(permit) as Box<dyn super::runtime::enforcement::WriterLease>
             }),
+            accounting: super::runtime::native::Accounting::CallerOwned,
         },
         &mut notices,
         &child_env,
@@ -653,6 +663,98 @@ mod tests {
             requested_route(&explicit),
             Some("slow"),
             "--route overrides the positional"
+        );
+    }
+
+    /// Issue #554 (review round 2): a delegated native worker accounts
+    /// EXACTLY ONCE.
+    ///
+    /// Round 1 put reserve/settle/place into `run_session` for the seat
+    /// paths, but `native_worker` already did all three itself -- so every
+    /// delegated worker double-reserved the same billing pool and wrote two
+    /// `log::Delegation` rows, doubling what `zirv ctx spend` reported an
+    /// account had spent. Drives the whole of `run` end to end against the
+    /// fixture provider and counts.
+    #[test]
+    fn delegated_native_worker_accounts_exactly_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let state = StateDir::from_root(tmp.path().join("state"));
+
+        let native_toml = home.join(crate::utils::SCRIPT_DIR_NAME).join("native.toml");
+        std::fs::create_dir_all(native_toml.parent().expect("parent")).expect("mkdir .zirv");
+        std::fs::write(
+            &native_toml,
+            "schema=1
+             [account.work]
+provider='anthropic'
+credential='env:KEY'
+             [route.opus]
+account='work'
+model='claude-opus-5'
+             [roles]
+worker='opus'
+",
+        )
+        .expect("write native.toml");
+
+        let mut args = args_for("opus");
+        args.mode = WorkerMode::ReadOnly;
+        let cfg = CtxConfig::default();
+        let parent = envelope::WorkerEnvelope::locked();
+        let provider = format!(
+            "fixture:{}",
+            crate::commands::ctx::runtime::fixture::fixture_root()
+                .join("helper-answer.json")
+                .display()
+        );
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.root().to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+
+        let code = run(
+            Request {
+                args: &args,
+                prompt: "do the thing".to_string(),
+                repo: &repo,
+                launch_repo: repo.clone(),
+                state: &state,
+                cfg: &cfg,
+                parent_envelope: &parent,
+                result_schema: None,
+                provider_override: Some(provider),
+            },
+            &mut Vec::new(),
+            &lookup,
+        )
+        .expect("a delegated native worker runs end to end");
+        assert_eq!(code, 0, "the fixture worker completes");
+
+        let rows = super::super::log::read_delegations(&state, 20);
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly ONE delegation row per worker -- two owners means `zirv ctx spend`              reports double what the account spent: {rows:?}"
+        );
+        assert_ne!(
+            rows[0].principal, "seat",
+            "and it is the DELEGATION's row, carrying this worker's own narrowed principal              ({}), never the seat row `run_session` would have written in parallel",
+            rows[0].principal
+        );
+        assert!(
+            rows[0].mode.is_some(),
+            "with the worker's own delegation mode, which a seat row has no value for"
+        );
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, "work", 0),
+            0,
+            "and the pool has nothing left outstanding: one reserve, one settle"
         );
     }
 

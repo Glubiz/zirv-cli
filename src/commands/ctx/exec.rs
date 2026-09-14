@@ -847,6 +847,7 @@ fn run_native<W: Write>(
         // `zirv agent --runtime native` is the surface that grants both.
         task: None,
         writer: None,
+        accounting: super::runtime::native::Accounting::Seat,
     };
 
     if args.view != "plain" {

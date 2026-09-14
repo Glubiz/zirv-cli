@@ -2768,6 +2768,30 @@ pub struct HeadlessRequest<'a> {
     /// nobody granted a tree to: its file writes are refused, which is the
     /// honest answer rather than an unbacked write.
     pub writer: Option<Box<dyn super::enforcement::WriterLease>>,
+    /// Who accounts this run (issue #554, review round 2). See [`Accounting`].
+    pub accounting: Accounting,
+}
+
+/// Who places, reserves and settles one native run (issue #554).
+///
+/// Exactly one owner, always. Two owners is not "belt and braces": it
+/// double-reserves the same billing pool and writes the same spend twice,
+/// which is how `zirv ctx spend` starts reporting an account spending double
+/// what it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Accounting {
+    /// A SEAT: this session is the thing spending, and nothing above it has a
+    /// delegation identity. [`run_session`] admits it through the shared
+    /// allocator, holds an estimate against its billing pool and settles it.
+    /// Every operator-facing entry point.
+    #[default]
+    Seat,
+    /// The CALLER owns it. `native_worker` already placed this route,
+    /// reserved against its pool and will settle it with a delegation
+    /// identity `run_session` does not have -- the principal, the envelope
+    /// digest, the work group and the worker mode -- so `run_session`
+    /// must not do any of it a second time.
+    CallerOwned,
 }
 
 /// The route a `--route`/`--role` pair names, from operator configuration
@@ -3013,7 +3037,8 @@ pub fn run_session<W: std::io::Write>(
     // same way and refused by the same persistent breaker -- previously only
     // `native_worker` did this, and `zirv ctx exec --runtime native` walked
     // straight past an open breaker onto an endpoint that had just failed.
-    if let Ok(route_id) = resolve_role_route_for(request.repo, request.route, request.role)
+    if request.accounting == Accounting::Seat
+        && let Ok(route_id) = resolve_role_route_for(request.repo, request.route, request.role)
         && let Some(refusal) = super::super::native_account::native_placement(
             &state,
             &cfg,
@@ -3200,13 +3225,24 @@ pub fn run_session<W: std::io::Write>(
     // Issue #554 (review round 1): the pool's ledger holds this run's own
     // estimate while it runs, and the settlement below replaces it with what
     // the provider actually metered.
-    let reservation = super::super::native_account::reserve_seat_turn(
-        &state,
-        route.billing_pool.as_ref(),
-        &session.to_string(),
-        request.limits.max_output_tokens,
-        now,
-    );
+    // Review round 2: held in a guard, so the `?`s below (the loop's own
+    // error, a journal that cannot be completed) release it instead of
+    // leaving it outstanding against the pool forever. `settle` takes it out
+    // of the guard on the success path.
+    let mut reservation = SeatReservation {
+        state: &state,
+        held: (request.accounting == Accounting::Seat)
+            .then(|| {
+                super::super::native_account::reserve_seat_turn(
+                    &state,
+                    route.billing_pool.as_ref(),
+                    &session.to_string(),
+                    request.limits.max_output_tokens,
+                    now,
+                )
+            })
+            .flatten(),
+    };
 
     let status = {
         let journal = backend
@@ -3252,17 +3288,51 @@ pub fn run_session<W: std::io::Write>(
             now_secs(),
         )?;
     }
-    // Issue #554 (review round 1): the breaker, the pool and the spend
-    // ledger, through the one seam every native path shares. A headless run's
-    // tokens are spent on the same account a delegated worker's are.
-    super::super::native_account::settle_seat_turn(
-        &state,
-        &cfg,
-        &status,
-        reservation.as_ref(),
-        super::super::mail::session_identity(env).as_deref(),
-    );
+    // Issue #554: the breaker, the pool and the spend ledger, through the one
+    // seam every native path shares. A headless run's tokens are spent on the
+    // same account a delegated worker's are.
+    //
+    // Review round 2: skipped entirely when the CALLER owns the accounting --
+    // `native_worker` settles this run itself, with a delegation identity
+    // this function does not have, and doing it here as well wrote the same
+    // spend twice.
+    if request.accounting == Accounting::Seat {
+        super::super::native_account::settle_seat_turn(
+            &state,
+            &cfg,
+            &status,
+            reservation.take().as_ref(),
+            super::super::mail::session_identity(env).as_deref(),
+        );
+    }
     Ok(status)
+}
+
+/// One seat run's reservation, released on drop unless it was settled
+/// (issue #554, review round 2).
+///
+/// `run_session` has two `?`s between taking the estimate and settling it --
+/// the loop's own failure and a journal that cannot be completed -- and
+/// before this guard existed either of them left the estimate outstanding
+/// against the pool for the rest of the state directory's life.
+struct SeatReservation<'a> {
+    state: &'a super::super::state::StateDir,
+    held: Option<(String, String)>,
+}
+
+impl SeatReservation<'_> {
+    /// Hands the reservation to the settlement, so the drop below is a no-op.
+    fn take(&mut self) -> Option<(String, String)> {
+        self.held.take()
+    }
+}
+
+impl Drop for SeatReservation<'_> {
+    fn drop(&mut self) {
+        if let Some((pool, id)) = self.held.take() {
+            let _ = super::super::reservation::release(self.state, &pool, &id);
+        }
+    }
 }
 
 /// The standing instruction and data context one native session runs under
@@ -3728,6 +3798,7 @@ pub fn spawn_interactive(
         fixture_tools: None,
         task: request.task.clone(),
         writer: None,
+        accounting: Accounting::Seat,
     };
 
     let (provider, mut tools, route, brokered) =
@@ -4137,6 +4208,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
         fixture_tools: turn.fixture_tools,
         task: turn.task.clone(),
         writer: turn.writer.take(),
+        accounting: Accounting::Seat,
     };
     let (provider, mut tools, route, brokered) =
         build_transport(&request, &state, &home, &cfg, env)?;
@@ -4727,6 +4799,7 @@ mod tests {
             fixture_tools: None,
             task: None,
             writer: None,
+            accounting: Accounting::Seat,
         };
         let (system, preamble) = compile_standing_context(
             &state,
@@ -6323,6 +6396,7 @@ mod tests {
             fixture_tools: None,
             task: None,
             writer: None,
+            accounting: Accounting::Seat,
         };
         let mut out: Vec<u8> = Vec::new();
         run_headless(&mut request, &mut out, &lookup).expect("resumed run");
@@ -6525,6 +6599,7 @@ mod tests {
                 fixture_tools: None,
                 task: None,
                 writer: None,
+                accounting: Accounting::Seat,
             },
             &mut Vec::new(),
             &lookup,
@@ -6568,6 +6643,61 @@ mod tests {
         assert!(
             row.input_tokens + row.output_tokens > 0,
             "with the tokens the provider actually metered"
+        );
+    }
+
+    /// Issue #554 (review round 2): a seat run's estimate is released when
+    /// the run does not reach its settlement.
+    ///
+    /// `run_session` has two `?`s between taking the estimate and settling it
+    /// -- the loop's own failure and a journal that cannot be completed --
+    /// and before this guard either of them left the pool short for the rest
+    /// of the state directory's life. Neither `?` is reachable with the
+    /// fixture provider (an exhausted or unusable script is a typed PROVIDER
+    /// failure, which is a journaled `Failed` status that settles normally,
+    /// not an `Err`), so the guard itself is what is driven here: the two
+    /// outcomes it exists to tell apart.
+    #[test]
+    fn headless_native_exec_releases_its_reservation_on_failure() {
+        let (_repo, state, _tree, _env) = interactive_shutdown_fixture();
+        let reserve = || {
+            crate::commands::ctx::native_account::reserve_seat_turn(
+                &state, "work", "sess-1", 4_096, 0,
+            )
+        };
+
+        // Dropped without settling -- the run never got there.
+        {
+            let _guard = SeatReservation {
+                state: &state,
+                held: reserve(),
+            };
+            assert_eq!(
+                crate::commands::ctx::reservation::outstanding(&state, "work", 0),
+                4_096,
+                "the estimate is genuinely held while the run is in flight"
+            );
+        }
+        assert_eq!(
+            crate::commands::ctx::reservation::outstanding(&state, "work", 0),
+            0,
+            "a run that never reached its settlement leaves nothing outstanding"
+        );
+
+        // Taken by the settlement -- the drop must NOT release it a second
+        // time, or a settled reservation would be resolved twice.
+        let taken = {
+            let mut guard = SeatReservation {
+                state: &state,
+                held: reserve(),
+            };
+            guard.take()
+        };
+        let (pool, id) = taken.expect("the settlement receives the reservation");
+        assert_eq!(
+            crate::commands::ctx::reservation::settle(&state, &pool, &id, 10).expect("settle"),
+            Some(4_096),
+            "the settlement still finds it: the guard handed it over rather than releasing it"
         );
     }
 
@@ -7398,6 +7528,7 @@ mod tests {
             fixture_tools: None,
             task: None,
             writer: None,
+            accounting: Accounting::Seat,
         };
         let mut out: Vec<u8> = Vec::new();
         run_session(&mut request, &mut out, &lookup).expect("first coordinator session");
@@ -7431,6 +7562,7 @@ mod tests {
             fixture_tools: None,
             task: None,
             writer: None,
+            accounting: Accounting::Seat,
         };
         let mut out2: Vec<u8> = Vec::new();
         run_session(&mut request2, &mut out2, &lookup).expect("second coordinator session");
