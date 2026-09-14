@@ -460,11 +460,13 @@ pub fn run_with<W: Write, E: Write>(
     {
         writeln!(stderr, "zirv chat: {note}")?;
     }
-    let native = args.runtime.is_some()
-        || configured.is_ok_and(|choice| choice.kind == RuntimeKind::Native);
+    let native =
+        args.runtime.is_some() || configured.is_ok_and(|choice| choice.kind == RuntimeKind::Native);
     if native {
         return run_native_chat(
-            args.runtime.as_deref().unwrap_or(RuntimeKind::Native.as_str()),
+            args.runtime
+                .as_deref()
+                .unwrap_or(RuntimeKind::Native.as_str()),
             &cfg,
             repo,
             env,
