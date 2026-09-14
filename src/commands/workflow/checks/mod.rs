@@ -15,6 +15,7 @@ pub mod eol;
 pub mod forbidden;
 pub mod hooks;
 pub mod inventory;
+pub mod parity;
 pub mod version_bump;
 
 use std::path::Path;
@@ -196,6 +197,7 @@ pub const ALL_IDS: &[&str] = &[
     hooks::ID,
     eol::ID,
     inventory::ID,
+    parity::ID,
 ];
 
 /// Runs every registered builtin check against `repo`, skipping any id in
@@ -214,6 +216,7 @@ pub fn run_all(repo: &Path, exclude: &[String]) -> Vec<BuiltinCheckResult> {
         hooks::run(repo),
         eol::run(repo),
         inventory::run(repo),
+        parity::run(repo),
     ];
     checks.retain(|check| !exclude.iter().any(|excluded| excluded == check.id));
     checks
@@ -287,6 +290,7 @@ mod tests {
                 docs::DOC_RESERVED_ID,
                 eol::ID,
                 inventory::ID,
+                parity::ID,
             ],
             "the repo-independent checks (argv, hooks) must still report a real verdict"
         );
@@ -333,6 +337,7 @@ mod tests {
             docs::DOC_RESERVED_ID,
             eol::ID,
             inventory::ID,
+            parity::ID,
         ] {
             let check = produced
                 .iter()

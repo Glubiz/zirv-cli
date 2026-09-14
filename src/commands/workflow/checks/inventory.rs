@@ -27,11 +27,11 @@ const ORIGIN: &str = "issue #470 (N01): the native-runtime roadmap (#469) needs 
      enforced map of who owns each command and each model-calling call site before any step \
      starts moving them";
 
-const INVENTORY_PATH: &str = "docs/design/native-runtime-inventory.md";
-const COMMANDS_HEADING: &str = "## Commands";
-const ENTRY_POINTS_HEADING: &str = "## Model-calling entry points";
-const COMMANDS_HEADER_ROW: &str = "| Verb | Owner | Notes |";
-const ENTRY_POINTS_HEADER_ROW: &str = "| Entry point | Path | Symbol | Owner | Notes |";
+pub(super) const INVENTORY_PATH: &str = "docs/design/native-runtime-inventory.md";
+pub(super) const COMMANDS_HEADING: &str = "## Commands";
+pub(super) const ENTRY_POINTS_HEADING: &str = "## Model-calling entry points";
+pub(super) const COMMANDS_HEADER_ROW: &str = "| Verb | Owner | Notes |";
+pub(super) const ENTRY_POINTS_HEADER_ROW: &str = "| Entry point | Path | Symbol | Owner | Notes |";
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
     if !super::is_zirv_repo(repo) {
@@ -222,7 +222,7 @@ fn valid_owner(owner: &str) -> bool {
 /// only) and does not resolve symlinks, so a symlink committed inside the
 /// repository that points outside it is still followed; that is accepted
 /// because the repository's own contents are already the trust boundary here.
-fn is_repo_relative(path: &str) -> bool {
+pub(super) fn is_repo_relative(path: &str) -> bool {
     !path.is_empty()
         && Path::new(path)
             .components()
@@ -230,7 +230,7 @@ fn is_repo_relative(path: &str) -> bool {
 }
 
 /// The text inside the first `` `...` `` span in `cell`, if any.
-fn backticked(cell: &str) -> Option<String> {
+pub(super) fn backticked(cell: &str) -> Option<String> {
     let start = cell.find('`')? + 1;
     let end = start + cell[start..].find('`')?;
     Some(cell[start..end].to_string())
@@ -241,7 +241,11 @@ fn backticked(cell: &str) -> Option<String> {
 /// of file), and returns its data rows -- everything after the `|---|...`
 /// separator, each split into trimmed cells, up to the first line that does
 /// not start with `|`.
-fn extract_table(text: &str, heading: &str, header_row: &str) -> Option<Vec<Vec<String>>> {
+pub(super) fn extract_table(
+    text: &str,
+    heading: &str,
+    header_row: &str,
+) -> Option<Vec<Vec<String>>> {
     let start = text.find(heading)? + heading.len();
     let section = &text[start..];
     let end = section.find("\n## ").unwrap_or(section.len());
