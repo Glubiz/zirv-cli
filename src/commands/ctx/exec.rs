@@ -232,6 +232,9 @@ pub struct ExecArgs {
     /// delegation reservation of its own, which this never creates one for.
     #[arg(skip)]
     pub reservation_id: Option<String>,
+    /// Internal cancellation shared with a delegation record watcher.
+    #[arg(skip)]
+    pub cancellation: Option<std::sync::Arc<super::provider::adapter::CancellationFlag>>,
 }
 
 /// The same defaults clap itself applies, so a caller that builds this struct
@@ -260,6 +263,7 @@ impl Default for ExecArgs {
             command: Vec::new(),
             simple: false,
             reservation_id: None,
+            cancellation: None,
         }
     }
 }
@@ -832,6 +836,8 @@ fn run_native<W: Write>(
         route: args.route.as_deref(),
         role: &args.role,
         limits,
+        session_id: None,
+        cancellation: None,
         resume: args.resume.as_deref(),
         provider: args.provider.as_deref(),
         fixture_tools: args.fixture_tools.as_deref(),
@@ -1877,7 +1883,26 @@ fn run_with_clock_inner<W: Write>(
             Duration::from_secs(cfg.supervise.in_tool_secs),
             Duration::from_secs(cfg.supervise.stall_grace_secs),
             &mut stalled,
+            args.cancellation.as_deref(),
         )?;
+
+        if args
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| super::provider::adapter::Cancellation::is_cancelled(flag.as_ref()))
+        {
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
+            session_guard.release();
+            return Ok(130);
+        }
 
         if budget_exhausted {
             let _ = log::append(
@@ -3488,6 +3513,7 @@ fn supervise_run(
     in_tool: Duration,
     stall_grace: Duration,
     stalled: &mut bool,
+    cancellation: Option<&super::provider::adapter::CancellationFlag>,
 ) -> CtxResult<Outcome> {
     // Issue #203: `evaluate_worker_budget` reads the transcript fresh on
     // every tick, so it can see a `HardStop` the instant the child's last
@@ -3515,6 +3541,9 @@ fn supervise_run(
     let mut stall_latch: Option<super::stall::StallLatch> = None;
     let mut last_mail_activity: Option<(usize, usize)> = None;
     let mut tick = || {
+        if cancellation.is_some_and(super::provider::adapter::Cancellation::is_cancelled) {
+            return Tick::Stop("cancelled");
+        }
         if let Some(candidate) = self_heal_transcript(transcript, resolve_transcript) {
             *scorer = score::IncrementalScorer::new(candidate.clone());
             *transcript = candidate;

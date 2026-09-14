@@ -257,6 +257,25 @@ fn lock_seat(state: &StateDir, short: &str) -> CtxResult<SeatLock> {
     Ok(SeatLock(file))
 }
 
+/// Holds the seat lock after validating one generation. Mutations performed
+/// while this value is alive cannot race a rollover commit.
+pub(crate) struct GenerationGuard {
+    _lock: SeatLock,
+}
+
+pub(crate) fn lock_generation(
+    state: &StateDir,
+    short: &str,
+    generation: u64,
+) -> CtxResult<Option<GenerationGuard>> {
+    let lock = lock_seat(state, short)?;
+    if load(state, short).is_none() {
+        return Ok(None);
+    }
+    guard(state, short, generation)?;
+    Ok(Some(GenerationGuard { _lock: lock }))
+}
+
 /// One seat record read straight off disk, tolerant like every other
 /// registry read in this codebase: a missing or malformed file is `None`,
 /// never an error.

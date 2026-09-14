@@ -200,6 +200,8 @@ pub fn run(request: &HelperRequest<'_>, env: EnvLookup<'_>) -> Result<HelperAnsw
             route: request.route,
             role: request.role,
             limits: request.budget.into_limits(),
+            session_id: None,
+            cancellation: None,
             resume: None,
             provider: request.provider,
             fixture_tools: None,

@@ -117,25 +117,43 @@ fn phase_of(status: NativeStatus) -> delegation::Phase {
 /// Runs one delegated native worker end to end.
 pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let args = request.args;
-    refuse_harness_only_flags(args)?;
     let state = request.state;
     let repo = request.repo;
     let cfg = request.cfg;
     let now = super::state::now_secs();
+    if let Err(error) = refuse_harness_only_flags(args) {
+        release_task_claim(state, repo, args);
+        return Err(error);
+    }
 
     // Ownership step 1 of 3: the per-provider token ledger. Resolved from
     // operator configuration alone (no credential store, no network), so an
     // unconfigured route fails here -- before a task card is marked running
     // by a worker that was never going to start.
-    let (route_id, provider) = super::runtime::native::route_provider(
+    let (route_id, provider) = match super::runtime::native::route_provider(
         &request.launch_repo,
         requested_route(args),
         role_of(args),
         env,
-    )?;
+    ) {
+        Ok(route) => route,
+        Err(error) => {
+            release_task_claim(state, repo, args);
+            return Err(error);
+        }
+    };
 
-    let (worker_budget, reserved_ceiling) = resolve_worker_budget(&env, args)?;
-    let worker_session = super::event::SessionId::new_v4().to_string();
+    let (worker_budget, reserved_ceiling) = match resolve_worker_budget(&env, args) {
+        Ok(budget) => budget,
+        Err(error) => {
+            release_task_claim(state, repo, args);
+            return Err(error);
+        }
+    };
+    let worker_session = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| super::event::SessionId::new_v4().to_string());
     let child_short = super::sessions::short_id(&worker_session);
 
     // Ownership step 2 of 3: the delegation envelope. A request that would
@@ -153,9 +171,23 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         Ok(envelope) => envelope,
         Err(err) => {
             let reason = format!("delegation envelope refused: {err}");
-            return refuse(args, w, &request.launch_repo, None, 2, reason);
+            return refuse(
+                (state, repo),
+                args,
+                w,
+                &request.launch_repo,
+                None,
+                2,
+                reason,
+            );
         }
     };
+    let child_envelope_json = envelope::canonical_json(&child_envelope).ok();
+    let child_env = super::agent::envelope_env(
+        env,
+        child_envelope_json,
+        Some(child_envelope.principal.clone()),
+    );
 
     let reservation = super::reservation::reserve_within(
         state,
@@ -212,6 +244,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
                     &tree,
                 );
                 return refuse(
+                    (state, repo),
                     args,
                     w,
                     &request.launch_repo,
@@ -275,6 +308,8 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             route: requested_route(args),
             role: role_of(args),
             limits,
+            session_id: Some(&worker_session),
+            cancellation: args.cancellation.clone(),
             // A delegated worker always starts a fresh session; a follow-up
             // against a finished one is `delegation::follow_up`'s Resume, not
             // a second launch (see this module's own doc comment).
@@ -290,7 +325,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             }),
         },
         &mut notices,
-        env,
+        &child_env,
     );
     if !notices.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&notices));
@@ -478,7 +513,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             mode: DelegationMode::Inline,
             state: delegation_state,
             exit_code: Some(code),
-            session: Some(child_short),
+            session: Some(status.session.clone()),
             task: args.task.clone(),
             workdir: Some(request.launch_repo.clone()),
             result_path,
@@ -505,6 +540,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
 /// name yet -- exactly what `launch_failure_receipt`'s own `Option`
 /// parameters exist for.
 fn refuse<W: Write>(
+    claim: (&StateDir, &Path),
     args: &AgentArgs,
     w: &mut W,
     workdir: &Path,
@@ -512,6 +548,7 @@ fn refuse<W: Write>(
     code: i32,
     reason: String,
 ) -> CtxResult<i32> {
+    release_task_claim(claim.0, claim.1, args);
     if args.json {
         let receipt = DelegationReceipt {
             schema_version: 1,
@@ -538,6 +575,17 @@ fn refuse<W: Write>(
         writeln!(w, "{reason}")?;
     }
     Ok(code)
+}
+
+fn release_task_claim(state: &StateDir, repo: &Path, args: &AgentArgs) {
+    finish_task_card(
+        state,
+        repo,
+        args,
+        super::task::ExitKind::Crash,
+        "launch refused",
+        super::state::now_secs(),
+    );
 }
 
 #[cfg(test)]
@@ -600,6 +648,65 @@ mod tests {
                 "{status:?} must never read as a completed delegation"
             );
         }
+    }
+
+    #[test]
+    fn native_worker_installs_child_envelope_before_nested_delegation() {
+        use super::super::{agent, coordinator, team};
+
+        let parent = envelope::WorkerEnvelope {
+            principal: "root".to_string(),
+            paths: vec![envelope::PathScope::new("repo")],
+            tools: envelope::ToolSet::all(),
+            network: true,
+            destructive: true,
+            delegation_depth: 2,
+            expires_at: u64::MAX,
+            token_budget: Some(1_000),
+        };
+        let requested = envelope::WorkerEnvelope::requested(
+            &parent,
+            "root/child".to_string(),
+            &["repo/src".to_string()],
+            true,
+            false,
+            None,
+            Some(500),
+        );
+        let child = envelope::WorkerEnvelope::narrow(&parent, &requested).expect("narrow child");
+        let inherited = envelope::canonical_json(&parent).expect("parent json");
+        let base = |key: &str| (key == agent::ENVELOPE_ENV).then(|| inherited.clone());
+        let installed = agent::envelope_env(
+            &base,
+            Some(envelope::canonical_json(&child).expect("child json")),
+            Some(child.principal.clone()),
+        );
+        let observed = agent::resolve_parent_envelope(&Default::default(), &installed)
+            .expect("nested worker reads envelope");
+        assert_eq!(observed, child);
+        assert_eq!(observed.delegation_depth, 1);
+        assert!(!observed.network);
+        assert_eq!(observed.paths, [envelope::PathScope::new("repo/src")]);
+
+        let first = coordinator::check(&coordinator::Bounds {
+            parent_role: team::COORDINATOR,
+            child_role: team::IMPLEMENTER,
+            depth: observed.delegation_depth,
+            cancelled: false,
+            requested_write: true,
+        })
+        .expect("one nested worker may launch");
+        assert_eq!(first.depth, 0);
+        assert_eq!(
+            coordinator::check(&coordinator::Bounds {
+                parent_role: team::COORDINATOR,
+                child_role: team::IMPLEMENTER,
+                depth: first.depth,
+                cancelled: false,
+                requested_write: true,
+            }),
+            Err(coordinator::Refusal::DepthExhausted)
+        );
     }
 
     #[test]
@@ -692,5 +799,80 @@ mod tests {
             second.is_err(),
             "a native worker must not claim a card a live legacy claimant already holds"
         );
+    }
+
+    #[test]
+    fn native_launch_refusal_releases_live_coordinator_claim() {
+        use super::super::task;
+
+        for failure in ["route", "budget", "writer"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(dir.path().join("state"));
+            let repo = dir.path().join("repo");
+            std::fs::create_dir_all(&repo).expect("repo");
+            let slug = super::super::state::repo_slug(&repo);
+            let task_id = format!("issue575-{failure}");
+            task::append_event(
+                &state,
+                &slug,
+                &task::Event::Created {
+                    id: task_id.clone(),
+                    repo_slug: slug.clone(),
+                    title: failure.to_string(),
+                    brief: "must not strand claim".to_string(),
+                    parents: Vec::new(),
+                    group_id: None,
+                    workdir: None,
+                    at: 1,
+                },
+            )
+            .expect("create card");
+            let pid = std::process::id();
+            task::claim_locked(
+                &state,
+                &slug,
+                &task_id,
+                "live-coordinator",
+                pid,
+                super::super::sessions::process_start_secs(pid),
+                &task::local_host(),
+                2,
+                task::DEFAULT_CLAIM_TTL_SECS,
+            )
+            .expect("claim")
+            .expect("card")
+            .expect("first claimant");
+
+            let mut args = args_for("native");
+            args.task = Some(task_id.clone());
+            refuse(
+                (&state, &repo),
+                &args,
+                &mut Vec::new(),
+                &repo,
+                None,
+                2,
+                failure.to_string(),
+            )
+            .expect("refusal receipt");
+
+            let reclaimed = task::claim_locked(
+                &state,
+                &slug,
+                &task_id,
+                "replacement",
+                pid,
+                super::super::sessions::process_start_secs(pid),
+                &task::local_host(),
+                3,
+                task::DEFAULT_CLAIM_TTL_SECS,
+            )
+            .expect("claim")
+            .expect("card");
+            assert!(
+                reclaimed.is_ok(),
+                "{failure} refusal stranded the live claim"
+            );
+        }
     }
 }
