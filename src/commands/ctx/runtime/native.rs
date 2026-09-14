@@ -4031,6 +4031,8 @@ pub(crate) fn session_broker(
     writer: Option<Box<dyn super::enforcement::WriterLease>>,
     approvals: Option<Arc<super::enforcement::InteractiveApprovals>>,
 ) -> Result<super::enforcement::ExecutionBroker, super::enforcement::BrokerError> {
+    use super::super::provider::config::NativeConfig;
+    use super::super::provider::credential::CredentialRef;
     use super::enforcement::{
         ApprovalAuthority, ApprovalMode, ConfigPolicySource, ExecutionBroker, PlatformIsolation,
         ResourceClaims, StoredSeatFence,
@@ -4065,6 +4067,15 @@ pub(crate) fn session_broker(
         .as_ref()
         .map(|approvals| approvals.authority())
         .unwrap_or_else(|| std::sync::Arc::new(ApprovalAuthority::new()));
+    let protected_env_names = NativeConfig::load(home, repo)
+        .map_err(|error| super::enforcement::BrokerError::PolicyUnavailable(error.to_string()))?
+        .into_iter()
+        .flat_map(|native| native.accounts.into_values())
+        .filter_map(|account| match account.credential {
+            Some(CredentialRef::Env(name)) => Some(name),
+            _ => None,
+        })
+        .collect();
     let broker = ExecutionBroker::new(
         identity,
         claims,
@@ -4074,7 +4085,7 @@ pub(crate) fn session_broker(
         authority,
         writer,
         PlatformIsolation::detect(),
-        Default::default(),
+        protected_env_names,
     )?;
     Ok(match approvals {
         Some(approvals) => broker.with_interactive_approvals(approvals),

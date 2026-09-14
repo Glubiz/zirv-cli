@@ -5256,7 +5256,7 @@ fn sibling_root_for(canon_repo: &Path) -> Option<PathBuf> {
 /// in `[dash] workdir_roots` / `ZIRV_CTX_DASH_WORKDIR_ROOTS` (`REPO_FORBIDDEN`
 /// -- see `DashConfig::workdir_roots`'s own doc comment; a repo checkout can
 /// never contribute to this list).
-fn workdir_roots(cfg: &CtxConfig, repo: &Path) -> Vec<PathBuf> {
+pub(crate) fn workdir_roots(cfg: &CtxConfig, repo: &Path) -> Vec<PathBuf> {
     let mut roots = default_workdir_roots(repo);
     for extra in &cfg.dash.workdir_roots {
         let path = PathBuf::from(extra);
@@ -5316,7 +5316,7 @@ fn workdir_outside_roots_reason(dir: &Path, roots: &[PathBuf]) -> String {
 /// what the default confinement is and how an operator widens it.
 ///
 /// `Ok(accepted)`, unchanged, when `workdir` is `None` -- pre-#228 behaviour.
-fn resolved_spawn_cwd(
+pub(crate) fn resolved_spawn_cwd(
     accepted: PathBuf,
     workdir: Option<&Path>,
     roots: &[PathBuf],

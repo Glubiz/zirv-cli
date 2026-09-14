@@ -55,7 +55,7 @@ pub(super) struct SearchArgs {
     pub max_results: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WriteFileArgs {
     pub path: PathBuf,
@@ -67,7 +67,7 @@ pub(super) struct WriteFileArgs {
     pub idempotency_key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ApplyPatchArgs {
     pub path: PathBuf,
@@ -76,7 +76,7 @@ pub(super) struct ApplyPatchArgs {
     pub idempotency_key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReplaceOperation {
     pub expected: String,
@@ -171,7 +171,7 @@ pub(super) fn read_file(
 pub(super) fn list_directory(root: &Path, args: &DirectoryArgs) -> Result<FileOutcome, ToolError> {
     let limit = args.max_results.clamp(1, MAX_WALK_ENTRIES);
     let mut entries = Vec::new();
-    walk(root, args.recursive, &mut |path, metadata| {
+    walk(root, args.recursive, &[], &mut |path, metadata| {
         entries.push(json!({
             "path": relative(root, path),
             "kind": file_kind(metadata),
@@ -215,7 +215,7 @@ pub(super) fn glob(root: &Path, args: &GlobArgs) -> Result<FileOutcome, ToolErro
     }
     let limit = args.max_results.clamp(1, MAX_WALK_ENTRIES);
     let mut matches = Vec::new();
-    walk(root, true, &mut |path, _| {
+    walk(root, true, &[], &mut |path, _| {
         let relative = relative(root, path);
         if glob_matches(
             &args.pattern.replace('\\', "/"),
@@ -230,7 +230,11 @@ pub(super) fn glob(root: &Path, args: &GlobArgs) -> Result<FileOutcome, ToolErro
     string_list_outcome("glob_search", root, matches, limit)
 }
 
-pub(super) fn search(root: &Path, args: &SearchArgs) -> Result<FileOutcome, ToolError> {
+pub(super) fn search(
+    root: &Path,
+    args: &SearchArgs,
+    protected_roots: &[PathBuf],
+) -> Result<FileOutcome, ToolError> {
     if args.query.is_empty() {
         return Err(ToolError::new(
             ToolErrorCode::InvalidArguments,
@@ -258,7 +262,7 @@ pub(super) fn search(root: &Path, args: &SearchArgs) -> Result<FileOutcome, Tool
     let limit = args.max_results.clamp(1, MAX_WALK_ENTRIES);
     let mut matches = Vec::new();
     let mut skipped_binary = 0usize;
-    walk(root, true, &mut |path, metadata| {
+    walk(root, true, protected_roots, &mut |path, metadata| {
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
             return true;
         }
@@ -477,8 +481,15 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, ToolError> {
 fn walk(
     root: &Path,
     recursive: bool,
+    excluded_roots: &[PathBuf],
     visit: &mut impl FnMut(&Path, &std::fs::Metadata) -> bool,
 ) -> Result<(), ToolError> {
+    if excluded_roots
+        .iter()
+        .any(|excluded| root.starts_with(excluded))
+    {
+        return Ok(());
+    }
     if root.is_file() {
         let metadata = std::fs::symlink_metadata(root).map_err(ToolError::io)?;
         visit(root, &metadata);
@@ -491,6 +502,12 @@ fn walk(
         for entry in entries {
             let entry = entry.map_err(ToolError::io)?;
             let path = entry.path();
+            if excluded_roots
+                .iter()
+                .any(|excluded| path.starts_with(excluded))
+            {
+                continue;
+            }
             let metadata = std::fs::symlink_metadata(&path).map_err(ToolError::io)?;
             seen += 1;
             if !visit(&path, &metadata) || seen >= MAX_WALK_ENTRIES {
@@ -721,7 +738,7 @@ fn validate_key(key: &str) -> Result<(), ToolError> {
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(super) fn sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -887,9 +904,35 @@ mod tests {
                 include: Some("**/*.rs".into()),
                 max_results: 10,
             },
+            &[],
         )
         .expect("search");
         assert_eq!(outcome.data["matches"][0]["path"], "blå.rs");
+    }
+
+    #[test]
+    // Issue #564: authorizing an ancestor never exposes a protected descendant.
+    fn text_search_skips_protected_descendants_under_allowed_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let protected = dir.path().join("protected");
+        std::fs::create_dir_all(&protected).expect("protected root");
+        std::fs::write(dir.path().join("visible.txt"), "ordinary text").expect("visible file");
+        std::fs::write(protected.join("state.txt"), "unique-protected-marker")
+            .expect("protected file");
+        let outcome = search(
+            dir.path(),
+            &SearchArgs {
+                root: dir.path().to_path_buf(),
+                query: "unique-protected-marker".into(),
+                regex: false,
+                case_sensitive: true,
+                include: None,
+                max_results: 10,
+            },
+            std::slice::from_ref(&protected),
+        )
+        .expect("search");
+        assert_eq!(outcome.data["total"], 0);
     }
 
     #[test]
