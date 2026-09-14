@@ -460,8 +460,18 @@ pub fn run_with<W: Write, E: Write>(
     {
         writeln!(stderr, "zirv chat: {note}")?;
     }
-    let native =
-        args.runtime.is_some() || configured.is_ok_and(|choice| choice.kind == RuntimeKind::Native);
+    // Issue #593 (roadmap N22): an explicit `--runtime` always wins over the
+    // configured default -- including an explicit `--runtime harness`, which
+    // must launch the ordinary wrapped chat even when `[runtime] default =
+    // "native"`. Only the ABSENCE of the flag falls back to `configured`
+    // (which already folds in `[runtime.roles]`/`[runtime] default`). An
+    // explicit value this build does not recognise (anything but `harness`)
+    // still routes into `run_native_chat`, which re-validates it through
+    // `runtime_kind::selected` and reuses that function's own error text.
+    let native = match args.runtime.as_deref() {
+        Some(flag) => !flag.eq_ignore_ascii_case(RuntimeKind::Harness.as_str()),
+        None => configured.is_ok_and(|choice| choice.kind == RuntimeKind::Native),
+    };
     if native {
         return run_native_chat(
             args.runtime
@@ -2042,6 +2052,68 @@ mod tests {
             .expect_err("bogus is not a known runtime")
             .to_string();
         assert_eq!(msg.trim_end(), expected);
+    }
+
+    /// Issue #593 (roadmap N22): an explicit `--runtime harness` must
+    /// override a configured `[runtime] default = "native"` and launch the
+    /// normal wrapped chat -- not the native dashboard pane. Every agent is
+    /// disabled so `resolve_adapter` fails deterministically, the same setup
+    /// `chat_with_no_enabled_and_ready_adapter_names_each_candidate_and_its_
+    /// reason` uses: reaching THAT message (naming every harness candidate)
+    /// rather than `run_native_chat`'s own refusal text is the proof the
+    /// wrapped path, not the native one, was taken.
+    #[test]
+    fn chat_runtime_harness_overrides_configured_native_default() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            crate::commands::ctx::adapters::ADAPTERS
+                .iter()
+                .map(|(name, _)| format!("[agents.{name}]\nenabled = false\n"))
+                .collect::<String>(),
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            "[runtime]\ndefault = 'native'\n",
+        )
+        .expect("write ctx.toml");
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("harness".to_string()),
+            extra: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_with(&args, &mut out, &mut err_out, repo.path(), &|k| {
+            empty.get(k).cloned()
+        })
+        .expect("prints and exits 1 rather than propagating an Err");
+        assert_eq!(code, 1, "nothing is both enabled and ready");
+        assert!(out.is_empty(), "no dashboard/banner is ever built here");
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(
+            msg.contains("claude") && msg.contains("codex") && msg.contains("opencode"),
+            "reaching resolve_adapter's every-candidate message proves the wrapped harness \
+             path was taken, not run_native_chat: {msg}"
+        );
+        assert!(
+            !msg.contains("needs an interactive terminal"),
+            "run_native_chat's own refusal text must never appear: {msg}"
+        );
     }
 
     #[test]
