@@ -2079,10 +2079,15 @@ mod tests {
 
             let moving = direction(source, target).expect("direction");
             assert!(
-                validate(&facts(&route), &demand(), &ContinuationPlan::Rebuilt {
-                    checkpoint: None,
-                    messages: Vec::new(),
-                }, moving)
+                validate(
+                    &facts(&route),
+                    &demand(),
+                    &ContinuationPlan::Rebuilt {
+                        checkpoint: None,
+                        messages: Vec::new(),
+                    },
+                    moving
+                )
                 .is_ok(),
                 "{moving:?}: the successor clears every gate"
             );
@@ -2096,8 +2101,8 @@ mod tests {
                 500,
             )
             .expect("prepare");
-            let committed = seat::commit(&state, &short, generation, "successor-session", 501)
-                .expect("commit");
+            let committed =
+                seat::commit(&state, &short, generation, "successor-session", 501).expect("commit");
             assert_eq!(committed.short, short, "{moving:?}");
 
             let waiting = mail::list(&state, slug, None, Some(&short)).expect("list after");
