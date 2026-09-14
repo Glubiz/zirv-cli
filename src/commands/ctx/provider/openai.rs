@@ -199,6 +199,7 @@ impl OpenAiResponsesAdapter {
         }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .timeout_connect(Some(self.timeouts.connect))
             .timeout_recv_response(Some(self.timeouts.first_event))
             .timeout_recv_body(Some(WORKER_READ_POLL))

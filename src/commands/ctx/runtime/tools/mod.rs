@@ -1182,15 +1182,13 @@ fn valid_idempotency(value: &str) -> Result<(), ToolError> {
     }
 }
 
-/// Maps an MCP failure onto the tool vocabulary. A cancelled call is the one
-/// case whose outcome is genuinely unknown -- the server may well have
-/// finished the effect -- so it is never reported as a clean failure a caller
-/// could retry.
+/// Maps MCP failures onto the tool vocabulary without turning an uncertain
+/// external effect into a clean failure a caller could retry.
 fn mcp_error(error: super::mcp::McpError) -> ToolError {
     use super::mcp::McpError;
 
     match error {
-        McpError::Cancelled => ToolError {
+        McpError::Cancelled | McpError::OutcomeUnknown(_) => ToolError {
             code: ToolErrorCode::Internal,
             message: error.to_string(),
             approval: None,
@@ -1199,7 +1197,7 @@ fn mcp_error(error: super::mcp::McpError) -> ToolError {
         McpError::StaleTool(_) => {
             ToolError::new(ToolErrorCode::PreconditionFailed, error.to_string())
         }
-        McpError::Unavailable(_) => {
+        McpError::Unavailable(_) | McpError::AuthenticationRejected(_) => {
             ToolError::new(ToolErrorCode::PreconditionFailed, error.to_string())
         }
         McpError::Timeout(_) => ToolError::new(ToolErrorCode::ResourceBusy, error.to_string()),
@@ -1596,7 +1594,11 @@ impl NativeToolClient {
             Err(error) => ToolReceipt {
                 receipt_id: uuid::Uuid::new_v4().simple().to_string(),
                 tool: name.to_string(),
-                state: ToolReceiptState::Failed,
+                state: if error.outcome_unknown {
+                    ToolReceiptState::OutcomeUnknown
+                } else {
+                    ToolReceiptState::Failed
+                },
                 retry,
                 result: None,
                 error: Some(error),
@@ -2859,22 +2861,30 @@ fn journal_finish(
     record: &mut JournalExecution<'_>,
     receipt: &ToolReceipt,
 ) -> Result<(), super::journal::JournalError> {
-    let (state, detail) = match receipt.state {
-        ToolReceiptState::Completed => (ExecutionState::Completed, None),
+    let (state, result, detail) = match receipt.state {
+        ToolReceiptState::Completed => (ExecutionState::Completed, Some(receipt), None),
         ToolReceiptState::Failed => (
             ExecutionState::Failed,
+            Some(receipt),
             receipt.error.as_ref().map(|error| error.message.clone()),
         ),
-        ToolReceiptState::OutcomeUnknown => (ExecutionState::OutcomeUnknown, None),
+        ToolReceiptState::OutcomeUnknown => (
+            ExecutionState::OutcomeUnknown,
+            None,
+            receipt.error.as_ref().map(|error| error.message.clone()),
+        ),
     };
-    let text = serde_json::to_string(receipt)?;
+    let result = result
+        .map(serde_json::to_string)
+        .transpose()?
+        .map(|text| ContentRef::Inline { text });
     record.journal.transition_execution(
         &record.session,
         record.generation,
         &record.scope,
         &record.execution,
         state,
-        Some(ContentRef::Inline { text }),
+        result,
         detail,
         Some(now_ms()),
         state::now_secs(),
@@ -5443,7 +5453,10 @@ mod tests {
     #[test]
     fn an_unconfigured_web_capability_fails_the_call_rather_than_returning_nothing() {
         let mut fixture = end_to_end(
-            super::super::super::policy::EffectivePolicy::default(),
+            super::super::super::policy::EffectivePolicy {
+                network: Some(super::super::super::policy::Stance::Allow),
+                ..super::super::super::policy::EffectivePolicy::default()
+            },
             super::super::mcp::FixtureServer::default(),
             24,
         );
@@ -5454,6 +5467,64 @@ mod tests {
         let error = receipt.error.expect("error");
         assert_eq!(error.code, ToolErrorCode::PreconditionFailed);
         assert!(error.message.contains("capabilities.web"), "{error:?}");
+    }
+
+    #[test]
+    fn network_denied_role_cannot_use_web_search() {
+        // Issue #558.
+        use super::super::super::config::WebCapabilityConfig;
+        use super::super::super::policy::{EffectivePolicy, Stance};
+        use super::super::capabilities::{HttpGetReply, HttpGetter, PassThroughEgress, WebBackend};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingGetter(std::sync::Arc<AtomicUsize>);
+
+        impl HttpGetter for CountingGetter {
+            fn get(
+                &self,
+                _: &str,
+                _: &[(String, String)],
+                _: usize,
+                _: std::time::Duration,
+            ) -> Result<HttpGetReply, String> {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Ok(HttpGetReply {
+                    status: 200,
+                    content_type: "application/json".into(),
+                    body: r#"{"results":[]}"#.into(),
+                })
+            }
+        }
+
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut fixture = end_to_end(
+            EffectivePolicy {
+                network: Some(Stance::Deny),
+                ..EffectivePolicy::default()
+            },
+            super::super::mcp::FixtureServer::default(),
+            24,
+        );
+        fixture.client.services.web = Some(WebBackend::new(
+            WebCapabilityConfig {
+                search_endpoint: Some("https://search.example/?q={query}".into()),
+                allow_hosts: vec!["search.example".into()],
+                ..WebCapabilityConfig::default()
+            },
+            None,
+            std::sync::Arc::new(CountingGetter(std::sync::Arc::clone(&requests))),
+            std::sync::Arc::new(PassThroughEgress),
+        ));
+        let receipt = fixture
+            .client
+            .execute(WEB_SEARCH, json!({"query":"blocked"}), None, None);
+        assert_eq!(receipt.state, ToolReceiptState::Failed);
+        assert_eq!(
+            receipt.error.expect("policy error").code,
+            ToolErrorCode::AuthorizationDenied
+        );
+        assert_eq!(requests.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -5497,5 +5568,175 @@ mod tests {
         let stale = mcp_error(super::super::mcp::McpError::StaleTool("changed".into()));
         assert_eq!(stale.code, ToolErrorCode::PreconditionFailed);
         assert!(!stale.outcome_unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_disconnect_after_request_write_records_outcome_unknown() {
+        // Issue #569.
+        use super::super::super::config::{McpServerConfig, McpTransportConfig};
+        use super::super::super::provider::{
+            AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
+        };
+        use super::super::journal::{PolicyProvenance, RouteIdentity, SeatId, SessionIdentity};
+        use super::super::mcp::{McpError, StdioTransport, TransportFactory};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct DisconnectFactory {
+            connects: AtomicUsize,
+            marker: std::path::PathBuf,
+        }
+
+        impl TransportFactory for DisconnectFactory {
+            fn connect(&self) -> Result<Box<dyn super::super::mcp::McpTransport>, McpError> {
+                let disconnect = self.connects.fetch_add(1, Ordering::AcqRel) == 0;
+                let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{},\"resources\":{}},\"serverInfo\":{\"name\":\"disconnect\",\"version\":\"1\"}}}"
+      ;;
+    *'"method":"tools/list"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"mutate\",\"description\":\"change state\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      ;;
+    *'"method":"resources/list"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"resources\":[]}}"
+      ;;
+    *'"method":"tools/call"'*)
+      printf received > "$MCP_DISCONNECT_MARKER"
+      if [ "$MCP_DISCONNECT" = yes ]; then exit 0; fi
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"mutated\"}]}}"
+      ;;
+  esac
+done
+"#;
+                let config = McpServerConfig {
+                    name: "disconnect".into(),
+                    transport: McpTransportConfig::Stdio {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), script.into()],
+                        cwd: None,
+                        environment: std::collections::BTreeMap::from([
+                            (
+                                "MCP_DISCONNECT".into(),
+                                if disconnect { "yes" } else { "no" }.into(),
+                            ),
+                            (
+                                "MCP_DISCONNECT_MARKER".into(),
+                                self.marker.to_string_lossy().into_owned(),
+                            ),
+                        ]),
+                    },
+                    ..McpServerConfig::default()
+                };
+                Ok(Box::new(StdioTransport::spawn(&config)?))
+            }
+        }
+
+        let mut fixture = end_to_end(
+            super::super::super::policy::EffectivePolicy::default(),
+            super::super::mcp::FixtureServer {
+                tools: vec![tool_row("mutate")],
+                ..Default::default()
+            },
+            24,
+        );
+        fixture.client.services.shutdown();
+        let marker = fixture.client.state.root().join("mcp-disconnect-received");
+        fixture.client.services.transport_overrides.insert(
+            "docs".into(),
+            std::sync::Arc::new(DisconnectFactory {
+                connects: AtomicUsize::new(0),
+                marker: marker.clone(),
+            }),
+        );
+
+        let session = JournalSessionId::new("session-569").expect("session id");
+        let mut journal = Journal::open(&fixture.client.state).expect("journal");
+        journal
+            .create_session(&SessionIdentity {
+                session: session.clone(),
+                seat: SeatId::new("seat-569").expect("seat id"),
+                generation: 1,
+                task: None,
+                route: RouteIdentity {
+                    route: RouteId::new("route-569").expect("route id"),
+                    provider: ProviderId::new("fixture").expect("provider id"),
+                    endpoint: EndpointId::new("fixture").expect("endpoint id"),
+                    account: AccountId::new("fixture").expect("account id"),
+                    billing_pool: BillingPoolId::new("fixture").expect("pool id"),
+                    protocol: Protocol::OpenAiResponses,
+                    model: ModelId {
+                        vendor: "fixture".into(),
+                        id: "fixture-model".into(),
+                    },
+                },
+                created_at: 1,
+                completed_at: None,
+            })
+            .expect("create session");
+        let scope = EventScope {
+            turn: None,
+            attempt: None,
+            task: None,
+        };
+        let call = ToolCallId::new("call-569").expect("call id");
+        let execution = ExecutionId::new("execution-569").expect("execution id");
+        journal
+            .prepare_tool_call(
+                &session,
+                1,
+                &scope,
+                call.clone(),
+                "mcp__docs__mutate".into(),
+                json!({"value":"x"}),
+                PolicyProvenance {
+                    fingerprint: "fixture".into(),
+                    source: "test".into(),
+                    decision: "allow".into(),
+                    scope: "test".into(),
+                },
+                Some(1),
+                1,
+            )
+            .expect("prepare call");
+        let receipt = fixture.client.execute(
+            "mcp__docs__mutate",
+            json!({"value":"x"}),
+            None,
+            Some(JournalExecution {
+                journal: &mut journal,
+                session: session.clone(),
+                generation: 1,
+                scope,
+                tool_call: call,
+                execution: execution.clone(),
+            }),
+        );
+        assert_eq!(
+            receipt.state,
+            ToolReceiptState::OutcomeUnknown,
+            "{receipt:?}"
+        );
+        let guidance = &receipt
+            .error
+            .as_ref()
+            .expect("uncertainty guidance")
+            .message;
+        assert!(guidance.contains("reconcile"), "{guidance}");
+        assert!(!guidance.contains("re-issue"), "{guidance}");
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("request marker"),
+            "received"
+        );
+        assert_eq!(
+            journal.replay(&session).expect("replay").executions[&execution].state,
+            ExecutionState::OutcomeUnknown
+        );
     }
 }

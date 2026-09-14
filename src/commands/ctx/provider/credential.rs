@@ -550,22 +550,18 @@ pub fn macos_get_command(item: &str) -> CommandSpec {
 
 #[cfg(any(test, target_os = "macos"))]
 pub fn macos_set_command(item: &str, secret: &str, interactive: bool) -> CommandSpec {
-    let mut args = vec![
-        "add-generic-password".into(),
-        "-U".into(),
-        "-s".into(),
-        "zirv-native".into(),
-        "-a".into(),
-        item.into(),
-        "-w".into(),
-    ];
-    if !interactive {
-        args.push(secret.into());
-    }
     CommandSpec {
         program: "security",
-        args,
-        stdin: None,
+        args: vec![
+            "add-generic-password".into(),
+            "-U".into(),
+            "-s".into(),
+            "zirv-native".into(),
+            "-a".into(),
+            item.into(),
+            "-w".into(),
+        ],
+        stdin: (!interactive).then(|| secret.to_string()),
         inherit_stdin: interactive,
     }
 }
@@ -726,6 +722,7 @@ mod tests {
 
     #[test]
     fn os_store_builders_keep_platform_specific_secret_handling() {
+        // Issue #560.
         assert_eq!(
             macos_get_command("work").args,
             [
@@ -751,11 +748,10 @@ mod tests {
             ]
         );
         assert!(mac_prompt.inherit_stdin);
-        assert!(
-            macos_set_command("work", "secret", false)
-                .args
-                .ends_with(&["-w".into(), "secret".into()])
-        );
+        let mac_piped = macos_set_command("work", "secret", false);
+        assert!(!mac_piped.args.contains(&"secret".into()));
+        assert_eq!(mac_piped.stdin.as_deref(), Some("secret"));
+        assert!(!mac_piped.inherit_stdin);
         let linux = linux_set_command("work", "secret");
         assert_eq!(linux.program, "secret-tool");
         assert_eq!(
@@ -806,6 +802,38 @@ mod tests {
         let store = OsStore::with_runner(Box::new(TimeoutRunner), false);
         let error = store.get("work").unwrap_err();
         assert!(error.contains("timed out after 3s"), "got {error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_non_tty_command_stores_without_putting_the_value_in_argv() {
+        // Issue #560.
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct RecordingRunner(Arc<std::sync::Mutex<Option<CommandSpec>>>);
+
+        impl CommandRunner for RecordingRunner {
+            fn run(&self, command: &CommandSpec, _: Duration) -> Result<CommandOutput, RunError> {
+                *self.0.lock().expect("recording lock") = Some(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let store = OsStore::with_runner(Box::new(RecordingRunner(Arc::clone(&recorded))), false);
+        store.set("work", "piped-value").expect("store succeeds");
+        let command = recorded
+            .lock()
+            .expect("recording lock")
+            .clone()
+            .expect("command");
+        assert!(!command.args.contains(&"piped-value".into()));
+        assert_eq!(command.stdin.as_deref(), Some("piped-value"));
     }
 
     #[cfg(unix)]

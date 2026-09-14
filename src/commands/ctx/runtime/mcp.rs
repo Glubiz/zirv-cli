@@ -39,7 +39,9 @@ use sha2::{Digest, Sha256};
 use super::super::config::{CapabilityEffectsConfig, McpServerConfig, McpTransportConfig};
 use super::super::pace::redact_for_log;
 use super::super::provider::adapter::{Cancellation, NeverCancelled};
-use super::enforcement::ProcessEffects;
+use super::enforcement::{
+    PlatformIsolation, ProcessEffects, ProcessInvocation, ProcessSandboxPolicy, SandboxLaunch,
+};
 
 /// The protocol revision this client negotiates.
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -69,6 +71,10 @@ pub enum McpError {
     /// The caller's cancellation flag fired; `notifications/cancelled` was
     /// sent, and the outcome of the server-side effect is unknown.
     Cancelled,
+    /// A tool request left this process, but no definitive response arrived.
+    OutcomeUnknown(String),
+    /// The remote endpoint definitively refused the current auth material.
+    AuthenticationRejected(String),
     Timeout(String),
     /// No such server is configured, or it is disabled.
     Unavailable(String),
@@ -83,6 +89,10 @@ impl std::fmt::Display for McpError {
             Self::Protocol(why) => write!(f, "MCP protocol violation: {why}"),
             Self::Server { code, message } => write!(f, "MCP server error {code}: {message}"),
             Self::Cancelled => f.write_str("MCP call was cancelled; its outcome is unknown"),
+            Self::OutcomeUnknown(why) => write!(f, "MCP call outcome is unknown: {why}"),
+            Self::AuthenticationRejected(why) => {
+                write!(f, "MCP authentication was rejected: {why}")
+            }
             Self::Timeout(why) => write!(f, "MCP call timed out: {why}"),
             Self::Unavailable(why) => write!(f, "MCP server unavailable: {why}"),
             Self::StaleTool(why) => write!(f, "MCP tool is stale: {why}"),
@@ -167,27 +177,94 @@ impl StdioTransport {
                 config.name
             )));
         }
-        let mut process = Command::new(command);
+        let cwd = cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| {
+                McpError::Transport("could not resolve the MCP working directory".into())
+            })?;
+        Self::spawn_launch(
+            SandboxLaunch {
+                program: command.into(),
+                args: args.iter().map(Into::into).collect(),
+                cwd,
+                environment: environment.clone(),
+            },
+            &config.name,
+            command,
+        )
+    }
+
+    fn spawn_isolated(
+        config: &McpServerConfig,
+        isolation: &PlatformIsolation,
+    ) -> Result<Self, McpError> {
+        let McpTransportConfig::Stdio {
+            command,
+            args,
+            cwd,
+            environment,
+        } = &config.transport
+        else {
+            return Err(McpError::Unavailable(format!(
+                "server `{}` is not configured for the stdio transport",
+                config.name
+            )));
+        };
+        let cwd = cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| {
+                McpError::Transport("could not resolve the MCP working directory".into())
+            })?;
+        let effects = ProcessEffects::from(&config.effects);
+        let invocation = ProcessInvocation::Argv {
+            program: command.clone(),
+            args: args.clone(),
+            cwd: cwd.clone(),
+            environment: environment.clone(),
+        };
+        let policy = ProcessSandboxPolicy {
+            read_roots: vec![cwd.clone()],
+            write_roots: (effects.repo_write
+                || effects.outside_write
+                || effects.git_metadata_write)
+                .then_some(cwd)
+                .into_iter()
+                .collect(),
+            masked_roots: Vec::new(),
+            network: effects.network,
+            environment: environment.clone(),
+        };
+        let launch = isolation
+            .prepare(&invocation, &policy)
+            .map_err(|error| McpError::Unavailable(error.to_string()))?;
+        Self::spawn_launch(launch, &config.name, command)
+    }
+
+    fn spawn_launch(
+        launch: SandboxLaunch,
+        server_name: &str,
+        command_label: &str,
+    ) -> Result<Self, McpError> {
+        let mut process = Command::new(&launch.program);
         process
-            .args(args)
+            .args(&launch.args)
+            .current_dir(&launch.cwd)
+            .env_clear()
+            .envs(&launch.environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(cwd) = cwd {
-            process.current_dir(cwd);
-        }
-        for (key, value) in environment {
-            process.env(key, value);
-        }
+        super::super::supervise::isolate_process_tree(&mut process);
         let mut child = process.spawn().map_err(|error| {
             McpError::Transport(format!(
-                "could not start MCP server `{}` ({command}): {error}",
-                config.name
+                "could not start MCP server `{server_name}` ({command_label}): {error}"
             ))
         })?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| {
-            McpError::Transport(format!("MCP server `{}` has no stdout", config.name))
+            McpError::Transport(format!("MCP server `{server_name}` has no stdout"))
         })?;
         let (sender, frames) = sync_channel(64);
         std::thread::spawn(move || pump_frames(stdout, &sender));
@@ -201,7 +278,7 @@ impl StdioTransport {
             stdin,
             frames,
             pending: Vec::new(),
-            label: format!("stdio:{command}"),
+            label: format!("stdio:{command_label}"),
             stderr_tail,
         })
     }
@@ -424,17 +501,29 @@ fn frame_id(frame: &Value) -> Option<u64> {
 #[derive(Debug)]
 pub struct StdioFactory {
     config: McpServerConfig,
+    isolation: PlatformIsolation,
 }
 
 impl StdioFactory {
     pub fn new(config: McpServerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            isolation: PlatformIsolation::detect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_isolation(config: McpServerConfig, isolation: PlatformIsolation) -> Self {
+        Self { config, isolation }
     }
 }
 
 impl TransportFactory for StdioFactory {
     fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-        Ok(Box::new(StdioTransport::spawn(&self.config)?))
+        Ok(Box::new(StdioTransport::spawn_isolated(
+            &self.config,
+            &self.isolation,
+        )?))
     }
 }
 
@@ -481,6 +570,7 @@ impl HttpPoster for UreqPoster {
         }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .timeout_connect(Some(budget))
             .timeout_recv_response(Some(budget))
             .build()
@@ -621,7 +711,7 @@ impl HttpTransport {
         match reply.status {
             200..=299 => {}
             401 | 403 => {
-                return Err(McpError::Unavailable(format!(
+                return Err(McpError::AuthenticationRejected(format!(
                     "remote MCP server refused the credential (HTTP {})",
                     reply.status
                 )));
@@ -715,15 +805,31 @@ impl McpTransport for HttpTransport {
     }
 }
 
-#[derive(Debug)]
 pub struct HttpFactory {
     url: String,
-    bearer: Option<String>,
+    bearer: Arc<dyn Fn() -> Result<Option<String>, McpError> + Send + Sync>,
     poster: Arc<dyn HttpPoster>,
+}
+
+impl std::fmt::Debug for HttpFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpFactory")
+            .field("url", &self.url)
+            .field("bearer", &"[redacted resolver]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpFactory {
     pub fn new(url: String, bearer: Option<String>, poster: Arc<dyn HttpPoster>) -> Self {
+        Self::new_resolving(url, Arc::new(move || Ok(bearer.clone())), poster)
+    }
+
+    pub fn new_resolving(
+        url: String,
+        bearer: Arc<dyn Fn() -> Result<Option<String>, McpError> + Send + Sync>,
+        poster: Arc<dyn HttpPoster>,
+    ) -> Self {
         Self {
             url,
             bearer,
@@ -736,7 +842,7 @@ impl TransportFactory for HttpFactory {
     fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
         Ok(Box::new(HttpTransport::new(
             self.url.clone(),
-            self.bearer.clone(),
+            (self.bearer)()?,
             Arc::clone(&self.poster),
         )))
     }
@@ -1206,9 +1312,25 @@ impl McpClient {
                 // One reconnect, then the call is reported rather than
                 // silently replayed: a tool whose shape moved must not be
                 // re-entered against a stale description.
+                let reconnect = self.reconnect();
+                let suffix = if reconnect.is_ok() {
+                    "the connection was refreshed"
+                } else {
+                    "the connection could not be refreshed"
+                };
+                return Err(McpError::OutcomeUnknown(format!(
+                    "{why}; {suffix}; reconcile the external state before any re-execution"
+                )));
+            }
+            Err(McpError::Timeout(why)) => {
+                return Err(McpError::OutcomeUnknown(format!(
+                    "{why}; reconcile the external state before any re-execution"
+                )));
+            }
+            Err(McpError::AuthenticationRejected(why)) => {
                 self.reconnect()?;
-                return Err(McpError::Transport(format!(
-                    "{why}; reconnected and re-discovered, re-issue the call"
+                return Err(McpError::Unavailable(format!(
+                    "{why}; authentication material was refreshed; re-issue the refused call"
                 )));
             }
             Err(other) => return Err(other),
@@ -1591,6 +1713,69 @@ mod tests {
         (client, factory)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stdio_mcp_child_receives_only_declared_scrubbed_environment() {
+        // Issue #555.
+        const PARENT_NAME: &str = "UNRELATED_PARENT_SECRET";
+        unsafe { std::env::set_var(PARENT_NAME, "parent-only-value") };
+        let transport = McpTransportConfig::Stdio {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "read line; if [ -z \"${UNRELATED_PARENT_SECRET+x}\" ] && [ \"$DECLARED_VALUE\" = visible ]; then name=isolated; else name=leaked; fi; printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"result\\\":{\\\"protocolVersion\\\":\\\"2025-11-25\\\",\\\"capabilities\\\":{},\\\"serverInfo\\\":{\\\"name\\\":\\\"$name\\\",\\\"version\\\":\\\"1\\\"}}}\""
+                    .into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::from([("DECLARED_VALUE".into(), "visible".into())]),
+        };
+        let mut child = StdioTransport::spawn(&McpServerConfig {
+            name: "environment-check".into(),
+            transport,
+            ..McpServerConfig::default()
+        })
+        .expect("spawn environment fixture");
+        let reply = child
+            .request(
+                1,
+                "initialize",
+                json!({}),
+                Instant::now() + Duration::from_secs(5),
+                &NeverCancelled,
+            )
+            .expect("fixture reply");
+        unsafe { std::env::remove_var(PARENT_NAME) };
+        assert_eq!(
+            reply.pointer("/result/serverInfo/name"),
+            Some(&json!("isolated"))
+        );
+    }
+
+    #[test]
+    fn stdio_mcp_is_refused_when_required_isolation_is_unavailable() {
+        // Issue #555.
+        let config = McpServerConfig {
+            name: "local".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "/bin/true".into(),
+                args: Vec::new(),
+                cwd: None,
+                environment: BTreeMap::new(),
+            },
+            ..McpServerConfig::default()
+        };
+        let factory = StdioFactory::with_isolation(
+            config,
+            PlatformIsolation::Unavailable {
+                platform: "test".into(),
+                reason: "fixture has no process sandbox".into(),
+            },
+        );
+        let error = factory.connect().expect_err("isolation is required");
+        assert!(matches!(error, McpError::Unavailable(_)), "{error:?}");
+        assert!(error.to_string().contains("fixture has no process sandbox"));
+    }
+
     #[test]
     fn a_local_server_negotiates_discovers_and_calls_a_tool() {
         let (mut client, factory) = fixture_client(FixtureServer {
@@ -1667,6 +1852,103 @@ mod tests {
                 "the negotiated session id must be pinned on later requests"
             );
         }
+    }
+
+    #[test]
+    fn remote_mcp_reloads_auth_after_401() {
+        // Issue #591.
+        #[derive(Debug)]
+        struct RejectOncePoster {
+            server: Arc<std::sync::Mutex<FixtureServer>>,
+            rejected: std::sync::atomic::AtomicBool,
+            observed: ObservedHeaders,
+        }
+
+        impl HttpPoster for RejectOncePoster {
+            fn post(
+                &self,
+                _url: &str,
+                headers: &[(String, String)],
+                body: String,
+                _deadline: Instant,
+            ) -> Result<HttpReply, McpError> {
+                self.observed
+                    .lock()
+                    .expect("observed lock")
+                    .push(headers.to_vec());
+                let frame: Value = serde_json::from_str(&body).expect("request frame");
+                if frame["method"] == "tools/call"
+                    && !self
+                        .rejected
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Ok(HttpReply {
+                        status: 401,
+                        content_type: "application/json".into(),
+                        session_id: None,
+                        body: "auth refused".into(),
+                    });
+                }
+                if frame.get("id").is_none() {
+                    return Ok(HttpReply {
+                        status: 202,
+                        content_type: "application/json".into(),
+                        session_id: None,
+                        body: String::new(),
+                    });
+                }
+                let answer = self.server.lock().expect("server lock").answer(&frame);
+                Ok(HttpReply {
+                    status: 200,
+                    content_type: "application/json".into(),
+                    session_id: None,
+                    body: serde_json::to_string(&answer).expect("response frame"),
+                })
+            }
+        }
+
+        let current = Arc::new(std::sync::Mutex::new("old-auth-value".to_string()));
+        let resolving = Arc::clone(&current);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let poster = Arc::new(RejectOncePoster {
+            server: Arc::new(std::sync::Mutex::new(FixtureServer {
+                tools: vec![tool("mutate", "Change remote state.", "value")],
+                ..FixtureServer::default()
+            })),
+            rejected: std::sync::atomic::AtomicBool::new(false),
+            observed: Arc::clone(&observed),
+        });
+        let factory = Arc::new(HttpFactory::new_resolving(
+            "https://mcp.example/rpc".into(),
+            Arc::new(move || Ok(Some(resolving.lock().expect("auth lock").clone()))),
+            poster,
+        ));
+        let mut client = McpClient::connect(
+            "remote",
+            factory,
+            ProcessEffects::default(),
+            Duration::from_secs(5),
+        )
+        .expect("connect with initial auth");
+        *current.lock().expect("auth lock") = "new-auth-value".into();
+        let error = client
+            .call_tool("mutate", json!({"value":"x"}), &NeverCancelled)
+            .expect_err("the rejected call is not replayed");
+        let diagnostic = error.to_string();
+        assert!(!diagnostic.contains("old-auth-value"));
+        assert!(!diagnostic.contains("new-auth-value"));
+        assert_eq!(client.reconnects(), 1);
+        let requests = observed.lock().expect("observed lock");
+        assert!(requests.iter().any(|headers| {
+            headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Bearer old-auth-value")
+        }));
+        assert!(requests.iter().rev().any(|headers| {
+            headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Bearer new-auth-value")
+        }));
     }
 
     #[test]

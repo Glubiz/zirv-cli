@@ -98,6 +98,7 @@ impl AnthropicMessagesAdapter {
                 "Anthropic adapter requires an anthropic-messages target",
             ));
         }
+        Self::reject_harness_login_credential(credential.secret.expose(), &target)?;
         if is_plaintext_non_loopback(&target.base_url) {
             return Err(ProviderFailure::new(
                 FailureClass::Configuration,
@@ -120,6 +121,32 @@ impl AnthropicMessagesAdapter {
             credential,
             timeouts,
         })
+    }
+
+    fn reject_harness_login_credential(
+        secret: &str,
+        target: &ProviderTarget,
+    ) -> Result<(), ProviderFailure> {
+        let trimmed = secret.trim();
+        if trimmed.starts_with("sk-ant-oat")
+            || trimmed.starts_with('{')
+            || trimmed.to_ascii_lowercase().starts_with("bearer ")
+        {
+            return Err(ProviderFailure::new(
+                FailureClass::Entitlement,
+                FailureScope {
+                    kind: FailureScopeKind::Account,
+                    id: Some(target.account.to_string()),
+                },
+                format!(
+                    "Anthropic account `{}` is configured with a Claude Code subscription login, \
+                     not an Anthropic API key; harness entitlements are never sent to the generic \
+                     Messages API",
+                    target.account
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn messages_url(&self) -> String {
@@ -266,6 +293,7 @@ impl AnthropicMessagesAdapter {
         }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .timeout_connect(Some(self.timeouts.connect))
             .timeout_recv_response(Some(self.timeouts.first_event))
             .timeout_recv_body(Some(WORKER_READ_POLL))
@@ -1230,6 +1258,22 @@ mod tests {
             secret: Secret::new("test-secret-never-log".into()),
             expires_at: None,
         }
+    }
+
+    #[test]
+    fn anthropic_refuses_harness_login_secret_before_network() {
+        // Issue #561.
+        let error = AnthropicMessagesAdapter::new(
+            target("http://127.0.0.1:9".into()),
+            Credential {
+                secret: Secret::new("sk-ant-oat01-subscription-token".into()),
+                expires_at: None,
+            },
+            AnthropicTimeouts::default(),
+        )
+        .expect_err("a harness login must be rejected locally");
+        assert_eq!(error.class, FailureClass::Entitlement);
+        assert_eq!(error.scope.kind, FailureScopeKind::Account);
     }
 
     fn request() -> ProviderRequest {
