@@ -280,6 +280,15 @@ fn excluded_model_call(path: &str, function: &str) -> bool {
                 "src/commands/ctx/run_loop.rs",
                 "prompt_delivery_via_stdin" | "zirv_invocation"
             )
+            // Valid only while `runtime::select` has no production caller
+            // (it is referenced solely from `runtime/mod.rs`'s own
+            // `#[cfg(test)] mod tests`, per
+            // `runtime_select_is_referenced_only_from_its_own_tests` below).
+            // The harness backend this call sits in is unreachable dead
+            // code until something wires `runtime::select` up to a real
+            // command path; the moment it does, `start`/`submit` become a
+            // live model-calling entry point and this exclusion must be
+            // dropped so the inventory documents them.
             | ("src/commands/ctx/runtime/harness.rs", "start" | "submit")
             | ("src/commands/ctx/session/host.rs", "resume_argv")
             | ("src/commands/ctx/session/mod.rs", "spawn_service")
@@ -587,6 +596,53 @@ mod tests {
         );
         assert!(result.details.contains("stream_once"), "{result:?}");
         assert!(result.details.contains("discovered"), "{result:?}");
+    }
+
+    /// Guards the precondition `excluded_model_call` documents for
+    /// `runtime/harness.rs`'s `start`/`submit` exclusion: `runtime::select`
+    /// must have no production caller. If this trips, the harness backend
+    /// has gone live and that exclusion is stale -- drop it so
+    /// `discovered_model_entry_points` starts requiring inventory rows for
+    /// `start`/`submit` instead of silently skipping them.
+    #[test]
+    fn runtime_select_is_referenced_only_from_its_own_tests() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_files(&root, &mut files).expect("collect source files");
+
+        let runtime_mod_rs = root
+            .join("commands")
+            .join("ctx")
+            .join("runtime")
+            .join("mod.rs");
+        let tests_marker =
+            Regex::new(r"(?m)#\[cfg\(test\)\]\s*mod\s+tests\s*\{").expect("static pattern");
+
+        for file in &files {
+            let contents = std::fs::read_to_string(file).expect("read source file");
+            let is_own_module = *file == runtime_mod_rs;
+            let production = tests_marker
+                .find(&contents)
+                .map(|found| &contents[..found.start()])
+                .unwrap_or(contents.as_str());
+
+            for (line_no, line) in production.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let calls_select = if is_own_module {
+                    code.contains("select(") && !code.contains("fn select(")
+                } else {
+                    code.contains("runtime::select(")
+                };
+                assert!(
+                    !calls_select,
+                    "runtime::select must stay uncalled from production code until the \
+                     `runtime/harness.rs` start/submit `excluded_model_call` exclusion is \
+                     revisited -- found a call at {}:{}: {line:?}",
+                    file.display(),
+                    line_no + 1,
+                );
+            }
+        }
     }
 
     /// The doc's `Path` cell is repo-owned, UNTRUSTED text: an absolute path
