@@ -394,6 +394,7 @@ fn run_native_chat<E: Write>(
             role: "orchestrator".to_string(),
             route: None,
             writing: true,
+            provider: None,
         }),
         args.force_pace,
     )
