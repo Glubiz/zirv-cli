@@ -150,6 +150,13 @@ pub struct ProcessSnapshot {
     pub exit_code: Option<i32>,
     pub output: Vec<ProcessOutputChunk>,
     pub pending_output_bytes: usize,
+    /// Set once any stream (stdout/stderr/PTY) crossed
+    /// `MAX_STREAM_BYTES`/`MAX_STREAM_LINES` and stopped being read further
+    /// (issue #583 review round 1). Distinct from `pending_output_bytes`:
+    /// that tracks output the caller's own inline-display budget excluded
+    /// but which still reached the persisted capture; this means output was
+    /// never read from the process at all and is gone permanently.
+    pub stream_truncated: bool,
     pub output_id: Option<String>,
     pub summary: Option<String>,
     pub interactive: bool,
@@ -172,6 +179,11 @@ pub(super) struct ProcessLimits {
 struct StreamChunk {
     stream: ProcessStream,
     bytes: Vec<u8>,
+    /// Set on the one chunk a reader sends immediately before giving up on
+    /// this stream because it crossed `MAX_STREAM_BYTES`/`MAX_STREAM_LINES`
+    /// (issue #583 review round 1). `false` on every ordinary chunk,
+    /// including the last one before a natural EOF.
+    truncated: bool,
 }
 
 type SpawnedProcess = (ProcessChild, Receiver<StreamChunk>, Vec<JoinHandle<()>>);
@@ -312,9 +324,16 @@ struct ManagedProcess {
     /// roadmap N05) as soon as this process reaches a terminal state by any
     /// other path (self-detected timeout, natural exit, or an explicit
     /// `terminate`), so the watchdog never fires a redundant (though
-    /// harmless -- `kill_tree` on an exited pid is a no-op) kill later.
+    /// harmless -- `terminate_pid` on an exited pid is a no-op) kill later.
     /// `None` when no `timeout_ms` was given, so no watchdog was spawned.
     watchdog_stop: Option<Sender<()>>,
+    /// Set once any reader thread stopped pulling its stream early because
+    /// it crossed [`MAX_STREAM_BYTES`]/[`MAX_STREAM_LINES`] -- review round
+    /// 1 on #583: hitting either cap used to be silent, with no way for a
+    /// caller to tell "the process produced no more output" apart from "the
+    /// process produced more output than zirv would ever retain". Surfaced
+    /// on [`ProcessSnapshot::stream_truncated`].
+    stream_truncated: bool,
 }
 
 impl ManagedProcess {
@@ -447,6 +466,7 @@ impl ProcessManager {
                 interactive: args.interactive,
                 heavy_permit,
                 watchdog_stop,
+                stream_truncated: false,
             },
         );
         self.idempotency
@@ -650,27 +670,39 @@ fn spawn_reader<R: Read + Send + 'static>(
         let mut total_bytes = 0usize;
         let mut total_lines = 0usize;
         loop {
-            // Issue #583 (roadmap N05): stop pulling more of this stream once
-            // either hard ceiling is crossed, independent of whether -- or
-            // how often -- a caller drains the channel. A byte-only cap does
-            // not bound a stream of many small lines the same way a child
-            // could still flood: each `read()` can return a full buffer of
-            // short lines as one chunk under the byte cap.
-            if total_bytes >= MAX_STREAM_BYTES || total_lines >= MAX_STREAM_LINES {
-                return;
-            }
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => return,
                 Ok(read) => {
                     total_bytes += read;
                     total_lines += buffer[..read].iter().filter(|&&byte| byte == b'\n').count();
+                    // Issue #583 (roadmap N05): stop pulling more of this
+                    // stream once either hard ceiling is crossed,
+                    // independent of whether -- or how often -- a caller
+                    // drains the channel. A byte-only cap does not bound a
+                    // stream of many small lines the same way a child could
+                    // still flood: each `read()` can return a full buffer of
+                    // short lines as one chunk under the byte cap.
+                    //
+                    // Checked here, after folding this read into the
+                    // running totals, rather than at the top of the loop:
+                    // that lets the chunk that actually crosses the ceiling
+                    // carry `truncated: true` itself (review round 1), so a
+                    // caller can tell "no more output" apart from "more
+                    // output existed and was permanently dropped" without a
+                    // separate empty marker chunk.
+                    let truncated =
+                        total_bytes >= MAX_STREAM_BYTES || total_lines >= MAX_STREAM_LINES;
                     if sender
                         .send(StreamChunk {
                             stream,
                             bytes: buffer[..read].to_vec(),
+                            truncated,
                         })
                         .is_err()
                     {
+                        return;
+                    }
+                    if truncated {
                         return;
                     }
                 }
@@ -766,6 +798,9 @@ fn drain(
     let mut remaining = inline_budget;
     let mut suppressed = 0usize;
     while let Ok(chunk) = process.receiver.try_recv() {
+        if chunk.truncated {
+            process.stream_truncated = true;
+        }
         if let Some(capture) = process.capture.as_mut() {
             capture.append(&chunk.bytes).map_err(ToolError::external)?;
         }
@@ -796,6 +831,7 @@ fn snapshot(
         exit_code: process.exit_code,
         output,
         pending_output_bytes,
+        stream_truncated: process.stream_truncated,
         output_id: process.captured.as_ref().map(|capture| capture.id.clone()),
         summary: process
             .captured
@@ -936,6 +972,61 @@ mod tests {
         );
     }
 
+    /// Review round 1 on #583: a cheap, deterministic, cross-platform proof
+    /// of `spawn_reader`'s cap logic in isolation -- no real process needed,
+    /// unlike `process_lifecycle_bounds_timeout_output_and_cleanup`'s own
+    /// `#[cfg(unix)]` coverage of the same behavior against a real shell
+    /// pipeline. Many short lines, comfortably under `MAX_STREAM_BYTES`, so
+    /// this specifically isolates the LINE ceiling from the byte one.
+    #[test]
+    fn spawn_reader_stops_and_flags_truncation_at_the_line_ceiling() {
+        // Margin well beyond one read buffer's worth of lines (8192 bytes /
+        // ~6 bytes per short line): the reader must give up several reads
+        // before reaching the end of the fixture, not merely on whichever
+        // read happens to coincide with EOF.
+        let lines = MAX_STREAM_LINES + 5_000;
+        let mut content = Vec::new();
+        for i in 0..lines {
+            content.extend_from_slice(format!("{i}\n").as_bytes());
+        }
+        assert!(
+            content.len() < MAX_STREAM_BYTES,
+            "fixture must stay under the byte ceiling to isolate the line ceiling"
+        );
+
+        let cursor = std::io::Cursor::new(content);
+        let (sender, receiver) = mpsc::channel();
+        let handle = spawn_reader(cursor, sender, ProcessStream::Stdout);
+        handle
+            .join()
+            .expect("the reader thread must finish once it crosses the ceiling, not block");
+
+        let chunks: Vec<StreamChunk> = receiver.try_iter().collect();
+        assert!(!chunks.is_empty(), "the reader must have sent something");
+        assert!(
+            chunks.last().expect("at least one chunk").truncated,
+            "the chunk that crosses the ceiling must carry truncated: true"
+        );
+        assert!(
+            chunks[..chunks.len() - 1]
+                .iter()
+                .all(|chunk| !chunk.truncated),
+            "only the ceiling-crossing chunk may be marked truncated"
+        );
+        let total_lines: usize = chunks
+            .iter()
+            .map(|chunk| chunk.bytes.iter().filter(|&&byte| byte == b'\n').count())
+            .sum();
+        assert!(
+            total_lines >= MAX_STREAM_LINES,
+            "the reader must have read at least up to the line ceiling: read {total_lines}"
+        );
+        assert!(
+            total_lines < lines,
+            "the reader must not have read the whole oversized fixture: read {total_lines} of {lines}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn process_output_keeps_non_utf8_bytes_and_returns_a_retrieval_handle() {
@@ -1053,6 +1144,7 @@ mod tests {
                         )
                         .expect("start");
                     let mut delivered = 0usize;
+                    let mut truncated = false;
                     for _ in 0..40 {
                         let snap = manager.poll(&snapshot.handle).expect("poll");
                         delivered += snap
@@ -1061,12 +1153,18 @@ mod tests {
                             .map(|chunk| chunk.byte_len)
                             .sum::<usize>()
                             + snap.pending_output_bytes;
+                        truncated |= snap.stream_truncated;
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     assert!(
                         delivered <= MAX_STREAM_BYTES + 8192,
                         "the reader must stop at the byte ceiling instead of buffering \
                          the whole 9 MB, single-line stream unbounded: delivered {delivered}"
+                    );
+                    assert!(
+                        truncated,
+                        "hitting the byte ceiling must be surfaced on the snapshot, not silent \
+                         (review round 1 on #583)"
                     );
                     let _ = manager.terminate(&snapshot.handle);
                 }
