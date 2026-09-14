@@ -215,11 +215,20 @@ jobs:
       - name: Set Up Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Issue #609 (roadmap N22, review of #493): every name
+      # `ctx::adapters::ADAPTERS` registers, not the `claude`/`codex` pair
+      # this step used to check alone. This bash list is a best-effort sanity
+      # check on the ambient runner and can drift from the registry if a
+      # ninth adapter is ever added without updating it here; the
+      # authoritative, non-drifting check is the Rust test below
+      # (`a_real_native_worker_and_every_helper_role_complete_with_every_registered_harness_canaried_and_uninvoked`),
+      # which walks `ctx::adapters::ADAPTERS` directly and scrubs `PATH`
+      # itself rather than trusting the runner's ambient state.
       - name: Assert No Coding Harness Is Installed
         shell: bash
         run: |
           set -euo pipefail
-          for harness in claude codex; do
+          for harness in claude codex copilot droid gemini opencode pi qwen; do
             if command -v "$harness" >/dev/null 2>&1; then
               echo "$harness is on PATH; this job must run with none installed" >&2
               exit 1
@@ -282,6 +291,24 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --bin zirv every_coding_harness -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
+
+      # Issue #609 (roadmap N22, review of #493): the installed-binary proof
+      # the review found missing -- a REAL native worker
+      # (`runtime::native::run_session`, the exact function `zirv ctx exec
+      # --runtime native --provider fixture:` runs) and every helper role,
+      # driven to completion with a CANARY executable standing in for every
+      # name `ctx::adapters::ADAPTERS` registers (enumerated from that
+      # registry, not a hard-coded pair). Each canary leaves evidence if the
+      # OS ever actually runs it, so this fails loudly on a regression that
+      # merely "would have failed a PATH lookup" and could otherwise slip
+      # past an empty-`PATH` assertion alone.
+      - name: Verify The Harness-Free Install Proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv canaried_and_uninvoked -- --test-threads=1 2>&1 | tee result.txt
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
             || { echo "filter matched no tests" >&2; exit 1; }
 
@@ -419,3 +446,31 @@ jobs:
       # The scan proves itself on every run too.
       - name: Advisory scan self-test
         run: bash scripts/security-scan.sh --self-test
+
+  # Issue #615 (N23): an ADVISORY nudge on binary size and build cost, same
+  # shape as the security scan above -- `continue-on-error: true` so it can
+  # never fail a PR, PR-only since it needs a base commit to diff against.
+  # Debug-only (`ZIRV_BENCH_SKIP_RELEASE=1`): the full release measurement is
+  # a from-scratch LTO/codegen-units=1 build of TWO refs, which is too slow
+  # to run on every PR without materially slowing the merge queue -- see
+  # docs/benchmarks/build-cost.md for the reasoning and for how to run the
+  # release half by hand when a change is expected to move it (a large new
+  # dependency, a new provider transport, a new native tool). The recorded
+  # thresholds and this machine's own actual measurements are also there.
+  build-cost:
+    name: Advisory Build Cost
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run advisory build-cost scan
+        env:
+          ZIRV_BENCH_SKIP_RELEASE: "1"
+        run: |
+          bash scripts/bench-build-cost.sh "origin/${{ github.base_ref }}" HEAD \
+            >> "$GITHUB_STEP_SUMMARY"
