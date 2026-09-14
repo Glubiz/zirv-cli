@@ -1220,6 +1220,8 @@ pub struct Parent<'a> {
     /// running outside any seat -- which is not fenced, exactly as
     /// `seat::fence` leaves an unseated process alone.
     pub generation: Option<u64>,
+    /// The caller already holds this generation's seat lock across the whole effect.
+    pub generation_locked: bool,
 }
 
 /// Registers one delegation and starts its worker, in that order.
@@ -1320,7 +1322,7 @@ pub fn delegate(
         );
     };
     let launched = match parent.generation {
-        Some(generation) => {
+        Some(generation) if !parent.generation_locked => {
             super::coordinator::update_fenced(state, repo, parent.short, generation, |graph| {
                 let launched = record_launch(
                     state,
@@ -1332,6 +1334,12 @@ pub fn delegate(
                 dispatch(graph);
                 Ok(launched)
             })?
+        }
+        Some(_) => {
+            let launched =
+                record_launch(state, repo, handle, parent.session.map(str::to_string), now)?;
+            super::coordinator::update(state, repo, |graph| dispatch(graph))?;
+            launched
         }
         None => {
             let launched =
@@ -1362,9 +1370,10 @@ pub fn delegate(
         }
     };
 
-    let launch_guard = match parent.generation {
-        Some(generation) => super::seat::lock_generation(state, parent.short, generation)?,
-        None => None,
+    let launch_guard = match (parent.generation, parent.generation_locked) {
+        (_, true) => None,
+        (Some(generation), false) => super::seat::lock_generation(state, parent.short, generation)?,
+        (None, false) => None,
     };
     let watcher_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher = {
@@ -2230,6 +2239,7 @@ mod tests {
             role: super::super::team::COORDINATOR,
             depth: 2,
             generation: None,
+            generation_locked: false,
         }
     }
 
