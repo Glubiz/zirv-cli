@@ -287,6 +287,14 @@ resolves the route, builds the adapter and runs the loop to a structured
 final status. `--runtime`/`--route`/`--role` are flags on an existing verb,
 so no `## Commands` row changes.
 
+N16 (#485) adds one more native tool with #541 chunk C: `team_plan`
+(coordinator/sub-orchestrator seats only) runs the same deterministic
+`workflow::team::compile`/`compile_explicit` chunk B's `workflow team plan`
+CLI verb already runs and persists the result. It calls no model -- the same
+"registry entry under `runtime::tools`, not a command verb and not a
+model-calling call site" treatment N14's thirteen capability tools and N15's
+four workflow tools get, so it adds no row to either table above.
+
 Issue #617 (N01 follow-up) closed the gap that let a documented row go
 stale without detection: `ZCHK-RUNTIME-INVENTORY` no longer only confirms
 the rows already written above, it independently *rediscovers* production
