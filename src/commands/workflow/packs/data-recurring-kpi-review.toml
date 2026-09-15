@@ -1,0 +1,73 @@
+# Built-in workflow pack: data-recurring-kpi-review (issue #542 chunk 5). A
+# routine, recurring KPI check: collect metrics -> compare to baseline ->
+# flag deviations proportionally -> summary. A live metrics/BI integration is
+# #539's typed tool, not yet available: collect-metrics declares that gap in
+# its own reason and gates explicitly rather than inventing values.
+schema_version = 1
+id = "data-recurring-kpi-review"
+version = 1
+title = "Recurring KPI review"
+description = "Collect KPI values, compare against baseline/thresholds, and flag deviations proportionally."
+domains = ["data"]
+triggers = ["kpi review", "recurring kpi", "kpi check", "weekly kpi review", "review the kpis"]
+effects = "none"
+
+[[inputs]]
+name = "kpi-set"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "kpi-summary"
+kind = "report"
+
+[[steps]]
+id = "collect-metrics"
+title = "Collect metrics"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "data-analyst"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "requires a live metrics/BI integration (#539) for automatic pulls; without it, this step collects an offline artifact from the operator and says so explicitly rather than inventing values"
+
+[[steps]]
+id = "compare-baseline"
+title = "Compare against baseline"
+phase = "implement"
+skills = ["implement"]
+agent_role = "data-analyst"
+depends_on = ["collect-metrics"]
+condition = "always"
+
+[[steps]]
+id = "flag-deviations"
+title = "Flag deviations"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["compare-baseline"]
+condition = { risk-at-least = "medium" }
+reason = "a routine, on-baseline KPI check does not need an extra validation pass; a flagged deviation does"
+
+[[steps]]
+id = "kpi-summary"
+title = "KPI summary"
+phase = "present"
+skills = ["verify"]
+depends_on = ["compare-baseline", "flag-deviations"]
+condition = "always"
+
+[gates]
+approval = ["collect-metrics"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["kpi-summary"]
+present_as = "summary"

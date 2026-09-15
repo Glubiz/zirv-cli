@@ -1,0 +1,65 @@
+# Built-in workflow pack: pm-status-report (issue #542 chunk 4). Source
+# collection -> variance/blockers/decisions -> audience-specific update.
+# Linear is #539's typed tool, not yet available: source collection declares
+# that gap in its own reason and gates explicitly rather than inventing
+# status (see `a_pack_needing_a_missing_integration_stops_at_an_explicit_
+# gate`).
+schema_version = 1
+id = "pm-status-report"
+version = 1
+title = "Status report"
+description = "Collect sources, assess variance/blockers/decisions, and produce an audience-specific status update."
+domains = ["pm"]
+triggers = ["status report", "sprint update", "project status", "stakeholder update"]
+effects = "none"
+
+[[inputs]]
+name = "audience"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "update"
+kind = "report"
+
+[[steps]]
+id = "source-collection"
+title = "Collect sources"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "planner"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "requires a Linear integration (#539) for live source data; without it, this step collects an offline artifact from the operator and says so explicitly rather than inventing status"
+
+[[steps]]
+id = "variance-analysis"
+title = "Variance, blockers and decisions"
+phase = "implement"
+skills = ["implement"]
+agent_role = "planner"
+depends_on = ["source-collection"]
+condition = "always"
+
+[[steps]]
+id = "audience-update"
+title = "Audience-specific update"
+phase = "present"
+skills = ["verify"]
+depends_on = ["variance-analysis"]
+condition = "always"
+
+[gates]
+approval = ["source-collection"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["update"]
+present_as = "summary"

@@ -1,0 +1,90 @@
+# Built-in workflow pack: sre-postmortem (issue #542 chunk 5). Timeline ->
+# root cause -> contributing factors -> corrective actions -> independent
+# review -> the postmortem. An incident or postmortem pack never mutates.
+schema_version = 1
+id = "sre-postmortem"
+version = 1
+title = "Postmortem"
+description = "Record an incident timeline, root cause, contributing factors and corrective actions, with independent review."
+domains = ["sre"]
+triggers = ["postmortem", "post-mortem", "incident postmortem", "write a postmortem", "retro on the incident"]
+effects = "none"
+
+[[inputs]]
+name = "incident"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "postmortem"
+kind = "report"
+
+[[steps]]
+id = "timeline"
+title = "Incident timeline"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "devops-sre"
+artifact = "intent"
+approval = true
+condition = "always"
+
+[[steps]]
+id = "root-cause"
+title = "Root-cause analysis"
+phase = "debug"
+skills = ["systematic-debugging"]
+agent_role = "devops-sre"
+depends_on = ["timeline"]
+condition = "always"
+
+[[steps]]
+id = "contributing-factors"
+title = "Contributing factors"
+phase = "implement"
+skills = ["implement"]
+agent_role = "devops-sre"
+depends_on = ["root-cause"]
+condition = "always"
+
+[[steps]]
+id = "corrective-actions"
+title = "Corrective actions"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "devops-sre"
+depends_on = ["contributing-factors"]
+condition = "always"
+
+[[steps]]
+id = "independent-review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["corrective-actions"]
+condition = "always"
+reason = "a postmortem's corrective actions always get an independent read before circulation -- an incident or postmortem pack never mutates production itself"
+
+[[steps]]
+id = "postmortem"
+title = "Postmortem"
+phase = "present"
+skills = ["verify"]
+depends_on = ["corrective-actions", "independent-review"]
+condition = "always"
+
+[gates]
+approval = ["timeline"]
+independent_review = ["independent-review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["postmortem"]
+present_as = "report"

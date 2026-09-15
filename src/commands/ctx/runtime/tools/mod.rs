@@ -42,7 +42,7 @@ use self::team::{
     CardFilter, GroupCreateArgs, GroupStatusArgs, TaskCreateArgs, TaskIdArgs, TaskListArgs,
     TeamPlanArgs,
 };
-use self::workflow::{WorkflowAdvanceArgs, WorkflowLookupArgs};
+use self::workflow::{WorkflowAdvanceArgs, WorkflowLookupArgs, WorkflowStartArgs};
 use super::capabilities::{CapabilityError, CapabilityServices};
 use super::enforcement::{
     ApprovalGrant, ApprovalRequest, Authorization, BrokerError, ExecutionAction, ExecutionBroker,
@@ -192,6 +192,8 @@ pub const WORKFLOW_STATUS: &str = "workflow_status";
 pub const WORKFLOW_CONTEXT: &str = "workflow_context";
 pub const WORKFLOW_ADVANCE: &str = "workflow_advance";
 pub const WORKFLOW_APPROVE: &str = "workflow_approve";
+pub const WORKFLOW_LIST: &str = "workflow_list";
+pub const WORKFLOW_START: &str = "workflow_start";
 pub use team::{
     GROUP_CREATE, GROUP_STATUS, OBJECTIVE_STATUS, TASK_CLAIM, TASK_CREATE, TASK_LIST, TEAM_PLAN,
     TEAM_STATUS,
@@ -457,6 +459,8 @@ impl ToolRegistry {
             WORKFLOW_CONTEXT => parse!(WorkflowContext, WorkflowLookupArgs),
             WORKFLOW_ADVANCE => parse!(WorkflowAdvance, WorkflowAdvanceArgs),
             WORKFLOW_APPROVE => parse!(WorkflowApprove, WorkflowLookupArgs),
+            WORKFLOW_LIST => parse!(WorkflowList, EmptyArgs),
+            WORKFLOW_START => parse!(WorkflowStart, WorkflowStartArgs),
             TASK_CREATE => parse!(TaskCreate, TaskCreateArgs),
             TASK_CLAIM => parse!(TaskClaim, TaskIdArgs),
             TASK_LIST => parse!(TaskList, TaskListArgs),
@@ -587,6 +591,8 @@ enum ParsedTool {
     WorkflowContext(WorkflowLookupArgs),
     WorkflowAdvance(WorkflowAdvanceArgs),
     WorkflowApprove(WorkflowLookupArgs),
+    WorkflowList(EmptyArgs),
+    WorkflowStart(WorkflowStartArgs),
     TaskCreate(TaskCreateArgs),
     TaskClaim(TaskIdArgs),
     TaskList(TaskListArgs),
@@ -738,6 +744,11 @@ impl ParsedTool {
             | Self::WorkflowContext(args)
             | Self::WorkflowApprove(args) => workflow_id(args.id.as_deref()),
             Self::WorkflowAdvance(args) => workflow_id(args.id.as_deref()),
+            Self::WorkflowList(_) => Ok(()),
+            Self::WorkflowStart(args) => {
+                workflow_id(args.id.as_deref())?;
+                non_empty(&args.task, "task")
+            }
             // Issue #485: ids that name a durable record are validated here,
             // at the boundary, rather than left for the store to reject.
             Self::TaskCreate(args) => args.validate(),
@@ -1001,6 +1012,24 @@ impl ParsedTool {
                 key: args.id.clone(),
                 write: true,
             },
+            // Issue #542 chunk 3b: listing the registry is inert, exactly
+            // like reading a workflow's own status; starting one WRITES the
+            // shared workflow store (a new durable id, the active pointer)
+            // the same way advance/approve do.
+            Self::WorkflowList(_) => ExecutionAction::Knowledge {
+                service: "workflow".into(),
+                operation: "list".into(),
+                scope: Some("shared".into()),
+                key: None,
+                write: false,
+            },
+            Self::WorkflowStart(args) => ExecutionAction::Knowledge {
+                service: "workflow".into(),
+                operation: "start".into(),
+                scope: Some("shared".into()),
+                key: args.id.clone(),
+                write: true,
+            },
             // Issue #485: the task, group, objective and coordinator stores
             // are shared state on exactly the same footing as the workflow
             // store above. Minting a card, taking a claim and opening a work
@@ -1093,6 +1122,7 @@ impl ParsedTool {
             | Self::McpDescribe(_)
             | Self::WorkflowStatus(_)
             | Self::WorkflowContext(_)
+            | Self::WorkflowList(_)
             // Reading a card index, a group's terms, the objective or the
             // coordinator's own graph changes nothing.
             | Self::TaskList(_)
@@ -1115,8 +1145,10 @@ impl ParsedTool {
             Self::WorkflowAdvance(_) | Self::WorkflowApprove(_) => RetryPolicy::Reconcile,
             // A blind repeat would mint a SECOND card or a SECOND work group,
             // and a repeated claim has to be read against the claim that is
-            // already held rather than taken again.
-            Self::TaskCreate(_) | Self::TaskClaim(_) | Self::GroupCreate(_) => {
+            // already held rather than taken again. A repeated
+            // workflow_start is the same shape: it would start a SECOND
+            // workflow, not resume the first.
+            Self::TaskCreate(_) | Self::TaskClaim(_) | Self::GroupCreate(_) | Self::WorkflowStart(_) => {
                 RetryPolicy::Reconcile
             }
             // Deterministic given the same inputs, but the workflow/
@@ -1850,6 +1882,8 @@ impl NativeToolClient {
             ParsedTool::WorkflowContext(args) => self.workflow_context(args.id.as_deref()),
             ParsedTool::WorkflowAdvance(args) => self.workflow_advance(&args),
             ParsedTool::WorkflowApprove(args) => self.workflow_approve(args.id.as_deref()),
+            ParsedTool::WorkflowList(_) => self.workflow_list(),
+            ParsedTool::WorkflowStart(args) => self.workflow_start(&args),
             ParsedTool::TaskCreate(args) => self.task_create(&args),
             ParsedTool::TaskClaim(args) => self.task_claim(&args),
             ParsedTool::TaskList(args) => self.task_list(&args),
@@ -2690,6 +2724,71 @@ impl NativeToolClient {
             "status": format!("{:?}", approved.status),
             "step": approved.current().map(|step| step.id.clone()),
         }))
+    }
+
+    /// Issue #542 chunk 3b: the layered, trust-checked registry for this
+    /// session's own repository -- shared by `workflow_list` and
+    /// `workflow_start`, the same construction `zirv workflow list|show|
+    /// start` uses (`workflow::engine::load_workflow_registry`).
+    fn workflow_registry(
+        &self,
+    ) -> Result<crate::commands::workflow::registry::WorkflowRegistry, ToolError> {
+        use crate::commands::workflow::{registry::WorkflowRegistry, skill::SkillRegistry};
+
+        let home = crate::utils::home_dir().ok();
+        let skills = SkillRegistry::load_for_repo(&self.repo, home.as_deref(), true)
+            .map_err(ToolError::external)?;
+        WorkflowRegistry::load_for_repo(&self.repo, home.as_deref(), true, &skills)
+            .map_err(ToolError::external)
+    }
+
+    /// Returns the EXACT same JSON shape `zirv workflow list --json` prints
+    /// (a JSON array of the registry's `RegisteredWorkflow` entries) -- a
+    /// native session and a headless caller must see one registry, not two
+    /// independently-shaped views of it (issue #542 chunk 3b decision 4).
+    fn workflow_list(&self) -> Result<Value, ToolError> {
+        let registry = self.workflow_registry()?;
+        serde_json::to_value(registry.list().collect::<Vec<_>>()).map_err(ToolError::external)
+    }
+
+    /// Starts a workflow through the EXACT same `workflow::engine::
+    /// start_workflow` the CLI's `Start` handler calls -- omitting `id`
+    /// selects one deterministically (`selection::select_definition`)
+    /// against `task`, exactly like `zirv workflow start` with no id.
+    /// Shared-scope WRITE: the broker requires a live writer permit for
+    /// this session's own worktree (`action()`, above), the same posture
+    /// `workflow_advance`/`workflow_approve` already have.
+    fn workflow_start(&self, args: &WorkflowStartArgs) -> Result<Value, ToolError> {
+        use crate::commands::workflow::engine;
+
+        let start_args = engine::StartArgs {
+            id: args.id.clone(),
+            task: args.task.clone(),
+            agent: None,
+            built_in_only: false,
+            repo: Some(self.repo.clone()),
+            paths: Vec::new(),
+            changed_lines: None,
+            tests_changed: false,
+            complexity: None,
+            risk: None,
+            branch: None,
+            frontend_root: None,
+            brainstorm: false,
+            no_brainstorm: false,
+            profile: None,
+            json: true,
+        };
+        let outcome =
+            engine::start_workflow(&self.state, &start_args).map_err(ToolError::external)?;
+        let mut value = serde_json::to_value(&outcome.state).map_err(ToolError::external)?;
+        if let (Some(selection), Value::Object(map)) = (&outcome.selection, &mut value) {
+            map.insert(
+                "selection".into(),
+                serde_json::to_value(selection).map_err(ToolError::external)?,
+            );
+        }
+        Ok(value)
     }
 
     fn list_mcp(&mut self, server: Option<&str>) -> Result<Value, ToolError> {
@@ -3694,6 +3793,34 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &[ResourceClaimKind::WorktreeWrite],
             (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
         ),
+        // Issue #542 chunk 3b: the layered workflow-definition registry is
+        // read-only to list; starting a workflow writes the shared store
+        // (a new durable id, the active pointer) exactly like advance/
+        // approve above.
+        definition(
+            WORKFLOW_LIST,
+            "List every registered workflow definition pack (built-in, operator-global, and enabled repository packs), with layer, version, hash and domains.",
+            object_schema(&[], json!({})),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::ReadRoot],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            WORKFLOW_START,
+            "Start a new workflow. Omit id to select one deterministically from the task text and classification; an explicit id always wins outright.",
+            object_schema(
+                &["task"],
+                json!({
+                    "id":{"type":"string","minLength":1},
+                    "task":{"type":"string","minLength":1}
+                }),
+            ),
+            &write_caps,
+            ToolExecutionMode::Immediate,
+            &[ResourceClaimKind::WorktreeWrite],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
         // Issue #485 (roadmap N16): the coordinator's own services. Each is a
         // thin adaptor over the same `ctx::task`/`ctx::group`/`ctx::objective`
         // function the CLI verb calls; the three that mutate shared state
@@ -3880,11 +4007,12 @@ mod tests {
     use super::*;
 
     /// 16 coding/knowledge tools (#474-#475), the 7 delegation tools
-    /// (#479), the 13 capability tools (#483), the 4 workflow tools (#484)
-    /// and the 7 team tools (#485). Asserted as a number on purpose: a tool
-    /// added without a deliberate decision here is a tool the model was
-    /// handed silently.
-    const NATIVE_TOOL_COUNT: usize = 48;
+    /// (#479), the 13 capability tools (#483), the 6 workflow tools (#484,
+    /// plus `workflow_list`/`workflow_start` from issue #542) and the 8
+    /// team tools (#485, plus `team_plan` from issue #541). Asserted as a
+    /// number on purpose: a tool added without a deliberate decision here
+    /// is a tool the model was handed silently.
+    const NATIVE_TOOL_COUNT: usize = 50;
 
     #[test]
     fn registry_names_are_unique_and_schemas_are_closed_objects() {
@@ -4777,6 +4905,92 @@ mod tests {
             .parse(WORKFLOW_STATUS, json!({"id":"../other"}))
             .expect_err("a workflow id may not escape the store");
         assert_eq!(bad_id.code, ToolErrorCode::InvalidArguments);
+    }
+
+    /// Issue #542 chunk 3b: `workflow_start` mints a new durable workflow --
+    /// the same shared-scope WRITE posture as `workflow_advance`/
+    /// `workflow_approve` above, refused before the engine is ever reached
+    /// when this session holds no writer permit for its own worktree.
+    #[test]
+    fn workflow_start_tool_requires_a_writer_permit() {
+        let mut fixture = delegation_fixture(0);
+        let refused = call(
+            &mut fixture.client,
+            WORKFLOW_START,
+            json!({"task": "fix a bug in the retry loop"}),
+        );
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.clone()),
+            Some(ToolErrorCode::ResourceBusy),
+            "starting a workflow without a writer permit must be refused BEFORE the engine is reached: {refused:?}"
+        );
+    }
+
+    /// Issue #542 chunk 3b decision 4: a native session and a headless
+    /// caller must see one registry and one workflow-start result, not two
+    /// independently-shaped views of them.
+    #[test]
+    fn workflow_list_and_start_tools_match_the_headless_json() {
+        let mut fixture = fixture_with(0, "implementer", true);
+        // workflow_start classifies through git when the args declare no
+        // explicit change surface, so the fixture repo needs a real commit.
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&fixture.repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(fixture.repo.join("README.md"), "hello\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let listed = call(&mut fixture.client, WORKFLOW_LIST, json!({}));
+        assert!(listed.error.is_none(), "{listed:?}");
+        let tool_list = result_of(&listed).clone();
+
+        let skills = crate::commands::workflow::skill::SkillRegistry::load_for_repo(
+            &fixture.repo,
+            None,
+            true,
+        )
+        .expect("skills");
+        let headless_registry =
+            crate::commands::workflow::registry::WorkflowRegistry::load_for_repo(
+                &fixture.repo,
+                None,
+                true,
+                &skills,
+            )
+            .expect("registry");
+        let headless_list =
+            serde_json::to_value(headless_registry.list().collect::<Vec<_>>()).expect("json");
+        assert_eq!(tool_list, headless_list);
+
+        let started = call(
+            &mut fixture.client,
+            WORKFLOW_START,
+            json!({"id": "bugfix", "task": "fix the retry loop"}),
+        );
+        assert!(started.error.is_none(), "{started:?}");
+        let tool_state = result_of(&started).clone();
+        let id = tool_state["id"].as_str().expect("workflow id").to_string();
+
+        let headless_state =
+            crate::commands::workflow::engine::load(&fixture.state, &fixture.repo, &id)
+                .expect("headless load");
+        let headless_value = serde_json::to_value(&headless_state).expect("json");
+        assert_eq!(tool_state, headless_value);
     }
 
     // -- the team tools (issue #485, roadmap N16) -------------------------

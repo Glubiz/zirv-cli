@@ -17,6 +17,7 @@ pub mod artifact;
 pub mod capability;
 pub mod checks;
 pub mod classify;
+pub mod definition;
 pub mod deploy;
 pub mod engine;
 pub mod frontend;
@@ -24,7 +25,9 @@ pub mod frontend_detector;
 pub mod frontend_render;
 pub mod maintain;
 pub mod profile;
+pub mod registry;
 pub mod review;
+pub mod selection;
 pub mod skill;
 pub mod team;
 pub mod telemetry;
@@ -84,6 +87,14 @@ pub(crate) struct RepoGates {
     pub checks: bool,
     pub skills: bool,
     pub agents: bool,
+    /// Operator-owned `[workflow] repo_workflows_enabled` (REPO_FORBIDDEN,
+    /// off by default, issue #542) -- whether untrusted repository-provided
+    /// `.zirv/workflows/` definition packs are loaded at all. Off by default,
+    /// same posture as `agents`: a checkout may propose a new pack only
+    /// after the operator explicitly enables this layer, and even then may
+    /// never replace a trusted built-in/operator id or widen authority --
+    /// see `registry::WorkflowRegistry`.
+    pub workflows: bool,
     /// Operator-owned `[workflow] check_env_passthrough` (REPO_FORBIDDEN,
     /// `~/.zirv/ctx.toml`/`ZIRV_CTX_*` only) -- extra environment variable
     /// names ADDED to `verification::DEFAULT_CHECK_ENV_PASSTHROUGH` when a
@@ -125,6 +136,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
             checks: cfg.workflow.repo_checks_enabled,
             skills: cfg.workflow.repo_skills_enabled,
             agents: cfg.workflow.repo_agents_enabled,
+            workflows: cfg.workflow.repo_workflows_enabled,
             check_env_passthrough: cfg.workflow.check_env_passthrough,
             allow_empty_verify: cfg.workflow.allow_empty_verify,
             builtin_checks_exclude: cfg.workflow.builtin_checks_exclude,
@@ -135,6 +147,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
                 checks: false,
                 skills: false,
                 agents: false,
+                workflows: false,
                 check_env_passthrough: Vec::new(),
                 allow_empty_verify: false,
                 builtin_checks_exclude: Vec::new(),

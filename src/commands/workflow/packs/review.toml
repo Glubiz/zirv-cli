@@ -1,0 +1,73 @@
+# Built-in workflow pack: review. Declarative reproduction of the legacy
+# WorkflowKind::Review literal in engine.rs (issue #542, chunks 1+2).
+schema_version = 1
+id = "review"
+version = 1
+title = "Review"
+description = "Independent review with inspectable disposition."
+domains = ["software"]
+triggers = ["review this", "independent review", "second opinion on this diff"]
+effects = "none"
+idempotency = "review findings are keyed by the diff fingerprint they were raised against; re-running review after a crash reconciles rather than duplicates them"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "disposition"
+kind = "report"
+
+[[steps]]
+id = "review"
+title = "Review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+capabilities = ["repo.read"]
+condition = "always"
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+capabilities = ["test.run"]
+depends_on = ["review"]
+condition = { risk-at-least = "high" }
+reason = "high risk gets a final evidence check after review disposes its findings"
+
+# Frontend domain variants (issue #542 chunk 3a) -- see feature.toml's own
+# comment on this section for the mechanism.
+[[steps]]
+id = "review-frontend"
+title = "Review (frontend)"
+phase = "review"
+skills = ["frontend-review"]
+agent_role = "reviewer"
+domains = ["frontend"]
+overrides_step = "review"
+
+[[steps]]
+id = "verify-frontend"
+title = "Verify (frontend)"
+phase = "verify"
+skills = ["frontend-verify"]
+domains = ["frontend"]
+overrides_step = "verify"
+
+[gates]
+independent_review = ["review"]
+validation = ["verify"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["disposition"]
+present_as = "report"

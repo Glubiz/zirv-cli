@@ -1,0 +1,68 @@
+# Built-in workflow pack: data-quality-investigation (issue #542 chunk 4).
+schema_version = 1
+id = "data-quality-investigation"
+version = 1
+title = "Data quality investigation"
+description = "Investigate a suspected data-quality or integrity issue with reproducible evidence and independent validation."
+domains = ["data"]
+triggers = ["data quality", "investigate data quality", "data integrity issue", "suspicious data"]
+effects = "none"
+
+[[inputs]]
+name = "symptom"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "findings"
+kind = "report"
+
+[[steps]]
+id = "scope"
+title = "Scope the investigation"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = "always"
+
+[[steps]]
+id = "investigation"
+title = "Investigate"
+phase = "implement"
+skills = ["implement"]
+agent_role = "data-analyst"
+depends_on = ["scope"]
+condition = "always"
+
+[[steps]]
+id = "validation"
+title = "Independent validation"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["investigation"]
+condition = "always"
+
+[[steps]]
+id = "findings"
+title = "Findings"
+phase = "present"
+skills = ["verify"]
+depends_on = ["investigation", "validation"]
+condition = "always"
+
+[gates]
+approval = ["scope"]
+independent_review = ["validation"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["findings"]
+present_as = "report"

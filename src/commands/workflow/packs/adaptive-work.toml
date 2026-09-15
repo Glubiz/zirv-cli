@@ -1,0 +1,72 @@
+# Built-in workflow pack: adaptive-work. The generic proportional fallback
+# for a task that matches no specialized pack (issue #542 chunk 3b,
+# architecture §3) -- understand -> plan (if warranted) -> execute ->
+# validate (if warranted) -> present. Never a competitor in
+# `selection::select_definition`'s scoring (see that module's own doc
+# comment): this is the answer only when nothing else clears the floor.
+schema_version = 1
+id = "adaptive-work"
+version = 1
+title = "Adaptive work"
+description = "Generic proportional fallback: understand, plan if warranted, execute, validate if warranted, present."
+domains = []
+triggers = []
+effects = "none"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "result"
+kind = "report"
+
+[[steps]]
+id = "understand"
+title = "Understand"
+phase = "intent"
+skills = ["write-intent"]
+condition = "always"
+
+[[steps]]
+id = "plan"
+title = "Plan if needed"
+phase = "plan"
+skills = ["plan"]
+depends_on = ["understand"]
+condition = { complexity-at-least = "bounded" }
+reason = "bounded-or-larger work gets an ordered plan; a trivial task does not need one"
+
+[[steps]]
+id = "execute"
+title = "Execute"
+phase = "implement"
+skills = ["implement"]
+depends_on = ["understand", "plan"]
+condition = "always"
+
+[[steps]]
+id = "validate"
+title = "Validate"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["execute"]
+condition = { complexity-or-risk = { complexity = "bounded", risk = "medium" } }
+reason = "bounded-or-riskier work gets an independent validation pass before presenting"
+
+[[steps]]
+id = "present"
+title = "Present"
+phase = "present"
+skills = ["verify"]
+depends_on = ["execute", "validate"]
+condition = "always"
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["result"]
+present_as = "summary"

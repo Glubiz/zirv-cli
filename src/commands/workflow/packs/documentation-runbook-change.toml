@@ -1,0 +1,86 @@
+# Built-in workflow pack: documentation-runbook-change (issue #542 chunk 5).
+# A small wording fix stays lightweight; a substantial rewrite gets an
+# explicit intent, and a runbook change always gets a risk-scaled
+# independent review since a runbook error can mislead an on-call responder
+# during a real incident.
+schema_version = 1
+id = "documentation-runbook-change"
+version = 1
+title = "Documentation/runbook change"
+description = "Change documentation or an operational runbook proportionally, with a risk-scaled independent review."
+domains = ["software"]
+triggers = ["documentation change", "update the docs", "runbook change", "update the runbook", "docs update"]
+effects = "repository"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change"
+kind = "patch"
+
+[[steps]]
+id = "intent"
+title = "Capture intent"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = { complexity-or-risk = { complexity = "bounded", risk = "medium" } }
+effect = "repository"
+reason = "a substantial documentation/runbook rewrite gets an explicit intent; a small wording fix does not need the extra ceremony"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+phase = "implement"
+skills = ["implement"]
+agent_role = "doc-keeper"
+depends_on = ["intent"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["implement"]
+condition = { risk-at-least = "medium" }
+reason = "a runbook error can mislead an on-call responder during a real incident -- risk-scaled independent review, not skipped by complexity alone"
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["implement", "review"]
+condition = "always"
+
+[[steps]]
+id = "deploy"
+title = "Finish branch"
+phase = "deploy"
+skills = ["finish-branch"]
+depends_on = ["verify"]
+condition = "always"
+effect = "repository"
+
+[gates]
+approval = ["intent"]
+validation = ["verify"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change"]
+present_as = "patch"

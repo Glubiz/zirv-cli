@@ -1,0 +1,82 @@
+# Built-in workflow pack: pm-risk-review (issue #542 chunk 5). Identify
+# risks -> assess likelihood/impact -> mitigation options -> reviewed risk
+# register.
+schema_version = 1
+id = "pm-risk-review"
+version = 1
+title = "Risk review"
+description = "Identify risks, assess likelihood and impact, propose mitigations, and produce a reviewed risk register."
+domains = ["pm"]
+triggers = ["risk review", "project risk review", "risk register", "identify risks", "review project risks"]
+effects = "none"
+
+[[inputs]]
+name = "scope"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "risk-register"
+kind = "report"
+
+[[steps]]
+id = "identify-risks"
+title = "Identify risks"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "planner"
+artifact = "intent"
+approval = true
+condition = "always"
+
+[[steps]]
+id = "assess-risks"
+title = "Assess likelihood and impact"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "planner"
+depends_on = ["identify-risks"]
+condition = "always"
+reason = "each risk gets an explicit likelihood/impact assessment before mitigation options are proposed"
+
+[[steps]]
+id = "mitigation-options"
+title = "Mitigation options"
+phase = "implement"
+skills = ["implement"]
+agent_role = "planner"
+depends_on = ["assess-risks"]
+condition = "always"
+
+[[steps]]
+id = "independent-review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["mitigation-options"]
+condition = { risk-at-least = "medium" }
+reason = "a high-risk register gets an independent read before it is circulated; a low-risk one does not need the extra seat"
+
+[[steps]]
+id = "register"
+title = "Risk register"
+phase = "present"
+skills = ["verify"]
+depends_on = ["mitigation-options", "independent-review"]
+condition = "always"
+
+[gates]
+approval = ["identify-risks"]
+independent_review = ["independent-review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["risk-register"]
+present_as = "report"

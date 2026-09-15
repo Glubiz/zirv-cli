@@ -1,0 +1,93 @@
+# Built-in workflow pack: devops-infrastructure-change (issue #542 chunk 5).
+# Read-only scope/plan/precondition checks first; any actual mutation needs
+# the typed cloud-ops tooling from #539, not yet available, so this workflow
+# stops at an explicit operator approval rather than applying a change
+# through raw/untyped access. `effects = "external"` is the pack's declared
+# ceiling for the day #539 lands, not a claim that this version mutates
+# anything today -- every step below stays `effect = "none"` (the default),
+# proven by `an_external_effects_pack_stays_read_only_until_its_gate`.
+schema_version = 1
+id = "devops-infrastructure-change"
+version = 1
+title = "Infrastructure change"
+description = "Scope and plan an infrastructure change with read-only precondition checks, stopping at an explicit gate before any mutation."
+domains = ["devops"]
+triggers = ["infrastructure change", "change the infrastructure", "terraform change", "provision infrastructure", "infra change"]
+effects = "external"
+idempotency = "each apply step re-checks the live infrastructure state before acting and records a receipt, so a resumed run after a crash reconciles instead of blindly re-applying"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change-receipt"
+kind = "report"
+
+[[steps]]
+id = "scope"
+title = "Scope the change"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "devops-sre"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "every infrastructure change starts from an explicit, reviewable statement of scope and blast radius"
+
+[[steps]]
+id = "plan"
+title = "Plan"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "devops-sre"
+artifact = "plan"
+approval = true
+depends_on = ["scope"]
+condition = "always"
+reason = "a scoped, reviewable plan is required before any external mutation is attempted"
+
+[[steps]]
+id = "preconditions"
+title = "Precondition checks"
+phase = "verify"
+skills = ["verify"]
+agent_role = "devops-sre"
+depends_on = ["plan"]
+condition = "always"
+reason = "read-only precondition checks against the live infrastructure state, before any mutation"
+
+[[steps]]
+id = "apply-gate"
+title = "Apply gate"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["preconditions"]
+approval = true
+condition = "always"
+reason = "requires the typed cloud-ops tooling from #539, not yet available; this workflow stops at an explicit operator approval rather than applying the change through raw/untyped access"
+
+[[steps]]
+id = "receipt"
+title = "Change receipt"
+phase = "present"
+skills = ["verify"]
+depends_on = ["apply-gate"]
+condition = "always"
+
+[gates]
+approval = ["scope", "plan", "apply-gate"]
+validation = ["preconditions"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change-receipt"]
+present_as = "report"
