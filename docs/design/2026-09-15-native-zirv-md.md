@@ -317,3 +317,155 @@ to "switch provider and route every request through it" is compiled in.
   neither, so no row was required, and the check already passes.
 - Migration tooling and native runtime inventory doc changes remain chunk
   C's, unchanged from chunk A's own Deferred section above.
+
+Every item in this list was closed in chunk C below, except where chunk C's
+own text says otherwise.
+
+---
+
+# Chunk C: finish the wiring, typed touched paths, migration command
+
+**Date:** 2026-09-15 · **Issue:** #538 (chunk C of 3) · **Roadmap:** #469
+
+## Context
+
+Chunk B built three real mechanisms (`recompile_instructions_if_changed`,
+typed-touched-path tracking, the `/context` render function) but left every
+one of them unwired from a live production call site -- a tested method
+nothing calls is not the same as the feature working. This chunk closes
+exactly those three gaps, replaces the touched-path heuristic with real
+per-tool typed extraction, and adds the migration command (`zirv context
+sync --init-zirv-md`) issue #538's acceptance bullets 3 and 8 need.
+
+## Decisions
+
+**Live recompile** (decision 1). `NativeLoop::recompile_if_scope_changed`
+(new, private) runs at the top of `run_turn` -- right after minting the
+turn's own `TurnId`, before the per-request loop -- unconditionally; it is a
+no-op unless `set_recompile_context` was called. All three real production
+entry points (`run_headless`, `spawn_interactive`'s per-turn thread loop,
+`run_hosted_turns`) now call `driver.set_recompile_context(RecompileContext
+{ state, home, cfg, repo })` right after constructing their `NativeLoop`.
+`RecompileContext` is a new, small, owned (`Clone`) struct -- deliberately
+NOT new `NativeLoop` fields with a wider constructor, which would have
+touched all ~30 existing `NativeLoop::new` call sites (almost all tests) for
+no benefit; instead every existing test that never opts in is provably
+unaffected (`recompile_context: None` by construction).
+
+Reconciliation with prompt-cache stability, proven directly rather than
+argued: `an_unchanged_scope_keeps_the_stable_prefix_hash_across_turns`
+asserts `context_version()` (`stable_prefix_sha256`) and `config.preamble`
+are BYTE-IDENTICAL across three consecutive recompile checks when nothing
+changed -- the cached prefix is never rebuilt for the common case.
+`run_turn_recompiles_the_instruction_layer_automatically` is the wiring
+proof itself: it never calls `recompile_instructions_if_changed` directly,
+only `set_recompile_context` + `run_turn`, and shows a file changed between
+two real turns reaches the second turn's own compiled context. `a_changed_
+instruction_file_recompiles_before_the_next_turn` (extended) confirms the
+new prefix is what the caller actually reads afterward (`config.preamble`/
+`context_version()`), and the single call site inside `run_turn` (never
+inside the per-request retry/compaction loop) is what makes "never mutated
+mid-turn" true by construction, not by a runtime check.
+
+**Typed touched paths** (decision 2). `touched_path_argument_key` maps each
+built-in tool to its real typed argument name, read directly off the
+argument structs in `runtime/tools/files.rs`/`process.rs`: `file_read`/
+`file_write`/`apply_patch`/`directory_list` all use `path`
+(`ReadFileArgs`/`WriteFileArgs`/`ApplyPatchArgs`/`DirectoryArgs`);
+`glob_search`/`text_search` use `root` (`GlobArgs`/`SearchArgs`);
+`process_start`'s shell `cwd` (`ProcessStartArgs`) is the one non-file tool
+that still names a repository path. `execute_one` now calls `touched_path_
+from_call`, which looks up the key and pulls it out of the call's own
+`serde_json::Value` arguments -- replacing chunk B's generic `"path"` guess
+entirely. Every other tool (memory, network, MCP, workflow, process control/
+output-read by opaque id, ...) has no path-bearing argument and returns
+`None`, proven by `an_unknown_or_pathless_tool_never_widens_the_touched_
+scope` (also covering an unregistered future tool name and an empty path
+value).
+
+**Live `/context` pane** (decision 3). `NativePaneRuntime::context_view_
+facts` reads the journal's own most recent `ContextCompiled` event
+(`Journal::latest_event_of_type`, already existing) rather than re-deriving
+anything from disk -- deliberate: what shaped the LIVE session is exactly
+what was recorded when it compiled, and a fresh `resolve_active_scope_
+instructions` call could disagree if a file changed again since. This needed
+no new "minimal accessor" shared with `/status`: `NativePaneRuntime` already
+holds a live `journal: Journal` and `session_id`, so the read is a single
+existing method call. `ResolvedInstructionSource`/`SourceTrust` gained
+`Deserialize` so the journal's stored JSON round-trips back into typed rows.
+One documented simplification: the journal's `ContextCompiled` provenance
+carries path/scope/trust/decision/sha256 but no byte count, so the live
+view's `ContextViewSource.bytes` is `0` rather than a fresh per-file
+re-read (which would reintroduce the same "could disagree with what
+actually shaped the session" problem this decision's whole design avoids).
+`recompiled_last_turn` in the render is also simplified to "a compile has
+been recorded at all" rather than a true turn-by-turn correlation, which
+would need matching `EventScope::turn` ids across records with no cheap
+existing read for it.
+
+**Migration command** (decision 4). `zirv context sync --init-zirv-md` joins
+the existing `report`/`import`/`generate` `ArgGroup` (now four mutually
+exclusive modes). `build_zirv_md_plan` sources content from exactly three
+fixed, always-shared/committed paths -- canonical `.zirv/context/common.md`,
+root `AGENTS.md`, root `CLAUDE.md` -- so ".local"/private content is
+excluded BY CONSTRUCTION, never by a runtime filter (no `.local`-scoped
+path is ever a candidate). `is_managed` (already existing) skips a
+compatibility file that is itself zirv's own `--generate` output, so
+round-tripping never duplicates the canonical layer a second time. Secret
+screening reuses `safety::text_names_credential_material` (now `pub(crate)`)
+verbatim -- the one existing content screen this codebase has for
+credential-shaped material -- per the brief's "do not invent a new scanner";
+every skip is reported (`not included: <path> (<reason>)`), never silent.
+Idempotency and the never-without-`--force` guarantee are not reimplemented:
+`run_init_zirv_md` calls the EXISTING `generate_one` (already used by
+`--generate`) directly against the generated plan text, which already gives
+"unchanged when byte-identical", "refused when different and no reason to
+believe it's zirv's own output", and "force lifts the refusal" for free.
+`ZIRV.md` deliberately carries no `MANAGED_MARKER`: once a user hand-edits
+it, `generate_one`'s own equality check means it can never be silently
+regenerated over again. `--report`'s compatibility-link plan (a repo with
+`AGENTS.md` but neither `ZIRV.md` nor `CLAUDE.md`) prints the one-line
+`@AGENTS.md` import stanza chunk A's own dedup rule already recognises,
+alongside a pointer to `--init-zirv-md` for anyone who would rather start
+from real content.
+
+**Acceptance bullet 9 regression** (decision 5).
+`a_zirv_md_file_never_changes_the_legacy_wrapped_harness_prompt`
+(`prompt.rs`) asserts `prompt::compose`'s output is byte-identical with and
+without a `ZIRV.md` file present -- the wrapped-harness prompt composer
+reads only `.zirv/system-prompt.md` and canonical `.zirv/context/`, never
+`ZIRV.md`/`AGENTS.md`/`CLAUDE.md` (those stay drift-detection-only surfaces
+for that path), so this was already true by construction; the test makes it
+provable rather than merely argued.
+
+## Verified
+
+- `cargo build`, `cargo fmt -- --check`, `cargo clippy --all-targets -- -D
+  warnings` all clean.
+- `cargo nextest run --no-fail-fast` across `ctx::runtime::native` (86),
+  `ctx::runtime::context` (15), `ctx::runtime::journal` (24),
+  `ctx::dash::native_pane`, `ctx::dash::native_ux` (71), `ctx::context_cli`
+  (44), `ctx::optimize`: every test passed.
+- `cargo run -q -- verify --builtin`: all 10 checks pass.
+- `cargo nextest run every_repo_slug_consumer`, `scripts/check-test-presence.sh
+  --base release/native-harness`, `scripts/check-readme-features.sh`: all
+  pass.
+
+## Deferred (as of chunk C)
+
+- `run_hosted_turns`/`spawn_interactive`'s per-turn recompile is wired with
+  `state`/`cfg` clones taken at loop-construction time; a config or state
+  root change mid-session (extremely rare, no existing mechanism changes
+  either live) would not be picked up without a fresh `NativeLoop`. Matches
+  every other per-session snapshot this loop already takes (route, limits,
+  workflow policy).
+- Full `ExecutionAction`-typed resolution (as opposed to typed JSON-argument
+  extraction, which is now real) remains out of scope -- the broker's
+  resolved `ExecutionAction` was not cheaply reachable from `execute_one`
+  within this chunk's scope; the current typed-argument extraction is
+  already precise per tool, not a heuristic.
+- `docs/design/native-parity.md`/`native-runtime-inventory.md`: no new rows.
+  `--init-zirv-md` is a flag on the existing `sync` verb, not a new clap verb
+  or model-calling call site, so neither enforced inventory needed one;
+  `/context`/`/instructions` remain pane-local slash commands, not tracked
+  by either doc (confirmed `/status` is not listed there either).

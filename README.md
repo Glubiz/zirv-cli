@@ -155,6 +155,18 @@ can steer a session's prose but can never change sandboxing, approvals,
 credentials, provider/account/billing routing, tool grants, workflow policy
 floors, or settings precedence — see [Trust boundary](#trust-boundary) below.
 
+**Migration is opt-in and never destructive.** `zirv context sync
+--init-zirv-md` idempotently writes a starting `<repo>/ZIRV.md` from the
+canonical `.zirv/context/common.md` layer plus any root `AGENTS.md`/
+`CLAUDE.md` content that is not already zirv-managed; a repeat run with
+nothing changed is a no-op, and an existing `ZIRV.md` — including one you
+have since hand-edited — is never overwritten without `--force`. Content
+that looks secret-shaped is skipped and named, never copied. A repository
+with only `AGENTS.md` needs no migration at all: `zirv context sync
+--report` (the default, read-only mode) offers a one-line compatibility-link
+plan — a `ZIRV.md` containing just `@AGENTS.md` — for anyone who would rather
+link than duplicate.
+
 ### `zirv chat` and `zirv agent`
 
 `zirv chat` and `zirv agent` are shorter top-level aliases for `zirv ctx
