@@ -748,6 +748,17 @@ pub struct ContextConfig {
     /// an operator deliberately bounded, the same asymmetry as every other
     /// numeric key in this struct.
     pub lint_max_pairs: usize,
+    /// Issue #538 (chunk B): aggregate byte budget for the native
+    /// compiler's whole instruction layer -- every resolved `ZIRV.md`/
+    /// `AGENTS.md`/`CLAUDE.md`/`AGENT.md` winner for the repo root and the
+    /// active scope's ancestor chain, combined. Applied in stable order
+    /// (root first, then nested by depth) after the per-file cap
+    /// (`optimize.max_surface_bytes`, reused unchanged) already bounds any
+    /// one file: this is the ceiling on the layer as a whole, so a
+    /// monorepo with many small nested files cannot still blow the budget
+    /// through sheer count. `REPO_FORBIDDEN`, same rationale as
+    /// `max_common_bytes` above -- see `REPO_FORBIDDEN`.
+    pub instructions_max_bytes: usize,
 }
 
 impl Default for ContextConfig {
@@ -758,6 +769,7 @@ impl Default for ContextConfig {
             max_harness_roster_bytes: 4096,
             dedupe_native: true,
             lint_max_pairs: 20_000,
+            instructions_max_bytes: 32 * 1024,
         }
     }
 }
@@ -2984,6 +2996,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_CONTEXT_INSTRUCTIONS_MAX_BYTES",
+        &["context", "instructions_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS",
         &["context", "lint_max_pairs"],
         EnvKind::Int,
@@ -3867,6 +3884,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["context", "max_harness_roster_bytes"],
         "ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES",
+    ),
+    // Issue #538 (chunk B): without this a repo checkout could raise its own
+    // aggregate budget for the native compiler's whole instruction layer,
+    // making the cap decorative -- same reasoning as every byte-cap entry
+    // above.
+    (
+        &["context", "instructions_max_bytes"],
+        "ZIRV_CTX_CONTEXT_INSTRUCTIONS_MAX_BYTES",
     ),
     // Issue #275: without this a repo checkout could raise its own cap on
     // how many sentence pairs `zirv context lint`'s CTX002/CTX003 checks
@@ -11317,6 +11342,7 @@ mod tests {
         ("context", "max_harness_roster_bytes"),
         ("context", "dedupe_native"),
         ("context", "lint_max_pairs"),
+        ("context", "instructions_max_bytes"),
         ("mail", "enabled"),
         ("mail", "max_message_bytes"),
         ("mail", "max_delivered_bytes"),
