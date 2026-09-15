@@ -12,6 +12,13 @@ use super::agents::AgentRegistry;
 use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
 use super::deploy::DeployTier;
 use super::skill::{SkillRegistry, WorkflowPhase};
+// Only `mod tests` below refers to this module by its bare name (as
+// `super::team::X`, where `super` from inside `tests` is `engine`, which has
+// no `team` submodule of its own); the non-test code above always spells the
+// path from `workflow` (`super::team::X` where `super` is `workflow`)
+// directly and needs no import for it.
+#[cfg(test)]
+use super::team;
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
@@ -748,6 +755,12 @@ pub struct WorkflowState {
     /// at that moment. `None` for a workflow never closed.
     #[serde(default)]
     pub closed_at: Option<u64>,
+    /// The most recently compiled `zirv workflow team plan` for this
+    /// workflow (issue #541). `None` until `team plan` is run against it;
+    /// state persisted before this field existed defaults safely to `None`,
+    /// same as every other additive field on this struct.
+    #[serde(default)]
+    pub team_plan: Option<super::team::TeamPlan>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -806,6 +819,7 @@ impl WorkflowState {
             status,
             closed_reason: None,
             closed_at: None,
+            team_plan: None,
             created_at: now,
             updated_at: now,
         }
@@ -1171,6 +1185,16 @@ pub(crate) fn save(state_dir: &StateDir, state: &WorkflowState, active: bool) ->
         std::fs::remove_file(active_path(state_dir, &state.repo))?;
     }
     Ok(())
+}
+
+/// Persists `state` without touching the active-workflow pointer either way
+/// -- unlike [`save`], whose `active` flag can clear a DIFFERENT workflow's
+/// pointer when `false`. Issue #541: `zirv workflow team plan` annotates a
+/// (possibly non-active, explicitly `--workflow <id>`-named) workflow with a
+/// compiled `TeamPlan` and must never change which workflow is active as a
+/// side effect of doing so.
+pub(crate) fn save_preserving_active(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
+    write_state_file(state_dir, state)
 }
 
 /// Persists `state` and clears this repository's active pointer only when it
@@ -2682,6 +2706,9 @@ pub enum WorkflowSubcommand {
     Artifacts(ArtifactsArgs),
     /// Inspect provider-neutral workflow seats and their trust provenance.
     Agents(super::agents::AgentArgs),
+    /// Compile, show, and brief the proportional team for a request (issue
+    /// #541).
+    Team(super::team::TeamArgs),
     /// Approve the current gated step.
     Approve(StateIdArgs),
     /// Record a step result and transition the state machine.
@@ -2916,7 +2943,7 @@ pub struct AdvanceArgs {
     pub accept_preexisting_findings: bool,
 }
 
-fn resolve_repo(repo: Option<&Path>) -> CtxResult<PathBuf> {
+pub(crate) fn resolve_repo(repo: Option<&Path>) -> CtxResult<PathBuf> {
     Ok(match repo {
         Some(path) => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
         None => std::env::current_dir()?,
@@ -2944,7 +2971,7 @@ fn resolve_frontend_root(path: &Path) -> CtxResult<PathBuf> {
     Ok(canonical)
 }
 
-fn resolve_state() -> CtxResult<StateDir> {
+pub(crate) fn resolve_state() -> CtxResult<StateDir> {
     StateDir::resolve(&|key| std::env::var(key).ok())
 }
 
@@ -3482,7 +3509,23 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         WorkflowSubcommand::Classify(args) => {
             let value = classify::from_args(args)?;
             if args.json {
-                serde_json::to_writer_pretty(&mut *writer, &value)?;
+                #[derive(Serialize)]
+                struct ClassifyOutput<'a> {
+                    #[serde(flatten)]
+                    classification: &'a Classification,
+                    /// Issue #541 decision 1: the minimal execution profile
+                    /// derived from this same classification, embedded
+                    /// alongside it rather than requiring a second call.
+                    profile: super::profile::ExecutionProfile,
+                }
+                let profile = super::profile::ExecutionProfile::derive(&args.task, &value);
+                serde_json::to_writer_pretty(
+                    &mut *writer,
+                    &ClassifyOutput {
+                        classification: &value,
+                        profile,
+                    },
+                )?;
                 writeln!(writer)?;
             } else {
                 writeln!(
@@ -3663,6 +3706,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         WorkflowSubcommand::Agents(args) => {
             return super::agents::run(args, writer);
+        }
+        WorkflowSubcommand::Team(args) => {
+            return super::team::run(args, writer);
         }
         WorkflowSubcommand::Artifacts(args) => {
             let repo = resolve_repo(args.repo.as_deref())?;
@@ -8498,5 +8544,175 @@ mod tests {
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .unwrap_err();
         assert!(error.to_string().contains("independent review"));
+    }
+
+    /// A committed repository with a few pending (untracked) files, so
+    /// `zirv workflow team plan`'s own undeclared classification has a real
+    /// measured diff to size a Bounded team against.
+    fn git_repo_with_pending_files(count: usize) -> tempfile::TempDir {
+        let repo = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        // All under one `src/` prefix (not scattered at the repository
+        // root), so `classify`'s cross-module signal never fires here and
+        // this stays a plain Bounded, Low-risk change regardless of
+        // `count` -- the point of this fixture is a real measured diff
+        // sized as Bounded, not an incidental risk escalation.
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        for index in 0..count {
+            std::fs::write(
+                repo.path().join(format!("src/pending-{index}.rs")),
+                "fn work() {}\n".repeat(15),
+            )
+            .unwrap();
+        }
+        repo
+    }
+
+    /// Issue #541: `zirv workflow team plan --json`'s printed plan is
+    /// exactly what got persisted onto the active workflow -- the CLI never
+    /// prints a plan different from the one a later `team show`/`team
+    /// brief` would read back.
+    #[test]
+    fn workflow_team_plan_json_matches_the_stored_plan() {
+        let repo = git_repo_with_pending_files(0);
+        let home = tempdir().unwrap();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Team(super::team::TeamArgs {
+                command: super::team::TeamCommand::Plan(super::team::TeamPlanArgs {
+                    objective: "add a small feature".into(),
+                    workflow: None,
+                    dry_run: false,
+                    seat: None,
+                    built_in_only: true,
+                    repo: Some(repo.path().to_path_buf()),
+                    json: true,
+                }),
+            }),
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out).unwrap();
+        assert_eq!(code, 0);
+        let printed: super::team::TeamPlan = serde_json::from_slice(&out).unwrap();
+
+        let stored = load_active(&state_dir, repo.path())
+            .unwrap()
+            .expect("workflow still active");
+        assert_eq!(stored.team_plan, Some(printed));
+    }
+
+    /// Issue #541: `zirv workflow team brief <seat>` attaches only the
+    /// skills that SEAT's own manifest references (the debugger's
+    /// `systematic-debugging`), never the whole skill catalogue and never
+    /// another seat's skills.
+    #[test]
+    fn workflow_team_brief_attaches_only_the_seats_skills() {
+        let repo = git_repo_with_pending_files(3);
+        let home = tempdir().unwrap();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "fix the crash".into(),
+            WorkflowKind::Bugfix,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let plan_args = WorkflowArgs {
+            command: WorkflowSubcommand::Team(super::team::TeamArgs {
+                command: super::team::TeamCommand::Plan(super::team::TeamPlanArgs {
+                    objective: "fix the crash".into(),
+                    workflow: None,
+                    dry_run: false,
+                    seat: None,
+                    built_in_only: true,
+                    repo: Some(repo.path().to_path_buf()),
+                    json: true,
+                }),
+            }),
+        };
+        let mut plan_out = Vec::new();
+        run(&plan_args, &mut plan_out).unwrap();
+        let plan: super::team::TeamPlan = serde_json::from_slice(&plan_out).unwrap();
+        assert!(
+            plan.seats.iter().any(|seat| seat.id == "debugger-1"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.seats.iter().any(|seat| seat.id == "implementer-1"),
+            "{plan:?}"
+        );
+
+        let brief = |seat_id: &str| -> serde_json::Value {
+            let args = WorkflowArgs {
+                command: WorkflowSubcommand::Team(super::team::TeamArgs {
+                    command: super::team::TeamCommand::Brief(super::team::TeamBriefArgs {
+                        seat_id: seat_id.to_string(),
+                        workflow: None,
+                        built_in_only: true,
+                        repo: Some(repo.path().to_path_buf()),
+                        json: true,
+                    }),
+                }),
+            };
+            let mut out = Vec::new();
+            run(&args, &mut out).unwrap();
+            serde_json::from_slice(&out).unwrap()
+        };
+
+        let debugger_brief = brief("debugger-1");
+        let skills = debugger_brief["skills"].as_array().expect("skills array");
+        assert_eq!(skills.len(), 1, "{debugger_brief}");
+        assert_eq!(skills[0]["id"], "systematic-debugging");
+
+        let implementer_brief = brief("implementer-1");
+        assert_eq!(
+            implementer_brief["skills"].as_array().unwrap().len(),
+            0,
+            "{implementer_brief}"
+        );
     }
 }

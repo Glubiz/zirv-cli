@@ -116,6 +116,10 @@ repository's standards and to the engineering standard above: reuse before addin
 diff, one focused test per behaviour change, format, lint and test before reporting back.
 - Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
 resolve conflicts between worker outputs and report outcomes, including failures, plainly.
+- Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
+spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
+honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
+explicit choice.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
 by ONE designated integrator worker; a writer touching one says so in its report. Git \
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
@@ -147,6 +151,10 @@ repository's standards and to the engineering standard above: reuse before addin
 diff, one focused test per behaviour change, format, lint and test before reporting back.
 - Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
 resolve conflicts between worker outputs and report outcomes, including failures, plainly.
+- Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
+spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
+honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
+explicit choice.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
 by ONE designated integrator worker; a writer touching one says so in its report. Git \
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
@@ -3406,6 +3414,29 @@ mod tests {
         assert!(
             !ORCHESTRATOR_PROMPT.contains("haiku") && !ORCHESTRATOR_PROMPT.contains("sonnet"),
             "codex has no fixed model vocabulary to name: {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// Issue #541: before delegating substantial work, this seat compiles
+    /// the proportional team through `zirv workflow team plan` rather than
+    /// guessing which specialists to spawn, and briefs each compiled seat
+    /// through `zirv workflow team brief` rather than re-deriving its
+    /// instructions. Mirrors claude's own
+    /// `the_orchestrator_conventions_name_workflow_team_plan`.
+    #[test]
+    fn the_orchestrator_conventions_name_workflow_team_plan() {
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow team plan"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow team brief"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.len() < 3_600,
+            "this ships on every codex session: {} bytes",
+            ORCHESTRATOR_PROMPT.len()
         );
     }
 

@@ -49,9 +49,9 @@ document may claim a rung it has not earned:
 | `live-validated` | a recorded run against a real provider endpoint, with the recording committed under `docs/benchmarks/`. **No row in this document claims this rung.** |
 | `legacy-only` | there is no native path, and the `Requires` cell says why. Every one of these is an entitlement limitation, not an unfinished feature -- see the two tables at the end. |
 
-Current distribution, counted by the check itself: 98 `unit`, 34
+Current distribution, counted by the check itself: 100 `unit`, 34
 `integration`, 18 `ci-matrix`, 8 `legacy-only`, 0 `live-validated`, across
-158 capabilities (121 command verbs, 37 model-calling call sites).
+160 capabilities (122 command verbs, 38 model-calling call sites).
 
 ## Release blockers
 
@@ -203,6 +203,7 @@ means it runs on any supported OS with no provider configured at all.
 | `workflow start` | `workflow::engine` | same zirv code | none | `engine::tests::start_profile_flag_overrides_automatic_classification` | `unit` |
 | `workflow stats` | `workflow::telemetry` | same zirv code | none | `telemetry::tests::stats_report_json_carries_the_overall_cache_hit_ratio_field` | `unit` |
 | `workflow status` | `workflow::engine` + native `workflow_status` tool | same zirv code | none | `tools::tests::a_session_with_no_writer_permit_can_read_a_workflow_but_never_advance_it` | `integration` |
+| `workflow team` | `workflow::team` | same zirv code | none | `workflow::team::tests::a_mechanical_request_compiles_to_no_seats`, `workflow::team::tests::the_team_battery_holds`, `engine::tests::workflow_team_plan_json_matches_the_stored_plan` | `unit` |
 
 ## Capability matrix: model-calling call sites
 
