@@ -8,6 +8,7 @@
 //! preserves every required source or fails closed, and records every
 //! truncation/exclusion decision.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -15,10 +16,13 @@ use sha2::{Digest, Sha256};
 
 use super::super::CtxResult;
 use super::super::config::CtxConfig;
+use super::super::context as chunk_a;
 use super::super::memory::{self, MemoryScope};
+use super::super::optimize;
 use super::super::prompt::{self, PromptRole};
 use super::super::provider::capability::{Capability, ModelCapabilities};
 use super::super::state::{self, StateDir};
+use super::super::surface;
 use super::tools::{ToolDefinition, ToolRegistry};
 
 pub const NATIVE_CONTEXT_SCHEMA_VERSION: u32 = 1;
@@ -44,6 +48,16 @@ pub enum SourceKind {
     ModelProfile,
     OperatorInstructions,
     RepositoryInstructions,
+    /// The chunk A same-directory-precedence winners (issue #538): operator-
+    /// global `~/.zirv/ZIRV.md`, and the repo root plus active-scope ancestor
+    /// chain's resolved `ZIRV.md`/`AGENTS.md`/`CLAUDE.md`/singular `AGENT.md`.
+    /// Distinct from `RepositoryInstructions` (`.zirv/system-prompt.md`
+    /// alone, unchanged) so the two conventions never get conflated in
+    /// provenance or in a report. Vendor-directory-specific global files
+    /// (`~/CLAUDE.md`, `~/.codex/AGENTS.md`) are never included here -- the
+    /// native compiler still never reads a vendor CLI's own instruction
+    /// layer, per this module's doc.
+    NativeInstructions,
     CanonicalContext,
     Workflow,
     Skill,
@@ -95,6 +109,17 @@ pub struct SourceProvenance {
     pub tokens: u64,
     pub decision: SourceDecision,
     pub reason: String,
+    /// Issue #538 (chunk B): `global` / `repo` / `nested:<relative dir>` for
+    /// a `NativeInstructions` source, mirroring the wrapped-harness
+    /// collector's `surface::Scope`. `None` for every other source kind.
+    pub scope: Option<String>,
+    /// Issue #538 (chunk B): full sha256 hex of the delivered content, for a
+    /// `NativeInstructions` source only -- the same hash the journal's
+    /// `context_sources` column and the native `/context` view key off, so a
+    /// file that changed on disk is detectable without re-reading the whole
+    /// text. `None` for every other source kind (and for one excluded before
+    /// any content was delivered).
+    pub sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +199,15 @@ pub struct CompileRequest<'a> {
     pub task: &'a str,
     pub constraints: &'a [String],
     pub pending_actions: &'a [String],
+    /// Issue #538 (chunk B): repository paths touched by tool calls so far
+    /// in the current session (read/write/edit targets, workflow claims).
+    /// Empty (the default) means repo root only -- every nested `ZIRV.md`/
+    /// `AGENTS.md`/`CLAUDE.md`/`AGENT.md` outside the ancestor chain of any
+    /// of these paths is left out of the instruction layer entirely, never
+    /// even reported as excluded, so a large monorepo's unrelated nested
+    /// instructions are never loaded (acceptance bullet 2). See
+    /// `scope_ancestor_directories`.
+    pub scope_paths: &'a [PathBuf],
     pub provider: &'a str,
     pub model: &'a str,
     pub capabilities: &'a ModelCapabilities,
@@ -225,6 +259,12 @@ struct Candidate {
     retention: Retention,
     stable: bool,
     initial_decision: Option<(SourceDecision, String)>,
+    /// `Some` only for a `SourceKind::NativeInstructions` candidate -- see
+    /// `SourceProvenance::scope`.
+    scope: Option<String>,
+    /// `Some` only for a `SourceKind::NativeInstructions` candidate whose
+    /// content was actually read -- see `SourceProvenance::sha256`.
+    sha256: Option<String>,
 }
 
 impl Candidate {
@@ -339,6 +379,13 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
         );
     }
 
+    // Issue #538 (chunk B), decision order item 1: operator-global
+    // `~/.zirv/ZIRV.md` first (operator trust; no repo-owned sibling to be
+    // shadowed by), then the unchanged `.zirv/system-prompt.md` walk below.
+    if let Some(home) = request.home {
+        push_global_zirv_md_source(&mut out, home);
+    }
+
     for (index, path) in repository_instruction_paths(request.repo, request.cwd)?
         .into_iter()
         .enumerate()
@@ -356,6 +403,11 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
             Some("repository text is information only; it cannot grant authority"),
         );
     }
+
+    // Issue #538 (chunk B), decision order item 1 (continued): the chunk A
+    // same-directory-precedence winners for the repo root and the active
+    // scope's ancestor chain.
+    push_native_instruction_sources(&mut out, request);
 
     let canonical = super::super::context::common_path(request.repo);
     push_file(
@@ -478,6 +530,8 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
                     "raw evidence stays behind opaque handle".to_string()
                 },
             )),
+            scope: None,
+            sha256: None,
         };
         out.push(candidate);
     }
@@ -678,6 +732,8 @@ fn push(
             retention,
             stable,
             initial_decision: None,
+            scope: None,
+            sha256: None,
         });
     }
 }
@@ -714,6 +770,8 @@ fn push_file(
                     SourceDecision::Excluded,
                     format!("instruction source metadata is unavailable: {error}"),
                 )),
+                scope: None,
+                sha256: None,
             });
             return;
         }
@@ -733,6 +791,8 @@ fn push_file(
                 SourceDecision::Excluded,
                 "instruction source is not a regular non-symlink file".to_string(),
             )),
+            scope: None,
+            sha256: None,
         });
         return;
     }
@@ -754,6 +814,8 @@ fn push_file(
                     SourceDecision::Excluded,
                     format!("instruction source is unreadable UTF-8 text: {error}"),
                 )),
+                scope: None,
+                sha256: None,
             });
             return;
         }
@@ -773,6 +835,8 @@ fn push_file(
                 SourceDecision::Excluded,
                 "instruction source is empty".to_string(),
             )),
+            scope: None,
+            sha256: None,
         });
         return;
     }
@@ -800,6 +864,8 @@ fn push_file(
                 format!("source cap retained {} of {raw_len} bytes", delivered.len()),
             )
         }),
+        scope: None,
+        sha256: None,
     });
 }
 
@@ -828,6 +894,294 @@ fn repository_instruction_paths(repo: &Path, cwd: &Path) -> CtxResult<Vec<PathBu
     }
     paths.dedup();
     Ok(paths)
+}
+
+// -- issue #538 (chunk B): ZIRV.md/AGENTS.md/CLAUDE.md/AGENT.md sources ---
+
+/// Reads and pushes the operator-global `~/.zirv/ZIRV.md` source, then
+/// stamps `scope`/`sha256` on whatever `push_file` actually pushed (nothing,
+/// when the file is absent -- `push_file` itself no-ops in that case, so
+/// `out.len()` is unchanged and there is nothing to stamp).
+fn push_global_zirv_md_source(out: &mut Vec<Candidate>, home: &Path) {
+    let before = out.len();
+    push_file(
+        out,
+        "native:instructions:global",
+        SourceKind::NativeInstructions,
+        MessageRole::Data,
+        SourceTrust::Operator,
+        &home.join(".zirv").join("ZIRV.md"),
+        None,
+        Retention::Optional,
+        true,
+        None,
+    );
+    if out.len() > before {
+        let candidate = out.last_mut().expect("just pushed above");
+        candidate.scope = Some("global".to_string());
+        candidate.sha256 =
+            (!candidate.text.is_empty()).then(|| memory::sha256_hex(&candidate.text));
+    }
+}
+
+/// `repo` itself, plus every ancestor directory (down to, not past, `repo`)
+/// of each touched path's own containing directory. Empty `scope_paths`
+/// yields just `{repo}` -- a fresh session that has not touched anything
+/// yet loads only the repo root's own instruction files.
+fn scope_ancestor_directories(repo: &Path, scope_paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut dirs = BTreeSet::new();
+    dirs.insert(repo.to_path_buf());
+    for touched in scope_paths {
+        let Some(mut dir) = touched.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        loop {
+            if !dir.starts_with(repo) {
+                break;
+            }
+            let at_root = dir == repo;
+            dirs.insert(dir.clone());
+            if at_root {
+                break;
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => break,
+            }
+        }
+    }
+    dirs
+}
+
+/// Whether a chunk A (issue #538) resolved instruction candidate is inside
+/// the active scope: a repo-root-scoped layer always is (root is always in
+/// `scope_dirs`); a nested one only when its own directory is too. A
+/// global-scoped layer is never a candidate here at all -- it is pushed
+/// separately by `push_global_zirv_md_source`.
+fn in_active_scope(layer: optimize::Layer, path: &Path, scope_dirs: &BTreeSet<PathBuf>) -> bool {
+    use optimize::Layer;
+    match layer {
+        Layer::RepoZirvMd | Layer::RepoAgentsMd | Layer::RepoClaudeMd | Layer::RepoAgentMd => true,
+        Layer::NestedZirvMd
+        | Layer::NestedAgentsMd
+        | Layer::NestedClaudeMd
+        | Layer::NestedAgentMd => path.parent().is_some_and(|dir| scope_dirs.contains(dir)),
+        _ => false,
+    }
+}
+
+/// `repo` / `nested:<relative dir>` for `SourceProvenance::scope` -- `global`
+/// is stamped separately by `push_global_zirv_md_source`, so this is never
+/// called for that layer.
+fn native_scope_label(repo: &Path, layer: optimize::Layer, path: &Path) -> String {
+    use optimize::Layer;
+    match layer {
+        Layer::RepoZirvMd | Layer::RepoAgentsMd | Layer::RepoClaudeMd | Layer::RepoAgentMd => {
+            "repo".to_string()
+        }
+        _ => {
+            let dir = path.parent().unwrap_or(path);
+            let relative = dir.strip_prefix(repo).unwrap_or(dir);
+            format!("nested:{}", relative.display())
+        }
+    }
+}
+
+/// "Root first, then nested by depth" stable ordering (issue #538, decision
+/// 1's aggregate-cap ordering): 0 for every repo-root-scoped layer,
+/// otherwise the touched directory's component distance from `repo`.
+fn native_scope_depth(repo: &Path, layer: optimize::Layer, path: &Path) -> usize {
+    use optimize::Layer;
+    match layer {
+        Layer::RepoZirvMd | Layer::RepoAgentsMd | Layer::RepoClaudeMd | Layer::RepoAgentMd => 0,
+        _ => path
+            .parent()
+            .and_then(|dir| dir.strip_prefix(repo).ok())
+            .map(|relative| relative.components().count())
+            .unwrap_or(0),
+    }
+}
+
+fn native_source_trust(layer: optimize::Layer) -> SourceTrust {
+    match layer.trust() {
+        surface::Trust::Operator => SourceTrust::Operator,
+        surface::Trust::RepoUntrusted => SourceTrust::RepositoryUntrusted,
+    }
+}
+
+/// One resolved repo-root-or-nested instruction file for `scope_paths`, as
+/// `resolve_active_scope_instructions` reports it -- deliberately lighter
+/// than a `Candidate`/`SourceProvenance` (no budgeting, no provider message):
+/// just enough identity to compare "did the resolved file set change" and to
+/// render the native `/context` view / journal `context_sources` column.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResolvedInstructionSource {
+    pub path: PathBuf,
+    pub scope: String,
+    pub trust: SourceTrust,
+    /// `chunk_a::Decision::render()` -- `included` / `shadowed by <path>` /
+    /// `duplicate of <path>` / `excluded: <reason>`.
+    pub decision: String,
+    /// `Some` only when `decision == "included"` and the file's content was
+    /// actually read.
+    pub sha256: Option<String>,
+}
+
+/// Issue #538 (chunk B), decision 2: the chunk A same-directory-precedence
+/// resolution for the repo root and `scope_paths`' ancestor chain, in the
+/// same "root first, then nested by depth" stable order `push_native_
+/// instruction_sources` builds candidates in -- but without building
+/// `Candidate`s/provider messages or applying the aggregate byte cap. Two
+/// consumers: `NativeLoop`'s per-turn recompile-on-change check (`native.rs`)
+/// compares this list's `(path, sha256)` pairs turn to turn, and the native
+/// `/context` view / journal `context_sources` column (`native_ux.rs`,
+/// `journal.rs`) render it directly.
+pub fn resolve_active_scope_instructions(
+    repo: &Path,
+    home: Option<&Path>,
+    scope_paths: &[PathBuf],
+    max_surface_bytes: usize,
+) -> Vec<ResolvedInstructionSource> {
+    let surfaces = optimize::collect_surfaces(home, repo, max_surface_bytes);
+    let exclusions = optimize::collect_instruction_exclusions(home, repo, max_surface_bytes);
+    let resolved = chunk_a::resolve_instruction_winners(&surfaces, &exclusions, repo, home);
+    let scope_dirs = scope_ancestor_directories(repo, scope_paths);
+
+    let mut in_scope: Vec<&chunk_a::Resolved> = resolved
+        .iter()
+        .filter(|r| in_active_scope(r.layer, &r.path, &scope_dirs))
+        .collect();
+    in_scope.sort_by_key(|r| (native_scope_depth(repo, r.layer, &r.path), r.path.clone()));
+
+    in_scope
+        .into_iter()
+        .map(|r| {
+            let sha256 = matches!(r.decision, chunk_a::Decision::Included)
+                .then(|| surfaces.iter().find(|s| s.path == r.path))
+                .flatten()
+                .map(|s| memory::sha256_hex(&s.text));
+            ResolvedInstructionSource {
+                path: r.path.clone(),
+                scope: native_scope_label(repo, r.layer, &r.path),
+                trust: native_source_trust(r.layer),
+                decision: r.decision.render(),
+                sha256,
+            }
+        })
+        .collect()
+}
+
+/// The chunk A (issue #538) same-directory-precedence winners for the repo
+/// root and the active scope's ancestor chain (`request.scope_paths`), as
+/// `SourceKind::NativeInstructions` candidates. A shadowed/duplicate/
+/// excluded chunk A decision still gets a candidate here -- with no
+/// deliverable text and an `Excluded` `initial_decision` naming the exact
+/// chunk A reason (`chunk_a::Decision::render`) -- so the native side
+/// reports the same decisions the wrapped side does (acceptance bullet 5).
+/// Every candidate that IS delivered is aggregate-capped at `config.context.
+/// instructions_max_bytes` in stable order (root first, then nested by
+/// depth): this is on top of the per-file cap `collect_surfaces` already
+/// applied at read time (`config.optimize.max_surface_bytes`, reused
+/// unchanged).
+fn push_native_instruction_sources(out: &mut Vec<Candidate>, request: &CompileRequest<'_>) {
+    let max_surface_bytes = request.config.optimize.max_surface_bytes;
+    let surfaces = optimize::collect_surfaces(request.home, request.repo, max_surface_bytes);
+    let exclusions =
+        optimize::collect_instruction_exclusions(request.home, request.repo, max_surface_bytes);
+    let resolved =
+        chunk_a::resolve_instruction_winners(&surfaces, &exclusions, request.repo, request.home);
+    let scope_dirs = scope_ancestor_directories(request.repo, request.scope_paths);
+
+    let mut in_scope: Vec<&chunk_a::Resolved> = resolved
+        .iter()
+        .filter(|r| in_active_scope(r.layer, &r.path, &scope_dirs))
+        .collect();
+    in_scope.sort_by_key(|r| {
+        (
+            native_scope_depth(request.repo, r.layer, &r.path),
+            r.path.clone(),
+        )
+    });
+
+    let instructions_max_bytes = request.config.context.instructions_max_bytes;
+    let mut budget_remaining = instructions_max_bytes;
+    for resolved in in_scope {
+        let id = format!("native:instructions:{}", resolved.path.display());
+        let scope = native_scope_label(request.repo, resolved.layer, &resolved.path);
+        let trust = native_source_trust(resolved.layer);
+
+        let chunk_a::Decision::Included = &resolved.decision else {
+            out.push(Candidate {
+                id,
+                source: SourceKind::NativeInstructions,
+                role: MessageRole::Data,
+                trust,
+                path: Some(resolved.path.clone()),
+                raw_bytes: 0,
+                text: String::new(),
+                retention: Retention::Optional,
+                stable: true,
+                initial_decision: Some((SourceDecision::Excluded, resolved.decision.render())),
+                scope: Some(scope),
+                sha256: None,
+            });
+            continue;
+        };
+        let Some(raw_text) = surfaces
+            .iter()
+            .find(|s| s.path == resolved.path)
+            .map(|s| s.text.as_str())
+        else {
+            continue;
+        };
+        if raw_text.trim().is_empty() {
+            continue;
+        }
+        let raw_bytes = raw_text.len();
+        let sha256 = memory::sha256_hex(raw_text);
+        let (text, initial_decision) = if raw_bytes <= budget_remaining {
+            budget_remaining -= raw_bytes;
+            (raw_text.to_string(), None)
+        } else if budget_remaining > 0 {
+            let truncated =
+                crate::utils::truncate_bytes(raw_text.to_string(), Some(budget_remaining));
+            let used = truncated.len();
+            budget_remaining = 0;
+            (
+                truncated,
+                Some((
+                    SourceDecision::Truncated,
+                    format!(
+                        "native instruction layer aggregate cap ({instructions_max_bytes} bytes) retained {used} of {raw_bytes} bytes"
+                    ),
+                )),
+            )
+        } else {
+            (
+                String::new(),
+                Some((
+                    SourceDecision::Excluded,
+                    format!(
+                        "native instruction layer aggregate cap ({instructions_max_bytes} bytes) reached"
+                    ),
+                )),
+            )
+        };
+        out.push(Candidate {
+            id,
+            source: SourceKind::NativeInstructions,
+            role: MessageRole::Data,
+            trust,
+            path: Some(resolved.path.clone()),
+            raw_bytes,
+            text,
+            retention: Retention::Optional,
+            stable: true,
+            initial_decision,
+            scope: Some(scope),
+            sha256: Some(sha256),
+        });
+    }
 }
 
 fn pack_sources(
@@ -1010,6 +1364,8 @@ fn provenance_for(
         tokens,
         decision,
         reason,
+        scope: candidate.scope.clone(),
+        sha256: candidate.sha256.clone(),
     }
 }
 
@@ -1077,6 +1433,7 @@ mod tests {
             task,
             constraints: &[],
             pending_actions: &[],
+            scope_paths: &[],
             provider: "openai",
             model: "gpt-5",
             capabilities,
@@ -1267,6 +1624,8 @@ mod tests {
             retention,
             stable: false,
             initial_decision: None,
+            scope: None,
+            sha256: None,
         };
         let compiled = pack_sources(
             vec![
@@ -1461,5 +1820,244 @@ mod tests {
         let compiled = compile(&req).unwrap();
         assert!(compiled.tools.is_empty());
         assert_eq!(compiled.accounting.tool_tokens, 0);
+    }
+
+    // -- issue #538 (chunk B): ZIRV.md/AGENTS.md/CLAUDE.md/AGENT.md --------
+
+    /// Acceptance bullet 1: a repo root `ZIRV.md` reaches the compiled
+    /// messages (as untrusted DATA, never an instruction), with its
+    /// `scope`/`sha256` stamped on the matching `SourceProvenance`.
+    #[test]
+    fn zirv_md_winners_reach_the_compiled_messages_with_scope_and_hash() {
+        let repo = tempfile::tempdir().unwrap();
+        let zirv_md_path = repo.path().join("ZIRV.md");
+        std::fs::write(&zirv_md_path, "- always run the full test suite\n").unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let req = request(
+            None,
+            repo.path(),
+            &state,
+            &cfg,
+            "implement it",
+            ample_budget(),
+        );
+        let compiled = compile(&req).unwrap();
+
+        let text = compiled
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("always run the full test suite"), "{text}");
+        assert!(
+            compiled
+                .messages
+                .iter()
+                .all(|m| !(m.content.contains("always run the full test suite")
+                    && m.role == MessageRole::Instruction)),
+            "repository instructions are DATA, never Instruction role"
+        );
+
+        let provenance = compiled
+            .provenance
+            .iter()
+            .find(|p| p.path.as_deref() == Some(zirv_md_path.as_path()))
+            .expect("ZIRV.md has a provenance entry");
+        assert_eq!(provenance.source, SourceKind::NativeInstructions);
+        assert_eq!(provenance.scope.as_deref(), Some("repo"));
+        assert_eq!(provenance.trust, SourceTrust::RepositoryUntrusted);
+        assert_eq!(provenance.decision, SourceDecision::Included);
+        assert_eq!(
+            provenance.sha256.as_deref(),
+            Some(memory::sha256_hex("- always run the full test suite\n").as_str())
+        );
+    }
+
+    /// Acceptance bullet 5 (native half): a same-directory-shadowed and a
+    /// duplicate candidate both still get a provenance entry -- `Excluded`,
+    /// naming the exact chunk A reason -- rather than silently vanishing,
+    /// and neither one's text reaches a compiled message.
+    #[test]
+    fn shadowed_and_duplicate_candidates_are_reported_excluded_in_provenance() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("ZIRV.md"), "- one shared rule\n").unwrap();
+        std::fs::write(repo.path().join("CLAUDE.md"), "- one shared rule\n").unwrap();
+        std::fs::write(repo.path().join("AGENTS.md"), "- a different rule\n").unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let req = request(
+            None,
+            repo.path(),
+            &state,
+            &cfg,
+            "implement it",
+            ample_budget(),
+        );
+        let compiled = compile(&req).unwrap();
+
+        let claude = compiled
+            .provenance
+            .iter()
+            .find(|p| p.path.as_deref() == Some(repo.path().join("CLAUDE.md").as_path()))
+            .expect("CLAUDE.md has a provenance entry");
+        assert_eq!(claude.decision, SourceDecision::Excluded);
+        assert!(claude.reason.contains("duplicate of"), "{}", claude.reason);
+        assert_eq!(claude.delivered_bytes, 0);
+
+        let agents = compiled
+            .provenance
+            .iter()
+            .find(|p| p.path.as_deref() == Some(repo.path().join("AGENTS.md").as_path()))
+            .expect("AGENTS.md has a provenance entry");
+        assert_eq!(agents.decision, SourceDecision::Excluded);
+        assert!(agents.reason.contains("shadowed by"), "{}", agents.reason);
+        assert_eq!(agents.delivered_bytes, 0);
+
+        let text = compiled
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("a different rule"), "{text}");
+    }
+
+    /// Acceptance bullet 2: a nested instruction file outside the active
+    /// scope's ancestor chain never even reaches provenance -- not
+    /// `Included`, not `Excluded`, not present at all -- so a large
+    /// monorepo's unrelated nested instructions are never loaded.
+    #[test]
+    fn nested_instructions_load_only_for_the_active_scope() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("crates/inner")).unwrap();
+        std::fs::create_dir_all(repo.path().join("crates/other")).unwrap();
+        std::fs::write(repo.path().join("crates/inner/ZIRV.md"), "- inner rule\n").unwrap();
+        let other_path = repo.path().join("crates/other/ZIRV.md");
+        std::fs::write(&other_path, "- other rule\n").unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let touched = vec![repo.path().join("crates/inner/lib.rs")];
+        let req = CompileRequest {
+            scope_paths: &touched,
+            ..request(
+                None,
+                repo.path(),
+                &state,
+                &cfg,
+                "implement it",
+                ample_budget(),
+            )
+        };
+        let compiled = compile(&req).unwrap();
+
+        let text = compiled
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("inner rule"), "{text}");
+        assert!(!text.contains("other rule"), "{text}");
+        assert!(
+            compiled
+                .provenance
+                .iter()
+                .all(|p| p.path.as_deref() != Some(other_path.as_path())),
+            "an out-of-scope nested file must not appear in provenance at all: {:#?}",
+            compiled.provenance
+        );
+    }
+
+    /// Decision 1: the aggregate `context.instructions_max_bytes` cap is
+    /// enforced on the instruction layer independently of the global token
+    /// budget, in stable order, with the overflow recorded as `Truncated`
+    /// naming the cap.
+    #[test]
+    fn the_instruction_layer_is_capped_after_task_and_evidence_and_records_truncation() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("ZIRV.md"), "x".repeat(200)).unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.context.instructions_max_bytes = 10;
+        let req = request(
+            None,
+            repo.path(),
+            &state,
+            &cfg,
+            "implement it",
+            ample_budget(),
+        );
+        let compiled = compile(&req).unwrap();
+
+        let zirv_md = compiled
+            .provenance
+            .iter()
+            .find(|p| p.path.as_deref() == Some(repo.path().join("ZIRV.md").as_path()))
+            .expect("ZIRV.md has a provenance entry");
+        assert_eq!(zirv_md.decision, SourceDecision::Truncated);
+        assert!(
+            zirv_md.reason.contains("aggregate cap") && zirv_md.reason.contains("10 bytes"),
+            "{}",
+            zirv_md.reason
+        );
+        assert!(zirv_md.delivered_bytes <= 10, "{}", zirv_md.delivered_bytes);
+
+        // The required user task is never dropped by the instruction layer's
+        // own cap -- it is a completely separate budget.
+        let task_text = compiled
+            .messages
+            .iter()
+            .find(|m| m.source == SourceKind::UserTask)
+            .expect("the user task is still present");
+        assert_eq!(task_text.content, "implement it");
+    }
+
+    /// Acceptance bullet 5 (native half): a symlinked `ZIRV.md` is refused
+    /// (never read through) and reported `Excluded`, mirroring the wrapped
+    /// collector's own posture.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_zirv_md_is_excluded() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = repo.path().join("outside-secret.md");
+        std::fs::write(&outside, "not this repo's own configuration\n").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.path().join("ZIRV.md")).unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let req = request(
+            None,
+            repo.path(),
+            &state,
+            &cfg,
+            "implement it",
+            ample_budget(),
+        );
+        let compiled = compile(&req).unwrap();
+
+        let zirv_md = compiled
+            .provenance
+            .iter()
+            .find(|p| p.path.as_deref() == Some(repo.path().join("ZIRV.md").as_path()))
+            .expect("ZIRV.md has a provenance entry");
+        assert_eq!(zirv_md.decision, SourceDecision::Excluded);
+        assert!(zirv_md.reason.contains("symlinked"), "{}", zirv_md.reason);
+
+        let text = compiled
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("not this repo's own configuration"),
+            "{text}"
+        );
     }
 }
