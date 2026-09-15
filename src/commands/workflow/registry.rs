@@ -1017,7 +1017,10 @@ present_as = "summary"
         std::fs::create_dir_all(&dir).unwrap();
         // `minimal_pack` deliberately never sets `domains`, so it defaults
         // to empty.
-        write(&dir.join("no-domains.toml"), &minimal_pack("no-domains", ""));
+        write(
+            &dir.join("no-domains.toml"),
+            &minimal_pack("no-domains", ""),
+        );
 
         let registry = WorkflowRegistry::load(repo.path(), None, true, true, &skills()).unwrap();
         assert!(

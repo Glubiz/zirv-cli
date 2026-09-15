@@ -10297,7 +10297,10 @@ present_as = "summary"
         assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
         let pack = registry.get("drift-fixture").expect("drift-fixture pack");
         let pinned_hash = pack.hash.clone();
-        assert_eq!(pack.source, super::super::registry::WorkflowSource::Repository);
+        assert_eq!(
+            pack.source,
+            super::super::registry::WorkflowSource::Repository
+        );
 
         let mut state = WorkflowState::start_from_pack(
             repo.path().to_path_buf(),
@@ -10332,7 +10335,10 @@ present_as = "summary"
                 "[failure]",
                 "[[steps]]\nid = \"third\"\ntitle = \"Third\"\nphase = \"verify\"\nskills = [\"verify\"]\ndepends_on = [\"second\"]\ncondition = \"always\"\n\n[failure]",
             );
-        assert_ne!(edited, DRIFT_FIXTURE, "the fixture text must actually change");
+        assert_ne!(
+            edited, DRIFT_FIXTURE,
+            "the fixture text must actually change"
+        );
         std::fs::write(&fixture_path, &edited).unwrap();
 
         // Resume: reload from disk and advance past "first" -- the run must
@@ -10688,10 +10694,7 @@ present_as = "summary"
                 full_classification(),
             );
             let first = state.current().unwrap_or_else(|| {
-                panic!(
-                    "{}: materialized with no first step",
-                    pack.definition.id
-                )
+                panic!("{}: materialized with no first step", pack.definition.id)
             });
             if let Some(role) = &first.agent {
                 assert!(
@@ -10709,7 +10712,10 @@ present_as = "summary"
             registry.list().count(),
             "every registered built-in pack must have started and materialised"
         );
-        assert!(checked >= 32, "expected the full built-in catalogue, checked {checked}");
+        assert!(
+            checked >= 32,
+            "expected the full built-in catalogue, checked {checked}"
+        );
     }
 
     /// Issue #542 review finding 11: `sre-postmortem` has no legacy
@@ -11023,8 +11029,7 @@ present_as = "summary"
         ensure_current_artifact_template(&state).expect("template");
         let intent_path =
             workflow_artifact_path(&state, ArtifactStage::Intent).expect("artifact path");
-        std::fs::write(&intent_path, "# Fixture\n\nSubstantive intake content.\n")
-            .expect("write");
+        std::fs::write(&intent_path, "# Fixture\n\nSubstantive intake content.\n").expect("write");
         state = approve(&state_dir, state).expect("approve intake");
         state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .expect("advance past constraints");
@@ -11047,7 +11052,10 @@ present_as = "summary"
         .expect("rewrite");
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .expect_err("a drifted earlier artifact must reopen its gate");
-        assert!(error.to_string().contains("intent artifact changed"), "{error}");
+        assert!(
+            error.to_string().contains("intent artifact changed"),
+            "{error}"
+        );
 
         let reopened = load_active(&state_dir, repo.path()).unwrap().unwrap();
         assert_eq!(reopened.current().unwrap().id, "intake");
@@ -11169,7 +11177,10 @@ present_as = "summary"
         state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .expect("advance past the ungated first step");
         assert_eq!(state.current().unwrap().id, "second");
-        assert!(!state.current().unwrap().approval, "the step's own approval field stays false");
+        assert!(
+            !state.current().unwrap().approval,
+            "the step's own approval field stays false"
+        );
         assert_eq!(
             state.status,
             WorkflowStatus::AwaitingApproval,
@@ -11782,12 +11793,12 @@ present_as = "summary"
     #[test]
     fn external_effects_packs_now_carry_a_deploy_phase_step() {
         for (pack_id, deploy_step_id, gate_step_id) in [
+            ("devops-infrastructure-change", "apply-change", "apply-gate"),
             (
-                "devops-infrastructure-change",
-                "apply-change",
-                "apply-gate",
+                "sre-deploy-or-rollback",
+                "execute-decision",
+                "decision-gate",
             ),
-            ("sre-deploy-or-rollback", "execute-decision", "decision-gate"),
         ] {
             let definition = super::super::registry::builtin_definition(pack_id)
                 .unwrap_or_else(|| panic!("{pack_id} pack"));
@@ -11824,7 +11835,9 @@ present_as = "summary"
                 let materialized_deploy = materialized
                     .iter()
                     .find(|step| step.phase == WorkflowPhase::Deploy)
-                    .unwrap_or_else(|| panic!("{pack_id}: no materialized Deploy step at {tier:?}"));
+                    .unwrap_or_else(|| {
+                        panic!("{pack_id}: no materialized Deploy step at {tier:?}")
+                    });
                 assert!(
                     materialized_deploy.approval,
                     "{pack_id}: the Deploy-phase gate must survive every tier ({tier:?})"
