@@ -716,6 +716,31 @@ pub struct NativeLoop<'a> {
     /// recompile. Compared against a fresh resolution by
     /// [`Self::recompile_instructions_if_changed`].
     instruction_fingerprint: Vec<super::context::ResolvedInstructionSource>,
+    /// `CompiledNativeContext::stable_prefix_sha256` from the most recent
+    /// compile/recompile -- see [`NativeLoop::context_version`].
+    context_version: Option<String>,
+    /// Issue #538 (chunk C): what [`Self::recompile_if_scope_changed`] needs
+    /// to actually recompile -- `None` for a loop nobody opted in (every
+    /// existing test, and any caller that has not called
+    /// [`Self::set_recompile_context`]), in which case that method is a
+    /// no-op. Set once by the loop's real production entry points
+    /// (`run_headless`, `spawn_interactive`, `run_hosted_turns`) right after
+    /// construction, so `run_turn`'s own top -- the single place every one
+    /// of them eventually calls, whether directly or through `run_to_
+    /// completion`'s loop -- is the one narrow shared hook point.
+    recompile_context: Option<RecompileContext>,
+}
+
+/// Everything [`NativeLoop::recompile_if_scope_changed`] needs that is not
+/// already on `config`/`journal` (issue #538, chunk C). Owned, not borrowed:
+/// `NativeLoop` already carries enough lifetimes, and none of these are hot
+/// enough to justify adding another.
+#[derive(Clone, Debug)]
+pub struct RecompileContext {
+    pub state: super::super::state::StateDir,
+    pub home: PathBuf,
+    pub cfg: super::super::config::CtxConfig,
+    pub repo: PathBuf,
 }
 
 impl std::fmt::Debug for NativeLoop<'_> {
@@ -849,6 +874,8 @@ impl<'a> NativeLoop<'a> {
             failure_routing: None,
             touched_paths: Vec::new(),
             instruction_fingerprint: Vec::new(),
+            context_version: None,
+            recompile_context: None,
         }
     }
 
@@ -892,26 +919,84 @@ impl<'a> NativeLoop<'a> {
         self.touched_paths.push(path);
     }
 
-    /// Issue #538 (chunk B), decision 2: recomputes the resolved instruction
-    /// file list for `repo` and this session's touched-path scope; if it
-    /// differs from the fingerprint that shaped the CURRENT `config.system`/
-    /// `config.preamble` (a new nested file entered scope, a file changed on
-    /// disk, a file removed), recompiles the whole standing context and
-    /// replaces both before the next turn is sent. Returns whether a
-    /// recompile happened, so a caller can log/journal it.
+    /// Issue #538 (chunk C): opts a loop into automatic per-turn recompile
+    /// checking (`run_turn`'s own top calls `recompile_if_scope_changed`
+    /// unconditionally; without a context set, that call is a no-op). Every
+    /// one of the three real production entry points
+    /// (`run_headless`/`run_session`, `spawn_interactive`, `run_hosted_
+    /// turns`) calls this right after constructing its `NativeLoop`. No
+    /// existing test is affected: `recompile_context` defaults to `None`.
+    pub fn set_recompile_context(&mut self, context: RecompileContext) {
+        self.recompile_context = Some(context);
+    }
+
+    /// The current compiled context's stable-prefix hash, if this loop has
+    /// ever (re)compiled the instruction layer -- `CompiledNativeContext::
+    /// stable_prefix_sha256` from the most recent call, kept without holding
+    /// onto the rest of that value. `None` before the first compile/
+    /// recompile, or for a loop with no `recompile_context` set at all.
+    pub fn context_version(&self) -> Option<&str> {
+        self.context_version.as_deref()
+    }
+
+    /// The instruction file list that shaped the CURRENT `config.system`/
+    /// `config.preamble`, for a live `/context` view to render.
+    pub fn instruction_provenance(&self) -> &[super::context::ResolvedInstructionSource] {
+        &self.instruction_fingerprint
+    }
+
+    /// Issue #538 (chunk C), decision 1: called at the top of every turn
+    /// (`run_turn`), whether or not a `recompile_context` was ever set --
+    /// a no-op when it was not, which is every existing test and every
+    /// loop no production caller has opted in yet. Delegates to
+    /// `recompile_instructions_if_changed`, restoring the context
+    /// afterward (`Option::take` avoids a borrow conflict between `&mut
+    /// self` and `&self.recompile_context` without cloning a whole
+    /// `CtxConfig` every turn).
+    fn recompile_if_scope_changed(&mut self, turn: Option<&TurnId>, now: u64) -> CtxResult<bool> {
+        let Some(context) = self.recompile_context.take() else {
+            return Ok(false);
+        };
+        let result = self.recompile_instructions_if_changed(
+            &context.state,
+            &context.home,
+            &context.cfg,
+            &context.repo,
+            turn,
+            now,
+        );
+        self.recompile_context = Some(context);
+        result
+    }
+
+    /// Issue #538 (chunk B/C), decision 2: recomputes the resolved
+    /// instruction file list for `repo` and this session's touched-path
+    /// scope (a cheap stat+hash of each file, not a full recompile by
+    /// itself); if it differs from the fingerprint that shaped the CURRENT
+    /// `config.system`/`config.preamble` (a new nested file entered scope, a
+    /// file changed on disk, a file removed), recompiles the whole standing
+    /// context and replaces both before the next request goes out. Returns
+    /// whether a recompile happened. When it did NOT, `config.system`/
+    /// `config.preamble` and this loop's `context_version()` are the exact
+    /// same values as before the call -- the cached prefix is never
+    /// rebuilt, and `stable_prefix_sha256` stays byte-identical, which is
+    /// what keeps prompt caching intact for the (rare) unchanged case.
     ///
-    /// Deliberately narrow: only `config.system`/`config.preamble` are ever
-    /// reassigned here. Tools, policy, permissions, limits, route and every
-    /// other field of `config` are untouched -- proven by
-    /// `recompilation_never_changes_tools_or_policy`.
-    #[allow(clippy::too_many_arguments)]
+    /// Deliberately narrow: only `config.system`/`config.preamble`/
+    /// `context_version`/`instruction_fingerprint` are ever reassigned here.
+    /// Tools, policy, permissions, limits, route and every other field of
+    /// `config` are untouched -- proven by
+    /// `recompilation_never_changes_tools_or_policy`. Called only between
+    /// turns (`run_turn`'s own top, before any request for that turn is
+    /// built) -- never mid-turn, so a turn already in flight is never
+    /// mutated (`a_changed_instruction_file_recompiles_before_the_next_
+    /// turn`).
     pub fn recompile_instructions_if_changed(
         &mut self,
         state: &super::super::state::StateDir,
         home: &std::path::Path,
         cfg: &super::super::config::CtxConfig,
         repo: &std::path::Path,
-        headless: &HeadlessRequest<'_>,
         turn: Option<&TurnId>,
         now: u64,
     ) -> CtxResult<bool> {
@@ -944,7 +1029,11 @@ impl<'a> NativeLoop<'a> {
             config: cfg,
             role: prompt_role(&self.config.role),
             session_id: &session_id,
-            task: headless.prompt,
+            // Discarded below (only `messages` is read): a recompile never
+            // changes the actual per-turn task text, which is submitted
+            // separately through `acknowledge`/`queued_input`, never through
+            // this compile call.
+            task: "",
             constraints: &[],
             pending_actions: &[],
             scope_paths: &self.touched_paths,
@@ -981,11 +1070,12 @@ impl<'a> NativeLoop<'a> {
                 attempt: None,
                 task: self.config.task.clone(),
             },
-            compiled.stable_prefix_sha256,
+            compiled.stable_prefix_sha256.clone(),
             sources,
             self.secs(),
         )?;
 
+        self.context_version = Some(compiled.stable_prefix_sha256);
         self.instruction_fingerprint = current;
         Ok(true)
     }
@@ -1516,6 +1606,17 @@ impl<'a> NativeLoop<'a> {
         }
         self.turns += 1;
         let turn = TurnId::new(self.mint("turn"))?;
+        // Issue #538 (chunk C), decision 1: the single narrowest place every
+        // real turn passes through, whether reached directly or through
+        // `run_to_completion`'s own loop -- before any request for THIS turn
+        // is built, never mid-turn. A no-op when no `recompile_context` was
+        // set (every existing test, and any loop no production caller has
+        // opted in). A recompile failure degrades to the existing (stale)
+        // standing context rather than failing the turn -- the same
+        // fail-open posture `compile_standing_context`'s own session-start
+        // caller already holds.
+        let now = self.secs();
+        let _ = self.recompile_if_scope_changed(Some(&turn), now);
         let mut outcome = TurnOutcome {
             turn: turn.clone(),
             state: TurnState::Pending,
@@ -2156,21 +2257,14 @@ impl<'a> NativeLoop<'a> {
     /// Runs one prepared call, with the tool-retry budget applied only where
     /// the tool's own retry policy allows it.
     fn execute_one(&mut self, scope: &EventScope, entry: &PreparedCall) -> CtxResult<ToolOutcome> {
-        // Issue #538 (chunk B): a heuristic touched-path signal for the
-        // instruction layer's scoped nested loading -- every native file
-        // tool (`file_read`/`file_write`/`edit`/`artifact_read`/...) takes a
-        // `path` string argument by this codebase's own typed-tool
-        // convention, so this is generic across tool kinds rather than
-        // hand-listing each one. A tool with no `path` argument (a process,
-        // a network call, memory) simply contributes nothing here.
-        if let Some(path) = entry
-            .call
-            .arguments
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .filter(|path| !path.is_empty())
-        {
-            self.note_touched_path(PathBuf::from(path));
+        // Issue #538 (chunk C), decision 2: the touched-path signal for the
+        // instruction layer's scoped nested loading, from each tool's own
+        // REAL typed argument name (`touched_path_from_call`) -- not a
+        // generic `"path"` guess. A tool with no path-bearing argument
+        // (memory, network, process control, MCP, workflow, ...)
+        // contributes nothing here.
+        if let Some(path) = touched_path_from_call(&entry.call) {
+            self.note_touched_path(path);
         }
         let mut attempts = 0u32;
         let mut execution = entry.execution.clone();
@@ -4044,6 +4138,15 @@ pub fn run_session<W: std::io::Write>(
             &now_ms,
             env,
         );
+        // Issue #538 (chunk C), decision 1: opts this loop into automatic
+        // per-turn recompile checking -- see `set_recompile_context`'s own
+        // doc.
+        driver.set_recompile_context(RecompileContext {
+            state: state.clone(),
+            home: home.clone(),
+            cfg: cfg.clone(),
+            repo: request.repo.to_path_buf(),
+        });
         // Issue #645: stamped immediately before the turn actually runs, the
         // same edge `exec.rs`'s own per-cycle spawn stamps at. Left standing
         // on the abort/error arm below on purpose -- a record still carrying
@@ -4207,6 +4310,44 @@ fn compile_standing_context(
 /// every seat record already use) resolve to one methodology rather than two.
 fn prompt_role(role: &str) -> super::super::prompt::PromptRole {
     super::super::team::prompt_role(role)
+}
+
+/// Issue #538 (chunk C), decision 2: the real typed argument name that names
+/// a repository path, per built-in tool -- enumerated from the tool
+/// registry's own argument structs (`runtime/tools/files.rs`, `process.rs`),
+/// not a generic `"path"` guess. `read`/`write`/`edit` share `path`
+/// (`ReadFileArgs`/`WriteFileArgs`/`ApplyPatchArgs`, and `directory_list`'s
+/// own `DirectoryArgs`); `glob_search`/`text_search` name it `root`
+/// (`GlobArgs`/`SearchArgs`); `process_start`'s shell `cwd`
+/// (`ProcessStartArgs`) is the one non-file tool that still names a
+/// repository path. Every other tool (memory, network, MCP, workflow,
+/// process control/output-read by opaque id, ...) has no path-bearing
+/// argument at all and returns `None`.
+fn touched_path_argument_key(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        super::tools::FILE_READ
+        | super::tools::FILE_WRITE
+        | super::tools::APPLY_PATCH
+        | super::tools::DIRECTORY_LIST => Some("path"),
+        super::tools::GLOB_SEARCH | super::tools::TEXT_SEARCH => Some("root"),
+        super::tools::PROCESS_START => Some("cwd"),
+        _ => None,
+    }
+}
+
+/// Extracts the repository path a tool call names, using its real typed
+/// argument (`touched_path_argument_key`) rather than a generic guess. Never
+/// widens the touched scope for a tool with no path-bearing argument, or for
+/// one whose argument is present but empty/not a string (a malformed call
+/// the broker will refuse on its own terms; this is not the enforcement
+/// point).
+fn touched_path_from_call(call: &NativeToolCall) -> Option<PathBuf> {
+    let key = touched_path_argument_key(&call.name)?;
+    call.arguments
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 // -- an interactive, multi-turn session for a dashboard native pane --------
@@ -4825,6 +4966,11 @@ pub fn spawn_interactive(
     // settle against the same pool its admission was granted on.
     let worker_state = state.clone();
     let worker_cfg = cfg.clone();
+    // Issue #538 (chunk C): captured here (owned) so the spawned thread below
+    // can opt its own `NativeLoop` into automatic per-turn recompile
+    // checking -- `home`/`request.repo` themselves are not moved into it.
+    let worker_home = home.clone();
+    let worker_repo = request.repo.to_path_buf();
     let worker_pool = route.billing_pool.as_ref().to_string();
     let worker_output_reserve = request.limits.max_output_tokens;
 
@@ -4859,6 +5005,15 @@ pub fn spawn_interactive(
                 &now_ms,
                 env,
             );
+            // Issue #538 (chunk C), decision 1: opts this loop into
+            // automatic per-turn recompile checking -- see
+            // `set_recompile_context`'s own doc.
+            driver.set_recompile_context(RecompileContext {
+                state: worker_state.clone(),
+                home: worker_home.clone(),
+                cfg: worker_cfg.clone(),
+                repo: worker_repo.clone(),
+            });
             // Issue #554 (review round 1): a pane's turn is accounted like
             // any other native request -- an estimate held against the
             // route's BILLING POOL while it runs, replaced by what the
@@ -5133,6 +5288,14 @@ pub fn run_hosted_turns<W: std::io::Write>(
         &now_ms,
         env,
     );
+    // Issue #538 (chunk C), decision 1: opts this loop into automatic
+    // per-turn recompile checking -- see `set_recompile_context`'s own doc.
+    driver.set_recompile_context(RecompileContext {
+        state: state.clone(),
+        home: home.clone(),
+        cfg: cfg.clone(),
+        repo: turn.repo.to_path_buf(),
+    });
     let reservation = execution_pool.as_ref().and_then(|pool| {
         super::super::native_account::reserve_seat_turn(
             &state,
@@ -9164,7 +9327,6 @@ mod tests {
         let state =
             crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
         let cfg = crate::commands::ctx::config::CtxConfig::default();
-        let headless = headless_for(repo.path());
 
         let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
         let (_dir, mut journal, session) = journal_for(&route);
@@ -9185,15 +9347,7 @@ mod tests {
         );
 
         let first = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile check");
         assert!(first, "an empty fingerprint always compiles once");
         assert!(
@@ -9207,15 +9361,7 @@ mod tests {
         );
 
         let second = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile check");
         assert!(
             !second,
@@ -9233,7 +9379,6 @@ mod tests {
         let state =
             crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
         let cfg = crate::commands::ctx::config::CtxConfig::default();
-        let headless = headless_for(repo.path());
 
         let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
         let (_dir, mut journal, session) = journal_for(&route);
@@ -9254,28 +9399,12 @@ mod tests {
         );
 
         driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile");
 
         std::fs::write(repo.path().join("ZIRV.md"), "- a changed rule\n").unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile");
         assert!(changed, "a file changed on disk must be detected");
         assert!(
@@ -9296,6 +9425,279 @@ mod tests {
             "the stale text must not survive the recompile: {:?}",
             driver.config.preamble
         );
+        // The new prefix -- both the rendered text and its hash -- is what
+        // the NEXT request actually gets: `config.preamble`/`context_
+        // version()` are exactly what `build_request` reads, so "reaches the
+        // next request" is the same fact as "is stored in `config` now".
+        assert!(
+            driver.context_version().is_some(),
+            "a recompile always sets a version"
+        );
+        // recompile_if_scope_changed (the wrapper `run_turn` calls) is
+        // invoked from exactly one place in `run_turn` -- before the first
+        // request of a turn is built, never inside the per-request loop --
+        // so a turn already in flight can never be mutated mid-turn by
+        // construction; `run_turn_recompiles_the_instruction_layer_
+        // automatically` below proves the positive, wired case end to end.
+    }
+
+    /// Decision 1's reconciliation with prompt-cache stability: when the
+    /// resolved instruction file list has not changed, `stable_prefix_
+    /// sha256` (this loop's `context_version()`) is byte-identical across
+    /// repeated recompile checks -- the cached prefix is never rebuilt for
+    /// the (common) unchanged case.
+    #[test]
+    fn an_unchanged_scope_keeps_the_stable_prefix_hash_across_turns() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("ZIRV.md"), "- a stable rule\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
+        let cfg = crate::commands::ctx::config::CtxConfig::default();
+
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(r#"{"turns":[]}"#).unwrap(),
+        );
+        let mut tools = FixtureToolExecutor::new(FixtureToolScript::default());
+        let clock = || 1_000u64;
+        let mut driver = NativeLoop::new(
+            config_for(session, route),
+            &provider,
+            &mut tools,
+            &mut journal,
+            Arc::new(CancellationFlag::default()),
+            &clock,
+            &no_env,
+        );
+
+        driver
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
+            .expect("first recompile (turn 1)");
+        let version_turn_1 = driver.context_version().expect("compiled once").to_string();
+        let preamble_turn_1 = driver.config.preamble.clone();
+
+        // Turn 2, turn 3: nothing on disk changed, nothing new touched.
+        for now in [1_001u64, 1_002u64] {
+            let recompiled = driver
+                .recompile_instructions_if_changed(
+                    &state,
+                    home.path(),
+                    &cfg,
+                    repo.path(),
+                    None,
+                    now,
+                )
+                .expect("recompile check");
+            assert!(!recompiled, "an unchanged scope must never recompile");
+            assert_eq!(
+                driver.context_version(),
+                Some(version_turn_1.as_str()),
+                "stable_prefix_sha256 must be byte-identical across turns when nothing changed"
+            );
+            assert_eq!(
+                driver.config.preamble, preamble_turn_1,
+                "the cached prefix itself must never be rebuilt for the unchanged case"
+            );
+        }
+    }
+
+    /// Decision 1: the live wiring. Unlike every test above, this one never
+    /// calls `recompile_instructions_if_changed` directly -- it opts a loop
+    /// in with `set_recompile_context` and drives it only through the real
+    /// production entry point, `run_turn`, proving the instruction layer
+    /// actually reaches a real turn's compiled context without a test
+    /// reaching around the wiring to call the method itself.
+    #[test]
+    fn run_turn_recompiles_the_instruction_layer_automatically() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("ZIRV.md"), "- the original rule\n").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
+        let cfg = crate::commands::ctx::config::CtxConfig::default();
+
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, "fixture-anthropic-model"),
+            FixtureScript::from_json(
+                r#"{"turns":[
+                    {"model":"fixture-anthropic-model","blocks":[{"type":"text","text":"ok"}]},
+                    {"model":"fixture-anthropic-model","blocks":[{"type":"text","text":"ok"}]}
+                ]}"#,
+            )
+            .unwrap(),
+        );
+        let mut tools = FixtureToolExecutor::new(FixtureToolScript::default());
+        let clock = || 1_000u64;
+        let mut driver = NativeLoop::new(
+            config_for(session, route),
+            &provider,
+            &mut tools,
+            &mut journal,
+            Arc::new(CancellationFlag::default()),
+            &clock,
+            &no_env,
+        );
+        driver.set_recompile_context(RecompileContext {
+            state: state.clone(),
+            home: home.path().to_path_buf(),
+            cfg: cfg.clone(),
+            repo: repo.path().to_path_buf(),
+        });
+
+        assert!(
+            driver.context_version().is_none(),
+            "nothing has compiled yet"
+        );
+        driver.acknowledge("go", false).unwrap();
+        driver.run_turn().expect("first turn");
+        assert!(
+            driver
+                .config
+                .preamble
+                .iter()
+                .any(|line| line.contains("the original rule")),
+            "run_turn itself must have recompiled the instruction layer: {:?}",
+            driver.config.preamble
+        );
+        let version_after_turn_1 = driver
+            .context_version()
+            .expect("run_turn recompiled once")
+            .to_string();
+
+        std::fs::write(repo.path().join("ZIRV.md"), "- a changed rule\n").unwrap();
+        driver.acknowledge("continue", false).unwrap();
+        driver.run_turn().expect("second turn");
+        assert!(
+            driver
+                .config
+                .preamble
+                .iter()
+                .any(|line| line.contains("a changed rule")),
+            "a file changed between turns must reach the SECOND turn's own request: {:?}",
+            driver.config.preamble
+        );
+        assert_ne!(
+            driver.context_version(),
+            Some(version_after_turn_1.as_str()),
+            "the context version must advance when run_turn recompiles"
+        );
+    }
+
+    // -- issue #538 (chunk C), decision 2: typed touched paths -------------
+
+    fn typed_call(name: &str, arguments: serde_json::Value) -> NativeToolCall {
+        NativeToolCall {
+            id: ToolCallId::new("call-1").unwrap(),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    /// One family per built-in tool that names a repository path, extracted
+    /// through its own real typed argument (`ReadFileArgs.path`, `GlobArgs.
+    /// root`, `ProcessStartArgs.cwd`, ...), never a generic `"path"` guess.
+    #[test]
+    fn touched_path_extraction_uses_each_tools_real_typed_argument() {
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::FILE_READ,
+                serde_json::json!({"path": "src/a.rs"})
+            )),
+            Some(PathBuf::from("src/a.rs")),
+            "file_read"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::FILE_WRITE,
+                serde_json::json!({
+                    "path": "src/b.rs", "content": "x", "idempotency_key": "k"
+                })
+            )),
+            Some(PathBuf::from("src/b.rs")),
+            "file_write"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::APPLY_PATCH,
+                serde_json::json!({
+                    "path": "src/c.rs", "expected_sha256": "x", "operations": [],
+                    "idempotency_key": "k"
+                })
+            )),
+            Some(PathBuf::from("src/c.rs")),
+            "apply_patch (edit)"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::DIRECTORY_LIST,
+                serde_json::json!({"path": "src"})
+            )),
+            Some(PathBuf::from("src")),
+            "directory_list"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::GLOB_SEARCH,
+                serde_json::json!({"root": "crates", "pattern": "*.rs"})
+            )),
+            Some(PathBuf::from("crates")),
+            "glob_search"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::TEXT_SEARCH,
+                serde_json::json!({"root": "crates", "query": "foo"})
+            )),
+            Some(PathBuf::from("crates")),
+            "text_search (grep)"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::PROCESS_START,
+                serde_json::json!({
+                    "program": "cargo", "cwd": "crates/api", "idempotency_key": "k"
+                })
+            )),
+            Some(PathBuf::from("crates/api")),
+            "process_start (shell cwd)"
+        );
+    }
+
+    /// A tool with no path-bearing argument at all (memory), an unregistered
+    /// tool name, and an empty path value all contribute nothing -- the
+    /// touched scope is never widened by a tool the enumeration does not
+    /// recognise or a value that names no real path.
+    #[test]
+    fn an_unknown_or_pathless_tool_never_widens_the_touched_scope() {
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::MEMORY_RECALL,
+                serde_json::json!({"scope": "session", "query": "x"})
+            )),
+            None,
+            "a tool with no path-bearing argument"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                "some_future_tool_not_yet_enumerated",
+                serde_json::json!({"path": "src/a.rs"})
+            )),
+            None,
+            "an unrecognised tool name, even with a path-shaped argument"
+        );
+        assert_eq!(
+            touched_path_from_call(&typed_call(
+                super::super::tools::FILE_READ,
+                serde_json::json!({"path": ""})
+            )),
+            None,
+            "an empty path value"
+        );
     }
 
     /// Decision 2's guard: recompiling the instruction layer touches only
@@ -9309,7 +9711,6 @@ mod tests {
         let state =
             crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
         let cfg = crate::commands::ctx::config::CtxConfig::default();
-        let headless = headless_for(repo.path());
 
         let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
         let (_dir, mut journal, session) = journal_for(&route);
@@ -9337,27 +9738,11 @@ mod tests {
         let workflow_gate_before = driver.config.workflow_gate.clone();
 
         driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile");
         std::fs::write(repo.path().join("ZIRV.md"), "- rule two\n").unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile");
         assert!(changed);
 
@@ -9386,8 +9771,6 @@ mod tests {
         let state =
             crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
         let cfg = crate::commands::ctx::config::CtxConfig::default();
-        let mut headless = headless_for(repo.path());
-        headless.role = "orchestrator";
 
         let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
         let (_dir, mut journal, session) = journal_for(&route);
@@ -9417,7 +9800,6 @@ mod tests {
                     home.path(),
                     &cfg,
                     repo.path(),
-                    &headless,
                     None,
                     1_000,
                 )
@@ -9458,7 +9840,6 @@ mod tests {
         let state =
             crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
         let cfg = crate::commands::ctx::config::CtxConfig::default();
-        let headless = headless_for(repo.path());
 
         let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
         let (_dir, mut journal, session) = journal_for(&route);
@@ -9480,15 +9861,7 @@ mod tests {
         let route_before = driver.config.route.clone();
 
         driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile, no instruction file yet");
         assert_eq!(driver.config.route, route_before);
 
@@ -9498,15 +9871,7 @@ mod tests {
         )
         .unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                &headless,
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile, with the adversarial file");
         assert!(changed, "the file change is detected");
         assert_eq!(
