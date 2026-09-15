@@ -334,6 +334,9 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     }
     if let Some(tokens) = worker_budget.tokens {
         limits.max_output_tokens = tokens;
+        // Carry the delegation ceiling to the loop as well. Official
+        // execution must refuse a token ceiling it cannot enforce.
+        limits.max_budget_tokens = Some(tokens);
     }
 
     // The one human line a run can owe before its status exists is a resume's

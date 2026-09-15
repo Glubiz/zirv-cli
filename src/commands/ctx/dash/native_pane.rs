@@ -203,6 +203,19 @@ pub fn build_transcript(state: &ConversationState) -> TranscriptView {
                     let message_id = message.message_id.as_str().to_string();
                     match block {
                         AssistantBlock::Text { text } => {
+                            // Official process streaming persists incremental text
+                            // as committed observations. Present adjacent chunks
+                            // as one response rather than one bubble per token.
+                            if message_id.starts_with("execution-text-")
+                                && let Some(TranscriptItem::AssistantText {
+                                    message_id: previous,
+                                    text: accumulated,
+                                }) = items.last_mut()
+                                && previous.starts_with("execution-text-")
+                            {
+                                accumulated.push_str(text);
+                                continue;
+                            }
                             items.push(TranscriptItem::AssistantText {
                                 message_id,
                                 text: text.clone(),
@@ -3244,11 +3257,24 @@ impl NativePaneRuntime {
     fn route_label(&self) -> String {
         self.route
             .as_ref()
-            .map(|route| route.route.to_string())
+            .map(
+                |route| match super::super::runtime::execution::spec(route.endpoint.as_ref()) {
+                    Ok(spec) => format!(
+                        "{} via {} (subscription; spend unknown)",
+                        route.route, spec.id
+                    ),
+                    Err(_) => route.route.to_string(),
+                },
+            )
             .unwrap_or_else(|| style::PLACEHOLDER.to_string())
     }
 
     fn context_left(&self) -> Option<u8> {
+        if self.route.as_ref().is_some_and(|route| {
+            super::super::runtime::execution::spec(route.endpoint.as_ref()).is_ok()
+        }) {
+            return None; // The official harness owns compaction and its context window.
+        }
         self.route
             .as_ref()
             .and_then(|route| context_left_pct(route, &self.recorded_usage))

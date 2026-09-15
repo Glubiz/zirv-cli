@@ -18,6 +18,13 @@ pub struct ProviderArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ProviderVerb {
+    /// Hand authentication to the route's official, unmodified provider CLI.
+    Login { route: super::provider::RouteId },
+    /// Offline official CLI version, capabilities and non-secret auth status.
+    Status { route: super::provider::RouteId },
+    /// Internal MCP relay; not a credential transport.
+    #[command(hide = true)]
+    Bridge,
     /// Create a commented ~/.zirv/native.toml template.
     Init,
     /// List native providers, endpoints, accounts, routes and capabilities.
@@ -76,6 +83,9 @@ const TEMPLATE: &str = r#"schema = 1
 "#;
 
 pub fn run(args: &ProviderArgs, w: &mut dyn Write) -> CtxResult<i32> {
+    if matches!(args.command, ProviderVerb::Bridge) {
+        return super::runtime::execution::bridge_stdio();
+    }
     let home = crate::utils::home_dir()?;
     let repo = std::env::current_dir()?;
     let env = env_from_process();
@@ -117,7 +127,24 @@ fn run_with(
         return Ok(0);
     };
     match &args.command {
-        ProviderVerb::Init => unreachable!(),
+        ProviderVerb::Init | ProviderVerb::Bridge => unreachable!(),
+        ProviderVerb::Login { route } | ProviderVerb::Status { route } => {
+            use super::runtime::execution;
+            let execution = cfg.routes.get(route).and_then(|route| route.execution.as_ref())
+                .ok_or("select a route with execution.adapter = 'claude-code'; direct API credentials use provider credential set")?;
+            execution.validate(&cfg, route)?;
+            let adapter = execution::discover(execution, repo, home, env)?;
+            if matches!(args.command, ProviderVerb::Login { .. }) {
+                adapter.login()
+            } else {
+                writeln!(
+                    w,
+                    "{}",
+                    serde_json::to_string_pretty(&adapter.diagnostic())?
+                )?;
+                Ok(0)
+            }
+        }
         ProviderVerb::List { json } => {
             let inventory = Inventory::build(&cfg, env, store, now, None);
             print_inventory(&inventory, *json, w)?;
@@ -125,7 +152,8 @@ fn run_with(
         }
         ProviderVerb::Check { live, role, json } => {
             let live_probe = live.then_some(probe);
-            let inventory = Inventory::build(&cfg, env, store, now, live_probe);
+            let mut inventory = Inventory::build(&cfg, env, store, now, live_probe);
+            inventory.inspect_executions(&cfg, home, repo, env);
             print_check(&inventory, role.as_deref(), *json, w)
         }
         ProviderVerb::Credential(CredentialArgs {
@@ -227,6 +255,11 @@ fn print_inventory(inventory: &Inventory, json: bool, w: &mut dyn Write) -> CtxR
         "\nROUTE\tMODEL\tPROFILE\tSTATE\tCAPABILITIES\tALLOWED\tPROBLEM"
     )?;
     for route in &inventory.routes {
+        writeln!(
+            w,
+            "{}: execution={} auth={} billing={:?}",
+            route.route, route.execution_backend, route.authentication_owner, route.billing
+        )?;
         writeln!(
             w,
             "{}\t{}/{}\t{}\t{}\t{}\t{}\t{}",

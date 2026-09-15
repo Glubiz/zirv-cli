@@ -82,6 +82,9 @@ impl Default for AccountConfig {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouteConfig {
+    /// An official provider process owns the model connection and agent loop.
+    /// Absent means the existing direct API transport.
+    pub execution: Option<crate::commands::ctx::runtime::execution::ExecutionConfig>,
     pub account: AccountId,
     pub endpoint: Option<EndpointId>,
     pub model: String,
@@ -97,6 +100,7 @@ pub struct RouteConfig {
 impl Default for RouteConfig {
     fn default() -> Self {
         Self {
+            execution: None,
             account: AccountId::new("missing").expect("static account id"),
             endpoint: None,
             model: String::new(),
@@ -209,6 +213,16 @@ impl NativeConfig {
     }
 
     pub fn account_pool(&self, id: &AccountId) -> BillingPoolId {
+        // One local official login is one allowance pool, even when several
+        // configured accounts/routes alias it. Never multiply its capacity.
+        if let Some(execution) = self.routes.values().find_map(|route| {
+            (&route.account == id)
+                .then_some(route.execution.as_ref())
+                .flatten()
+        }) && let Ok(spec) = crate::commands::ctx::runtime::execution::spec(&execution.adapter)
+        {
+            return BillingPoolId::new(spec.shared_pool).expect("static execution pool");
+        }
         self.accounts
             .get(id)
             .and_then(|account| account.pool.clone())
@@ -277,6 +291,11 @@ impl NativeConfig {
     }
 
     fn validate(&self, path: &Path) -> CtxResult<()> {
+        for (id, route) in &self.routes {
+            if let Some(execution) = &route.execution {
+                execution.validate(self, id)?;
+            }
+        }
         for (id, endpoint) in &self.endpoints {
             let key = format!("endpoint.{id}");
             let spec = provider(endpoint.provider.as_ref()).ok_or_else(|| {

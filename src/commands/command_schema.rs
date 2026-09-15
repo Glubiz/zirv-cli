@@ -226,6 +226,8 @@ const MUTATING: &[&str] = &[
     "zirv ctx objective close",
     "zirv ctx permissions compile",
     "zirv ctx permissions propose",
+    "zirv ctx provider login",
+    "zirv ctx provider status", // official non-model process probe; may create private startup state
     "zirv ctx provider init",
     "zirv ctx provider check",
     "zirv ctx provider credential set",

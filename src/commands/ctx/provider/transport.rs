@@ -193,7 +193,17 @@ pub(crate) fn read_sse_line<R: BufRead>(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) => {}
+                ) || error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<ureq::Error>())
+                    .is_some_and(|source| matches!(source, ureq::Error::Timeout(_))) =>
+            {
+                // ureq's BodyReader wraps its timeout as ErrorKind::Other.
+                // The supervisor owns the first-event/idle deadline;
+                // don't turn a read poll into a transport outage. Yield
+                // in case a reader keeps returning an expired deadline.
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                 return Err(invalid_stream(format!(
                     "{provider} SSE contains invalid UTF-8"
@@ -460,6 +470,30 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.class, FailureClass::FirstEventTimeout);
         assert!(error.retry.retryable);
+    }
+
+    #[test]
+    fn a_wrapped_ureq_timeout_preserves_partial_sse_until_the_next_read() {
+        struct Reader {
+            polls: u8,
+        }
+        impl Read for Reader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.polls += 1;
+                let chunk: &[u8] = match self.polls {
+                    1 => b"data: ",
+                    2 => return Err(ureq::Error::Timeout(ureq::Timeout::RecvBody).into_io()),
+                    3 => b"hello\n",
+                    _ => return Ok(0),
+                };
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+        let mut reader = std::io::BufReader::new(Reader { polls: 0 });
+        let mut line = String::new();
+        read_sse_line(&mut reader, &mut line, "Test", &NeverCancelled, &target()).unwrap();
+        assert_eq!(line, "data: hello\n");
     }
 
     #[test]

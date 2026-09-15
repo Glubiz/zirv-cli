@@ -95,7 +95,9 @@ pub(crate) fn native_placement(
             .harness(name)
             .and_then(|row| row.identity.model.clone())
     });
-    // Only an UNHEALTHY verdict refuses admission. Every other exclusion the
+    // Execution routes also enforce confirmed capacity refusals from the
+    // official harness pool, including an operator opt-out of unknown headroom.
+    // For direct transports only an UNHEALTHY verdict refuses admission. Every other exclusion the
     // allocator reports for a native row today is a capacity reading it does
     // not have yet: a native pool has no per-minute window of its own, so it
     // ranks `Unknown`, which for a harness means "prefer someone else" and
@@ -108,9 +110,23 @@ pub(crate) fn native_placement(
         .iter()
         .find(|(name, why)| {
             name.eq_ignore_ascii_case(&requested)
-                && matches!(why, allocator::Exclusion::Unhealthy(_))
+                && (matches!(why, allocator::Exclusion::Unhealthy(_))
+                    || (native
+                        .routes
+                        .get(route_id)
+                        .is_some_and(|route| route.execution.is_some())
+                        && matches!(
+                            why,
+                            allocator::Exclusion::HardBlocked
+                                | allocator::Exclusion::Draining(_)
+                                | allocator::Exclusion::AtMaxActive { .. }
+                                | allocator::Exclusion::InsufficientHeadroom { .. }
+                                | allocator::Exclusion::UnknownHeadroomOptedOut
+                                | allocator::Exclusion::Disabled
+                                | allocator::Exclusion::Ineligible(_)
+                        )))
         })
-        .map(|(name, why)| format!("native route `{name}` is not healthy right now: {why:?}"));
+        .map(|(name, why)| format!("native route `{name}` cannot run right now: {why:?}"));
     // The requested route is the placement when nothing excluded it on
     // health: an operator's configured route is never silently swapped for
     // another vendor's billing (#487 item 6), so `selected` reports what the
@@ -182,7 +198,12 @@ pub(crate) fn settle_native_run(
             session: &status.session,
             parent_session: settlement.parent_session.unwrap_or_default(),
             work_group_id: settlement.group,
-            agent: RuntimeKind::Native.as_str(),
+            agent: status
+                .execution
+                .as_ref()
+                .map_or(RuntimeKind::Native.as_str(), |execution| {
+                    execution.backend.as_str()
+                }),
             model: Some(&status.configured_model),
             input_tokens: status.usage.input_tokens,
             cache_creation_input_tokens: status.usage.cache_creation_input_tokens,
@@ -519,6 +540,7 @@ mod tests {
         crate::commands::ctx::runtime::native::NativeFinalStatus {
             schema_version: 1,
             runtime: RuntimeKind::Native.as_str(),
+            execution: None,
             status,
             session: "11111111-2222-4333-8444-555555555555".to_string(),
             route: "opus".to_string(),

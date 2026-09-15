@@ -38,7 +38,7 @@ verification/helper-model calls natively · N16 #485 meta-orchestrator/mixed
 teams · N17 #486 compaction/rot recovery/checkpoints · N18 #487 usage/
 spend/health · N19 #488 rollover · N20 #489 persistent runtime/protocol ·
 N21 #490 UX · N22 #491 setup/migration/diagnostics/docs/packaging · N23 #492
-parity proof.
+parity proof · N24 #650 official provider execution.
 
 ## Commands
 
@@ -91,7 +91,7 @@ criterion).
 | `ctx optimize` | N15 (#484) |  |
 | `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
 | `ctx permissions` | N04 (#473) | canonical policy and approval audit remain shared; native effects consume them through `runtime::enforcement` |
-| `ctx provider` | N02 (#471) | `init`, `list`, `check`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
+| `ctx provider` | N02 (#471) | `init`, `list`, `check`, official execution `login`/`status`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
 | `ctx recall` | N06 (#475) | native `memory_recall` preserves session/private/global/shared precedence |
 | `ctx remember` | N06 (#475) | native `memory_remember` defaults to session scope; shared writes retain policy/writer enforcement |
 | `ctx resume` | N17 (#486) |  |
@@ -198,6 +198,7 @@ installed binary during self-update; never spawns it).
 
 | Entry point | Path | Symbol | Owner | Notes |
 |---|---|---|---|---|
+| Official provider execution | `src/commands/ctx/runtime/execution.rs` | `run` | N24 (#650) | official unmodified Claude Code owns model/agent loop; native UI and Zirv MCP broker own presentation/effects; no subscription token transport |
 | Native Anthropic Messages request | `src/commands/ctx/provider/anthropic.rs` | `perform_blocking` | N07 (#476) | direct HTTPS/SSE transport behind `ProviderAdapter`; no vendor CLI or SDK agent loop |
 | Native OpenAI Responses request | `src/commands/ctx/provider/openai.rs` | `perform_blocking` | N08 (#477) | direct HTTPS/SSE transport behind `ProviderAdapter`; no Codex binary, SDK, or App Server |
 | Native Google Gemini request | `src/commands/ctx/provider/google.rs` | `perform_blocking` | N12 (#481) | direct HTTPS/SSE transport behind `ProviderAdapter`; explicit Developer/Vertex protocol profiles, no Gemini CLI |

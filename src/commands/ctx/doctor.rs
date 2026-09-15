@@ -168,7 +168,11 @@ pub fn classify(message: &str) -> FindingKind {
     if lower.contains("no adapter yet") || lower.contains("no route profile binds") {
         return FindingKind::MissingTool;
     }
-    if lower.contains("credential") {
+    if lower.contains("credential")
+        || lower.contains("login needed")
+        || lower.contains("auth status unknown")
+        || lower.contains("wrong effective billing route")
+    {
         return FindingKind::MissingAuthMaterial;
     }
     if lower.contains("model") {
@@ -595,9 +599,12 @@ fn run_with(
             return Ok(1);
         }
     };
-    let inventory = native
+    let mut inventory = native
         .as_ref()
         .map(|native| Inventory::build(native, env, store, now, probe));
+    if let (Some(native), Some(inventory)) = (&native, &mut inventory) {
+        inventory.inspect_executions(native, home, repo, env);
+    }
     let integrations = super::runtime::capabilities::discover(&cfg, repo);
     // Issue #597 (roadmap N22): `ready()` is fail-open by design (see
     // `adapters::resolve_program`'s own doc comment) -- a program that

@@ -2763,6 +2763,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
+| `route.<id>.execution` | `~/.zirv/native.toml` only; selects an official provider process and optional absolute executable path. Repository layers cannot select executables, login methods, billing or startup settings; all effects retain the native broker |
 | `native.toml` keys other than `policy.allowed_routes` and `policy.compaction` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, and repository `compaction` may only narrow `automatic` to `advisory`, never the reverse |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
@@ -2955,8 +2956,9 @@ and a `base_url` unless the vendor's route profile has a documented one.
 Account pools default to the account id; two accounts may deliberately share
 one `pool` when they share quota. Every API-billed account except
 `openai-compatible` must declare a credential reference. Subscription-billed
-accounts may omit one; even when one is declared, their native routes stop at
-`configured` with the harness-entitlement problem. Credential references are
+accounts may omit one. A direct API route on such an account stops at
+`configured` with an entitlement problem; an explicit provider-owned execution
+route uses the official harness login, as described below. Credential references are
 `env:NAME`, `store:<item>`, or `file:<path>` (`~` expands; Unix files must be
 mode 0600 or stricter). Claude Code/Codex harness login tokens are refused:
 Claude.ai and ChatGPT subscriptions are entitlements for the harness backend,
@@ -2971,8 +2973,9 @@ The evidence ladder is `recognized` → `configured` → `credentialed` →
 `reachable` → `authenticated` → `validated`. Catalogue recognition never
 claims account access, and `authenticated` specifically means a credential was
 accepted. A credential-less compatible route stops at `configured` offline
-and can reach only `reachable` during a live check. The offline commands stop
-at `credentialed`; `--live` can establish reachability/authentication, while
+and can reach only `reachable` during a live check. Direct API offline commands stop
+at `credentialed`; official-harness checks may attest a signed-in account without
+a model call (model access remains unverified). For direct API routes, `--live` can establish reachability/authentication, while
 `validated` remains unavailable until the native model transports record a
 real validation. Credentials are withheld from plaintext HTTP on non-loopback
 hosts and that live probe is skipped; loopback HTTP remains available for
@@ -2983,6 +2986,120 @@ The optional repository layer `<repo>/.zirv/native.toml` may contain only
 intersected with the operator's set, so a checkout can narrow access but
 cannot add accounts, endpoints, routes, role bindings, credentials, or
 permissions.
+
+#### Provider-owned execution in the native UI
+
+A route may use an official provider harness while retaining Zirv's native
+conversation UI, tasks, approvals and tool broker. This is distinct from direct
+API execution: the official process owns the model connection, agent loop and
+local conversation. Provider identity, execution backend, authentication owner
+and billing are separate route facts. Initially the adapter registry supports
+`claude-code`; adding another provider requires an execution adapter and an
+independent review of that provider's rules, not a subscription-token transport.
+
+```toml
+# ~/.zirv/native.toml (operator configuration only)
+schema = 1
+
+[account.personal-claude]
+provider = "anthropic"
+billing = "subscription"
+# No credential. Claude Code owns authentication.
+
+[route.personal-claude]
+account = "personal-claude"
+model = "sonnet"
+execution = { adapter = "claude-code" }
+# Optional absolute path; spaces are supported:
+# execution = { adapter = "claude-code", program = "/opt/Claude Code/claude" }
+
+[roles]
+orchestrator = "personal-claude"
+worker = "personal-claude"
+```
+
+Run `zirv ctx provider login personal-claude` to hand the terminal directly to
+**official Claude Code's login**, then `zirv ctx provider status personal-claude`.
+Zirv does not read, import, store or refresh subscription credentials, login
+URLs or authorization codes. A missing binary is never silently installed.
+Removing this route from `native.toml` leaves Claude Code signed in. To log out
+of the official installation, run `claude auth logout` yourself; that affects
+Claude Code sessions outside Zirv too. Its API and cloud login choices remain
+available in the official CLI; select a compatible Zirv route when using them.
+
+`zirv chat --runtime native` uses this route for the orchestrator. Native workers
+use their configured role routes and retain the existing task, mail, delegation,
+writer-lease and generation fences. The UI identifies the backend and selected
+billing. Headless final status schema **3** adds an `execution` object for these
+routes with backend/version/auth owner, estimated API-equivalent cost, and
+separate nullable billed-spend and remaining-allowance fields.
+
+**Initial capability boundary.** Requires a local, unmodified native Claude Code
+2.1.248+ executable in the 2.1 series, its documented restricted/settings/tool/MCP
+flags, and a public status response attesting a first-party Pro/Max login.
+Windows/WSL (managed-policy verification pending), npm shell shims, managed
+Team/Enterprise policy, unknown status formats,
+and an explicit token-budget ceiling are rejected before a model turn.
+Turn/time limits, streaming, follow-up and exact-session continuation are
+supported. Steering waits until the next turn; it is never reported as immediate.
+No live installation/platform compatibility is implied by fixture tests.
+
+Claude Code starts in a private Zirv directory with project/user settings
+excluded, hooks disabled, and only the explicit Zirv MCP server. Managed startup
+configuration that could override this boundary is rejected. Claude built-in
+tools and internal subagents are unavailable on this route; coding, shell,
+external services and independently scheduled workers use Zirv MCP tools. Every
+such effect passes the existing native broker, sandbox, exact-action approval,
+repository narrowing and generation checks. A denied approval produces a tool
+error, never an automatic permission-mode escalation. Streamed tool observations
+are not executed again. Tool subprocesses receive no provider credentials.
+
+**Billing.** Environment API keys, endpoint/cloud overrides and public
+`apiKeyHelper` settings conflict with subscription selection and are refused
+without printing their values. No authentication failure or exhausted allowance
+causes an automatic API fallback. All aliases of the local official login share
+one `anthropic` capacity pool. Unknown allowance is unknown,
+not unlimited. The official result's dollar figure and `zirv ctx spend` are
+API-equivalent estimates, not invoices. Billed spend remains unknown. Paid usage
+credits can permit additional upstream charges: disable them in Claude's
+**Settings → Usage** if desired; Zirv cannot verify that switch or promise zero
+additional charges.
+
+A successful turn persists an exact Claude session reference bound to its Zirv
+seat, route and workspace. Follow-up resumes only that reference. Cancellation
+before any tool effect can resume; a crash or interrupted effect with uncertain
+delivery leaves a reconciliation block. Inspect effects and use a new session
+with a portable checkpoint before retrying; Zirv never blindly replays the task.
+A provider-owned continuation cannot become an API conversation. Cross-runtime
+handoff transfers Zirv task/artifact/approval state, with the existing exclusive
+writer and worker/mail disposition rules.
+
+**Policy evidence, checked 2026-09-15.** This design relies on Anthropic's explicit
+allowance for running the unmodified binary under the applicable terms and
+conditions, with users authenticating themselves. It does not offer Zirv-owned
+Claude login or claim endorsement. The June 15 pause means print-mode usage
+currently draws subscription limits; this is not a guarantee of permanent
+eligibility. The SDK documentation retains restrictive third-party-login
+language; extending this design beyond the unmodified-binary allowance requires
+clarification from Anthropic. See [legal and compliance](https://code.claude.com/docs/en/legal-and-compliance),
+[the current subscription notice](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan),
+[programmatic execution](https://code.claude.com/docs/en/headless), and the
+[decision and validation note](docs/superpowers/2026-09-15-provider-execution.md).
+This replaces #644's Claude-specific token-import proposal; it grants no
+entitlement for other providers. Direct Anthropic API routes still work without
+Claude Code installed and continue rejecting harness-login secrets before HTTP.
+
+**Opt-in live smoke (uses your own allowance).** Record `claude --version` and the
+sanitized `provider status` output. In an authorized disposable worktree, open
+`zirv chat --runtime native`, ask for a bounded file edit and its verification,
+and check streamed text, one tool receipt per effect, and the backend/billing
+label. Send a follow-up and confirm the same external session in the journal's
+`provider_execution` checkpoint. Interrupt a response before tool work, then
+resume with a follow-up. For an interrupted effect, verify the reconciliation
+block instead of replaying it. Finally restart/reattach the Zirv session and
+check task/mail state. Never copy raw auth output, MCP configuration or login
+codes into a report. Fixture results and actual live versions/platforms must be
+reported separately.
 
 #### Native setup, diagnosis and rollback
 
@@ -3013,17 +3130,18 @@ because the operator's next action is different for each:
 | `service-failure` | The endpoint is configured and credentialed but did not answer | Check the endpoint URL, the network, and the provider's status |
 | `upstream-entitlement` | A genuine upstream limitation, not a zirv gap: a subscription-billed account, or a vendor surface that exists only inside that vendor's CLI | Use an API-billed account, or keep that surface on the harness backend |
 
-The doctor writes nothing and exits `1` only when a role that *would* run
+For provider-owned routes, doctor checks the official CLI's non-model version/auth
+interfaces and may create its private startup directory. It exits `1` only when a role that *would* run
 natively has no usable route. Its output is redacted the way `zirv ctx
 snapshot` is — every line is screened for credential shapes, high-entropy and
 opaque runs, and any line that opens like a conversation turn is replaced
 outright — so a doctor dump is safe to paste into a bug report. It carries no
 transcript text and no continuation data by construction.
 
-**Billing.** A route's `billing` is `api` or `subscription`. Native operation
-spends API billing only: a Claude.ai or ChatGPT subscription is an entitlement
-for that vendor's own CLI, and its login token is refused as a native
-credential (`credential set` refuses those store refs before it reads a
+**Billing.** A route's `billing` is `api` or `subscription`. Direct provider
+execution requires API billing; explicit provider-owned execution can use its
+official harness login under the boundary above. Subscription tokens remain
+refused as native API credentials (`credential set` refuses those store refs before it reads a
 secret). Accounts that share quota share a `pool`, and the usage windows
 (`zirv ctx usage`) aggregate per pool, so two accounts on one plan are not
 double-counted. `zirv ctx spend --by` groups the delegation ledger by
@@ -3085,8 +3203,9 @@ Genuine upstream entitlement limitations:
 
 - **Subscription plans are not API entitlements.** A Claude.ai or ChatGPT
   subscription cannot be spent through a direct provider API call. Native
-  routes on a subscription-billed account stop at `configured` with that
-  problem named, and the harness backend remains the way to spend it.
+  direct API routes on a subscription-billed account stop at `configured`
+  with that problem named. Explicit official execution routes use the vendor
+  harness while retaining the native Zirv seat.
 - **Harness login tokens are refused as credentials.** Reusing the vendor
   CLI's stored login for direct API calls is outside what that token is
   issued for; `credential set` refuses those store refs before reading a

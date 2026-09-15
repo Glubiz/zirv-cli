@@ -691,6 +691,11 @@ fn read_stdin() -> String {
 
 /// `args[0]` is the literal "ctx" as it appeared in argv.
 pub fn dispatch(args: &[String]) -> i32 {
+    // The private MCP relay must not probe harness readiness, load repository
+    // configuration, or construct the ordinary CLI before authenticating.
+    if args.len() == 3 && args[1] == "provider" && args[2] == "bridge" {
+        return runtime::execution::bridge_stdio().unwrap_or(1);
+    }
     let argv = std::iter::once("zirv ctx".to_string()).chain(args.iter().skip(1).cloned());
     let cli = match CtxCli::try_parse_from(argv) {
         Ok(cli) => cli,

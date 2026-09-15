@@ -585,6 +585,12 @@ pub fn offers_from_config(config: &super::provider::config::NativeConfig) -> Vec
                 .endpoint
                 .as_ref()
                 .map(|id| id.as_ref().to_string())
+                .or_else(|| {
+                    route
+                        .execution
+                        .as_ref()
+                        .map(|execution| execution.adapter.clone())
+                })
                 .or_else(|| provider.clone())
                 .unwrap_or_default();
             // A route with no credential at all is a local runtime
@@ -593,8 +599,8 @@ pub fn offers_from_config(config: &super::provider::config::NativeConfig) -> Vec
             // rather than as free, so a spend readout is neither inflated
             // nor silently incomplete.
             let billing = match account.map(|a| (a.billing, a.credential.is_some())) {
-                Some((_, false)) => BillingPosture::Local,
                 Some((BillingClass::Subscription, _)) => BillingPosture::Subscription,
+                Some((_, false)) => BillingPosture::Local,
                 _ => BillingPosture::Api,
             };
             let spec = account.and_then(|a| super::provider::provider(a.provider.as_ref()));
@@ -623,6 +629,12 @@ pub fn offers_from_config(config: &super::provider::config::NativeConfig) -> Vec
                 add(declared.streaming, Capability::Streaming);
                 add(declared.vision, Capability::Vision);
                 add(declared.continuation, Capability::ReplayableReasoning);
+            }
+            if route.execution.is_some() {
+                capabilities.remove(&Capability::Vision);
+                capabilities.remove(&Capability::ReplayableReasoning);
+                capabilities.insert(Capability::ToolCalls);
+                capabilities.insert(Capability::Streaming);
             }
             RouteOffer {
                 route: route_id.as_ref().to_string(),

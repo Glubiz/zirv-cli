@@ -34,6 +34,8 @@ pub struct RouteReport {
     pub protocol: Protocol,
     pub model: ModelId,
     pub billing: BillingClass,
+    pub execution_backend: String,
+    pub authentication_owner: String,
     pub state: RouteState,
     /// The N13 route profile this route binds to, and what that profile's
     /// support status is. An accessible route is never left unbound.
@@ -260,6 +262,45 @@ pub(crate) fn resolve_model(
 }
 
 impl Inventory {
+    /// Official public, non-model status checks. Kept out of pure inventory
+    /// construction and called explicitly by doctor/provider check.
+    pub fn inspect_executions(
+        &mut self,
+        cfg: &NativeConfig,
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        env: EnvLookup<'_>,
+    ) {
+        use super::super::runtime::execution;
+        for report in &mut self.routes {
+            let Some(execution) = cfg
+                .routes
+                .get(&report.route)
+                .and_then(|route| route.execution.as_ref())
+            else {
+                continue;
+            };
+            match execution::discover(execution, repo, home, env) {
+                Ok(adapter) => {
+                    let diagnostic = adapter.diagnostic();
+                    if diagnostic.state.starts_with("signed-in;") {
+                        report.state = RouteState::Authenticated;
+                        report.notes.push(format!(
+                            "{} {}; {}",
+                            diagnostic.backend,
+                            diagnostic.version.as_deref().unwrap_or("unknown version"),
+                            diagnostic.state
+                        ));
+                    } else {
+                        report.problems.push(diagnostic.state);
+                    }
+                }
+                Err(error) => report.problems.push(error.to_string()),
+            }
+        }
+        self.access = access_matrix(cfg, &self.routes);
+    }
+
     pub fn build(
         cfg: &NativeConfig,
         env: EnvLookup<'_>,
@@ -298,6 +339,16 @@ impl Inventory {
                 capabilities: declared(spec.protocol, &model, profile),
                 model,
                 billing: account.billing,
+                execution_backend: route.execution.as_ref().map_or_else(
+                    || "direct-api".to_string(),
+                    |execution| execution.adapter.clone(),
+                ),
+                authentication_owner: if route.execution.is_some() {
+                    "official-harness"
+                } else {
+                    "zirv-api-credential"
+                }
+                .to_string(),
                 state: RouteState::Configured,
                 profile: profile.map(|profile| profile.id),
                 profile_version: profile.map(|profile| profile.version),
@@ -306,6 +357,29 @@ impl Inventory {
                 problems: Vec::new(),
                 notes: catalogue_note.into_iter().collect(),
             };
+            if route.execution.is_some() {
+                report.capabilities.tools = super::capability::Capability::declared(true);
+                report.capabilities.streaming = super::capability::Capability::declared(true);
+                report.capabilities.vision = super::capability::Capability::declared(false);
+                report.capabilities.structured_output =
+                    super::capability::Capability::declared(false);
+                report.capabilities.prompt_caching = super::capability::Capability::Unknown;
+                report.capabilities.reasoning_controls =
+                    super::capability::Capability::declared(false);
+                report.capabilities.continuation = super::capability::Capability::declared(false);
+                report.capabilities.max_output_tokens = None;
+                report.capabilities.source = "execution adapter contract v1; provider conversation resumes by exact session reference";
+                report.endpoint =
+                    EndpointId::new(&report.execution_backend).expect("validated adapter endpoint");
+                report.profile = Some("claude-code-execution");
+                report.profile_version = Some(super::super::runtime::execution::CONTRACT_VERSION);
+                report.notes.push("Official Claude Code owns execution/login; no API fallback. Auth status, model access, billed spend and allowance unknown; use `zirv ctx provider status <route>`. Steering waits for a turn boundary; tools/approvals use Zirv MCP.".into());
+                if let Err(error) = super::super::runtime::execution::check_selectors(env) {
+                    report.problems.push(error.to_string());
+                }
+                routes.push(report);
+                continue;
+            }
             match profile {
                 None => report.problems.push(format!(
                     "no route profile binds vendor `{}` on provider `{}`; an accessible route is \

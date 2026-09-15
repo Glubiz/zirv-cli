@@ -35,6 +35,7 @@ pub mod checkpoint;
 pub mod compaction;
 pub mod context;
 pub mod enforcement;
+pub mod execution;
 pub mod fake;
 pub mod fixture;
 pub mod harness;

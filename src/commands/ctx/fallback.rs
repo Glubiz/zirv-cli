@@ -487,6 +487,16 @@ pub fn capacity_snapshot_with_native(
             identity: offer.identity.clone(),
             offer: Some(offer.clone()),
         };
+        if let Ok(execution) = super::runtime::execution::spec(&offer.identity.endpoint) {
+            let limits = cfg.fallback.harness_limits(execution.harness);
+            row.enabled = cfg.agents.is_enabled(execution.harness);
+            row.max_active = limits.max_active;
+            row.reserve_headroom_pct = cfg.fallback.reserve_headroom_pct(execution.harness);
+            row.active = snapshot
+                .harness(execution.harness)
+                .map_or(0, |h| h.active)
+                .max(super::reservation::active_count(state, &pool));
+        }
         let (row_state, reason) = allocator::classify(&row, &provider_capacity, cfg);
         row.state = row_state;
         row.state_reason = reason;
