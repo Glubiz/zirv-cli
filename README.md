@@ -562,6 +562,13 @@ to the section that documents it in depth.
   delegates one task to a supervised worker on another enabled harness
   (also `zirv agent`). See [Verbs](#verbs) and [Just Run
   `zirv`](#just-run-zirv).
+- **Experimental: `native`** — a thin, case-insensitive top-level alias
+  (`zirv native`) for `zirv chat --runtime native`, reserved so a script or
+  shortcut can never shadow it. Shown only in `zirv help`'s separately
+  labelled "Experimental / work in progress" section, never beside the
+  stable commands; `zirv commands --json` reports it with `"stability":
+  "experimental"` and `"runtime": "native"`. See [The native conversation
+  pane](#the-native-conversation-pane).
 - **Handoffs and recovery** — `score` rot-scores a transcript, `handoff`
   distills one, `resume` starts a clean session with the latest handoff
   injected, `handover` swaps the orchestrator seat's model or harness in
@@ -1207,7 +1214,7 @@ marks it as shadowed in the listing.
 <!-- zchk-doc-reserved:start -->
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
 `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`,
-`commands`, `update`, `session`, and their short aliases `h`, `v`, `i`, `c`,
+`commands`, `update`, `session`, `native`, and their short aliases `h`, `v`, `i`, `c`,
 <!-- zchk-doc-reserved:end -->
 are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
@@ -1809,6 +1816,26 @@ driving an in-process, multi-turn native session on a background thread:
 ```
 zirv chat --runtime native
 ```
+
+**Experimental: `zirv native`.** `zirv native` (case-insensitive) is a thin
+top-level alias for `zirv chat --runtime native` above: `main.rs` rewrites
+the argv to the identical `ctx chat --runtime native` shape before
+`ctx::dispatch` ever runs, so there is exactly one native-chat launch path
+either spelling reaches — no second implementation to keep in sync. `zirv
+native --help` documents its own syntax, prerequisites, limitations, and
+where session/journal state lives, and exits 0. `zirv help` never lists it
+beside the stable commands; it appears only in a separately labelled
+"Experimental / work in progress" section, and `zirv commands --json`
+reports it with `"stability": "experimental"` and `"runtime": "native"` so
+automation and docs generation can tell "hidden help" from "does not exist".
+Launching it prints a one-time notice on stderr ("zirv native is
+experimental; `zirv chat` remains the stable harness."), never repeated per
+turn and never folded into the model's own context; `zirv chat --runtime
+native` itself never prints that notice, since it is keyed on the alias
+having been used, not on the runtime chosen. Like the flag it rewrites to,
+it never changes the operator's default runtime, migrates configuration, or
+falls back to a wrapped harness — reject-with-a-refusal is the only response
+to a missing prerequisite (see `zirv ctx doctor`).
 
 `zirv chat` takes no `--route` or `--view` flag (those are `zirv ctx exec
 --runtime native`'s own) — the native pane always spends the `orchestrator`

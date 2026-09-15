@@ -310,6 +310,86 @@ fn probe_terminal() -> (bool, bool, bool, (u16, u16), Option<term::VtGuard>) {
     (stdout_is_tty, stdin_is_tty, vt_ok, size, vt_guard)
 }
 
+/// Issue #540: set by `main.rs`'s `zirv native` alias rewrite
+/// (`rewrite_native_alias_args`) on the process environment, immediately
+/// before it calls `ctx::dispatch` -- never by an operator directly. Read
+/// back here (through the same `EnvLookup` closure every other environment
+/// signal in this function already goes through, e.g. `quiet_env`'s
+/// `ZIRV_CTX_QUIET`) so `run_native_chat` can tell the `zirv native` alias
+/// apart from an explicit `zirv chat --runtime native`, even though both
+/// launch through this exact same function -- there is no second native
+/// launch path anywhere for the alias to have its own copy of. An argv-based
+/// signal (a hidden flag on `ChatArgs`) was the alternative; the environment
+/// was chosen because it needs no new clap surface on a struct an operator's
+/// own `--help` already renders, and it keeps `command_schema.rs`'s
+/// `zirv chat` flag list identical to what an operator can actually pass.
+pub const NATIVE_ALIAS_ENV: &str = "ZIRV_CTX_NATIVE_ALIAS";
+
+/// The one-time, low-noise notice `run_native_chat` prints on `stderr` when
+/// launched through the `zirv native` alias (see [`NATIVE_ALIAS_ENV`]) --
+/// never for an explicit `zirv chat --runtime native`, and never repeated
+/// per turn or folded into the model's own context.
+pub const NATIVE_ALIAS_BANNER: &str =
+    "zirv native is experimental; `zirv chat` remains the stable harness.";
+
+/// Shared verbatim between `run_native_chat`'s own refusal and `zirv native
+/// --help`'s prose (`main.rs`'s `native_help_text`), so the two descriptions
+/// of the same limitation can never drift apart.
+pub const NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL: &str = "--runtime native accepts no --agent, --simple, --resume, --pin-harness or trailing \
+     arguments -- those are wrapped-harness-only";
+
+/// Same sharing as [`NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL`], for the TTY
+/// requirement.
+pub const NATIVE_TTY_REFUSAL: &str =
+    "zirv chat --runtime native needs an interactive terminal on both stdin and stdout";
+
+/// `zirv native --help`'s own text (`main.rs` prints this verbatim and exits
+/// 0 for `zirv native --help`/`-h`, before the argv rewrite, so this never
+/// falls through to clap's generated help for the ordinary `chat` verb tree,
+/// which does not mention any of this). Syntax, prerequisites, limitations
+/// and where state/journal live, plus a prominent experimental notice --
+/// the limitations reuse [`NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL`]/
+/// [`NATIVE_TTY_REFUSAL`] verbatim rather than restating them, so this text
+/// and `run_native_chat`'s own refusals can never drift apart.
+pub fn native_help_text() -> String {
+    let lines = [
+        "zirv native -- EXPERIMENTAL / WORK IN PROGRESS".to_string(),
+        String::new(),
+        "A thin, case-insensitive top-level alias for `zirv chat --runtime native`: opens"
+            .to_string(),
+        "the structured native conversation pane (no coding harness installed, no PTY)".to_string(),
+        "instead of a wrapped-harness session. `zirv chat` remains the stable, recommended"
+            .to_string(),
+        "harness while this command is under development.".to_string(),
+        String::new(),
+        "Usage:".to_string(),
+        "  zirv native [--force-pace]".to_string(),
+        String::new(),
+        "Prerequisites:".to_string(),
+        "  - Native provider configuration in ~/.zirv/native.toml (see `zirv ctx provider"
+            .to_string(),
+        "    init`).".to_string(),
+        "  - A configured provider route for the orchestrator role.".to_string(),
+        "  - An interactive terminal (TTY) on both stdin and stdout.".to_string(),
+        String::new(),
+        "Limitations:".to_string(),
+        format!("  - {NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL}."),
+        format!("  - {NATIVE_TTY_REFUSAL}."),
+        "  - Never changes the operator's default runtime, migrates configuration, or".to_string(),
+        "    falls back to a wrapped harness.".to_string(),
+        String::new(),
+        "State and journal:".to_string(),
+        "  Session and journal state live under the same state directory `zirv ctx status`"
+            .to_string(),
+        "  reports, in <state>/native-journal.sqlite.".to_string(),
+        String::new(),
+        "Missing prerequisites are diagnosed by `zirv ctx doctor`.".to_string(),
+    ];
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
 /// `zirv chat --runtime native`'s own refusal/dispatch, split out of
 /// `run_with` so the wrapped-harness path above it never has to know this
 /// branch exists. Refuses a runtime value this build does not recognize and
@@ -328,6 +408,16 @@ fn run_native_chat<E: Write>(
     stdin_is_tty: bool,
     vt_ok: bool,
 ) -> CtxResult<i32> {
+    // Issue #540: printed exactly once -- this function runs once per
+    // process invocation -- and only for the `zirv native` alias spelling,
+    // never for a direct `zirv chat --runtime native` (which never sets
+    // `NATIVE_ALIAS_ENV`). Before the runtime/flag/TTY checks below, so an
+    // operator sees it even when the launch goes on to refuse for some other
+    // reason -- the notice is about which spelling was used, not about
+    // whether the launch succeeds.
+    if env(NATIVE_ALIAS_ENV).as_deref() == Some("true") {
+        writeln!(stderr, "{NATIVE_ALIAS_BANNER}")?;
+    }
     // Issue #531 review: this used to reimplement the harness/native decision
     // inline. Routing through `runtime::selected()` makes it the one place a
     // `--runtime` flag is turned into a decision, and reusing its own error
@@ -352,18 +442,11 @@ fn run_native_chat<E: Write>(
         || args.pin_harness
         || !args.extra.is_empty()
     {
-        writeln!(
-            stderr,
-            "--runtime native accepts no --agent, --simple, --resume, --pin-harness or trailing \
-             arguments -- those are wrapped-harness-only"
-        )?;
+        writeln!(stderr, "{NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL}")?;
         return Ok(1);
     }
     if !(stdout_is_tty && stdin_is_tty && vt_ok) {
-        writeln!(
-            stderr,
-            "zirv chat --runtime native needs an interactive terminal on both stdin and stdout"
-        )?;
+        writeln!(stderr, "{NATIVE_TTY_REFUSAL}")?;
         return Ok(1);
     }
     // `run_with`'s own nesting refusal (F2) already ran, before `cfg` was
@@ -2116,6 +2199,108 @@ mod tests {
             !msg.contains("needs an interactive terminal"),
             "run_native_chat's own refusal text must never appear: {msg}"
         );
+    }
+
+    /// Issue #540: `run_native_chat` prints the one-time experimental banner
+    /// when launched through the `zirv native` alias -- signalled by
+    /// `NATIVE_ALIAS_ENV`, exactly the flag `main.rs`'s alias rewrite sets --
+    /// and prints it exactly once, before any of its own refusals (proven
+    /// here by asserting it appears even though a non-terminal test process
+    /// makes this call reach the TTY refusal too).
+    #[test]
+    fn native_alias_env_prints_the_banner_once() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let cfg = CtxConfig::default();
+        let env_map: std::collections::HashMap<String, String> =
+            [(NATIVE_ALIAS_ENV.to_string(), "true".to_string())]
+                .into_iter()
+                .collect();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("native".to_string()),
+            extra: Vec::new(),
+        };
+        let mut err_out = Vec::new();
+        let _ = run_native_chat(
+            "native",
+            &cfg,
+            repo.path(),
+            &|k| env_map.get(k).cloned(),
+            &mut err_out,
+            &args,
+            false,
+            false,
+            false,
+        );
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert_eq!(
+            msg.matches(NATIVE_ALIAS_BANNER).count(),
+            1,
+            "the banner must print exactly once: {msg}"
+        );
+    }
+
+    /// The mirror of the test above: an explicit `zirv chat --runtime
+    /// native` never sets `NATIVE_ALIAS_ENV`, so it must never print the
+    /// alias banner even though it launches through this exact same
+    /// function.
+    #[test]
+    fn plain_runtime_native_never_prints_the_alias_banner() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let cfg = CtxConfig::default();
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("native".to_string()),
+            extra: Vec::new(),
+        };
+        let mut err_out = Vec::new();
+        let _ = run_native_chat(
+            "native",
+            &cfg,
+            repo.path(),
+            &|k| empty.get(k).cloned(),
+            &mut err_out,
+            &args,
+            false,
+            false,
+            false,
+        );
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(
+            !msg.contains(NATIVE_ALIAS_BANNER),
+            "an explicit `--runtime native` (no alias env) must never print the alias banner: \
+             {msg}"
+        );
+    }
+
+    /// `zirv native --help`'s prose (`main.rs` prints `native_help_text()`
+    /// verbatim) must name the experimental notice, the stable equivalent,
+    /// and reuse -- not restate -- the same refusal text `run_native_chat`
+    /// itself prints, so the two can never drift apart.
+    #[test]
+    fn native_help_text_names_the_experimental_notice_and_reuses_refusal_text() {
+        let text = native_help_text();
+        assert!(text.contains("EXPERIMENTAL / WORK IN PROGRESS"), "{text}");
+        assert!(text.contains("zirv chat --runtime native"), "{text}");
+        assert!(text.contains(NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL), "{text}");
+        assert!(text.contains(NATIVE_TTY_REFUSAL), "{text}");
+        assert!(text.contains("native-journal.sqlite"), "{text}");
+        assert!(text.contains("~/.zirv/native.toml"), "{text}");
     }
 
     #[test]
