@@ -741,6 +741,19 @@ pub struct RecompileContext {
     pub home: PathBuf,
     pub cfg: super::super::config::CtxConfig,
     pub repo: PathBuf,
+    /// Review fix (issue #538): the SAME task/prompt text this session's
+    /// own session-start compile used (`request.prompt`/`headless.prompt`
+    /// at each real call site). A recompile that budgeted against a
+    /// DIFFERENT task text (chunk C originally used `""` unconditionally)
+    /// sees a different `SourceKind::UserTask` Required-reservation size,
+    /// which can silently change how much budget is left for every
+    /// Optional source (canonical context, repository instructions,
+    /// memory) -- not just the instruction layer this whole mechanism is
+    /// about. Evidence is not threaded through for the same reason: every
+    /// production `compile_standing_context` call already passes `evidence:
+    /// &[]`, so there is no live evidence to diverge from in the first
+    /// place.
+    pub task: String,
 }
 
 impl std::fmt::Debug for NativeLoop<'_> {
@@ -962,6 +975,7 @@ impl<'a> NativeLoop<'a> {
             &context.home,
             &context.cfg,
             &context.repo,
+            &context.task,
             turn,
             now,
         );
@@ -991,12 +1005,14 @@ impl<'a> NativeLoop<'a> {
     /// built) -- never mid-turn, so a turn already in flight is never
     /// mutated (`a_changed_instruction_file_recompiles_before_the_next_
     /// turn`).
+    #[allow(clippy::too_many_arguments)]
     pub fn recompile_instructions_if_changed(
         &mut self,
         state: &super::super::state::StateDir,
         home: &std::path::Path,
         cfg: &super::super::config::CtxConfig,
         repo: &std::path::Path,
+        task: &str,
         turn: Option<&TurnId>,
         now: u64,
     ) -> CtxResult<bool> {
@@ -1029,11 +1045,16 @@ impl<'a> NativeLoop<'a> {
             config: cfg,
             role: prompt_role(&self.config.role),
             session_id: &session_id,
-            // Discarded below (only `messages` is read): a recompile never
-            // changes the actual per-turn task text, which is submitted
-            // separately through `acknowledge`/`queued_input`, never through
-            // this compile call.
-            task: "",
+            // Review fix (issue #538): the SAME task text the session-start
+            // compile used, not an empty placeholder -- a `SourceKind::
+            // UserTask` Required reservation of a different size silently
+            // changes how much budget is left for every Optional source
+            // (canonical context, repository instructions, memory), not
+            // just the instruction layer this recompile is actually about.
+            // `messages` is still the only part of the result this method
+            // reads; the task's own compiled message is discarded exactly
+            // as before, only the BUDGET it reserves now matches.
+            task,
             constraints: &[],
             pending_actions: &[],
             scope_paths: &self.touched_paths,
@@ -4146,6 +4167,9 @@ pub fn run_session<W: std::io::Write>(
             home: home.clone(),
             cfg: cfg.clone(),
             repo: request.repo.to_path_buf(),
+            // Review fix (issue #538): the same task text the session-start
+            // `compile_standing_context` call above already used.
+            task: request.prompt.to_string(),
         });
         // Issue #645: stamped immediately before the turn actually runs, the
         // same edge `exec.rs`'s own per-cycle spawn stamps at. Left standing
@@ -5013,6 +5037,12 @@ pub fn spawn_interactive(
                 home: worker_home.clone(),
                 cfg: worker_cfg.clone(),
                 repo: worker_repo.clone(),
+                // Review fix (issue #538): matches this session's own
+                // session-start compile, which also used an empty prompt
+                // (`headless.prompt = ""` above) -- a pane's task text is
+                // driven turn-by-turn through `acknowledge`, never a fixed
+                // session-wide string.
+                task: String::new(),
             });
             // Issue #554 (review round 1): a pane's turn is accounted like
             // any other native request -- an estimate held against the
@@ -5295,6 +5325,9 @@ pub fn run_hosted_turns<W: std::io::Write>(
         home: home.clone(),
         cfg: cfg.clone(),
         repo: turn.repo.to_path_buf(),
+        // Review fix (issue #538): the same task text the session-start
+        // `compile_standing_context` call above already used.
+        task: request.prompt.to_string(),
     });
     let reservation = execution_pool.as_ref().and_then(|pool| {
         super::super::native_account::reserve_seat_turn(
@@ -9347,7 +9380,15 @@ mod tests {
         );
 
         let first = driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_000,
+            )
             .expect("first recompile check");
         assert!(first, "an empty fingerprint always compiles once");
         assert!(
@@ -9361,7 +9402,15 @@ mod tests {
         );
 
         let second = driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_001,
+            )
             .expect("second recompile check");
         assert!(
             !second,
@@ -9399,12 +9448,28 @@ mod tests {
         );
 
         driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_000,
+            )
             .expect("first recompile");
 
         std::fs::write(repo.path().join("ZIRV.md"), "- a changed rule\n").unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_001,
+            )
             .expect("second recompile");
         assert!(changed, "a file changed on disk must be detected");
         assert!(
@@ -9474,7 +9539,15 @@ mod tests {
         );
 
         driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_000,
+            )
             .expect("first recompile (turn 1)");
         let version_turn_1 = driver.context_version().expect("compiled once").to_string();
         let preamble_turn_1 = driver.config.preamble.clone();
@@ -9487,6 +9560,7 @@ mod tests {
                     home.path(),
                     &cfg,
                     repo.path(),
+                    "go",
                     None,
                     now,
                 )
@@ -9547,6 +9621,7 @@ mod tests {
             home: home.path().to_path_buf(),
             cfg: cfg.clone(),
             repo: repo.path().to_path_buf(),
+            task: "go".to_string(),
         });
 
         assert!(
@@ -9703,10 +9778,21 @@ mod tests {
     /// Decision 2's guard: recompiling the instruction layer touches only
     /// `config.system`/`config.preamble`. Limits, route, write posture and
     /// the workflow gate -- every policy-shaped field -- are untouched.
+    /// Review fix (issue #538, item 2): the recompile also budgets against
+    /// the SAME task text the session-start compile used, so every
+    /// non-instruction Optional source (here, canonical `.zirv/context/
+    /// common.md`) is delivered byte-identically across the recompile too
+    /// -- not merely the config-level fields above.
     #[test]
     fn recompilation_never_changes_tools_or_policy() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("ZIRV.md"), "- rule one\n").unwrap();
+        std::fs::create_dir_all(repo.path().join(".zirv/context")).unwrap();
+        std::fs::write(
+            repo.path().join(".zirv/context/common.md"),
+            "canonical common content that must never change across a recompile\n",
+        )
+        .unwrap();
         let home = tempfile::tempdir().unwrap();
         let state =
             crate::commands::ctx::state::StateDir::from_root(tempfile::tempdir().unwrap().keep());
@@ -9738,13 +9824,53 @@ mod tests {
         let workflow_gate_before = driver.config.workflow_gate.clone();
 
         driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_000,
+            )
             .expect("first recompile");
+        let canonical_before = driver
+            .config
+            .preamble
+            .iter()
+            .find(|line| line.contains("canonical common content"))
+            .cloned();
+        assert!(
+            canonical_before.is_some(),
+            "sanity: canonical context must have reached the preamble: {:?}",
+            driver.config.preamble
+        );
+
         std::fs::write(repo.path().join("ZIRV.md"), "- rule two\n").unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_001,
+            )
             .expect("second recompile");
         assert!(changed);
+
+        let canonical_after = driver
+            .config
+            .preamble
+            .iter()
+            .find(|line| line.contains("canonical common content"))
+            .cloned();
+        assert_eq!(
+            canonical_before, canonical_after,
+            "a non-instruction candidate's delivered content must be byte-identical across a \
+             recompile -- passing the same live task keeps the budget landscape unchanged"
+        );
 
         assert_eq!(driver.config.limits, limits_before);
         assert_eq!(driver.config.route, route_before);
@@ -9800,6 +9926,7 @@ mod tests {
                     home.path(),
                     &cfg,
                     repo.path(),
+                    "go",
                     None,
                     1_000,
                 )
@@ -9861,7 +9988,15 @@ mod tests {
         let route_before = driver.config.route.clone();
 
         driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_000,
+            )
             .expect("first recompile, no instruction file yet");
         assert_eq!(driver.config.route, route_before);
 
@@ -9871,7 +10006,15 @@ mod tests {
         )
         .unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
+            .recompile_instructions_if_changed(
+                &state,
+                home.path(),
+                &cfg,
+                repo.path(),
+                "go",
+                None,
+                1_001,
+            )
             .expect("second recompile, with the adversarial file");
         assert!(changed, "the file change is detected");
         assert_eq!(
