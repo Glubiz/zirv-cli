@@ -447,6 +447,40 @@ impl WorkflowDefinitionV2 {
             }
         }
 
+        // Issue #542 review finding 2: before this fix, a step's own
+        // `effect` field was purely descriptive -- nothing anywhere actually
+        // gated on it, so an `External`-effect step (a genuine durable mark
+        // outside the repository/workflow state itself: a ticket, a cloud
+        // action, a deployment) could be authored to run completely
+        // unattended simply by leaving its own `approval` unset. A step
+        // whose OWN effect is `External` must now be recorded as an
+        // approval gate -- either the step's own `approval = true`, or its
+        // id listed in `gates.approval`. `Repository`-effect steps are
+        // deliberately NOT included here: every built-in pack already gates
+        // its actual repository mutation points (intent/plan/deploy) via
+        // the existing convention while leaving implement/test/verify
+        // ungated by design, so widening this to `Repository` would gate
+        // steps the issue never asked to gate and break the entire built-in
+        // catalogue. (The engine's own `WorkflowState::step_requires_
+        // approval` separately refuses to ENTER an unapproved `External`
+        // step even if this authoring-time check were somehow bypassed --
+        // e.g. an operator-global override, which also runs through this
+        // same `validate()`.)
+        for step in &self.steps {
+            if step.effect == EffectClass::External
+                && !step.approval
+                && !self.gates.approval.iter().any(|id| id == &step.id)
+            {
+                return Err(format!(
+                    "workflow definition '{}': step '{}' has effect 'external' but is not gated \
+                     by approval (set `approval = true` on the step or list it in \
+                     `gates.approval`)",
+                    self.id, step.id
+                )
+                .into());
+            }
+        }
+
         Ok(())
     }
 
@@ -912,6 +946,34 @@ present_as = "summary"
             bad_capability.is_err(),
             "an unrecognized capability id must fail to parse"
         );
+    }
+
+    /// Issue #542 review finding 2: a step whose own `effect` is `External`
+    /// must be gated -- either `approval = true` on the step itself, or its
+    /// id listed in `gates.approval` -- or `validate` rejects the
+    /// definition. Before this fix `effect` was purely descriptive and
+    /// nothing checked it at all.
+    #[test]
+    fn a_definition_with_an_ungated_external_step_is_rejected() {
+        let mut definition = minimal_definition();
+        definition.steps[1].effect = EffectClass::External;
+        assert!(!definition.steps[1].approval);
+        let error = definition
+            .validate(&known_skills())
+            .expect_err("an ungated external-effect step must be rejected");
+        assert!(error.to_string().contains("effect 'external'"), "{error}");
+        assert!(error.to_string().contains("execute"), "{error}");
+
+        // Gating it via the step's own `approval` is sufficient.
+        let mut approved = definition.clone();
+        approved.steps[1].approval = true;
+        approved.validate(&known_skills()).expect("valid");
+
+        // Gating it via `gates.approval` alone (no `approval` field on the
+        // step itself) is also sufficient.
+        let mut gated = definition.clone();
+        gated.gates.approval.push("execute".into());
+        gated.validate(&known_skills()).expect("valid");
     }
 
     #[test]
