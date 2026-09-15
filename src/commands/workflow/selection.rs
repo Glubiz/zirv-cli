@@ -276,11 +276,45 @@ mod tests {
     /// neither objective actually mentions either pack's domain.
     #[test]
     fn a_domain_tag_only_matches_a_whole_word_not_a_substring() {
-        assert_eq!(score_pack(&["data".into()], &[], &classification(Intent::Other), "investigate the database schema").0, 0);
-        assert_eq!(score_pack(&["pm".into()], &[], &classification(Intent::Other), "track the shipment status").0, 0);
+        assert_eq!(
+            score_pack(
+                &["data".into()],
+                &[],
+                &classification(Intent::Other),
+                "investigate the database schema"
+            )
+            .0,
+            0
+        );
+        assert_eq!(
+            score_pack(
+                &["pm".into()],
+                &[],
+                &classification(Intent::Other),
+                "track the shipment status"
+            )
+            .0,
+            0
+        );
         // The genuine whole-word case still scores.
-        assert!(score_pack(&["data".into()], &[], &classification(Intent::Other), "look at the data quality").0 > 0);
-        assert!(score_pack(&["pm".into()], &[], &classification(Intent::Other), "update the pm backlog").0 > 0);
+        assert!(
+            score_pack(
+                &["data".into()],
+                &[],
+                &classification(Intent::Other),
+                "look at the data quality"
+            )
+            .0 > 0
+        );
+        assert!(
+            score_pack(
+                &["pm".into()],
+                &[],
+                &classification(Intent::Other),
+                "update the pm backlog"
+            )
+            .0 > 0
+        );
     }
 
     #[test]
