@@ -59,6 +59,32 @@ impl Availability {
     }
 }
 
+/// Whether a command is part of the ordinary, stable surface, marked
+/// experimental (shown to a human only in `zirv help`'s separately labelled
+/// "Experimental / work in progress" section, never beside stable commands
+/// without qualification), or hidden entirely from human help while still
+/// present in `zirv commands --json` for automation/docs generation. Issue
+/// #540 adds the first `Experimental` entry (`zirv native`); nothing sets
+/// `Hidden` yet, but the variant exists so a future hidden verb reuses this
+/// field instead of growing a parallel one-off mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stability {
+    Stable,
+    Experimental,
+    Hidden,
+}
+
+impl Stability {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stability::Stable => "stable",
+            Stability::Experimental => "experimental",
+            Stability::Hidden => "hidden",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandEntry {
     pub path: String,
@@ -67,6 +93,15 @@ pub struct CommandEntry {
     pub flags: Vec<FlagEntry>,
     pub mutating: bool,
     pub availability: Availability,
+    /// Default `Stable` for every command discovered off the clap model or
+    /// listed as an ordinary synthetic entry; only the `zirv native` alias
+    /// sets `Experimental` today. See [`Stability`]'s own doc comment.
+    pub stability: Stability,
+    /// `Some("native")` only for the `zirv native` alias; `None` for every
+    /// other command, including `zirv chat --runtime native` itself (that
+    /// flag is a runtime *choice* on a stable command, not this field --
+    /// this names which alternate runtime a whole command entry targets).
+    pub runtime: Option<String>,
 }
 
 /// Leaf paths (space-joined, e.g. `"zirv ctx agent"`) that only ever read or
@@ -93,6 +128,7 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx safety list",
     "zirv ctx safety explain",
     "zirv ctx permissions audit",
+    "zirv ctx provider list",
     "zirv ctx hook audit",
     "zirv ctx objective show",
     "zirv ctx group status",
@@ -125,6 +161,8 @@ const READ_ONLY: &[&str] = &[
     "zirv workflow artifacts",
     "zirv workflow agents list",
     "zirv workflow agents show",
+    "zirv workflow team show",
+    "zirv workflow team brief",
     "zirv workflow review status",
     "zirv workflow review show",
     "zirv workflow review list",
@@ -145,6 +183,11 @@ const READ_ONLY: &[&str] = &[
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
+    // Issue #353: renders the protocol contract compiled into this binary.
+    // Touches no disk, no registry and no socket.
+    "zirv ctx api schema",
+    // Issue #352: reads one runtime's session list over the protocol.
+    "zirv session list",
 ];
 
 /// Leaf paths that write: state on disk, a session/registry entry, a
@@ -153,6 +196,30 @@ const READ_ONLY: &[&str] = &[
 /// on a GitHub issue). See [`READ_ONLY`]'s own doc comment for the
 /// completeness guarantee both tables share.
 const MUTATING: &[&str] = &[
+    // Issue #483: the report itself only reads configuration, PATH and the
+    // tree, but `--probe` spawns each configured local MCP server and reaches
+    // a remote one over the network. Classified by what the verb CAN do, like
+    // `ctx api call` right below.
+    "zirv ctx capabilities",
+    // Issue #491: `zirv ctx doctor` writes nothing at all, but `--live`
+    // contacts each configured provider's model-list endpoint with that
+    // account's own auth material. Classified by what the verb CAN do, like
+    // `ctx capabilities` right above.
+    "zirv ctx doctor",
+    // Issue #353. Both bind the local runtime endpoint and write its
+    // state-directory marker file, and `api call` can carry a mutating
+    // protocol method (`session.start|stop|send_input`). Classified by what
+    // the verb CAN do, not by what the narrowest invocation happens to do.
+    "zirv ctx api serve",
+    "zirv ctx api call",
+    // Issue #352: `serve` binds the endpoint and owns processes; `attach`
+    // types into one; `detach` rewrites the attachment table; `stop` ends a
+    // process. Classified by what the verb CAN do -- `detach` deliberately
+    // cannot end anything, but it still writes runtime state.
+    "zirv session serve",
+    "zirv session attach",
+    "zirv session detach",
+    "zirv session stop",
     "zirv init",
     "zirv create",
     "zirv report bug",
@@ -161,6 +228,9 @@ const MUTATING: &[&str] = &[
     "zirv ctx chat",
     "zirv ctx config set",
     "zirv ctx config add",
+    // Issue #491: rewrites `~/.zirv/ctx.toml`, writes a backup beside it and
+    // a schema marker; `--downgrade` restores that backup.
+    "zirv ctx config migrate",
     "zirv ctx agent",
     "zirv ctx handoff",
     "zirv ctx resume",
@@ -193,6 +263,11 @@ const MUTATING: &[&str] = &[
     "zirv ctx objective close",
     "zirv ctx permissions compile",
     "zirv ctx permissions propose",
+    "zirv ctx provider login",
+    "zirv ctx provider status", // official non-model process probe; may create private startup state
+    "zirv ctx provider init",
+    "zirv ctx provider check",
+    "zirv ctx provider credential set",
     "zirv ctx usage tee",
     "zirv ctx worktree prune",
     "zirv ctx task create",
@@ -223,6 +298,7 @@ const MUTATING: &[&str] = &[
     "zirv workflow review add",
     "zirv workflow review ingest-pr-comments",
     "zirv workflow agents dispatch",
+    "zirv workflow team plan",
     "zirv test baseline",
     "zirv artifact render",
     "zirv frontend render",
@@ -328,6 +404,8 @@ fn walk(cmd: &Command, prefix: &str, out: &mut Vec<CommandEntry>, unclassified: 
                 flags,
                 mutating,
                 path,
+                stability: Stability::Stable,
+                runtime: None,
             }),
             None => unclassified.push(path),
         }
@@ -353,6 +431,8 @@ fn synthetic(path: &str, about: &str, mutating: bool, flags: Vec<FlagEntry>) -> 
         flags,
         mutating,
         availability: availability_for(path),
+        stability: Stability::Stable,
+        runtime: None,
     }
 }
 
@@ -378,7 +458,7 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
     let mut entries = Vec::new();
     let mut unclassified = Vec::new();
 
-    let roots: [Command; 7] = [
+    let roots: [Command; 8] = [
         super::ctx::CtxCli::command(),
         super::ctx::memory_cli::MemoryCli::command(),
         super::ctx::context_cli::ContextCli::command(),
@@ -386,6 +466,7 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
         super::report::ReportCli::command(),
         super::setup::SetupCli::command(),
         super::update::UpdateCli::command(),
+        super::ctx::session::SessionCli::command(),
     ];
     for root in &roots {
         let prefix = root.get_name().to_string();
@@ -417,6 +498,32 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
             ..source
         });
     }
+
+    // Issue #540: `zirv native` is a thin, case-insensitive top-level alias
+    // for `zirv chat --runtime native` (see `main.rs`'s
+    // `rewrite_native_alias_args`) -- cloned from the `zirv chat` entry
+    // above, which the loop just pushed, so its args/flags/mutating/
+    // availability can never drift from the command it actually rewrites
+    // into. Only `about`, `stability` and `runtime` are overridden: this is
+    // the one entry `zirv help` places in its separate "Experimental / work
+    // in progress" section rather than beside the stable commands, and the
+    // one JSON consumers can identify by `stability`/`runtime` without
+    // parsing prose.
+    let chat_entry = entries
+        .iter()
+        .find(|entry| entry.path == "zirv chat")
+        .unwrap_or_else(|| panic!("zirv chat must exist for the zirv native alias to clone"))
+        .clone();
+    entries.push(CommandEntry {
+        path: "zirv native".to_string(),
+        about: "EXPERIMENTAL / WORK IN PROGRESS: thin alias for `zirv chat --runtime native` \
+                (opens the native conversation pane -- no coding harness installed, no PTY); \
+                not part of the stable command surface yet."
+            .to_string(),
+        stability: Stability::Experimental,
+        runtime: Some("native".to_string()),
+        ..chat_entry
+    });
 
     entries.push(synthetic(
         "zirv help",
@@ -472,9 +579,17 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
 
 fn render_human(entries: &[CommandEntry], writer: &mut impl Write) -> std::io::Result<()> {
     for entry in entries {
+        // A stable entry prints no extra tag at all -- only a non-default
+        // stability earns one, so `zirv native` (and any future hidden
+        // verb) is never visually indistinguishable from a stable command
+        // in the plain-text listing either, not only in `--json`.
+        let tag = match entry.stability {
+            Stability::Stable => String::new(),
+            other => format!(" [{}]", other.label().to_uppercase()),
+        };
         writeln!(
             writer,
-            "{:<32} [{}] ({})  {}",
+            "{:<32} [{}] ({}){tag}  {}",
             entry.path,
             if entry.mutating { "W" } else { "R" },
             entry.availability.label(),
@@ -622,6 +737,95 @@ mod tests {
             .expect("zirv ctx chat must be discovered");
         assert_eq!(alias.about, canonical.about);
         assert_eq!(alias.mutating, canonical.mutating);
+    }
+
+    /// Issue #540: `zirv native` carries `stability: experimental` and
+    /// `runtime: native` so an automation/docs consumer can tell "hidden
+    /// help" from "does not exist" without parsing prose, and inherits its
+    /// args/flags/mutating/availability byte-for-byte from `zirv chat` (the
+    /// command it actually rewrites into), so forwarding native-compatible
+    /// chat options can never drift between the two.
+    #[test]
+    fn native_carries_experimental_stability_and_native_runtime() {
+        let entries = command_entries().expect("classified");
+        let native = entries
+            .iter()
+            .find(|entry| entry.path == "zirv native")
+            .expect("zirv native must be discovered");
+        assert_eq!(native.stability, Stability::Experimental);
+        assert_eq!(native.runtime.as_deref(), Some("native"));
+
+        let chat = entries
+            .iter()
+            .find(|entry| entry.path == "zirv chat")
+            .expect("zirv chat must be discovered");
+        assert_eq!(native.mutating, chat.mutating);
+        assert_eq!(native.availability, chat.availability);
+        assert_eq!(native.args, chat.args);
+        assert_eq!(native.flags, chat.flags);
+        assert_ne!(
+            native.about, chat.about,
+            "the experimental notice must not be silently identical to chat's own about text"
+        );
+    }
+
+    /// Every OTHER entry -- discovered off the clap model or an ordinary
+    /// synthetic built-in -- defaults to `stable` with no runtime override,
+    /// so `zirv native` is the one and only exception, not a special case
+    /// buried among a majority of unmarked entries.
+    #[test]
+    fn every_command_other_than_native_is_stable_with_no_runtime() {
+        let entries = command_entries().expect("classified");
+        for entry in &entries {
+            if entry.path == "zirv native" {
+                continue;
+            }
+            assert_eq!(
+                entry.stability,
+                Stability::Stable,
+                "{} must default to stable",
+                entry.path
+            );
+            assert_eq!(
+                entry.runtime, None,
+                "{} must carry no runtime override",
+                entry.path
+            );
+        }
+    }
+
+    #[test]
+    fn stability_json_labels_are_kebab_case() {
+        assert_eq!(Stability::Stable.label(), "stable");
+        assert_eq!(Stability::Experimental.label(), "experimental");
+        assert_eq!(Stability::Hidden.label(), "hidden");
+        assert_eq!(
+            serde_json::to_string(&Stability::Experimental).expect("serialize"),
+            "\"experimental\""
+        );
+    }
+
+    /// The plain-text `zirv commands` listing must qualify `zirv native`
+    /// visibly too, not only the `--json` form.
+    #[test]
+    fn human_output_tags_a_non_stable_entry() {
+        let entries = command_entries().expect("classified");
+        let mut buffer = Vec::new();
+        render_human(&entries, &mut buffer).expect("render");
+        let text = String::from_utf8(buffer).expect("utf8");
+        let native_line = text
+            .lines()
+            .find(|line| line.starts_with("zirv native "))
+            .expect("zirv native must be listed");
+        assert!(native_line.contains("[EXPERIMENTAL]"), "got: {native_line}");
+        let chat_line = text
+            .lines()
+            .find(|line| line.starts_with("zirv chat "))
+            .expect("zirv chat must be listed");
+        assert!(
+            !chat_line.contains("[EXPERIMENTAL]") && !chat_line.contains("[HIDDEN]"),
+            "a stable entry must carry no stability tag, got: {chat_line}"
+        );
     }
 
     #[test]

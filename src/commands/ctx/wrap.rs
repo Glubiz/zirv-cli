@@ -2937,6 +2937,55 @@ struct HandoverOutcome {
     source: &'static str,
 }
 
+/// `zirv ctx wrap`'s own successor backend (issue #552, review round 1).
+///
+/// A wrap seat supervises ONE harness child through a pty. Swapping that
+/// child for another harness is the whole of what this seam can do, so a
+/// rollover whose successor resolves to the NATIVE runtime is refused here
+/// rather than attempted: before this gate existed,
+/// `perform_handover_swap` called `handover::resolve_swap_launch`
+/// unconditionally and a native successor became a harness swap onto
+/// `req.target_agent` -- a route the rollover never chose, spending an
+/// account it never authorised.
+///
+/// A refusal PARKS the seat: it is returned before the old child is touched,
+/// so the harness keeps running with its handoff already stored, which is
+/// `rollover_runtime`'s own item 7 ("otherwise park honestly with all
+/// durable state intact").
+///
+/// `launch` itself never starts anything: the in-place swap below it is what
+/// starts the successor, and duplicating it inside a closure over twenty
+/// borrowed pty handles would be a second copy of the one thing this seam
+/// already does correctly. So this is an admission gate with a launch arm
+/// that only confirms the seat it is returning to.
+struct WrapSwapLauncher<'a> {
+    session: &'a str,
+}
+
+impl super::rollover_runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
+    fn admits(
+        &self,
+        plan: &super::rollover_runtime::SuccessorPlan,
+    ) -> Result<(), super::rollover_runtime::SuccessorRefusal> {
+        if plan.to == super::runtime::RuntimeKind::Harness {
+            return Ok(());
+        }
+        Err(super::rollover_runtime::SuccessorRefusal::LaunchFailed(
+            format!(
+                "`zirv ctx wrap` supervises a harness child and has no {} backend; the seat                  is parked on its current harness with its handoff stored, rather than swapped                  onto a harness this rollover never chose",
+                plan.to.as_str()
+            ),
+        ))
+    }
+
+    fn launch(
+        &mut self,
+        _plan: &super::rollover_runtime::SuccessorPlan,
+    ) -> Result<String, super::rollover_runtime::SuccessorRefusal> {
+        Ok(self.session.to_string())
+    }
+}
+
 /// Issue #84: swaps the orchestrator seat's model or harness in place,
 /// mirroring `pump`'s own `Action::Restart` arm (distill via the existing
 /// handoff machinery, quit the old child, open a fresh pty, relaunch) but
@@ -3038,6 +3087,49 @@ fn perform_handover_swap(
             cfg,
         );
     }
+
+    // Issue #552 (review round 1): WHICH RUNTIME the successor is, decided
+    // before a harness adapter is resolved for it. Everything below this
+    // point assumes a harness child; a rollover that chose a native route
+    // used to arrive here and be swapped onto `req.target_agent` anyway.
+    // Routed through the one seam every live swap shares, so this seat's
+    // subagents are settled by the same `settle_subagents` a dashboard swap
+    // runs -- and, because `admits` is asked first, NOT settled when the
+    // swap is refused. Nothing has been torn down yet, so the `?` parks the
+    // seat on its current harness with the handoff already stored.
+    let successor_generation_for_plan = req
+        .generation
+        .or_else(|| super::seat::load(state_dir, &bar.session_short).map(|seat| seat.generation))
+        .unwrap_or(1);
+    let plan = super::rollover_runtime::plan_successor(
+        super::runtime::RuntimeKind::Harness,
+        req.successor_runtime(),
+        &bar.session_short,
+        successor_generation_for_plan,
+        Some(&req.target_agent),
+        req.target_model.as_deref(),
+        req.target_route.as_deref(),
+        req.resume_session.as_deref(),
+        super::rollover_runtime::load(state_dir, &bar.session_short)
+            .and_then(|record| record.boundary)
+            .as_ref(),
+    );
+    super::rollover_runtime::launch_successor(
+        state_dir,
+        repo,
+        &mut WrapSwapLauncher {
+            session: session.as_str(),
+        },
+        &plan,
+        Some(session.as_str()),
+        if req.structural_only {
+            super::rollover_runtime::Drain::Forced
+        } else {
+            super::rollover_runtime::Drain::Quiesced
+        },
+        super::state::now_secs(),
+    )
+    .map_err(|refusal| refusal.to_string())?;
 
     // Everything from here on names the *new* harness. Resolved before the
     // old child is touched, so an unknown target agent (a race against the
@@ -4242,6 +4334,55 @@ mod tests {
     // unix socket for turn signals and raw mode for passthrough.
     #[cfg(unix)]
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    /// Issue #552 (review round 1): a wrap seat whose rollover resolves to a
+    /// NATIVE successor is parked, never swapped onto a harness.
+    ///
+    /// Platform-neutral by construction: the decision is
+    /// `WrapSwapLauncher::admits`, which reads the plan's runtime and nothing
+    /// else, so it runs here and on every CI platform. Everything the real
+    /// `perform_handover_swap` does after this gate needs a live pty and is
+    /// unix-only; the gate itself is what stops a mis-swap, and it sits
+    /// before the old child is touched -- so a refusal leaves the harness
+    /// running with its handoff already stored.
+    #[test]
+    fn wrap_rollover_to_native_never_selects_a_harness_swap() {
+        use super::super::rollover_runtime::SuccessorLauncher;
+        use super::super::runtime::RuntimeKind;
+
+        let plan_for = |to: RuntimeKind| {
+            super::super::rollover_runtime::plan_successor(
+                RuntimeKind::Harness,
+                to,
+                "aaaa1111",
+                4,
+                Some("claude"),
+                None,
+                Some("opus"),
+                None,
+                None,
+            )
+        };
+        let launcher = WrapSwapLauncher {
+            session: "11111111-2222-4333-8444-555555555555",
+        };
+
+        // The one direction this seam can actually perform.
+        assert!(launcher.admits(&plan_for(RuntimeKind::Harness)).is_ok());
+
+        let refusal = launcher
+            .admits(&plan_for(RuntimeKind::Native))
+            .expect_err("a native successor must never become a harness swap");
+        let reason = refusal.to_string();
+        assert!(
+            reason.contains("no native backend"),
+            "the refusal names the missing backend: {reason}"
+        );
+        assert!(
+            reason.contains("parked"),
+            "and says the seat is parked rather than swapped: {reason}"
+        );
+    }
     #[cfg(unix)]
     use std::io::Read;
     use std::path::PathBuf;

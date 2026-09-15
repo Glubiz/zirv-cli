@@ -1,0 +1,9 @@
+{
+  "id": "req-read",
+  "method": "session.read",
+  "params": {
+    "after_revision": 0,
+    "session_id": "fake-1"
+  },
+  "v": 1
+}

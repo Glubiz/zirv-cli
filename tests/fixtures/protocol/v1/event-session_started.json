@@ -1,0 +1,23 @@
+{
+  "generation": 1,
+  "payload": {
+    "kind": "session_started",
+    "session": {
+      "agent": "claude",
+      "generation": 1,
+      "reachable": true,
+      "repo_slug": "zirv-cli",
+      "role": "orchestrator",
+      "runtime": "harness",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "short": "11111111",
+      "started_at": 1757000000,
+      "state": "idle",
+      "surface": "terminal"
+    }
+  },
+  "revision": 1,
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "type": "event",
+  "v": 1
+}

@@ -1,0 +1,10 @@
+{
+  "id": "req-stop",
+  "idempotency_key": "stop-1",
+  "method": "session.stop",
+  "params": {
+    "generation": 1,
+    "session_id": "fake-1"
+  },
+  "v": 1
+}

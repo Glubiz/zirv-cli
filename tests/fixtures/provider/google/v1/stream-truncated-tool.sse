@@ -1,0 +1,2 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"file_read","args":{"path":"src/lib.rs"}}}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"resp_trunc"}
+

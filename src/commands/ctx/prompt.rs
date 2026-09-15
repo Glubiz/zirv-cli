@@ -7948,4 +7948,49 @@ mod tests {
             &before_layers,
         );
     }
+
+    /// Issue #538, acceptance bullet 9: a `ZIRV.md` file's mere presence in
+    /// the repository (chunk A's new native-instruction source) must never
+    /// change what the LEGACY wrapped harness's injected system prompt
+    /// contains. `compose` reads only `.zirv/system-prompt.md` and canonical
+    /// `.zirv/context/`, never `ZIRV.md`/`AGENTS.md`/`CLAUDE.md` -- those
+    /// stay drift-detection-only surfaces for the wrapped harness path, per
+    /// `optimize.rs`'s own module doc.
+    #[test]
+    fn a_zirv_md_file_never_changes_the_legacy_wrapped_harness_prompt() {
+        let (_tmp, home, repo) = tree();
+        let without = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        );
+
+        std::fs::write(
+            repo.join("ZIRV.md"),
+            "- this must never reach the wrapped harness prompt (bullet 9 regression)\n",
+        )
+        .expect("write ZIRV.md");
+
+        let with = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        );
+
+        assert_eq!(
+            without.map(|c| c.text),
+            with.map(|c| c.text),
+            "a ZIRV.md file must never change the composed wrapped-harness prompt"
+        );
+    }
 }

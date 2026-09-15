@@ -40,6 +40,7 @@
   - [Deploy tiers](#deploy-tiers)
   - [Workflow adoption](#workflow-adoption)
   - [Agent registry](#agent-registry)
+  - [Team composition](#team-composition)
   - [Maintain loop](#maintain-loop)
   - [Frontend quality](#frontend-quality)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
@@ -124,6 +125,48 @@ zirv setup reset claude --scope project --dry-run
 zirv setup reset codex --scope global --yes
 zirv setup reset all --scope all --yes
 ```
+
+### `ZIRV.md` instruction files
+
+Zirv's own native instruction file. Sources, closest scope first:
+
+1. nested `ZIRV.md` files between the repository root and the files/worktree
+   scope currently being acted on;
+2. repository `ZIRV.md` at the repo root, or `.zirv/ZIRV.md` when the root
+   file is absent — if both exist, the root file wins and `.zirv/ZIRV.md` is
+   reported shadowed, never merged;
+3. optional operator-global `~/.zirv/ZIRV.md`.
+
+The portable `AGENTS.md` convention is a first-class source alongside it, and
+existing `CLAUDE.md` repositories work unmigrated. At the same directory,
+`ZIRV.md` outranks `AGENTS.md`, which outranks `CLAUDE.md`, which outranks the
+singular `AGENT.md` compatibility alias — `AGENT.md` is only ever a candidate
+when no `AGENTS.md` exists in that directory, and always carries a migration
+diagnostic recommending rename to `AGENTS.md`. A compatibility file whose
+content duplicates the winning file (identical text, a symlink resolving to
+it, or a lone `@AGENTS.md`-style import of it) is reported as a duplicate
+consumed once, not as separate shadowed content — the same rules never reach
+a session twice. `zirv ctx optimize`'s report and `zirv context status` (see
+[Reviewing your instruction files](#reviewing-your-instruction-files)) list
+every discovered `ZIRV.md`/`AGENTS.md`/`CLAUDE.md`/`AGENT.md` surface with its
+trust class, scope, content hash, and precedence decision
+(included/shadowed/duplicate/excluded, with a reason). **Instructions are
+context, never permissions**: like every native instruction file, `ZIRV.md`
+can steer a session's prose but can never change sandboxing, approvals,
+credentials, provider/account/billing routing, tool grants, workflow policy
+floors, or settings precedence — see [Trust boundary](#trust-boundary) below.
+
+**Migration is opt-in and never destructive.** `zirv context sync
+--init-zirv-md` idempotently writes a starting `<repo>/ZIRV.md` from the
+canonical `.zirv/context/common.md` layer plus any root `AGENTS.md`/
+`CLAUDE.md` content that is not already zirv-managed; a repeat run with
+nothing changed is a no-op, and an existing `ZIRV.md` — including one you
+have since hand-edited — is never overwritten without `--force`. Content
+that looks secret-shaped is skipped and named, never copied. A repository
+with only `AGENTS.md` needs no migration at all: `zirv context sync
+--report` (the default, read-only mode) offers a one-line compatibility-link
+plan — a `ZIRV.md` containing just `@AGENTS.md` — for anyone who would rather
+link than duplicate.
 
 ### `zirv chat` and `zirv agent`
 
@@ -528,6 +571,12 @@ to the section that documents it in depth.
   for delegated workers, worktree groups, and kill/nudge/send from the
   keyboard. See [The dashboard: multiple sessions in one
   terminal](#the-dashboard-multiple-sessions-in-one-terminal).
+- **Persistent runtime (experimental)** — `session` runs a local service that
+  owns the PTYs, so closing or crashing the client leaves the agents running:
+  `serve` starts it, `list` shows what it holds, `attach` and `detach` connect
+  and disconnect a terminal, and `stop` is the separate verb that actually
+  ends something. Off by default and operator-only. See [Persistent runtime
+  (`zirv session`)](#persistent-runtime-zirv-session).
 - **Nested sessions are refused** — a supervisor started inside another
   supervised session stops instead of sharing its outer session's registry
   and turn signals. See [Nested sessions are
@@ -556,6 +605,13 @@ to the section that documents it in depth.
   delegates one task to a supervised worker on another enabled harness
   (also `zirv agent`). See [Verbs](#verbs) and [Just Run
   `zirv`](#just-run-zirv).
+- **Experimental: `native`** — a thin, case-insensitive top-level alias
+  (`zirv native`) for `zirv chat --runtime native`, reserved so a script or
+  shortcut can never shadow it. Shown only in `zirv help`'s separately
+  labelled "Experimental / work in progress" section, never beside the
+  stable commands; `zirv commands --json` reports it with `"stability":
+  "experimental"` and `"runtime": "native"`. See [The native conversation
+  pane](#the-native-conversation-pane).
 - **Handoffs and recovery** — `score` rot-scores a transcript, `handoff`
   distills one, `resume` starts a clean session with the latest handoff
   injected, `handover` swaps the orchestrator seat's model or harness in
@@ -597,13 +653,40 @@ to the section that documents it in depth.
   printing a compact, reversible summary; `compile` prints or measures the
   composed session prompt. See [Verbs](#verbs).
 - **Configuration and instruction hygiene** — `config` shows or edits the
-  operator's `~/.zirv/ctx.toml`; `context` (`sync`/`lint`/`status`) manages
-  the canonical instruction-file layer; `optimize` reports redundancy,
-  contradictions, and dead references across every configuration surface;
-  `usage` reports usage-window state or tees the statusline. See [Reviewing
+  operator's `~/.zirv/ctx.toml`, and `config migrate`/`--downgrade` versions
+  that file with a backup and a documented way back; `provider` (`init`/`list`/`check`/
+  `credential set`) configures and inspects opt-in native provider
+  routes, accounts and credentials; `context` (`sync`/`lint`/`status`)
+  manages the canonical instruction-file layer; `optimize` reports
+  redundancy, contradictions, and dead references across every
+  configuration surface; `usage` reports usage-window state or tees the
+  statusline. See [Reviewing
   your instruction files](#reviewing-your-instruction-files) and
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
+- **Configured capabilities** — `capabilities` reports every non-shell
+  integration a native session can use — MCP servers, web search/fetch,
+  browser, language diagnostics, artifact and frontend rendering — as
+  `available`, `unavailable` or `unverified`, naming the missing binary,
+  credential or config key for anything absent. `--probe` contacts each
+  configured MCP server to verify it; `--require` gates a script on the same
+  admission rule the workflow engine applies. See [Native configured
+  capabilities](#native-configured-capabilities).
+- **Native readiness** — `doctor` diagnoses whether this machine can run a
+  native session: per role, which backend an unflagged session gets and which
+  authority decided it, which route it would spend, and every problem sorted
+  into exactly one of `missing-auth-material`, `inaccessible-model`,
+  `missing-tool`, `unsupported-isolation`, `service-failure` or
+  `upstream-entitlement` — so a missing native adapter is never dismissed as
+  an entitlement problem. Writes nothing; `--live` additionally contacts each
+  provider's model-list endpoint. Redacted like `snapshot`, so the output is
+  safe to paste into a bug report. See [Native setup, diagnosis and
+  rollback](#native-setup-diagnosis-and-rollback).
+- **Local runtime protocol** — `api` (`schema`/`serve`/`call`) publishes zirv's
+  versioned local control surface: an owner-only unix socket or Windows named
+  pipe carrying NDJSON requests, replies and event subscriptions, with a
+  generated schema and frozen wire fixtures. See [Runtime protocol
+  v1](#runtime-protocol-v1-zirv-ctx-api).
 - **Hooks** — `hook` wires zirv into Claude Code's and Codex's own lifecycle
   events (stop, prompt, pre-compact, pretool/posttool, permission, notify,
   session-start), audits recorded decisions, and checks or heals the
@@ -629,10 +712,17 @@ to the section that documents it in depth.
 - **Artifacts and agent seats** — `artifacts` inspects committed
   work-product artifacts and their acceptance state, and `agents`
   (`list`/`show`/`dispatch`) inspects provider-neutral workflow seats and
-  trust provenance. See [Agent registry](#agent-registry).
+  trust provenance; `dispatch --runtime native` runs a read-only seat on
+  zirv's own runtime with no coding harness installed. See [Agent
+  registry](#agent-registry).
+- **Team composition** — `team` (`plan`/`show`/`brief`) compiles the
+  smallest capable team for a request from the agent/skill registries,
+  persists it on a workflow, and briefs one compiled seat with only its own
+  manifest instructions and attached skills. See [Team
+  composition](#team-composition).
 - **Review** — `review` (`package`/`run`/`add`/`dispose`/`list`/
   `ingest-pr-comments`) builds compact review packages and persists finding
-  dispositions.
+  dispositions; `run --runtime native` runs the reviewer seat natively.
 - **Maintenance and telemetry** — `maintain` (`scan`) runs deterministic
   operator-configured maintenance detectors, and `stats` aggregates
   privacy-conscious local workflow telemetry. See [Maintain
@@ -1010,6 +1100,27 @@ commands:
   - command: cargo test
 ```
 
+`runtime` selects which machinery runs the step: `harness` (the default, and
+what every existing script keeps doing) or `native` — zirv conducts the
+conversation itself over a direct provider route, with no coding harness
+installed:
+
+```yaml
+commands:
+  - agent: fast-route          # a [route] name, not an adapter name
+    runtime: native
+    prompt: "Summarise the failing checks in ${dir}"
+```
+
+Under `runtime: native` the `agent` value names a provider route from
+`~/.zirv/native.toml` (the reserved value `native` means "use the `[roles]`
+entry for the worker role"), and `flags` are refused rather than silently
+ignored — they exist to reach a vendor CLI and there is none. An unrecognised
+`runtime` fails at load time, so `--dry-run` and the real run reject the same
+script. Everything else — `${var}` substitution, secrets, `operating_system`,
+`proceed_on_failure`, `delay_ms`, `fallback` and the exit-code contract — is
+identical on both runtimes.
+
 `prompt` gets the same `${var}` substitution as `command`, including the
 unresolved-placeholder error if a variable is missing. `flags` are passed
 straight through to the agent CLI. `operating_system`, `proceed_on_failure`,
@@ -1151,7 +1262,7 @@ marks it as shadowed in the listing.
 <!-- zchk-doc-reserved:start -->
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
 `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`,
-`commands`, `update`, and their short aliases `h`, `v`, `i`, `c`,
+`commands`, `update`, `session`, `native`, and their short aliases `h`, `v`, `i`, `c`,
 <!-- zchk-doc-reserved:end -->
 are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
@@ -1204,12 +1315,15 @@ and database/schema changes cannot be downgraded below High risk.
 zirv workflow list                              # built-in workflow definitions
 zirv workflow show feature                       # one definition's steps
 zirv workflow classify --task "..."               # classify without starting
-zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm]
+zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>]
 zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off and per-step wall-clock
 zirv workflow resume <id>                         # restore as the active workflow
 zirv workflow context [id]                        # the current step's resolved skill context
 zirv workflow artifacts <id> [--json]              # committed work-product state
 zirv workflow agents list|show <id>|dispatch <id> --adapter <name> --prompt <task>
+zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run] [--seat <id>] [--json]
+zirv workflow team show [--workflow <id>|active] [--json]
+zirv workflow team brief <seat-id> [--json]       # Agent-tool-ready brief for one compiled seat
 zirv workflow approve <id>                        # approve the current gated step
 zirv workflow advance <id> --outcome success|failure
 zirv workflow review package <id> | run <id> --agent <name> | add | ...
@@ -1242,6 +1356,63 @@ into a review or verify step, so a review/verify gate the initial `workflow
 start` measurement missed (an empty tree, before any code existed) still gets
 added once the real change exists.
 
+### Linked worktrees
+
+A workflow started in a repository's main checkout can be found from, and
+gated against evidence in, a `git worktree add`-linked sibling of it (and
+vice versa) -- but workflow state, and evidence, are never merged into one
+shared identity: every piece of per-repository state (workflow state, the
+active-workflow pointer, verification reports, crash witnesses, handoffs,
+telemetry, test baselines, mail, ...) stays keyed by the LITERAL checkout a
+session, process, or `zirv test changed` run actually used. Two independent
+lookup/relatedness rules make cross-worktree orchestration work without that:
+
+- **Finding a workflow by id or by "the active one".** `zirv workflow
+  status|advance|review package <id> --repo <path>` looks in `<path>`'s own
+  state directory first, then in each of its sibling checkouts
+  (`git worktree list`) for that id -- an explicit id is never ambiguous, so
+  this is safe to widen to every sibling. Bare `zirv workflow status` (no
+  id) is different: it reads `<path>`'s own active-workflow pointer first,
+  and if `<path>` has none, falls back ONLY to the MAIN checkout's own
+  pointer -- never an arbitrary other sibling. This is what lets a worker
+  worktree with no workflow of its own inherit the orchestrator's, while two
+  workers each running their own `zirv workflow start` in their own
+  worktrees never collide or clobber one another's active pointer.
+- **The `Test`/`Verify` evidence gate's relatedness check.** A workflow
+  records the branch it gates (`WorkflowState.branch`: `--branch <name>` at
+  `start`, or the checkout's own current branch when not given), and every
+  `zirv test changed`/`zirv verify` run records the branch it was produced
+  on. `zirv test changed` always writes its evidence under the literal
+  checkout it ran in, so concurrent runs in sibling worktrees never clobber
+  each other's evidence. The gate widens only its read: if the checkout it
+  is evaluated from has no fresh, passing evidence of its own, it also
+  checks every sibling checkout's own evidence against that sibling's own
+  tree -- but ONLY accepts a sibling whose recorded branch matches the
+  workflow's own recorded branch exactly. A sibling with fresh, passing
+  evidence on a *different* branch never opens this gate, no matter how
+  fresh or passing.
+
+Together: start the workflow in the main checkout (`--branch
+worker/feature-x` if that main checkout is not itself on the worker's
+branch), have the worker implement and run `zirv test changed` in
+`<repo>/.claude/worktrees/<name>` (checked out on `worker/feature-x`), then
+`zirv workflow advance <id> --outcome success` from the main checkout (or
+`--repo <repo>/.claude/worktrees/<name>`, either finds the same workflow) --
+the gate accepts the worktree's evidence because its recorded branch matches,
+not merely because it happens to be fresh and passing for someone.
+
+`zirv workflow classify`/`start --branch <name>` diffs that branch against
+its own base as refs (`git diff <base> <name>`), not `--repo`'s working tree
+-- necessary because the checkout given as `--repo` need not have `<name>`
+checked out at all. Without `--branch`, classification is unchanged: `git
+diff --numstat <base>` already measures whichever repository it is given, so
+pointed at a worktree (`--repo` or plain cwd) it already saw that worktree's
+own branch diff (uncommitted edits included) against its base.
+
+The one unsupported edge case is a main checkout whose `.git` was relocated
+with `git init --separate-git-dir=...`; its worktree siblings are not
+resolved to it as "the main checkout" for the active-pointer fallback above.
+
 ### Deploy tiers
 
 `[workflow.deploy] tier = "development" | "staging" | "production"` in
@@ -1273,15 +1444,86 @@ with no active `zirv workflow`:
 ### Agent registry
 
 Workflow seats are provider-neutral data, not harness-specific plugins: a
-`WorkflowStep.agent` addresses one by id. Built-in seats are `implementer`,
-`reviewer`, `doc-keeper`, `security-scanner`, and `explorer` — `reviewer` is
-pinned read-only by its own adapter. `~/.zirv/agents/*` (operator-global) may
-replace a built-in seat; `.zirv/agents/*` (repository) is disabled unless the
-operator sets `workflow.repo_agents_enabled`, and even then may only add
-non-colliding ids — a repository manifest can never rewrite `reviewer` or grant
-itself capabilities it does not already have. `zirv workflow agents list|show`
-inspects the resolved registry and provenance; `zirv workflow agents dispatch
-<id> --adapter <name> --prompt <task>` launches that seat directly.
+`WorkflowStep.agent` addresses one by id. The prebuilt roster has twelve
+built-in manifests, each mapped to the closed native team role
+(`ctx::team::TeamRole`) whose authority it holds — a manifest's `role` field
+is a display label, never an authorization grant:
+
+| id | team role | write posture | deliverable |
+|---|---|---|---|
+| `implementer` | implementer | writable | bounded implementation unit + evidence |
+| `reviewer` | reviewer | read-only | independent structured findings |
+| `doc-keeper` | implementer | writable | synchronized documentation |
+| `security-scanner` | reviewer | read-only | security/trust-boundary findings |
+| `explorer` | researcher | read-only | bounded investigation findings |
+| `researcher` | researcher | read-only | sourced external/repo research |
+| `planner` | planner | read-only | dependency-ordered task breakdown |
+| `architect` | planner | read-only | ADR-quality decision record |
+| `debugger` | implementer | writable | reproduction test + root-cause note |
+| `tester` | tester | read-only | independent test results + triage |
+| `data-analyst` | researcher | read-only | reproducible data/query analysis |
+| `devops-sre` | implementer | writable | CI/CD, infrastructure, deployment change |
+
+`reviewer`/`security-scanner`/`explorer` are pinned read-only by their own
+adapter. `~/.zirv/agents/*` (operator-global) may replace a built-in seat;
+`.zirv/agents/*` (repository) is disabled unless the operator sets
+`workflow.repo_agents_enabled`, and even then may only add non-colliding ids —
+a repository manifest can never rewrite `reviewer` or grant itself
+capabilities it does not already have. An operator/repository manifest may
+omit `team_role`; it is then derived from `read_only` alone (read-only →
+`researcher`, writable → `implementer`), so a manifest written before this
+field existed keeps loading unchanged. A manifest's `skills` list attaches
+existing `zirv skill` ids to a seat by reference (never by copying instruction
+text); an unknown or version-mismatched reference is refused by
+`AgentRegistry::validate_against`. `zirv workflow agents list|show` inspects
+the resolved registry and provenance; `zirv workflow agents dispatch <id>
+--adapter <name> --prompt <task>` launches that seat directly.
+
+### Team composition
+
+`zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run]
+[--seat <manifest-id>] [--json]` compiles the smallest capable team for a
+request: it classifies the objective exactly like `zirv workflow classify`,
+derives the minimal execution profile (`intent`/`complexity`/`risk` →
+`Direct`/`Bounded`/`Orchestrated`, plus which independent-review/test/security
+gates apply), and deterministically selects seats from the agent roster
+above. Unless `--dry-run`, the compiled `TeamPlan` is stored on the active (or
+`--workflow`-named) workflow; with no active workflow it prints without
+storing and says so. `zirv workflow team show [--workflow <id>|active]
+[--json]` re-prints the stored plan, and `zirv workflow team brief <seat-id>
+[--json]` prints an Agent-tool-ready brief for one compiled seat — the seat
+manifest's own instructions plus the bodies of only the skills that seat's
+manifest references, never the whole skill catalogue. `--seat <manifest-id>`
+bypasses the proportional rules for one explicit seat, but still passes the
+same capability/team-role/route checks a compiled seat does — explicit
+selection never bypasses policy.
+
+**How a team is chosen.** Mechanical/trivial work (`Direct` execution) spawns
+nobody. Bounded work gets one implementer (or the matching domain
+specialist); an independent reviewer joins only when the validation profile
+requires it. A bug fix gets a `debugger` (reproduction test + root-cause
+note) then an `implementer` scoped to that root cause. Substantial features
+add a `planner`; architectural ones also add an `architect`; implementers
+split one per claim-boundary group (by TOP-LEVEL path from the
+classification's own changed-path list when it has one, capped by the
+profile's fan-out limit — a count-based bucket only when it does not).
+Security/data/docs/dev-ops signals in the request or the diff add the
+matching specialist with a concrete deliverable — never a duplicate of a
+gate already covered (a security signal is satisfied by the same independent
+`security-scanner` gate risk alone would require, not a second seat).
+Independent review/test/security seats never share a writer's claim or
+worktree and depend only on the writers having finished, never on reading
+their transcript. An unknown manifest or a team role with no eligible route
+is never invented into a plan: the seat is omitted with a stated reason, and
+the plan still compiles. Fan-out (`Bounded`: 2, `Orchestrated`: 6) and
+dependency-depth limits are enforced before the plan is returned — a plan
+that would exceed them is refused outright, not silently truncated. The team
+compiler never spawns every role; see
+`docs/design/2026-09-15-native-team-composition.md` for the full rule set and
+what is deferred to #537's full execution profile. A native coordinator or
+sub-orchestrator seat compiles the same plan itself with the `team_plan`
+tool, and the native pane's `/agents`, `/agent` and `/team` slash commands —
+see "The native meta-orchestrator" below.
 
 ### Maintain loop
 
@@ -1398,16 +1640,1028 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
-| `zirv ctx status [--json]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON |
+| `zirv ctx status [--json] [--agents]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
-| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat |
-| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal (also `zirv agent`) |
+| `zirv ctx provider init\|list\|check\|credential set` | Initializes, inventories, validates, or stores credentials for opt-in native provider routes |
+| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--runtime native` opens a structured native conversation pane instead (no coding harness, no PTY) — see [The native conversation pane](#the-native-conversation-pane) |
+| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` delegates to a native worker instead, with the same task/ownership/receipt contracts (also `zirv agent`) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
 | `zirv ctx handover [--agent <name>] [--model <tier\|id>] [--dry-run] [--force]` | Swaps the orchestrator seat's harness or model in place mid-session, carrying a handoff packet across the swap — see [Cross-harness fallback and handover](#cross-harness-fallback-and-handover) below |
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
+| `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
+| `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
+| `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+| `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+
+### Runtime backends
+
+Every supervised session picks a `RuntimeKind`: `harness` (the default — an
+`AgentAdapter` spawns the real Claude Code/Codex/etc. binary through the
+`supervise::spawn_tapped` chokepoint) or `native` (zirv conducts the
+model/tool conversation itself over a direct provider route, with no vendor
+CLI in the loop, on the native-runtime roadmap,
+[issue #469](https://github.com/Glubiz/zirv-cli/issues/469)). Native mode is
+always explicit and opt-in: nothing detects it, and an unrecognised runtime
+name is an error rather than a silent fallback to `harness`.
+
+The session registry (`sessions::Record`), the orchestrator seat
+(`seat::Seat`), and the `.conversation` marker each persist which
+`RuntimeKind` they were started under, defaulting to `harness` so every
+record written by an older binary still parses. A resume matches agent,
+session id, **and** runtime before reusing a recorded conversation, so a
+session can never silently cross from a harness-backed conversation to a
+native one (or back).
+
+The in-process wire shapes a `RuntimeBackend` speaks — commands, events
+(`EventEnvelope`'s wire keys are `version, revision, session_id, generation,
+event`), replies, and a structured `ErrorCode` (`runtime::RuntimeError`'s
+`Unsupported`/`UnknownSession`/`Busy`/`StaleGeneration` map 1:1 to it; any
+other backend error maps to `ErrorCode::Backend`) — are versioned from day
+one as protocol v1 (`src/commands/ctx/runtime/protocol.rs`), with frozen
+example payloads under `tests/fixtures/runtime/v1/` so a later change can't
+silently break what v1 meant. No daemon or socket exists yet; everything is
+in-process.
+
+Native sessions use an authoritative schema-v1 SQLite/WAL journal at
+`<state>/native-journal.sqlite`. It records acknowledged inputs, complete
+typed assistant blocks, exact tool calls, execution-state receipts, usage,
+task receipts, portable checkpoints, and monotonic sequence/generation IDs.
+Bounded streaming frames are transient until a completed-message barrier
+commits them; incomplete tool arguments never enter the executable event log.
+An execution interrupted after it starts becomes `outcome_unknown` and must be
+reconciled rather than blindly replayed. Provider continuation envelopes live
+outside portable replay and are readable only with the same route, provider,
+endpoint, account, protocol, vendor, and model identity. The journal projects
+committed facts into the existing `NormalizedEvent` scoring vocabulary, so
+the pure rot engine is unchanged. The storage/recovery contract is documented
+in
+[`docs/design/2026-09-11-native-conversation-journal.md`](docs/design/2026-09-11-native-conversation-journal.md).
+
+The journal does not replace the session registry, seat, task, mailbox,
+workflow, or policy stores. Those remain the single authorities for their own
+state and the journal records only their stable identifiers and receipts.
+Existing harness transcripts are untouched, and older Zirv builds simply
+ignore the additional private database.
+
+Native effects are admitted through one Zirv-owned execution broker before
+any tool implementation can touch the machine. The broker reloads the
+current canonical policy, fences the persisted native seat generation,
+resolves paths through symlinks/junctions, requires the writer permit for the
+exact linked worktree, protects Zirv/provider credential paths, and strips
+credential-bearing environment variables from subprocesses. Interactive
+approvals are signed and bound to the exact action arguments, canonical path
+targets, task/session/role/generation, resource claims, and current policy;
+they cannot be reused after any of those facts changes, and a headless ask is
+an explicit refusal.
+
+Arbitrary native processes require a verified OS isolation launcher. Linux
+uses bubblewrap when `bwrap` is installed, macOS uses the built-in Seatbelt
+launcher, and Windows requires Zirv's restricted-token/AppContainer helper;
+a Job Object is cleanup, not containment. A missing mechanism is reported as
+unsupported and never falls back to an unsandboxed spawn. Consequently Zirv
+does not advertise native coding support on a host until that host's
+enforcement probe passes. The contract and current platform evidence are in
+[`docs/design/2026-09-11-native-execution-enforcement.md`](docs/design/2026-09-11-native-execution-enforcement.md).
+
+The native coding tool service now exposes a closed, schema-described
+registry for file ranges, directory/glob/text search, atomic writes,
+exact-content patches, process start/poll/wait/input/termination, and stored
+output retrieval. JSON is fully decoded into a typed request before the N04
+broker sees an action; unknown fields, incomplete payloads, empty handles,
+and oversized arguments are refused without executing anything. File writes
+require idempotency keys and existing files require SHA-256 preconditions.
+Patches additionally require exact occurrence counts. UTF-8 BOM, UTF-16
+endianness, existing permissions, and consistent line endings survive an
+atomic replacement; binary and image reads report their media type and hash
+instead of corrupting bytes through a text decoder.
+
+Processes use explicit argv by default. Shell mode is a separate
+`shell_script` shape and receives conservative git/destructive effects.
+Requested network, outside-write, and git-metadata access can only add broker
+checks and sandbox bindings; omitting them leaves those effects unavailable.
+Non-interactive commands use pipes, interactive commands alone use
+PTY/ConPTY, and every live command has an opaque handle for bounded polling,
+waiting, input, and process-tree termination. Raw stdout/stderr streams once
+into the existing output store, so large and non-UTF-8 failures return a
+bounded summary plus `output_id` rather than filling model context. Process
+handles are intentionally machine-process-local and are not claimed to
+survive a runtime crash. N03 journal states make an interrupted effect
+`outcome_unknown`; receipts mark each tool `safe`, `reconcile`, or
+`never_after_start`, preventing blind replay of remote mutations. The exact
+contract is documented in
+[`docs/design/2026-09-11-native-coding-tools.md`](docs/design/2026-09-11-native-coding-tools.md).
+
+Native context is compiled independently from provider delivery. Zirv emits
+typed instruction and data messages with source/trust provenance, a stable
+methodology prefix, an output-token reservation, and explicit records for
+every included, truncated, referenced, or excluded source. Operator and Zirv
+methodology are instructions; repository prompts, canonical context, shared
+memory, and repository skills remain untrusted data and cannot grant
+authority. Only the active workflow step's skills and bounded relevant memory
+are selected. Required task, workflow, and evidence handles either fit or the
+compile fails—optional prose can never silently crowd them out.
+
+The native registry also exposes `memory_recall`, `memory_remember`,
+`memory_forget`, and zero-model `context_search`. They reuse the existing
+locked memory/search stores and opaque `output_read` evidence handles; shared
+memory writes still cross the repository policy and writer-lease boundary.
+No Claude/Codex prompt file, helper process, or `AgentAdapter` participates in
+native compilation. The contract is documented in
+[`docs/design/2026-09-12-native-context-compiler.md`](docs/design/2026-09-12-native-context-compiler.md).
+
+The first direct-model adapter speaks Anthropic's Messages API over raw
+HTTPS/SSE behind a provider-neutral transport contract. It sends only Zirv's
+compiled system/data messages and public tool schemas, reassembles interleaved
+text, tool-use, thinking signatures, and redacted-thinking blocks, and keeps
+all tool execution in Zirv. Exact model IDs and model-specific thinking/effort
+controls are checked locally; authentication, entitlement, model access,
+context limits, rate limits, overloads, timeouts, cancellation, refusals, and
+usage/cache classes remain typed. Opaque continuation material is replayed
+verbatim but excluded from diagnostics. Versioned fixtures and an ignored,
+credential-gated live contract test (`cargo test --ignored
+live_anthropic_messages_contract`, needing `ANTHROPIC_API_KEY` and
+`ZIRV_ANTHROPIC_LIVE_MODEL` — an exact, entitled model id) cover the provider
+boundary; N09 owns wiring this adapter into the durable agent loop. The
+transport contract is in
+[`docs/design/2026-09-12-native-anthropic-provider.md`](docs/design/2026-09-12-native-anthropic-provider.md).
+
+The second direct-model adapter speaks OpenAI's Responses API the same way --
+raw HTTPS/SSE to `POST /v1/responses`, with no Codex binary, Codex SDK, or
+Codex App Server in the path. Zirv owns the conversation: every request sends
+`store: false` with the full local history, and `previous_response_id` is
+never used as durable state. Reasoning items keep their id and encrypted
+content verbatim for replay and are refused when they reach a provider that
+cannot carry them; function calls commit only from a completed output item
+whose arguments match the streamed ones, an incomplete response drops every
+function call and records why, and a stream without a terminal event is a
+typed error rather than a completion. Only a Platform API key is accepted: a
+ChatGPT/Codex subscription login is refused with an entitlement error instead
+of being billed as API usage. Controls are validated against exact API model
+ids -- a Codex harness model id is not assumed to be a Responses model. The
+routes are fixture-verified, with live validation available through an
+ignored, credential-gated test (`cargo test --ignored
+live_openai_responses_contract`, needing `OPENAI_API_KEY` and
+`ZIRV_OPENAI_LIVE_MODEL`); the contract is in
+[`docs/design/2026-09-12-native-openai-provider.md`](docs/design/2026-09-12-native-openai-provider.md).
+
+The third direct-model adapter speaks Google's Gemini `generateContent`/
+`streamGenerateContent` API over the same raw HTTPS/SSE transport, behind two
+explicitly versioned protocol profiles: the Gemini Developer API (API key,
+`generativelanguage.googleapis.com`, `v1beta`, where thinking and
+function-calling controls live) and Vertex AI (an OAuth access-token
+credential plus an explicit project and location, addressed at
+`.../v1/projects/{project}/locations/{location}/publishers/google/models/
+{model}`). Token acquisition for the Vertex profile is a separate
+credential-class concern from payload transformation. Parallel function calls
+and `thoughtSignature` continuation metadata -- including signature-only
+reasoning with no visible thought text -- are preserved verbatim as opaque
+data and rejected before transport if they carry another provider's shape.
+Safety blocks (`SAFETY`/`RECITATION`/`PROHIBITED_CONTENT`/...) commit as a
+typed refusal outcome, never prose; quota errors, invalid project/location,
+authentication, model access, transport and context-overflow failures map
+onto the same typed failure classes the other two providers use. A Gemini CLI
+OAuth login (`~/.gemini`) is refused outright, by path and by credential
+shape, with an actionable `Entitlement` failure -- the same posture as
+OpenAI's subscription refusal. The Vertex profile is declared but only just
+promoted from `Support::Planned` to `Support::Native` in N02's capability
+table; both routes are fixture-verified, with live validation of the
+Developer API profile available through an ignored, credential-gated test
+(`cargo test --ignored live_google_generative_ai_contract`, needing
+`GEMINI_API_KEY` and `ZIRV_GOOGLE_LIVE_MODEL`).
+The contract, and how to add or retire a protocol profile, is in
+[`docs/design/2026-09-13-native-google-provider.md`](docs/design/2026-09-13-native-google-provider.md).
+
+#### The native agent loop
+
+`zirv ctx exec --runtime native` runs a whole session without a coding
+harness installed:
+
+```
+zirv ctx exec --runtime native --prompt "fix the failing test"
+zirv ctx exec --runtime native --route work-sonnet --role worker -- fix the failing test
+zirv ctx exec --runtime native --resume 9d2f… --prompt "now update the docs"
+```
+
+Flags: `--runtime harness|native` (default `configured` — the operator's own
+`~/.zirv/ctx.toml` `[runtime]` table decides; unconfigured resolves to
+`harness` — see [Choosing the default](#native-setup-diagnosis-and-rollback)),
+`--route <id>` (a
+`[route]` from the operator's native provider configuration; defaults to the
+`[roles]` entry for `--role`), `--role <role>` (default `worker`; selects
+that default route and the repository-write posture its tools run under),
+`--resume <session>` (continue a stored native session — see below; a resume
+needs no fresh prompt). `--budget-tokens`, `--max-tool-calls` and
+`--timeout-secs` apply as the loop's own ceilings (issue #637:
+`--budget-tokens` checkpoints once at `agent::BUDGET_SOFT_FRACTION` of the
+ceiling and stops at it, `status:"limit_reached"`, `limit:"tokens"`, the
+same exit code the harness path's own budget ceiling uses). The ceiling
+counts input + cache-creation + cache-read + output tokens, the same four
+classes the harness path's own `--budget-tokens` sums (harness parity);
+the final status's own `reconciliation.billable_tokens` counts only input +
+output, so the two figures differ whenever cache tokens are in play.
+`--agent`, `--transcript`, `--session-id` and
+`--max-restarts` are harness-runtime flags and are **refused** here, not
+ignored: a native session supervises no external process, has no transcript to
+score and nothing to restart. The command prints one structured JSON final
+status (`schema_version`, `status`, the actual route/provider/endpoint/account,
+the configured **and** served model, turn/request/tool counts, usage, evidence,
+and any incomplete or outcome-unknown tools) and exits on the same supervisor
+exit codes. `--view json|plain` (default `json`, contract unchanged) — `plain`
+additionally renders the finished session's transcript, after that same JSON
+status, through the dashboard native pane's own non-ratatui renderer (issue
+#480): streaming text/markdown, tool calls, diffs, test outcomes, artifact
+links and errors, readable in a piped log or a terminal too small for the
+dashboard, with no `ratatui` required.
+
+`--resume <session>` does the four things a continuation owes before it may
+run, in this order: it reads the stored session (a session this journal has
+never heard of is an error, never an invented one), checks it was started in
+**this** repository (issue #639 — the canonical repository root is recorded
+once at session start and never rewritten; `--resume` from any other root is
+refused, naming the recorded origin, before anything else below runs or
+mutates the journal at all — resume from the same repository is unaffected),
+converts every execution whose last durable state is `started` to
+`outcome_unknown` — an effect that began and never reported is **never**
+silently retried — and then advances the generation, which fences the
+previous one out of both the journal and the execution broker. Anything still
+holding the old generation (a half-dead process, a stale handle) is refused
+from that point on.
+
+Two operator-only flags make a whole native session runnable with no provider
+configured at all: `--provider fixture:<path>` replays a deterministic
+provider script instead of calling a model, and `--fixture-tools <path>`
+supplies the tool receipts it runs against (without it every tool call reports
+a fixture failure rather than touching the machine). Both are command-line
+flags and nothing else — no configuration layer, least of all a repository's,
+can set them. This is the same fixture machinery the loop's own tests use, so
+`zirv ctx exec --runtime native --provider fixture:…` exercises the shipped
+code path end to end without a credential, a network call or an installed
+harness.
+
+Inside, an explicit session/turn/request/tool state machine drives the cycle.
+The assistant message and its complete tool calls are committed to the journal
+**before** any tool preflight, so a truncated argument stream can never become
+an effect. Independent (read-only) calls may be scheduled ahead of mutating
+ones, but results always go back in the provider's own declared order, keyed by
+call id. Every input is durably acknowledged the moment it is accepted and
+joins the conversation at an explicit delivery boundary — between requests in
+a turn, or between turns, never mid-stream or mid-tool; anything not yet
+delivered is reported as `queued_input` rather than dropped. An interrupt
+cancels the in-flight stream, every unstarted tool and the remaining turns, but
+never an effect already in progress: that becomes `outcome_unknown` and must be
+reconciled before any retry. Response retries (re-sending a request that
+committed nothing) are budgeted separately from tool-effect retries, and only a
+tool whose own contract says `safe` is ever re-run. A model's finish token
+cannot produce `completed` while an execution is incomplete, an outcome is
+unknown, an acknowledged input is undelivered, or a lifecycle gate objects.
+
+Every lifecycle decision the loop makes — before-tool admission, after-tool
+result disposition, prompt notes, stop, notification classification, owed
+verification — comes from `ctx::lifecycle`, the shared service `hook.rs` now
+translates its harness payloads into. The native path calls it directly: no
+hook process, no harness binary, no PATH probe. Deterministic fixture
+provider/tool scripts under `tests/fixtures/runtime/native/` prove loop
+correctness for both primary provider shapes without a paid call. The contract
+is in
+[`docs/design/2026-09-13-native-agent-loop.md`](docs/design/2026-09-13-native-agent-loop.md).
+
+#### The native conversation pane
+
+`zirv chat --runtime native` opens a structured native conversation instead
+of a wrapped-harness session: a dedicated `ratatui` dashboard pane (no PTY,
+no `vt100` — the pane renders the journal's own structured events directly)
+driving an in-process, multi-turn native session on a background thread:
+
+```
+zirv chat --runtime native
+```
+
+**Experimental: `zirv native`.** `zirv native` (case-insensitive) is a thin
+top-level alias for `zirv chat --runtime native` above: `main.rs` rewrites
+the argv to the identical `ctx chat --runtime native` shape before
+`ctx::dispatch` ever runs, so there is exactly one native-chat launch path
+either spelling reaches — no second implementation to keep in sync. `zirv
+native --help` documents its own syntax, prerequisites, limitations, and
+where session/journal state lives, and exits 0. `zirv help` never lists it
+beside the stable commands; it appears only in a separately labelled
+"Experimental / work in progress" section, and `zirv commands --json`
+reports it with `"stability": "experimental"` and `"runtime": "native"` so
+automation and docs generation can tell "hidden help" from "does not exist".
+Launching it prints a one-time notice on stderr ("zirv native is
+experimental; `zirv chat` remains the stable harness."), never repeated per
+turn and never folded into the model's own context; `zirv chat --runtime
+native` itself never prints that notice, since it is keyed on the alias
+having been used, not on the runtime chosen. Like the flag it rewrites to,
+it never changes the operator's default runtime, migrates configuration, or
+falls back to a wrapped harness — reject-with-a-refusal is the only response
+to a missing prerequisite (see `zirv ctx doctor`).
+
+`zirv chat` takes no `--route` or `--view` flag (those are `zirv ctx exec
+--runtime native`'s own) — the native pane always spends the `orchestrator`
+role's route (`[runtime.roles].orchestrator`, or `[roles].orchestrator` in
+`~/.zirv/native.toml` with no per-role runtime override). `--runtime native`
+refuses every wrapped-harness-only flag (`--agent`,
+`--simple`, `--resume`, `--pin-harness`, a trailing `extra` argv) rather than
+silently ignoring them, and refuses without an interactive terminal on both
+stdin and stdout. The transcript renders Claude Code-style: assistant text
+and tool calls as `⏺` bullets, each tool result as an indented `⎿` line
+("(ctrl+r to expand)" while collapsed), user turns as `>` lines, and diffs
+with an old/new line-number gutter. While a turn runs, an activity line
+(spinner, a rotating verb, real elapsed time, a running token count, "esc to
+interrupt") appears at the tail of the transcript. The bottom status line
+shows the actual model, route, runtime and billing class, one of seven
+states (generating, executing, waiting, blocked, cancelled, failed, or
+completed with an unread result), an estimated "context left N%" (recorded
+usage against the route's declared context window — not the compaction
+budget's own accounting), the repo path and, when known, the checked-out
+git branch.
+
+**Composer key contract:** `Enter` submits (or, mid-turn, steers — written
+straight to the journal and picked up at the next turn boundary, the same
+mechanism `NativeLoop::queued_input` already re-polls between turns; a
+blocked/not-yet-ready submission is queued instead, and queued input is
+**never** treated as an approval answer). `Shift+Enter`/`Alt+Enter` insert a
+newline. `Up`/`Down` browse submit history only at the first/last line of the
+draft. `Esc` interrupts the current turn without quitting. `Ctrl+C` no
+longer interrupts by itself — one press arms a quit confirmation, and a
+second `Ctrl+C` within 2 seconds of the first quits; `Ctrl+Q` still quits
+immediately (persisting the draft first). `Ctrl+R` toggles the most
+recently rendered tool call's expanded state from either region. `Shift+Tab`
+cycles a composer mode label (`default`/`accept-edits`/`plan`) shown on the
+hint line — **decorative only**: no submit path reads it back to change
+approval or write behaviour yet. `Tab` swaps focus between the composer and
+the transcript, where `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` scroll
+(scrolling up disengages auto-follow; it re-engages at the bottom) and
+`e`/`Enter` expands or collapses the most recent tool call. A `/`-prefixed
+submission is a pane-local command, never a turn: `/clear` drops the queued
+backlog, `/help` and `/status` report the key contract and the live session
+facts, `/compact` is an honest inert stub. `/agents` lists the resolved
+agent roster; `/agent <manifest-id> <task>` compiles and shows an explicit
+one-seat plan (a dry-run preview through the same capability/team-role/route
+checks `--seat` uses, never persisted); `/team` shows the plan stored for
+this repository and `/team plan <objective>` compiles and persists a new
+one — all three render through the identical functions the headless `zirv
+workflow agent list`/`team show|plan` commands print through, so the two
+surfaces cannot drift (issue #541 chunk C). `@` file references
+(`resolve_file_refs`, containment-checked against the workdir) and a
+`!`-prefixed shell line are not wired into this loop yet.
+
+`--runtime native` is **not** a separate dashboard any more: the native
+conversation opens as the **first pane of the ordinary dashboard**, so one
+process holds wrapped and native panes together. A pane carries its kind
+(`dash::pane::PaneKind`); everything around it — the header, the sidebar
+roster, the spawn-request channel, the mail sweep, attention, the budget
+sweep, the footer spend and the restore roster — is the dashboard's own and
+applies to both kinds unchanged. Only four things differ by kind: the pane
+renders as a `vt100` grid or as the native frame, a keystroke reaches the
+pty writer or the native composer/router (a native control is never offered
+on a wrapped pane, and vice versa), mail is delivered as a visible pty
+injection or through the native **submit path** (so it is subject to the same
+rollover/generation guard the operator's own `Enter` is), and ending it sends
+a harness quit sequence or shuts the session down. `zirv agent <role>
+--runtime native` from inside the dashboard opens a native **worker** pane
+the same way; such a request is refused, rather than accepted and silently
+unaccounted, when it asks for a work group or a token/time ceiling, which are
+accounted from a harness transcript a native session does not have. The
+restore roster records each pane's kind, and a native pane comes back through
+the same attachment decision a fresh one makes — so a dashboard restarting
+while the persistent runtime still holds the conversation re-attaches to it
+rather than opening a second supervisor over it. The view model (the reducer
+from the journal to a transcript, the composer, the renderers) is
+`dash::native_pane`, covered by deterministic tests with no terminal
+required; see
+[`docs/design/2026-09-13-native-pane.md`](docs/design/2026-09-13-native-pane.md).
+
+**The pane's own surfaces (issue #490).** Beside the conversation the pane
+draws an **agent & task overview** built from the coordinator graph, the
+delegation receipts and the seat records — role, the *actual* model and
+backend with its provenance, ownership and worktree, and one of
+running / blocked / approval-needed / done-unread / failed / queued /
+draining, each with its own glyph as well as its own colour. Rows are
+navigable with `Up`/`Down` and clickable; `Enter` opens that worker's
+**bounded manifest** — its diff, test and artifact evidence — and never its
+transcript, and `f` sends a bounded follow-up to it (queued automatically if
+that worker is itself blocked, and retried at its next idle boundary).
+Underneath sits the **usage and health provenance strip**: measured,
+estimated and unknown are labelled and never summed, a route that is
+excluded keeps its reason verbatim, and an unknown figure is never rendered
+as a zero. Compaction, rollover and reconnect appear as ordinary notices
+that scroll with the conversation, each announced once; drafts, selection,
+focus, scrollback and acknowledged input survive all three, and a
+submission is refused outright when the logical seat has moved on
+underneath the pane. An approval is rendered as a numbered dialog carrying
+the exact scope, answered only with `1`–`3`, the arrows, `Enter` or `Esc` —
+never from the composer, which queues while blocked. **Answering "Yes" is
+real for an in-process session:** its execution broker runs in interactive
+approval mode, raises a typed request carrying the exact tool, scope and
+actor, and BLOCKS that tool call until the dialog answers. `1` runs it once;
+`2` runs it and stops asking for that **exact** tool+scope for the rest of
+this session only (never persisted, never widened to a directory, and only
+offered when the scope can be stated exactly); `3` refuses the call with the
+operator's guidance, which is also committed as steering so the running loop
+picks it up. `Esc` is `3`. Interrupting the turn cancels whatever is blocked
+on the dialog: the call fails closed and a later answer releases nothing. A
+**headless** session is unchanged — it is shown the deny option only, rather
+than a "Yes" that would quietly fail — and repository-owned configuration can
+only narrow this, never grant it. `?` lists every binding, `Tab` moves
+focus, `Esc` interrupts (or closes a dialog first), and a double `Ctrl+C`
+quits. The composer itself is a bordered box with a `>` marker and a hint
+line naming what `Enter` does right now, and `/`, `@` and `!` open the
+slash-command list, the worktree-restricted file picker and a shell line
+that runs through the pane's own process tool under the same policy as any
+other tool call.
+
+**Where the conversation lives.** With `[session] persistent` on, something
+listening, a runtime that serves native conversations, and a live native seat
+for this repository, the pane **attaches** to that session over protocol v1
+instead of opening its own — submit, steer, interrupt and the approval
+decision all go out as `session.send_input` / `session.interrupt` /
+`session.approve`, closing the window is a `session.detach` rather than a
+kill, and the status line reads `native · runtime`. Anything missing falls
+back to an in-process session, which is a working mode rather than a failure.
+An attached pane's model and route show as `–`: the runtime publishes no
+route identity for a session, and a guess would be worse than an honest
+placeholder. See
+[`docs/design/2026-09-13-native-ux.md`](docs/design/2026-09-13-native-ux.md)
+and the mock in
+[`docs/design/mocks/2026-09-13-native-pane.html`](docs/design/mocks/2026-09-13-native-pane.html).
+
+#### Native workers, shared ownership and delegation receipts
+
+`zirv agent --runtime native` (equally `zirv ctx agent --runtime native`)
+delegates one task to a **native** worker -- no coding harness installed, no
+child process, no PTY:
+
+```
+zirv agent native "read src/main.rs and report the entry point" --runtime native
+zirv agent work-sonnet "run the failing test and report" --runtime native --task task-12 --json
+zirv agent claude "review this diff" --mode read-only          # unchanged: the harness fork
+```
+
+Flags: `--runtime harness|native` (default `configured`, resolved the same
+way `zirv ctx exec`'s does — see
+[Choosing the default](#native-setup-diagnosis-and-rollback)) and
+`--route <id>`, the same two flags and the same two values `zirv ctx exec`
+already takes.
+**Without `--runtime native` nothing changes** -- the harness delegation is
+reached by the same code, in the same order, with the same arguments. With
+it, the positional `<name>` names the provider **route** rather than a
+harness (a native worker has no harness to name), and the reserved value
+`native` defers to the `[roles]` entry for `--role`; `--route` overrides it.
+`--max-restarts` and a trailing `-- <flags>` passthrough are **refused**, not
+ignored, for the same reason `zirv ctx exec --runtime native` refuses them.
+
+Everything else about the delegation is identical, because it is literally
+the same code: `--workdir`/`--worktree`, `--task`, `--group`, `--mode`,
+`--path-scope`/`--no-network`/`--depth`, `--result-schema`/`--result-kind`,
+`--budget-tokens`/`--max-tool-calls` and `--json` all behave exactly as they
+do for a harness worker. A native worker takes the **same** ownership a
+legacy one does and is therefore mutually exclusive with it:
+
+| Exclusive claim | Mechanism | Effect |
+|---|---|---|
+| Task card | `zirv ctx task` claim (`task::claim_locked`) | one live claimant per card, whichever runtime asked |
+| Checkout write | writer permit (`permit::acquire_writer`) | one writer per tree; a native worker's permit is handed to its execution broker, which refuses any repository write not backed by a permit for that exact tree |
+| Provider tokens | per-provider reservation ledger | one machine-wide outstanding total, settled from the run's real usage |
+
+Each delegation gets a **stable handle** -- minted by zirv, independent of
+any provider conversation id a resume would change -- and a durable record at
+`<state>/delegations/<repo-slug>/<handle>.json` holding the launch receipt
+(written *before* anything runs), the ownership taken, every attempt, and
+every delivery already published or consumed. Terminal outcomes are persisted
+first and notified second, over ordinary mail, carrying a **delivery
+identity** `<handle>:<attempt>:<revision>`. Mail is at-least-once: a
+consuming `zirv ctx inbox` drops an exact repeat of an identity it has
+already consumed (and still shows anything it cannot account for), so one
+completion is never acted on twice and never lost. A message that arrives
+while its target has an approval or other attention latch open is queued
+durably and retried at the next idle boundary -- never typed at the dialog
+(the same rule the dashboard's own pane sweep applies).
+
+A native session drives all of this with seven typed tools in its own
+registry -- `delegate`, `send`, `wait`, `result`, `follow_up`, `interrupt`,
+`close` -- each a validated argument shape in front of the *same* service
+method the CLI verb calls. `result` returns a bounded manifest (outcome,
+delivery identities, report reference, unknown tool outcomes, whether the
+summary was cut), never a transcript. `follow_up` is addressed to the
+delegation handle: directed mail while the worker is live, a journal resume
+for a finished native worker (the id it returns is what `zirv ctx exec
+--runtime native --resume` takes), otherwise an explicit replacement
+checkpoint that says it has none of the original's hidden context -- there is
+no "most recent session" fallback, and an unknown handle is an error. `close`
+releases the reservation and the write claim while preserving every receipt
+and every `outcome_unknown` effect. The contract is in
+[`docs/design/2026-09-13-native-workers.md`](docs/design/2026-09-13-native-workers.md).
+
+Trust boundary: every delegation tool crosses the native execution broker as
+an `ExecutionAction::Delegate`, so a native session cannot delegate around
+the seat fence and policy its other tools run behind; the delegation handle
+is validated as `[A-Za-z0-9_-]{1,128}` at the argument boundary, so provider
+output can never name a file outside its own repository's delegation
+directory; and a nested worker gets its own principal and a
+`delegation_depth` one hop shorter than its parent's, so it inherits none of
+the parent's session authority.
+
+`zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
+[`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
+honest against the real command surface and source tree: every command verb
+and every model-calling call site in `src/` has a named implementation
+owner, checked on every run. Its sibling `ZCHK-NATIVE-PARITY` keeps
+[`docs/design/native-parity.md`](docs/design/native-parity.md) -- the
+release-blocking parity matrix -- honest in turn: every capability the
+inventory knows about has a row naming the native path, the legacy path, the
+provider/platform requirement, the evidence, and the *rung* that says how
+strong the claim is (`unit`, `integration`, `ci-matrix`, `live-validated`,
+`legacy-only`). A missing row, a cited test that exists nowhere in `src/`, a
+CI step that is not in `ci.yaml`, an uncommitted `docs/benchmarks/` pointer,
+a `live-validated` claim with no recording, an evidence-free row that is not
+named as a release blocker, or a `legacy-only` row that does not say why --
+each fails the build, so no row can claim more than its evidence. What that
+record is worth, what is deliberately *not* verified, the pre-declared
+non-regression targets and the release decision (the default stays the
+harness; native is opt-in) are in
+[`docs/design/2026-09-14-native-release-evidence.md`](docs/design/2026-09-14-native-release-evidence.md).
+The architecture decision behind all of this is
+recorded in
+[`docs/design/2026-09-11-native-runtime-contracts.md`](docs/design/2026-09-11-native-runtime-contracts.md).
+
+### Native workflows, verification and helper calls
+
+Migrating the chat loop alone would leave hidden vendor-CLI dependencies in
+everything around it, so every zirv model call that is *not* the main
+conversation runs natively too: handoff distillation, `zirv ctx ask`, `zirv
+ctx optimize`'s judgment pass, the agent loop's objective judge, the memory
+harvest and consolidation, the independent code reviewer, the frontend visual
+reviewer and the built-in agent seats.
+
+They all go through one helper service (`ctx::helper`) rather than
+per-call-site provider code: one bounded conversation, a typed answer, typed
+failures. **There is no new configuration key.** A helper runs natively
+exactly when your own native provider configuration names a route for that
+helper's role — `distiller`, `ask`, `optimize` or `seat` under `[roles]` in
+`~/.zirv/native.toml` — and otherwise keeps its existing harness path
+unchanged. A native attempt that fails still falls back to the harness rather
+than failing the caller.
+
+The seats that are real delegated workers take `--runtime native` instead, so
+they reuse `zirv agent` end to end:
+
+```bash
+zirv workflow review run <id> --agent fast-route --runtime native
+zirv workflow agents dispatch reviewer --adapter fast-route --runtime native
+zirv workflow frontend review --runtime native
+```
+
+Read-only stays read-only by mechanism, not by prompt: a native helper and a
+`--mode read-only` native worker hold no writer permit at all, so the
+execution broker refuses every repository write, outside write, write-effect
+process and shared-scope knowledge write at effect time — and a headless
+session cannot approve its way past that. A *writable* seat is therefore
+refused by the native seat dispatcher rather than quietly downgraded; run it
+as a delegated worker (`zirv agent --runtime native --mode writing`), which
+takes a real permit.
+
+A native session drives the workflow itself with four typed tools —
+`workflow_status`, `workflow_context`, `workflow_advance`, `workflow_approve`
+— each a thin adaptor over the same `workflow::engine` function the CLI verb
+calls, over the same durable state. The two that mutate the workflow declare
+the write capability, so a read-only reviewer can read the workflow it is
+reviewing and cannot move it.
+
+Methodology and workflow adoption are automatic. The native context compiler
+puts the engineering standard, the role methodology, the model profile, your
+own and the repository's instruction files and the active workflow's current
+step into every request the session makes; nobody hand-seeds a prompt.
+Verification freshness is not advisory either: the engine's completion gate is
+re-read at every completion attempt, so a session that reaches the Test step
+after it started is gated on the evidence that exists then, and its "I am
+finished" token cannot outrank it. That gate is keyed by the workflow's own
+recorded branch, so a workflow started in the main checkout accepts its worker
+worktree's evidence for the same change set (see [Linked
+worktrees](#linked-worktrees)) and rejects a different one.
+
+The per-command parity table — every shipped command and helper, its native
+implementation and the test that pins it — is
+[`docs/design/native-parity.md`](docs/design/native-parity.md); the decisions
+behind this step are in
+[`docs/design/2026-09-13-native-workflows.md`](docs/design/2026-09-13-native-workflows.md).
+
+#### Instructions in native sessions
+
+A native session's instruction layer (`SourceKind::NativeInstructions`, data,
+never a provider instruction message) is built the same [`ZIRV.md`
+precedence](#zirvmd-instruction-files) the wrapped harness reports, in a fixed
+order: operator-global `~/.zirv/ZIRV.md` first, then the unchanged repo
+`.zirv/system-prompt.md` layer, then the resolved `ZIRV.md`/`AGENTS.md`/
+`CLAUDE.md`/`AGENT.md` winners for the repo root and the active scope's
+ancestor directory chain. **Scope rule**: only the repo root plus directories
+that contain a path this session has actually touched (a tool call's
+read/write/edit target) load their nested instruction files — a large
+monorepo's unrelated crates are never pulled in. A shadowed, duplicate or
+excluded chunk A decision still gets a provenance entry (`Excluded`, naming
+the exact reason) rather than vanishing, and the whole layer is capped by
+`context.instructions_max_bytes` (default 32 KiB) on top of the existing
+per-file cap. **Recompile on change**: at the start of a turn, the resolved
+instruction file list (paths and content hashes) is recomputed for the
+session's touched-path scope; when it differs from what shaped the current
+system/preamble — a new nested file entered scope, a file changed on disk, a
+file was removed — the whole standing context recompiles and replaces it
+before that turn is sent, without restarting the session. Recompiling only
+ever touches the instruction layer: tools, policy, permissions and the route
+are untouched. Every compile/recompile is journaled
+(`context_version` = the compiled context's stable-prefix hash, plus the
+per-source path/scope/trust/decision), and the native `/context` (alias
+`/instructions`) pane command surfaces the same facts live.
+
+### Native teams and the coordinating seat
+
+Zirv can run the coordinator itself. A native session seated as
+`--role coordinator` (or `sub-orchestrator`) plans the work, staffs it and
+delegates it across native *and* wrapped workers, over the same shared task
+cards, work groups, objective and workflow every other surface uses.
+
+Seven team roles are recognised — `coordinator`, `sub-orchestrator`,
+`researcher`, `planner`, `implementer`, `reviewer`, `tester` — and each one
+spends the route **you** configured for it under `[roles]` in
+`~/.zirv/native.toml`:
+
+```toml
+[roles]
+coordinator   = "sonnet-seat"
+implementer   = "sonnet-seat"
+reviewer      = "haiku-metered"
+tester        = "haiku-metered"
+```
+
+A role with no entry has no native path at all: the refusal names the role and
+lists the roles that *are* configured, rather than quietly spending another
+role's route. Nothing is inferred, and nothing changes provider on its own —
+a route a model asks for is admitted only if it clears your policy and keeps
+the same billing posture you seated that role on.
+
+```bash
+zirv ctx exec --runtime native --role coordinator --prompt "ship issue #123"
+```
+
+Eight typed tools give that seat the board: `task_create`, `task_claim`,
+`task_list`, `group_create`, `group_status`, `objective_status`,
+`team_status` and `team_plan`. Each is a thin adaptor over the same `zirv
+ctx task|group|objective`/`zirv workflow team` service the CLI verb calls, so
+there is one definition of "this card is claimed" and one of "this group is
+full". The four that change shared state need a writer permit; the four that
+read do not.
+
+**Who may do what comes from the seat, not from the request.** A reviewer or
+tester is read-only by identity, however the delegation was spelled; a
+coordinator that is itself read-only can still dispatch a writing implementer;
+a reviewer seat may not delegate at all. Delegation depth, task ownership,
+checkout ownership, group admission and the provider token ceiling are the
+same limits the rest of zirv already enforces — there is no second counter,
+and a delegation that fails any of them starts nothing and leaves no receipt
+behind.
+
+**A delegation is checked against its manifest and the team plan (issue
+#541 chunk C).** `delegate` accepts `manifest: <id>` (defaulting to the
+requesting role's own built-in manifest — `implementer` for `implementer`,
+`reviewer` for `reviewer`, and so on); an unknown manifest, or one whose own
+team role disagrees with the requested role, or one that may write for a
+role that is read-only by identity, is refused before any receipt exists.
+`team_plan` (coordinator/sub-orchestrator seats only) compiles the SAME
+proportional team `zirv workflow team plan` compiles — classification,
+execution profile, then `compile`/`compile_explicit` for `seat: <manifest
+id>` — and stores it: the active workflow owns the plan when one exists for
+the repository, and the coordinator's own record does otherwise. Once a plan
+exists, a `delegate` call must name (as its `task`) an unfilled seat whose
+manifest and role match one in it, or it is refused with `not in the team
+plan; run team_plan again or pass override: true`; `override: true` bypasses
+the match but is honoured only for the coordinator seat, and is recorded on
+the launch receipt either way. Seats are marked filled the moment they are
+dispatched (the SAME graph node `task_create`/`team_status` already key by
+task id); a retry after a failure re-fills the identical seat rather than
+creating a second one, and two seats whose claimed paths overlap can never
+both be dispatched at once — a wrapped-harness worker seat goes through
+these exact checks too, whichever runtime the coordinator itself runs on.
+
+**A coordinator survives a restart.** Its task graph, decisions, evidence
+references and your standing constraints are durable. On restart it consumes
+every worker receipt published while it was away, exactly once, and never
+re-dispatches work that already settled. A worker's outcome is a bounded
+manifest and a reference to its result, never a replay of its transcript, and
+until the receipt is actually read `team_status` reports it as pending rather
+than assuming it:
+
+```bash
+zirv ctx objective set "ship issue #123 without touching the release branch"
+zirv ctx objective close      # stops further dispatch; work already running still reports
+```
+
+Setting an objective is how you steer — it redirects the coordinator and lifts
+a previous stop. Closing it stops further dispatch while leaving work already
+delegated answerable, so its results are still collected. `objective close`
+refuses (exit 1) unless a fresh, passing final verification for the
+repository already exists — completion is asserted only by a passing
+verification gate, never by prose.
+
+The decisions behind this step are in
+[`docs/design/2026-09-13-native-orchestrator.md`](docs/design/2026-09-13-native-orchestrator.md).
+
+### Native configured capabilities
+
+A native session inherits nothing from a coding harness, so the non-shell
+capabilities a workflow needs — MCP servers, a browser, web search, language
+diagnostics, artifact presentation — are **configured**, never assumed. Zirv
+does not claim a raw model API provides any of them.
+
+```bash
+zirv ctx capabilities                       # the report, one row per integration
+zirv ctx capabilities --probe               # also contact each configured MCP server
+zirv ctx capabilities --require browser     # exit non-zero unless it would admit a step
+```
+
+Every row is exactly one of three states. `available` means zirv found the
+backend. `unavailable` means it did not, and the row names the missing binary,
+credential or config key. `unverified` means it is configured but has not been
+contacted this run — discovery reads configuration, `PATH` and the repository
+tree and contacts nothing, so a configured MCP server nobody spoke to is not
+evidence that it answers. `--probe` is what turns an unverified MCP row into a
+verified one. The workflow engine reads the same report and refuses to enter a
+step whose required integration is unavailable, quoting the diagnosis, instead
+of failing halfway through it.
+
+Zirv speaks MCP itself, over a local stdio server or a remote Streamable HTTP
+endpoint with a bearer credential from the same store the direct providers use.
+It negotiates the 2025-11-25 revision (refusing an unknown one rather than
+guessing), discovers tools and resources, calls them, cancels with
+`notifications/cancelled`, and reconnects with re-discovery. A reconnect that
+changed or removed a tool invalidates it: a call naming that tool is refused
+until its current schema is described again, so a stale call can never execute
+a different tool. Server descriptions and results are untrusted data — bounded,
+redacted, never executed, and streamed into the existing output store when
+large. A catalogue at or below `capabilities.max_inline_mcp_tools` is exposed
+as ordinary tools, namespaced `mcp__<server>__<tool>` so a server can never
+shadow a built-in name; a larger one is reachable only through a compact index
+(`mcp_list`), an on-demand schema (`mcp_describe`) and `mcp_call`, so a big
+toolset never enters every model request.
+
+MCP invocation crosses the same execution broker, canonical policy, tool
+receipts and output limits as every built-in tool, with the effects an operator
+declared for that server — never the server's own claim about itself. An MCP
+call is never blindly replayed, and a cancelled one is reported as an unknown
+outcome.
+
+Web results always carry the source URL they came from, and a row that cannot
+name one is dropped. Browser captures return the on-disk evidence path they
+actually wrote, and a capture that produced no readable file is an error rather
+than a success. A capability with no configured backend returns a typed
+unavailable result naming what is missing; there is no code path that returns
+an empty success. Outbound requests pass one interception seam
+(`EgressGuard`), which is where
+[issue #466](https://github.com/Glubiz/zirv-cli/issues/466)'s on-device
+obfuscation belongs rather than a second subsystem beside it.
+
+Configuration lives under `[capabilities]` in `~/.zirv/ctx.toml` and is off by
+default:
+
+```toml
+[capabilities]
+enabled = true
+max_inline_mcp_tools = 24        # above this, only the index plus describe
+
+[capabilities.web]
+search_endpoint = "https://search.example/api?q={query}"
+search_credential = "env:SEARCH_TOKEN"   # env:NAME, store:<item> or file:<path>
+fetch_enabled = true
+allow_hosts = ["docs.rs", ".rust-lang.org"]   # empty means nothing is reachable
+
+[capabilities.browser]
+enabled = true
+# binary = "chromium"            # discovered on PATH when unset
+
+[[capabilities.mcp]]
+name = "docs"
+enabled = true
+transport = { mode = "stdio", command = "mcp-docs", args = [] }
+effects = { network = true }     # what this server's tools may do, per the operator
+
+[[capabilities.mcp]]
+name = "remote"
+enabled = true
+transport = { mode = "http", url = "https://mcp.example/rpc", credential = "env:MCP_TOKEN" }
+```
+
+The whole `[capabilities]` table is operator-only (see [Trust
+boundary](#trust-boundary)): every key names a command zirv spawns, an endpoint
+it authenticates to, a credential, or a browser it launches, so there is no
+narrowing half a repository checkout could legitimately set. The full contract
+is documented in
+[`docs/design/2026-09-13-native-capabilities.md`](docs/design/2026-09-13-native-capabilities.md).
+
+### Runtime protocol v1 (`zirv ctx api`)
+
+The `RuntimeBackend` wire above is in-process. **Protocol v1** is the public,
+versioned surface around it: the one a durable subscriber, an alternate
+client or a future daemon is allowed to depend on. The CLI wrappers remain
+the normal automation interface — raw protocol access exists for clients zirv
+does not ship.
+
+```bash
+zirv ctx api schema          # the contract, for a human
+zirv ctx api schema --json   # the same contract as a JSON Schema document
+zirv ctx api serve           # bind the endpoint for a bounded time
+zirv ctx api call session.snapshot
+```
+
+Both schema renderings are generated from the binary's own types — the method
+table, the real enum variants, and a test that pins the published frame field
+lists against what serde actually writes — so the documentation cannot drift
+from the wire.
+
+**Transport.** A unix domain socket at `<state>/s/api.sock` on unix, a named
+pipe on Windows, carrying NDJSON in both directions. The server writes one
+`hello` frame per connection before reading anything; a client intersects the
+capabilities that frame advertises with its own and disables locally whatever
+is missing, which is how an older client connects to a newer server and vice
+versa. Requests carry a caller-chosen `id`; replies echo it and carry the
+server `revision`; mutations accept an optional `idempotency_key`, and a retry
+with the same key returns the first attempt's result instead of repeating the
+work. Unknown fields are ignored everywhere, and every published enum
+vocabulary ends with an `unknown` fallback.
+
+**Methods** (v1 is deliberately narrow): `server.ping`,
+`server.capabilities`, `session.snapshot|list|get`, `session.start|stop`,
+`session.read|send_input`, `session.wait`, `session.report_status`,
+`session.attach|detach|takeover|resize|screen`,
+`session.interrupt|approve|task_result|history|journal`, `events.subscribe`.
+Mail, memory, work-group, workflow, layout and plugin methods are added only
+when a concrete client needs them. The five attachment methods need a server
+that owns terminals, so they sit behind their own `session.attach` capability;
+the five native methods need one that owns native conversations, so they sit
+behind `session.native`. A server without either does not advertise it, and a
+client disables that surface locally rather than calling it and being refused.
+
+**Native sessions on the protocol.** A native conversation has a journal
+instead of a pseudoterminal, so it reaches the same endpoint through the same
+methods with a different half of the surface. Input is `session.send_input`'s
+ordinary `submit`/`steer` modes — there is no second way to hand a session
+text. `session.interrupt` cancels the turn in flight and leaves the session
+alive (`session.stop` is still the only verb that ends one); `session.approve`
+decides one pending approval; `session.task_result` records a delegated task's
+outcome; `session.history` reads the conversation; `session.journal` pages its
+durable event stream by cursor. `session.screen`, `session.resize` and
+`mode=raw` are refused by name: there is no terminal to act on.
+
+`session.history` is the one method in v1 that publishes conversation text.
+It is capability-gated, seat-checked, and its tool entries carry a tool's name
+and never its arguments or results. Session facts, snapshots, lists and event
+frames still carry none of it.
+
+**Seats and durable retries.** Once any client is attached to a native session,
+every mutation must name a `client_id` holding the controller seat — omitting
+it is refused too, so an observer cannot mutate by leaving the field out. A
+session nobody has attached to is driven by whoever can reach the owner-only
+endpoint, which is the rule a headless `zirv ctx exec` needs. For a native
+session an `idempotency_key` becomes the journal's own message id, so a retry
+after a reconnect — or after the runtime restarted, which loses every in-memory
+cache — is deduplicated on disk and answered with `duplicate: true` and the
+original `message_id`; no second turn is queued. `session.journal` answers
+`gap: true` when a caller's cursor can no longer be continued from, which is
+the durable counterpart of the live revision gap rule.
+
+**Events and gaps.** The server-wide `revision` advances by exactly one per
+emitted event, so a subscriber that sees a revision other than `last + 1` has
+missed something and refreshes `session.snapshot` rather than drifting. Waits
+pin the session generation resolved at call time: a session replaced while a
+wait is running fails that wait with `stale_generation` instead of letting the
+replacement satisfy it.
+
+**What is shared and what is not.** Server state holds runtime facts only —
+which sessions exist, their stable ids, generations and lifecycle state, and
+the event log. Layout, colour, sidebar selection, mouse state and modals stay
+in whichever client draws them; no method can read or write any of it. Session
+ids are stable across panes, tabs, worktrees and client attachment: `surface`
+is the only axis a client change moves.
+
+**Security.** The endpoint path is always derived from the operator-owned
+state directory — there is no flag, config key or environment variable that
+points the server or a client at an arbitrary path, so a checkout cannot name
+or redirect it (see [Trust boundary](#trust-boundary)). On unix the socket
+lives in a 0700 directory, is chmod'ed 0600, and the server verifies the peer
+uid (`SO_PEERCRED`/`getpeereid`) against its own; on Windows the pipe is
+created with an explicit owner-only DACL, because the *default* named-pipe
+descriptor grants read access to Everyone and the anonymous account. Snapshots
+publish a redacted session shape by construction: no transcript path or body,
+no prompt, no mail body, no terminal history, no credential and no absolute
+repository path — only the sanitised repo slug. Mutations go through the same
+narrowing-only trust model as everything else.
+
+**What v1 is not.** The reference server (`zirv ctx api serve`, or the
+duration of one `zirv ctx api call`) runs in-process, owns no terminals and
+holds no processes: it serves every read method off the session registry,
+refuses `session.start|stop|send_input` with a structured `unsupported`, and
+does not advertise the attachment capability at all. The daemon that does own
+terminals is `zirv session serve` — the same protocol, the same endpoint, one
+extra capability. Frozen request/response/event fixtures under
+`tests/fixtures/protocol/v1/` are replayed against the server on every test
+run, so the wire cannot change by accident. The full contract and its
+trade-offs are recorded in
+[`docs/design/2026-09-12-runtime-protocol-v1.md`](docs/design/2026-09-12-runtime-protocol-v1.md).
+
+### Persistent runtime (`zirv session`)
+
+**Experimental, operator-only, and off by default.** A local runtime service
+owns the PTY/ConPTY processes, their supervisors and their registry records,
+and every UI is a client of it. Closing the window, killing the client or
+losing the terminal then costs a repaint, not a session.
+
+```bash
+zirv session serve                 # run the runtime (owns the terminals)
+zirv session list                  # what it holds, and who is attached
+zirv session attach [name|id]      # attach this terminal (Ctrl+A d detaches)
+zirv session detach [name|id]      # release clients; the agent keeps running
+zirv session stop [name|id]        # end a session (this one asks first)
+zirv session stop --runtime        # stop the service; sessions keep running
+```
+
+Turn it on in `~/.zirv/ctx.toml` (a repository cannot):
+
+```toml
+[session]
+persistent = true       # default false
+history = false         # default false -- see the warning below
+scrollback_rows = 2000  # in memory, per session
+stale_after_secs = 120  # secondary staleness signal only
+```
+
+With `persistent = true` and a real terminal on both stdin and stdout, `zirv
+chat` attaches to this repository's runtime session (starting the runtime and
+the session if they are not there yet) instead of owning a PTY in its own
+process. `zirv chat --no-session`, a piped stdin and a redirected stdout all
+keep the previous behaviour exactly.
+
+**Clients.** Any number of observers may watch a session; at most one client
+holds the keyboard. A second controller is refused with `busy` rather than
+silently displacing the first — `zirv session attach --takeover` takes the
+seat on purpose, and every client sees the `controller_changed` event. `Ctrl+A
+d` detaches (`Ctrl+A Ctrl+A` sends a literal `Ctrl+A` to the agent), the same
+prefix the dashboard uses.
+
+**Detach is not stop.** `detach` moves an entry in the runtime's attachment
+table and touches nothing else: no confirmation, and the agent, its PTY, its
+supervisor and its registry record are all still there afterwards. `stop`
+puts the child through the existing termination ladder and asks first —
+`--yes` is required when stdin is not a terminal.
+
+**What actually survives, honestly:**
+
+| Tier | Event | Guarantee |
+|---|---|---|
+| 1 | A client detaches, crashes or closes | The original PTY and process keep running. Reattaching restores the current rendered screen and live input from the runtime's own in-memory parser. Nothing is relaunched. |
+| 2 | The runtime itself restarts | The processes are gone. Topology (which sessions, which directories, what size) is restored, and a session is **resumed** only when it carries a verified harness conversation reference; everything else is reported as not resumed. A restored session is a new session that records its predecessor — never the old identity revived. |
+| 3 | Rendered terminal history across a runtime restart | Off by default. `history = true` writes rendered terminal output — including anything an agent printed, such as API keys, tokens and file contents — to disk, and says so every time the runtime starts. |
+| 4 | Replacing the runtime binary under live sessions | Not supported. Stop the runtime, upgrade, start it again. |
+
+A detached session keeps every Zirv guarantee that reads the registry, because
+the runtime files the same registry record a dashboard pane does and holds it
+for the life of the session: usage pacing, budgets, rot scoring, mail
+addressing, writer permits and workflow policy all keep working with nobody
+watching, and the harness's turn signals keep being observed. **Mail is
+delivered while nobody is watching too** — the service types it into the
+session on its own heartbeat, through the dashboard's own sweep, instead of
+leaving it queued until a client attaches.
+
+**Native conversations live here too.** The same runtime owns native sessions
+(`runtime = "native"`), publishes them in the same session list and serves them
+over the same endpoint — one service with two hosts, not two daemons. A native
+conversation's durable state is its journal, so a runtime restart brings it
+back by reading it: every tool execution that was merely *started* becomes
+outcome-unknown and is named on startup rather than retried, the generation
+advances to fence out any straggler, and nothing is re-submitted. No process is
+ever described as having survived.
+
+**The dashboard is a client, not a second owner.** With the gate on and a
+runtime listening, `zirv dash` refuses to open a second terminal over a session
+the runtime already holds and points at `zirv session attach`; two supervisors
+on one conversation is what the runtime exists to prevent. With the gate off,
+or with nothing listening, the dashboard owns its own terminals exactly as
+before.
+
+**Identity.** Each namespace publishes a record under `<state>/runtime/` with
+its owner, version, endpoint, creation time and last-client time. Staleness is
+decided by process **start identity**, not by pid alone: a live pid whose
+start time does not match the record is a recycled pid and the namespace is
+free, while a record nothing can verify is left alone rather than seized.
+Every service start mints a fresh instance id, so a crashed runtime's session
+identities can never be republished by its successor.
+
+The native integration — the two hosts, the seat rule, durable idempotency,
+journal cursors and restart reconciliation — is recorded in
+[`docs/design/2026-09-13-native-runtime-integration.md`](docs/design/2026-09-13-native-runtime-integration.md).
+See
+[`docs/design/2026-09-13-persistent-runtime.md`](docs/design/2026-09-13-persistent-runtime.md)
+for the design, the measurements and what is deferred.
 
 ### Signals and verdicts
 
@@ -1557,20 +2811,108 @@ keep only your own.
 
 #### Trust boundary
 
+| Surface | Trust | Narrowing? |
+|---|---|---|
+| `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
+| `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
+
+Every native instruction file inside the repository checkout — `ZIRV.md`
+(root, `.zirv/` fallback, or nested), `AGENTS.md`, `CLAUDE.md`, and the
+singular `AGENT.md` compatibility alias — is `RepoUntrusted`: it can steer a
+session's prose but can never widen sandboxing, approvals, credentials,
+provider/account/billing routing, tool grants, workflow policy floors, or
+settings precedence, the same asymmetry `REPO_FORBIDDEN` enforces for
+`ctx.toml` below. Only the operator-global `~/.zirv/ZIRV.md` (and its
+`CLAUDE.md`/`AGENTS.md` counterparts) carries `Operator` trust, and even then
+only as prose context — instructions are context, never permissions, at
+every scope.
+
 A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
-`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `mail.enabled`,
+`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
-`handover`, or any of the five keys that feed the token gate (`score.token_floor`,
+`handover`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
 `score.model_context_tokens`); doing so is an error
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
 `ZIRV_CTX_*` variable below, which comes from the operator rather than the
 checkout:
+
+The same narrowing-only rule applies to native execution. Native tools receive
+the already-resolved policy and resource claims from trusted runtime state;
+repository instructions and model output cannot add roots, provider
+credentials, network targets, approvals, or a different seat generation.
+Process environment overrides are part of the broker-signed action and may
+not replace protected credential variables. Declared process effects only
+request additional sandbox access; under-declaring an effect leaves that
+resource read-only or disconnected rather than bypassing policy.
+
+The native agent loop adds no repository-settable key either. Which runtime
+runs, which provider route it spends, which role it holds, which session it
+resumes and whether a fixture transport stands in for a real provider all come
+from the command line and from the operator-owned native provider
+configuration in `~/.zirv/native.toml` — never from a checkout. Model output is untrusted
+input throughout: a tool call it emits is admitted by the shared before-tool
+service and the N04 broker before anything runs, and its "I am finished"
+token is one input to the final status rather than the answer. A repository
+can still narrow, through the same `[supervise] orchestrator_writes` posture
+that governs the harness path, which the native loop applies to its own
+`file_write`/`apply_patch` calls.
+
+Native workers and the delegation tools add no repository-settable key
+either. Which runtime a worker runs on, which route it spends and which task
+it claims come from the command line (or from the parent's own delegation
+tool call), never from a checkout. A delegation tool call is model output and
+is treated as such: it crosses the broker as an `ExecutionAction::Delegate`
+under the same seat generation fence every other native tool runs behind, the
+delegation handle it names is validated as `[A-Za-z0-9_-]{1,128}` before it
+can reach a file, and the worker it asks for is narrowed against the parent's
+own envelope (`--path-scope`, `--no-network`, `--depth`, writing vs
+read-only) — asking for more than the parent holds is refused, never clamped.
+A nested worker gets its own principal and one hop less delegation depth, so
+it inherits none of the parent's session authority. The delegation record
+itself lives under the operator-owned state directory, never in the
+repository.
+
+Native workflows, verification and helper calls add no repository-settable key
+either. Which runtime a workflow reviewer, agent seat or script `agent:` step
+runs on comes from the command line or the script the operator wrote; which
+route a helper spends comes from the operator-owned `[roles]` table in
+`~/.zirv/native.toml`, and a role with no entry has no native path at all. A
+helper session is constructed with no writer permit, so its read-only
+character is the broker's decision at effect time rather than a prompt a
+model could be talked out of, and `workflow_advance`/`workflow_approve` are
+priced as shared-scope writes for the same reason. The workflow id a tool
+call names is validated as `[A-Za-z0-9_-]{1,128}` before it can reach a file,
+so model output cannot address state outside the workflow store. The
+completion gate reads the workflow's own recorded branch and the verification
+store, never the model's account of them.
+
+The native meta-orchestrator adds no repository-settable key either. A seat's
+**role** comes from the persisted seat record zirv itself minted, never from
+model output, and that role alone decides whether the seat may delegate and
+whether a child it delegates may write — so a read-only coordinator can still
+dispatch a writing implementer, and a reviewer stays read-only however the
+request was spelled. A route a delegating model names for a role is admitted
+only when it clears operator policy and stays on the billing posture the
+operator seated that role on; an operator's own `--route` is the operator
+speaking and is untouched. Task and group ids a tool call names are validated
+as `[A-Za-z0-9_-]{1,128}` before they can reach a file, and
+`task_create`/`task_claim`/`group_create` are priced as shared-scope writes,
+so a seat with no writer permit reads the board and cannot move a piece on
+it. The coordinator's own record lives under the operator-owned state
+directory, never in the repository.
+
+The local runtime protocol ([`zirv ctx api`](#runtime-protocol-v1-zirv-ctx-api))
+adds no configuration key, and deliberately so: its endpoint is always derived
+from the operator-owned state directory, there is no setting or flag that
+names one, and the server's policy — which methods exist, which capabilities
+are advertised, who may connect — is compiled into the binary. A repository
+therefore has nothing to narrow here, and nothing to widen either.
 
 | Forbidden repo key | Set instead via |
 |---|---|
@@ -1587,9 +2929,11 @@ checkout:
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
 | `prompt.codex_orchestrator` | `ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR` |
+| `chat.claude_permission_mode` | `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
 | `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |
+| `context.instructions_max_bytes` | `ZIRV_CTX_CONTEXT_INSTRUCTIONS_MAX_BYTES` |
 | `context.lint_max_pairs` | `ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS` |
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
@@ -1642,6 +2986,9 @@ checkout:
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
+| `route.<id>.execution` | `~/.zirv/native.toml` only; selects an official provider process and optional absolute executable path. Repository layers cannot select executables, login methods, billing or startup settings; all effects retain the native broker |
+| Claude Code authentication environment and public user settings | User-owned process environment and `~/.claude/settings.json` (or an absolute `CLAUDE_CONFIG_DIR` outside the repository); only authentication settings are carried into the restricted model invocation. Official login receives options after `--`. Inherited auth values are excluded from persisted settings and diagnostic output |
+| `native.toml` keys other than `policy.allowed_routes` and `policy.compaction` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, and repository `compaction` may only narrow `automatic` to `advisory`, never the reverse |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
@@ -1689,6 +3036,25 @@ checkout:
 | `fallback.health.degrade_error_rate_pct` | `ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT` |
 | `fallback.health.degrade_min_samples` | `ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES` |
 | `fallback.health.degrade_ttft_ms` | `ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS` |
+| `session.persistent` | `ZIRV_CTX_SESSION_PERSISTENT` |
+| `session.history` | `ZIRV_CTX_SESSION_HISTORY` |
+| `session.scrollback_rows` | `ZIRV_CTX_SESSION_SCROLLBACK_ROWS` |
+| `session.stale_after_secs` | `ZIRV_CTX_SESSION_STALE_AFTER_SECS` |
+| `capabilities` | `ZIRV_CTX_CAPABILITIES` |
+| `runtime` | `ZIRV_CTX_RUNTIME` |
+
+`capabilities` is listed as a whole table rather than key by key: every key
+under it names an MCP server command zirv spawns, a remote endpoint it
+authenticates to, a credential reference, or a browser binary it launches, so
+there is no narrowing half a repository checkout could legitimately set.
+
+`runtime` is a whole table for the same reason, in both directions: it decides
+which provider account a session with no explicit `--runtime` spends, and a
+checkout moving that onto the operator's metered native routes — or off them
+— is widening either way. `ZIRV_CTX_RUNTIME` sets `runtime.default`
+(`harness` or `native`); per-role overrides live in `[runtime.roles]` in
+`~/.zirv/ctx.toml`. See [Native setup, diagnosis and
+rollback](#native-setup-diagnosis-and-rollback).
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -1701,6 +3067,11 @@ able to force that layer back on for an operator who turned it off.
 `prompt.codex_orchestrator` closes the same loop once more for codex's own
 orchestrator-conventions layer (issue #167): a repo checkout must not be
 able to re-enable it for an operator who turned it off.
+`session.*` closes a sharper version of the same hole: `session.persistent`
+decides whether cloning a repository is enough to make sessions started from
+it outlive the operator's terminal, and `session.history` decides whether
+rendered terminal output — tokens, keys and file contents included — is
+written to disk at all. Neither is a decision a checkout gets to make.
 `memory.*` closes the same hole again for the memory bank's *configuration*
 (not its content -- see below): a repo checkout must not be able to switch
 either scope's gate on or off for itself, raise its own caps, or switch
@@ -1765,6 +3136,486 @@ the names follow the key, for example `ZIRV_CTX_DEBOUNCE_MS` for
 (`ZIRV_CTX_QUIET=true` turns events off) rather than `ZIRV_CTX_CHROME_EVENTS`,
 because "quiet" is the more natural spelling for the flag most people will
 actually reach for.
+
+### Native provider routes
+
+Native routing is opt-in through a separate `~/.zirv/native.toml`; older
+zirv binaries ignore this file and continue reading the unchanged
+`ctx.toml`. Start with `zirv ctx provider init`, inspect the offline inventory
+with `zirv ctx provider list [--json]`, and validate role access with
+`zirv ctx provider check [--live] [--role <role>] [--json]`. Live checks are
+off by default and only call the configured model-list endpoint. Store a
+`store:` credential without accepting its value as a zirv argument with
+`zirv ctx provider credential set <account>`.
+
+```toml
+schema = 1
+
+[endpoint.local]
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:11434"
+vendor = "ollama"
+
+[account.work]
+provider = "anthropic"
+credential = "env:ANTHROPIC_API_KEY_WORK"
+billing = "api"
+pool = "work"
+
+[route.work-sonnet]
+account = "work"
+endpoint = "anthropic"
+model = "claude-sonnet-5"
+
+[roles]
+orchestrator = "work-sonnet"
+
+[policy]
+allowed_routes = ["work-sonnet"]
+```
+
+Providers with a default URL have an implicit endpoint named after the
+provider. `openai-compatible` and `aws-bedrock` instead require a `vendor`,
+and a `base_url` unless the vendor's route profile has a documented one.
+Account pools default to the account id; two accounts may deliberately share
+one `pool` when they share quota. Every API-billed account except
+`openai-compatible` must declare a credential reference. Subscription-billed
+accounts may omit one. A direct API route on such an account stops at
+`configured` with an entitlement problem; an explicit provider-owned execution
+route uses the official harness login, as described below. Credential references are
+`env:NAME`, `store:<item>`, or `file:<path>` (`~` expands; Unix files must be
+mode 0600 or stricter). Claude Code/Codex harness login tokens are refused:
+Claude.ai and ChatGPT subscriptions are entitlements for the harness backend,
+not native API credentials, and `credential set` refuses those store refs
+before reading a secret. Every route must declare a model that remains
+non-empty after an optional matching `vendor/` prefix. Model ids and aliases
+resolve by exact case-insensitive match. A matching `vendor/` prefix is
+accepted, but `@date` and `:suffix` decorations are never stripped or silently
+substituted.
+
+The evidence ladder is `recognized` → `configured` → `credentialed` →
+`reachable` → `authenticated` → `validated`. Catalogue recognition never
+claims account access, and `authenticated` specifically means a credential was
+accepted. A credential-less compatible route stops at `configured` offline
+and can reach only `reachable` during a live check. Direct API offline commands stop
+at `credentialed`; official-harness checks may attest a signed-in account without
+a model call (model access remains unverified). For direct API routes, `--live` can establish reachability/authentication, while
+`validated` remains unavailable until the native model transports record a
+real validation. Credentials are withheld from plaintext HTTP on non-loopback
+hosts and that live probe is skipped; loopback HTTP remains available for
+local runtimes.
+
+The optional repository layer `<repo>/.zirv/native.toml` may contain only
+`schema`, `[policy].allowed_routes` and `[policy].compaction`. Its routes are
+intersected with the operator's set, so a checkout can narrow access but
+cannot add accounts, endpoints, routes, role bindings, credentials, or
+permissions.
+
+#### Provider-owned execution in the native UI
+
+A route may use an official provider harness while retaining Zirv's native
+conversation UI, tasks, approvals and tool broker. This is distinct from direct
+API execution: the official process owns the model connection, agent loop and
+local conversation. Provider identity, execution backend, authentication owner
+and billing are separate route facts. Initially the adapter registry supports
+`claude-code`; adding another provider requires an execution adapter and an
+independent review of that provider's rules, not a subscription-token transport.
+
+```toml
+# ~/.zirv/native.toml (operator configuration only)
+schema = 1
+
+[account.personal-claude]
+provider = "anthropic"
+billing = "subscription" # Use "api" for Console/API/cloud billing.
+# No credential. Claude Code owns authentication.
+
+[route.personal-claude]
+account = "personal-claude"
+model = "sonnet"
+execution = { adapter = "claude-code" }
+# Optional absolute path; spaces are supported:
+# execution = { adapter = "claude-code", program = "/opt/Claude Code/claude" }
+
+[roles]
+orchestrator = "personal-claude"
+worker = "personal-claude"
+```
+
+Run `zirv ctx provider login personal-claude` to hand the terminal directly to
+**official Claude Code's login**, then `zirv ctx provider status personal-claude`.
+Zirv does not read, import, store or refresh subscription credentials, login
+URLs or authorization codes. A missing binary is never silently installed.
+Removing this route from `native.toml` leaves Claude Code signed in. To log out
+of the official installation, run `claude auth logout` yourself; that affects
+Claude Code sessions outside Zirv too. All official authentication methods and
+subscription plans are accepted. Pass login options after `--`, for example
+`zirv ctx provider login personal-claude -- --console` or `-- --sso`.
+API keys, cloud credentials and profiles configured in the launching user's
+environment remain available to Claude Code. Its public user settings retain
+`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, login restrictions and
+authentication environment variables. `CLAUDE_CONFIG_DIR` may select an absolute
+user configuration directory outside the repository. Zirv never copies inherited
+authentication secrets to its settings, journal or diagnostics.
+
+`zirv chat --runtime native` uses this route for the orchestrator. Native workers
+use their configured role routes and retain the existing task, mail, delegation,
+writer-lease and generation fences. The UI identifies the backend and selected
+billing. Provider status and headless final status report the detected official
+authentication method, upstream provider and billing, using `unknown` when the
+public status cannot establish them. Headless final status schema **3** includes
+an `execution` object with backend/version/auth owner, estimated API-equivalent cost, and
+separate nullable billed-spend and remaining-allowance fields.
+
+**Initial capability boundary.** Requires a local, unmodified native Claude Code
+2.1.248+ executable in the 2.1 series, its documented restricted/settings/tool/MCP
+flags, and a public status response attesting authentication.
+Windows/WSL (managed-policy verification pending), npm shell shims, managed
+startup policy, unauthenticated status,
+and an explicit token-budget ceiling are rejected before a model turn.
+Turn/time limits, streaming, follow-up and exact-session continuation are
+supported. Steering waits until the next turn; it is never reported as immediate.
+No live installation/platform compatibility is implied by fixture tests.
+
+Claude Code starts in a private Zirv directory with project settings excluded,
+only authentication settings carried from public user configuration, hooks
+disabled, and only the explicit Zirv MCP server. Managed startup
+configuration that could override this boundary is rejected. Claude built-in
+tools and internal subagents are unavailable on this route; coding, shell,
+external services and independently scheduled workers use Zirv MCP tools. Every
+such effect passes the existing native broker, sandbox, exact-action approval,
+repository narrowing and generation checks. A denied approval produces a tool
+error, never an automatic permission-mode escalation. Streamed tool observations
+are not executed again. Tool subprocesses receive no provider credentials.
+
+**Billing.** Claude Code selects authentication using its own precedence. The
+account's `billing` declares scheduling intent; it does not force a login method.
+Keep it aligned with the method you select in Claude Code. Detected billing is
+reported separately and is never hardcoded to subscription. No authentication
+failure or exhausted allowance causes an automatic API fallback. All aliases of the local official login share
+one `anthropic` capacity pool. Unknown allowance is unknown,
+not unlimited. The official result's dollar figure and `zirv ctx spend` are
+API-equivalent estimates, not invoices. Billed spend remains unknown. Paid usage
+credits can permit additional upstream charges: disable them in Claude's
+**Settings → Usage** if desired; Zirv cannot verify that switch or promise zero
+additional charges.
+
+A successful turn persists an exact Claude session reference bound to its Zirv
+seat, route and workspace. Follow-up resumes only that reference. Cancellation
+before any tool effect can resume; a crash or interrupted effect with uncertain
+delivery leaves a reconciliation block. Inspect effects and use a new session
+with a portable checkpoint before retrying; Zirv never blindly replays the task.
+A provider-owned continuation cannot become an API conversation. Cross-runtime
+handoff transfers Zirv task/artifact/approval state, with the existing exclusive
+writer and worker/mail disposition rules.
+
+**Policy evidence, checked 2026-09-15.** This design relies on Anthropic's explicit
+allowance for running the unmodified binary under the applicable terms and
+conditions, including the product operator agreeing to Commercial Terms and
+each user authenticating and being billed under their own agreement. Zirv does
+not resell usage or claim Anthropic approval. Written confirmation for this exact
+integration has not been obtained; this is not a guarantee of policy compliance.
+It does not offer Zirv-owned
+Claude login or claim endorsement. The June 15 pause means print-mode usage
+currently draws subscription limits; this is not a guarantee of permanent
+eligibility. The SDK documentation retains restrictive third-party-login
+language; extending this design beyond the unmodified-binary allowance requires
+clarification from Anthropic. See [legal and compliance](https://code.claude.com/docs/en/legal-and-compliance),
+[the current subscription notice](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan),
+[programmatic execution](https://code.claude.com/docs/en/headless), and the
+[decision and validation note](docs/superpowers/2026-09-15-provider-execution.md).
+This replaces #644's Claude-specific token-import proposal; it grants no
+entitlement for other providers. Direct Anthropic API routes still work without
+Claude Code installed and continue rejecting harness-login secrets before HTTP.
+
+**Opt-in live smoke (uses your own allowance).** Record `claude --version` and the
+sanitized `provider status` output. In an authorized disposable worktree, open
+`zirv chat --runtime native`, ask for a bounded file edit and its verification,
+and check streamed text, one tool receipt per effect, and the backend/billing
+label. Send a follow-up and confirm the same external session in the journal's
+`provider_execution` checkpoint. Interrupt a response before tool work, then
+resume with a follow-up. For an interrupted effect, verify the reconciliation
+block instead of replaying it. Finally restart/reattach the Zirv session and
+check task/mail state. Never copy raw auth output, MCP configuration or login
+codes into a report. Fixture results and actual live versions/platforms must be
+reported separately.
+
+#### Native setup, diagnosis and rollback
+
+A fresh machine needs no coding harness installed to run native sessions. The
+whole path is four commands:
+
+```bash
+zirv ctx provider init                       # write ~/.zirv/native.toml
+$EDITOR ~/.zirv/native.toml                  # declare account, route, roles
+zirv ctx provider credential set work        # store the secret out of band
+zirv ctx doctor                              # verify, class by class
+zirv ctx exec --runtime native -- "…"        # first native run
+```
+
+`zirv ctx doctor [--role <role>] [--live] [--json]` is the readiness command.
+For every role it prints which backend an unflagged session would get and
+which authority decided that (`flag`, `runtime.roles`, `runtime.default`,
+`built-in`), which route it would spend, and how far that route got up the
+evidence ladder. Every problem it finds is sorted into exactly one class,
+because the operator's next action is different for each:
+
+| Class | What it means | What to do |
+|---|---|---|
+| `missing-auth-material` | No API key resolved for the account, or the one that resolved was rejected | Set the `env:`/`store:`/`file:` reference, or `zirv ctx provider credential set <account>` |
+| `inaccessible-model` | Auth material works; this model is not one this account may call | Pick a model the account is entitled to, or fix the alias |
+| `missing-tool` | A binary, MCP server or configured integration is absent — including a native adapter zirv has not shipped yet | Install/configure it; a missing adapter is a zirv gap with a tracking issue, never an entitlement excuse |
+| `unsupported-isolation` | No verified process containment on this platform | Install `bwrap` (Linux); on Windows there is no verified backend yet, and sandboxed invocations are refused rather than run unconfined |
+| `service-failure` | The endpoint is configured and credentialed but did not answer | Check the endpoint URL, the network, and the provider's status |
+| `upstream-entitlement` | A genuine upstream limitation, not a zirv gap: a subscription-billed account, or a vendor surface that exists only inside that vendor's CLI | Use an API-billed account, or keep that surface on the harness backend |
+
+For provider-owned routes, doctor checks the official CLI's non-model version/auth
+interfaces and may create its private startup directory. It exits `1` only when a role that *would* run
+natively has no usable route. Its output is redacted the way `zirv ctx
+snapshot` is — every line is screened for credential shapes, high-entropy and
+opaque runs, and any line that opens like a conversation turn is replaced
+outright — so a doctor dump is safe to paste into a bug report. It carries no
+transcript text and no continuation data by construction.
+
+**Billing.** A route's `billing` is `api` or `subscription`. Direct provider
+execution requires API billing; explicit provider-owned execution can use its
+official harness login under the boundary above. Subscription tokens remain
+refused as native API credentials (`credential set` refuses those store refs before it reads a
+secret). Accounts that share quota share a `pool`, and the usage windows
+(`zirv ctx usage`) aggregate per pool, so two accounts on one plan are not
+double-counted. `zirv ctx spend --by` groups the delegation ledger by
+`harness`, `model`, `task-class`, or `worker` instead -- it has no `pool`
+dimension of its own.
+
+**Choosing the default.** `~/.zirv/ctx.toml`'s `[runtime]` table decides which
+backend a session gets when the command line does not say:
+
+```toml
+# ~/.zirv/ctx.toml
+[runtime]
+default = "native"        # or "harness"; absent means "harness"
+
+[runtime.roles]
+reviewer = "native"       # per-role override, outranks `default`
+worker = "harness"
+```
+
+An explicit `--runtime harness|native` always wins over both. `zirv ctx exec`
+and `zirv ctx agent` default that flag to `configured`, which is exactly "ask
+this table"; `zirv chat` with no `--runtime` resolves the same way at the
+`orchestrator` role. A value this build does not recognise degrades to the
+harness with a one-line note rather than failing the command — `zirv ctx
+doctor` is where it is reported. The whole `[runtime]` table is
+`REPO_FORBIDDEN` (see [Trust boundary](#trust-boundary)).
+
+**Migration and rollback.** `zirv ctx config migrate [--to harness|native]
+[--dry-run]` brings `~/.zirv/ctx.toml` to schema 2 — the `[runtime]` table
+above — backing the previous document up to
+`~/.zirv/ctx.toml.pre-schema-2.bak` and recording the schema in a sidecar
+`~/.zirv/ctx.migration.toml`. The marker is deliberately *not* a key inside
+`ctx.toml`: that file is parsed with unknown keys rejected, so an older zirv
+binary would refuse the whole configuration rather than ignore one key.
+Running the migration twice writes nothing the second time and says so, so a
+re-run can never overwrite the real pre-migration backup.
+
+`zirv ctx config migrate --downgrade` restores that backup byte for byte (or,
+with no backup, removes the `[runtime]` table), and deletes both markers. It
+is the supported way back to an older zirv: install the older binary *after*
+downgrading, since an older binary cannot parse `[runtime]` either. Nothing
+else is part of the transaction — `~/.zirv/native.toml`, native journals, and
+the harness conversation references those journals carry are all outside the
+file being migrated and survive a round trip in either direction. Both modes
+can run concurrently on one machine throughout: a native and a wrapped
+session share the state directory, session registry, mail, task cards and
+cost ledger.
+
+#### Entitlement limitations versus implementation gaps
+
+These are not the same thing and zirv never conflates them. An *entitlement
+limitation* is something the upstream vendor does not sell zirv access to; an
+*implementation gap* is work zirv has not done, and every one of them has a
+tracking issue. `zirv ctx doctor` classifies the first as
+`upstream-entitlement` and the second as `missing-tool`, and
+`docs/design/native-parity.md` lists both exhaustively. The current lists:
+
+Genuine upstream entitlement limitations:
+
+- **Subscription plans are not API entitlements.** A Claude.ai or ChatGPT
+  subscription cannot be spent through a direct provider API call. Native
+  direct API routes on a subscription-billed account stop at `configured`
+  with that problem named. Explicit official execution routes use the vendor
+  harness while retaining the native Zirv seat.
+- **Harness login tokens are refused as credentials.** Reusing the vendor
+  CLI's stored login for direct API calls is outside what that token is
+  issued for; `credential set` refuses those store refs before reading a
+  secret.
+- **Vendor-CLI-only surfaces.** `zirv ctx wrap` supervises a vendor TUI by
+  definition, and `zirv ctx handover` swaps one vendor CLI for another; a
+  native session has neither. Changing a native seat's model is `[roles]`
+  configuration, not a handover.
+- **Model entitlement per account.** A model absent from an account's own
+  model list is that account's entitlement, reported as
+  `inaccessible-model`; zirv cannot grant it.
+
+Implementation gaps (zirv's own work, each tracked):
+
+- **Route profiles with no adapter yet** are reported as `missing-tool` with
+  their tracking issue in the message, explicitly as "a zirv gap, not an
+  upstream entitlement limit".
+- **Windows process isolation.** There is no verified restricted-token/
+  AppContainer helper shipped, so `PlatformIsolation::detect` reports
+  unavailable on Windows and sandboxed invocations are refused rather than
+  run unconfined. Linux (`bwrap`) and macOS (`sandbox-exec`) are supported.
+- **Live-provider validation.** Every parity row is fixture- or
+  service-level; the `validated` rung of the evidence ladder is not reachable
+  until the N19 validation pass records a real one.
+
+#### Native compaction
+
+A native session compacts itself rather than calling a harness `/compact`.
+Committed journal events and the provider's own measured input footprint
+(fresh input plus cache writes plus cache reads) are projected into zirv's
+existing rot scoring engine, with the token gate sized from the route model's
+declared context window less the run's output reservation — not from the
+harness-transcript token constants. An unknown context window falls back to
+the absolute `score.token_floor`/`score.token_ceiling` defaults rather than a
+guess.
+
+Four typed triggers are reported: `context_overflow` (the provider refused the
+request), `token_pressure` (measured input reached the derived ceiling),
+`repeated_identical_errors`, and `loss_of_progress`. The first two force a
+compaction; the others are advice until the rot gate escalates.
+
+A compaction writes a versioned portable checkpoint — objective, hard
+constraints, task/workflow refs, every acknowledged input, task claims,
+completed-action receipts, outstanding tool calls, and evidence by SHA-256 —
+as an atomic export under `<state>/native-checkpoints/` plus one journal
+event, which is the commit point. The original history and every stored
+artifact are retained: the summary only replaces what the next provider
+request sends, and the cacheable system prefix is never rewritten. The summary
+boundary never crosses a tool call whose effect has not settled, so compaction
+cannot mark a pending action complete, and acknowledged input that has not
+been answered is repeated verbatim. Distillation runs through the session's
+own native route with a bounded output budget and no tool schemas at all, and
+falls back to a deterministic structural summary whenever no model capacity,
+credential or valid reply is available — so it works with no coding-harness
+binary installed.
+
+A same-route resume keeps the provider's opaque continuation envelope. A
+route, model, endpoint, account or protocol change discards it and rebuilds a
+portable semantic history from the checkpoint and the journal: text and
+refusals only, with no hidden reasoning, no provider signature, and no
+synthesized tool outcome — an unknown outcome is carried as unknown.
+
+`[policy].compaction` is `automatic` (the default) or `advisory` (zirv reports
+the pressure and never compacts on its own). A repository layer may narrow it
+to `advisory` and can never widen it back — see [Trust
+boundary](#trust-boundary). `zirv ctx status` prints one line per native
+session that has compacted or resumed, with the newest reason, and `zirv ctx
+exec --runtime native` reports the same facts in its final-status JSON.
+
+#### Route profiles
+
+Every configured route binds to a *route profile*: the versioned record of
+one vendor route's documented base URL, request path, credential class,
+capability caveats and permitted provider-native options. `zirv ctx provider
+list` prints the whole registry and the profile each route bound to. A route
+whose vendor has no profile is refused at load time rather than sent to a
+guessed endpoint.
+
+The primary families keep their own transports (`anthropic`, `openai`,
+`google`, `google-vertex`). Everything else speaks one of two:
+
+| Family | Provider | Vendor | Protocol |
+|---|---|---|---|
+| DeepSeek, xAI, Qwen (DashScope), Moonshot/Kimi, Mistral, Zhipu/GLM, MiniMax, Meta (Llama API) | `openai-compatible` | the vendor slug | chat completions |
+| Ollama, LM Studio, vLLM | `openai-compatible` | `ollama` / `lmstudio` / `vllm` | chat completions |
+| Azure OpenAI | `azure-openai` | (fixed) | chat completions |
+| Amazon Nova and every Bedrock-hosted family | `aws-bedrock` | the vendor slug | Bedrock Converse |
+
+A vendor with a documented base URL does not need one configured:
+
+```toml
+[endpoint.deepseek]
+provider = "openai-compatible"
+vendor = "deepseek"
+
+[account.deepseek]
+provider = "openai-compatible"
+credential = "env:DEEPSEEK_API_KEY"
+
+[route.reason]
+account = "deepseek"
+endpoint = "deepseek"
+model = "deepseek-v4-pro"
+
+[route.reason.extensions]
+temperature = 0.2
+```
+
+`[route.<id>.extensions]` carries provider-native request options and is
+validated against the profile's typed allow-list: an unknown key, a wrong
+type or an out-of-range value is a load error that names the accepted keys.
+There is no free-form passthrough, and an extension can never overwrite a
+protocol-owned field such as `messages` or `tools`.
+
+A compatible endpoint is not a feature superset of OpenAI's. Capabilities are
+declared per profile, and a request asking for something the profile does not
+declare -- tools, a reasoning-effort control, a thinking configuration,
+prompt caching -- is refused with a typed failure instead of being silently
+stripped. Reasoning text a chat-completions endpoint emits
+(`reasoning_content`) is streamed for display but never replayed as
+continuation state, because it carries no signature.
+
+#### Local models
+
+`ollama`, `lmstudio` and `vllm` routes default to their runtime's own
+loopback address (`127.0.0.1:11434`, `:1234`, `:8000`). Their credential
+class is "none" or "optional": no key is fabricated for them, and declaring
+one on a key-less local route is an error rather than a secret sent to a
+local server. Plain `http://` is accepted only for a loopback or private
+address (a literal one -- a hostname is never assumed local); a credential is
+still never sent in the clear to a non-loopback host.
+
+#### Cloud routes
+
+`aws-bedrock` requires `account.<id>.region` and signs every request with
+SigV4; its credential is a JSON object rather than a bare key, because a
+signature needs a key pair:
+
+```toml
+[endpoint.bedrock]
+provider = "aws-bedrock"
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+vendor = "anthropic"
+
+[account.aws]
+provider = "aws-bedrock"
+credential = "store:aws-bedrock"   # {"access_key_id":"…","secret_access_key":"…"}
+region = "us-east-1"
+
+[route.bedrock-sonnet]
+account = "aws"
+endpoint = "bedrock"
+model = "claude-sonnet-5"
+```
+
+`azure-openai` requires `account.<id>.api_version` and a per-route
+`deployment`; the request is addressed at
+`{base}/openai/deployments/{deployment}/chat/completions?api-version=…` with
+an `api-key` header, and carries no model id, because on Azure the deployment
+names the model. Each identity field is required by exactly one provider and
+forbidden on every other, so a Vertex `project`, a Bedrock `region` and an
+Azure `api_version` can never be read as one another.
+
+#### Broker subscriptions
+
+GitHub Copilot and Factory/Droid resell models under their own subscription
+identity, with no documented, separately authorized direct API. Their
+profiles are `legacy-only` with that reason recorded, configuring one as a
+native route is refused, and they remain available through their harness
+backend. `zirv ctx provider list` distinguishes this from `planned`, which
+means zirv has not written an adapter yet -- the two are never conflated.
 
 ### .settings.toml
 
@@ -2132,6 +3983,52 @@ that can resume *and* accept a prompt in the same launch (claude's
 cold launch carrying the packet — because resuming a conversation without
 telling it what happened in its absence would silently drop the interim's
 work.
+
+**A rollover can cross runtimes, and the seat keeps its identity.** The same
+prepare/commit/abort transaction moves a seat between backends as well as
+between harnesses — `harness→harness`, `harness→native`, `native→harness`,
+`native→native` — and the seat's short id and generation lineage are exactly
+what does not change. What changes is which backend answers at that address,
+which `zirv ctx status` names inline (`seat: claude opus [native] gen 3`)
+alongside the harness or route the seat was displaced from and a one-line
+rollover record: trigger, direction, every route tried with why it was
+refused, and whether the seat committed, **kept the original session**
+(preparation failed, so the seat never moved), or **parked** honestly with all
+its durable state intact. The record lives at
+`<state>/sessions/<short>.rollover.json`.
+
+Before a successor is prepared at all, a native source reaches a safe
+boundary: in-flight work is drained or explicitly cancelled, any tool effect
+that *began and never reported* is carried as outcome-unknown (never retried,
+never called failed), and one portable checkpoint — acknowledged input with
+whatever is still owed, task claims, completion receipts, outstanding tools,
+evidence — is committed to the journal. An outcome-unknown effect **halts the
+successor** until it is reconciled: the whole point is that a fresh model must
+not re-run it. Portable checkpoints stay strictly separate from a provider's
+own continuation envelope, and only a native successor on the *identical*
+route may keep that envelope; every other direction rebuilds a legal semantic
+history, and a coding-harness successor never sees another vendor's envelope
+at all.
+
+Two rules are worth stating because they are refusals rather than fallbacks.
+A successor is validated — policy, capabilities, context room, billing
+authority, authentication, budget, startup — *before* the source is given up,
+and a failure keeps the original session. And a rollover is only authorized to
+move work onto the billing posture the seat **already** spends (plus local
+runtimes, which have no credential and no invoice): moving subscription work
+onto metered API credit is a decision an operator makes, never a silent
+consequence of capacity. Native subagents a rolling seat owns are finished,
+stopped, or retained under recorded ownership — zirv has no mechanism that
+migrates a running worker to another seat, so it never claims one.
+
+Only one seat generation is write-capable at a time, and that is enforced
+rather than assumed: a stale generation is refused at native tool effects (the
+journal's own fence), at wrapped tool effects (the pre-tool hook), at
+`zirv agent` delegation, at the coordinator's plan graph and at the per-tree
+writer lease. In the window between prepare and commit the *source* still
+holds the seat, so a successor that has been validated but not committed
+cannot write either — which is what makes a crash at either boundary
+incapable of producing two writers.
 
 **Cross-harness capacity, at a glance.** `zirv ctx status` (and `zirv ctx
 status --json` for machine-readable output) reports a pool section built on
@@ -2520,10 +4417,36 @@ or the explicit opt-out below do.
   and runs Bash without OS sandboxing; Zirv's permission mode, allowed/disallowed
   tools and `zirv ctx safety check` PreToolUse hook remain in force.
   macOS uses the built-in `sandbox-exec`. Native Windows has no OS sandbox
-  and receives the hook and credential rules.
+  and receives the hook and credential rules. The interactive `Edit(./**)`/
+  `Read(./**)` scope also covers Claude Code's own agent-worktree convention
+  (`.claude/worktrees/**`) and any `--add-dir` grant this launch passes (a
+  linked git worktree of the launch repo, issue #329), so a native subagent's
+  Edit/Write inside a delegation worktree never falls through to a prompt.
 - **Claude headless:** `--permission-mode dontAsk`; ordinary allow rules are
   pre-approved and both deny and ask rules are disallowed, so no prompt can
   stall automation.
+- **`chat.claude_permission_mode`** (issue #504, operator-only, see
+  [Trust boundary](#trust-boundary)): overrides the INTERACTIVE launch's own
+  `--permission-mode` to `"acceptEdits"` or `"bypassPermissions"` instead of
+  the shipped `"default"`. Claude Code's own `--permission-mode` flag
+  outranks `permissions.defaultMode` in the operator's `~/.claude/
+  settings.json`, so before this key existed there was no way to quiet the
+  interactive prompt volume from config at all — an operator running several
+  native subagents delegating into worktrees got prompted for every
+  Edit/Write and every unlisted compound command, with `bypassPermissions`
+  reachable only via the live `/permissions` slash command each session.
+  Headless is untouched either way, and the mode change never suppresses or
+  widens the `--allowedTools`/`--disallowedTools` lists above — only the flag
+  itself changes:
+
+  ```toml
+  [chat]
+  claude_permission_mode = "acceptEdits"   # or "bypassPermissions"
+  ```
+
+  or `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE=acceptEdits`. Unset (the default)
+  reproduces `"default"` exactly. `REPO_FORBIDDEN`: a repository checkout
+  must not be able to widen its own session's permission posture.
 - **Codex interactive:** `--sandbox workspace-write --ask-for-approval
   on-request` when the installed CLI's own bounded capability probe documents
   it, otherwise `never`. When that CLI also advertises `--approve-for-me`,

@@ -129,7 +129,7 @@ fn capacity_backoff_secs(attempt: u32) -> u64 {
     }
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ExecArgs {
     /// Adapter name: claude or codex. Detected from the command when omitted.
     #[arg(long)]
@@ -164,6 +164,55 @@ pub struct ExecArgs {
     /// for a per-run ceiling.
     #[arg(long)]
     pub objective: Option<String>,
+    /// Which runtime drives the conversation: `harness` (zirv supervises an
+    /// external coding-agent process) or `native` (issue #478, roadmap N09 --
+    /// zirv conducts the model/tool conversation itself over a direct
+    /// provider route, with no coding harness installed at all). Native mode
+    /// is explicit and opt-in: it is never selected by detection.
+    ///
+    /// The default, `configured` (issue #491), means "whatever `[runtime]` in
+    /// `~/.zirv/ctx.toml` says, harness when it says nothing" -- so an
+    /// operator config written before that key existed behaves exactly as it
+    /// always did. See `runtime::resolve`.
+    #[arg(long, default_value = super::runtime::CONFIGURED)]
+    pub runtime: String,
+    /// Native runtime only: which `[route]` from the operator's own native
+    /// provider configuration to spend. Defaults to the `[roles]` entry for
+    /// this run's seat role.
+    #[arg(long)]
+    pub route: Option<String>,
+    /// Native runtime only: the session's role, which selects the default
+    /// route and the repository-write posture applied to its tools.
+    #[arg(long, default_value = "worker")]
+    pub role: String,
+    /// Native runtime only: continue an existing native journal session
+    /// instead of starting a new one. Every execution that was still running
+    /// when that session stopped is reconciled as outcome-unknown (never
+    /// silently retried) and the generation is advanced, fencing out anything
+    /// still holding the old one.
+    #[arg(long)]
+    pub resume: Option<String>,
+    /// Issue #480 (roadmap N11): native runtime only. `json` (the default)
+    /// prints exactly the structured final status this flag's absence
+    /// always printed -- the JSON contract is unchanged. `plain` ADDITIONALLY
+    /// renders the session's transcript through `dash::native_pane`'s own
+    /// non-ratatui renderer (the same view model the dashboard pane draws,
+    /// with no terminal required) after the JSON status line, so a native
+    /// session is inspectable without ratatui at all -- piped output, a CI
+    /// log, or a terminal too small for the dashboard.
+    #[arg(long, default_value = "json")]
+    pub view: String,
+    /// Native runtime only, operator-only: replace the live provider with a
+    /// deterministic fixture script. The only accepted value is
+    /// `fixture:<path>`. No configuration layer can set this -- least of all
+    /// a repository's -- because it is a command-line flag and nothing else.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Native runtime only: the fixture tool script a `--provider fixture:`
+    /// run executes against. Without it every tool call reports a fixture
+    /// failure rather than touching the machine.
+    #[arg(long)]
+    pub fixture_tools: Option<PathBuf>,
     /// The headless agent command, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
@@ -183,6 +232,40 @@ pub struct ExecArgs {
     /// delegation reservation of its own, which this never creates one for.
     #[arg(skip)]
     pub reservation_id: Option<String>,
+    /// Internal cancellation shared with a delegation record watcher.
+    #[arg(skip)]
+    pub cancellation: Option<std::sync::Arc<super::provider::adapter::CancellationFlag>>,
+}
+
+/// The same defaults clap itself applies, so a caller that builds this struct
+/// in code (a delegation fold, an `agent:` script step, a test) gets the
+/// harness runtime and the worker role without restating them -- and a field
+/// added here later cannot silently become `""` at those call sites.
+impl Default for ExecArgs {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            session_id: None,
+            transcript: None,
+            prompt: None,
+            max_restarts: None,
+            timeout_secs: None,
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            runtime: super::runtime::RuntimeKind::Harness.to_string(),
+            route: None,
+            role: "worker".to_string(),
+            view: "json".to_string(),
+            resume: None,
+            provider: None,
+            fixture_tools: None,
+            command: Vec::new(),
+            simple: false,
+            reservation_id: None,
+            cancellation: None,
+        }
+    }
 }
 
 /// One vendor-backed portion of a logical supervised execution. A cross-harness
@@ -671,6 +754,23 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    // Issue #478: `--runtime native` conducts the conversation in-process
+    // instead of supervising a harness, and shares nothing with the spawn
+    // path below -- no adapter, no argv, no PTY, no transcript to score. It
+    // is matched here, before any of that work starts, and the branch is
+    // explicit: an unrecognised value is an error, never a silent fall back
+    // to the harness.
+    match args.runtime.parse::<super::runtime::RuntimeKind>() {
+        Ok(super::runtime::RuntimeKind::Native) => return run_native(args, w, repo, env),
+        Ok(super::runtime::RuntimeKind::Harness) => {}
+        _ => {
+            return Err(format!(
+                "--runtime '{}': expected `harness` or `native`",
+                args.runtime
+            )
+            .into());
+        }
+    }
     run_with_clock(
         args,
         w,
@@ -679,6 +779,177 @@ pub fn run_with<W: Write>(
         &super::state::now_secs,
         &|d: Duration| std::thread::sleep(d),
     )
+}
+
+/// `zirv ctx exec --runtime native` (issue #478, roadmap N09). The prompt is
+/// `--prompt`, or the trailing `-- <text>` words when no `--prompt` is given;
+/// `--agent`, `--transcript`, `--session-id` and the restart/rot flags have no
+/// meaning here and are refused rather than silently ignored, because a native
+/// session has no external process to restart or transcript to score.
+fn run_native<W: Write>(
+    args: &ExecArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    for (name, present) in [
+        ("--agent", args.agent.is_some()),
+        ("--transcript", args.transcript.is_some()),
+        ("--session-id", args.session_id.is_some()),
+        ("--max-restarts", args.max_restarts.is_some()),
+    ] {
+        if present {
+            return Err(format!(
+                "{name} is a harness-runtime flag; a native session supervises no external \
+                 process"
+            )
+            .into());
+        }
+    }
+    let prompt = match args.prompt.as_deref() {
+        Some(prompt) => prompt.to_string(),
+        None => args.command.join(" "),
+    };
+    // A resume continues a conversation that already has everything it needs,
+    // so a fresh prompt is optional there and mandatory everywhere else.
+    if prompt.trim().is_empty() && args.resume.is_none() {
+        return Err("native runtime: pass a prompt with --prompt or after `--`".into());
+    }
+    if args.fixture_tools.is_some() && args.provider.is_none() {
+        return Err("--fixture-tools needs --provider fixture:<path>".into());
+    }
+
+    if !matches!(args.view.as_str(), "json" | "plain") {
+        return Err(format!("--view '{}': expected `json` or `plain`", args.view).into());
+    }
+
+    let mut limits = super::runtime::native::NativeLimits::default();
+    if let Some(max_tool_calls) = args.max_tool_calls {
+        limits.max_tool_calls = max_tool_calls;
+    }
+    if let Some(timeout_secs) = args.timeout_secs {
+        limits.max_wall_ms = timeout_secs.saturating_mul(1000);
+    }
+    // Issue #637: was accepted by clap but never read on the native path, so
+    // `--budget-tokens` silently did nothing (`--max-tool-calls` on the same
+    // request correctly stopped the loop).
+    if let Some(budget_tokens) = args.budget_tokens {
+        limits.max_budget_tokens = Some(budget_tokens);
+    }
+    let mut request = super::runtime::native::HeadlessRequest {
+        repo,
+        prompt: prompt.trim(),
+        route: args.route.as_deref(),
+        role: &args.role,
+        limits,
+        session_id: None,
+        cancellation: None,
+        resume: args.resume.as_deref(),
+        provider: args.provider.as_deref(),
+        fixture_tools: args.fixture_tools.as_deref(),
+        // Issue #479: a plain `zirv ctx exec --runtime native` is not a
+        // delegation. It holds no task card and no writer permit, so its
+        // repository writes are refused rather than silently unbacked --
+        // `zirv agent --runtime native` is the surface that grants both.
+        task: None,
+        writer: None,
+        accounting: super::runtime::native::Accounting::Seat,
+    };
+
+    if args.view != "plain" {
+        return super::runtime::native::run_headless(&mut request, w, env);
+    }
+
+    // `--view plain`: the exact same JSON status `run_headless` always
+    // printed (the contract is unchanged), followed by the same view model
+    // `dash::native_pane`'s ratatui renderer draws, rendered as plain text
+    // -- no terminal, no ratatui, required to read it.
+    let mut notices: Vec<u8> = Vec::new();
+    let status = super::runtime::native::run_session(&mut request, &mut notices, env)?;
+    if !notices.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&notices));
+    }
+    writeln!(w, "{}", serde_json::to_string_pretty(&status)?)?;
+
+    let state = super::state::StateDir::resolve(env)?;
+    let plain = render_native_session_plain(&state, &status, repo);
+    match plain {
+        Ok(text) => {
+            writeln!(w)?;
+            write!(w, "{text}")?;
+        }
+        Err(error) => {
+            eprintln!("--view plain: could not render the transcript: {error}");
+        }
+    }
+    Ok(status.exit_code)
+}
+
+/// Replays `session`'s journal and renders it through `dash::native_pane`'s
+/// own plain-text renderer -- exactly the view model a dashboard native pane
+/// draws, over the SAME reducer (`build_transcript`) both surfaces share, so
+/// this headless view and the dashboard's live one never diverge in what a
+/// tool call, a diff or a test outcome looks like.
+fn render_native_session_plain(
+    state: &super::state::StateDir,
+    status: &super::runtime::native::NativeFinalStatus,
+    repo: &Path,
+) -> CtxResult<String> {
+    use super::dash::native_pane::{
+        NativePresentation, StatusFacts, build_transcript, render_plain, resolve_billing,
+    };
+    use super::runtime::journal::{Journal, JournalSessionId};
+
+    let journal = Journal::open(state)?;
+    let session_id = JournalSessionId::new(status.session.clone())?;
+    let identity = journal.session(&session_id)?;
+    let conversation = journal.replay(&session_id)?;
+    let view = build_transcript(&conversation);
+    let (session_state, blocked, unread_result) = plain_status_projection(
+        status.status,
+        status.blocked_reason.is_some(),
+        status.final_text.is_some(),
+    );
+    let facts = StatusFacts {
+        model: format!(
+            "{}/{}",
+            identity.route.model.vendor, identity.route.model.id
+        ),
+        route: identity.route.route.to_string(),
+        runtime: "native".to_string(),
+        billing: resolve_billing(&identity.route, repo),
+        session_state,
+        turn_state: None,
+        blocked,
+        unread_result,
+        notice: None,
+        activity: None,
+        cwd: repo.display().to_string(),
+        git_branch: None,
+        context_left_pct: None,
+    };
+    Ok(render_plain(
+        &view,
+        &NativePresentation::default(),
+        &facts,
+        100,
+    ))
+}
+
+fn plain_status_projection(
+    status: super::runtime::native::NativeStatus,
+    blocked: bool,
+    unread: bool,
+) -> (super::runtime::native::SessionState, bool, bool) {
+    use super::runtime::native::{NativeStatus, SessionState};
+    let state = match status {
+        NativeStatus::Completed => SessionState::Completed,
+        NativeStatus::Interrupted => SessionState::Interrupted,
+        NativeStatus::Incomplete | NativeStatus::LimitReached | NativeStatus::Failed => {
+            SessionState::Failed
+        }
+    };
+    (state, blocked, unread)
 }
 
 /// Same supervised execution as [run_with], plus the per-harness accounting
@@ -1619,7 +1890,26 @@ fn run_with_clock_inner<W: Write>(
             Duration::from_secs(cfg.supervise.in_tool_secs),
             Duration::from_secs(cfg.supervise.stall_grace_secs),
             &mut stalled,
+            args.cancellation.as_deref(),
         )?;
+
+        if args
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| super::provider::adapter::Cancellation::is_cancelled(flag.as_ref()))
+        {
+            record_execution_segment(
+                report,
+                adapter.as_ref(),
+                &session,
+                &transcript,
+                &prior_usage,
+                execution_model.as_deref(),
+                execution_started,
+            );
+            session_guard.release();
+            return Ok(130);
+        }
 
         if budget_exhausted {
             let _ = log::append(
@@ -2452,6 +2742,7 @@ fn run_with_clock_inner<W: Write>(
                     command: target.model_args(&selected_model),
                     simple: args.simple,
                     reservation_id,
+                    ..Default::default()
                 };
 
                 let mut next_visited = visited;
@@ -3229,6 +3520,7 @@ fn supervise_run(
     in_tool: Duration,
     stall_grace: Duration,
     stalled: &mut bool,
+    cancellation: Option<&super::provider::adapter::CancellationFlag>,
 ) -> CtxResult<Outcome> {
     // Issue #203: `evaluate_worker_budget` reads the transcript fresh on
     // every tick, so it can see a `HardStop` the instant the child's last
@@ -3256,6 +3548,9 @@ fn supervise_run(
     let mut stall_latch: Option<super::stall::StallLatch> = None;
     let mut last_mail_activity: Option<(usize, usize)> = None;
     let mut tick = || {
+        if cancellation.is_some_and(super::provider::adapter::Cancellation::is_cancelled) {
+            return Tick::Stop("cancelled");
+        }
         if let Some(candidate) = self_heal_transcript(transcript, resolve_transcript) {
             *scorer = score::IncrementalScorer::new(candidate.clone());
             *transcript = candidate;
@@ -3679,13 +3974,233 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     // (`parent: None`), so a direct launch always resolves to no parent --
     // fail-closed to peer trust.
     let env = agent::parent_session_env(&ambient, None);
-    run_with(args, w, &repo, &env)
+    // Issue #491: the CLI entry is where the operator's opt-in `[runtime]`
+    // default becomes an explicit backend, so everything below -- `run_with`,
+    // the native branch, `script_runner`'s own direct callers -- keeps seeing
+    // one of exactly two literal values and never has to resolve anything.
+    let choice = resolved_runtime(args, &repo, &env)?;
+    if let Some(note) = &choice.note {
+        eprintln!("zirv ctx exec: {note}");
+    }
+    let mut args = args.clone();
+    args.runtime = choice.kind.as_str().to_string();
+    run_with(&args, w, &repo, &env)
+}
+
+/// Issue #491: the `[runtime]` resolution `run` applies before anything
+/// downstream sees a runtime value at all.
+///
+/// Split out of `run` for one reason: the ROLE it keys on is a real decision,
+/// and hardcoding `"worker"` here would silently resolve `zirv ctx exec
+/// --role reviewer` against the `worker` row of `[runtime.roles]`. `args.role`
+/// is this run's own seat role -- the same key `agent::run` passes -- and a
+/// test pins that rather than the resolution ladder underneath it (which
+/// `runtime::tests` already owns).
+fn resolved_runtime(
+    args: &ExecArgs,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<super::runtime::RuntimeChoice> {
+    super::runtime::resolve_for_cli(&args.runtime, repo, env, &args.role)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn plain_native_view_matches_structured_status() {
+        use super::super::runtime::native::{NativeStatus, SessionState};
+
+        for (status, expected) in [
+            (NativeStatus::Completed, SessionState::Completed),
+            (NativeStatus::Incomplete, SessionState::Failed),
+            (NativeStatus::Interrupted, SessionState::Interrupted),
+            (NativeStatus::LimitReached, SessionState::Failed),
+            (NativeStatus::Failed, SessionState::Failed),
+        ] {
+            assert_eq!(plain_status_projection(status, false, false).0, expected);
+        }
+        assert_eq!(
+            plain_status_projection(NativeStatus::Incomplete, true, false),
+            (SessionState::Failed, true, false)
+        );
+        assert_eq!(
+            plain_status_projection(NativeStatus::Completed, false, true),
+            (SessionState::Completed, false, true)
+        );
+    }
+
+    /// PR #546 review finding 1: `run` used to resolve the configured
+    /// runtime default against a hardcoded `"worker"`, so an exec launched
+    /// as some other seat read the wrong row of `[runtime.roles]`. The
+    /// resolution has to key on THIS run's `--role`.
+    #[test]
+    fn exec_resolves_the_configured_default_against_its_own_role() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let repo = super::super::testenv::repo();
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            "[runtime.roles]\nreviewer = 'native'\nworker = 'harness'\n",
+        )
+        .expect("ctx.toml");
+
+        let choice_for = |role: &str| {
+            let args = ExecArgs {
+                runtime: super::super::runtime::CONFIGURED.to_string(),
+                role: role.to_string(),
+                ..Default::default()
+            };
+            resolved_runtime(&args, repo.path(), &|_| None).expect("resolve")
+        };
+
+        let reviewer = choice_for("reviewer");
+        assert_eq!(reviewer.kind, super::super::runtime::RuntimeKind::Native);
+        assert_eq!(
+            reviewer.source,
+            super::super::runtime::RuntimeSource::RoleTable
+        );
+        assert_eq!(
+            choice_for("worker").kind,
+            super::super::runtime::RuntimeKind::Harness
+        );
+    }
+
+    // -- issue #478: the native runtime through the shipped CLI path -------
+
+    /// Issue #478 item 7: the deterministic fixtures must be reachable from
+    /// the shipped command, not only from `#[cfg(test)]`. This drives a whole
+    /// native session -- request, tool call, continuation, structured final
+    /// status -- through `exec::run_with` with NO provider configured, no
+    /// credential, and no coding harness installed.
+    #[test]
+    fn native_runtime_runs_a_whole_fixture_session_through_exec() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+
+        let fixtures = super::super::runtime::fixture::fixture_root();
+        let args = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("fix the failing test".to_string()),
+            provider: Some(format!(
+                "fixture:{}",
+                fixtures
+                    .join("anthropic-investigate-edit-test.json")
+                    .display()
+            )),
+            fixture_tools: Some(fixtures.join("tools-investigate-edit-test.json")),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, repo.path(), &lookup).expect("native run");
+        let text = String::from_utf8(out).expect("utf8");
+        let status: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|error| panic!("{error}: {text}"));
+
+        assert_eq!(code, 0, "{text}");
+        assert_eq!(status["runtime"], "native");
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["requests"], 4);
+        assert_eq!(status["tool_calls"], 4);
+        assert_eq!(status["served_model"], "fixture-anthropic-model");
+    }
+
+    /// The same command, resumed: `--resume` continues the stored session
+    /// rather than starting a new one, and says so by reusing its id.
+    #[test]
+    fn native_runtime_resumes_a_stored_session_through_exec() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let fixtures = super::super::runtime::fixture::fixture_root();
+
+        let first = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("start".to_string()),
+            provider: Some(format!(
+                "fixture:{}",
+                fixtures
+                    .join("anthropic-investigate-edit-test.json")
+                    .display()
+            )),
+            fixture_tools: Some(fixtures.join("tools-investigate-edit-test.json")),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        run_with(&first, &mut out, repo.path(), &lookup).expect("first run");
+        let started: serde_json::Value =
+            serde_json::from_slice(&out).expect("first status is json");
+        let session = started["session"].as_str().expect("session id").to_string();
+
+        // A different script for the continuation: a provider never reissues
+        // a tool-call id it has already used, and the journal would refuse it
+        // if one did.
+        let resumed = ExecArgs {
+            runtime: "native".to_string(),
+            resume: Some(session.clone()),
+            provider: Some(format!(
+                "fixture:{}",
+                fixtures.join("resume-continue.json").display()
+            )),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        // No prompt at all: a resume continues a conversation that already
+        // has one.
+        run_with(&resumed, &mut out, repo.path(), &lookup)
+            .unwrap_or_else(|error| panic!("resumed run: {error}"));
+        let status: serde_json::Value =
+            serde_json::from_slice(&out).expect("resumed status is json");
+        assert_eq!(status["session"], session);
+        assert_eq!(status["runtime"], "native");
+    }
+
+    #[test]
+    fn native_runtime_refuses_an_unsupported_provider_override() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = tempfile::tempdir().expect("tempdir");
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let args = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("go".to_string()),
+            provider: Some("https://example.invalid".to_string()),
+            ..Default::default()
+        };
+        let error = run_with(&args, &mut Vec::new(), repo.path(), &lookup).expect_err("refused");
+        assert!(error.to_string().contains("fixture:"), "{error}");
+    }
+
+    #[test]
+    fn fixture_tools_without_a_fixture_provider_is_refused() {
+        let repo = tempfile::tempdir().expect("repo");
+        let args = ExecArgs {
+            runtime: "native".to_string(),
+            prompt: Some("go".to_string()),
+            fixture_tools: Some(PathBuf::from("tools.json")),
+            ..Default::default()
+        };
+        let error = run_with(&args, &mut Vec::new(), repo.path(), &|_| None).expect_err("refused");
+        assert!(error.to_string().contains("--fixture-tools"), "{error}");
+    }
 
     #[test]
     fn every_declared_exit_constant_is_in_exit_codes() {
@@ -4403,6 +4918,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -4443,6 +4959,7 @@ mod tests {
                 "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf '{}\\n' >> \"$1\"; /bin/sleep 0.25; done".into(),
                 "worker".into(), transcript.display().to_string(),
             ],
+            ..Default::default()
         };
         let code = run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned());
         assert_eq!(
@@ -4480,6 +4997,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: vec!["sh".into(), "-c".into(), "/bin/sleep 5".into()],
+            ..Default::default()
         };
         let code =
             run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -4526,6 +5044,7 @@ mod tests {
                 "-c".into(),
                 "printf 'Selected model is at capacity\\n'; /bin/sleep 3; exit 2".into(),
             ],
+            ..Default::default()
         };
         let code =
             run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -4561,6 +5080,7 @@ mod tests {
                 "-c".into(),
                 "printf 'insufficient_quota\\n'; /bin/sleep 3; exit 2".into(),
             ],
+            ..Default::default()
         };
         let code =
             run_with(&args, &mut Vec::new(), tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -4595,6 +5115,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4643,6 +5164,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -4691,6 +5213,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4728,6 +5251,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4791,6 +5315,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4877,6 +5402,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4933,6 +5459,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -4988,6 +5515,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5038,6 +5566,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5074,6 +5603,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -5109,6 +5639,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: vec!["true".to_string()],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -5291,6 +5822,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
@@ -5357,6 +5889,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
@@ -5409,6 +5942,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5468,6 +6002,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let started = std::time::Instant::now();
         let mut out = Vec::new();
@@ -5522,6 +6057,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let started = std::time::Instant::now();
         let mut out = Vec::new();
@@ -5631,6 +6167,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5685,6 +6222,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5730,6 +6268,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5773,6 +6312,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5814,6 +6354,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -5854,6 +6395,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -5898,6 +6440,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned()).expect("runs");
@@ -5934,6 +6477,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6022,6 +6566,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
 
@@ -6087,6 +6632,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6165,6 +6711,7 @@ mod tests {
             simple: false,
             reservation_id: Some(seeded.id.clone()),
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let (code, report) =
@@ -6246,6 +6793,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -6315,6 +6863,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let clock = std::cell::Cell::new(crate::commands::ctx::state::now_secs());
         let slept = std::cell::RefCell::new(Vec::new());
@@ -6388,6 +6937,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6442,6 +6992,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6497,6 +7048,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -6572,6 +7124,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6631,6 +7184,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6693,6 +7247,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6747,6 +7302,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
@@ -6814,6 +7370,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6865,6 +7422,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -6940,6 +7498,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7054,6 +7613,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7116,6 +7676,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7194,6 +7755,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7279,6 +7841,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run(&args, &mut out);
@@ -7374,6 +7937,7 @@ mod tests {
             // adapter` below for the other shape (an explicit `-- <command>`),
             // where there is no such text to append to at all.
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7460,6 +8024,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7538,6 +8103,7 @@ mod tests {
                 "exec".to_string(),
                 "do the work".to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7600,6 +8166,7 @@ mod tests {
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
+        let modes_for_writer = modes.clone();
         let writer = std::thread::spawn(move || {
             // No session-env log for codex (it never receives `--session-id`
             // at all -- see the fixture's own doc comment), so liveness is
@@ -7610,6 +8177,9 @@ mod tests {
             // nudging -- see `wait_for_live_session_or_panic`'s own doc
             // comment.
             wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
+            // The registry becomes live before the child consumes its mode.
+            // Do not interrupt it until the first `hang` has been consumed.
+            wait_for_first_line_or_panic(&modes_for_writer, "healthy", Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -7635,6 +8205,7 @@ mod tests {
                 "exec".to_string(),
                 "do the work".to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7744,6 +8315,7 @@ mod tests {
                 "exec".to_string(),
                 "do the work".to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7793,12 +8365,16 @@ mod tests {
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
+        let modes_for_writer = modes.clone();
         let writer = std::thread::spawn(move || {
             // 20s, not the old 5s: honest against this test's own 30s exec
             // timeout, and a give-up now panics instead of silently never
             // nudging -- see `wait_for_live_session_or_panic`'s own doc
             // comment.
             wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
+            // The registry becomes live before the child consumes its mode.
+            // Do not interrupt it until the first `hang` has been consumed.
+            wait_for_first_line_or_panic(&modes_for_writer, "healthy", Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -7819,6 +8395,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -7889,6 +8466,7 @@ mod tests {
             simple: true,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8043,6 +8621,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: Vec::new(),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8115,6 +8694,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8189,6 +8769,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session1),
+            ..Default::default()
         };
         let mut out1 = Vec::new();
         let code1 = run_with(&args1, &mut out1, tmp.path(), &|k| env.get(k).cloned());
@@ -8220,6 +8801,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session2),
+            ..Default::default()
         };
         let mut out2 = Vec::new();
         let code2 = run_with(&args2, &mut out2, tmp.path(), &|k| env.get(k).cloned());
@@ -8285,6 +8867,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8355,6 +8938,7 @@ mod tests {
                 "--session-id".to_string(),
                 session.to_string(),
             ],
+            ..Default::default()
         };
         let mut out = Vec::new();
         let result = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8422,6 +9006,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8471,6 +9056,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8533,6 +9119,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8740,6 +9327,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8826,6 +9414,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -8904,6 +9493,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -9004,6 +9594,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
@@ -9111,6 +9702,7 @@ mod tests {
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
+            ..Default::default()
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());

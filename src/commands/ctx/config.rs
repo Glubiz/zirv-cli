@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -747,6 +748,17 @@ pub struct ContextConfig {
     /// an operator deliberately bounded, the same asymmetry as every other
     /// numeric key in this struct.
     pub lint_max_pairs: usize,
+    /// Issue #538 (chunk B): aggregate byte budget for the native
+    /// compiler's whole instruction layer -- every resolved `ZIRV.md`/
+    /// `AGENTS.md`/`CLAUDE.md`/`AGENT.md` winner for the repo root and the
+    /// active scope's ancestor chain, combined. Applied in stable order
+    /// (root first, then nested by depth) after the per-file cap
+    /// (`optimize.max_surface_bytes`, reused unchanged) already bounds any
+    /// one file: this is the ceiling on the layer as a whole, so a
+    /// monorepo with many small nested files cannot still blow the budget
+    /// through sheer count. `REPO_FORBIDDEN`, same rationale as
+    /// `max_common_bytes` above -- see `REPO_FORBIDDEN`.
+    pub instructions_max_bytes: usize,
 }
 
 impl Default for ContextConfig {
@@ -757,6 +769,7 @@ impl Default for ContextConfig {
             max_harness_roster_bytes: 4096,
             dedupe_native: true,
             lint_max_pairs: 20_000,
+            instructions_max_bytes: 32 * 1024,
         }
     }
 }
@@ -1410,6 +1423,72 @@ impl Default for TaskConfig {
     }
 }
 
+/// Issue #352: the persistent runtime service -- the one that owns PTYs so a
+/// session survives the client that was looking at it. EXPERIMENTAL and
+/// operator-only: with `persistent = false` (the default) nothing in this
+/// table has any effect and every surface behaves exactly as it did before
+/// the feature existed.
+///
+/// Every key here is `REPO_FORBIDDEN`. A checked-out repository must not be
+/// able to decide that sessions started from it outlive the operator's
+/// terminal, and -- the sharper half -- must not be able to turn on
+/// `history`, which persists rendered terminal output (and therefore any
+/// secret an agent happened to print) to disk. Only `~/.zirv/ctx.toml`, the
+/// `ZIRV_CTX_SESSION_*` variables, or an explicit flag may set them.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// The master switch (`ZIRV_CTX_SESSION_PERSISTENT`). Off by default:
+    /// until crash, upgrade and cross-platform recovery are proven on every
+    /// platform, `zirv session serve` is something an operator opts into, and
+    /// `zirv chat` keeps launching its own PTY in its own process.
+    pub persistent: bool,
+    /// Tier 3 (`ZIRV_CTX_SESSION_HISTORY`): persist each session's rendered
+    /// terminal state across a RUNTIME restart, not just across a client
+    /// detach. Off by default and warned about at the point of use, because
+    /// terminal output routinely contains tokens, keys and repository
+    /// contents, and this is the only zirv setting that writes that stream to
+    /// disk. Detach/reattach (tier 1) does not need it: the original PTY and
+    /// its live screen never left the service's memory.
+    pub history: bool,
+    /// How many rows of scrollback each server-owned PTY keeps in memory for
+    /// a reattaching client (`ZIRV_CTX_SESSION_SCROLLBACK_ROWS`). Memory, not
+    /// disk: unaffected by `history`.
+    pub scrollback_rows: usize,
+    /// How long a namespace record may go without a heartbeat before another
+    /// process treats it as stale (`ZIRV_CTX_SESSION_STALE_AFTER_SECS`).
+    /// Only ever a secondary signal: staleness is decided by process start
+    /// identity first (see `session::namespace`), never by age or pid alone.
+    pub stale_after_secs: u64,
+}
+
+/// Defaults are written out rather than derived so the "off by default"
+/// promise is one visible line rather than an inference about `bool`.
+impl SessionConfig {
+    pub const DEFAULT_SCROLLBACK_ROWS: usize = 2000;
+    pub const DEFAULT_STALE_AFTER_SECS: u64 = 120;
+
+    /// The resolved scrollback budget, with `0` (an unset or explicitly
+    /// zeroed key) reading as the built-in default rather than "keep
+    /// nothing": the same clamping convention `setup.backup_retention_runs`
+    /// and `workflow.telemetry_max_events` already use.
+    pub fn scrollback_rows_or_default(&self) -> usize {
+        if self.scrollback_rows == 0 {
+            Self::DEFAULT_SCROLLBACK_ROWS
+        } else {
+            self.scrollback_rows
+        }
+    }
+
+    pub fn stale_after_secs_or_default(&self) -> u64 {
+        if self.stale_after_secs == 0 {
+            Self::DEFAULT_STALE_AFTER_SECS
+        } else {
+            self.stale_after_secs
+        }
+    }
+}
+
 /// Bookkeeping for the guided `zirv setup` flow (issues #87, #93, #95). Not
 /// `REPO_FORBIDDEN`: unlike the workflow/memory tables above, nothing here
 /// gates execution of repository content or spend on the operator's
@@ -1591,6 +1670,34 @@ pub struct ChatConfig {
     /// `--quiet`/`ZIRV_CTX_QUIET`. The banner and the dashboard header still
     /// show it too, as the standing on-screen copy.
     pub model: Option<String>,
+
+    /// Issue #504: overrides the INTERACTIVE launch's Claude Code
+    /// `--permission-mode`, one of `"default"` (the shipped posture: every
+    /// action outside the projected allow-list prompts), `"acceptEdits"` or
+    /// `"bypassPermissions"`. `None` (the default) reproduces `"default"`
+    /// exactly, so behavior is unchanged unless an operator sets this.
+    /// Headless launches are untouched either way -- they always carry
+    /// `dontAsk` -- and this key never suppresses or widens the
+    /// `--allowedTools`/`--disallowedTools` lists themselves, even under
+    /// `bypassPermissions`: only the mode flag changes.
+    ///
+    /// Reached, before this key existed, only by editing the operator's own
+    /// `~/.claude/settings.json` `permissions.defaultMode` -- which the CLI
+    /// flag zirv always passes silently outranks, so that setting had no
+    /// effect (the observed report, issue #504: an operator running several
+    /// native subagents delegating into worktrees outside the launch cwd's
+    /// own `./**` scope got prompted for every Edit/Write and every
+    /// unlisted compound command, with no config knob to quiet it).
+    ///
+    /// `REPO_FORBIDDEN`: a repository checkout must not be able to widen its
+    /// own session's permission posture -- the same trust asymmetry
+    /// `sandbox.enabled`/`sandbox.extra_allow` already hold, applied to this
+    /// adapter-native flag instead. Set it in `~/.zirv/ctx.toml`, or with
+    /// `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE`. Validated at load (see
+    /// `CtxConfig::load`) against the same fixed set Claude Code's own CLI
+    /// accepts; an unrecognized value is a load-time error naming the key,
+    /// not a silent fallback to `"default"`.
+    pub claude_permission_mode: Option<String>,
 }
 
 /// Per-agent override for which model runs code review, keyed the same way
@@ -2174,6 +2281,235 @@ pub struct HarnessLimits {
     pub reserve_headroom_pct: Option<f64>,
 }
 
+/// Issue #491 (roadmap N22): which backend a session gets when the caller did
+/// not name one. `zirv ctx exec`/`zirv ctx agent` default their `--runtime`
+/// flag to the literal `configured`, and `zirv chat` with no `--runtime` at
+/// all means the same thing: consult this table, fall back to the harness.
+///
+/// Opt-in by construction. An absent `[runtime]` table, an absent `default`
+/// and an unparsable value all resolve to `harness` -- the behaviour every
+/// build before N22 had -- so an existing operator config keeps running the
+/// legacy backend until they say otherwise, and saying otherwise is one key.
+/// Switching back is deleting that key (or `zirv ctx config migrate
+/// --downgrade`, which restores the pre-migration document wholesale).
+///
+/// The WHOLE `[runtime]` table is `REPO_FORBIDDEN`, the same reasoning
+/// `[capabilities]` carries: a checked-out repository moving this operator's
+/// sessions onto their metered native provider accounts is pure widening, and
+/// there is no narrowing half to allow -- "run on the harness instead" is not
+/// a safety property a repo gets to assert either, because the operator's
+/// harness account is just as spendable.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// `"native"` or `"harness"`. Unset (the default) means `harness`.
+    /// Deliberately a plain `String` rather than a typed enum: an unknown
+    /// value here must degrade to the harness with a doctor finding, never
+    /// abort the whole config load of a machine whose zirv is older than the
+    /// value someone wrote.
+    pub default: Option<String>,
+    /// Per-role overrides, keyed by the same role names `[roles]` in
+    /// `native.toml` uses (`orchestrator`, `worker`, `reviewer`, ...). A role
+    /// named here outranks `default`.
+    pub roles: std::collections::BTreeMap<String, String>,
+}
+
+/// Issue #483 (roadmap N14): the non-shell capabilities a native session has
+/// no host harness to inherit -- MCP servers, web search/fetch, browser
+/// automation.
+///
+/// The WHOLE `[capabilities]` table is `REPO_FORBIDDEN`. Every key in it
+/// names something zirv then runs, reaches over the network, or authenticates
+/// with: an MCP server command, a remote endpoint, a credential reference, a
+/// browser binary. A checked-out repository adding any of them is pure
+/// widening -- exactly what the repo layer may never do -- so only
+/// `~/.zirv/ctx.toml` or `ZIRV_CTX_CAPABILITIES` may set them.
+///
+/// Everything here is off by default. An unconfigured capability is reported
+/// as `unavailable` with a diagnosis naming what is missing; it never
+/// degrades into an empty success.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapabilitiesConfig {
+    /// Master switch. With this off, no MCP server is contacted, no outbound
+    /// web call is made and no browser is launched, whatever else is set.
+    pub enabled: bool,
+    pub web: WebCapabilityConfig,
+    pub browser: BrowserCapabilityConfig,
+    /// Configured MCP servers, in declaration order.
+    pub mcp: Vec<McpServerConfig>,
+    /// At or below this many discovered MCP tools, each one is registered as
+    /// its own native tool definition. Above it, the catalogue is reachable
+    /// only through the compact index plus an on-demand describe, so a large
+    /// toolset never forces every schema into every model request.
+    pub max_inline_mcp_tools: usize,
+}
+
+impl CapabilitiesConfig {
+    pub const DEFAULT_MAX_INLINE_MCP_TOOLS: usize = 24;
+
+    pub fn max_inline_mcp_tools_or_default(&self) -> usize {
+        if self.max_inline_mcp_tools == 0 {
+            Self::DEFAULT_MAX_INLINE_MCP_TOOLS
+        } else {
+            self.max_inline_mcp_tools
+        }
+    }
+
+    /// Servers an operator actually turned on. A disabled entry stays in the
+    /// file and out of every session.
+    pub fn active_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
+        let enabled = self.enabled;
+        self.mcp
+            .iter()
+            .filter(move |server| enabled && server.enabled && !server.name.trim().is_empty())
+    }
+}
+
+/// Configured web search and fetch. Both are *configured* capabilities: a raw
+/// model provides neither, and zirv never claims otherwise.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebCapabilityConfig {
+    /// A search endpoint taking `{query}` in its URL template and answering
+    /// JSON. Unset means web search is unavailable, not silently empty.
+    pub search_endpoint: Option<String>,
+    /// `env:NAME`, `store:<item>` or `file:<path>`, resolved through the same
+    /// credential store the direct providers use. Never logged.
+    pub search_credential: Option<String>,
+    /// Whether `web_fetch` may retrieve a URL at all.
+    pub fetch_enabled: bool,
+    /// Hosts the web capabilities may reach. Empty means none: an allowlist
+    /// with no entries is a closed door, not an open one.
+    pub allow_hosts: Vec<String>,
+    /// Ceiling on one fetched body before it is stored as bounded evidence.
+    pub max_fetch_bytes: usize,
+    pub timeout_ms: u64,
+}
+
+impl WebCapabilityConfig {
+    pub const DEFAULT_MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
+    pub const DEFAULT_TIMEOUT_MS: u64 = 20_000;
+
+    pub fn max_fetch_bytes_or_default(&self) -> usize {
+        if self.max_fetch_bytes == 0 {
+            Self::DEFAULT_MAX_FETCH_BYTES
+        } else {
+            self.max_fetch_bytes
+        }
+    }
+
+    pub fn timeout_ms_or_default(&self) -> u64 {
+        if self.timeout_ms == 0 {
+            Self::DEFAULT_TIMEOUT_MS
+        } else {
+            self.timeout_ms
+        }
+    }
+}
+
+/// Configured browser automation. The backend is the same headless
+/// Chromium-family binary `frontend render` already drives, so a machine that
+/// can capture a frontend render can inspect a page natively too.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserCapabilityConfig {
+    pub enabled: bool,
+    /// An explicit binary, overriding discovery. Absent means "discover a
+    /// Chromium-family browser on PATH, and report unavailable if there is
+    /// none".
+    pub binary: Option<String>,
+    pub timeout_ms: u64,
+}
+
+impl BrowserCapabilityConfig {
+    pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+    pub fn timeout_ms_or_default(&self) -> u64 {
+        if self.timeout_ms == 0 {
+            Self::DEFAULT_TIMEOUT_MS
+        } else {
+            self.timeout_ms
+        }
+    }
+}
+
+/// One configured MCP server. `effects` is the *trusted* declaration of what
+/// this server's tools may do: it comes from the operator's own config and is
+/// what the N04 broker admits against. Server-supplied descriptions never
+/// influence it.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub transport: McpTransportConfig,
+    pub effects: CapabilityEffectsConfig,
+    pub request_timeout_ms: u64,
+}
+
+impl McpServerConfig {
+    pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+    pub fn request_timeout_ms_or_default(&self) -> u64 {
+        if self.request_timeout_ms == 0 {
+            Self::DEFAULT_REQUEST_TIMEOUT_MS
+        } else {
+            self.request_timeout_ms
+        }
+    }
+}
+
+/// How to reach one MCP server. `mode` is explicit: a server is local or
+/// remote because the operator said so, never because a URL happened to parse.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpTransportConfig {
+    /// A child process speaking newline-delimited JSON-RPC on stdin/stdout.
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
+    },
+    /// A remote Streamable HTTP endpoint, optionally bearer-authenticated
+    /// from the shared credential store.
+    Http {
+        url: String,
+        #[serde(default)]
+        credential: Option<String>,
+    },
+}
+
+impl Default for McpTransportConfig {
+    fn default() -> Self {
+        Self::Stdio {
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            environment: BTreeMap::new(),
+        }
+    }
+}
+
+/// The operator's declaration of what a configured integration's tools may
+/// do. Mirrors `runtime::enforcement::ProcessEffects` one field at a time so
+/// the config surface and the broker's own vocabulary cannot drift; every
+/// field defaults to `false`, so an undeclared effect is unavailable rather
+/// than assumed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapabilityEffectsConfig {
+    pub repo_write: bool,
+    pub outside_write: bool,
+    pub network: bool,
+    pub git_metadata_write: bool,
+    pub git_push_or_destructive: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CtxConfig {
@@ -2211,6 +2547,15 @@ pub struct CtxConfig {
     pub objective: ObjectiveConfig,
     pub screen: ScreenConfig,
     pub task: TaskConfig,
+    /// Issue #352's experimental persistent-runtime gate. Every key is
+    /// `REPO_FORBIDDEN`; see [`SessionConfig`].
+    pub session: SessionConfig,
+    /// Issue #483's configured MCP/web/browser integrations. The whole table
+    /// is `REPO_FORBIDDEN`; see [`CapabilitiesConfig`].
+    pub capabilities: CapabilitiesConfig,
+    /// Issue #491's opt-in native runtime default. The whole table is
+    /// `REPO_FORBIDDEN`; see [`RuntimeConfig`].
+    pub runtime: RuntimeConfig,
     /// Per-agent enable/disable state from `.settings.toml`, a file this type
     /// deliberately never deserializes (see `crate::settings`): loaded
     /// separately at the end of `load`, and rejected outright if it appears
@@ -2651,6 +2996,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_CONTEXT_INSTRUCTIONS_MAX_BYTES",
+        &["context", "instructions_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS",
         &["context", "lint_max_pairs"],
         EnvKind::Int,
@@ -2875,6 +3225,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
     (
+        "ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE",
+        &["chat", "claude_permission_mode"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_REVIEW_MODEL_CLAUDE",
         &["review", "claude"],
         EnvKind::Str,
@@ -2969,6 +3324,40 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["task", "max_parent_outcome_bytes"],
         EnvKind::Int,
     ),
+    // Issue #352: the operator's own override for every persistent-runtime
+    // key. These are the ONLY spellings besides `~/.zirv/ctx.toml` and an
+    // explicit flag that can set them -- see `REPO_FORBIDDEN` below.
+    (
+        "ZIRV_CTX_SESSION_PERSISTENT",
+        &["session", "persistent"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_SESSION_HISTORY",
+        &["session", "history"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_SESSION_SCROLLBACK_ROWS",
+        &["session", "scrollback_rows"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
+        &["session", "stale_after_secs"],
+        EnvKind::Int,
+    ),
+    // Issue #483: the operator's master switch for the configured MCP/web/
+    // browser integrations, and the spelling `REPO_FORBIDDEN` names when it
+    // rejects a repo layer's `[capabilities]` table.
+    (
+        "ZIRV_CTX_CAPABILITIES",
+        &["capabilities", "enabled"],
+        EnvKind::Bool,
+    ),
+    // Issue #491: the operator's opt-in native default, and the spelling
+    // `REPO_FORBIDDEN` names when it rejects a repo layer's `[runtime]` table.
+    ("ZIRV_CTX_RUNTIME", &["runtime", "default"], EnvKind::Str),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -3496,6 +3885,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["context", "max_harness_roster_bytes"],
         "ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES",
     ),
+    // Issue #538 (chunk B): without this a repo checkout could raise its own
+    // aggregate budget for the native compiler's whole instruction layer,
+    // making the cap decorative -- same reasoning as every byte-cap entry
+    // above.
+    (
+        &["context", "instructions_max_bytes"],
+        "ZIRV_CTX_CONTEXT_INSTRUCTIONS_MAX_BYTES",
+    ),
     // Issue #275: without this a repo checkout could raise its own cap on
     // how many sentence pairs `zirv context lint`'s CTX002/CTX003 checks
     // compare, turning a bound meant to protect the operator's own CPU time
@@ -3855,6 +4252,20 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // does not. This is a narrower, correctness-preserving guard than banning
     // the key outright, which is why it stays out of `REPO_FORBIDDEN`.
     //
+    // `chat.claude_permission_mode` (issue #504) is the opposite call from
+    // `chat.model` right above, on purpose: unlike a model choice, which is
+    // disclosed on screen and cannot itself widen what a session may DO,
+    // this key picks the interactive launch's native `--permission-mode` --
+    // `bypassPermissions` silently skips every prompt the shipped `default`
+    // posture and the safety hook both rely on. A repo checkout choosing it
+    // for the operator would be exactly the widening `sandbox.enabled`/
+    // `sandbox.extra_allow` already stand between an untrusted layer and, so
+    // it is `REPO_FORBIDDEN` outright rather than charset-validated like
+    // `chat.model`'s narrower guard above.
+    (
+        &["chat", "claude_permission_mode"],
+        "ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE",
+    ),
     // `review.claude`/`review.codex` are the opposite call from `chat.model`
     // right above, on purpose: those pick which model spends the operator's
     // vendor account running review work in the *background* (every `zirv
@@ -4094,6 +4505,40 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["task", "max_parent_outcome_bytes"],
         "ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES",
     ),
+    // Issue #352, one entry per key so the refusal names the exact one the
+    // checkout tried to set. `persistent` decides whether cloning a
+    // repository is enough to make sessions started from it outlive the
+    // operator's terminal; `history` decides whether rendered terminal
+    // output -- tokens and keys included -- is written to disk at all; and
+    // the two bounds would be decorative if the untrusted layer could simply
+    // raise its own, the same reasoning as every cap above.
+    (&["session", "persistent"], "ZIRV_CTX_SESSION_PERSISTENT"),
+    (&["session", "history"], "ZIRV_CTX_SESSION_HISTORY"),
+    (
+        &["session", "scrollback_rows"],
+        "ZIRV_CTX_SESSION_SCROLLBACK_ROWS",
+    ),
+    (
+        &["session", "stale_after_secs"],
+        "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
+    ),
+    // Issue #483: the WHOLE `[capabilities]` table, as one prefix entry
+    // rather than a leaf per key -- `value_at` matches a prefix, so a repo
+    // layer that sets anything at all under it is rejected by name. Unlike
+    // every table where only some keys are operator-only, there is no
+    // narrowing half here: each key names an MCP server command zirv then
+    // spawns, a remote endpoint it authenticates to, a credential reference,
+    // or a browser binary it launches. A checked-out repository adding one is
+    // pure widening, and "repo-owned config may only narrow" leaves nothing
+    // for it to legitimately say.
+    (&["capabilities"], "ZIRV_CTX_CAPABILITIES"),
+    // Issue #491: the WHOLE `[runtime]` table, as one prefix entry, same
+    // reasoning as `[capabilities]` right above -- this decides which
+    // provider account a session with no explicit `--runtime` spends, and a
+    // checked-out repository redirecting that is pure widening in either
+    // direction. `~/.zirv/ctx.toml`, `ZIRV_CTX_RUNTIME` and the `--runtime`
+    // flag remain the only ways to set it.
+    (&["runtime"], "ZIRV_CTX_RUNTIME"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -5347,6 +5792,24 @@ impl CtxConfig {
             validate_model_str("chat.model", model)?;
         }
 
+        // Issue #504: `chat.claude_permission_mode` reaches an interactive
+        // launch's own `--permission-mode` argv (`ClaudeAdapter::default_
+        // sandbox_args`) verbatim, so it is constrained to exactly the fixed
+        // set Claude Code's own CLI accepts, the same "loud rather than
+        // silent" style `validate_endpoint_target`'s `wire_api` check uses --
+        // an unrecognized value is a load-time error naming the key, never a
+        // value that reaches argv unexamined or silently falls back to
+        // `"default"`.
+        if let Some(mode) = cfg.chat.claude_permission_mode.as_deref()
+            && !matches!(mode, "default" | "acceptEdits" | "bypassPermissions")
+        {
+            return Err(format!(
+                "chat.claude_permission_mode must be \"default\", \"acceptEdits\" or \
+                 \"bypassPermissions\", got \"{mode}\""
+            )
+            .into());
+        }
+
         // `review.claude`/`review.codex` land in injected prompt text (see
         // `review_roster_line` in `adapters/mod.rs`, the harness-roster line
         // an Orchestrator session's own base prompt reads), not in argv
@@ -5810,45 +6273,7 @@ fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()>
         )
     })?;
 
-    if !target.base_url.starts_with("http://") && !target.base_url.starts_with("https://") {
-        return Err(format!(
-            "{key}: base_url must be an http(s) URL, got \"{}\"",
-            target.base_url
-        )
-        .into());
-    }
-
-    // Review finding: `CodexAdapter::base` renders `base_url` into a codex
-    // `-c model_providers.<vendor>.base_url=<toml_quoted_string(base_url)>`
-    // argv token. `toml_quoted_string` prefers a TOML literal string
-    // (`'...'`) but falls back to an escaped basic string (`"..."`) the
-    // moment `base_url` itself contains a `'` -- and that fallback's OWN
-    // raw `"` delimiters, plus any of `&`, `(`, `)`, `%`, `!`, `^` etc. that
-    // survive either quoting form unescaped, are exactly the characters
-    // `adapters::guard_cmd_shim_reparse` fails a Windows npm-shim launch
-    // closed on. Refusing them here, at load time, catches a hostile or
-    // merely careless `base_url` before it ever reaches that argv --
-    // reusing `CMD_REPARSE_METACHARS` rather than a second, possibly
-    // drifting copy of the same character list. Whitespace and `'` are
-    // refused too, even though neither is in that list on its own: a space
-    // would silently split into a second argv token, and `'` is what
-    // forces the unsafe quoting fallback in the first place. Applied to
-    // `endpoint.claude` as well for consistency, even though its base_url
-    // currently only ever reaches its child via an environment variable
-    // (`ClaudeAdapter::base`'s `ANTHROPIC_BASE_URL`), not argv -- one rule
-    // for both tables, so they can never quietly drift apart.
-    if let Some(bad) = target.base_url.chars().find(|c| {
-        c.is_whitespace()
-            || *c == '\''
-            || *c == '"'
-            || super::adapters::CMD_REPARSE_METACHARS.contains(c)
-    }) {
-        return Err(format!(
-            "{key}: base_url must not contain {bad:?} (it is passed to codex as a -c argv \
-             token)"
-        )
-        .into());
-    }
+    validate_endpoint_base_url(key, &target.base_url)?;
 
     if target.credential_env.is_empty()
         || target.credential_env.contains('=')
@@ -5898,6 +6323,28 @@ fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()>
         }
     }
 
+    Ok(())
+}
+
+/// Shared base-URL validation for harness overrides and native provider
+/// endpoints. The metacharacter rule lives in one place so the two config
+/// surfaces cannot drift.
+pub(crate) fn validate_endpoint_base_url(key: &str, base_url: &str) -> CtxResult<()> {
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(format!("{key}: base_url must be an http(s) URL, got \"{base_url}\"").into());
+    }
+    if let Some(bad) = base_url.chars().find(|c| {
+        c.is_whitespace()
+            || *c == '\''
+            || *c == '"'
+            || super::adapters::CMD_REPARSE_METACHARS.contains(c)
+    }) {
+        return Err(format!(
+            "{key}: base_url must not contain {bad:?} (it is passed to codex as a -c argv \
+             token)"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -9606,6 +10053,61 @@ mod tests {
         );
     }
 
+    /// Issue #491: the whole `[runtime]` table is operator-only, in BOTH
+    /// directions -- a checkout must not be able to move this operator's
+    /// unflagged sessions onto their metered native routes, and "run on the
+    /// harness instead" is not a safety property a checkout gets to assert
+    /// either, because the harness account is just as spendable. Both the
+    /// table-level `default` and a per-role entry are refused, by the
+    /// table's own name -- a whole-table entry matches on the prefix, so the
+    /// refusal says `runtime`, the same way `capabilities` does.
+    #[test]
+    fn repo_layer_cannot_set_runtime_default_or_roles() {
+        for (case, toml) in [
+            ("default", "[runtime]\ndefault = \"native\"\n"),
+            ("roles", "[runtime.roles]\nworker = \"native\"\n"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = match CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("a repo may not set runtime.{case}"),
+            };
+            assert!(err.contains("`runtime`"), "runtime.{case}: got {err}");
+            assert!(
+                err.contains("ZIRV_CTX_RUNTIME"),
+                "runtime.{case} names the operator escape hatch: {err}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: the operator's own layer still sets
+    /// it, which is the whole point of the key -- only the checkout is
+    /// refused.
+    #[test]
+    fn the_operator_may_set_a_native_runtime_default_from_home_config() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[runtime]\ndefault = \"native\"\n[runtime.roles]\nworker = \"harness\"\n",
+        )
+        .expect("write");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.runtime.default.as_deref(), Some("native"));
+        assert_eq!(
+            cfg.runtime.roles.get("worker").map(String::as_str),
+            Some("harness")
+        );
+    }
+
     /// Issue #268: `workflow.allow_empty_verify` is operator-only, same
     /// asymmetry as `auto_spawn_on_gate` above -- a repo checkout must not
     /// be able to declare its own missing/empty `verify.toml` a pass.
@@ -9954,6 +10456,85 @@ mod tests {
         let env = env_map(&[("ZIRV_CTX_CHAT_MODEL", "sonnet")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.chat.model.as_deref(), Some("sonnet"));
+    }
+
+    /// Issue #504: the operator's own `~/.zirv/ctx.toml` may set
+    /// `chat.claude_permission_mode` (unlike a repo layer -- see the
+    /// `REPO_FORBIDDEN` test right below), and an unrecognized value is a
+    /// load-time error rather than a value that reaches argv unexamined.
+    #[test]
+    fn chat_claude_permission_mode_parses_and_validates_the_fixed_set() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        // Separate from `home`: the operator and repo layers must not
+        // collapse onto the same file, or the REPO_FORBIDDEN check below
+        // would reject this operator-only value too.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+
+        for mode in ["default", "acceptEdits", "bypassPermissions"] {
+            std::fs::write(
+                home.path().join(".zirv/ctx.toml"),
+                format!("[chat]\nclaude_permission_mode = \"{mode}\"\n"),
+            )
+            .expect("write");
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+            assert_eq!(cfg.chat.claude_permission_mode.as_deref(), Some(mode));
+        }
+
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[chat]\nclaude_permission_mode = \"askForever\"\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("an unrecognized permission mode must fail to load");
+        assert!(
+            err.to_string().contains("chat.claude_permission_mode"),
+            "got {err}"
+        );
+    }
+
+    /// Issue #504: `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE` follows the same
+    /// env-override pattern as every other operator-only `[chat]`/`REPO_
+    /// FORBIDDEN` key (`ZIRV_CTX_CHAT_MODEL` right above).
+    #[test]
+    fn env_overrides_the_chat_claude_permission_mode() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE", "acceptEdits")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.chat.claude_permission_mode.as_deref(),
+            Some("acceptEdits")
+        );
+    }
+
+    /// Issue #504: unlike `chat.model` right above -- which a repo checkout
+    /// MAY set (see `a_repository_config_may_set_the_chat_model`'s own doc
+    /// comment) -- `chat.claude_permission_mode` widens what a session may
+    /// silently DO, so a repo layer setting it at all is a hard load error,
+    /// not merely a rejected value.
+    #[test]
+    fn a_repo_may_not_set_the_chat_claude_permission_mode() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[chat]\nclaude_permission_mode = \"bypassPermissions\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to set chat.claude_permission_mode");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "chat.claude_permission_mode must be rejected as REPO_FORBIDDEN: {err}"
+        );
     }
 
     /// SECURITY (FIX 1): `chat.model` is repo-settable and reaches an argv that
@@ -10761,6 +11342,7 @@ mod tests {
         ("context", "max_harness_roster_bytes"),
         ("context", "dedupe_native"),
         ("context", "lint_max_pairs"),
+        ("context", "instructions_max_bytes"),
         ("mail", "enabled"),
         ("mail", "max_message_bytes"),
         ("mail", "max_delivered_bytes"),
@@ -10920,6 +11502,7 @@ mod tests {
             agents: cfg.agents.clone(),
             chat: ChatConfig {
                 model: Some("fable".to_string()),
+                claude_permission_mode: None,
             },
             output: OutputConfig {
                 filter: super::super::output_filters::bundled_output_filter_rules(),
@@ -11596,5 +12179,89 @@ mod tests {
             err.to_string().contains("reactive_force_after_secs"),
             "{err}"
         );
+    }
+
+    /// Issue #352: with nothing configured, the persistent runtime is OFF and
+    /// terminal history is OFF. Pinned as a test rather than left to
+    /// `#[derive(Default)]` so turning either default around is a visible
+    /// change to an assertion about operator safety, not a one-character edit.
+    #[test]
+    fn the_persistent_runtime_and_its_history_are_both_off_by_default() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.session.persistent,
+            "the experimental runtime must be opt-in"
+        );
+        assert!(
+            !cfg.session.history,
+            "terminal history writes secrets to disk and must be opt-in"
+        );
+        assert_eq!(
+            cfg.session.scrollback_rows_or_default(),
+            SessionConfig::DEFAULT_SCROLLBACK_ROWS
+        );
+        assert_eq!(
+            cfg.session.stale_after_secs_or_default(),
+            SessionConfig::DEFAULT_STALE_AFTER_SECS
+        );
+    }
+
+    /// Issue #352: every `[session]` key is operator-only, one assertion per
+    /// key so a future edit that drops one entry from `REPO_FORBIDDEN` fails
+    /// here naming it. `persistent` and `history` are the two that matter
+    /// most -- a checkout must not be able to decide that sessions outlive
+    /// the operator's terminal, nor that rendered terminal output (tokens
+    /// included) is written to disk.
+    #[test]
+    fn every_session_key_is_operator_only() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        for (key, line) in [
+            ("persistent", "persistent = true"),
+            ("history", "history = true"),
+            ("scrollback_rows", "scrollback_rows = 100000"),
+            ("stale_after_secs", "stale_after_secs = 99999"),
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[session]\n{line}\n"),
+            )
+            .expect("write repo");
+            let err = CtxConfig::load(repo.path(), &|_| None)
+                .err()
+                .unwrap_or_else(|| panic!("a repo must not be able to set session.{key}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "session.{key} must be a REPO_FORBIDDEN rejection: {err}"
+            );
+            assert!(
+                err.to_string().contains(key),
+                "the refusal must name session.{key}: {err}"
+            );
+        }
+    }
+
+    /// The other direction of the same boundary: the operator's own
+    /// environment override does set it, so the gate is reachable at all.
+    #[test]
+    fn the_operator_environment_turns_the_persistent_runtime_on() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let env = env_map(&[
+            ("ZIRV_CTX_SESSION_PERSISTENT", "true"),
+            ("ZIRV_CTX_SESSION_HISTORY", "1"),
+            ("ZIRV_CTX_SESSION_SCROLLBACK_ROWS", "64"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.session.persistent);
+        assert!(cfg.session.history);
+        assert_eq!(cfg.session.scrollback_rows_or_default(), 64);
     }
 }

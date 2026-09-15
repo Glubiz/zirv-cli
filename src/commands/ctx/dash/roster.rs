@@ -109,6 +109,23 @@ pub struct RosterPane {
     /// hard parse failure and not a fabricated parent.
     #[serde(default)]
     pub parent_session: Option<String>,
+    /// Issue #490 (roadmap N21 item A): whether this pane was a NATIVE one.
+    /// A restore then reopens it through `dash::native_pane::
+    /// open_native_pane`, whose `resolve_attach` decides all over again
+    /// whether the persistent runtime already holds this seat -- so a
+    /// dashboard restarting while the runtime kept the conversation alive
+    /// re-ATTACHES to it rather than opening a second supervisor over it,
+    /// which is exactly what `link::RUNTIME_OWNS_IT` exists to prevent.
+    /// `#[serde(default)]` reads an older roster's entries as wrapped, which
+    /// is what they were.
+    #[serde(default)]
+    pub native: bool,
+    /// The seat generation this native pane answered for at quit time,
+    /// recorded so a restore that comes back on a DIFFERENT generation is
+    /// visible rather than silent. Meaningless (and zero) for a wrapped pane,
+    /// whose generation lives on the seat record alone.
+    #[serde(default)]
+    pub native_generation: u64,
 }
 
 /// A full dashboard's worth of panes, stamped with the time it was written
@@ -261,6 +278,8 @@ mod tests {
                     budget_tokens: None,
                     interactive: true,
                     parent_session: None,
+                    native: false,
+                    native_generation: 0,
                 },
                 RosterPane {
                     agent: "codex".to_string(),
@@ -275,6 +294,8 @@ mod tests {
                     budget_tokens: Some(200_000),
                     interactive: false,
                     parent_session: Some("orch0001".to_string()),
+                    native: false,
+                    native_generation: 0,
                 },
             ],
         }
@@ -564,5 +585,36 @@ mod tests {
                 .any(|a| a.contains("resuming after a dashboard restart")),
             "got {argv:?}"
         );
+    }
+
+    /// Issue #490 (roadmap N21 item A): the restore roster has to remember
+    /// WHICH KIND of pane an entry was, because the two come back by
+    /// different routes -- a wrapped pane by relaunching its argv, a native
+    /// one through `open_native_pane`, whose `resolve_attach` decides all
+    /// over again whether the persistent runtime already holds the seat.
+    #[test]
+    fn a_roster_records_the_pane_kind_and_an_older_roster_reads_as_wrapped() {
+        let mut roster = sample_roster();
+        roster.panes[1].native = true;
+        roster.panes[1].native_generation = 3;
+        let json = serde_json::to_string(&roster).expect("serialize");
+        let back: Roster = serde_json::from_str(&json).expect("deserialize");
+        assert!(!back.panes[0].native);
+        assert!(back.panes[1].native);
+        assert_eq!(back.panes[1].native_generation, 3);
+
+        // An entry written by a build from before this field existed has no
+        // way to say it was native, and every such pane WAS wrapped -- so
+        // absence reads as wrapped rather than failing to parse.
+        let older = serde_json::json!({
+            "agent": "claude",
+            "session_id": "11111111-2222-4333-8444-555555555555",
+            "role": "orchestrator",
+            "short": "aaaa1111",
+            "title": "orch",
+        });
+        let entry: RosterPane = serde_json::from_value(older).expect("older entry parses");
+        assert!(!entry.native);
+        assert_eq!(entry.native_generation, 0);
     }
 }

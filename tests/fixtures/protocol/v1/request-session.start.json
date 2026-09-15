@@ -1,0 +1,14 @@
+{
+  "id": "req-start",
+  "idempotency_key": "start-worker-1",
+  "method": "session.start",
+  "params": {
+    "agent": "native",
+    "cwd": "/work/repo",
+    "prompt": "summarise the failing test",
+    "role": "worker",
+    "runtime": "native",
+    "surface": "headless"
+  },
+  "v": 1
+}

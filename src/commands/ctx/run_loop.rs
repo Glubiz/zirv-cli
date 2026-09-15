@@ -1244,7 +1244,8 @@ fn evaluate_objective_after_cycle<W: Write>(
                 "{}\n\n---\nRecent transcript (tail):\n{transcript_tail}{JUDGE_OUTPUT_CONTRACT}",
                 objective::layer_text(&record),
             );
-            let answer = handoff::run_model(
+            let answer = handoff::helper_answer(
+                super::helper::ROLE_DISTILLER,
                 adapter,
                 &model,
                 &prompt,
@@ -3756,6 +3757,7 @@ mod tests {
                 mode: VerificationMode::Final,
                 source: "test".to_string(),
                 repo: repo.to_path_buf(),
+                branch: String::new(),
                 change_fingerprint: fingerprint,
                 changed_paths: Vec::new(),
                 fallback_to_full: false,

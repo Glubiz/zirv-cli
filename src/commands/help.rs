@@ -351,6 +351,29 @@ fn write_builtins<W: Write>(
         }],
         colour,
     )?;
+    // Issue #540: a separate, clearly labelled section at the bottom --
+    // never inside "Commands:" above -- so `native` is never listed beside
+    // a stable command without qualification. `zirv commands --json`
+    // reports the same command with `stability: "experimental"` and
+    // `runtime: "native"` (`command_schema.rs`); this is the human-readable
+    // side of that same fact.
+    writeln!(
+        writer,
+        "{}",
+        header(colour, "Experimental / work in progress:")
+    )?;
+    write_table(
+        writer,
+        &[Row {
+            name: "native",
+            desc: &[
+                "EXPERIMENTAL: thin alias for `zirv chat --runtime native` (the native",
+                "conversation pane, no coding harness installed, no PTY). Not part of the",
+                "stable command surface yet -- see `zirv native --help`.",
+            ],
+        }],
+        colour,
+    )?;
     Ok(())
 }
 
@@ -896,6 +919,44 @@ shortcuts:
             "an ordinary script must not be marked shadowed, got: {build_line}"
         );
 
+        Ok(())
+    }
+
+    /// Issue #540: `zirv native` must appear in `zirv help` only inside the
+    /// separately labelled "Experimental / work in progress" section, never
+    /// beside the stable built-ins in "Commands:" -- and the section itself
+    /// must exist and name the stable equivalent.
+    #[test]
+    fn help_lists_native_only_in_the_experimental_section() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let empty = tempdir()?;
+        let home = tempdir()?;
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(empty.path()));
+
+        let mut out = Cursor::new(Vec::new());
+        show_help(&mut out, false)?;
+        let text = String::from_utf8(out.into_inner())?;
+
+        let marker = "Experimental / work in progress:";
+        assert!(text.contains(marker), "got {text}");
+        let (before, after) = text.split_once(marker).expect("marker present");
+
+        // The commands table (everything before the experimental section)
+        // must never mention `native` at all -- not even inside another
+        // row's description -- so it can never look like an ordinary,
+        // qualification-free built-in.
+        assert!(
+            !before.contains("native"),
+            "the stable Commands: section must not mention native: {before}"
+        );
+        assert!(
+            after.contains("native") && after.contains("EXPERIMENTAL"),
+            "the experimental section must list native with its warning: {after}"
+        );
+        assert!(
+            after.contains("zirv chat --runtime native"),
+            "the experimental section must name the stable equivalent: {after}"
+        );
         Ok(())
     }
 

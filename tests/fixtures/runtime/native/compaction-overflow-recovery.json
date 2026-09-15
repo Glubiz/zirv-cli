@@ -1,0 +1,72 @@
+{
+  "shape": "anthropic",
+  "model": "fixture-anthropic-model",
+  "turns": [
+    {
+      "message_id": "msg_1",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_1",
+          "name": "file_read",
+          "input": { "path": "src/lib.rs" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 100, "output_tokens": 20 }
+    },
+    {
+      "message_id": "msg_2",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_2",
+          "name": "text_search",
+          "input": { "query": "broken" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 140, "output_tokens": 20 }
+    },
+    {
+      "message_id": "msg_3",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_3",
+          "name": "apply_patch",
+          "input": { "path": "src/lib.rs", "patch": "@@\n-old\n+new\n" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 180, "output_tokens": 20 }
+    },
+    {
+      "message_id": "msg_overflow",
+      "blocks": [],
+      "finish_reason": "end_turn",
+      "failure": {
+        "class": "context_overflow",
+        "message": "prompt is too long for this model's context window",
+        "retryable": false
+      }
+    },
+    {
+      "message_id": "msg_distill",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Read the entry point, searched for the broken symbol and applied one patch. Verification is still outstanding."
+        }
+      ],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 90, "output_tokens": 40 }
+    },
+    {
+      "message_id": "msg_done",
+      "blocks": [{ "type": "text", "text": "The patch is in place." }],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 120, "output_tokens": 25 }
+    }
+  ]
+}

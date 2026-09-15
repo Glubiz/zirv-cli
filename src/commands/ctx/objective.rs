@@ -258,6 +258,19 @@ pub fn run_set<W: Write>(
         evidence: Vec::new(),
     };
     store(state, &key, &record)?;
+    // Issue #485 (roadmap N16) item 7: setting an objective IS the operator
+    // steering. The coordinator's own durable record picks the new target up
+    // as a constraint the native coordinator reads (`objective_status`,
+    // `team_status`), and a previously stopped coordinator starts dispatching
+    // again -- a new objective is exactly the instruction to continue.
+    if let Err(error) = super::coordinator::update(state, repo, |graph| {
+        graph.objective = Some(args.objective.clone());
+        graph.steer(&args.objective, now);
+        graph.cancelled = false;
+        graph.decide("operator set the objective", now);
+    }) {
+        log_coordinator_store_error(state, &key, &*error, now);
+    }
     writeln!(
         w,
         "zirv ctx objective: set for {} (budget: {}, deadline: {})",
@@ -313,13 +326,58 @@ pub fn record_completion(state: &StateDir, repo: &Path, evidence: Vec<String>) -
     if record.status == Status::Closed {
         return Ok(true);
     }
-    if !crate::commands::workflow::verification::latest_is_fresh_and_passing(state, repo, true)? {
+    if !crate::commands::workflow::verification::latest_is_fresh_and_passing(
+        state, repo, true, None,
+    )? {
         return Ok(false);
     }
     record.status = Status::Closed;
     record.evidence = evidence;
     store(state, &key, &record)?;
+    // Issue #485 item 7: a closed objective admits no further delegations.
+    // Work already dispatched keeps its node -- its worker may still be
+    // running and its receipt still has to be consumed -- while anything only
+    // planned is stopped. Setting a new objective lifts this.
+    let now = super::state::now_secs();
+    if let Err(error) = super::coordinator::update(state, repo, |graph| {
+        graph.cancel(now);
+        graph.decide(
+            "the objective was closed; no further work is dispatched",
+            now,
+        );
+    }) {
+        log_coordinator_store_error(state, &key, &*error, now);
+    }
     Ok(true)
+}
+
+/// Review finding on issue #485: `run_set` and `record_completion` above
+/// both fold operator intent into the coordinator's durable graph as a
+/// best-effort side effect of the authoritative objective write, which must
+/// never fail or roll back because the graph could not be stored. A store
+/// failure must not vanish silently either, so it gets one decision-log
+/// line -- the same idiom `delegation::log_boundary`/`compile::
+/// log_truncation_decisions` use for their own best-effort writes.
+fn log_coordinator_store_error(
+    state: &StateDir,
+    key: &str,
+    error: &dyn std::error::Error,
+    now: u64,
+) {
+    let detail = format!("objective {key}: {error}");
+    let _ = super::log::append(
+        state,
+        &super::log::Decision {
+            ts: now,
+            session: "",
+            verb: "objective",
+            verdict: "error",
+            score: 0,
+            action: "coordinator-store-failed",
+            detail: &detail,
+            observed_at: None,
+        },
+    );
 }
 
 pub fn run_close<W: Write>(state: &StateDir, w: &mut W, repo: &Path) -> CtxResult<i32> {
@@ -714,6 +772,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "test".to_string(),
             repo: repo.to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: Vec::new(),
             fallback_to_full: false,

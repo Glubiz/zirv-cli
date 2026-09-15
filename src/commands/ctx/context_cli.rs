@@ -130,6 +130,13 @@ fn native_codex_path(repo: &Path) -> PathBuf {
     repo.join("AGENTS.md")
 }
 
+/// `<repo>/ZIRV.md` -- zirv's own native instruction file (issue #538). Same
+/// fixed root path `optimize::collect_surfaces` reads for `Layer::
+/// RepoZirvMd`'s root candidate.
+fn zirv_md_path(repo: &Path) -> PathBuf {
+    repo.join("ZIRV.md")
+}
+
 /// The prefix of a generated file's canonical-content provenance line. Sits
 /// on the line immediately after [`MANAGED_MARKER`], so it is inside the
 /// managed prefix [`is_managed`] recognises and a zirv old enough not to know
@@ -369,6 +376,7 @@ fn run_report<W: Write>(w: &mut W, repo: &Path) -> CtxResult<i32> {
     }
 
     writeln!(w, "\nnative compatibility files:")?;
+    let mut agents_present = false;
     for (label, path) in [
         ("CLAUDE.md", native_claude_path(repo)),
         ("AGENTS.md", native_codex_path(repo)),
@@ -378,7 +386,36 @@ fn run_report<W: Write>(w: &mut W, repo: &Path) -> CtxResult<i32> {
             Ok(_) => "present, hand-maintained (not zirv-managed)".to_string(),
             Err(_) => "missing".to_string(),
         };
+        if label == "AGENTS.md" {
+            agents_present = status.starts_with("present");
+        }
         writeln!(w, "  {label}: {status} ({})", path.display())?;
+    }
+    let zirv_md_present = zirv_md_path(repo).is_file();
+    let claude_md_present = native_claude_path(repo).is_file();
+    writeln!(
+        w,
+        "  ZIRV.md: {}",
+        if zirv_md_present {
+            "present"
+        } else {
+            "missing"
+        }
+    )?;
+
+    // Issue #538 (chunk C), decision 4: a repo with only AGENTS.md (no
+    // ZIRV.md, no CLAUDE.md) gets a one-line compatibility-link plan --
+    // AGENTS.md is already a first-class portable source (chunk A), so the
+    // suggestion is a lone import stanza, never a full duplicate copy.
+    if agents_present && !zirv_md_present && !claude_md_present {
+        writeln!(
+            w,
+            "\ncompatibility-link plan: this repo has AGENTS.md but no ZIRV.md. Rather than \
+             duplicating it, create ZIRV.md with this single line (the Claude Code `@file` \
+             import syntax, followed by chunk A's dedup rule):\n\n    @AGENTS.md\n\n\
+             Run `zirv context sync --init-zirv-md` for an idempotent, non-destructive starting \
+             point instead, if you would rather begin from AGENTS.md's own content."
+        )?;
     }
 
     let home = crate::utils::home_dir().ok();
@@ -540,6 +577,137 @@ fn run_import<W: Write>(w: &mut W, repo: &Path, force: bool) -> CtxResult<i32> {
     }
 
     Ok(if any_refused { 1 } else { 0 })
+}
+
+/// What [`build_zirv_md_plan`] would write to `<repo>/ZIRV.md`, plus every
+/// candidate source it deliberately left out and why -- printed under
+/// `--init-zirv-md` (and its `--report`-adjacent compatibility-link plan)
+/// so a skip is visible, never silent.
+struct ZirvMdPlan {
+    content: String,
+    skipped: Vec<String>,
+}
+
+/// Issue #538 (chunk C), decision 4: selects existing sources for a fresh
+/// `ZIRV.md` -- the canonical `.zirv/context/common.md` layer, plus any root
+/// `AGENTS.md`/`CLAUDE.md` content that is not already zirv-managed
+/// (`is_managed`, so `--generate`'s own output is never round-tripped back
+/// in as if it were hand-authored). Never reads a `.local`/private-scoped
+/// surface at all -- only these three fixed, committed, shared paths are
+/// ever consulted, so that exclusion holds by construction, not by a
+/// runtime filter. Each candidate is screened with `safety::text_names_
+/// credential_material` (the one existing content screen this codebase has
+/// for credential-shaped material; no new scanner is invented here) and
+/// skipped, not silently dropped, when it trips it.
+fn build_zirv_md_plan(repo: &Path) -> ZirvMdPlan {
+    let mut skipped = Vec::new();
+    let mut sections = Vec::new();
+
+    let canonical_path = context::common_path(repo);
+    if let Ok(text) = fs::read_to_string(&canonical_path) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            if super::safety::text_names_credential_material(trimmed) {
+                skipped.push(format!(
+                    "{} (looks secret-shaped; review and add it by hand)",
+                    canonical_path.display()
+                ));
+            } else {
+                sections.push(trimmed.to_string());
+            }
+        }
+    }
+
+    for (label, path) in [
+        ("AGENTS.md", native_codex_path(repo)),
+        ("CLAUDE.md", native_claude_path(repo)),
+    ] {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if is_managed(&text) {
+            skipped.push(format!(
+                "{} (zirv-managed -- already sourced from .zirv/context/, not a second time)",
+                path.display()
+            ));
+            continue;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if super::safety::text_names_credential_material(trimmed) {
+            skipped.push(format!(
+                "{} (looks secret-shaped; review and add it by hand)",
+                path.display()
+            ));
+            continue;
+        }
+        sections.push(format!("<!-- migrated from {label} -->\n{trimmed}"));
+    }
+
+    let mut content = String::new();
+    content.push_str(
+        "<!-- generated once by `zirv context sync --init-zirv-md`; this file is yours to \
+         edit -- rerunning the command never overwrites a hand edit without --force -->\n\n",
+    );
+    if sections.is_empty() {
+        content.push_str(
+            "<!-- no existing common.md/AGENTS.md/CLAUDE.md content was found to start from; \
+             add your project's working instructions here -->\n",
+        );
+    } else {
+        content.push_str(&sections.join("\n\n"));
+        content.push('\n');
+    }
+
+    ZirvMdPlan { content, skipped }
+}
+
+/// Issue #538 (chunk C), decision 4: `zirv context sync --init-zirv-md`.
+/// Idempotent and non-destructive by reusing `generate_one` exactly as
+/// `--generate` does: a fresh write, an already-matching file (a repeat run
+/// with nothing changed) is `Unchanged`, and an existing file that differs
+/// is `Refused` unless `--force` is given -- `ZIRV.md` deliberately carries
+/// no `MANAGED_MARKER`, so once an operator hand-edits it, this command can
+/// never silently regenerate over that edit.
+fn run_init_zirv_md<W: Write>(w: &mut W, repo: &Path, force: bool) -> CtxResult<i32> {
+    writeln!(w, "zirv context sync --init-zirv-md")?;
+
+    let plan = build_zirv_md_plan(repo);
+    let target = zirv_md_path(repo);
+    let refused = match generate_one(&target, &plan.content, force)? {
+        GenerateOutcome::Refused => {
+            writeln!(
+                w,
+                "  refused -- {} already exists with different content; re-run \
+                 `--init-zirv-md --force` to replace it",
+                target.display()
+            )?;
+            true
+        }
+        GenerateOutcome::Unchanged => {
+            writeln!(
+                w,
+                "  unchanged -- {} already matches the current sources",
+                target.display()
+            )?;
+            false
+        }
+        GenerateOutcome::Written { created: true } => {
+            writeln!(w, "  created {}", target.display())?;
+            false
+        }
+        GenerateOutcome::Written { created: false } => {
+            writeln!(w, "  regenerated {}", target.display())?;
+            false
+        }
+    };
+    for skip in &plan.skipped {
+        writeln!(w, "  not included: {skip}")?;
+    }
+
+    Ok(if refused { 1 } else { 0 })
 }
 
 /// `--budget <profile>` for `zirv context lint`: which target CTX001 checks
@@ -834,7 +1002,7 @@ pub fn run_lint<W: Write>(args: &LintArgs, w: &mut W) -> CtxResult<i32> {
 }
 
 #[derive(Debug, clap::Args)]
-#[command(group(clap::ArgGroup::new("sync_mode").args(["report", "import", "generate"]).multiple(false)))]
+#[command(group(clap::ArgGroup::new("sync_mode").args(["report", "import", "generate", "init_zirv_md"]).multiple(false)))]
 pub struct SyncArgs {
     /// Report differences between canonical context and native files. The
     /// default when no mode flag is given. Never writes anything.
@@ -848,9 +1016,18 @@ pub struct SyncArgs {
     /// `.zirv/context/` content.
     #[arg(long)]
     pub generate: bool,
+    /// Issue #538 (chunk C): idempotently writes `<repo>/ZIRV.md` from
+    /// selected existing sources -- the canonical `.zirv/context/common.md`
+    /// layer plus any root `AGENTS.md`/`CLAUDE.md` content that is not
+    /// already zirv-managed. Never overwrites an existing `ZIRV.md` without
+    /// `--force`; never copies secret-shaped content.
+    #[arg(long)]
+    pub init_zirv_md: bool,
     /// Explicitly overwrite: with `--import`, replace canonical content that
-    /// already differs; with `--generate`, replace a native file that is not
-    /// zirv-managed. Has no effect with the default report mode.
+    /// already differs; with `--generate`/`--init-zirv-md`, replace a native
+    /// file that is not zirv-managed (or, for `--init-zirv-md`, that already
+    /// holds different hand-authored content). Has no effect with the
+    /// default report mode.
     #[arg(long)]
     pub force: bool,
 }
@@ -859,6 +1036,7 @@ enum SyncMode {
     Report,
     Import,
     Generate,
+    InitZirvMd,
 }
 
 fn mode(args: &SyncArgs) -> SyncMode {
@@ -866,6 +1044,8 @@ fn mode(args: &SyncArgs) -> SyncMode {
         SyncMode::Import
     } else if args.generate {
         SyncMode::Generate
+    } else if args.init_zirv_md {
+        SyncMode::InitZirvMd
     } else {
         SyncMode::Report
     }
@@ -876,6 +1056,7 @@ pub fn run_with<W: Write>(args: &SyncArgs, w: &mut W, repo: &Path) -> CtxResult<
         SyncMode::Report => run_report(w, repo),
         SyncMode::Import => run_import(w, repo, args.force),
         SyncMode::Generate => run_generate(w, repo, args.force),
+        SyncMode::InitZirvMd => run_init_zirv_md(w, repo, args.force),
     }
 }
 
@@ -998,6 +1179,7 @@ mod tests {
             report: true,
             import: false,
             generate: false,
+            init_zirv_md: false,
             force: false,
         }
     }
@@ -1006,6 +1188,7 @@ mod tests {
             report: false,
             import: true,
             generate: false,
+            init_zirv_md: false,
             force,
         }
     }
@@ -1014,6 +1197,16 @@ mod tests {
             report: false,
             import: false,
             generate: true,
+            init_zirv_md: false,
+            force,
+        }
+    }
+    fn init_zirv_md_args(force: bool) -> SyncArgs {
+        SyncArgs {
+            report: false,
+            import: false,
+            generate: false,
+            init_zirv_md: true,
             force,
         }
     }
@@ -1249,12 +1442,114 @@ mod tests {
                 report: false,
                 import: false,
                 generate: false,
+                init_zirv_md: false,
                 force: false,
             },
             dir.path(),
         );
         assert_eq!(code, 0);
         assert!(out.contains("read-only"));
+    }
+
+    // -- issue #538 (chunk C), decision 4: `zirv context sync --init-zirv-md`
+
+    #[test]
+    fn init_zirv_md_is_idempotent_and_never_overwrites() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "Always run the full test suite.");
+        let target = zirv_md_path(dir.path());
+
+        // First run: created.
+        let (code, out) = run_sync(&init_zirv_md_args(false), dir.path());
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("created"), "{out}");
+        let first_content = fs::read_to_string(&target).expect("read ZIRV.md");
+        assert!(first_content.contains("Always run the full test suite."));
+
+        // Second run, nothing changed: idempotent no-op, not an error.
+        let (code, out) = run_sync(&init_zirv_md_args(false), dir.path());
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("unchanged"), "{out}");
+        assert_eq!(
+            fs::read_to_string(&target).expect("read ZIRV.md"),
+            first_content,
+            "a repeat run with nothing changed must not rewrite the file"
+        );
+
+        // A hand edit is never overwritten without --force.
+        let hand_edited = "# my own notes\n\nDo not touch this.\n";
+        fs::write(&target, hand_edited).expect("hand edit");
+        let (code, out) = run_sync(&init_zirv_md_args(false), dir.path());
+        assert_eq!(code, 1, "a refusal must be a non-zero exit: {out}");
+        assert!(out.contains("refused"), "{out}");
+        assert_eq!(
+            fs::read_to_string(&target).expect("read ZIRV.md"),
+            hand_edited,
+            "a hand-edited ZIRV.md must never be silently overwritten"
+        );
+
+        // --force lifts the refusal, same as --generate's own contract.
+        let (code, out) = run_sync(&init_zirv_md_args(true), dir.path());
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("regenerated"), "{out}");
+    }
+
+    #[test]
+    fn init_zirv_md_refuses_to_copy_private_or_secret_shaped_content() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "Always run the full test suite.");
+        // A root AGENTS.md that names credential material -- the one
+        // existing screen (`safety::text_names_credential_material`) must
+        // keep it out of the generated ZIRV.md.
+        fs::write(
+            native_codex_path(dir.path()),
+            "See ~/.aws/credentials for the deploy key.\n",
+        )
+        .expect("write AGENTS.md");
+
+        let (code, out) = run_sync(&init_zirv_md_args(false), dir.path());
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains("not included") && out.contains("secret-shaped"),
+            "the skip must be reported, not silent: {out}"
+        );
+
+        let content = fs::read_to_string(zirv_md_path(dir.path())).expect("read ZIRV.md");
+        assert!(
+            !content.contains(".aws/credentials"),
+            "secret-shaped content must never reach ZIRV.md: {content}"
+        );
+        assert!(
+            content.contains("Always run the full test suite."),
+            "the non-secret canonical content must still be included: {content}"
+        );
+    }
+
+    #[test]
+    fn the_report_names_a_compatibility_import_plan() {
+        let (dir, _guard) = repo();
+        fs::write(
+            native_codex_path(dir.path()),
+            "- always run the full test suite\n",
+        )
+        .expect("write AGENTS.md");
+
+        let (code, out) = run_sync(&report_args(), dir.path());
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains("compatibility-link plan"),
+            "a repo with only AGENTS.md must get the import-stanza suggestion: {out}"
+        );
+        assert!(out.contains("@AGENTS.md"), "{out}");
+
+        // Once a ZIRV.md exists, the same repo no longer gets the plan --
+        // there is nothing left to suggest linking.
+        fs::write(zirv_md_path(dir.path()), "- a real rule\n").expect("write ZIRV.md");
+        let (_, out) = run_sync(&report_args(), dir.path());
+        assert!(
+            !out.contains("compatibility-link plan"),
+            "a repo that already has ZIRV.md must not be told to create one: {out}"
+        );
     }
 
     // -- unmanaged native file causes refusal, not overwrite ---------------

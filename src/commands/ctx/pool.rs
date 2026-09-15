@@ -49,6 +49,34 @@ pub struct HarnessRow {
     pub queued: u32,
     pub reserved_tokens: u64,
     pub resets_at: Option<u64>,
+    /// Issue #487 (items 2 and 7): the runtime this route runs on, and the
+    /// billing pool it actually spends from. Two rows sharing a pool share
+    /// one balance; two rows at one provider with different pools do not.
+    pub runtime: String,
+    pub pool: String,
+    /// Every capacity dimension this route can run out of, tightest first,
+    /// each labelled `measured` or `estimated` with the reason. Omitted from
+    /// `--json` when it would only restate `headroom_pct`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<DimensionRow>,
+    /// Which of them actually binds. Always one of `dimensions`, so a row can
+    /// never name a binding dimension it does not also list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_dimension: Option<String>,
+}
+
+/// One capacity dimension in a [`HarnessRow`]. The provenance is the point:
+/// an operator has to be able to tell a number the provider stated from one
+/// zirv assumed on its behalf, and a placement that lost to an estimate is a
+/// different fact from one that lost to a measurement.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DimensionRow {
+    pub dimension: String,
+    pub headroom_pct: f64,
+    /// `"measured"` or `"estimated"`.
+    pub provenance: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One provider's row: the reservation ledger's own view
@@ -72,6 +100,20 @@ pub struct SeatView {
     pub model: Option<String>,
     pub generation: u64,
     pub pinned: bool,
+    /// Issue #488: which BACKEND is answering at this seat right now --
+    /// `harness` or `native`. The seat's own identity (`short`, `generation`)
+    /// is what a rollover preserves; this is what it changes.
+    pub runtime: String,
+    /// The harness or route this seat was rolled OFF and still wants back,
+    /// with its runtime and whether a conversation reference was retained for
+    /// a verified return. `None` for a seat that was never displaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub displaced: Option<String>,
+    /// The last rollover's own record (`rollover_runtime::Record`): trigger,
+    /// direction, decision, outcome, and any reconciliation the successor is
+    /// halted on. `None` when this seat has never rolled over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollover: Option<String>,
     /// `"idle"` / `"prepared"` / `"parked"` -- `seat::Phase`'s own three
     /// variants, lower-cased.
     pub phase: String,
@@ -106,6 +148,23 @@ pub struct PoolView {
     /// stopped trusting a route.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub health: Vec<RouteHealthRow>,
+    /// Issue #487 (criterion 1): every billing pool more than one route
+    /// draws on, and every endpoint more than one route depends on. Empty
+    /// -- and omitted from `--json` -- when no two routes share anything,
+    /// which is the ordinary single-harness-per-vendor case. A row here is
+    /// the operator's warning that those routes are ONE balance, or that one
+    /// outage takes all of them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<SharedRow>,
+}
+
+/// One shared dependency in a [`PoolView`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SharedRow {
+    /// `"billing-pool"` or `"endpoint"`.
+    pub kind: &'static str,
+    pub id: String,
+    pub routes: Vec<String>,
 }
 
 /// One unhealthy route in a [`PoolView`].
@@ -177,12 +236,22 @@ fn cause_label(cause: &seat::Cause) -> String {
     }
 }
 
-fn seat_view_for(record: &seat::Seat) -> SeatView {
+fn seat_view_for(state: &StateDir, record: &seat::Seat) -> SeatView {
     let (phase, successor, parked_until) = match &record.phase {
         seat::Phase::Idle => ("idle".to_string(), None, None),
         seat::Phase::Prepared {
-            successor_agent, ..
-        } => ("prepared".to_string(), Some(successor_agent.clone()), None),
+            successor_agent,
+            successor_runtime,
+            ..
+        } => (
+            "prepared".to_string(),
+            // Issue #488: the successor is named with its BACKEND, because a
+            // swap onto the same adapter name on a different runtime is a
+            // different successor and an operator reading `status` mid-swap
+            // has to be able to see which.
+            Some(format!("{successor_agent} [{successor_runtime}]")),
+            None,
+        ),
         seat::Phase::Parked { until, .. } => ("parked".to_string(), None, Some(*until)),
     };
     let rollover_pending = record.pending.as_ref().map(|p| cause_label(&p.cause));
@@ -193,6 +262,24 @@ fn seat_view_for(record: &seat::Seat) -> SeatView {
         model: record.model.clone(),
         generation: record.generation,
         pinned: record.pinned,
+        // Issue #488 criterion 6: the seat's identity (short, generation) is
+        // unchanged by a rollover; what a reader needs is WHICH backend is
+        // answering at it now and why it moved.
+        runtime: record.runtime.as_str().to_string(),
+        displaced: record.displaced.as_ref().map(|displaced| {
+            format!(
+                "{} [{}]{}",
+                displaced.agent,
+                displaced.runtime,
+                if displaced.conversation.is_some() {
+                    ", conversation retained"
+                } else {
+                    ", no conversation reference"
+                }
+            )
+        }),
+        rollover: super::rollover_runtime::load(state, &record.short)
+            .map(|ledger| ledger.status_line()),
         phase,
         rollover_pending,
         successor,
@@ -206,6 +293,45 @@ fn seat_view_for(record: &seat::Seat) -> SeatView {
 /// (`allocator::place`'s own doc comment: "explain every candidate it
 /// considered, eligible losers included"). `None` when there is no harness
 /// to plan against at all (no seat, no configured fallback order).
+/// Issue #487 (criterion 1): the shared dependencies in one snapshot --
+/// every billing pool and every endpoint that more than one route depends
+/// on, each listing the routes involved.
+///
+/// Pure over the snapshot, and empty whenever nothing is shared, so the
+/// ordinary one-harness-per-vendor picture gains no rows at all. A pool row
+/// is the operator's warning that two routes are ONE balance (ranking them
+/// as two would invent capacity); an endpoint row is the warning that one
+/// outage takes all of them.
+fn shared_rows(snapshot: &allocator::CapacitySnapshot) -> Vec<SharedRow> {
+    let mut rows: Vec<SharedRow> = Vec::new();
+    let mut push = |kind: &'static str, id: String, routes: Vec<String>| {
+        if routes.len() > 1 && !rows.iter().any(|row| row.kind == kind && row.id == id) {
+            rows.push(SharedRow { kind, id, routes });
+        }
+    };
+    for route in &snapshot.harnesses {
+        push(
+            "billing-pool",
+            route.identity.pool.clone(),
+            snapshot
+                .pool_siblings(route)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect(),
+        );
+        push(
+            "endpoint",
+            route.identity.endpoint.clone(),
+            snapshot
+                .endpoint_siblings(route)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect(),
+        );
+    }
+    rows
+}
+
 fn build_exclusions(
     snapshot: &allocator::CapacitySnapshot,
     cfg: &CtxConfig,
@@ -215,6 +341,7 @@ fn build_exclusions(
         return Vec::new();
     };
     let unit = allocator::WorkUnit {
+        demand: super::route::Demand::default(),
         id: "pool".to_string(),
         requested: requested.to_string(),
         bounds: allocator::TaskBounds {
@@ -331,6 +458,23 @@ pub fn build(
                 queued,
                 reserved_tokens,
                 resets_at: binding.map(|w| w.resets_at),
+                runtime: harness.identity.runtime.as_str().to_string(),
+                pool: harness.identity.pool.clone(),
+                binding_dimension: allocator::route_binding(harness, provider_capacity, now, cfg)
+                    .map(|headroom| headroom.dimension.as_str().to_string()),
+                dimensions: allocator::route_dimensions(harness, provider_capacity, now, cfg)
+                    .into_iter()
+                    .map(|headroom| DimensionRow {
+                        dimension: headroom.dimension.as_str().to_string(),
+                        headroom_pct: headroom.pct,
+                        provenance: if headroom.is_measured() {
+                            "measured".to_string()
+                        } else {
+                            "estimated".to_string()
+                        },
+                        reason: headroom.provenance.reason().map(str::to_string),
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -340,11 +484,14 @@ pub fn build(
     PoolView {
         taken_at: now,
         degraded: snapshot.degraded,
-        seat: seat_record.as_ref().map(seat_view_for),
+        seat: seat_record
+            .as_ref()
+            .map(|record| seat_view_for(state, record)),
         harnesses,
         providers,
         exclusions,
         health: health_rows(state, cfg, now),
+        shared: shared_rows(&snapshot),
     }
 }
 
@@ -491,10 +638,11 @@ fn format_seat_line(seat: &SeatView, colour: bool) -> String {
     let model = seat.model.as_deref().unwrap_or("--");
     let pin = if seat.pinned { " pinned" } else { "" };
     let mut line = format!(
-        "  {} {} {} gen {}{pin} phase {}",
+        "  {} {} {} [{}] gen {}{pin} phase {}",
         label(colour, "seat:"),
         seat.agent,
         model,
+        seat.runtime,
         seat.generation,
         seat.phase,
     );
@@ -531,6 +679,14 @@ fn render_full(view: &PoolView, colour: bool) -> String {
         }
         if let Some(until) = seat.parked_until {
             lines.push(format!("  parked until unix {until}"));
+        }
+        // Issue #488 criterion 6: the same logical seat, the new backend, and
+        // the reason -- one line an operator can read after the fact.
+        if let Some(displaced) = &seat.displaced {
+            lines.push(format!("  displaced from: {displaced}"));
+        }
+        if let Some(rollover) = &seat.rollover {
+            lines.push(format!("  rollover: {rollover}"));
         }
     }
     for provider in &view.providers {
@@ -669,6 +825,10 @@ mod tests {
 
     fn sample_row(name: &str, provider: &str, state: &str, headroom: Option<f64>) -> HarnessRow {
         HarnessRow {
+            runtime: "harness".to_string(),
+            pool: provider.to_string(),
+            dimensions: Vec::new(),
+            binding_dimension: None,
             name: name.to_string(),
             provider: provider.to_string(),
             state: state.to_string(),
@@ -697,6 +857,9 @@ mod tests {
                 model: Some("opus".to_string()),
                 generation: 3,
                 pinned: false,
+                runtime: "harness".to_string(),
+                displaced: None,
+                rollover: None,
                 phase: "idle".to_string(),
                 rollover_pending: None,
                 successor: None,
@@ -714,6 +877,7 @@ mod tests {
             }],
             exclusions: vec![("gemini".to_string(), "disabled".to_string())],
             health: Vec::new(),
+            shared: Vec::new(),
         }
     }
 
@@ -758,6 +922,9 @@ mod tests {
             model: None,
             generation: 4,
             pinned: true,
+            runtime: "harness".to_string(),
+            displaced: None,
+            rollover: None,
             phase: "parked".to_string(),
             rollover_pending: None,
             successor: None,
@@ -778,9 +945,15 @@ mod tests {
             model: Some("opus".to_string()),
             generation: 3,
             pinned: false,
+            runtime: "native".to_string(),
+            displaced: Some("claude [harness], conversation retained".to_string()),
+            rollover: Some(
+                "seat abcd1234 (generation 3): usage-exhaustion via harness->native -> in flight"
+                    .to_string(),
+            ),
             phase: "prepared".to_string(),
             rollover_pending: Some("proactive (4.0% headroom)".to_string()),
-            successor: Some("codex".to_string()),
+            successor: Some("codex [harness]".to_string()),
             parked_until: None,
         });
         let text = render_text(&view, false, false);
@@ -790,7 +963,19 @@ mod tests {
             ),
             "got {text}"
         );
-        assert!(text.contains("successor: codex"), "got {text}");
+        assert!(text.contains("successor: codex [harness]"), "got {text}");
+        // Issue #488 criterion 6: the same logical seat (short, generation),
+        // the backend now answering at it, where it came from, and why.
+        assert!(
+            text.contains("seat: claude opus [native] gen 3"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("displaced from: claude [harness], conversation retained"),
+            "got {text}"
+        );
+        assert!(text.contains("rollover: seat abcd1234"), "got {text}");
+        assert!(text.contains("harness->native"), "got {text}");
     }
 
     #[test]
@@ -804,6 +989,9 @@ mod tests {
                 model: None,
                 generation: 1,
                 pinned: false,
+                runtime: "harness".to_string(),
+                displaced: None,
+                rollover: None,
                 phase: "idle".to_string(),
                 rollover_pending: None,
                 successor: None,
@@ -813,6 +1001,7 @@ mod tests {
             providers: Vec::new(),
             exclusions: Vec::new(),
             health: Vec::new(),
+            shared: Vec::new(),
         };
         let text = render_text(&view, true, false);
         assert_eq!(text, "pool: seat claude gen 1");

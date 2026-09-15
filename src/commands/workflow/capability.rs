@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::policy::{Capability as PolicyCapability, EffectivePolicy, Stance};
 
+/// The adapter name a NATIVE seat host reports under (issue #484, roadmap
+/// N15). Not a vendor CLI: it names zirv's own runtime, so a report built for
+/// it describes what the execution broker and the native tool registry
+/// provide.
+pub const NATIVE_ADAPTER: &str = "native";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CapabilityId {
     #[serde(rename = "shell.exec")]
@@ -110,10 +116,155 @@ pub struct CapabilityStatus {
     pub reason: String,
 }
 
+/// One concrete integration a native session can be equipped with (issue
+/// #483, roadmap N14). Distinct from [`CapabilityId`] on purpose:
+/// a `CapabilityId` is a logical permission a skill asks for, while an
+/// `IntegrationId` is a real backend that either exists on this machine or
+/// does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum IntegrationId {
+    #[serde(rename = "mcp")]
+    Mcp,
+    #[serde(rename = "web.search")]
+    WebSearch,
+    #[serde(rename = "web.fetch")]
+    WebFetch,
+    #[serde(rename = "browser")]
+    Browser,
+    #[serde(rename = "diagnostics")]
+    Diagnostics,
+    #[serde(rename = "artifact.render")]
+    ArtifactRender,
+    #[serde(rename = "frontend.render")]
+    FrontendRender,
+}
+
+impl IntegrationId {
+    pub const ALL: [Self; 7] = [
+        Self::Mcp,
+        Self::WebSearch,
+        Self::WebFetch,
+        Self::Browser,
+        Self::Diagnostics,
+        Self::ArtifactRender,
+        Self::FrontendRender,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::WebSearch => "web.search",
+            Self::WebFetch => "web.fetch",
+            Self::Browser => "browser",
+            Self::Diagnostics => "diagnostics",
+            Self::ArtifactRender => "artifact.render",
+            Self::FrontendRender => "frontend.render",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|integration| integration.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for IntegrationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The three honest answers, and only these three. `Unverified` is what keeps
+/// the other two truthful: a configured MCP server that has not been
+/// contacted this run is not evidence that it answers, and calling it
+/// `Available` would be exactly the "incomplete native support reported as
+/// full parity" this roadmap forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntegrationState {
+    Available,
+    Unavailable,
+    Unverified,
+}
+
+impl IntegrationState {
+    /// Whether a workflow step requiring this integration may be entered. An
+    /// unverified integration is admitted -- it may well work -- but an
+    /// unavailable one is refused before the step starts.
+    pub fn admits_step(self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
+impl std::fmt::Display for IntegrationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::Unverified => "unverified",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntegrationStatus {
+    pub integration: IntegrationId,
+    pub state: IntegrationState,
+    /// What was actually found: the backend, the binary, the server names.
+    pub detail: String,
+    /// For anything but `Available`: the exact missing binary, credential or
+    /// config key, phrased so an operator can act on it without reading code.
+    pub diagnosis: Option<String>,
+}
+
+impl IntegrationStatus {
+    pub fn available(integration: IntegrationId, detail: impl Into<String>) -> Self {
+        Self {
+            integration,
+            state: IntegrationState::Available,
+            detail: detail.into(),
+            diagnosis: None,
+        }
+    }
+
+    pub fn unavailable(
+        integration: IntegrationId,
+        detail: impl Into<String>,
+        diagnosis: impl Into<String>,
+    ) -> Self {
+        Self {
+            integration,
+            state: IntegrationState::Unavailable,
+            detail: detail.into(),
+            diagnosis: Some(diagnosis.into()),
+        }
+    }
+
+    pub fn unverified(
+        integration: IntegrationId,
+        detail: impl Into<String>,
+        diagnosis: impl Into<String>,
+    ) -> Self {
+        Self {
+            integration,
+            state: IntegrationState::Unverified,
+            detail: detail.into(),
+            diagnosis: Some(diagnosis.into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CapabilityReport {
     pub adapter: String,
     pub statuses: Vec<CapabilityStatus>,
+    /// Issue #483: the concrete integrations discovered for this repository.
+    /// Empty on a report built without discovery (`for_adapter`), which is
+    /// why [`CapabilityReport::admit`] treats an absent row as unavailable
+    /// rather than as permission.
+    #[serde(default)]
+    pub integrations: Vec<IntegrationStatus>,
 }
 
 impl CapabilityReport {
@@ -122,7 +273,14 @@ impl CapabilityReport {
     /// them. Zirv-owned operations can be reported as supported independently
     /// of a vendor's native tool vocabulary.
     pub fn for_adapter(adapter: &str) -> Self {
-        let known = matches!(adapter, "claude" | "codex");
+        // Issue #484 (roadmap N15): the native runtime is a first-class
+        // seat host, not an unknown adapter. Its logical capabilities are the
+        // same ones a harness seat has -- zirv owns agent spawn, test running
+        // and artifact rendering either way, and shell/filesystem/network stay
+        // operator-controlled because the execution broker, not markdown,
+        // decides them. Without this row a native reviewer or agent seat is
+        // refused by `ensure_supported` before it ever runs.
+        let known = matches!(adapter, "claude" | "codex" | NATIVE_ADAPTER);
         let status = |capability, support, reason: &'static str| CapabilityStatus {
             capability,
             support,
@@ -169,7 +327,8 @@ impl CapabilityReport {
                 status(
                     CapabilityId::BrowserOpen,
                     SupportLevel::Degraded,
-                    "available only when a browser-capable harness is configured",
+                    "available only when a browser-capable harness or an operator-configured \
+                     browser capability is present",
                 ),
                 status(
                     CapabilityId::NetworkAccess,
@@ -192,7 +351,48 @@ impl CapabilityReport {
         Self {
             adapter: adapter.to_string(),
             statuses,
+            integrations: Vec::new(),
         }
+    }
+
+    pub fn with_integrations(mut self, integrations: Vec<IntegrationStatus>) -> Self {
+        self.integrations = integrations;
+        self
+    }
+
+    pub fn integration(&self, integration: IntegrationId) -> IntegrationState {
+        self.integrations
+            .iter()
+            .find(|status| status.integration == integration)
+            .map_or(IntegrationState::Unavailable, |status| status.state)
+    }
+
+    pub fn integration_status(&self, integration: IntegrationId) -> Option<&IntegrationStatus> {
+        self.integrations
+            .iter()
+            .find(|status| status.integration == integration)
+    }
+
+    /// Workflow admission: a step whose required integration is unavailable is
+    /// refused BEFORE it starts, and the refusal quotes the diagnosis, so the
+    /// operator reads "`chromium` is not installed" rather than watching a
+    /// step fail halfway through for reasons it has to reconstruct.
+    pub fn admit(&self, required: &[IntegrationId]) -> Result<(), String> {
+        for integration in required {
+            let state = self.integration(*integration);
+            if state.admits_step() {
+                continue;
+            }
+            let diagnosis = self
+                .integration_status(*integration)
+                .and_then(|status| status.diagnosis.clone())
+                .unwrap_or_else(|| "no capability discovery ran for this report".to_string());
+            return Err(format!(
+                "this step requires the `{integration}` integration, which is unavailable: \
+                 {diagnosis}"
+            ));
+        }
+        Ok(())
     }
 
     pub fn support(&self, capability: CapabilityId) -> SupportLevel {
@@ -215,10 +415,16 @@ impl CapabilityReport {
     /// policy for `repo`. Policy loading uses the same asymmetric operator /
     /// repository fold as every AI launch, so repository content can narrow
     /// permissions but cannot grant itself a capability.
+    /// Resolved report for `repo`: logical capabilities folded through the
+    /// canonical policy, plus the concrete integrations auto-discovered
+    /// within the authorization that already exists (issue #483). Discovery
+    /// contacts nothing -- it reads config, PATH and the tree -- so this stays
+    /// cheap enough for every workflow admission check.
     pub fn for_repo(adapter: &str, repo: &Path) -> CtxResult<Self> {
         let config =
             crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())?;
-        Ok(Self::for_policy(adapter, &config.policy))
+        let integrations = crate::commands::ctx::runtime::capabilities::discover(&config, repo);
+        Ok(Self::for_policy(adapter, &config.policy).with_integrations(integrations))
     }
 
     pub fn for_policy(adapter: &str, policy: &EffectivePolicy) -> Self {
@@ -251,6 +457,29 @@ impl CapabilityReport {
             }
         }
         self
+    }
+}
+
+/// The integrations one workflow step genuinely cannot proceed without
+/// (issue #483). Deliberately short: a step is refused only where the missing
+/// backend makes the step impossible rather than merely harder. A frontend
+/// step that has to render and inspect a page needs a browser; nothing else
+/// in the ladder does.
+pub fn required_integrations(
+    phase: super::skill::WorkflowPhase,
+    frontend_domain: bool,
+) -> Vec<IntegrationId> {
+    use super::skill::WorkflowPhase;
+
+    match (phase, frontend_domain) {
+        (WorkflowPhase::Implement | WorkflowPhase::Review | WorkflowPhase::Verify, true) => {
+            vec![IntegrationId::FrontendRender]
+        }
+        (WorkflowPhase::Present, true) => {
+            vec![IntegrationId::ArtifactRender, IntegrationId::FrontendRender]
+        }
+        (WorkflowPhase::Present, false) => vec![IntegrationId::ArtifactRender],
+        _ => Vec::new(),
     }
 }
 
@@ -314,6 +543,73 @@ mod tests {
         assert_eq!(
             unknown.support(CapabilityId::RepoRead),
             SupportLevel::Unsupported
+        );
+    }
+
+    #[test]
+    fn every_integration_id_round_trips_through_its_wire_name() {
+        for integration in IntegrationId::ALL {
+            assert_eq!(
+                IntegrationId::parse(integration.as_str()),
+                Some(integration)
+            );
+            assert_eq!(
+                serde_json::to_value(integration).expect("encode"),
+                serde_json::Value::String(integration.as_str().to_string()),
+                "the serde rename and as_str must agree for {integration}"
+            );
+        }
+        assert_eq!(IntegrationId::parse("browser.open"), None);
+    }
+
+    #[test]
+    fn a_report_distinguishes_available_unavailable_and_unverified_integrations() {
+        let report = CapabilityReport::for_adapter("claude").with_integrations(vec![
+            IntegrationStatus::available(IntegrationId::ArtifactRender, "zirv renderer"),
+            IntegrationStatus::unverified(IntegrationId::Mcp, "1 server", "not contacted"),
+            IntegrationStatus::unavailable(
+                IntegrationId::Browser,
+                "no browser",
+                "install chromium",
+            ),
+        ]);
+        assert_eq!(
+            report.integration(IntegrationId::ArtifactRender),
+            IntegrationState::Available
+        );
+        assert_eq!(
+            report.integration(IntegrationId::Mcp),
+            IntegrationState::Unverified
+        );
+        assert_eq!(
+            report.integration(IntegrationId::Browser),
+            IntegrationState::Unavailable
+        );
+        // A never-discovered integration is unavailable, not permitted.
+        assert_eq!(
+            report.integration(IntegrationId::WebSearch),
+            IntegrationState::Unavailable
+        );
+    }
+
+    #[test]
+    fn workflow_admission_refuses_an_unavailable_integration_and_names_the_missing_piece() {
+        let report = CapabilityReport::for_adapter("claude").with_integrations(vec![
+            IntegrationStatus::unavailable(
+                IntegrationId::Browser,
+                "no Chromium-family browser was discovered",
+                "install chromium/google-chrome/microsoft-edge",
+            ),
+            IntegrationStatus::unverified(IntegrationId::Mcp, "1 server", "not contacted"),
+        ]);
+        let refusal = report
+            .admit(&[IntegrationId::Browser])
+            .expect_err("an unavailable integration must not admit a step");
+        assert!(refusal.contains("browser"), "{refusal}");
+        assert!(refusal.contains("install chromium"), "{refusal}");
+        assert!(
+            report.admit(&[IntegrationId::Mcp]).is_ok(),
+            "unverified is not the same as unavailable"
         );
     }
 

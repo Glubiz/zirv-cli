@@ -4,9 +4,11 @@ pub mod adapters;
 pub mod agent;
 pub mod allocator;
 pub mod announce;
+pub mod api;
 pub mod ask;
 pub mod attention;
 pub mod breakdown;
+pub mod capabilities_cmd;
 pub mod catalogue;
 pub mod chain;
 pub mod chat;
@@ -18,9 +20,14 @@ pub mod context;
 pub mod context_cli;
 pub mod context_lint;
 pub mod context_status;
+/// Issue #485 (roadmap N16): the native coordinator's durable task graph and
+/// the one place a delegation's identity-decidable bounds are judged.
+pub mod coordinator;
 pub mod dash;
+pub mod delegation;
 pub mod diagnostics;
 pub mod discover;
+pub mod doctor;
 pub mod drift;
 pub mod envelope;
 pub mod event;
@@ -31,19 +38,23 @@ pub mod handoff;
 pub mod handover;
 pub mod health;
 pub mod health_store;
+pub mod helper;
 pub mod hook;
 pub(crate) mod hook_integrity;
 pub(crate) mod hook_project;
 pub mod judge;
 pub mod learn;
 pub mod ledger;
+pub mod lifecycle;
 pub mod log;
 pub mod mail;
 pub mod measure;
 pub mod memory;
 pub mod memory_cli;
 pub mod memory_optimize;
+pub(crate) mod native_account;
 pub mod native_hooks;
+pub mod native_worker;
 pub mod objective;
 pub mod optimize;
 pub mod output;
@@ -62,20 +73,28 @@ pub mod pool;
 pub mod price;
 pub mod priority;
 pub mod prompt;
+pub mod provider;
+pub mod provider_cmd;
 pub mod reservation;
 pub mod result_schema;
 pub mod resume;
 pub mod retrieval;
 pub mod reuse;
 pub mod rollover;
+pub mod rollover_runtime;
 pub mod rot;
+pub mod route;
 pub mod run_loop;
+pub mod runtime;
 pub mod safety;
 pub mod score;
 pub mod screen;
 pub mod search;
 pub mod search_index;
 pub mod seat;
+/// Issue #352: the persistent runtime service -- the process that owns
+/// pty/ConPTY sessions so they outlive the client looking at them.
+pub mod session;
 pub mod session_spend;
 pub mod sessions;
 pub mod signal;
@@ -87,6 +106,9 @@ pub mod status;
 pub mod supervise;
 pub mod surface;
 pub mod task;
+/// Issue #485 (roadmap N16): the native team's roles, the operator-configured
+/// route each one spends, and the authority a role carries on its own.
+pub mod team;
 pub mod term;
 pub(crate) mod testrun;
 pub mod transcript_source;
@@ -269,6 +291,76 @@ pub(crate) mod testenv {
         (dir, guard)
     }
 
+    /// Issue #609 (roadmap N22, review of #493): the install-proof
+    /// counterpart of [`stub_live_adapters_on_path`] above. That helper
+    /// drops an empty placeholder file per adapter, which is enough to prove
+    /// PRESENCE but nothing about INVOCATION. This drops one CANARY
+    /// executable per [`super::adapters::ADAPTERS`] entry -- enumerated from
+    /// the same registry, so a ninth adapter needs no test rewritten -- and
+    /// each canary appends its own name to `invoked_log` and exits non-zero
+    /// if the OS ever actually runs it. A test can then assert `invoked_log`
+    /// never came to exist: direct evidence that no registered harness
+    /// executable was spawned, not merely that `PATH` came up empty (which a
+    /// regression that resolved a harness by full path, or via `PATHEXT`,
+    /// could still slip past).
+    ///
+    /// Returns both guards for the same reason `stub_live_adapters_on_path`
+    /// does: the `TempDir` must outlive the `VarGuard`.
+    pub(crate) fn canary_path_for_every_registered_harness(
+        invoked_log: &Path,
+    ) -> (tempfile::TempDir, VarGuard) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in super::adapters::ADAPTERS {
+            write_canary(dir.path(), name, invoked_log);
+        }
+        let guard = VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        (dir, guard)
+    }
+
+    /// Windows canary: a `.cmd` script. `std::process::Command` on Windows
+    /// resolves a bare program name (no extension) against `PATHEXT`-style
+    /// candidates on each `PATH` directory, the same resolution a real
+    /// `claude`/`codex` npm-shim install relies on, so `Command::new(name)`
+    /// finds this exactly as it would a genuine install.
+    #[cfg(windows)]
+    fn write_canary(dir: &Path, name: &str, invoked_log: &Path) {
+        let script = dir.join(format!("{name}.cmd"));
+        std::fs::write(
+            &script,
+            format!(
+                "@echo off\r\necho {name}>>\"{}\"\r\nexit /b 7\r\n",
+                invoked_log.display()
+            ),
+        )
+        .expect("write canary");
+    }
+
+    /// Unix canary: a `chmod +x` shell script with the bare adapter name --
+    /// mirrors `wrap.rs`'s own `#[cfg(unix)]` stub-executable tests (see
+    /// CLAUDE.md). Not exercised on this Windows dev machine; CI's Linux and
+    /// macOS legs of the `Native Install` job are what actually run it.
+    #[cfg(unix)]
+    fn write_canary(dir: &Path, name: &str, invoked_log: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho {name} >> \"{}\"\nexit 7\n",
+                invoked_log.display()
+            ),
+        )
+        .expect("write canary");
+        let mut perms = std::fs::metadata(&script)
+            .expect("canary metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod +x canary");
+    }
+
     /// Enters `dir` and returns to the previous working directory on drop --
     /// including on a panicking assertion, which is the whole point.
     ///
@@ -425,6 +517,8 @@ pub struct CtxCli {
 pub enum CtxVerb {
     /// Show or edit operator ~/.zirv/ctx.toml; set/add ask for approval in wrapped sessions.
     Config(config_cmd::ConfigArgs),
+    /// Configure and inspect opt-in native provider routes.
+    Provider(provider_cmd::ProviderArgs),
     /// Rot-score a session transcript and print JSON.
     Score(score::ScoreArgs),
     /// Distill a handoff from a transcript.
@@ -542,6 +636,24 @@ pub enum CtxVerb {
     /// transcripts into one `learned:`-prefixed private memory entry
     /// (issue #425). Read-only with `--dry-run`.
     Learn(learn::LearnArgs),
+    /// The versioned local runtime protocol (issue #353): `schema` prints
+    /// the v1 contract, `serve` binds the local endpoint, `call` invokes one
+    /// method over it.
+    Api(api::ApiArgs),
+    /// Report every configured integration -- MCP servers, web search/fetch,
+    /// browser, diagnostics, artifact and frontend rendering -- as available,
+    /// unavailable or unverified, with the diagnosis for anything missing
+    /// (issue #483). `--probe` contacts each MCP server to verify it.
+    Capabilities(capabilities_cmd::CapabilitiesArgs),
+    /// Diagnose native readiness (issue #491): for every role, which backend
+    /// an unflagged session gets and why, which route it would spend, and
+    /// every problem sorted into exactly one named class -- missing auth
+    /// material, inaccessible model, missing tool, unsupported isolation,
+    /// service failure or upstream entitlement limit. Redacted like `ctx
+    /// snapshot`, so the output is safe to paste into a bug report. Exits 1
+    /// when a role that would run natively has no usable route. `--live`
+    /// additionally contacts each provider's model-list endpoint.
+    Doctor(doctor::DoctorArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -579,6 +691,11 @@ fn read_stdin() -> String {
 
 /// `args[0]` is the literal "ctx" as it appeared in argv.
 pub fn dispatch(args: &[String]) -> i32 {
+    // The private MCP relay must not probe harness readiness, load repository
+    // configuration, or construct the ordinary CLI before authenticating.
+    if args.len() == 3 && args[1] == "provider" && args[2] == "bridge" {
+        return runtime::execution::bridge_stdio().unwrap_or(1);
+    }
     let argv = std::iter::once("zirv ctx".to_string()).chain(args.iter().skip(1).cloned());
     let cli = match CtxCli::try_parse_from(argv) {
         Ok(cli) => cli,
@@ -630,6 +747,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     let mut out = std::io::stdout();
     let result = match &cli.verb {
         CtxVerb::Config(a) => config_cmd::run(a, &mut out),
+        CtxVerb::Provider(a) => provider_cmd::run(a, &mut out),
         CtxVerb::Score(a) => score::run(a, &mut out),
         CtxVerb::Handoff(a) => handoff::run(a, &mut out),
         CtxVerb::Resume(a) => resume::run(a, &mut out),
@@ -670,6 +788,9 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Measure(a) => measure::run(a, &mut out),
         CtxVerb::Discover(a) => discover::run(a, &mut out),
         CtxVerb::Learn(a) => learn::run(a, &mut out),
+        CtxVerb::Api(a) => api::run(a, &mut out),
+        CtxVerb::Capabilities(a) => capabilities_cmd::run(a, &mut out),
+        CtxVerb::Doctor(a) => doctor::run(a, &mut out),
     };
 
     match result {

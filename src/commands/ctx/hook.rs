@@ -7,7 +7,6 @@ use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::diagnostics;
 use super::event::{NormalizedEvent, input_hash};
-use super::pathutil::canonicalize_with_missing_tail;
 use super::rot::{Score, Verdict};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::supervise::Watcher;
@@ -1249,16 +1248,6 @@ pub(crate) fn session_has_modification(
 /// verify` has anything to check in a documentation-only change. Vacuously
 /// `true` for an empty slice, the same "nothing to point to" reading
 /// `changed_paths` itself gives an untouched worktree.
-fn changes_are_doc_only(paths: &[PathBuf]) -> bool {
-    paths.iter().all(|path| {
-        path.starts_with("docs")
-            || matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("md" | "txt" | "rst")
-            )
-    })
-}
-
 /// Issue #309: whether `phase` is a step that itself already gates on fresh
 /// verification evidence -- `engine::advance`'s own Test/Verify check prints
 /// exactly the "run `zirv test changed`/`zirv verify`" message a Stop-hook
@@ -1275,14 +1264,6 @@ fn workflow_step_covers_verification(phase: WorkflowPhase) -> bool {
 /// caller -- kept anyway as the direct mirror of `engine::advance`'s own
 /// `if final_only { "zirv verify" } else { "zirv test changed" }` naming, in
 /// case a future change narrows the suppression rule to `Test` alone.
-fn verify_on_stop_command(active_phase: Option<WorkflowPhase>) -> &'static str {
-    if active_phase == Some(WorkflowPhase::Verify) {
-        "zirv verify"
-    } else {
-        "zirv test changed"
-    }
-}
-
 /// Bumped whenever `VerifyOnStopRecord`'s own shape changes -- deliberately
 /// a separate constant from `MODIFICATION_CHECKPOINT_VERSION` even though
 /// both start at `1`: the two checkpoints have unrelated schemas and must be
@@ -1348,18 +1329,30 @@ fn verify_on_stop_nudge(
     }
     // Any doubt here (no git, no repo, ...) reads as "fresh": a nudge is
     // advisory, never worth a false positive over an unreadable repo state.
-    if verification::latest_is_fresh_and_passing(state, repo, false).unwrap_or(true) {
+    // No specific workflow branch in view here (a generic advisory nudge),
+    // so this never widens to a sibling worktree's evidence -- see
+    // `latest_is_fresh_and_passing`'s own doc comment.
+    if verification::latest_is_fresh_and_passing(state, repo, false, None).unwrap_or(true) {
         return None;
     }
     let changed = verification::changed_paths(repo).ok()?;
-    if changes_are_doc_only(&changed) {
-        return None;
-    }
     let active_phase = engine::load_active(state, repo)
         .ok()
         .flatten()
         .and_then(|workflow| workflow.current().map(|step| step.phase));
-    if active_phase.is_some_and(workflow_step_covers_verification) {
+    // Issue #478: whether fresh evidence is owed, and which command produces
+    // it, is the shared verification service's decision -- a native session
+    // asks the same question with no transcript and no hook payload.
+    let owed = super::lifecycle::verification(
+        true,
+        &changed,
+        active_phase.is_some_and(workflow_step_covers_verification),
+        active_phase == Some(WorkflowPhase::Verify),
+    );
+    if !matches!(
+        owed,
+        super::lifecycle::VerificationDecision::Required { .. }
+    ) {
         return None;
     }
 
@@ -1372,7 +1365,9 @@ fn verify_on_stop_nudge(
     record.nudges += 1;
     save_verify_on_stop_record(&path, &record);
 
-    let command = verify_on_stop_command(active_phase);
+    let super::lifecycle::VerificationDecision::Required { command } = owed else {
+        return None;
+    };
     Some(format!(
         "zirv ctx: code changed since the last passing run; run `{command}` before relying on this session's own verification."
     ))
@@ -1616,6 +1611,35 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // itself) keeps every one of its existing call sites/tests untouched.
     // Issue #308 rides the same fold a third time, for the identical reason.
     // Issue #312 rides it a fourth time, for the identical reason.
+    //
+    // Issue #478: whether this session may stop quietly is the shared stop
+    // service's call, not this function's. `stop_hook_active` is its loop
+    // breaker -- exactly what this hook's own early return above already used
+    // it for -- and the verify-on-stop result is the verification signal it
+    // reads. Behaviour is unchanged today (a `Required` verification yields
+    // `AllowWithNote`, and the note is the one computed above), but the moment
+    // `StopSignals::workflow_gate` or `incomplete_tools` is populated, the
+    // harness path blocks for the same reasons the native loop already does.
+    let stop_decision = super::lifecycle::stop(&super::lifecycle::StopSignals {
+        already_blocked: payload.stop_hook_active,
+        incomplete_tools: Vec::new(),
+        verification: match verify_nudge.is_some() {
+            true => super::lifecycle::VerificationDecision::Required {
+                command: super::lifecycle::verification_command(false),
+            },
+            false => super::lifecycle::VerificationDecision::NotRequired,
+        },
+        workflow_gate: None,
+    });
+    let verify_nudge = match &stop_decision {
+        // The service says fresh evidence is owed; the nudge computed above is
+        // this hook's own wording for that, so it rides along.
+        super::lifecycle::StopDecision::AllowWithNote(_) => verify_nudge.clone(),
+        // Allowed outright, or blocked for a reason that outranks a nudge --
+        // in either case the evidence note is not what should be said.
+        super::lifecycle::StopDecision::Allow => None,
+        super::lifecycle::StopDecision::Block(reason) => Some(reason.clone()),
+    };
     let combined_nudge = [
         adoption_nudge.as_deref(),
         verify_nudge.as_deref(),
@@ -1660,9 +1684,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
 /// wording a second way -- the measurement and the actual injected text can
 /// never drift apart on what "the hook context" means.
 pub fn per_turn_context_text(marker: &str) -> String {
-    format!(
-        "Prefix each final answer with {marker} on line 1 (mid-turn exempt): zirv ctx health marker."
-    )
+    super::lifecycle::per_turn_context_text(marker)
 }
 
 pub fn prompt_output(
@@ -1671,32 +1693,26 @@ pub fn prompt_output(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> String {
-    let mut lines = Vec::new();
-    if !marker.is_empty() {
-        lines.push(per_turn_context_text(marker));
-    }
-    if let Some(nudge) = adoption_nudge {
-        lines.push(nudge.to_string());
-    }
-    if let Some(short) = super::mail::session_identity(env)
-        && let Ok(state) = StateDir::resolve(env)
-        && let Ok(messages) = super::mail::list(
-            &state,
-            &super::state::repo_slug(repo),
-            env(adapters::AGENT_ENV).as_deref(),
-            Some(&short),
-        )
-        && !messages.is_empty()
-    {
-        lines.push(format!(
-            "[zirv ▸ mail] {} unread -- run zirv ctx inbox",
-            messages.len()
-        ));
-    }
-    if lines.is_empty() {
+    let mail = super::mail::session_identity(env)
+        .and_then(|short| {
+            let state = StateDir::resolve(env).ok()?;
+            super::mail::list(
+                &state,
+                &super::state::repo_slug(repo),
+                env(adapters::AGENT_ENV).as_deref(),
+                Some(&short),
+            )
+            .ok()
+        })
+        .filter(|messages| !messages.is_empty())
+        .map(|messages| super::lifecycle::mail_note(messages.len()));
+    // Issue #478: assembled by the shared prompt service, so a native session
+    // injects the same notes in the same order with no hook in the picture.
+    let context =
+        super::lifecycle::prompt_notes(marker, &[adoption_nudge.map(str::to_string), mail]);
+    if context.is_empty() {
         return String::new();
     }
-    let context = lines.join("\n");
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -1916,23 +1932,10 @@ pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
 // orchestrator-write guard that refuses an orchestrator seat's own direct
 // edit of a repository file (issue #334) ------------------------------------
 
-/// Model-name fragments that mark a seat too expensive to inherit silently.
-/// Matched case-insensitively as substrings, so a vendor-qualified id
-/// (`us.anthropic.mythos-...`) or a suffixed one (`fable[1m]`) still lands.
-const EXPENSIVE_TIERS: [&str; 2] = ["fable", "mythos"];
-
-/// The tool names that dispatch a subagent. Both spellings are covered
-/// because the tool has been presented under either name and the guard must
-/// not turn itself off on a rename.
-const SUBAGENT_TOOLS: [&str; 2] = ["Agent", "Task"];
-
-/// Subagent types that pin no model of their own, so an omitted `model`
-/// parameter means "inherit the caller's". Matched exactly and
-/// case-sensitively: these are literal values of the tool's own
-/// `subagent_type` parameter, not free text. Any other name is a
-/// `.claude/agents/<name>.md` definition, which carries its own `model`
-/// frontmatter and is therefore none of zirv's business.
-const GENERIC_SUBAGENT_TYPES: [&str; 5] = ["fork", "claude", "general-purpose", "Explore", "Plan"];
+// The expensive-tier model fragments, the subagent-dispatch tool names and
+// the subagent types that pin no model of their own now live in
+// `lifecycle.rs` (issue #478): the same vocabulary decides a native session's
+// dispatches, where there is no hook payload at all.
 
 /// The PreToolUse stdin payload, narrowed to what the guard reads. Every
 /// field is optional with a zero default, the same rule the Stop payload
@@ -2017,24 +2020,10 @@ impl PreToolPayload {
     }
 }
 
-fn names_expensive_tier(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    EXPENSIVE_TIERS.iter().any(|tier| model.contains(tier))
-}
-
 /// What the model is told when a dispatch is refused. The reason is the only
 /// thing it sees, so it has to carry the whole remedy: naming the seat, the
 /// cheaper models that are accepted, and the one option (a fork) that no
 /// model parameter can rescue.
-fn pretool_deny_reason(seat: &str) -> String {
-    format!(
-        "zirv guard: this seat runs {seat}; re-dispatch with an explicit cheaper model \
-         parameter (haiku for mechanical work, sonnet for standard work, opus for hard \
-         work), or use an agent type that pins its own model. Forks are not allowed from \
-         this seat: a fork always inherits the seat model and ignores a model override."
-    )
-}
-
 /// The whole decision, pure: `Some(reason)` denies, `None` allows.
 ///
 /// `seat` is `SEAT_MODEL_ENV`'s value, absent for any session zirv did not
@@ -2046,40 +2035,35 @@ fn pretool_deny_reason(seat: &str) -> String {
 /// runs in front of every tool call in the session, and the cost of a wrong
 /// deny is far higher than the cost of a missed one.
 pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<String> {
-    let seat = seat?;
-    if !names_expensive_tier(seat) {
-        return None;
-    }
-    if !SUBAGENT_TOOLS.contains(&payload.tool_name.as_str()) {
-        return None;
-    }
+    // Issue #478: the decision itself is `lifecycle::subagent_admission`, so
+    // a native session (which has no PreToolUse payload at all) reaches the
+    // same guard. This function stays exactly what it always was on the hook
+    // side -- the translator from claude's payload shape into that intent.
+    //
     // A payload with no `tool_input` at all, an empty `{}`, or one that
     // simply omits `prompt` is schema drift, not a subagent dispatch: every
     // genuine `Agent`/`Task` call carries a non-empty `prompt` (the
-    // subagent's own task text), so this guard must not deny on `#[serde(
-    // default)]`'s own zero values for a call it never actually recognised.
-    if payload.tool_input.prompt.trim().is_empty() {
-        return None;
+    // subagent's own task text), so the guard must not deny on `#[serde(
+    // default)]`'s own zero values for a call it never actually recognised --
+    // `subagent_admission` applies that same empty-prompt rule.
+    super::lifecycle::subagent_admission(seat, &pretool_intent(payload))
+}
+
+/// The neutral [`super::lifecycle::ToolIntent`] for a PreToolUse payload, as
+/// far as the subagent guard needs it. The write-guard fields are filled in
+/// separately by [`orchestrator_write_target`], which has a `cwd` to resolve
+/// the target against.
+fn pretool_intent(payload: &PreToolPayload) -> super::lifecycle::ToolIntent {
+    super::lifecycle::ToolIntent {
+        tool: payload.tool_name.clone(),
+        write_target: None,
+        subagent: Some(super::lifecycle::SubagentIntent {
+            prompt: payload.tool_input.prompt.clone(),
+            subagent_type: payload.tool_input.subagent_type.clone(),
+            model: payload.tool_input.model.clone(),
+        }),
+        delegated: !payload.agent_id.is_empty(),
     }
-
-    let subagent_type = payload.tool_input.subagent_type.trim();
-    let model = payload.tool_input.model.trim();
-
-    // A fork inherits the seat model by construction and ignores `model`
-    // outright, so naming a cheap one buys nothing and must not read as
-    // though it did.
-    let denied = if subagent_type == "fork" {
-        true
-    } else if !model.is_empty() {
-        // An explicit model is honored, unless it asks for the seat tier
-        // again by name, which is the exact spend being guarded.
-        names_expensive_tier(model)
-    } else {
-        // No model named: only a subagent type that pins its own inherits.
-        subagent_type.is_empty() || GENERIC_SUBAGENT_TYPES.contains(&subagent_type)
-    };
-
-    denied.then(|| pretool_deny_reason(seat))
 }
 
 // -- PreToolUse: the orchestrator-write guard (issues #328/#334) -----------
@@ -2087,7 +2071,7 @@ pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<
 /// Tool names that write repository files. An orchestrator seat must be
 /// technically unable to edit repository files itself -- every change goes
 /// through a dispatched worker instead.
-const FILE_MODIFICATION_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+use super::lifecycle::FILE_MODIFICATION_TOOLS;
 
 /// Resolves `path` lexically: `.` components drop, `..` pops the previous
 /// component (or is kept literally once there is nothing left to pop, so a
@@ -2095,48 +2079,19 @@ const FILE_MODIFICATION_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "Noteb
 /// Deliberately NOT `std::fs::canonicalize`: a `Write` target may not exist
 /// yet, and this must stay a pure path computation, no filesystem access.
 fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if out.pop() => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+    super::lifecycle::normalize_lexically(path)
 }
 
 /// Claude Code's operator-owned configuration directory. An explicit,
 /// non-empty `CLAUDE_CONFIG_DIR` wins; otherwise Claude's default beneath
 /// `HOME` (or Windows' `USERPROFILE`) applies. Environment access stays
 /// injectable so both write guards remain deterministic in tests.
-fn harness_home(env: EnvLookup<'_>) -> Option<PathBuf> {
-    env("CLAUDE_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env("HOME")
-                .or_else(|| env("USERPROFILE"))
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
-}
-
 /// Whether a write target belongs to Claude Code's own configuration tree.
 /// Existing harness homes compare in canonical space so symlinked home/temp
 /// paths agree; a not-yet-created harness home uses a component-aware lexical
 /// comparison on the paths exactly as supplied.
 pub(crate) fn target_is_under_harness_home(target: &Path, env: EnvLookup<'_>) -> bool {
-    let Some(harness_home) = harness_home(env) else {
-        return false;
-    };
-    if !harness_home.exists() {
-        return target.starts_with(harness_home);
-    }
-    let Ok(harness_home) = std::fs::canonicalize(harness_home) else {
-        return false;
-    };
-    canonicalize_with_missing_tail(target).is_some_and(|target| target.starts_with(harness_home))
+    super::lifecycle::target_is_under_harness_home(target, env)
 }
 
 /// The absolute, lexically-normalized target `payload` names, or `None` when
@@ -2169,13 +2124,7 @@ fn normalized_write_target(payload: &PreToolPayload, cwd: &Path) -> Option<PathB
 /// the model can see why, and the remedy: dispatch a worker rather than
 /// retry the same tool call.
 fn orchestrator_write_deny_reason(target: &Path) -> String {
-    format!(
-        "orchestrator seat: dispatch a worker -- this seat coordinates and never edits \
-         repository files itself ({}). Delegate the change to a worker: the native Agent \
-         tool for this harness, `zirv agent <other-harness>` for another. Writes under \
-         .zirv/work and .zirv/memory stay allowed.",
-        target.display()
-    )
+    super::lifecycle::orchestrator_write_deny_reason(target)
 }
 
 /// What the model is told, non-blocking, when an orchestrator seat's own
@@ -2184,11 +2133,7 @@ fn orchestrator_write_deny_reason(target: &Path) -> String {
 /// names the target and the standing guidance to delegate anything larger
 /// than a trivial edit.
 fn orchestrator_write_advise_note(target: &Path) -> String {
-    format!(
-        "orchestrator seat wrote to {}: fine for a trivial edit; delegate substantial changes \
-         to a worker",
-        target.display()
-    )
+    super::lifecycle::orchestrator_write_advise_note(target)
 }
 
 /// This seat's own repository-write guard posture -- `cfg.supervise.
@@ -2199,7 +2144,7 @@ fn orchestrator_write_advise_note(target: &Path) -> String {
 /// PowerShell in `safety.rs`) can never read a different posture for the
 /// same session.
 pub(crate) fn orchestrator_write_posture(cfg: &CtxConfig) -> super::config::OrchestratorWrites {
-    cfg.supervise.orchestrator_writes
+    super::lifecycle::orchestrator_write_posture(cfg)
 }
 
 /// One orchestrator-write guard decision, resolved against this seat's own
@@ -2274,11 +2219,7 @@ pub(crate) fn orchestrator_advisory_should_surface(env: EnvLookup<'_>, session: 
 /// (`gitdir: ...`) -- so both shapes resolve to the same repository root.
 /// Pure apart from `Path::exists`.
 fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
-    target
-        .parent()?
-        .ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
-        .map(Path::to_path_buf)
+    super::lifecycle::repo_root_for_target(target)
 }
 
 /// The resolved write TARGET when `payload` is an orchestrator seat's own
@@ -2308,25 +2249,13 @@ fn orchestrator_write_target(
     cwd: &Path,
     env: EnvLookup<'_>,
 ) -> Option<PathBuf> {
-    if role != Some("orchestrator") {
-        return None;
-    }
-    if !payload.agent_id.is_empty() {
-        return None;
-    }
-    let target = normalized_write_target(payload, cwd)?;
-    if target_is_under_harness_home(&target, env) {
-        return None;
-    }
-    let target_repo = repo_root_for_target(&target)?;
-    let allowed_roots = [
-        target_repo.join(".zirv/work"),
-        target_repo.join(".zirv/memory"),
-    ];
-    if allowed_roots.iter().any(|root| target.starts_with(root)) {
-        return None;
-    }
-    Some(target)
+    // Issue #478: the rule itself lives in `lifecycle.rs` so a native
+    // session's own `file_write`/`apply_patch` call reaches it too; this stays
+    // the translator that resolves claude's `file_path`/`notebook_path`
+    // against `cwd`.
+    let mut intent = pretool_intent(payload);
+    intent.write_target = normalized_write_target(payload, cwd);
+    super::lifecycle::orchestrator_write_target(role, &intent, env)
 }
 
 /// The whole orchestrator-write guard decision (issue #358 T8): `None` when
@@ -2754,7 +2683,7 @@ pub struct BashToolOutput {
 /// compacting it again would summarize a truncation notice and hand back a
 /// retrieval id for text zirv never actually holds.
 fn already_offloaded(text: &str) -> bool {
-    text.contains("Output too large") && text.contains("saved to")
+    super::lifecycle::already_offloaded(text)
 }
 
 /// The `updatedToolOutput` envelope. `stderr` is emptied deliberately: the
@@ -2909,7 +2838,10 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         // compacting once it is genuinely large.
         super::output::CompactionScope::Shape => cfg.output.compact_generic_min_bytes,
     };
-    if combined.len() < threshold {
+    // Issue #478: the size cutoff is the shared after-tool service's, so a
+    // native session replacing its own large tool result and this hook
+    // replacing claude's agree on when a result is worth compacting.
+    if !super::lifecycle::should_compact_result(combined.len(), true, threshold.saturating_sub(1)) {
         record(super::ledger::Outcome::BelowThreshold, bytes_in, None);
         return Ok(0);
     }
@@ -2999,15 +2931,7 @@ pub fn notify_payload_to_hook(raw: &str) -> CtxResult<HookPayload> {
 /// carry tokens, prompts and file contents, and the decision log is a plain
 /// file that outlives the session.
 pub fn notify_shape(payload: &str) -> String {
-    const MAX_KEYS: usize = 200;
-    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(payload)
-    else {
-        return format!("unparseable notify payload, {} bytes", payload.len());
-    };
-
-    let mut keys: String = map.keys().cloned().collect::<Vec<_>>().join(", ");
-    keys.truncate(MAX_KEYS);
-    format!("notify payload fields: {keys}")
+    super::lifecycle::notification_shape(payload)
 }
 
 pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
@@ -3017,15 +2941,22 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
     let Ok(mapped) = notify_payload_to_hook(payload) else {
         // A hook never blocks the agent, so an unmapped payload is recorded
         // rather than surfaced. The decision log is where a silent mismatch
-        // becomes visible.
+        // becomes visible. Issue #478: the shared notification service both
+        // classifies what the payload MEANT and bounds what may be written
+        // down about it (field names only, never values).
         if let Ok(state) = StateDir::resolve(env) {
+            let kind = super::lifecycle::notification_kind(payload);
             let _ = log::append(
                 &state,
                 &log::Decision {
                     ts: now_secs(),
                     session: "unknown",
                     verb: "hook",
-                    verdict: "n/a",
+                    verdict: match kind {
+                        super::lifecycle::NotificationKind::AwaitingApproval => "approval",
+                        super::lifecycle::NotificationKind::AwaitingInput => "idle",
+                        super::lifecycle::NotificationKind::Other => "n/a",
+                    },
                     score: 0,
                     action: "notify-unmapped",
                     detail: &notify_shape(payload),
@@ -3495,8 +3426,16 @@ fn run_hook_status<W: Write>(w: &mut W, heal: bool, env: EnvLookup<'_>) -> CtxRe
 #[cfg(test)]
 mod tests {
     use super::super::config::OrchestratorWrites;
+    // Issue #478: both decisions moved to `lifecycle.rs`; the tests that
+    // pinned them stay exactly as they were, now exercising the shared
+    // service that the native path also calls.
+    use super::super::lifecycle::changes_are_doc_only;
     use super::*;
     use crate::commands::ctx::rot::{Score, Signals, Verdict};
+
+    fn verify_on_stop_command(active_phase: Option<WorkflowPhase>) -> &'static str {
+        super::super::lifecycle::verification_command(active_phase == Some(WorkflowPhase::Verify))
+    }
 
     fn payload() -> HookPayload {
         HookPayload {
@@ -4522,8 +4461,14 @@ mod tests {
         let state = StateDir::from_root(state_root);
         let short = super::super::sessions::short_id("49195b07-217f-4401-8681-c857fcea294e");
         assert_eq!(
-            super::super::sessions::native_conversation(&state, &short, "claude", zirv_session)
-                .as_deref(),
+            super::super::sessions::native_conversation(
+                &state,
+                &short,
+                "claude",
+                zirv_session,
+                super::super::runtime::RuntimeKind::Harness,
+            )
+            .as_deref(),
             Some("49195b07-217f-4401-8681-c857fcea294e"),
             "the harness's own conversation id must be recorded against zirv's session"
         );
@@ -9085,6 +9030,32 @@ mod tests {
             verify_on_stop_nudge(&state, repo.path(), "sess-d", &cfg, &transcript),
             None,
             "a doc-only change set has nothing for a test/verify gate to check"
+        );
+    }
+
+    /// Issue #478 review finding 5: a session whose transcript shows edit
+    /// tool calls but whose working tree is CLEAN owes no fresh evidence --
+    /// `changes_are_doc_only(&[])` is vacuously true, and always has been.
+    /// The gate this pins is the one the extraction of `verification` into
+    /// `lifecycle.rs` could have quietly inverted.
+    #[test]
+    fn verify_on_stop_nudge_is_silent_when_nothing_actually_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let cfg = CtxConfig::default();
+
+        assert!(
+            verification::changed_paths(repo.path())
+                .expect("changed paths")
+                .is_empty(),
+            "this fixture repository must have nothing to verify"
+        );
+        assert_eq!(
+            verify_on_stop_nudge(&state, repo.path(), "sess-empty", &cfg, &transcript),
+            None,
+            "an empty change set has nothing for a test/verify gate to check"
         );
     }
 

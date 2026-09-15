@@ -1,0 +1,17 @@
+{
+  "shape": "anthropic",
+  "model": "fixture-anthropic-model",
+  "turns": [
+    {
+      "message_id": "msg_resumed",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Picking the task back up after the restart."
+        }
+      ],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 40, "output_tokens": 12 }
+    }
+  ]
+}

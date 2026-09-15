@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl_long","object":"chat.completion.chunk","model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"role":"assistant","content":"Starting."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_long","object":"chat.completion.chunk","model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_cut","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"src/lib.rs\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_long","object":"chat.completion.chunk","model":"deepseek-v4-pro","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+

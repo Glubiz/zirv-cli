@@ -1,0 +1,8 @@
+{
+  "payload": {
+    "kind": "heartbeat"
+  },
+  "revision": 7,
+  "type": "event",
+  "v": 1
+}

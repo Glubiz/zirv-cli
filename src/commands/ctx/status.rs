@@ -16,6 +16,8 @@ use super::memory;
 use super::permit;
 use super::pool;
 use super::price;
+use super::runtime::compaction;
+use super::runtime::journal::Journal;
 use super::search;
 use super::session_spend;
 use super::sessions::{self, Liveness};
@@ -941,6 +943,16 @@ pub struct StatusArgs {
     /// mode, matching `--breakdown`'s own early-return shape.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// Issue #490 (roadmap N21, item 6): print the native dashboard's OWN
+    /// agent/task overview, usage-and-health provenance strip and recent
+    /// notices as pretty-printed JSON -- the same `dash::native_ux` values
+    /// the TUI renders, not a parallel re-derivation, so a headless operator
+    /// and the pane can never disagree about what is running, blocked,
+    /// approval-needed, done-unread or failed. Includes a `limitations` list
+    /// naming every fact this build genuinely cannot know, so a gap is never
+    /// readable as a zero. Returns immediately, like `--breakdown`/`--json`.
+    #[arg(long, default_value_t = false)]
+    pub agents: bool,
     /// Issue #326: restore the report `zirv ctx status` printed before
     /// `--brief --diff` became the bare default -- the full, non-collapsed
     /// sections with no snapshot-diffing. Overrides `--brief`/`--diff` back
@@ -1183,7 +1195,8 @@ fn render_report<W: Write>(
     // fails: `status` must never fail just because this one line could not
     // be computed.
     if let Ok(Some(_)) = verification::latest_report_id(&state, repo) {
-        let fresh = verification::latest_is_fresh_and_passing(&state, repo, false).unwrap_or(false);
+        let fresh =
+            verification::latest_is_fresh_and_passing(&state, repo, false, None).unwrap_or(false);
         let (text, tone) = if fresh {
             ("gates: fresh".to_string(), Tone::Ok)
         } else {
@@ -2010,6 +2023,15 @@ fn render_report<W: Write>(
         }
     }
 
+    // Issue #486: what native sessions have compacted and resumed, and why.
+    // Read straight off the native journal, so it survives a restart and
+    // needs no second bookkeeping store. OMITTED ENTIRELY when no native
+    // session has ever compacted or resumed: a machine that has not used the
+    // native runtime must not grow a permanent empty section.
+    for line in native_recovery_lines(&state) {
+        writeln!(w, "{}", label(colour, &line))?;
+    }
+
     if args.brief {
         writeln!(
             w,
@@ -2076,6 +2098,50 @@ fn render_report<W: Write>(
     // outcome (success, a skipped-unparsable layer, or any other load error)
     // keeps exiting 0.
     Ok(if repo_forbidden { 1 } else { 0 })
+}
+
+/// How many native sessions' recovery history one status report shows.
+const NATIVE_RECOVERY_SESSIONS: usize = 5;
+
+/// Issue #486: one line per native session that has compacted or resumed --
+/// how many times, and the reason for the newest compaction.
+///
+/// Best-effort and read-only throughout. A missing native journal, one this
+/// build cannot open, or a session whose events cannot be read all produce
+/// NOTHING rather than an error or a fabricated "none": `ctx status` must
+/// never fail, and must never create a database, because of this section.
+fn native_recovery_lines(state: &StateDir) -> Vec<String> {
+    if !state.native_journal().exists() {
+        return Vec::new();
+    }
+    let Ok(journal) = Journal::open(state) else {
+        return Vec::new();
+    };
+    let Ok(sessions) = journal.session_ids() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for session in sessions.iter().rev().take(NATIVE_RECOVERY_SESSIONS) {
+        let Ok(history) = compaction::history_summary(&journal, session) else {
+            continue;
+        };
+        if history.is_empty() {
+            continue;
+        }
+        let mut line = format!(
+            "native {session}: {} compaction(s), {} resume(s)",
+            history.compactions, history.resumes
+        );
+        if let Some(last) = history.last_compaction.as_ref() {
+            line.push_str(&format!(
+                "; last {} through sequence {} ({} summary)",
+                last.reason, last.covers_through, last.summary_source
+            ));
+        }
+        lines.push(line);
+    }
+    lines.reverse();
+    lines
 }
 
 /// Issue #246: `status --diff`'s schema version for [`StatusSnapshot`].
@@ -2318,6 +2384,83 @@ fn render_pool_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> Ctx
     Ok(0)
 }
 
+/// Issue #490 (roadmap N21, item 6): `status --agents` -- the headless twin
+/// of the native dashboard's agent/task overview and provenance strip.
+///
+/// Built from the identical builders the pane draws through
+/// (`native_ux::build_overview`/`build_usage`), fed the identical records
+/// (`coordinator::load`, `delegation::list`, `seat::load`, `pool::build`), so
+/// "headless status agrees with the TUI" is a structural property of sharing
+/// one reducer rather than two implementations kept in step by hand.
+///
+/// The one thing it cannot share is the pane's live state: an approval is
+/// detected from a LIVE pane's transcript, and notices are that pane's own
+/// observations, so both are empty here and `limitations` says so.
+fn render_agents_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> CtxResult<i32> {
+    use super::dash::native_ux;
+    use super::{coordinator, delegation, seat};
+
+    let state = StateDir::resolve(repo_state_env(env))?;
+    let cfg = CtxConfig::load(repo, env)?;
+    let now = now_secs();
+
+    let graph = coordinator::load(&state, repo);
+    let records = delegation::list(&state, repo);
+    let seats: Vec<seat::Seat> = records
+        .iter()
+        .map(|record| record.handle.short.as_str())
+        .chain(mail::session_identity(env).as_deref())
+        .filter_map(|short| seat::load(&state, short))
+        .collect();
+    let view = pool::build(
+        &state,
+        &cfg,
+        now,
+        mail::session_identity(env).as_deref(),
+        Some(&repo_slug(repo)),
+    );
+
+    let overview = native_ux::build_overview(&graph, &records, &seats, &[], now);
+    let usage = native_ux::build_usage(&view, &billing_label(&cfg, repo));
+    let notices = native_ux::NoticeLog::new(native_ux::NOTICE_LOG_CAP);
+    let report = native_ux::headless_report(&overview, &usage, &notices, now);
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|e| format!("status --agents: failed to serialize the report: {e}"))?;
+    writeln!(w, "{json}")?;
+    Ok(0)
+}
+
+/// The operator's configured billing class for this repository's default
+/// native account, or the placeholder when nothing resolves -- never a
+/// guessed default.
+fn billing_label(cfg: &CtxConfig, repo: &Path) -> String {
+    let _ = cfg;
+    use super::provider::BillingClass;
+    use super::provider::config::NativeConfig;
+    let Ok(home) = crate::utils::home_dir() else {
+        return style::PLACEHOLDER.to_string();
+    };
+    let Ok(Some(native)) = NativeConfig::load(&home, repo) else {
+        return style::PLACEHOLDER.to_string();
+    };
+    match native
+        .accounts
+        .values()
+        .next()
+        .map(|account| account.billing)
+    {
+        Some(BillingClass::Api) => "api".to_string(),
+        Some(BillingClass::Subscription) => "subscription".to_string(),
+        None => style::PLACEHOLDER.to_string(),
+    }
+}
+
+/// `StateDir::resolve`'s own environment lookup, named so the two JSON paths
+/// read alike.
+fn repo_state_env(env: EnvLookup<'_>) -> EnvLookup<'_> {
+    env
+}
+
 pub fn run_with<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -2327,6 +2470,9 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     if let Some(session) = &args.breakdown {
         return render_breakdown(session, w, repo, env);
+    }
+    if args.agents {
+        return render_agents_json(w, repo, env);
     }
     if args.json {
         return render_pool_json(w, repo, env);
@@ -2440,6 +2586,213 @@ mod tests {
         [(STATE_ENV.to_string(), state.display().to_string())].into()
     }
 
+    /// Issue #486: a machine that has never run a native session grows no
+    /// section at all -- and `status` never creates the journal database as a
+    /// side effect of looking.
+    #[test]
+    fn the_native_recovery_section_is_absent_without_a_native_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        assert!(native_recovery_lines(&state).is_empty());
+        assert!(!state.native_journal().exists());
+    }
+
+    fn native_status_journal(filler_events: usize) -> (tempfile::TempDir, StateDir) {
+        use crate::commands::ctx::provider::{
+            AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
+        };
+        use crate::commands::ctx::runtime::checkpoint;
+        use crate::commands::ctx::runtime::journal::{
+            CheckpointId, CheckpointKind, EventScope, Journal, JournalSessionId, MessageId,
+            RouteIdentity, SeatId, SequenceId, SessionIdentity,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(state.root()).unwrap();
+        let session = JournalSessionId::new("native-status-1").unwrap();
+        let mut journal = Journal::open(&state).unwrap();
+        journal
+            .create_session(&SessionIdentity {
+                session: session.clone(),
+                seat: SeatId::new("seat-1").unwrap(),
+                generation: 1,
+                task: None,
+                route: RouteIdentity {
+                    route: RouteId::new("fixture").unwrap(),
+                    provider: ProviderId::new("anthropic").unwrap(),
+                    endpoint: EndpointId::new("fixture").unwrap(),
+                    account: AccountId::new("fixture").unwrap(),
+                    billing_pool: BillingPoolId::new("fixture").unwrap(),
+                    protocol: Protocol::AnthropicMessages,
+                    model: ModelId {
+                        vendor: "fixture".into(),
+                        id: "fixture-model".into(),
+                    },
+                },
+                repo: std::path::PathBuf::from("/native-test-repo"),
+                created_at: 1,
+                completed_at: None,
+            })
+            .unwrap();
+        journal
+            .acknowledge_input(
+                &session,
+                1,
+                &EventScope::default(),
+                MessageId::new("m1").unwrap(),
+                "go".to_string(),
+                false,
+                Some(1),
+                1,
+            )
+            .unwrap();
+        let replayed = journal.replay(&session).unwrap();
+        let portable = checkpoint::build(
+            &replayed,
+            SequenceId(1),
+            SequenceId(1),
+            &CheckpointId::new("cp-1").unwrap(),
+            &checkpoint::CheckpointContext {
+                reason: "token_pressure".to_string(),
+                ..Default::default()
+            },
+            compaction::structural_summary(&replayed, SequenceId(1)),
+            1,
+        );
+        checkpoint::commit(
+            &mut journal,
+            None,
+            1,
+            &EventScope::default(),
+            CheckpointKind::Compaction,
+            &portable,
+            1,
+        )
+        .unwrap();
+        drop(journal);
+
+        // Issue #614: pad the session with `filler_events` extra, unrelated
+        // events (inserted directly, bypassing the journal API's own
+        // bookkeeping) so a test can prove the recovery summary's work does
+        // not scale with total journal history.
+        if filler_events > 0 {
+            let connection = rusqlite::Connection::open(state.native_journal()).unwrap();
+            let mut next_sequence: i64 = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM native_events WHERE session_id = ?1",
+                    [session.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            for index in 0..filler_events {
+                next_sequence += 1;
+                let payload = format!(
+                    r#"{{"type":"input_acknowledged","message_id":"filler-{index}","text":"filler payload {index}","steering":false,"at_ms":null}}"#
+                );
+                connection
+                    .execute(
+                        "INSERT INTO native_events (
+                            session_id, sequence, generation, event_type, turn_id, attempt_id,
+                            message_id, tool_call_id, execution_id, usage_id, task_id,
+                            checkpoint_id, payload_json, committed_at
+                        ) VALUES (?1, ?2, 1, 'input_acknowledged', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?3, ?2)",
+                        rusqlite::params![session.as_str(), next_sequence, payload],
+                    )
+                    .unwrap();
+            }
+        }
+
+        (dir, state)
+    }
+
+    /// Issue #486: a compacted native session reports its count and the
+    /// reason for its newest compaction, read straight off the journal.
+    #[test]
+    fn the_native_recovery_section_names_the_newest_compaction_reason() {
+        let (_dir, state) = native_status_journal(0);
+
+        let lines = native_recovery_lines(&state);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].contains("native native-status-1"), "{}", lines[0]);
+        assert!(lines[0].contains("1 compaction(s)"), "{}", lines[0]);
+        assert!(lines[0].contains("token_pressure"), "{}", lines[0]);
+        assert!(lines[0].contains("structural summary"), "{}", lines[0]);
+    }
+
+    /// Issue #614's own Fix acceptance: instruments `journal::decode_event`
+    /// calls (behind `#[cfg(test)]`) and asserts the recovery summary
+    /// decodes the same, small number of payloads whether the session's
+    /// history is 10 events or 800 -- the work ceiling is the projection,
+    /// never the total history.
+    #[test]
+    fn status_recovery_summary_reads_bounded_history() {
+        use crate::commands::ctx::runtime::journal;
+
+        let (_small_dir, small_state) = native_status_journal(10);
+        journal::reset_decoded_payload_count();
+        let small_lines = native_recovery_lines(&small_state);
+        let small_decoded = journal::decoded_payload_count();
+
+        let (_large_dir, large_state) = native_status_journal(800);
+        journal::reset_decoded_payload_count();
+        let large_lines = native_recovery_lines(&large_state);
+        let large_decoded = journal::decoded_payload_count();
+
+        assert_eq!(small_lines.len(), 1, "got {small_lines:?}");
+        assert!(
+            small_lines[0].contains("1 compaction(s)"),
+            "{}",
+            small_lines[0]
+        );
+        assert!(
+            small_lines[0].contains("token_pressure"),
+            "{}",
+            small_lines[0]
+        );
+
+        assert_eq!(large_lines.len(), 1, "got {large_lines:?}");
+        assert!(
+            large_lines[0].contains("1 compaction(s)"),
+            "{}",
+            large_lines[0]
+        );
+        assert!(
+            large_lines[0].contains("token_pressure"),
+            "{}",
+            large_lines[0]
+        );
+
+        assert_eq!(
+            small_decoded, large_decoded,
+            "decoded-payload work must not grow with journal history size"
+        );
+        assert!(
+            large_decoded <= 1,
+            "status should decode at most the newest compaction's own payload, got {large_decoded}"
+        );
+    }
+
+    /// The old regression form of #614: a corrupt, oversized payload on an
+    /// event type the summary never reads must not break status either.
+    #[test]
+    fn status_recovery_summary_tolerates_a_corrupt_unrelated_payload() {
+        let (_dir, state) = native_status_journal(0);
+        let connection = rusqlite::Connection::open(state.native_journal()).unwrap();
+        connection
+            .execute(
+                "UPDATE native_events SET payload_json = ?1 WHERE event_type = 'input_acknowledged'",
+                ["not-json".repeat(128 * 1024)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let lines = native_recovery_lines(&state);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].contains("1 compaction(s)"), "{}", lines[0]);
+        assert!(lines[0].contains("token_pressure"), "{}", lines[0]);
+    }
+
     /// Issue #312: the pure rendering half of `--breakdown`, exercised
     /// directly against a hand-built summary -- no session, transcript, or
     /// compile pass involved. Pins the deterministic shape: every bucket row
@@ -2511,6 +2864,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2551,6 +2905,7 @@ mod tests {
                 full: true,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2587,6 +2942,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2618,6 +2974,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: true,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -2675,6 +3032,7 @@ mod tests {
             mode: verification::VerificationMode::Changed,
             source: "configured".into(),
             repo: repo.to_path_buf(),
+            branch: String::new(),
             change_fingerprint: verification::change_fingerprint(repo).expect("fingerprint"),
             changed_paths: vec![],
             fallback_to_full: false,
@@ -2717,6 +3075,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             repo.path(),
@@ -2750,6 +3109,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             repo.path(),
@@ -2781,6 +3141,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             repo.path(),
@@ -2816,6 +3177,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -2863,6 +3225,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -2909,6 +3272,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -2972,6 +3336,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3011,6 +3376,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3063,6 +3429,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3120,6 +3487,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3194,6 +3562,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3239,6 +3608,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3282,6 +3652,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3331,6 +3702,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3390,6 +3762,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3445,6 +3818,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3485,6 +3859,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3565,6 +3940,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3626,6 +4002,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3671,6 +4048,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3714,7 +4092,7 @@ mod tests {
 
         let tree = tmp.path().join("worktree-repo");
         std::fs::create_dir_all(&tree).expect("mkdir");
-        let held = permit::acquire_writer(&state, 2, "session ab12cd34: claude", &tree)
+        let held = permit::acquire_writer(&state, 2, "session ab12cd34: claude", &tree, None)
             .expect("writer permit granted");
 
         let mut out = Vec::new();
@@ -3726,6 +4104,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3764,6 +4143,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3802,8 +4182,9 @@ mod tests {
         let env = env_for(state.root());
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-        let same = permit::acquire_writer(&state, 0, "same-repo", &repo).expect("granted");
-        let other = permit::acquire_writer(&state, 0, "other-repo", &other_repo).expect("granted");
+        let same = permit::acquire_writer(&state, 0, "same-repo", &repo, None).expect("granted");
+        let other =
+            permit::acquire_writer(&state, 0, "other-repo", &other_repo, None).expect("granted");
 
         let mut out = Vec::new();
         run_with(
@@ -3814,6 +4195,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -3877,6 +4259,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -3995,6 +4378,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4061,6 +4445,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4114,6 +4499,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4178,6 +4564,7 @@ mod tests {
                     full: false,
                     breakdown: None,
                     json: false,
+                    agents: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -4215,6 +4602,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
 
         let mut out = Vec::new();
@@ -4291,6 +4679,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4361,6 +4750,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4469,6 +4859,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
 
         ledger::record(
@@ -4539,6 +4930,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
 
         let mut out = Vec::new();
@@ -4574,6 +4966,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
 
         let mut out = Vec::new();
@@ -4638,6 +5031,7 @@ mod tests {
                     full: false,
                     breakdown: None,
                     json: false,
+                    agents: false,
                 },
                 &mut out,
                 tmp.path(),
@@ -4699,6 +5093,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4740,6 +5135,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4772,6 +5168,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4820,6 +5217,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4873,6 +5271,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4925,6 +5324,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -4994,6 +5394,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5061,6 +5462,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5138,6 +5540,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5180,6 +5583,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5218,6 +5622,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5266,6 +5671,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -5317,6 +5723,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -5381,6 +5788,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             &repo,
@@ -5417,6 +5825,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5460,6 +5869,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5497,6 +5907,7 @@ mod tests {
                         full: false,
                         breakdown: None,
                         json: false,
+                        agents: false,
                     },
                     &mut out,
                     tmp.path(),
@@ -5542,6 +5953,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5794,6 +6206,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5826,6 +6239,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5881,6 +6295,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -5950,6 +6365,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6016,6 +6432,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6170,6 +6587,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut full_out,
             &repo,
@@ -6188,6 +6606,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut brief_out,
             &repo,
@@ -6322,6 +6741,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),
@@ -6369,6 +6789,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
 
         let mut first = Vec::new();
@@ -6421,6 +6842,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
 
         let mut first = Vec::new();
@@ -6509,6 +6931,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
         let mut first_out = Vec::new();
         run_with(
@@ -6537,6 +6960,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut status_out,
             &repo,
@@ -6665,6 +7089,7 @@ mod tests {
             full: false,
             breakdown: None,
             json: false,
+            agents: false,
         };
 
         let mut out_a = Vec::new();
@@ -6712,6 +7137,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut full_out,
             tmp.path(),
@@ -6729,6 +7155,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut brief_out,
             tmp.path(),
@@ -6761,6 +7188,7 @@ mod tests {
                 full: false,
                 breakdown: None,
                 json: false,
+                agents: false,
             },
             &mut out,
             tmp.path(),

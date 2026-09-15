@@ -1,0 +1,11 @@
+{
+  "id": "req-send-input",
+  "outcome": {
+    "result": {
+      "accepted": true
+    },
+    "status": "ok"
+  },
+  "revision": 4,
+  "v": 1
+}

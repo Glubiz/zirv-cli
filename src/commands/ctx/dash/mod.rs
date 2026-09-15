@@ -13,6 +13,9 @@
 
 pub mod actions;
 pub mod hit;
+pub mod link;
+pub mod native_pane;
+pub mod native_ux;
 pub mod notify;
 pub mod pane;
 pub mod roster;
@@ -49,7 +52,7 @@ use super::policy;
 use super::state::StateDir;
 use super::term;
 use super::window;
-use super::{fallback, handoff, handover, mail, memory, prompt, score, seat, sessions};
+use super::{fallback, handoff, handover, mail, memory, prompt, runtime, score, seat, sessions};
 use crate::commands::workflow;
 use crate::style;
 use actions::{MENU_NO_CWD, MENU_NO_REQUEST};
@@ -3631,6 +3634,13 @@ fn on_quit(
             // SESSION_ENV` -- without this, a quit/restore round-trip
             // silently downgraded a genuine worker's steering mail to peer.
             parent_session: pane.parent_session().map(str::to_string),
+            // Issue #490 (roadmap N21 item A): which KIND of pane this was, so
+            // the restore reopens it through `open_native_pane`/
+            // `resolve_attach` rather than trying to relaunch an argv a native
+            // pane never had. The generation is recorded beside it so a
+            // restore that comes back on a different one is visible.
+            native: pane.is_native(),
+            native_generation: pane.native().map(|native| native.generation()).unwrap_or(0),
         })
         .collect();
     let panes_for_roster = merge_unoffered(live, unoffered);
@@ -3733,7 +3743,7 @@ struct ErrorEntry {
 /// `push_error` is the thin impure wrapper the hot path calls, so the collapse
 /// and acknowledgement rules are testable without a terminal.
 #[derive(Debug, Default)]
-struct ErrorLog {
+pub(crate) struct ErrorLog {
     entries: Vec<ErrorEntry>,
     next_id: u64,
 }
@@ -3859,6 +3869,209 @@ fn push_error(errors: &mut ErrorLog, message: String) {
     errors.record(message, Instant::now());
 }
 
+/// The dashboard's own successor backend (issue #552).
+///
+/// Two backends, one per successor runtime:
+///
+/// * a HARNESS successor is the in-place pty swap `Pane::handover` has always
+///   performed -- one child replaced under one pane, the pane's own identity
+///   untouched;
+/// * a NATIVE successor cannot be an in-place child replacement, because a
+///   native pane has no child: it is an in-process session with its own
+///   journal. So it is opened first (`Pane::spawn_native`, on THIS seat's
+///   short id and the committed generation) and the source pane is retired
+///   only once the successor exists. Exactly one of the two is ever live: the
+///   successor is built before anything is taken away, and a failure to build
+///   it leaves the source untouched and holding the seat.
+///
+/// Nothing here is `#[cfg(unix)]`; both halves compile and run on every
+/// platform CI covers.
+struct PaneSuccessorLauncher<'a> {
+    pane: &'a mut Pane,
+    cfg: &'a CtxConfig,
+    req: &'a handover::HandoverRequest,
+    note: &'a handoff::Handoff,
+    role: prompt::PromptRole,
+    repo: &'a Path,
+    size: (u16, u16),
+    /// The two `NativeDashboardSpec` fields a successor cannot infer.
+    /// `Default` is what every production call site passes; a deterministic
+    /// test opens a REAL successor pane against `fixture::FixtureProvider`
+    /// in a bare temp repo, the same escape `NativeDashboardSpec::provider`
+    /// already documents for itself.
+    native: NativeSuccessorSpec,
+}
+
+/// See [`PaneSuccessorLauncher::native`].
+struct NativeSuccessorSpec {
+    /// Whether the successor acquires the per-tree writer permit. A seat that
+    /// was writing keeps writing, which is every production rollover.
+    writing: bool,
+    provider: Option<String>,
+}
+
+impl Default for NativeSuccessorSpec {
+    fn default() -> Self {
+        Self {
+            writing: true,
+            provider: None,
+        }
+    }
+}
+
+/// What a native successor is told first: the handoff packet the source's own
+/// context was distilled into, every acknowledged input the source never
+/// delivered, and the reconciliation it is halted on.
+///
+/// Criterion 2 is the reason acknowledged input is spelled out here rather
+/// than assumed to be in the packet: the packet is a SUMMARY, and an
+/// operator's undelivered instruction is not something a summary may lose.
+fn native_successor_input(
+    plan: &super::rollover_runtime::SuccessorPlan,
+    note: &handoff::Handoff,
+    cfg: &CtxConfig,
+) -> String {
+    let mut text = super::wrap::restart_prompt(note, &cfg.screen.thresholds());
+    if !plan.acknowledged_input.is_empty() {
+        text.push_str(
+            "\n\nAcknowledged input the previous session never answered. Treat each line as an \
+             instruction you still owe:\n",
+        );
+        for input in &plan.acknowledged_input {
+            text.push_str("- ");
+            text.push_str(input);
+            text.push('\n');
+        }
+    }
+    if let Some(halt) = &plan.halted_for {
+        text.push_str("\n\nSTOP AND RECONCILE FIRST: ");
+        text.push_str(halt);
+        text.push('\n');
+    }
+    text
+}
+
+impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
+    fn launch(
+        &mut self,
+        plan: &super::rollover_runtime::SuccessorPlan,
+    ) -> Result<String, super::rollover_runtime::SuccessorRefusal> {
+        use super::rollover_runtime::SuccessorRefusal;
+
+        if plan.to != super::runtime::RuntimeKind::Native {
+            // A WRAPPED source swaps its child in place: one pane, one
+            // identity, a new harness underneath it.
+            if !self.pane.is_native() {
+                return self
+                    .pane
+                    .handover(
+                        self.cfg, self.req, self.note, self.role, self.repo, self.size,
+                    )
+                    .map(|()| self.pane.session_id().to_string())
+                    .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()));
+            }
+            // A NATIVE source has no child to swap, so the harness successor
+            // is opened beside it and the source retired afterwards -- the
+            // same open-then-retire shape the native branch below uses, over
+            // the same `Pane::build_swap_launch` derivation an in-place swap
+            // runs on.
+            let state = self.pane.state_dir().clone();
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let launch = self
+                .pane
+                .build_swap_launch(
+                    self.cfg,
+                    self.req,
+                    self.note,
+                    self.role,
+                    self.repo,
+                    &session_id,
+                    // The socket `Pane::spawn_on_seat` goes on to bind for
+                    // this identity, so the child is told where to report
+                    // before the pane exists to bind it.
+                    Some(&state.socket_for(&session_id)),
+                    self.pane.title().to_string(),
+                )
+                .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()))?;
+            let successor = Pane::spawn_on_seat(
+                launch.spec,
+                &state,
+                self.pane.cwd(),
+                self.repo,
+                self.size,
+                &launch.turn_env,
+                launch.turn_signal_capable,
+                launch.idle_quiet,
+                Some(&plan.short),
+            )
+            .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()))?;
+            return Ok(self.retire_source_for(successor));
+        }
+
+        // Built BEFORE anything is taken away: a failure here leaves the
+        // source pane exactly as it was, still holding the seat with all of
+        // its durable state (`rollover_runtime`'s own item 7).
+        // The successor's session must be created in the SAME state
+        // directory this pane is registered in: `spawn_interactive` resolves
+        // its own from the environment, and a bare `env_from_process()` would
+        // send the journal somewhere the pane then replays nothing from.
+        let state = self.pane.state_dir().clone();
+        let state_root = state.root().to_str().map(str::to_string);
+        let process_env = super::config::env_from_process();
+        let env = move |key: &str| {
+            if key == super::state::STATE_ENV {
+                return state_root.clone();
+            }
+            process_env(key)
+        };
+        let successor = Pane::spawn_native(
+            self.cfg,
+            &state,
+            &env,
+            self.repo,
+            self.pane.verb(),
+            self.pane.title().to_string(),
+            self.size,
+            native_pane::NativeDashboardSpec {
+                repo: self.pane.cwd().to_path_buf(),
+                role: self.role.label().to_string(),
+                route: plan.target_route.clone(),
+                writing: self.native.writing,
+                provider: self.native.provider.clone(),
+                // The seat's stable address and the generation `seat::commit`
+                // promoted. This is what keeps mail, nudge and `zirv ctx
+                // status` pointed at the same logical seat across the swap.
+                seat: Some((plan.short.clone(), plan.generation)),
+                initial_input: Some(native_successor_input(plan, self.note, self.cfg)),
+            },
+        )
+        .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()))?;
+
+        Ok(self.retire_source_for(successor))
+    }
+}
+
+impl PaneSuccessorLauncher<'_> {
+    /// Swaps `successor` into the roster slot the source occupies and retires
+    /// the source, returning the successor's own session identity.
+    ///
+    /// One live successor from here on. The source is retired WITHOUT
+    /// releasing the registry record or the seat, both of which the successor
+    /// has just adopted under the same short id -- see
+    /// `Pane::retire_for_successor`.
+    fn retire_source_for(&mut self, successor: Pane) -> String {
+        let session = successor.session_id().to_string();
+        let mut source = std::mem::replace(self.pane, successor);
+        // The SOURCE's own harness quit sequence -- a native source has no
+        // child to ask politely and ignores it.
+        let quit_sequence = adapters::select(Some(source.agent()), &[], self.cfg)
+            .map(|adapter| adapter.quit_sequence().to_string())
+            .unwrap_or_default();
+        source.retire_for_successor(&quit_sequence);
+        session
+    }
+}
+
 /// Issue #84: the `Ctrl+A o` picker's confirm action. Distills a handoff
 /// packet through the exact same machinery `wrap::perform_handover_swap`
 /// uses (`handoff::distill_or_structural` against the pane's own current
@@ -3942,8 +4155,57 @@ fn handover_pane(
         prompt::PromptRole::Worker
     };
     let size = pane.screen().size();
-    match pane.handover(cfg, req, &note, role, repo, (size.1, size.0)) {
-        Ok(()) => true,
+    // Issue #552: every live swap starts its successor through the ONE
+    // production seam, `rollover_runtime::launch_successor` -- so the
+    // direction (harness->harness, harness->native, native->harness,
+    // native->native) decides which backend runs, this seat's subagents are
+    // settled before anything takes the seat, and an ambiguous tool effect
+    // halts the successor instead of being replayed by it.
+    let from = if pane.is_native() {
+        super::runtime::RuntimeKind::Native
+    } else {
+        super::runtime::RuntimeKind::Harness
+    };
+    let plan = super::rollover_runtime::plan_successor(
+        from,
+        req.successor_runtime(),
+        pane.short(),
+        req.generation
+            .or_else(|| super::seat::load(state, pane.short()).map(|seat| seat.generation))
+            .unwrap_or(1),
+        Some(&req.target_agent),
+        req.target_model.as_deref(),
+        req.target_route.as_deref(),
+        req.resume_session.as_deref(),
+        super::rollover_runtime::load(state, pane.short())
+            .and_then(|record| record.boundary)
+            .as_ref(),
+    );
+    let parent_session = pane.session_id().to_string();
+    let mut launcher = PaneSuccessorLauncher {
+        pane,
+        cfg,
+        req,
+        note: &note,
+        role,
+        repo,
+        size: (size.1, size.0),
+        native: NativeSuccessorSpec::default(),
+    };
+    match super::rollover_runtime::launch_successor(
+        state,
+        repo,
+        &mut launcher,
+        &plan,
+        Some(&parent_session),
+        if req.structural_only {
+            super::rollover_runtime::Drain::Forced
+        } else {
+            super::rollover_runtime::Drain::Quiesced
+        },
+        super::state::now_secs(),
+    ) {
+        Ok(_) => true,
         Err(e) => {
             // `Pane::handover` assembles the successor completely before it
             // touches the old child, so a failure here leaves the pane
@@ -4133,6 +4395,7 @@ fn settle_pending_rollover(
                     &short,
                     &seat.agent,
                     &seat.session,
+                    runtime::RuntimeKind::Harness,
                 ) {
                     // A lifecycle hook OBSERVED this conversation for this
                     // exact seat and zirv session: the strongest evidence
@@ -4180,6 +4443,8 @@ fn settle_pending_rollover(
                             generation: None,
                             structural_only: true,
                             resume_session: resume.clone(),
+                            target_runtime: None,
+                            target_route: None,
                         },
                         cfg,
                         repo,
@@ -4879,7 +5144,7 @@ fn turn_signal_capable_for(cfg: &CtxConfig, agent_name: &str) -> bool {
 /// not a silently-headless pane; `LaunchMode::Headless` already reads as
 /// "no pin" through `launch_mode_pin_env`, so no separate `Option` is
 /// needed to make "no pin" explicit -- the enum already has that variant.
-fn build_turn_env(
+pub(crate) fn build_turn_env(
     cfg: &CtxConfig,
     state: &StateDir,
     repo: &Path,
@@ -5138,7 +5403,7 @@ pub(crate) fn select_live_dash_dir(candidates: &[DashCandidate]) -> Option<&Dash
 /// `AgentAdapter::interactive_cmd`'s output exactly (duplicated rather than
 /// shared: pulling in `chat` here for one helper would make `dash` and
 /// `chat` depend on each other in both directions).
-fn flatten_command(command: std::process::Command) -> Vec<String> {
+pub(crate) fn flatten_command(command: std::process::Command) -> Vec<String> {
     let mut argv = vec![command.get_program().to_string_lossy().to_string()];
     argv.extend(command.get_args().map(|a| a.to_string_lossy().to_string()));
     argv
@@ -5245,7 +5510,7 @@ fn sibling_root_for(canon_repo: &Path) -> Option<PathBuf> {
 /// in `[dash] workdir_roots` / `ZIRV_CTX_DASH_WORKDIR_ROOTS` (`REPO_FORBIDDEN`
 /// -- see `DashConfig::workdir_roots`'s own doc comment; a repo checkout can
 /// never contribute to this list).
-fn workdir_roots(cfg: &CtxConfig, repo: &Path) -> Vec<PathBuf> {
+pub(crate) fn workdir_roots(cfg: &CtxConfig, repo: &Path) -> Vec<PathBuf> {
     let mut roots = default_workdir_roots(repo);
     for extra in &cfg.dash.workdir_roots {
         let path = PathBuf::from(extra);
@@ -5305,7 +5570,7 @@ fn workdir_outside_roots_reason(dir: &Path, roots: &[PathBuf]) -> String {
 /// what the default confinement is and how an operator widens it.
 ///
 /// `Ok(accepted)`, unchanged, when `workdir` is `None` -- pre-#228 behaviour.
-fn resolved_spawn_cwd(
+pub(crate) fn resolved_spawn_cwd(
     accepted: PathBuf,
     workdir: Option<&Path>,
     roots: &[PathBuf],
@@ -5601,6 +5866,51 @@ impl SpawnRefusal {
             budget_exhausted: true,
         }
     }
+}
+
+/// Whether a request's claimed `parent_session` is refused, and as which
+/// KIND of refusal. `None` allows it.
+///
+/// `requester` is the identity the intake channel itself proved (`Some` only
+/// for a pane's own private directory); `claims_a_live_pane` says whether an
+/// unproven claim names a session this dashboard is actually running.
+///
+/// Issue #627: the two cases are not the same refusal. A request that arrived
+/// on some pane's OWN channel and named a different session is that pane
+/// forging a lineage -- `::policy`, because an inline fallback would route
+/// straight around a gate this operator's dashboard just applied. A request
+/// on the SHARED channel proved no identity at all, which is the ordinary
+/// shape of a dashboard-hosted seat that re-registered after a restart with
+/// handoff: nothing was forged, the channel simply cannot carry the claim.
+/// That is `::channel`, so the requester falls back to the inline supervised
+/// run (`agent::answer_for_ack`) instead of the delegation exiting 1 with no
+/// fallback at all. The claim itself is refused either way -- the caller's
+/// `verified_parent` reads `requester` and never `req.parent_session`.
+pub(crate) fn parent_claim_refusal(
+    claimed: &str,
+    requester: Option<&str>,
+    claims_a_live_pane: bool,
+) -> Option<SpawnRefusal> {
+    let mismatched = match requester {
+        Some(requester) => claimed != requester,
+        None => claims_a_live_pane,
+    };
+    if !mismatched {
+        return None;
+    }
+    let reason = format!(
+        "a spawn request may only name the session it was sent from as its parent; this one \
+         arrived on {} and claimed '{claimed}'",
+        match requester {
+            Some(requester) => format!("session {requester}'s own channel"),
+            None => "a channel that proves no session identity".to_string(),
+        }
+    );
+    Some(if requester.is_some() {
+        SpawnRefusal::policy(reason)
+    } else {
+        SpawnRefusal::channel(reason)
+    })
 }
 
 /// Why this spawn is refused on delegation depth, or `None` to allow it.
@@ -6299,21 +6609,12 @@ fn fulfill_spawn_request(
     // is attributed the sibling's identity. Accepted for this release;
     // socket-peer-credential hardening is tracked in issue #179.
     if let Some(claimed) = req.parent_session.as_deref() {
-        let mismatched = match requester {
-            Some(requester) => claimed != requester,
-            None => panes
+        let claims_a_live_pane = requester.is_none()
+            && panes
                 .iter()
-                .any(|pane| sessions::short_id(pane.session_id()) == claimed),
-        };
-        if mismatched {
-            return Err(SpawnRefusal::policy(format!(
-                "a spawn request may only name the session it was sent from as its parent; this \
-                 one arrived on {} and claimed '{claimed}'",
-                match requester {
-                    Some(requester) => format!("session {requester}'s own channel"),
-                    None => "a channel that proves no session identity".to_string(),
-                }
-            )));
+                .any(|pane| sessions::short_id(pane.session_id()) == claimed);
+        if let Some(refusal) = parent_claim_refusal(claimed, requester, claims_a_live_pane) {
+            return Err(refusal);
         }
     }
     // Issue #249: the ONLY parent id any downstream mail-trust seam for the
@@ -6363,6 +6664,62 @@ fn fulfill_spawn_request(
     }
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(SpawnRefusal::policy(reason));
+    }
+    // Issue #490 (roadmap N21 item A): a request naming the NATIVE runtime
+    // opens a native pane instead of a wrapped harness child. Everything
+    // above this point has already run -- the argv guard, the repo gate, the
+    // workdir roots, the pane cap, the delegation depth cap and the operator's
+    // own agent allowlist -- and the pane's own session takes it from there:
+    // `spawn_interactive` acquires its writer lease against this seat's own
+    // generation and its execution broker is the effect-time authority, so a
+    // native worker is fenced by N04 rather than by a harness's argv.
+    //
+    // What this path deliberately does NOT do is the wrapped path's
+    // harness-shaped accounting -- the reroute search, the per-provider token
+    // reservation, the work-group token ledger and the pane deadline are all
+    // keyed to an adapter and a transcript a native session does not have. A
+    // request that asks for any of them is refused here rather than accepted
+    // and silently unaccounted.
+    if req
+        .agent
+        .eq_ignore_ascii_case(super::runtime::RuntimeKind::Native.as_str())
+    {
+        if req.work_group_id.is_some() || req.budget_tokens.is_some() || req.timeout_secs.is_some()
+        {
+            return Err(SpawnRefusal::policy(
+                "a native pane cannot yet be spawned inside a work group or under a token/time                  ceiling: those are accounted from a harness transcript this session does not                  have"
+                    .to_string(),
+            ));
+        }
+        let title = format!("wrk native {}", requested_role.label());
+        let mut pane = Pane::spawn_native(
+            cfg,
+            state,
+            &super::config::env_from_process(),
+            repo,
+            sessions::Verb::Dash,
+            title,
+            size,
+            native_pane::NativeDashboardSpec {
+                repo: spawn_cwd.clone(),
+                role: requested_role.label().to_string(),
+                route: req.model.clone(),
+                // A worker delegation is writing work; a read-only request is
+                // expressed by the pane's own broker refusing every write,
+                // which is the same answer `--mode read-only` produces.
+                writing: req.mode == super::permit::WorkerMode::Writing,
+                provider: None,
+                seat: None,
+                initial_input: None,
+            },
+        )
+        .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
+        pane.set_report_to(report_to_for(req, cfg));
+        pane.set_parent_session(verified_parent.clone());
+        let short = pane.short().to_string();
+        panes.push(pane);
+        nudge_queues.push(VecDeque::new());
+        return Ok((short, Vec::new(), None));
     }
     let requested_adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
@@ -6660,6 +7017,9 @@ fn fulfill_spawn_request(
             cfg.supervise.max_writers,
             &format!("session {registry_short}: {}", req.agent),
             &tree,
+            // Issue #488: the dashboard spawns for a requester whose seat
+            // generation it does not carry; the env fence is what applies.
+            None,
         ) {
             Ok(permit) => Some(permit),
             Err(refusal) => {
@@ -9028,6 +9388,50 @@ fn spawn_restored_pane(
     errors: &mut ErrorLog,
     deferred_restore: &mut Vec<roster::RosterPane>,
 ) {
+    // Issue #490 (roadmap N21 item A): a native pane comes back through the
+    // SAME seam a fresh one opens on -- `open_native_pane`, and therefore
+    // `resolve_attach`. That is the whole point of routing the restore here
+    // rather than reconstructing a session: if the persistent runtime is
+    // still holding this seat's conversation, the restored pane attaches to
+    // it instead of opening a second in-process supervisor over it.
+    if candidate.native {
+        match Pane::spawn_native(
+            cfg,
+            state,
+            &super::config::env_from_process(),
+            repo,
+            sessions::Verb::Dash,
+            candidate.title.clone(),
+            size,
+            native_pane::NativeDashboardSpec {
+                repo: repo.to_path_buf(),
+                role: candidate.role.clone(),
+                route: None,
+                writing: true,
+                provider: None,
+                seat: None,
+                initial_input: None,
+            },
+        ) {
+            Ok(mut pane) => {
+                pane.set_report_to(candidate.report_to.clone());
+                if candidate.report_reminder_sent {
+                    pane.mark_report_reminder_sent();
+                }
+                pane.settled_mail_sent = candidate.settled_mail_sent;
+                pane.set_work_group_id(candidate.work_group_id.clone());
+                pane.set_budget_tokens(candidate.budget_tokens);
+                pane.set_parent_session(candidate.parent_session.clone());
+                panes.push(pane);
+                nudge_queues.push(VecDeque::new());
+            }
+            Err(e) => {
+                push_error(errors, format!("restore {}: {e}", candidate.short));
+                deferred_restore.push(candidate.clone());
+            }
+        }
+        return;
+    }
     let adapter = match adapters::select(Some(&candidate.agent), &[], cfg) {
         Ok(adapter) => adapter,
         Err(e) => {
@@ -9137,6 +9541,14 @@ fn next_deliverable(queue: &mut VecDeque<String>, injectable: bool) -> Option<St
 pub(crate) trait Injector {
     fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()>;
     fn track_delivery_sender(&mut self, _sender: &str) {}
+    /// Issue #468: this pane's own attention-block dedup pairing -- see
+    /// `Pane::mail_block_log`'s own doc comment. Defaults to `None`/no-op for
+    /// an injector double that does not exercise the dedup itself; a fake
+    /// that does must back this with real storage the way `Pane` does.
+    fn mail_block_log(&self) -> Option<&(&'static str, String)> {
+        None
+    }
+    fn set_mail_block_log(&mut self, _value: Option<(&'static str, String)>) {}
 }
 
 impl Injector for Pane {
@@ -9146,6 +9558,14 @@ impl Injector for Pane {
 
     fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
         self.inject_visible(label, body)
+    }
+
+    fn mail_block_log(&self) -> Option<&(&'static str, String)> {
+        self.mail_block_log.as_ref()
+    }
+
+    fn set_mail_block_log(&mut self, value: Option<(&'static str, String)>) {
+        self.mail_block_log = value;
     }
 }
 
@@ -9188,7 +9608,7 @@ fn deliver_and_consume<I: Injector>(
 ///
 /// G1: takes `injectable` rather than a `&PaneState` -- see `deliverable_now`'s
 /// own doc comment for why `state == Idle` alone is no longer the right gate.
-fn is_delivery_eligible(verb: sessions::Verb, injectable: bool) -> bool {
+pub(crate) fn is_delivery_eligible(verb: sessions::Verb, injectable: bool) -> bool {
     verb == sessions::Verb::Dash && injectable
 }
 
@@ -9233,6 +9653,78 @@ fn mail_injection_label(from_agent: &str, from_session: &str, is_parent: bool) -
     )
 }
 
+/// Issue #468: whether a mail sweep target may be typed into a pane right
+/// now, given `status` (`attention::load`'s own return for this pane), and
+/// the specific [`attention::Attention`] blocking it when it may not.
+///
+/// `Pane::injectable`'s turn-signal gate (the caller's own precondition
+/// before either `sweep_one_pane` or `advise_one_pane` is even reached) is
+/// silent about WHY a pane looks idle: a Claude permission dialog pauses the
+/// harness between the model's own turns, so the turn-signal side can report
+/// idle while the hook-driven attention axis still latches
+/// `Attention::Approval` (see `attention.rs`'s own doc comment on the
+/// `AdapterHook`/`Supervisor` authority split, and #456/#457, which taught
+/// hooks to clear that latch again once the prompt resolves). Typing into a
+/// pane in that state lands as raw keystrokes on the open dialog -- exactly
+/// the "must not answer the prompt" failure this function exists to
+/// prevent.
+///
+/// `Projection::Blocked(Attention::None)` (a bare `Lifecycle::Waiting` with
+/// no named reason) is deliberately NOT treated as blocking: nothing in this
+/// codebase currently latches that combination from a live hook, and
+/// treating it as a mail block would risk silently withholding an ordinary
+/// advisory from a session that is simply waiting on its next prompt.
+///
+/// Issue #479 (roadmap N10) moved the predicate itself to
+/// [`attention::blocking`] so the runtime-neutral delegation mail service
+/// (`ctx::delegation::send`) answers the identical question for a NATIVE
+/// worker that this sweep answers for a legacy pane -- one rule, not two
+/// that can drift apart.
+fn mail_blocked_by_attention(
+    status: &super::attention::SessionStatus,
+) -> Option<super::attention::Attention> {
+    super::attention::blocking(status)
+}
+
+/// Pure: the decision-log skip reason named by issue #468's own acceptance
+/// criterion (`approval-open`) for [`attention::Attention::Approval`], and an
+/// analogous reason for every other variant [`mail_blocked_by_attention`] can
+/// return -- so a skip row is never just "blocked" with no way to tell which
+/// latch caused it. Shared with the delegation mail service since issue #479.
+fn mail_block_reason(attention: super::attention::Attention) -> &'static str {
+    super::attention::block_reason(attention)
+}
+
+/// Issue #468: the one decision-log row shape for an attention-blocked mail
+/// sweep target, used both for the skip (`action` = `mail-attention-skip`)
+/// and for the delivery that eventually follows one (`action` =
+/// `mail-attention-delivered`). Both rows carry the SAME `mail_id` in
+/// `detail`, so `logs/decisions.jsonl` alone answers "was this message ever
+/// actually shown, and if not, why" without cross-referencing anything else.
+/// Best-effort, like every other decision-log write in this module: a
+/// logging failure must never affect whether the mail sweep itself proceeds.
+fn log_mail_attention_event(
+    state: &StateDir,
+    session_id: &str,
+    action: &str,
+    reason: &str,
+    mail_id: &str,
+) {
+    let _ = super::log::append(
+        state,
+        &super::log::Decision {
+            ts: super::state::now_secs(),
+            session: session_id,
+            verb: "dash",
+            verdict: "n/a",
+            score: 0,
+            action,
+            detail: &format!("mail {mail_id}: {reason}"),
+            observed_at: None,
+        },
+    );
+}
+
 /// One pane's share of a mail sweep: **at most one** message, injected
 /// visibly and consumed only if the injection itself succeeded. Returns
 /// whether anything was delivered.
@@ -9251,8 +9743,13 @@ fn mail_injection_label(from_agent: &str, from_session: &str, is_parent: bool) -
 /// resolved `[screen]` config, threaded straight through to
 /// `mail::message_with_delivery_envelope` below.
 #[allow(clippy::too_many_arguments)]
-fn sweep_one_pane<I: Injector>(
+pub(crate) fn sweep_one_pane<I: Injector>(
     injector: &mut I,
+    // Issue #468: this pane's own zirv session id, for the attention-block
+    // decision-log rows below -- the same value `advise_one_pane` already
+    // takes as `session_id`, matching `report_back_reminder_sweep`'s own
+    // `Decision::session` convention.
+    session_id: &str,
     state: &StateDir,
     slug: &str,
     agent: &str,
@@ -9272,8 +9769,34 @@ fn sweep_one_pane<I: Injector>(
         }
     };
     let Some((path, msg)) = messages.into_iter().next() else {
+        // Issue #468: nothing unread any more -- if a blocked-mail pairing
+        // was still held (the message was consumed some other way, e.g. a
+        // roster restart or a direct `zirv ctx inbox`), there is no
+        // delivery left to pair it with a decision-log row.
+        injector.set_mail_block_log(None);
         return false;
     };
+    let mail_id = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Issue #468: the hook-driven attention axis, not just the turn-signal
+    // `injectable` gate the caller already applied -- see
+    // `mail_blocked_by_attention`'s own doc comment for why both are needed.
+    let status = super::attention::load(state, short);
+    if let Some(attention) = mail_blocked_by_attention(&status) {
+        let reason = mail_block_reason(attention);
+        let already_logged = injector
+            .mail_block_log()
+            .is_some_and(|(_, id)| id == &mail_id);
+        if !already_logged {
+            log_mail_attention_event(state, session_id, "mail-attention-skip", reason, &mail_id);
+            injector.set_mail_block_log(Some((reason, mail_id)));
+        }
+        return false;
+    }
+
     let is_parent =
         parent_short.is_some_and(|parent| sessions::short_id(&msg.from_session) == parent);
     // D5: label and body share one budget. The label carries the sender's own
@@ -9289,6 +9812,20 @@ fn sweep_one_pane<I: Injector>(
     match deliver_and_consume(injector, state, slug, short, &label, &path, &body) {
         Ok(()) => {
             injector.track_delivery_sender(&msg.from_session);
+            // Issue #468: pair a delivery with the skip row logged earlier
+            // for this SAME mail id, if any.
+            if let Some((reason, blocked_id)) = injector.mail_block_log().cloned()
+                && blocked_id == mail_id
+            {
+                log_mail_attention_event(
+                    state,
+                    session_id,
+                    "mail-attention-delivered",
+                    reason,
+                    &blocked_id,
+                );
+            }
+            injector.set_mail_block_log(None);
             true
         }
         Err(e) => {
@@ -9359,7 +9896,7 @@ fn orchestrator_mail_advisory_body(count: usize, from_agent: &str, from_session:
 /// already uses, so the dedup/formatting logic is testable without a real
 /// pty.
 #[allow(clippy::too_many_arguments)]
-fn advise_one_pane<I: Injector>(
+pub(crate) fn advise_one_pane<I: Injector>(
     injector: &mut I,
     session_id: &str,
     state: &StateDir,
@@ -9386,6 +9923,10 @@ fn advise_one_pane<I: Injector>(
     entry.forget_missing(ids.iter().map(String::as_str));
 
     let Some((newest_path, newest_msg)) = messages.last() else {
+        // Issue #468: nothing unread any more -- drop any blocked-mail
+        // pairing that was still held; there is no delivery left to pair it
+        // with a decision-log row.
+        injector.set_mail_block_log(None);
         return false;
     };
     let newest_name = newest_path
@@ -9395,6 +9936,32 @@ fn advise_one_pane<I: Injector>(
     if entry.contains(&newest_name) {
         return false;
     }
+
+    // Issue #468: the hook-driven attention axis, not just the turn-signal
+    // `injectable` gate the caller already applied -- see
+    // `mail_blocked_by_attention`'s own doc comment for why both are needed.
+    // Checked here, AFTER the `entry.contains` dedup above and BEFORE the
+    // injection, so `attention::load` is only ever paid for a message this
+    // pane has not already been advised about.
+    let status = super::attention::load(state, short);
+    if let Some(attention) = mail_blocked_by_attention(&status) {
+        let reason = mail_block_reason(attention);
+        let already_logged = injector
+            .mail_block_log()
+            .is_some_and(|(_, id)| id == &newest_name);
+        if !already_logged {
+            log_mail_attention_event(
+                state,
+                session_id,
+                "mail-attention-skip",
+                reason,
+                &newest_name,
+            );
+            injector.set_mail_block_log(Some((reason, newest_name)));
+        }
+        return false;
+    }
+
     let body = orchestrator_mail_advisory_body(
         messages.len(),
         &newest_msg.from_agent,
@@ -9403,6 +9970,20 @@ fn advise_one_pane<I: Injector>(
     match injector.try_inject("mail", &body) {
         Ok(()) => {
             entry.insert(&newest_name);
+            // Issue #468: pair a delivery with the skip row logged earlier
+            // for this SAME mail id, if any.
+            if let Some((reason, blocked_id)) = injector.mail_block_log().cloned()
+                && blocked_id == newest_name
+            {
+                log_mail_attention_event(
+                    state,
+                    session_id,
+                    "mail-attention-delivered",
+                    reason,
+                    &blocked_id,
+                );
+            }
+            injector.set_mail_block_log(None);
             true
         }
         Err(e) => {
@@ -9441,11 +10022,13 @@ fn mail_sweep(
         if is_delivery_eligible(pane.verb(), injectable) {
             let agent = pane.agent().to_string();
             let short = pane.short().to_string();
+            let session_id = pane.session_id().to_string();
             // Issue #249: captured before `pane` is reborrowed mutably as
             // the `Injector` below.
             let parent_short = pane.parent_session().map(str::to_string);
             sweep_one_pane(
                 pane,
+                &session_id,
                 state,
                 &slug,
                 &agent,
@@ -10253,12 +10836,19 @@ fn sync_quiet_heuristic_attention(
 /// whatever additional panes get spawned along the way. Nesting is the
 /// caller's job (`chat.rs::run_with` checks `sessions::nesting_refusal`
 /// before calling this at all).
+/// Issue #490 (roadmap N21 item A): how often a native pane re-reads the
+/// durable records its overview, usage strip and notices are built from. Two
+/// seconds, not every frame: the records are a fleet's, not a conversation's,
+/// and none of them change between two consecutive 150 ms frames.
+const NATIVE_RECORD_REFRESH_SECS: u64 = 2;
+
 pub fn run_dashboard(
     cfg: &CtxConfig,
     repo: &Path,
     env: EnvLookup<'_>,
     state: &StateDir,
     first: PaneSpec,
+    first_native: Option<native_pane::NativeDashboardSpec>,
     force_pace: bool,
 ) -> CtxResult<i32> {
     let mut errors = ErrorLog::default();
@@ -10303,14 +10893,24 @@ pub fn run_dashboard(
     // Issue #160 finding 2 (2026-08-28): `build_turn_env` itself now pushes
     // the pin from the `LaunchMode` passed in, so this call site no longer
     // pushes it separately.
-    let (mut turn_env, turn_env_err) = build_turn_env(
-        cfg,
-        state,
-        repo,
-        &agent_name,
-        &session_id,
-        super::adapters::LaunchMode::Interactive,
-    );
+    // Issue #490 (roadmap N21 item A): a native first pane spawns no child
+    // process at all, so there is no environment to build for one -- and
+    // resolving a wrapped adapter for `native` would only produce a spurious
+    // error line. Everything below this that a native pane DOES need (the
+    // spawn-request channel, the owner pid, the restore roster) is built the
+    // same way either way.
+    let (mut turn_env, turn_env_err) = if first_native.is_some() {
+        (Vec::new(), None)
+    } else {
+        build_turn_env(
+            cfg,
+            state,
+            repo,
+            &agent_name,
+            &session_id,
+            super::adapters::LaunchMode::Interactive,
+        )
+    };
     if let Some(e) = turn_env_err {
         push_error(&mut errors, e);
     }
@@ -10434,21 +11034,62 @@ pub fn run_dashboard(
         super::wrap::apply_interactive_gate(gate, force_pace)?;
     }
 
+    // Issue #489 (issue #352's PTY-ownership residual): with `[session]
+    // persistent` on and a runtime listening, the terminals belong to the
+    // SERVICE. The dashboard becomes a protocol client of it rather than
+    // opening a second pty over a session that already has a supervisor --
+    // two supervisors on one conversation is exactly what the runtime exists
+    // to prevent. The link is dropped straight away here: it is the ownership
+    // question that matters at this point, and painting a runtime-owned
+    // session inside the dashboard is step N11 (#480).
+    if let Some(mut link) = link::RuntimeLink::connect(state, cfg.session.persistent) {
+        let slug = super::state::repo_slug(repo);
+        match link.seat_for(&slug, &agent_name) {
+            Ok(Some(seat)) => {
+                remove_request_dir(&requests_dir);
+                return Err(format!("{} ({})", link::RUNTIME_OWNS_IT, seat.short).into());
+            }
+            Ok(None) => {}
+            // A runtime that cannot be read is not a reason to refuse to
+            // start: the dashboard owns its own terminals in that case,
+            // which is the pre-runtime behaviour and a working one.
+            Err(error) => push_error(&mut errors, format!("runtime link: {error}")),
+        }
+    }
+
     let size = (main.width.max(1), main.height.max(1));
     // O7: the request directory exists from here on, so the one startup step
     // that can still fail outright owes it the same cleanup every other exit
     // path performs. Before this, a first pane that would not spawn left
     // `<state>/dash/<short>-<token>/` behind on every attempt.
-    let first_pane = match Pane::spawn(
-        first,
-        state,
-        repo,
-        repo,
-        size,
-        &turn_env,
-        turn_signal_capable_for(cfg, &agent_name),
-        Duration::from_millis(cfg.dash.idle_quiet_ms),
-    ) {
+    // Issue #490 (roadmap N21 item A): `zirv chat --runtime native` opens its
+    // conversation as the FIRST PANE of the ordinary dashboard rather than in
+    // a loop of its own, so the header, the sidebar, the roster, the mail
+    // sweep, the spawn channel and every other dashboard surface apply to it
+    // unchanged -- and a second, wrapped pane can be spawned beside it.
+    let first_spawn = match first_native {
+        Some(spec) => Pane::spawn_native(
+            cfg,
+            state,
+            env,
+            repo,
+            first.verb,
+            first.title.clone(),
+            size,
+            spec,
+        ),
+        None => Pane::spawn(
+            first,
+            state,
+            repo,
+            repo,
+            size,
+            &turn_env,
+            turn_signal_capable_for(cfg, &agent_name),
+            Duration::from_millis(cfg.dash.idle_quiet_ms),
+        ),
+    };
+    let first_pane = match first_spawn {
         Ok(mut pane) => {
             pane.set_intake_dir(first_pane_channel);
             pane
@@ -10685,6 +11326,13 @@ pub fn run_dashboard(
     // `Some` both while a drag is in progress and, after release, for
     // whatever stays highlighted until the next `Down` clears it.
     let mut selection: Option<Selection> = None;
+    // Issue #490 (roadmap N21 item A): the native pane key contract's own
+    // Ctrl+C quit-confirmation clock, held by the dashboard because the pane
+    // it belongs to may be swapped out from under it (focus moves, a pane is
+    // reaped). One clock for the roster, not one per pane: an operator only
+    // ever presses Ctrl+C in the pane they are looking at, and arming it in
+    // one pane and confirming it in another must not quit anything.
+    let mut native_ctrl_c: Option<Instant> = None;
     // The adaptive input-poll wait's own clock (`input_poll_wait`): refreshed
     // only on a keyboard/mouse event read from crossterm, not on pane output --
     // a streaming response or an animated spinner must not hold the loop in
@@ -10891,6 +11539,23 @@ pub fn run_dashboard(
         }
         for pane in panes.iter_mut() {
             pane.on_turn_signal();
+        }
+        // Issue #490 (roadmap N21 item A): a native pane's multi-agent
+        // surfaces (the overview, the usage strip, notices, the worker
+        // inspection) are read from durable records on their OWN cadence, not
+        // on every frame -- a fleet's coordinator graph, delegation receipts,
+        // seat records and pool view are far more expensive than a
+        // conversation's own journal, and none of them change between two
+        // consecutive frames.
+        {
+            let now = super::state::now_secs();
+            for pane in panes.iter_mut() {
+                if let Some(native) = pane.native_mut()
+                    && now.saturating_sub(native.ux().refreshed_at) >= NATIVE_RECORD_REFRESH_SECS
+                {
+                    native.refresh_records(cfg, env, now);
+                }
+            }
         }
         // Issue #440: ahead of EVERY step below that can release a seat --
         // the two enforcement sweeps (`Pane::shutdown`/`stop_now`) and the
@@ -11825,6 +12490,8 @@ pub fn run_dashboard(
                                                             generation: None,
                                                             structural_only: false,
                                                             resume_session: None,
+                                                            target_runtime: None,
+                                                            target_route: None,
                                                         },
                                                         cfg,
                                                         repo,
@@ -12098,19 +12765,37 @@ pub fn run_dashboard(
                                                 match panes.iter_mut().find(|p| p.short() == target)
                                                 {
                                                     Some(pane) => {
-                                                        let quit_sequence = adapters::select(
-                                                            Some(pane.agent()),
-                                                            &[],
-                                                            cfg,
-                                                        )
-                                                        .map(|adapter| adapter.quit_sequence())
-                                                        .unwrap_or("");
-                                                        pane.request_quit(quit_sequence);
-                                                        push_notice(
-                                                            &mut notices,
-                                                            now,
-                                                            format!("asked {target} to quit"),
-                                                        );
+                                                        if pane.is_native() {
+                                                            match pane.stop_now(0) {
+                                                                Ok(()) => push_notice(
+                                                                    &mut notices,
+                                                                    now,
+                                                                    format!(
+                                                                        "asked {target} to stop"
+                                                                    ),
+                                                                ),
+                                                                Err(error) => push_error(
+                                                                    &mut errors,
+                                                                    format!(
+                                                                        "could not stop {target}: {error}"
+                                                                    ),
+                                                                ),
+                                                            }
+                                                        } else {
+                                                            let quit_sequence = adapters::select(
+                                                                Some(pane.agent()),
+                                                                &[],
+                                                                cfg,
+                                                            )
+                                                            .map(|adapter| adapter.quit_sequence())
+                                                            .unwrap_or("");
+                                                            pane.request_quit(quit_sequence);
+                                                            push_notice(
+                                                                &mut notices,
+                                                                now,
+                                                                format!("asked {target} to quit"),
+                                                            );
+                                                        }
                                                     }
                                                     None => push_notice(
                                                         &mut notices,
@@ -12407,11 +13092,62 @@ pub fn run_dashboard(
                                     // until it reports the next one. A line injected
                                     // on top of a half-composed prompt submits it.
                                     InputVerdict::ToChild(bytes) => {
-                                        if !bytes.is_empty()
-                                            && let Some(pane) = panes.get_mut(focused)
-                                            && let Err(e) = pane.write_operator_input(&bytes)
-                                        {
-                                            push_error(&mut errors, format!("write_input: {e}"));
+                                        // Issue #490 (roadmap N21 item A):
+                                        // input routing is the second place a
+                                        // mixed roster parts company. A wrapped
+                                        // pane gets the encoded BYTES through
+                                        // its pty writer; a native pane gets
+                                        // the KEY, through the same router
+                                        // `zirv chat --runtime native` uses --
+                                        // so the composer, the approval dialog
+                                        // and the overview cursor all work
+                                        // identically in either loop, and none
+                                        // of those controls is reachable on a
+                                        // wrapped pane at all.
+                                        let routed_native = panes
+                                            .get_mut(focused)
+                                            .and_then(|pane| pane.native_mut())
+                                            .map(|native| {
+                                                native_pane::handle_native_key(
+                                                    native,
+                                                    key,
+                                                    &mut native_ctrl_c,
+                                                    false,
+                                                    cfg.session.persistent,
+                                                    cfg,
+                                                )
+                                            });
+                                        match routed_native {
+                                            // Ctrl+Q (or a double Ctrl+C)
+                                            // inside a native pane closes THAT
+                                            // pane, not the dashboard: the
+                                            // dashboard has its own prefixed
+                                            // quit, and a pane's own quit
+                                            // binding must never take the
+                                            // whole fleet with it.
+                                            Some(native_pane::NativeKey::Quit) => {
+                                                if let Some(pane) = panes.get_mut(focused)
+                                                    && let Err(e) = pane.stop_now(0)
+                                                {
+                                                    push_error(
+                                                        &mut errors,
+                                                        format!("native pane quit: {e}"),
+                                                    );
+                                                }
+                                            }
+                                            Some(native_pane::NativeKey::Consumed) => {}
+                                            None => {
+                                                if !bytes.is_empty()
+                                                    && let Some(pane) = panes.get_mut(focused)
+                                                    && let Err(e) =
+                                                        pane.write_operator_input(&bytes)
+                                                {
+                                                    push_error(
+                                                        &mut errors,
+                                                        format!("write_input: {e}"),
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                     InputVerdict::Dash(DashAction::LiteralPrefix) => {
@@ -12773,6 +13509,46 @@ pub fn run_dashboard(
                         // with `mouse_capture` true.
                         Ok(Event::Mouse(mouse)) => {
                             input_errors = 0;
+                            // Issue #490 (roadmap N21 item A): #354's
+                            // clickable rows, for a native pane's overview. A
+                            // click inside the panel column selects the agent
+                            // whose rendered lines it landed in and never
+                            // scrolls, submits or forwards anything -- and a
+                            // wrapped pane never reaches it, so the native
+                            // control is not offered where it has no meaning.
+                            //
+                            // PR #545 review finding 3: the WHEEL is routed
+                            // here too. A native pane has no vt100 grid and no
+                            // pty scrollback, so the wrapped path below moved a
+                            // buffer that is never rendered while the
+                            // transcript the operator is looking at sat still.
+                            // Both gestures now reach the one scroll position
+                            // a native pane actually has, the same state its
+                            // own Up/Down/PageUp/PageDown keys move.
+                            if let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
+                            {
+                                match mouse.kind {
+                                    MouseEventKind::Down(_) => {
+                                        let main = effective_main(full, sidebar_cols, zoomed);
+                                        native_pane::click_overview_row(
+                                            native,
+                                            main,
+                                            mouse.column,
+                                            mouse.row,
+                                        );
+                                        continue;
+                                    }
+                                    MouseEventKind::ScrollUp => {
+                                        native_pane::wheel_scroll(native, WHEEL_STEP);
+                                        continue;
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        native_pane::wheel_scroll(native, -WHEEL_STEP);
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
                             let delta = match mouse.kind {
                                 MouseEventKind::ScrollUp => WHEEL_STEP,
                                 MouseEventKind::ScrollDown => -WHEEL_STEP,
@@ -13001,6 +13777,21 @@ pub fn run_dashboard(
                                     }
                                 }
                                 _ => {}
+                            }
+                        }
+                        // Issue #490 (roadmap N21 item A): a bracketed paste
+                        // into a native pane goes to its composer as one
+                        // insertion, never key by key -- which is what keeps a
+                        // pasted multi-line block from submitting on its first
+                        // newline. A wrapped pane's child does its own paste
+                        // handling over the pty, unchanged.
+                        Ok(Event::Paste(text)) => {
+                            input_errors = 0;
+                            if let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
+                            {
+                                native.handle_composer_action(
+                                    native_pane::ComposerAction::InsertText(text),
+                                );
                             }
                         }
                         Ok(_) => input_errors = 0,
@@ -13271,6 +14062,7 @@ pub fn run_dashboard(
         // same `&overlay` it was built from -- see `overlay_route_is_current`.
         let next_snapshot_overlay_ident = overlay_identity(&overlay);
         let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
+        let mut native_approval_rendered = false;
         let draw = terminal.draw(|f| {
             if !zoomed {
                 ui::render_header(f, layout.header, &facts);
@@ -13304,28 +14096,57 @@ pub fn run_dashboard(
                     .as_ref()
                     .filter(|sel| sel.pane_short == pane.short())
                     .map(|sel| normalize_selection(sel.anchor, sel.end));
-                ui::render_grid(f, main_area, pane.screen(), selection_range);
-                // Why the grid is not moving, when it is not moving because
-                // the operator scrolled it. Drawn after the grid so it sits on
-                // top, and before any overlay so a dialog still owns the
-                // screen.
-                ui::render_scroll_marker(f, main_area, pane.scrollback());
-                // HIGH-1: the focused pane's own caret. ratatui hides the
-                // cursor on every frame whose `cursor_position` is left unset,
-                // so without this there is no caret anywhere for the whole
-                // session. An overlay is drawn on top below, but the caret is
-                // only set for the bare grid: an open dialog owns the screen.
-                //
-                // Suppressed while scrolled back as well: `cursor_position` is
-                // the *live* cursor and knows nothing about the scrollback
-                // offset, so a caret drawn from it would land on an unrelated
-                // row of history. tmux hides the cursor in copy mode for the
-                // same reason.
-                if matches!(overlay, ui::Overlay::None)
-                    && pane.scrollback() == 0
-                    && let Some(pos) = ui::grid_cursor_position(main_area, pane.screen())
-                {
-                    f.set_cursor_position(pos);
+                // Issue #490 (roadmap N21 item A): a native pane draws its own
+                // conversation inside this frame's chrome. Everything around
+                // it -- the header, the sidebar, the rule, the footer, the
+                // overlay -- is the dashboard's and is drawn by the same code
+                // either way, so this is the ONE place the two pane kinds part
+                // company on rendering. `render_native_pane` owns only the
+                // interior, exactly as `render_grid` never draws a border of
+                // its own.
+                if let Some(native) = pane.native() {
+                    let facts = native.status_facts();
+                    let (view, presentation) = native.view();
+                    // The whole native frame INSIDE the dashboard's main area:
+                    // the conversation, the agent/task overview beside it, the
+                    // usage/health provenance strip beneath it, and whichever
+                    // modal is open. Which of those exist at all is
+                    // `native_ux::resolve_layout`'s decision against the area
+                    // it is actually given, so the same code draws every
+                    // terminal size with no size-specific branch here.
+                    native_approval_rendered = native_pane::render_native_dashboard(
+                        f,
+                        main_area,
+                        view,
+                        presentation,
+                        &facts,
+                        native.ux(),
+                    );
+                } else {
+                    ui::render_grid(f, main_area, pane.screen(), selection_range);
+                    // Why the grid is not moving, when it is not moving because
+                    // the operator scrolled it. Drawn after the grid so it sits
+                    // on top, and before any overlay so a dialog still owns the
+                    // screen.
+                    ui::render_scroll_marker(f, main_area, pane.scrollback());
+                    // HIGH-1: the focused pane's own caret. ratatui hides the
+                    // cursor on every frame whose `cursor_position` is left
+                    // unset, so without this there is no caret anywhere for the
+                    // whole session. An overlay is drawn on top below, but the
+                    // caret is only set for the bare grid: an open dialog owns
+                    // the screen.
+                    //
+                    // Suppressed while scrolled back as well: `cursor_position`
+                    // is the *live* cursor and knows nothing about the
+                    // scrollback offset, so a caret drawn from it would land on
+                    // an unrelated row of history. tmux hides the cursor in
+                    // copy mode for the same reason.
+                    if matches!(overlay, ui::Overlay::None)
+                        && pane.scrollback() == 0
+                        && let Some(pos) = ui::grid_cursor_position(main_area, pane.screen())
+                    {
+                        f.set_cursor_position(pos);
+                    }
                 }
             }
             ui::render_overlay(f, main_area, &overlay, render_tick);
@@ -13333,6 +14154,12 @@ pub fn run_dashboard(
         if let Err(e) = draw {
             push_error(&mut errors, format!("draw: {e}"));
         } else {
+            if native_approval_rendered
+                && matches!(overlay, ui::Overlay::None)
+                && let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
+            {
+                native.ux_mut().mark_approval_visible();
+            }
             frame_snapshot = next_snapshot;
             frame_snapshot_overlay_ident = next_snapshot_overlay_ident;
             // Issue #354 phase 2: this frame COMPLETED, so whatever it showed
@@ -14741,6 +15568,7 @@ mod tests {
             role: None,
             start_time: None,
             in_flight: None,
+            runtime: runtime::RuntimeKind::Harness,
         }
     }
 
@@ -18716,6 +19544,254 @@ mod tests {
         );
     }
 
+    // Issue #468: a mail advisory held back by an open permission dialog
+    // (`Attention::Approval`) must never be typed while the dialog is open,
+    // and must be retried -- typed exactly once -- at the next verified-idle
+    // boundary once the dialog closes. `SucceedingInjector`'s own dedup
+    // field is a permanent no-op `None` (see its own `Injector` impl), which
+    // cannot exercise "log the skip once, not every tick" -- this fake backs
+    // the pairing with real storage the way `Pane` does.
+    struct RecordingInjector {
+        calls: Vec<(String, String)>,
+        mail_block_log: Option<(&'static str, String)>,
+    }
+    impl Injector for RecordingInjector {
+        fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+            self.calls.push((label.to_string(), body.to_string()));
+            Ok(())
+        }
+        fn mail_block_log(&self) -> Option<&(&'static str, String)> {
+            self.mail_block_log.as_ref()
+        }
+        fn set_mail_block_log(&mut self, value: Option<(&'static str, String)>) {
+            self.mail_block_log = value;
+        }
+    }
+
+    fn latch_approval(state: &StateDir, short: &str, now: u64) {
+        super::super::attention::record(
+            state,
+            short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "permission requested",
+                100,
+                now,
+            )
+            .with_attention(super::super::attention::Attention::Approval),
+            now,
+        );
+    }
+
+    /// The #456/#457 clearing shape (`hook::clear_resolved_approval`),
+    /// reproduced here rather than imported: an `AdapterHook` observation
+    /// asserting `Attention::None` outranks and replaces the latched
+    /// `Approval`.
+    fn clear_approval(state: &StateDir, short: &str, now: u64) {
+        super::super::attention::record(
+            state,
+            short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "tool ran",
+                100,
+                now,
+            )
+            .with_attention(super::super::attention::Attention::None),
+            now,
+        );
+    }
+
+    /// Acceptance test (b): the advisory is never typed while the dialog is
+    /// open -- typing into that pane would land as raw keystrokes on the
+    /// open dialog, not as a visible line the operator reads, and could
+    /// silently answer the prompt.
+    #[test]
+    fn advise_one_pane_never_types_while_approval_is_open() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+        latch_approval(&state, "short0000", 1);
+
+        let mut injector = RecordingInjector {
+            calls: Vec::new(),
+            mail_block_log: None,
+        };
+        let mut advised = HashMap::new();
+        let delivered = advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut ErrorLog::default(),
+        );
+
+        assert!(!delivered, "must not advise while the dialog is open");
+        assert!(
+            injector.calls.is_empty(),
+            "nothing may be typed into the pane while approval is pending: {:?}",
+            injector.calls
+        );
+    }
+
+    /// Acceptance test (a): mail arrives while the pane is `Approval`; the
+    /// state clears; the advisory is typed exactly once at the next idle
+    /// boundary (never re-typed on a later, unchanged tick).
+    #[test]
+    fn advise_one_pane_retries_once_approval_clears_and_delivers_exactly_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+        latch_approval(&state, "short0000", 1);
+
+        let mut injector = RecordingInjector {
+            calls: Vec::new(),
+            mail_block_log: None,
+        };
+        let mut advised = HashMap::new();
+        let mut errors = ErrorLog::default();
+
+        // The dialog is still open: held back, not dropped.
+        assert!(!advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+        assert!(injector.calls.is_empty());
+
+        // The dialog closes.
+        clear_approval(&state, "short0000", 2);
+
+        // Next verified-idle boundary: retried and delivered.
+        assert!(advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+        assert_eq!(
+            injector.calls.len(),
+            1,
+            "typed exactly once: {:?}",
+            injector.calls
+        );
+
+        // A further, unchanged tick must not re-type it.
+        assert!(!advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+        assert_eq!(
+            injector.calls.len(),
+            1,
+            "still exactly once: {:?}",
+            injector.calls
+        );
+        assert!(errors.is_empty(), "got errors: {errors:?}");
+    }
+
+    /// Acceptance test (c): a decision-log row records the skip (`reason` =
+    /// `approval-open`) and the later delivery names the SAME mail id, so
+    /// `logs/decisions.jsonl` alone is enough to diagnose a missed ping.
+    #[test]
+    fn attention_blocked_mail_logs_a_skip_and_a_matching_delivery_for_the_same_mail_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+        let mail_id = mail::list(&state, slug, None, None).expect("list")[0]
+            .0
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+
+        latch_approval(&state, "short0000", 1);
+
+        let mut injector = RecordingInjector {
+            calls: Vec::new(),
+            mail_block_log: None,
+        };
+        let mut advised = HashMap::new();
+        let mut errors = ErrorLog::default();
+        assert!(!advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+
+        clear_approval(&state, "short0000", 2);
+        assert!(advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut advised,
+            &mut errors,
+        ));
+
+        let log = std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE))
+            .expect("decision log");
+        let skip_line = log
+            .lines()
+            .find(|l| l.contains("mail-attention-skip"))
+            .unwrap_or_else(|| panic!("no skip row in {log}"));
+        let delivered_line = log
+            .lines()
+            .find(|l| l.contains("mail-attention-delivered"))
+            .unwrap_or_else(|| panic!("no delivered row in {log}"));
+        assert!(
+            skip_line.contains("approval-open"),
+            "skip row names the reason: {skip_line}"
+        );
+        assert!(
+            skip_line.contains(&mail_id),
+            "skip row names the mail id: {skip_line}"
+        );
+        assert!(
+            delivered_line.contains(&mail_id),
+            "delivery row names the SAME mail id: {delivered_line}"
+        );
+        assert!(
+            skip_line.contains("\"session\":\"session-a\""),
+            "got {skip_line}"
+        );
+        assert!(
+            delivered_line.contains("\"session\":\"session-a\""),
+            "got {delivered_line}"
+        );
+    }
+
     // F8: one mail message per pane per tick.
 
     /// The idle gate is checked once, before the first injection, and an
@@ -18749,6 +19825,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         let delivered = sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -18807,6 +19884,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         let delivered = sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -18839,6 +19917,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(!sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             "-work-repo",
             "claude",
@@ -18878,6 +19957,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(!sweep_one_pane(
             &mut FailingInjector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -21435,6 +22515,7 @@ mod tests {
             cfg.supervise.max_writers,
             "pre-held by test",
             &tree,
+            None,
         )
         .expect("hold the tree's one writer slot ahead of the request");
 
@@ -21589,6 +22670,337 @@ mod tests {
         }
     }
 
+    /// Issue #552: the two directions with a NATIVE target actually open a
+    /// live native pane, through the production launcher
+    /// (`PaneSuccessorLauncher`, which is what `handover_pane` drives) --
+    /// not a `NoBackend` refusal.
+    ///
+    /// What is asserted is what a successor owes: it exists, it is native, it
+    /// sits in the roster slot the source occupied (so exactly one seat
+    /// holder), it is a NEW conversation, it answers to the seat's own short
+    /// id, it runs under the committed generation, and retiring the source
+    /// did not delete the registry record the successor just wrote.
+    #[test]
+    fn a_native_successor_actually_opens_as_a_live_pane_on_the_same_seat() {
+        use super::super::rollover_runtime::{SuccessorLauncher, plan_successor};
+        use super::super::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_root = tmp.path().join("state");
+        let state = StateDir::from_root(state_root.clone());
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state_root.to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let cfg = CtxConfig::default();
+
+        for source_runtime in [RuntimeKind::Harness, RuntimeKind::Native] {
+            let mut source = if source_runtime == RuntimeKind::Native {
+                Pane::spawn_native(
+                    &cfg,
+                    &state,
+                    &lookup,
+                    repo.path(),
+                    sessions::Verb::Chat,
+                    "seat".to_string(),
+                    (80, 24),
+                    native_pane::NativeDashboardSpec {
+                        repo: repo.path().to_path_buf(),
+                        role: "orchestrator".to_string(),
+                        route: None,
+                        writing: false,
+                        provider: Some(fixture_provider()),
+                        seat: None,
+                        initial_input: None,
+                    },
+                )
+                .expect("a native source pane opens")
+            } else {
+                Pane::spawn(
+                    PaneSpec {
+                        agent_name: "test-agent".to_string(),
+                        argv: trivial_argv(),
+                        role: prompt::PromptRole::Orchestrator,
+                        verb: sessions::Verb::Chat,
+                        session_id: "51111111-2222-4333-8444-555555555555".to_string(),
+                        title: "seat".to_string(),
+                    },
+                    &state,
+                    repo.path(),
+                    repo.path(),
+                    (80, 24),
+                    &[],
+                    true,
+                    pane::DEFAULT_IDLE_QUIET,
+                )
+                .expect("a wrapped source pane opens")
+            };
+
+            let seat_short = source.short().to_string();
+            let source_session = source.session_id().to_string();
+            let plan = super::super::rollover_runtime::SuccessorPlan {
+                acknowledged_input: vec!["finish the migration note".to_string()],
+                ..plan_successor(
+                    source_runtime,
+                    RuntimeKind::Native,
+                    &seat_short,
+                    9,
+                    Some("claude"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let note = handoff::Handoff {
+                task: "carry the seat across".to_string(),
+                ..handoff::Handoff::default()
+            };
+            let req = handover::HandoverRequest {
+                target_agent: "claude".to_string(),
+                target_model: None,
+                force: false,
+                requested_at: 0,
+                interactive: false,
+                automatic: true,
+                generation: Some(9),
+                structural_only: true,
+                resume_session: None,
+                target_runtime: Some(RuntimeKind::Native.as_str().to_string()),
+                target_route: None,
+            };
+            let successor_session = {
+                let mut launcher = PaneSuccessorLauncher {
+                    pane: &mut source,
+                    cfg: &cfg,
+                    req: &req,
+                    note: &note,
+                    role: prompt::PromptRole::Orchestrator,
+                    repo: repo.path(),
+                    size: (24, 80),
+                    native: NativeSuccessorSpec {
+                        // A bare temp repo cannot take a writer lease, and
+                        // this test is about the successor existing at all.
+                        writing: false,
+                        provider: Some(fixture_provider()),
+                    },
+                };
+                launcher.launch(&plan).unwrap_or_else(|e| {
+                    panic!("{source_runtime:?} -> Native must open a pane: {e}")
+                })
+            };
+
+            assert!(
+                source.is_native(),
+                "{source_runtime:?} -> Native must leave a LIVE native pane, not a refusal"
+            );
+            assert!(source.native().is_some(), "with its own native driver");
+            assert_ne!(
+                successor_session, source_session,
+                "a successor is a new conversation, never the source's own"
+            );
+            assert_eq!(
+                source.session_id(),
+                successor_session,
+                "and the pane in the roster slot IS that successor"
+            );
+            assert_eq!(
+                source.short(),
+                seat_short,
+                "the seat's short id is its address and does not move across a rollover"
+            );
+            let seat =
+                super::super::seat::load(&state, &seat_short).expect("the seat still exists");
+            assert_eq!(
+                seat.generation, 9,
+                "the successor runs under the committed generation"
+            );
+            assert_eq!(seat.runtime, RuntimeKind::Native);
+            assert!(
+                sessions::list(&state)
+                    .iter()
+                    .any(|(record, _)| record.short == seat_short),
+                "retiring the source must not delete the record the successor registered"
+            );
+            let _ = source.shutdown("");
+        }
+    }
+
+    /// Issue #552, the fourth direction: a NATIVE source hands its seat to a
+    /// WRAPPED successor.
+    ///
+    /// A native pane has no child for `Pane::handover` to swap in place, so
+    /// this runs the same open-then-retire shape the native target uses, over
+    /// the same `Pane::build_swap_launch` derivation an in-place swap runs
+    /// on. The assertions are the seat's: a live wrapped pane, on the seat's
+    /// own short id, under the committed generation, with the record the
+    /// successor registered still present.
+    #[test]
+    fn a_harness_successor_takes_the_seat_from_a_native_source() {
+        use super::super::rollover_runtime::{SuccessorLauncher, plan_successor};
+        use super::super::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_root = tmp.path().join("state");
+        let state = StateDir::from_root(state_root.clone());
+        let env: HashMap<String, String> = [(
+            super::super::state::STATE_ENV.to_string(),
+            state_root.to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+
+        // A successor that really spawns, without needing to survive -- the
+        // same stub the pane module's own handover tests use.
+        #[cfg(windows)]
+        let successor_bin = "ping";
+        #[cfg(not(windows))]
+        let successor_bin = "sleep";
+        let cfg = CtxConfig {
+            agent_bin: Some(successor_bin.to_string()),
+            ..CtxConfig::default()
+        };
+
+        let mut source = Pane::spawn_native(
+            &CtxConfig::default(),
+            &state,
+            &lookup,
+            repo.path(),
+            sessions::Verb::Chat,
+            "seat".to_string(),
+            (80, 24),
+            native_pane::NativeDashboardSpec {
+                repo: repo.path().to_path_buf(),
+                role: "orchestrator".to_string(),
+                route: None,
+                writing: false,
+                provider: Some(fixture_provider()),
+                seat: None,
+                initial_input: None,
+            },
+        )
+        .expect("a native source pane opens");
+        let seat_short = source.short().to_string();
+        let source_session = source.session_id().to_string();
+        super::super::seat::register(
+            &state,
+            &seat_short,
+            &source_session,
+            "native",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            0,
+        )
+        .expect("seat");
+
+        let plan = plan_successor(
+            RuntimeKind::Native,
+            RuntimeKind::Harness,
+            &seat_short,
+            11,
+            Some("claude"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let note = handoff::Handoff {
+            task: "carry the seat back onto a harness".to_string(),
+            ..handoff::Handoff::default()
+        };
+        let req = handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: false,
+            automatic: true,
+            generation: Some(11),
+            structural_only: true,
+            resume_session: None,
+            target_runtime: Some(RuntimeKind::Harness.as_str().to_string()),
+            target_route: None,
+        };
+        // The successor's own launch, off the SAME builder an in-place swap
+        // runs on: fenced on the committed generation, and told the socket
+        // its own identity will bind.
+        let probe = source
+            .build_swap_launch(
+                &cfg,
+                &req,
+                &note,
+                prompt::PromptRole::Orchestrator,
+                repo.path(),
+                "probe-session",
+                None,
+                "seat".to_string(),
+            )
+            .expect("the swap launch derives");
+        assert!(
+            probe
+                .turn_env
+                .iter()
+                .any(|(key, value)| key == super::super::seat::GENERATION_ENV && value == "11"),
+            "the successor child is fenced on the committed generation: {:?}",
+            probe.turn_env
+        );
+
+        let successor_session = {
+            let mut launcher = PaneSuccessorLauncher {
+                pane: &mut source,
+                cfg: &cfg,
+                req: &req,
+                note: &note,
+                role: prompt::PromptRole::Orchestrator,
+                repo: repo.path(),
+                size: (24, 80),
+                native: NativeSuccessorSpec::default(),
+            };
+            launcher
+                .launch(&plan)
+                .expect("Native -> Harness must open a wrapped pane")
+        };
+
+        assert!(
+            !source.is_native(),
+            "the roster slot must now hold a LIVE wrapped pane, not a refusal"
+        );
+        assert_eq!(source.agent(), "claude");
+        assert_ne!(
+            successor_session, source_session,
+            "a successor is a new conversation, never the source's own"
+        );
+        assert_eq!(source.session_id(), successor_session);
+        assert_eq!(
+            source.short(),
+            seat_short,
+            "the seat's short id is its address and does not move across a rollover"
+        );
+        let record = sessions::list(&state)
+            .into_iter()
+            .find(|(record, _)| record.short == seat_short);
+        assert!(
+            record.is_some(),
+            "retiring the source must not delete the record the successor registered"
+        );
+        let _ = source.shutdown("");
+    }
+
+    fn fixture_provider() -> String {
+        format!(
+            "fixture:{}",
+            super::super::runtime::fixture::fixture_root()
+                .join("helper-answer.json")
+                .display()
+        )
+    }
+
     /// Issue #155, Phase 5(a): the depth cap is enforced HERE, at the
     /// authority side, not by prompt text. Orchestrator -> SubOrchestrator ->
     /// Worker is the whole tree; a SubOrchestrator asking for another
@@ -21632,6 +23044,38 @@ mod tests {
             )
             .is_some(),
             "nothing may spawn a full Orchestrator seat"
+        );
+    }
+
+    /// Issue #627: a parent claim this dashboard cannot verify is a CHANNEL
+    /// refusal, so the delegation falls back to the inline supervised run
+    /// instead of exiting with no fallback at all -- while a claim forged on
+    /// a channel that DID prove an identity stays a policy refusal.
+    #[test]
+    fn an_unprovable_parent_claim_is_a_retryable_channel_refusal() {
+        // The shape from the bug report: a dashboard-hosted seat, writing on
+        // the shared channel, naming its own live session as its parent.
+        let refusal = parent_claim_refusal("50aaa609", None, true)
+            .expect("an unproven claim on a live pane is still refused");
+        assert!(
+            refusal.retryable,
+            "the channel could not carry the claim; that is not a judgement on the task: \
+             {refusal:?}"
+        );
+        assert!(!refusal.budget_exhausted);
+        assert!(refusal.reason.contains("proves no session identity"));
+
+        // Same claim, but on a channel that proved a DIFFERENT session: a
+        // forged lineage, and an inline fallback would route around the gate.
+        let forged = parent_claim_refusal("50aaa609", Some("bbbb2222"), false)
+            .expect("a forged lineage is refused");
+        assert!(!forged.retryable, "got {forged:?}");
+
+        // And the two allowed shapes stay allowed.
+        assert!(parent_claim_refusal("bbbb2222", Some("bbbb2222"), false).is_none());
+        assert!(
+            parent_claim_refusal("50aaa609", None, false).is_none(),
+            "an unproven claim naming no live pane was never refused"
         );
     }
 
@@ -24317,6 +25761,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",
@@ -24375,6 +25820,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         assert!(sweep_one_pane(
             &mut injector,
+            "session-a",
             &state,
             slug,
             "claude",

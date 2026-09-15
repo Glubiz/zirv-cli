@@ -124,7 +124,7 @@ fn cap_head_tail(text: &str, budget: usize) -> String {
 /// reports only THAT a piece of text is flagged, never where within it, so
 /// replacing the smallest safe unit -- the containing line -- is the only
 /// sound thing to do with that.
-fn redact_text(text: &str) -> String {
+pub(super) fn redact_text(text: &str) -> String {
     text.lines()
         .map(|line| {
             let report = screen::screen(line);

@@ -1,0 +1,1219 @@
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{ToolError, ToolErrorCode};
+use crate::commands::ctx::config::OutputFilterRule;
+use crate::commands::ctx::output::{self, CapturedOutput, CompactionScope, StreamingCapture};
+use crate::commands::ctx::permit::HeavyPermit;
+use crate::commands::ctx::runtime::enforcement::{ProcessEffects, SandboxLaunch};
+use crate::commands::ctx::state::StateDir;
+use crate::commands::ctx::supervise::{self, ChildGuard};
+
+const MAX_WAIT_MS: u64 = 60_000;
+const TERMINATE_GRACE: Duration = Duration::from_secs(2);
+const MAX_COMPLETED: usize = 128;
+/// Hard per-stream ceiling on bytes a reader thread will ever pull off a
+/// process's stdout/stderr/PTY pipe, independent of whether -- or how often
+/// -- a caller polls. Issue #583 (roadmap N05): without this, a reader kept
+/// feeding an unbounded channel for as long as the child kept writing, so a
+/// chatty or malicious child could grow zirv's own memory without bound.
+const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+/// Hard per-stream ceiling on newline-delimited lines, alongside
+/// [`MAX_STREAM_BYTES`]: a byte cap alone does not bound a stream of many
+/// small lines the same way, since each `read()` can still return a full
+/// buffer of tiny lines as one chunk.
+const MAX_STREAM_LINES: usize = 50_000;
+/// Bound on how long `finish` waits for one reader thread to join. Issue
+/// #583 (roadmap N05): a reader blocks in `read()` until its pipe's write
+/// end is fully closed, which a descendant that outlives the direct child
+/// and keeps holding the pipe can prevent forever -- `finish` must still
+/// return so cleanup never hangs the whole process manager on that reader.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessStartArgs {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub shell_script: Option<String>,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub network: bool,
+    #[serde(default)]
+    pub outside_write: bool,
+    #[serde(default)]
+    pub git_metadata_write: bool,
+    #[serde(default)]
+    pub git_push_or_destructive: bool,
+    #[serde(default)]
+    pub interactive: bool,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    pub idempotency_key: String,
+}
+
+impl ProcessStartArgs {
+    pub(super) fn effects(&self) -> ProcessEffects {
+        let shell = self.shell_script.is_some();
+        let (git_write, destructive) = infer_git_effects(&self.program, &self.args);
+        ProcessEffects {
+            repo_write: !self.read_only,
+            outside_write: self.outside_write,
+            network: self.network,
+            git_metadata_write: shell || self.git_metadata_write || git_write,
+            git_push_or_destructive: shell || self.git_push_or_destructive || destructive,
+            clean_environment: false,
+        }
+    }
+
+    pub(super) fn display_command(&self) -> Vec<String> {
+        if let Some(script) = &self.shell_script {
+            let mut command = vec![self.program.clone()];
+            command.extend(self.args.clone());
+            command.push(script.clone());
+            command
+        } else {
+            std::iter::once(self.program.clone())
+                .chain(self.args.clone())
+                .collect()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessHandleArgs {
+    pub handle: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessWaitArgs {
+    pub handle: String,
+    #[serde(default = "default_wait_ms")]
+    pub wait_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessWriteArgs {
+    pub handle: String,
+    pub input: String,
+    #[serde(default)]
+    pub close: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessState {
+    Running,
+    Exited,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessStream {
+    Stdout,
+    Stderr,
+    Pty,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProcessOutputChunk {
+    pub stream: ProcessStream,
+    pub text: String,
+    pub byte_len: usize,
+    pub inline_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProcessSnapshot {
+    pub handle: String,
+    pub state: ProcessState,
+    pub exit_code: Option<i32>,
+    pub output: Vec<ProcessOutputChunk>,
+    pub pending_output_bytes: usize,
+    /// Set once any stream (stdout/stderr/PTY) crossed
+    /// `MAX_STREAM_BYTES`/`MAX_STREAM_LINES` and stopped being read further
+    /// (issue #583 review round 1). Distinct from `pending_output_bytes`:
+    /// that tracks output the caller's own inline-display budget excluded
+    /// but which still reached the persisted capture; this means output was
+    /// never read from the process at all and is gone permanently.
+    pub stream_truncated: bool,
+    pub output_id: Option<String>,
+    pub summary: Option<String>,
+    pub interactive: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ProcessLimits {
+    pub max_inline_bytes: usize,
+    pub max_processes: usize,
+    pub max_summary_bytes: usize,
+    pub max_heavy_operations: usize,
+    pub heavy_patterns: Vec<String>,
+    pub output_filter: Vec<OutputFilterRule>,
+    pub extra_verbatim: Vec<String>,
+    pub compact_search: bool,
+}
+
+#[derive(Debug)]
+struct StreamChunk {
+    stream: ProcessStream,
+    bytes: Vec<u8>,
+    /// Set on the one chunk a reader sends immediately before giving up on
+    /// this stream because it crossed `MAX_STREAM_BYTES`/`MAX_STREAM_LINES`
+    /// (issue #583 review round 1). `false` on every ordinary chunk,
+    /// including the last one before a natural EOF.
+    truncated: bool,
+}
+
+type SpawnedProcess = (ProcessChild, Receiver<StreamChunk>, Vec<JoinHandle<()>>);
+
+enum ProcessChild {
+    Standard {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        guard: ChildGuard,
+    },
+    Pty {
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        writer: Option<Box<dyn Write + Send>>,
+        guard: ChildGuard,
+    },
+}
+
+impl std::fmt::Debug for ProcessChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Standard { child, .. } => f
+                .debug_struct("Standard")
+                .field("pid", &child.id())
+                .finish(),
+            Self::Pty { child, .. } => f
+                .debug_struct("Pty")
+                .field("pid", &child.process_id())
+                .finish(),
+        }
+    }
+}
+
+impl ProcessChild {
+    /// The OS pid, usable from another thread with no borrow on `self` --
+    /// the one piece of state the deadline watchdog needs (issue #583 /
+    /// roadmap N05): it terminates by pid alone, via
+    /// [`supervise::terminate_pid`], never touching `ManagedProcess`/
+    /// `ProcessChild` itself.
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Standard { child, .. } => Some(child.id()),
+            Self::Pty { child, .. } => child.process_id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<i32>, ToolError> {
+        match self {
+            Self::Standard { child, guard, .. } => {
+                let status = child.try_wait().map_err(ToolError::io)?;
+                if status.is_some() {
+                    guard.release();
+                }
+                Ok(status.map(|status| status.code().unwrap_or(-1)))
+            }
+            Self::Pty { child, guard, .. } => {
+                let status = child.try_wait().map_err(ToolError::external)?;
+                if status.is_some() {
+                    guard.release();
+                }
+                Ok(status.map(|status| status.exit_code() as i32))
+            }
+        }
+    }
+
+    fn write_input(&mut self, input: &[u8], close: bool) -> Result<(), ToolError> {
+        match self {
+            Self::Standard { stdin, .. } => {
+                let sink = stdin.as_mut().ok_or_else(|| {
+                    ToolError::new(ToolErrorCode::ProcessClosed, "process stdin is closed")
+                })?;
+                sink.write_all(input).map_err(ToolError::io)?;
+                sink.flush().map_err(ToolError::io)?;
+                if close {
+                    stdin.take();
+                }
+            }
+            Self::Pty { writer, .. } => {
+                let sink = writer.as_mut().ok_or_else(|| {
+                    ToolError::new(ToolErrorCode::ProcessClosed, "PTY input is closed")
+                })?;
+                sink.write_all(input).map_err(ToolError::io)?;
+                sink.flush().map_err(ToolError::io)?;
+                if close {
+                    writer.take();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn terminate(&mut self) -> Result<(), ToolError> {
+        match self {
+            Self::Standard {
+                child,
+                stdin,
+                guard,
+            } => {
+                stdin.take();
+                supervise::terminate(child, TERMINATE_GRACE).map_err(ToolError::external)?;
+                guard.release();
+            }
+            Self::Pty {
+                child,
+                writer,
+                guard,
+            } => {
+                writer.take();
+                #[cfg(not(unix))]
+                if let Some(pid) = child.process_id() {
+                    supervise::kill_tree(pid);
+                }
+                let _ = child.kill();
+                child.wait().map_err(ToolError::external)?;
+                guard.release();
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ManagedProcess {
+    handle: String,
+    child: ProcessChild,
+    receiver: Receiver<StreamChunk>,
+    readers: Vec<JoinHandle<()>>,
+    capture: Option<StreamingCapture>,
+    captured: Option<CapturedOutput>,
+    command: Vec<String>,
+    scope: CompactionScope,
+    started: Instant,
+    timeout: Option<Duration>,
+    state: ProcessState,
+    exit_code: Option<i32>,
+    interactive: bool,
+    heavy_permit: Option<HeavyPermit>,
+    /// Sends once to cancel the deadline watchdog thread (issue #583 /
+    /// roadmap N05) as soon as this process reaches a terminal state by any
+    /// other path (self-detected timeout, natural exit, or an explicit
+    /// `terminate`), so the watchdog never fires a redundant (though
+    /// harmless -- `terminate_pid` on an exited pid is a no-op) kill later.
+    /// `None` when no `timeout_ms` was given, so no watchdog was spawned.
+    watchdog_stop: Option<Sender<()>>,
+    /// Set once any reader thread stopped pulling its stream early because
+    /// it crossed [`MAX_STREAM_BYTES`]/[`MAX_STREAM_LINES`] -- review round
+    /// 1 on #583: hitting either cap used to be silent, with no way for a
+    /// caller to tell "the process produced no more output" apart from "the
+    /// process produced more output than zirv would ever retain". Surfaced
+    /// on [`ProcessSnapshot::stream_truncated`].
+    stream_truncated: bool,
+}
+
+impl ManagedProcess {
+    fn cancel_watchdog(&mut self) {
+        if let Some(stop) = self.watchdog_stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ProcessManager {
+    state: StateDir,
+    repo: PathBuf,
+    limits: ProcessLimits,
+    processes: HashMap<String, ManagedProcess>,
+    idempotency: HashMap<String, String>,
+}
+
+impl ProcessManager {
+    pub(super) fn new(state: StateDir, repo: PathBuf, limits: ProcessLimits) -> Self {
+        Self {
+            state,
+            repo,
+            limits,
+            processes: HashMap::new(),
+            idempotency: HashMap::new(),
+        }
+    }
+
+    pub(super) fn existing_for_key(&self, key: &str) -> Option<&str> {
+        self.idempotency.get(key).map(String::as_str)
+    }
+
+    pub(super) fn start(
+        &mut self,
+        launch: SandboxLaunch,
+        args: &ProcessStartArgs,
+    ) -> Result<ProcessSnapshot, ToolError> {
+        validate_key(&args.idempotency_key)?;
+        if let Some(handle) = self
+            .existing_for_key(&args.idempotency_key)
+            .map(str::to_string)
+        {
+            return self.poll(&handle);
+        }
+        let running = self
+            .processes
+            .values()
+            .filter(|process| process.state == ProcessState::Running)
+            .count();
+        if running >= self.limits.max_processes.max(1) {
+            return Err(ToolError::new(
+                ToolErrorCode::ResourceBusy,
+                "native process limit is exhausted",
+            ));
+        }
+        let command = args.display_command();
+        let command_line = command.join(" ");
+        let heavy_permit =
+            if crate::commands::ctx::permit::is_heavy(&command_line, &self.limits.heavy_patterns) {
+                Some(
+                    crate::commands::ctx::permit::acquire(
+                        &self.state,
+                        self.limits.max_heavy_operations.max(1),
+                        &format!("native:{}", args.idempotency_key),
+                    )
+                    .ok_or_else(|| {
+                        ToolError::new(
+                            ToolErrorCode::ResourceBusy,
+                            "heavy-operation permit pool is exhausted",
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
+        let capture =
+            StreamingCapture::start(&self.state, &self.repo).map_err(ToolError::external)?;
+        let (child, receiver, readers) = match spawn(&launch, args.interactive) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                capture.abort();
+                return Err(error);
+            }
+        };
+        let handle = uuid::Uuid::new_v4().simple().to_string();
+        let scope = output::classify_compaction(
+            &command_line,
+            &self.limits.extra_verbatim,
+            self.limits.compact_search,
+        );
+        // Issue #583 (roadmap N05): the deadline must fire even if nobody
+        // ever calls `poll`/`wait` again, so it cannot live inside
+        // `update_process` alone. This watchdog owns only the bare pid, not
+        // the `Child`/`ManagedProcess`, so it needs no lock over state this
+        // struct's normal methods mutate; `cancel_watchdog` stops it as soon
+        // as the process reaches a terminal state by any other path.
+        let watchdog_stop = args.timeout_ms.zip(child.pid()).map(|(timeout_ms, pid)| {
+            let (stop_tx, stop_rx) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                match stop_rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Cancelled, or the `ManagedProcess` (and its
+                        // `watchdog_stop` sender) was dropped -- either way
+                        // the process was already handled elsewhere.
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        supervise::terminate_pid(pid, TERMINATE_GRACE);
+                    }
+                }
+            });
+            stop_tx
+        });
+        self.processes.insert(
+            handle.clone(),
+            ManagedProcess {
+                handle: handle.clone(),
+                child,
+                receiver,
+                readers,
+                capture: Some(capture),
+                captured: None,
+                command,
+                scope,
+                started: Instant::now(),
+                timeout: args.timeout_ms.map(Duration::from_millis),
+                state: ProcessState::Running,
+                exit_code: None,
+                interactive: args.interactive,
+                heavy_permit,
+                watchdog_stop,
+                stream_truncated: false,
+            },
+        );
+        self.idempotency
+            .insert(args.idempotency_key.clone(), handle.clone());
+        self.prune_completed();
+        self.poll(&handle)
+    }
+
+    pub(super) fn poll(&mut self, handle: &str) -> Result<ProcessSnapshot, ToolError> {
+        let limits = self.limits.clone();
+        let process = self
+            .processes
+            .get_mut(handle)
+            .ok_or_else(|| unknown(handle))?;
+        let (output, pending) = update_process(process, &limits)?;
+        Ok(snapshot(process, output, pending))
+    }
+
+    pub(super) fn wait(
+        &mut self,
+        handle: &str,
+        wait_ms: u64,
+    ) -> Result<ProcessSnapshot, ToolError> {
+        let deadline = Instant::now() + Duration::from_millis(wait_ms.min(MAX_WAIT_MS));
+        loop {
+            let snapshot = self.poll(handle)?;
+            if snapshot.state != ProcessState::Running || Instant::now() >= deadline {
+                return Ok(snapshot);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    pub(super) fn write_input(
+        &mut self,
+        handle: &str,
+        input: &str,
+        close: bool,
+    ) -> Result<ProcessSnapshot, ToolError> {
+        let process = self
+            .processes
+            .get_mut(handle)
+            .ok_or_else(|| unknown(handle))?;
+        if process.state != ProcessState::Running {
+            return Err(ToolError::new(
+                ToolErrorCode::ProcessClosed,
+                "cannot write to a completed process",
+            ));
+        }
+        process.child.write_input(input.as_bytes(), close)?;
+        self.poll(handle)
+    }
+
+    pub(super) fn terminate(&mut self, handle: &str) -> Result<ProcessSnapshot, ToolError> {
+        let limits = self.limits.clone();
+        let process = self
+            .processes
+            .get_mut(handle)
+            .ok_or_else(|| unknown(handle))?;
+        if process.state == ProcessState::Running {
+            process.child.terminate()?;
+            process.state = ProcessState::Cancelled;
+            process.exit_code = None;
+            process.cancel_watchdog();
+        }
+        let (output, pending) = finish(process, &limits, limits.max_inline_bytes)?;
+        Ok(snapshot(process, output, pending))
+    }
+
+    pub(super) fn output_json(snapshot: ProcessSnapshot) -> Result<Value, ToolError> {
+        serde_json::to_value(snapshot).map_err(ToolError::external)
+    }
+
+    fn terminate_all(&mut self) {
+        let handles: Vec<String> = self.processes.keys().cloned().collect();
+        for handle in handles {
+            let _ = self.terminate(&handle);
+        }
+    }
+
+    fn prune_completed(&mut self) {
+        let completed = self
+            .processes
+            .values()
+            .filter(|process| process.state != ProcessState::Running)
+            .count();
+        if completed <= MAX_COMPLETED {
+            return;
+        }
+        let mut oldest: Vec<(String, Duration)> = self
+            .processes
+            .iter()
+            .filter(|(_, process)| process.state != ProcessState::Running)
+            .map(|(handle, process)| (handle.clone(), process.started.elapsed()))
+            .collect();
+        oldest.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+        for (handle, _) in oldest.into_iter().take(completed - MAX_COMPLETED) {
+            self.processes.remove(&handle);
+            self.idempotency.retain(|_, held| held != &handle);
+        }
+    }
+}
+
+impl Drop for ProcessManager {
+    fn drop(&mut self) {
+        self.terminate_all();
+    }
+}
+
+fn spawn(launch: &SandboxLaunch, interactive: bool) -> Result<SpawnedProcess, ToolError> {
+    if interactive {
+        spawn_pty(launch)
+    } else {
+        spawn_standard(launch)
+    }
+}
+
+fn spawn_standard(launch: &SandboxLaunch) -> Result<SpawnedProcess, ToolError> {
+    let mut command = Command::new(&launch.program);
+    command
+        .args(&launch.args)
+        .current_dir(&launch.cwd)
+        .env_clear()
+        .envs(&launch.environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    supervise::isolate_process_tree(&mut command);
+    let mut child = command.spawn().map_err(ToolError::io)?;
+    let guard = ChildGuard::adopt(Some(child.id()));
+    let stdin = child.stdin.take();
+    let (sender, receiver) = mpsc::channel();
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_reader(stdout, sender.clone(), ProcessStream::Stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_reader(stderr, sender, ProcessStream::Stderr));
+    }
+    Ok((
+        ProcessChild::Standard {
+            child,
+            stdin,
+            guard,
+        },
+        receiver,
+        readers,
+    ))
+}
+
+fn spawn_pty(launch: &SandboxLaunch) -> Result<SpawnedProcess, ToolError> {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(ToolError::external)?;
+    let mut command = CommandBuilder::new(&launch.program);
+    for arg in &launch.args {
+        command.arg(arg);
+    }
+    command.cwd(&launch.cwd);
+    for (key, _) in std::env::vars_os() {
+        command.env_remove(key);
+    }
+    for (key, value) in &launch.environment {
+        command.env(key, value);
+    }
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(ToolError::external)?;
+    let writer = pair.master.take_writer().map_err(ToolError::external)?;
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(ToolError::external)?;
+    let guard = ChildGuard::adopt(child.process_id());
+    let (sender, receiver) = mpsc::channel();
+    let readers = vec![spawn_reader(reader, sender, ProcessStream::Pty)];
+    Ok((
+        ProcessChild::Pty {
+            child,
+            writer: Some(writer),
+            guard,
+        },
+        receiver,
+        readers,
+    ))
+}
+
+fn spawn_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    sender: Sender<StreamChunk>,
+    stream: ProcessStream,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        let mut total_bytes = 0usize;
+        let mut total_lines = 0usize;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    total_bytes += read;
+                    total_lines += buffer[..read].iter().filter(|&&byte| byte == b'\n').count();
+                    // Issue #583 (roadmap N05): stop pulling more of this
+                    // stream once either hard ceiling is crossed,
+                    // independent of whether -- or how often -- a caller
+                    // drains the channel. A byte-only cap does not bound a
+                    // stream of many small lines the same way a child could
+                    // still flood: each `read()` can return a full buffer of
+                    // short lines as one chunk under the byte cap.
+                    //
+                    // Checked here, after folding this read into the
+                    // running totals, rather than at the top of the loop:
+                    // that lets the chunk that actually crosses the ceiling
+                    // carry `truncated: true` itself (review round 1), so a
+                    // caller can tell "no more output" apart from "more
+                    // output existed and was permanently dropped" without a
+                    // separate empty marker chunk.
+                    let truncated =
+                        total_bytes >= MAX_STREAM_BYTES || total_lines >= MAX_STREAM_LINES;
+                    if sender
+                        .send(StreamChunk {
+                            stream,
+                            bytes: buffer[..read].to_vec(),
+                            truncated,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if truncated {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn update_process(
+    process: &mut ManagedProcess,
+    limits: &ProcessLimits,
+) -> Result<(Vec<ProcessOutputChunk>, usize), ToolError> {
+    if process.state != ProcessState::Running {
+        return drain(process, limits.max_inline_bytes);
+    }
+    if process
+        .timeout
+        .is_some_and(|timeout| process.started.elapsed() >= timeout)
+    {
+        process.child.terminate()?;
+        process.state = ProcessState::TimedOut;
+        process.exit_code = None;
+        process.cancel_watchdog();
+        return finish(process, limits, limits.max_inline_bytes);
+    }
+    let (mut output, mut pending) = drain(process, limits.max_inline_bytes)?;
+    if let Some(code) = process.child.try_wait()? {
+        process.state = ProcessState::Exited;
+        process.exit_code = Some(code);
+        process.cancel_watchdog();
+        let used: usize = output.iter().map(|chunk| chunk.text.len()).sum();
+        let (tail, tail_pending) = finish(
+            process,
+            limits,
+            limits.max_inline_bytes.saturating_sub(used),
+        )?;
+        output.extend(tail);
+        pending = pending.saturating_add(tail_pending);
+    }
+    Ok((output, pending))
+}
+
+fn finish(
+    process: &mut ManagedProcess,
+    limits: &ProcessLimits,
+    inline_budget: usize,
+) -> Result<(Vec<ProcessOutputChunk>, usize), ToolError> {
+    for reader in process.readers.drain(..) {
+        join_reader_bounded(reader);
+    }
+    let drained = drain(process, inline_budget)?;
+    process.heavy_permit.take();
+    if let Some(capture) = process.capture.take() {
+        process.captured = Some(
+            capture
+                .finish(
+                    &process.command,
+                    process.exit_code,
+                    limits.max_summary_bytes,
+                    process.scope,
+                    &limits.output_filter,
+                )
+                .map_err(ToolError::external)?,
+        );
+    }
+    Ok(drained)
+}
+
+/// Waits up to [`READER_JOIN_TIMEOUT`] for `reader` to finish, rather than
+/// `reader.join()` directly. A reader blocks in `read()` until its pipe's
+/// write end is fully closed, which any descendant still holding it --
+/// spawned by the child, outliving it, ignoring termination -- can prevent
+/// forever; `finish` (and everything synchronous above it: `poll`, `wait`,
+/// `terminate`) must still return on a bounded budget (issue #583 / roadmap
+/// N05). The actual join happens on a detached proxy thread so this
+/// function's own wait is a plain bounded channel receive: if the reader
+/// really is stuck forever, the proxy leaks (one idle thread) rather than
+/// this call.
+fn join_reader_bounded(reader: JoinHandle<()>) {
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let _ = reader.join();
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.recv_timeout(READER_JOIN_TIMEOUT);
+}
+
+fn drain(
+    process: &mut ManagedProcess,
+    inline_budget: usize,
+) -> Result<(Vec<ProcessOutputChunk>, usize), ToolError> {
+    let mut output = Vec::new();
+    let mut remaining = inline_budget;
+    let mut suppressed = 0usize;
+    while let Ok(chunk) = process.receiver.try_recv() {
+        if chunk.truncated {
+            process.stream_truncated = true;
+        }
+        if let Some(capture) = process.capture.as_mut() {
+            capture.append(&chunk.bytes).map_err(ToolError::external)?;
+        }
+        let take = remaining.min(chunk.bytes.len());
+        if take > 0 {
+            let bytes = &chunk.bytes[..take];
+            output.push(ProcessOutputChunk {
+                stream: chunk.stream,
+                text: String::from_utf8_lossy(bytes).into_owned(),
+                byte_len: chunk.bytes.len(),
+                inline_truncated: take < chunk.bytes.len(),
+            });
+            remaining -= take;
+        }
+        suppressed = suppressed.saturating_add(chunk.bytes.len().saturating_sub(take));
+    }
+    Ok((output, suppressed))
+}
+
+fn snapshot(
+    process: &ManagedProcess,
+    output: Vec<ProcessOutputChunk>,
+    pending_output_bytes: usize,
+) -> ProcessSnapshot {
+    ProcessSnapshot {
+        handle: process.handle.clone(),
+        state: process.state,
+        exit_code: process.exit_code,
+        output,
+        pending_output_bytes,
+        stream_truncated: process.stream_truncated,
+        output_id: process.captured.as_ref().map(|capture| capture.id.clone()),
+        summary: process
+            .captured
+            .as_ref()
+            .and_then(|capture| capture.summary.clone()),
+        interactive: process.interactive,
+        elapsed_ms: process
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+fn infer_git_effects(program: &str, args: &[String]) -> (bool, bool) {
+    let program = Path::new(program)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if program != "git" {
+        return (false, false);
+    }
+    let command = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        .unwrap_or_default();
+    let write = matches!(
+        command,
+        "add"
+            | "am"
+            | "branch"
+            | "checkout"
+            | "cherry-pick"
+            | "clean"
+            | "commit"
+            | "merge"
+            | "mv"
+            | "rebase"
+            | "reset"
+            | "restore"
+            | "revert"
+            | "rm"
+            | "stash"
+            | "switch"
+            | "tag"
+            | "worktree"
+    );
+    let destructive = command == "push"
+        || command == "clean"
+        || (command == "reset" && args.iter().any(|arg| arg == "--hard"))
+        || (command == "branch" && args.iter().any(|arg| arg == "-D"));
+    (write, destructive)
+}
+
+fn validate_key(key: &str) -> Result<(), ToolError> {
+    if key.trim().is_empty() || key.len() > 256 || key.contains('\0') {
+        Err(ToolError::new(
+            ToolErrorCode::InvalidArguments,
+            "idempotency_key must contain 1..=256 non-NUL bytes",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn unknown(handle: &str) -> ToolError {
+    ToolError::new(
+        ToolErrorCode::UnknownProcess,
+        format!("unknown native process handle {handle}"),
+    )
+}
+
+fn default_wait_ms() -> u64 {
+    10_000
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::ffi::OsString;
+
+    use super::*;
+
+    fn limits() -> ProcessLimits {
+        ProcessLimits {
+            max_inline_bytes: 4096,
+            max_processes: 4,
+            max_summary_bytes: 4096,
+            max_heavy_operations: 1,
+            heavy_patterns: Vec::new(),
+            output_filter: Vec::new(),
+            extra_verbatim: Vec::new(),
+            compact_search: true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell_launch(dir: &Path, script: &str) -> SandboxLaunch {
+        SandboxLaunch {
+            program: PathBuf::from("sh"),
+            args: vec![OsString::from("-c"), OsString::from(script)],
+            cwd: dir.to_path_buf(),
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+        }
+    }
+
+    #[cfg(unix)]
+    fn args(dir: &Path, key: &str) -> ProcessStartArgs {
+        ProcessStartArgs {
+            program: "sh".into(),
+            args: Vec::new(),
+            shell_script: Some("test".into()),
+            cwd: dir.to_path_buf(),
+            environment: BTreeMap::new(),
+            read_only: false,
+            network: false,
+            outside_write: false,
+            git_metadata_write: false,
+            git_push_or_destructive: false,
+            interactive: false,
+            timeout_ms: None,
+            idempotency_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn git_effects_are_inferred_instead_of_trusting_provider_flags() {
+        assert_eq!(infer_git_effects("git", &["status".into()]), (false, false));
+        assert_eq!(
+            infer_git_effects("git", &["reset".into(), "--hard".into()]),
+            (true, true)
+        );
+        assert_eq!(
+            infer_git_effects("git.exe", &["push".into()]),
+            (false, true)
+        );
+    }
+
+    /// Review round 1 on #583: a cheap, deterministic, cross-platform proof
+    /// of `spawn_reader`'s cap logic in isolation -- no real process needed,
+    /// unlike `process_lifecycle_bounds_timeout_output_and_cleanup`'s own
+    /// `#[cfg(unix)]` coverage of the same behavior against a real shell
+    /// pipeline. Many short lines, comfortably under `MAX_STREAM_BYTES`, so
+    /// this specifically isolates the LINE ceiling from the byte one.
+    #[test]
+    fn spawn_reader_stops_and_flags_truncation_at_the_line_ceiling() {
+        // Margin well beyond one read buffer's worth of lines (8192 bytes /
+        // ~6 bytes per short line): the reader must give up several reads
+        // before reaching the end of the fixture, not merely on whichever
+        // read happens to coincide with EOF.
+        let lines = MAX_STREAM_LINES + 5_000;
+        let mut content = Vec::new();
+        for i in 0..lines {
+            content.extend_from_slice(format!("{i}\n").as_bytes());
+        }
+        assert!(
+            content.len() < MAX_STREAM_BYTES,
+            "fixture must stay under the byte ceiling to isolate the line ceiling"
+        );
+
+        let cursor = std::io::Cursor::new(content);
+        let (sender, receiver) = mpsc::channel();
+        let handle = spawn_reader(cursor, sender, ProcessStream::Stdout);
+        handle
+            .join()
+            .expect("the reader thread must finish once it crosses the ceiling, not block");
+
+        let chunks: Vec<StreamChunk> = receiver.try_iter().collect();
+        assert!(!chunks.is_empty(), "the reader must have sent something");
+        assert!(
+            chunks.last().expect("at least one chunk").truncated,
+            "the chunk that crosses the ceiling must carry truncated: true"
+        );
+        assert!(
+            chunks[..chunks.len() - 1]
+                .iter()
+                .all(|chunk| !chunk.truncated),
+            "only the ceiling-crossing chunk may be marked truncated"
+        );
+        let total_lines: usize = chunks
+            .iter()
+            .map(|chunk| chunk.bytes.iter().filter(|&&byte| byte == b'\n').count())
+            .sum();
+        assert!(
+            total_lines >= MAX_STREAM_LINES,
+            "the reader must have read at least up to the line ceiling: read {total_lines}"
+        );
+        assert!(
+            total_lines < lines,
+            "the reader must not have read the whole oversized fixture: read {total_lines} of {lines}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_output_keeps_non_utf8_bytes_and_returns_a_retrieval_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let mut manager = ProcessManager::new(state.clone(), dir.path().to_path_buf(), limits());
+        let start = args(dir.path(), "bytes");
+        let first = manager
+            .start(shell_launch(dir.path(), "printf '\\377ok\\n'"), &start)
+            .expect("start");
+        let final_snapshot = if first.state == ProcessState::Exited {
+            first
+        } else {
+            manager.wait(&first.handle, 5_000).expect("wait")
+        };
+        assert_eq!(final_snapshot.state, ProcessState::Exited);
+        let id = final_snapshot.output_id.expect("output id");
+        let output_dir = std::fs::read_dir(state.outputs())
+            .expect("outputs")
+            .next()
+            .expect("repository output directory")
+            .expect("repository output entry")
+            .path();
+        let log = output_dir.join(format!("{id}.log"));
+        assert_eq!(std::fs::read(log).expect("read"), b"\xffok\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_is_bounded_and_terminate_reaps_the_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let mut manager = ProcessManager::new(state, dir.path().to_path_buf(), limits());
+        let start = args(dir.path(), "sleep");
+        let snapshot = manager
+            .start(shell_launch(dir.path(), "sleep 30"), &start)
+            .expect("start");
+        assert_eq!(snapshot.state, ProcessState::Running);
+        let before = Instant::now();
+        let waited = manager.wait(&snapshot.handle, 30).expect("short wait");
+        assert_eq!(waited.state, ProcessState::Running);
+        assert!(before.elapsed() < Duration::from_secs(1));
+        let stopped = manager.terminate(&snapshot.handle).expect("terminate");
+        assert_eq!(stopped.state, ProcessState::Cancelled);
+        assert!(stopped.output_id.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_idempotency_key_returns_the_same_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let mut manager = ProcessManager::new(state, dir.path().to_path_buf(), limits());
+        let start = args(dir.path(), "same");
+        let first = manager
+            .start(shell_launch(dir.path(), "sleep 1"), &start)
+            .expect("first");
+        let second = manager
+            .start(shell_launch(dir.path(), "printf wrong"), &start)
+            .expect("second");
+        assert_eq!(first.handle, second.handle);
+        manager.terminate(&first.handle).expect("terminate");
+    }
+
+    /// Issue #583 (roadmap N05): one process-lifecycle test, parameterised
+    /// over the three pathological children each bound below has to survive
+    /// -- an unpolled deadline, an oversized/no-newline stream, and a
+    /// descendant that outlives the direct child and keeps its pipe open.
+    /// `#[cfg(unix)]` like every other real-process test in this module (it
+    /// needs `sh`/`setsid`, neither available on this Windows dev box) --
+    /// verified on Linux, not here; see the PR/report for that run.
+    #[cfg(unix)]
+    #[test]
+    fn process_lifecycle_bounds_timeout_output_and_cleanup() {
+        enum Scenario {
+            UnpolledTimeout,
+            OversizedNoNewlineStream,
+            DescendantIgnoresTermination,
+        }
+
+        for scenario in [
+            Scenario::UnpolledTimeout,
+            Scenario::OversizedNoNewlineStream,
+            Scenario::DescendantIgnoresTermination,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(dir.path().join("state"));
+            let mut manager =
+                ProcessManager::new(state.clone(), dir.path().to_path_buf(), limits());
+
+            match scenario {
+                Scenario::UnpolledTimeout => {
+                    let mut start = args(dir.path(), "unpolled-timeout");
+                    start.timeout_ms = Some(200);
+                    let snapshot = manager
+                        .start(shell_launch(dir.path(), "sleep 5 && touch marker"), &start)
+                        .expect("start");
+                    assert_eq!(snapshot.state, ProcessState::Running);
+                    // No poll/wait call anywhere in this window: only the
+                    // watchdog, never caller polling, can be what kills it.
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    assert!(
+                        !dir.path().join("marker").exists(),
+                        "the watchdog must terminate the process before it reaches \
+                         `touch marker`, with no poll/wait call in between"
+                    );
+                    let after = manager.poll(&snapshot.handle).expect("poll after the fact");
+                    assert_ne!(after.state, ProcessState::Running);
+                }
+                Scenario::OversizedNoNewlineStream => {
+                    let start = args(dir.path(), "oversized-stream");
+                    let snapshot = manager
+                        .start(
+                            shell_launch(dir.path(), "head -c 9000000 /dev/zero | tr '\\0' 'a'"),
+                            &start,
+                        )
+                        .expect("start");
+                    // Poll until the reader itself reports it crossed the
+                    // ceiling -- no running byte total accumulated across
+                    // polls here. Review round 2 (CI #630): summing
+                    // `snap.output`/`snap.pending_output_bytes` per poll
+                    // proved non-deterministic (over-counted under some
+                    // schedulings, on macOS and in the Linux serial run).
+                    // The persisted capture FILE is the unambiguous source
+                    // of truth for total bytes instead: `drain` appends
+                    // every consumed chunk's full bytes to it exactly once,
+                    // via the same channel `try_recv` that removes each
+                    // chunk as it is read, regardless of the inline display
+                    // budget.
+                    let mut truncated = false;
+                    for _ in 0..40 {
+                        let snap = manager.poll(&snapshot.handle).expect("poll");
+                        if snap.stream_truncated {
+                            truncated = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    assert!(
+                        truncated,
+                        "hitting the byte ceiling must be surfaced on the snapshot, not silent \
+                         (review round 1 on #583)"
+                    );
+                    let stopped = manager.terminate(&snapshot.handle).expect("terminate");
+                    let output_id = stopped.output_id.clone().expect("captured output id");
+                    let output_dir = std::fs::read_dir(state.outputs())
+                        .expect("outputs")
+                        .next()
+                        .expect("repository output directory")
+                        .expect("repository output entry")
+                        .path();
+                    let captured_len =
+                        std::fs::metadata(output_dir.join(format!("{output_id}.log")))
+                            .expect("captured output file")
+                            .len() as usize;
+                    assert!(
+                        captured_len <= MAX_STREAM_BYTES + 8192,
+                        "the persisted capture must stop at the byte ceiling instead of the \
+                         whole 9 MB, single-line stream unbounded: captured {captured_len}"
+                    );
+                }
+                Scenario::DescendantIgnoresTermination => {
+                    let start = args(dir.path(), "descendant-survives");
+                    let snapshot = manager
+                        .start(
+                            shell_launch(
+                                dir.path(),
+                                "setsid sh -c 'sleep 30' >/dev/null 2>&1 & disown; exit 0",
+                            ),
+                            &start,
+                        )
+                        .expect("start");
+                    // Give the detached grandchild time to start and inherit
+                    // the pipe before the direct child exits.
+                    std::thread::sleep(Duration::from_millis(300));
+                    let before = Instant::now();
+                    let stopped = manager.terminate(&snapshot.handle).expect(
+                        "terminate must return even though the grandchild keeps the pipe open",
+                    );
+                    assert!(
+                        before.elapsed() < Duration::from_secs(8),
+                        "finish must join its readers on a bounded budget, not hang on a \
+                         descendant that outlives the direct child and keeps the pipe open"
+                    );
+                    assert_ne!(stopped.state, ProcessState::Running);
+                }
+            }
+        }
+    }
+}

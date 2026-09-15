@@ -59,31 +59,84 @@ pub struct Trial {
     pub at: u64,
 }
 
-/// Which route an observation belongs to: one harness, lower-cased. See this
-/// module's own header for why the model is deliberately NOT part of the
-/// identity.
+/// What a breaker record is ABOUT (issue #487, item 4).
+///
+/// Slice 1 of #455 had one scope because a harness has one: the failing hop
+/// is the connection or the endpoint, and a harness names both at once. A
+/// native route names four separately, and folding them together means one
+/// rejected key disables an account's other models and one model an account
+/// may not use looks like an outage. `Harness` is the `Default`, so every
+/// record written before this reads back unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteScope {
+    #[default]
+    Harness,
+    /// A host: every route reaching it is affected by its outage.
+    Endpoint,
+    /// One credential. A sibling account at the same endpoint is untouched.
+    Credential,
+    /// One model on one credential. That account's other models still work.
+    Model,
+}
+
+impl RouteScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::Endpoint => "endpoint",
+            Self::Credential => "credential",
+            Self::Model => "model",
+        }
+    }
+}
+
+/// Which route an observation belongs to: one harness, lower-cased, or -- for
+/// a native route -- one endpoint, credential or model. See this module's own
+/// header for why the model is deliberately NOT part of a HARNESS identity.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RouteKey {
     pub harness: String,
+    #[serde(default)]
+    pub scope: RouteScope,
 }
 
 impl RouteKey {
     pub fn new(harness: &str) -> Self {
         Self {
             harness: harness.to_lowercase(),
+            scope: RouteScope::Harness,
         }
     }
 
-    /// The human form -- the harness name.
+    /// A native route's breaker key, in one of the three non-harness scopes.
+    /// The scope is part of the identity, so an endpoint called `work` and a
+    /// credential called `work` are two records, not one.
+    pub fn scoped(scope: RouteScope, id: &str) -> Self {
+        Self {
+            harness: id.to_lowercase(),
+            scope,
+        }
+    }
+
+    /// The human form -- the harness name, or `<scope> <id>` for a native
+    /// scope, so a status line never reports a credential id as a harness.
     pub fn label(&self) -> String {
-        self.harness.clone()
+        match self.scope {
+            RouteScope::Harness => self.harness.clone(),
+            other => format!("{} {}", other.as_str(), self.harness),
+        }
     }
 
     /// The file-safe form used as a record's basename: everything outside
     /// `[a-z0-9._-]` folds to `-`. The record itself carries the key
-    /// verbatim, so this never has to be parsed back.
+    /// verbatim, so this never has to be parsed back. A harness stem is
+    /// unprefixed, so existing records keep their existing paths.
     pub fn file_stem(&self) -> String {
-        sanitize(&self.harness)
+        match self.scope {
+            RouteScope::Harness => sanitize(&self.harness),
+            other => format!("{}-{}", other.as_str(), sanitize(&self.harness)),
+        }
     }
 }
 
@@ -251,6 +304,22 @@ pub struct RouteHealth {
     /// longer recognised those rows, counted them a second time, and
     /// reopened a route on history it had already healed from.
     pub seen_other_ids: Vec<String>,
+    /// #496 finding 2: row ids of Auth observations, with the row's own time,
+    /// kept for as long as that row could still ACT.
+    ///
+    /// Auth does not count towards opening, so these ids used to land in
+    /// `seen_other_ids` alongside rate limits and overflows -- and an Auth row
+    /// is the one non-counting class that still changes a phase. One healed
+    /// auth failure followed by twenty rate limits (the single most common
+    /// thing a busy account produces) evicted its id, and the next replay
+    /// from offset 0 marked the route `Unavailable` all over again.
+    ///
+    /// Pruned by the policy WINDOW rather than by a bare count, because that
+    /// is exactly the span over which [`observe`]'s `inside_window` guard
+    /// still lets an auth row act: once the row has aged out it cannot change
+    /// anything, so its id no longer has to be remembered. [`MAX_SAMPLES`] is
+    /// a hard bound on top, so a pathological window cannot grow the record.
+    pub seen_auth_ids: Vec<SeenId>,
     /// R3: the `at` of the newest success this record has EVICTED by cap,
     /// `None` while the ring has never overflowed.
     ///
@@ -261,6 +330,14 @@ pub struct RouteHealth {
     /// that has evicted nothing still covers its whole span, and treating it
     /// as overflowed discarded real failures and hid a real degradation.
     pub success_floor: Option<u64>,
+}
+
+/// One already-folded row id together with the row's own time, so a ring of
+/// them can be aged out by the policy window instead of by a bare count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeenId {
+    pub id: String,
+    pub at: u64,
 }
 
 /// Operator policy for the breaker (`[fallback.health]`).
@@ -472,8 +549,22 @@ fn pruned(health: &RouteHealth, now: u64, policy: &HealthPolicy) -> RouteHealth 
         failures: prune_times(health.failures.clone(), now, policy),
         latency: prune_latency(health.latency.clone(), now, policy),
         seen_other_ids: health.seen_other_ids.clone(),
+        seen_auth_ids: prune_seen_auth(health.seen_auth_ids.clone(), now, policy),
         success_floor,
     }
+}
+
+/// #496 finding 2: the auth-id ring ages out on the policy window -- the same
+/// span [`observe`] will still let an auth row act over -- with
+/// [`MAX_SAMPLES`] as a hard bound on the record's size.
+fn prune_seen_auth(mut ids: Vec<SeenId>, now: u64, policy: &HealthPolicy) -> Vec<SeenId> {
+    let floor = now.saturating_sub(policy.window_secs);
+    ids.retain(|seen| seen.at >= floor);
+    if ids.len() > MAX_SAMPLES {
+        let drop = ids.len() - MAX_SAMPLES;
+        ids.drain(..drop);
+    }
+    ids
 }
 
 fn median(values: &[u64]) -> Option<u64> {
@@ -511,6 +602,18 @@ fn rate_samples(health: &RouteHealth) -> (u64, u64) {
 /// The newest evicted rather than the oldest: everything between the two is
 /// exactly the region whose successes are now gone, and keeping the failures
 /// that fall in it is the inflated numerator finding 10 set out to remove.
+///
+/// #496 finding 3: the cap evicts the oldest samples BY TIME, not the oldest
+/// by insertion order. A replay from offset 0 hands over old row times after
+/// newer ones are already in the ring, so an insertion-ordered drain evicted
+/// samples that were newer than surviving ones and then advanced the floor
+/// past those survivors. Failures in that region were filtered out of the
+/// numerator while their success counterparts stayed in the denominator --
+/// the exact inverse of the inflation this floor exists to prevent, hiding a
+/// real degradation. Sorting first makes the newest evicted strictly older
+/// than every survivor, so the floor only ever advances past samples that are
+/// genuinely gone. Order is otherwise unobservable: the ring is only ever
+/// read by `len()` and `contains()`.
 fn prune_successes(
     successes: Vec<u64>,
     floor: Option<u64>,
@@ -520,16 +623,16 @@ fn prune_successes(
     let mut kept = successes;
     let window_floor = now.saturating_sub(policy.window_secs);
     kept.retain(|at| *at >= window_floor);
+    kept.sort_unstable();
+    kept.dedup();
     if kept.len() <= MAX_SAMPLES {
         return (kept, floor);
     }
     let drop = kept.len() - MAX_SAMPLES;
-    let evicted = kept[..drop].iter().copied().max();
+    // Sorted and de-duplicated, so this is strictly older than `kept[drop]`.
+    let evicted = kept[drop - 1];
     kept.drain(..drop);
-    let advanced = match (floor, evicted) {
-        (Some(previous), Some(evicted)) => Some(previous.max(evicted)),
-        (previous, evicted) => previous.or(evicted),
-    };
+    let advanced = floor.map_or(Some(evicted), |previous| Some(previous.max(evicted)));
     (kept, advanced)
 }
 
@@ -728,7 +831,8 @@ pub fn observe(
 ) -> (RouteHealth, Option<Transition>) {
     if let Some(id) = &observed.id
         && (health.seen_ids.iter().any(|seen| seen == id)
-            || health.seen_other_ids.iter().any(|seen| seen == id))
+            || health.seen_other_ids.iter().any(|seen| seen == id)
+            || health.seen_auth_ids.iter().any(|seen| &seen.id == id))
     {
         return (health.clone(), None);
     }
@@ -749,15 +853,25 @@ pub fn observe(
         // ring, where no burst of rate limits can push a still-retained
         // failure's id out -- finding 8's single shared cap fixed the size
         // but left the eviction competition in place.
-        let (ring, cap) = if counts_toward_opening(class) {
-            (&mut next.seen_ids, MAX_SAMPLES)
+        //
+        // #496 finding 2: Auth is neither -- it does not count towards
+        // opening, yet it is the one class besides those two that moves a
+        // phase, so it gets its own window-aged ring rather than competing
+        // for slots with a burst of rate limits.
+        if class == ProviderErrorClass::Auth {
+            next.seen_auth_ids.push(SeenId { id: id.clone(), at });
+            next.seen_auth_ids = prune_seen_auth(next.seen_auth_ids, now, policy);
         } else {
-            (&mut next.seen_other_ids, MAX_OBSERVATIONS)
-        };
-        ring.push(id.clone());
-        if ring.len() > cap {
-            let drop = ring.len() - cap;
-            ring.drain(..drop);
+            let (ring, cap) = if counts_toward_opening(class) {
+                (&mut next.seen_ids, MAX_SAMPLES)
+            } else {
+                (&mut next.seen_other_ids, MAX_OBSERVATIONS)
+            };
+            ring.push(id.clone());
+            if ring.len() > cap {
+                let drop = ring.len() - cap;
+                ring.drain(..drop);
+            }
         }
     }
 
@@ -896,8 +1010,15 @@ pub fn record_samples(
     let prior_phase = promoted.phase.clone();
     let mut next = pruned(&promoted, now, policy);
     let floor = now.saturating_sub(policy.window_secs);
+    // #496 finding 3: a sample at or below `success_floor` is one the cap has
+    // ALREADY evicted. A poll re-reading the transcript from offset 0 hands
+    // the whole run's successes over again, and re-admitting the evicted ones
+    // both inflated the denominator and pushed genuinely newer samples back
+    // out of the ring on the very next prune -- a ring that churned instead
+    // of sliding, and a rate that read lower than the window really ran.
+    let evicted_floor = next.success_floor.unwrap_or(0);
     for at in successes {
-        if *at >= floor && !next.successes.contains(at) {
+        if *at >= floor && *at > evicted_floor && !next.successes.contains(at) {
             next.successes.push(*at);
         }
     }
@@ -1039,6 +1160,7 @@ pub fn record_success(
                 failures: promoted.failures.clone(),
                 latency: promoted.latency.clone(),
                 seen_other_ids: promoted.seen_other_ids.clone(),
+                seen_auth_ids: promoted.seen_auth_ids.clone(),
                 success_floor: promoted.success_floor,
             },
             Some(Transition::Recovered(reason)),
@@ -1416,6 +1538,135 @@ mod tests {
         assert_eq!(
             transition, None,
             "no retained failure falls inside the covered span: {settled:?}"
+        );
+    }
+
+    /// #496 finding 3: a poll re-reading the transcript from offset 0 hands
+    /// the whole run's successes over again, including the ones the cap has
+    /// already evicted. Re-admitting them churned the ring -- the replayed
+    /// old samples pushed genuinely newer ones straight back out -- and
+    /// `prune_successes`, draining in INSERTION order, then advanced the
+    /// floor past survivors, filtering their failure counterparts out of the
+    /// numerator while the successes stayed in the denominator. A real
+    /// degradation went unreported.
+    #[test]
+    fn a_replay_after_a_success_ring_overflow_neither_churns_the_ring_nor_hides_failures() {
+        let policy = HealthPolicy {
+            // Wide enough that nothing ages out, and a breaker that never
+            // opens: the subject here is the rate's rings, and an `Open`
+            // phase would short-circuit the degrade rule before it is read.
+            window_secs: 100_000,
+            open_after_failures: u32::MAX,
+            ..policy()
+        };
+        let mut health = RouteHealth::default();
+        // 20 transport failures, then far more successes than the ring holds.
+        for i in 0..20u64 {
+            let at = 10_000 + i;
+            let (next, _) = observe(
+                &health,
+                &err(ProviderErrorClass::Transport, at),
+                at,
+                &policy,
+            );
+            health = next;
+        }
+        let run: Vec<u64> = (0..100).map(|i| 10_100 + i).collect();
+        let (settled, _) = record_samples(&health, &run, &[], 10_300, &policy);
+        assert_eq!(settled.successes.len(), MAX_SAMPLES);
+        let floor = settled.success_floor.expect("the cap evicted samples");
+        let retained = settled.successes.clone();
+
+        // The replay: every success of the whole run, offered again.
+        let (replayed, _) = record_samples(&settled, &run, &[], 10_300, &policy);
+        assert_eq!(
+            replayed.successes, retained,
+            "an evicted sample must not be re-admitted, and must not push a newer one out"
+        );
+        assert_eq!(
+            replayed.success_floor,
+            Some(floor),
+            "nothing new was evicted, so the floor must not move"
+        );
+        assert!(
+            replayed
+                .successes
+                .iter()
+                .all(|at| *at > replayed.success_floor.unwrap_or(0)),
+            "the floor must only sit past samples that are actually gone: {replayed:?}"
+        );
+
+        // And a failure inside the covered span is still weighed: 40 retained
+        // successes with 20 failures above the floor is 33%, over threshold.
+        let inside: Vec<Observed> = (0..20u64)
+            .map(|i| err(ProviderErrorClass::Transport, 10_160 + i))
+            .collect();
+        let mut degrading = RouteHealth::default();
+        for observed in &inside {
+            let (next, _) = observe(&degrading, observed, 10_300, &policy);
+            degrading = next;
+        }
+        let (judged, transition) = record_samples(&degrading, &run, &[], 10_300, &policy);
+        let (numerator, denominator) = rate_samples(&judged);
+        assert!(
+            numerator > 0,
+            "failures above the floor must stay in the numerator: {judged:?}"
+        );
+        assert_eq!(
+            denominator,
+            numerator + MAX_SAMPLES as u64,
+            "and the denominator is exactly the surviving successes plus them"
+        );
+        assert!(
+            matches!(transition, Some(Transition::Degraded(_))),
+            "a real degradation inside the covered span must still be reported: {judged:?}"
+        );
+    }
+
+    /// #496 finding 2: Auth is the one non-counting class that still moves a
+    /// phase, so its row ids may not compete for slots with the rate limits a
+    /// busy account produces by the dozen. Before this, twenty rate limits
+    /// after a healed auth failure evicted its id and the next offset-zero
+    /// replay marked the route `Unavailable` all over again.
+    #[test]
+    fn a_healed_auth_rows_id_survives_a_burst_of_rate_limits() {
+        let policy = policy();
+        let auth = err(ProviderErrorClass::Auth, 1_000);
+        let (marked, _) = observe(&RouteHealth::default(), &auth, 1_000, &policy);
+        assert!(
+            matches!(marked.phase, Phase::Unavailable { .. }),
+            "{marked:?}"
+        );
+        let (healed, _) = record_success(&marked, 1_000 + policy.cooldown_secs, &policy);
+        assert!(healed.phase.is_healthy(), "{healed:?}");
+
+        // A burst big enough to fill the non-counting ring several times over.
+        let mut health = healed;
+        for i in 0..(MAX_OBSERVATIONS as u64 * 2) {
+            let at = 1_310 + i;
+            let (next, _) = observe(
+                &health,
+                &err(ProviderErrorClass::RateLimit, at),
+                at,
+                &policy,
+            );
+            health = next;
+        }
+
+        // The replay, still inside `window_secs` of the original auth row.
+        let (replayed, transition) = observe(&health, &auth, 1_400, &policy);
+        assert_eq!(transition, None, "an already-folded auth row is a no-op");
+        assert!(
+            replayed.phase.is_healthy(),
+            "a healed route must not be re-marked unavailable by a row it already folded: \
+             {replayed:?}"
+        );
+
+        // The ring is still bounded, and still ages out with the window.
+        let aged = pruned(&replayed, 1_000 + policy.window_secs + 1, &policy);
+        assert!(
+            aged.seen_auth_ids.is_empty(),
+            "an auth row that can no longer act needs no id: {aged:?}"
         );
     }
 
@@ -1990,6 +2241,29 @@ mod tests {
         assert_eq!(key.file_stem(), "claude");
         assert_eq!(key.label(), "claude");
         assert_eq!(RouteKey::new("gpt/6 astra").file_stem(), "gpt-6-astra");
+    }
+
+    /// Issue #487 (item 4): a native route's scopes are separate records, so
+    /// a rejected credential cannot deny the endpoint (or a sibling account
+    /// that happens to share its name), and a harness record keeps the
+    /// unprefixed path it has always had.
+    #[test]
+    fn a_native_scope_is_part_of_the_breaker_key_and_leaves_harness_paths_alone() {
+        let harness = RouteKey::new("claude");
+        let endpoint = RouteKey::scoped(RouteScope::Endpoint, "api.anthropic.com");
+        let credential = RouteKey::scoped(RouteScope::Credential, "work");
+        let model = RouteKey::scoped(RouteScope::Model, "work/claude-opus");
+
+        assert_eq!(harness.file_stem(), "claude", "unchanged, so records load");
+        assert_eq!(endpoint.file_stem(), "endpoint-api.anthropic.com");
+        assert_eq!(credential.file_stem(), "credential-work");
+        assert_eq!(model.file_stem(), "model-work-claude-opus");
+
+        // The scope is part of the identity: same id, different record.
+        let same_id_endpoint = RouteKey::scoped(RouteScope::Endpoint, "work");
+        assert_ne!(same_id_endpoint, credential);
+        assert_ne!(same_id_endpoint.file_stem(), credential.file_stem());
+        assert_eq!(credential.label(), "credential work");
     }
     /// Review round 2, finding 1: a dated Auth row from outside the window
     /// is history, not a live credential problem. Before this it denied the

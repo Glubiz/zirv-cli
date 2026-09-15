@@ -1,0 +1,53 @@
+{
+  "shape": "anthropic",
+  "model": "fixture-anthropic-model",
+  "turns": [
+    {
+      "message_id": "msg_truncated",
+      "blocks": [
+        {
+          "type": "truncated_tool_use",
+          "id": "call_truncated",
+          "name": "file_read",
+          "partial_json": ["{\"pa", "th\":\"src/"]
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 10, "output_tokens": 5 }
+    },
+    {
+      "message_id": "msg_empty",
+      "blocks": [],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 12, "output_tokens": 0 }
+    },
+    {
+      "message_id": "msg_refusal",
+      "blocks": [{ "type": "refusal", "text": "I will not do that." }],
+      "finish_reason": "refusal",
+      "usage": { "input_tokens": 14, "output_tokens": 6 }
+    },
+    {
+      "message_id": "msg_interleaved",
+      "blocks": [
+        { "type": "text", "text": "one" },
+        {
+          "type": "tool_use",
+          "id": "call_a",
+          "name": "file_read",
+          "input": { "path": "a" }
+        },
+        { "type": "text", "text": "two" },
+        {
+          "type": "tool_use",
+          "id": "call_b",
+          "name": "apply_patch",
+          "input": { "path": "b", "patch": "x" }
+        },
+        { "type": "text", "text": "three" }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 16, "output_tokens": 9 }
+    }
+  ]
+}

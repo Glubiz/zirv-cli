@@ -98,6 +98,10 @@ diff, one focused test per behaviour change, format, lint and test before report
 - Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
 runs at low or medium effort on the roster's review model, never high or above (that forks \
 this seat's model), and never when a `zirv workflow` review gate covers the change.
+- Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
+spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
+honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
+explicit choice.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
 by ONE designated integrator worker; a writer touching one says so in its report. Git \
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
@@ -132,6 +136,10 @@ diff, one focused test per behaviour change, format, lint and test before report
 - Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
 runs at low or medium effort on the roster's review model, never high or above (that forks \
 this seat's model), and never when a `zirv workflow` review gate covers the change.
+- Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
+spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
+honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
+explicit choice.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
 by ONE designated integrator worker; a writer touching one says so in its report. Git \
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
@@ -1182,6 +1190,16 @@ pub struct ClaudeAdapter {
     /// `with_endpoint` (tests/direct construction) -- never set from a repo
     /// layer, see `config.rs`'s `REPO_FORBIDDEN` entry for `endpoint`.
     endpoint: Option<super::super::config::EndpointTarget>,
+    /// Issue #504: an operator-only `chat.claude_permission_mode` override
+    /// for the INTERACTIVE launch's `--permission-mode`, attached
+    /// post-construction via `AgentAdapter::apply_chat_config` (production)
+    /// or `with_claude_permission_mode` (tests/direct construction) --
+    /// mirrors `endpoint`'s own pattern immediately above, and never set
+    /// from a repo layer (see `config.rs`'s `REPO_FORBIDDEN` entry for
+    /// `chat.claude_permission_mode`). `None` reproduces the shipped
+    /// `"default"` posture exactly -- see `default_sandbox_args`'s own doc
+    /// comment.
+    claude_permission_mode: Option<String>,
     #[cfg(test)]
     forced_file_support: Option<bool>,
     #[cfg(test)]
@@ -1201,6 +1219,7 @@ impl ClaudeAdapter {
             bin_args: parts.collect(),
             home: None,
             endpoint: None,
+            claude_permission_mode: None,
             #[cfg(test)]
             forced_file_support: None,
             #[cfg(test)]
@@ -1218,6 +1237,17 @@ impl ClaudeAdapter {
     #[cfg(test)]
     pub fn with_endpoint(mut self, endpoint: super::super::config::EndpointTarget) -> Self {
         self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Issue #504: attaches an operator `chat.claude_permission_mode`
+    /// override. Production code reaches this through `AgentAdapter::
+    /// apply_chat_config` (see `adapters::apply_chat_override`), mirroring
+    /// `with_endpoint` immediately above; this builder is only the direct-
+    /// construction path tests use.
+    #[cfg(test)]
+    pub fn with_claude_permission_mode(mut self, mode: impl Into<String>) -> Self {
+        self.claude_permission_mode = Some(mode.into());
         self
     }
 
@@ -1851,17 +1881,55 @@ fn additional_worktree_roots(
         .collect()
 }
 
-/// Adds linked worktrees belonging to the launch repository to Claude's
-/// working-directory set. Other repositories stay out of `--add-dir` (it
-/// would load their own `.claude/` hooks); sibling checkouts get sandbox
-/// write grants and `additionalDirectories` instead, via
-/// [`sibling_repo_roots`] (issue #329). Discovery is best-effort, bounded,
-/// and never invokes a shell.
+/// The linked worktrees belonging to the launch repository, rendered as
+/// grant paths -- the one shared, bounded set `default_sandbox_args` turns
+/// into BOTH the `--add-dir` argv (adds them to Claude's working-directory
+/// set) AND, since issue #504, the interactive `Edit`/`Read` allow-list
+/// widening (`add_dir_edit_read_rules`) so a delegated worker's Edit/Write
+/// inside one of them never falls through to a native permission prompt.
+/// Other repositories stay out of `--add-dir` (it would load their own
+/// `.claude/` hooks); sibling checkouts get sandbox write grants and
+/// `additionalDirectories` instead, via [`sibling_repo_roots`] (issue #329).
+/// Discovery is best-effort, bounded, and never invokes a shell. Empty
+/// under `#[cfg(test)]`: git worktree discovery is a real subprocess call
+/// (see [`linked_worktree_roots`]), unexercised by unit tests, which use
+/// [`add_dir_edit_read_rules`] directly with fabricated paths instead.
 #[cfg(not(test))]
-fn linked_worktree_args(repo: &Path) -> Vec<String> {
-    linked_worktree_roots(repo)
-        .into_iter()
-        .flat_map(|path| ["--add-dir".to_string(), grant_path(&path)])
+fn current_worktree_grant_paths() -> Vec<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|repo| linked_worktree_roots(&repo))
+        .unwrap_or_default()
+        .iter()
+        .map(|path| grant_path(path))
+        .collect()
+}
+
+#[cfg(test)]
+fn current_worktree_grant_paths() -> Vec<String> {
+    Vec::new()
+}
+
+/// Issue #504: converts each already-rendered `--add-dir` grant path (see
+/// [`grant_path`]) into an `Edit(<path>/**)`/`Read(<path>/**)` allow-list
+/// pair -- the same widening `super::scratchpad_rules` already does for the
+/// scratchpad -- so a delegated worker's Edit/Write inside its own
+/// `--add-dir` worktree never falls through to Claude Code's native
+/// permission prompt under the interactive posture. `grant_path` returns an
+/// OS-native path (backslashes on Windows, verbatim-prefix stripped only),
+/// never forward-slash-normalized, so this reuses `super::
+/// doubled_slash_rule_base` -- the same forward-slash/doubled-leading-slash
+/// projection `scratchpad_rules_from_roots` applies -- rather than
+/// interpolating the raw path directly. Pure and cfg-independent so a unit
+/// test can exercise it directly with fabricated paths, unlike
+/// [`current_worktree_grant_paths`]'s own real git worktree discovery.
+fn add_dir_edit_read_rules(grant_paths: &[String]) -> Vec<String> {
+    grant_paths
+        .iter()
+        .flat_map(|path| {
+            let base = format!("{}/**", super::doubled_slash_rule_base(path));
+            [format!("Read({base})"), format!("Edit({base})")]
+        })
         .collect()
 }
 
@@ -1877,7 +1945,7 @@ fn grant_path(path: &Path) -> String {
     super::super::state::display_path(path)
 }
 
-/// The discovery half of [`linked_worktree_args`], shared with
+/// The discovery half of [`current_worktree_grant_paths`], shared with
 /// [`LaunchEnvironment::resolve`] so the same bounded set that becomes a
 /// working directory also becomes a sandbox write grant (issue #329).
 #[cfg(not(test))]
@@ -2122,6 +2190,14 @@ impl AgentAdapter for ClaudeAdapter {
     /// `[endpoint.claude]` target after construction.
     fn apply_endpoint(&mut self, endpoint: Option<&super::super::config::EndpointTarget>) {
         self.endpoint = endpoint.cloned();
+    }
+
+    /// Issue #504: the production seam (`adapters::apply_chat_override`,
+    /// called by `select`/`resolve_default`) that attaches the operator's
+    /// `chat.claude_permission_mode` after construction, mirroring
+    /// `apply_endpoint` immediately above.
+    fn apply_chat_config(&mut self, chat: &super::super::config::ChatConfig) {
+        self.claude_permission_mode = chat.claude_permission_mode.clone();
     }
 
     fn endpoint_vendor(&self) -> Option<&str> {
@@ -2549,6 +2625,12 @@ impl AgentAdapter for ClaudeAdapter {
         safety: &crate::commands::ctx::safety::SafetyPolicy,
         mode: super::LaunchMode,
     ) -> Vec<String> {
+        // Issue #504: computed once, up front, so the SAME bounded worktree
+        // set both widens the interactive Edit/Read allow-list below AND
+        // becomes the `--add-dir` argv at the end -- one git worktree probe,
+        // not two independently-computed (and possibly drifting) ones.
+        let worktree_grant_paths = current_worktree_grant_paths();
+
         // The non-`Bash(...)` surface is pre-approved in BOTH modes: file
         // scope, the harness dirs, WebFetch/WebSearch. These are outside
         // `[safety]`'s command-only domain (see `safety::
@@ -2560,6 +2642,21 @@ impl AgentAdapter for ClaudeAdapter {
             .filter(|(rule, _)| !rule.starts_with("Bash("))
             .map(|(rule, _)| rule.to_string())
             .collect();
+
+        // Issue #504: native subagents delegate into worktrees the launch
+        // cwd's own `Edit(./**)`/`Read(./**)` scope above does not reach --
+        // Claude Code's own agent-worktree convention (`.claude/worktrees/**`,
+        // see `safety::is_agent_worktree_root`'s own doc comment, which
+        // already recognizes this same marker) and any `--add-dir` grant
+        // this launch passes below. Interactive only: headless is `dontAsk`,
+        // deny-by-omission by design, and widening it here would loosen a
+        // mode that stays deliberately strict with nobody present to answer
+        // a prompt.
+        if mode.is_interactive() {
+            allow_entries.push("Read(./.claude/worktrees/**)".to_string());
+            allow_entries.push("Edit(./.claude/worktrees/**)".to_string());
+            allow_entries.extend(add_dir_edit_read_rules(&worktree_grant_paths));
+        }
 
         if !mode.is_interactive() {
             allow_entries.extend(
@@ -2604,11 +2701,29 @@ impl AgentAdapter for ClaudeAdapter {
         // installed CLI's own `--help` text, quoted in this method's doc
         // comment) -- correct with no human present, and exactly wrong with
         // one. `default` prompts for anything not pre-approved, which is what
-        // lets the safety hook's own decisions be the whole story. Never
-        // `acceptEdits`/`bypassPermissions`: both were probed live and both
-        // auto-run unapproved destructive actions.
+        // lets the safety hook's own decisions be the whole story, and stays
+        // the shipped default: `acceptEdits`/`bypassPermissions` were probed
+        // live and both auto-run unapproved destructive actions, so zirv
+        // never picks either FOR the operator.
+        //
+        // Issue #504: the CLI flag outranks `permissions.defaultMode` in the
+        // operator's own `~/.claude/settings.json`, so before this override
+        // there was no way to widen the interactive posture from config --
+        // an operator running several native subagents in delegation
+        // worktrees got prompted for every Edit/Write outside `./**` and
+        // every unlisted compound command, with no knob to quiet it.
+        // `chat.claude_permission_mode` (operator-only, `REPO_FORBIDDEN` --
+        // see `config.rs`) now picks the mode this adapter INSTANCE carries
+        // (`self.claude_permission_mode`, attached by `AgentAdapter::
+        // apply_chat_config`); `None` (unset) reproduces `"default"` exactly,
+        // so behavior is unchanged for every operator who never sets it.
+        // Headless is untouched either way -- `dontAsk` stays hardcoded --
+        // and picking `bypassPermissions` here changes only this flag: the
+        // `--allowedTools`/`--disallowedTools` lists above are built exactly
+        // the same regardless of which mode wins, never suppressed or
+        // widened further for it.
         let permission_mode = if mode.is_interactive() {
-            "default"
+            self.claude_permission_mode.as_deref().unwrap_or("default")
         } else {
             "dontAsk"
         };
@@ -2623,11 +2738,10 @@ impl AgentAdapter for ClaudeAdapter {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
         }
-        #[cfg(not(test))]
         args.extend(
-            std::env::current_dir()
-                .ok()
-                .map_or_else(Vec::new, |repo| linked_worktree_args(&repo)),
+            worktree_grant_paths
+                .iter()
+                .flat_map(|path| ["--add-dir".to_string(), path.clone()]),
         );
         args
     }
@@ -4884,6 +4998,132 @@ mod tests {
         }
     }
 
+    /// Issue #504: an operator's `chat.claude_permission_mode` override
+    /// reaches the INTERACTIVE launch's `--permission-mode` argv verbatim,
+    /// while a headless launch keeps `dontAsk` no matter what the same
+    /// adapter instance carries -- the override is interactive-only by
+    /// construction (`default_sandbox_args` only reads it inside `mode.
+    /// is_interactive()`), and the invariant this test pins is that fact,
+    /// not any one exact full argv (see this repo's own Windows notes on
+    /// why an exact-argv assertion is fragile against an installed-binary
+    /// probe).
+    #[test]
+    fn chat_claude_permission_mode_overrides_the_interactive_flag_but_never_headless() {
+        let adapter = ClaudeAdapter::new(None).with_claude_permission_mode("acceptEdits");
+
+        let interactive = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        assert_eq!(
+            &interactive[0..2],
+            &["--permission-mode".to_string(), "acceptEdits".to_string()]
+        );
+
+        let headless = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
+        assert_eq!(
+            &headless[0..2],
+            &["--permission-mode".to_string(), "dontAsk".to_string()],
+            "an interactive-only override must never leak into the headless mode flag"
+        );
+    }
+
+    /// Issue #504: `bypassPermissions` changes only the mode flag -- the
+    /// `--allowedTools`/`--disallowedTools` lists are built exactly the same
+    /// regardless of which mode wins, never suppressed or widened further
+    /// for it.
+    #[test]
+    fn bypass_permissions_leaves_the_allow_and_deny_lists_untouched() {
+        let plain = ClaudeAdapter::new(None).default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        let bypassed = ClaudeAdapter::new(None)
+            .with_claude_permission_mode("bypassPermissions")
+            .default_sandbox_args(
+                &Default::default(),
+                &Default::default(),
+                super::super::LaunchMode::Interactive,
+            );
+        let without_mode_flag = |args: &[String]| args[2..].to_vec();
+        assert_eq!(
+            without_mode_flag(&plain),
+            without_mode_flag(&bypassed),
+            "only --permission-mode may differ between the two"
+        );
+    }
+
+    /// Issue #504: native subagents delegate into worktrees the launch
+    /// cwd's own `Edit(./**)`/`Read(./**)` scope does not reach -- Claude
+    /// Code's own agent-worktree convention (`.claude/worktrees/**`) and any
+    /// `--add-dir` grant. Interactive only: headless stays `dontAsk`, and
+    /// widening it would loosen a mode meant to stay strict.
+    #[test]
+    fn the_interactive_allow_list_widens_for_claude_worktrees_and_add_dir_grants() {
+        let interactive = ClaudeAdapter::new(None).default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Interactive,
+        );
+        let allow_arg = interactive
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        assert!(
+            allow_arg.contains("Read(./.claude/worktrees/**)"),
+            "got {allow_arg}"
+        );
+        assert!(
+            allow_arg.contains("Edit(./.claude/worktrees/**)"),
+            "got {allow_arg}"
+        );
+
+        let headless = ClaudeAdapter::new(None).default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            super::super::LaunchMode::Headless,
+        );
+        let headless_allow = headless
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        assert!(
+            !headless_allow.contains(".claude/worktrees"),
+            "headless must not widen for delegation worktrees: {headless_allow}"
+        );
+    }
+
+    /// Issue #504: pure unit coverage for the `--add-dir` -> `Edit`/`Read`
+    /// derivation itself, independent of real git worktree discovery (which
+    /// `current_worktree_grant_paths` only performs outside `#[cfg(test)]`
+    /// -- see that function's own doc comment).
+    #[test]
+    fn add_dir_edit_read_rules_derives_a_pair_per_grant_path() {
+        // Review fix (issue #504): a raw grant path -- Windows-shaped
+        // (backslashes, as `grant_path`/`display_path` actually produce) or
+        // Unix-shaped -- must come out forward-slashed with a DOUBLED
+        // leading slash, the same `//<path>` convention `scratchpad_rules_
+        // from_roots` already applies (`doubled_slash_rule_base`), not the
+        // raw OS-native path interpolated verbatim.
+        let grants = vec![r"D:\GitHub\wt".to_string(), "/home/u/wt".to_string()];
+        let rules = add_dir_edit_read_rules(&grants);
+        assert_eq!(
+            rules,
+            vec![
+                "Read(//D:/GitHub/wt/**)".to_string(),
+                "Edit(//D:/GitHub/wt/**)".to_string(),
+                "Read(//home/u/wt/**)".to_string(),
+                "Edit(//home/u/wt/**)".to_string(),
+            ]
+        );
+    }
+
     /// Fix round 2 (2026-08-22): `dontAsk` alone denies every unapproved
     /// action, including a legitimate in-repo write -- inert, not "runs
     /// freely inside the workspace". `SHIPPED_POSTURE_ALLOW`/`_DENY` is
@@ -6404,6 +6644,28 @@ mod tests {
         assert!(
             ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
             "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// Issue #541: before delegating substantial work, this seat compiles
+    /// the proportional team through `zirv workflow team plan` rather than
+    /// guessing which specialists to spawn, and briefs each compiled seat
+    /// through `zirv workflow team brief` rather than re-deriving its
+    /// instructions.
+    #[test]
+    fn the_orchestrator_conventions_name_workflow_team_plan() {
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow team plan"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow team brief"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.len() < 3_600,
+            "this ships on every claude session: {} bytes",
+            ORCHESTRATOR_PROMPT.len()
         );
     }
 

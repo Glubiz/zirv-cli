@@ -1,0 +1,12 @@
+{
+  "id": "req-send-input",
+  "idempotency_key": "send-1",
+  "method": "session.send_input",
+  "params": {
+    "generation": 1,
+    "input": "keep going",
+    "mode": "submit",
+    "session_id": "fake-1"
+  },
+  "v": 1
+}
