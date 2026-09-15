@@ -1715,7 +1715,7 @@ impl<'a> NativeLoop<'a> {
         };
         let checkpoint = |in_flight: bool| {
             json!({"kind":"provider_execution", "schema":super::execution::CONTRACT_VERSION,
-            "backend":adapter.id(), "authentication_owner":"official-harness", "billing":"subscription",
+            "backend":adapter.id(), "authentication_owner":"official-harness", "billing":adapter.authentication().billing, "authentication":adapter.authentication(),
             "session":external_session, "delivered_through":through, "in_flight":in_flight,
             "billed_spend":Value::Null,"allowance_remaining":Value::Null})
         };
@@ -2302,7 +2302,8 @@ impl<'a> NativeLoop<'a> {
             .map(|adapter| super::execution::ExecutionObservation {
                 backend: adapter.id().to_string(),
                 authentication_owner: "official-harness",
-                billing: "subscription",
+                billing: adapter.authentication().billing,
+                authentication: adapter.authentication(),
                 adapter_version: super::execution::CONTRACT_VERSION,
                 installed_version: adapter.installed_version().map(str::to_string),
                 estimated_api_cost: self.execution_cost,

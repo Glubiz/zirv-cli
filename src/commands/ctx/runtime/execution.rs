@@ -1,6 +1,7 @@
 //! Provider-owned agent loops. Never a token-level ProviderAdapter.
 //! Only the official process sees its login. Tool effects cross the existing
 //! Zirv broker via MCP; stdout tool events are strictly observations.
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,7 +18,7 @@ use super::super::provider::adapter::{Cancellation, ProviderUsage};
 use super::super::{
     CtxResult,
     config::EnvLookup,
-    provider::{BillingClass, RouteId, config::NativeConfig},
+    provider::{RouteId, config::NativeConfig},
     state, supervise,
 };
 use super::journal::RouteIdentity;
@@ -98,17 +99,13 @@ impl ExecutionConfig {
             .accounts
             .get(&route.account)
             .ok_or("execution account missing")?;
-        if account.provider.as_ref() != spec.provider
-            || account.billing != BillingClass::Subscription
-        {
-            return Err(format!(
-                "{} execution requires provider={} and explicit billing=subscription",
-                spec.id, spec.provider
-            )
-            .into());
+        if account.provider.as_ref() != spec.provider {
+            return Err(
+                format!("{} execution requires provider={}", spec.id, spec.provider).into(),
+            );
         }
         if account.credential.is_some() {
-            return Err("remove the Claude subscription credential from native.toml; use `zirv ctx provider login <route>` to authenticate in official Claude Code; tokens are never imported".into());
+            return Err("remove the execution credential from native.toml; use `zirv ctx provider login <route>` to authenticate in official Claude Code; tokens are never imported".into());
         }
         if route.endpoint.is_some() || !route.extensions.is_empty() || route.deployment.is_some() {
             return Err("provider execution cannot select an API endpoint, deployment or request extensions".into());
@@ -156,6 +153,7 @@ pub struct Diagnostic {
     pub backend: &'static str,
     pub authentication_owner: &'static str,
     pub billing: &'static str,
+    pub authentication: Authentication,
     pub version: Option<String>,
     pub state: String,
     pub capabilities: ExecutionCapabilities,
@@ -168,6 +166,7 @@ pub struct ExecutionObservation {
     pub backend: String,
     pub authentication_owner: &'static str,
     pub billing: &'static str,
+    pub authentication: Authentication,
     pub adapter_version: u32,
     pub installed_version: Option<String>,
     pub estimated_api_cost: Option<f64>,
@@ -218,8 +217,11 @@ pub struct ExecutionRequest<'a> {
 pub trait ExecutionAdapter: std::fmt::Debug + Send {
     fn id(&self) -> &str;
     fn verify_auth(&self) -> CtxResult<()>;
-    fn login(&self) -> CtxResult<i32> {
+    fn login(&self, _args: &[String]) -> CtxResult<i32> {
         Err("official login handoff unavailable for this execution adapter".into())
+    }
+    fn authentication(&self) -> Authentication {
+        Authentication::default()
     }
     fn installed_version(&self) -> Option<&str> {
         None
@@ -232,39 +234,120 @@ pub trait ExecutionAdapter: std::fmt::Debug + Send {
     fn diagnostic(&self) -> Diagnostic;
 }
 
-#[derive(Debug)]
 pub struct ClaudeCode {
     program: PathBuf,
-    home: PathBuf,
+    config_directory: PathBuf,
+    auth: RefCell<Authentication>,
     policy: PolicyRoots,
     directory: PathBuf,
     environment: BTreeMap<String, String>,
     version: String,
 }
 
+// Only startup controls that can defeat the native effect boundary are rejected.
+// Authentication selection belongs to the official binary, not this list.
 const SELECTORS: &[&str] = &[
+    "CLAUDE_CODE_SIMPLE",
+    "CLAUDE_CODE_SETTINGS_PATH",
+    "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+];
+
+const AUTH_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_CUSTOM_HEADERS",
     "ANTHROPIC_PROFILE",
     "ANTHROPIC_CONFIG_DIR",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
     "CLAUDE_CODE_API_KEY_HELPER",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_SIMPLE",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_SETTINGS_PATH",
-    "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+    "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_SDK_LOAD_CONFIG",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_BEARER_TOKEN_BEDROCK_MANTLE",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+    "AWS_CA_BUNDLE",
+    "AWS_EC2_METADATA_DISABLED",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
+    "CLOUDSDK_CONFIG",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "CLOUD_ML_REGION",
+    "AZURE_CLIENT_ID",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "AZURE_AUTHORITY_HOST",
+    "AZURE_CONFIG_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+const AUTH_SETTINGS: &[&str] = &[
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "forceLoginMethod",
+    "forceLoginOrgUUID",
 ];
 
 pub fn check_selectors(env: EnvLookup<'_>) -> CtxResult<()> {
     for key in SELECTORS {
         if env(key).is_some_and(|v| !v.is_empty()) {
-            return Err(format!("wrong effective billing route: {key} is set; reconcile it with subscription selection in the official CLI (value withheld)").into());
+            return Err(format!("runtime capability unavailable: {key} conflicts with native startup isolation (value withheld)").into());
         }
     }
     Ok(())
@@ -289,8 +372,63 @@ fn environment(env: EnvLookup<'_>) -> BTreeMap<String, String> {
         "LC_ALL",
     ]
     .into_iter()
+    .chain(AUTH_ENV.iter().copied())
     .filter_map(|key| env(key).map(|v| (key.to_string(), v)))
     .collect()
+}
+
+// Debug output must never include inherited credentials or helper commands.
+impl std::fmt::Debug for ClaudeCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeCode")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Authentication {
+    pub method: &'static str,
+    pub provider: &'static str,
+    pub billing: &'static str,
+}
+impl Default for Authentication {
+    fn default() -> Self {
+        Self {
+            method: "unknown",
+            provider: "unknown",
+            billing: "unknown",
+        }
+    }
+}
+
+fn authentication(status: &Value) -> Authentication {
+    let method = match status["authMethod"].as_str() {
+        Some("claude.ai") => "claude.ai",
+        Some("api_key") => "api_key",
+        Some("oauth") => "oauth",
+        Some("auth_token") => "auth_token",
+        _ => "unknown",
+    };
+    let provider = match status["apiProvider"].as_str() {
+        Some("firstParty") => "firstParty",
+        Some("bedrock") => "bedrock",
+        Some("vertex") => "vertex",
+        Some("foundry") => "foundry",
+        Some("mantle") => "mantle",
+        _ => "unknown",
+    };
+    let billing = match (provider, method) {
+        ("bedrock" | "vertex" | "foundry" | "mantle", _) => "api",
+        ("firstParty", "claude.ai") => "subscription",
+        ("firstParty", "api_key" | "oauth" | "auth_token") => "api",
+        _ => "unknown",
+    };
+    Authentication {
+        method,
+        provider,
+        billing,
+    }
 }
 
 fn bounded_json_file(path: &Path) -> CtxResult<Option<Value>> {
@@ -339,8 +477,8 @@ impl PolicyRoots {
     }
 }
 
-fn check_settings(home: &Path, policy: &PolicyRoots) -> CtxResult<()> {
-    if exists_checked(&home.join(".claude/remote-settings.json"))? {
+fn check_settings(config_directory: &Path, policy: &PolicyRoots) -> CtxResult<()> {
+    if exists_checked(&config_directory.join("remote-settings.json"))? {
         return Err("runtime capability unavailable: cached managed Claude policy requires effective-policy verification".into());
     }
     // macOS profiles can deliver the same managed keys without a JSON file.
@@ -359,20 +497,6 @@ fn check_settings(home: &Path, policy: &PolicyRoots) -> CtxResult<()> {
         }
     }
 
-    // Public configuration only. Never open .credentials.json, keychains,
-    // .claude.json, or any provider token store.
-    if let Some(settings) = bounded_json_file(&home.join(".claude/settings.json"))? {
-        if settings.get("apiKeyHelper").is_some()
-            || settings
-                .get("forceLoginMethod")
-                .is_some_and(|v| v != "claudeai")
-        {
-            return Err("wrong effective billing route: Claude settings select a helper or another login method".into());
-        }
-        if let Some(values) = settings.get("env").and_then(Value::as_object) {
-            check_selectors(&|key| values.get(key).and_then(Value::as_str).map(str::to_string))?;
-        }
-    }
     // Managed settings outrank invocation settings. Until a supported public
     // effective-policy interface can attest them, do not guess or override.
     for root in &policy.managed {
@@ -433,7 +557,22 @@ impl ClaudeCode {
         }
         check_selectors(env)?;
         let policy = PolicyRoots::system(home);
-        check_settings(home, &policy)?;
+        let config_directory = env("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".claude"));
+        if !config_directory.is_absolute() {
+            return Err("CLAUDE_CONFIG_DIR must be an absolute user-owned path".into());
+        }
+        for path in [&config_directory, &config_directory.join("settings.json")] {
+            if let (Ok(path), Ok(repo)) = (path.canonicalize(), repo.canonicalize())
+                && path.starts_with(repo)
+            {
+                return Err(
+                    "Claude user authentication settings cannot come from the repository".into(),
+                );
+            }
+        }
+        check_settings(&config_directory, &policy)?;
         let program = locate(config, env, repo)?;
         let directory = state::StateDir::resolve(env)?
             .root()
@@ -441,7 +580,8 @@ impl ClaudeCode {
         state::create_private_dir_all(&directory)?;
         let mut adapter = Self {
             program,
-            home: home.to_path_buf(),
+            config_directory,
+            auth: RefCell::default(),
             policy,
             directory,
             environment: environment(env),
@@ -487,26 +627,56 @@ impl ClaudeCode {
         Ok(adapter)
     }
 
-    fn command(&self) -> Command {
+    fn command(&self) -> CtxResult<Command> {
         let mut command = Command::new(&self.program);
         command
             .current_dir(&self.directory)
             .env_clear()
             .envs(&self.environment);
-        command
+        // Public user settings only. Never read Claude's credential stores.
+        if let Some(settings) = self.public_settings()?
+            && let Some(values) = settings.get("env").and_then(Value::as_object)
+        {
+            check_selectors(&|key| values.get(key).and_then(Value::as_str).map(str::to_string))?;
+            // Forward authentication environment without copying secrets to a file.
+            for key in AUTH_ENV {
+                if let Some(value) = values.get(*key).and_then(Value::as_str) {
+                    command.env(key, value);
+                }
+            }
+        }
+        Ok(command)
+    }
+
+    fn public_settings(&self) -> CtxResult<Option<Value>> {
+        bounded_json_file(&self.config_directory.join("settings.json"))
+    }
+
+    fn execution_settings(&self) -> CtxResult<Value> {
+        let mut settings =
+            json!({"disableAllHooks":true,"enabledPlugins":{},"autoMemoryEnabled":false});
+        if let Some(user) = self.public_settings()? {
+            for key in AUTH_SETTINGS {
+                if let Some(value) = user.get(*key) {
+                    settings[*key] = value.clone();
+                }
+            }
+        }
+        Ok(settings)
     }
 
     fn probe(&self, args: &[&str]) -> CtxResult<Vec<u8>> {
-        let mut command = self.command();
+        let mut command = self.command()?;
         command.args(args);
         capture(command, Duration::from_secs(10))
     }
 
-    pub fn login(&self) -> CtxResult<i32> {
+    pub fn login(&self, args: &[String]) -> CtxResult<i32> {
         // Direct terminal handoff: no URL/code/credential interception or log.
         let status = self
-            .command()
+            .command()?
             .args(["auth", "login"])
+            .args(args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -515,10 +685,13 @@ impl ClaudeCode {
     }
 
     pub fn auth_status(&self) -> CtxResult<()> {
+        *self.auth.borrow_mut() = Authentication::default();
         let bytes = self.probe(&["auth", "status"])?;
         let status: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "auth status unknown: unsupported public auth status response")?;
-        validate_auth_status(&status)
+        validate_auth_status(&status)?;
+        *self.auth.borrow_mut() = authentication(&status);
+        Ok(())
     }
 }
 
@@ -528,17 +701,6 @@ pub fn validate_auth_status(status: &Value) -> CtxResult<()> {
             "login needed: run `zirv ctx provider login <route>` (official Claude Code login)"
                 .into(),
         );
-    }
-    if status.get("authMethod").and_then(Value::as_str) != Some("claude.ai")
-        || status.get("apiProvider").and_then(Value::as_str) != Some("firstParty")
-    {
-        return Err("wrong effective billing route: official status does not attest a first-party Claude subscription login".into());
-    }
-    if !matches!(
-        status.get("subscriptionType").and_then(Value::as_str),
-        Some("pro" | "max")
-    ) {
-        return Err("runtime capability unavailable: this initial local adapter verifies Pro/Max only; managed plan policy is not yet supported".into());
     }
     Ok(())
 }
@@ -648,7 +810,7 @@ fn upstream_failure(category: &str) -> super::super::provider::adapter::Provider
         "rate_limit" => (
             FailureClass::RateLimited,
             FailureScopeKind::BillingPool,
-            "subscription allowance exhausted: wait for capacity or explicitly select an authorized route; no API fallback",
+            "provider usage limit reached: wait for capacity or explicitly select an authorized route; no API fallback",
         ),
         "model_not_found" => (
             FailureClass::ModelAccess,
@@ -968,8 +1130,11 @@ impl ExecutionAdapter for ClaudeCode {
     fn verify_auth(&self) -> CtxResult<()> {
         self.auth_status()
     }
-    fn login(&self) -> CtxResult<i32> {
-        ClaudeCode::login(self)
+    fn login(&self, args: &[String]) -> CtxResult<i32> {
+        ClaudeCode::login(self, args)
+    }
+    fn authentication(&self) -> Authentication {
+        *self.auth.borrow()
     }
     fn installed_version(&self) -> Option<&str> {
         Some(&self.version)
@@ -978,15 +1143,17 @@ impl ExecutionAdapter for ClaudeCode {
         "claude-code"
     }
     fn diagnostic(&self) -> Diagnostic {
+        let state = self.auth_status().map_or_else(
+            |e| e.to_string(),
+            |_| "signed-in; model availability and billed usage unverified".to_string(),
+        );
         Diagnostic {
             backend: "claude-code",
             authentication_owner: "official-harness",
-            billing: "subscription",
+            billing: self.authentication().billing,
+            authentication: self.authentication(),
             version: Some(self.version.clone()),
-            state: self.auth_status().map_or_else(
-                |e| e.to_string(),
-                |_| "signed-in; model availability and paid usage credits unverified".to_string(),
-            ),
+            state,
             capabilities: capabilities(),
             billed_spend: None,
             allowance_remaining: None,
@@ -1003,7 +1170,7 @@ impl ExecutionAdapter for ClaudeCode {
         }
         uuid::Uuid::parse_str(request.session)
             .map_err(|_| "explicit execution session must be a UUID")?;
-        check_settings(&self.home, &self.policy)?;
+        check_settings(&self.config_directory, &self.policy)?;
         self.auth_status()?;
         let mut bridge = Bridge::start()?;
         let directory = self.directory.join(request.session);
@@ -1013,13 +1180,15 @@ impl ExecutionAdapter for ClaudeCode {
         let system_file = directory.join("instructions.txt");
         let settings_file = directory.join("settings.json");
         state::write_private(&system_file, request.system)?;
-        state::write_private(
-            &settings_file,
-            &json!({"disableAllHooks":true,"enabledPlugins":{},"autoMemoryEnabled":false})
-                .to_string(),
-        )?;
-        state::write_private(&mcp_file, &json!({"mcpServers":{"zirv":{"type":"stdio","command":std::env::current_exe()?,"args":["ctx","provider","bridge"],"env":{BRIDGE_ADDRESS:bridge.address,BRIDGE_SECRET:bridge.secret}}}}).to_string())?;
-        let mut command = self.command();
+        let _ephemeral_settings = EphemeralFile(settings_file.clone());
+        state::write_private(&settings_file, &self.execution_settings()?.to_string())?;
+        // MCP effects have no reason to inherit the model process's credentials.
+        let mut bridge_environment: BTreeMap<&str, &str> =
+            AUTH_ENV.iter().map(|key| (*key, "")).collect();
+        bridge_environment.insert(BRIDGE_ADDRESS, &bridge.address);
+        bridge_environment.insert(BRIDGE_SECRET, &bridge.secret);
+        state::write_private(&mcp_file, &json!({"mcpServers":{"zirv":{"type":"stdio","command":std::env::current_exe()?,"args":["ctx","provider","bridge"],"env":bridge_environment}}}).to_string())?;
+        let mut command = self.command()?;
         command
             .current_dir(&directory)
             .args(["--restricted", "--setting-sources", "", "--settings"])
@@ -1228,6 +1397,7 @@ pub fn route_identity(config: &NativeConfig, id: &RouteId) -> CtxResult<RouteIde
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::super::provider::adapter::CancellationFlag;
     use super::*;
 
@@ -1266,26 +1436,40 @@ mod tests {
             assert!(!error.contains("SECRET-NEVER-LOG"));
         }
         let inherited = environment(&|key| Some(format!("value-{key}")));
-        assert!(!inherited.contains_key("ANTHROPIC_API_KEY"));
+        assert!(inherited.contains_key("ANTHROPIC_API_KEY"));
+        assert!(inherited.contains_key("AWS_PROFILE"));
+        assert!(inherited.contains_key("GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(inherited.contains_key("AZURE_CLIENT_ID"));
         assert!(!inherited.contains_key("OPENAI_API_KEY"));
         assert!(!inherited.contains_key("NODE_OPTIONS"));
     }
 
     #[test]
-    fn public_status_must_attest_subscription_not_just_login() {
-        let good = json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max","email":"private@example.com"});
-        validate_auth_status(&good).unwrap();
-        for (key, value) in [
-            ("loggedIn", json!(false)),
-            ("authMethod", json!("api_key")),
-            ("apiProvider", json!("bedrock")),
-            ("subscriptionType", json!("enterprise")),
+    fn public_status_accepts_all_official_auth_methods_and_plans() {
+        for (method, provider, plan, billing) in [
+            ("claude.ai", "firstParty", "free", "subscription"),
+            ("claude.ai", "firstParty", "pro", "subscription"),
+            ("claude.ai", "firstParty", "max", "subscription"),
+            ("claude.ai", "firstParty", "team", "subscription"),
+            ("claude.ai", "firstParty", "enterprise", "subscription"),
+            ("api_key", "firstParty", "", "api"),
+            ("oauth", "firstParty", "", "api"),
+            ("unknown", "bedrock", "", "api"),
+            ("unknown", "vertex", "", "api"),
+            ("unknown", "foundry", "", "api"),
+            ("future", "future", "", "unknown"),
         ] {
-            let mut status = good.clone();
-            status[key] = value;
-            let error = validate_auth_status(&status).unwrap_err().to_string();
-            assert!(!error.contains("private@example.com"));
+            let status = json!({"loggedIn":true,"authMethod":method,"apiProvider":provider,"subscriptionType":plan,"email":"PRIVATE"});
+            validate_auth_status(&status).unwrap();
+            assert_eq!(authentication(&status).billing, billing);
+            assert!(
+                !serde_json::to_string(&authentication(&status))
+                    .unwrap()
+                    .contains("PRIVATE")
+            );
         }
+        assert!(validate_auth_status(&json!({"loggedIn":false})).is_err());
+        assert!(validate_auth_status(&json!({})).is_err());
     }
 
     #[test]
@@ -1361,26 +1545,19 @@ mod tests {
     }
 
     #[test]
-    fn public_settings_helper_is_rejected_without_reading_token_storage() {
+    fn public_settings_do_not_require_reading_token_storage() {
         let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir(home.path().join(".claude")).unwrap();
         std::fs::write(
-            home.path().join(".claude/.credentials.json"),
-            "invalid secret storage that must never be parsed",
+            home.path().join(".credentials.json"),
+            "invalid secret storage",
         )
         .unwrap();
-        // Empty public settings are sufficient: private token storage is not
-        // inspected. Check the helper refusal independently of host policy.
         std::fs::write(
-            home.path().join(".claude/settings.json"),
-            r#"{"apiKeyHelper":"SECRET helper"}"#,
+            home.path().join("settings.json"),
+            r#"{"apiKeyHelper":"user helper","forceLoginMethod":"console"}"#,
         )
         .unwrap();
-        let error = check_settings(home.path(), &PolicyRoots::default())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("helper"));
-        assert!(!error.contains("SECRET"));
+        check_settings(home.path(), &PolicyRoots::default()).unwrap();
     }
 
     fn config() -> NativeConfig {
@@ -1441,6 +1618,60 @@ mod tests {
                 .iter()
                 .all(|offer| offer.identity.endpoint == "claude-code")
         );
+    }
+
+    #[test]
+    fn api_execution_is_billable_without_a_zirv_credential() {
+        let mut config = config();
+        config.accounts.values_mut().next().unwrap().billing =
+            super::super::super::provider::BillingClass::Api;
+        route_identity(&config, &RouteId::new("claude").unwrap()).unwrap();
+        let offers = super::super::super::route::offers_from_config(&config);
+        assert_eq!(
+            offers[0].billing,
+            super::super::super::route::BillingPosture::Api
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_auth_settings_survive_without_enabling_hooks_or_leaking_secrets() {
+        let (_tmp, mut adapter) = fake_cli("exit 0");
+        std::fs::create_dir_all(&adapter.config_directory).unwrap();
+        std::fs::write(adapter.config_directory.join("settings.json"), r#"{
+            "apiKeyHelper":"user-owned-helper", "forceLoginMethod":"console",
+            "awsAuthRefresh":"aws sso login", "enabledPlugins":{"untrusted":true},
+            "hooks":{"SessionStart":"unsafe"},
+            "env":{"ANTHROPIC_API_KEY":"SECRET-API", "CLAUDE_CODE_USE_BEDROCK":"1", "NODE_OPTIONS":"unsafe"}
+        }"#).unwrap();
+        adapter
+            .environment
+            .insert("AZURE_CLIENT_SECRET".into(), "SECRET-AZURE".into());
+        let settings = adapter.execution_settings().unwrap();
+        assert_eq!(settings["apiKeyHelper"], "user-owned-helper");
+        assert_eq!(settings["forceLoginMethod"], "console");
+        assert_eq!(settings["awsAuthRefresh"], "aws sso login");
+        assert_eq!(settings["disableAllHooks"], true);
+        assert_eq!(settings["enabledPlugins"], json!({}));
+        assert!(settings.get("hooks").is_none());
+        assert!(!settings.to_string().contains("SECRET"));
+        let command = adapter.command().unwrap();
+        let env: BTreeMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().to_string(),
+                        v.to_string_lossy().to_string(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(env["ANTHROPIC_API_KEY"], "SECRET-API");
+        assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"], "1");
+        assert_eq!(env["AZURE_CLIENT_SECRET"], "SECRET-AZURE");
+        assert!(!env.contains_key("NODE_OPTIONS"));
+        assert!(!format!("{adapter:?}").contains("SECRET"));
     }
 
     #[test]
@@ -1541,7 +1772,8 @@ printf '{{"type":"system","subtype":"init","session_id":"%s","model":"sonnet","t
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let adapter = ClaudeCode {
             program,
-            home: tmp.path().to_path_buf(),
+            config_directory: tmp.path().join(".claude"),
+            auth: RefCell::default(),
             policy: PolicyRoots::default(),
             directory: tmp.path().to_path_buf(),
             environment: BTreeMap::new(),
@@ -1630,10 +1862,10 @@ printf '{"type":"result","session_id":"%s","subtype":"success","is_error":false,
     #[test]
     fn newly_present_managed_policy_blocks_the_next_turn_before_execution() {
         let (_tmp, mut adapter) = fake_cli("exit 93");
-        let policy = adapter.home.join("managed");
-        std::fs::create_dir(&policy).unwrap();
+        let policy = adapter.config_directory.join("managed");
+        std::fs::create_dir_all(&policy).unwrap();
         adapter.policy.managed.push(policy.clone());
-        check_settings(&adapter.home, &adapter.policy).unwrap();
+        check_settings(&adapter.config_directory, &adapter.policy).unwrap();
         std::fs::write(policy.join("managed-settings.json"), "{}").unwrap();
         let cancel = CancellationFlag::default();
         let error = adapter

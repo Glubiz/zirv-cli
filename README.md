@@ -2764,6 +2764,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
 | `route.<id>.execution` | `~/.zirv/native.toml` only; selects an official provider process and optional absolute executable path. Repository layers cannot select executables, login methods, billing or startup settings; all effects retain the native broker |
+| Claude Code authentication environment and public user settings | User-owned process environment and `~/.claude/settings.json` (or an absolute `CLAUDE_CONFIG_DIR` outside the repository); only authentication settings are carried into the restricted model invocation. Official login receives options after `--`. Inherited auth values are excluded from persisted settings and diagnostic output |
 | `native.toml` keys other than `policy.allowed_routes` and `policy.compaction` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, and repository `compaction` may only narrow `automatic` to `advisory`, never the reverse |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
@@ -3003,7 +3004,7 @@ schema = 1
 
 [account.personal-claude]
 provider = "anthropic"
-billing = "subscription"
+billing = "subscription" # Use "api" for Console/API/cloud billing.
 # No credential. Claude Code owns authentication.
 
 [route.personal-claude]
@@ -3024,28 +3025,38 @@ Zirv does not read, import, store or refresh subscription credentials, login
 URLs or authorization codes. A missing binary is never silently installed.
 Removing this route from `native.toml` leaves Claude Code signed in. To log out
 of the official installation, run `claude auth logout` yourself; that affects
-Claude Code sessions outside Zirv too. Its API and cloud login choices remain
-available in the official CLI; select a compatible Zirv route when using them.
+Claude Code sessions outside Zirv too. All official authentication methods and
+subscription plans are accepted. Pass login options after `--`, for example
+`zirv ctx provider login personal-claude -- --console` or `-- --sso`.
+API keys, cloud credentials and profiles configured in the launching user's
+environment remain available to Claude Code. Its public user settings retain
+`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, login restrictions and
+authentication environment variables. `CLAUDE_CONFIG_DIR` may select an absolute
+user configuration directory outside the repository. Zirv never copies inherited
+authentication secrets to its settings, journal or diagnostics.
 
 `zirv chat --runtime native` uses this route for the orchestrator. Native workers
 use their configured role routes and retain the existing task, mail, delegation,
 writer-lease and generation fences. The UI identifies the backend and selected
-billing. Headless final status schema **3** adds an `execution` object for these
-routes with backend/version/auth owner, estimated API-equivalent cost, and
+billing. Provider status and headless final status report the detected official
+authentication method, upstream provider and billing, using `unknown` when the
+public status cannot establish them. Headless final status schema **3** includes
+an `execution` object with backend/version/auth owner, estimated API-equivalent cost, and
 separate nullable billed-spend and remaining-allowance fields.
 
 **Initial capability boundary.** Requires a local, unmodified native Claude Code
 2.1.248+ executable in the 2.1 series, its documented restricted/settings/tool/MCP
-flags, and a public status response attesting a first-party Pro/Max login.
+flags, and a public status response attesting authentication.
 Windows/WSL (managed-policy verification pending), npm shell shims, managed
-Team/Enterprise policy, unknown status formats,
+startup policy, unauthenticated status,
 and an explicit token-budget ceiling are rejected before a model turn.
 Turn/time limits, streaming, follow-up and exact-session continuation are
 supported. Steering waits until the next turn; it is never reported as immediate.
 No live installation/platform compatibility is implied by fixture tests.
 
-Claude Code starts in a private Zirv directory with project/user settings
-excluded, hooks disabled, and only the explicit Zirv MCP server. Managed startup
+Claude Code starts in a private Zirv directory with project settings excluded,
+only authentication settings carried from public user configuration, hooks
+disabled, and only the explicit Zirv MCP server. Managed startup
 configuration that could override this boundary is rejected. Claude built-in
 tools and internal subagents are unavailable on this route; coding, shell,
 external services and independently scheduled workers use Zirv MCP tools. Every
@@ -3054,10 +3065,11 @@ repository narrowing and generation checks. A denied approval produces a tool
 error, never an automatic permission-mode escalation. Streamed tool observations
 are not executed again. Tool subprocesses receive no provider credentials.
 
-**Billing.** Environment API keys, endpoint/cloud overrides and public
-`apiKeyHelper` settings conflict with subscription selection and are refused
-without printing their values. No authentication failure or exhausted allowance
-causes an automatic API fallback. All aliases of the local official login share
+**Billing.** Claude Code selects authentication using its own precedence. The
+account's `billing` declares scheduling intent; it does not force a login method.
+Keep it aligned with the method you select in Claude Code. Detected billing is
+reported separately and is never hardcoded to subscription. No authentication
+failure or exhausted allowance causes an automatic API fallback. All aliases of the local official login share
 one `anthropic` capacity pool. Unknown allowance is unknown,
 not unlimited. The official result's dollar figure and `zirv ctx spend` are
 API-equivalent estimates, not invoices. Billed spend remains unknown. Paid usage
@@ -3076,7 +3088,11 @@ writer and worker/mail disposition rules.
 
 **Policy evidence, checked 2026-09-15.** This design relies on Anthropic's explicit
 allowance for running the unmodified binary under the applicable terms and
-conditions, with users authenticating themselves. It does not offer Zirv-owned
+conditions, including the product operator agreeing to Commercial Terms and
+each user authenticating and being billed under their own agreement. Zirv does
+not resell usage or claim Anthropic approval. Written confirmation for this exact
+integration has not been obtained; this is not a guarantee of policy compliance.
+It does not offer Zirv-owned
 Claude login or claim endorsement. The June 15 pause means print-mode usage
 currently draws subscription limits; this is not a guarantee of permanent
 eligibility. The SDK documentation retains restrictive third-party-login

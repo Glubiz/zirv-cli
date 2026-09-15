@@ -23,7 +23,11 @@ Zirv workers use the existing team tools.
 - https://code.claude.com/docs/en/legal-and-compliance permits running the
   unmodified binary under its conditions and applicable Commercial Terms.
   Users authenticate themselves through the official binary. No authentication
-  method is removed, no credentials are collected, and no endorsement is claimed.
+  method or plan is gated. Claude alone reads its credential stores; user-supplied
+  authentication environment is passed only to the official process and excluded
+  from persisted settings and diagnostics. No endorsement is claimed. Product
+  operators must agree to Commercial Terms; no written vendor confirmation for
+  this specific integration has been obtained.
 - https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan
   has a June 15 pause: print-mode usage currently draws subscription limits.
   Its older credit announcement is superseded. This is not permanent entitlement.
@@ -37,15 +41,18 @@ Zirv workers use the existing team tools.
 - https://code.claude.com/docs/en/cli-reference documents auth status/login,
   settings-source selection, restricted mode, tool selection and strict MCP.
 
-Subscription selection rejects conflicting effective account selectors before
-launch. No automatic API fallback. CLI cost estimates are API-equivalent
+Subscription, Console/API and cloud authentication remain available, including
+public user authentication helpers and login options after `provider login <route>
+--`. Public status, rather than a subscription constant, supplies reported billing.
+The configured account billing declares scheduling intent; users keep it aligned
+with their official authentication choice. No automatic API fallback. CLI cost estimates are API-equivalent
 estimates, not invoices; billed spend and allowance remain unknown. Users control
 paid usage credits in Claude Settings > Usage; Zirv cannot verify that switch.
 
 ## Boundaries
 
-Fail closed on unsupported capabilities, unmanaged startup execution or ambiguous
-billing. Never consume allowance in discovery/status checks. Persist an exact
+Fail closed on unsupported capabilities or unverified startup policy. Never
+consume allowance in discovery/status checks. Persist an exact
 Claude session reference with the route, workspace and seat. An in-flight
 checkpoint survives a crash: require reconciliation before resuming uncertain
 effects rather than automatically replaying a task. Continuation tokens never
@@ -88,3 +95,17 @@ Serial verification also exposed #652: two Codex nudge fixtures waited for
 session registration but could interrupt their fake process before it consumed
 the initial `hang` mode. They now use the existing sibling fixture's mode-file
 handshake; their original exit and mail-delivery assertions are retained.
+
+## Authentication correction
+
+Removed the Pro/Max and first-party-only gate. API execution accounts no longer
+need a Zirv credential; direct API routes still do. API execution is billable,
+not a credential-free local model. Public user authentication settings are
+projected into the restricted invocation; hook/plugin/tool restrictions remain.
+Inherited auth values are not persisted or exposed by adapter Debug. The MCP
+relay receives empty overrides for provider authentication variables. Existing
+Windows/WSL and managed-policy capability exclusions remain independent of plan.
+
+Anthropic's published conditions are the design basis, not vendor approval. A
+written confirmation should cover the native UI, official print-mode process and
+MCP tool integration before claiming certainty about subscription eligibility.

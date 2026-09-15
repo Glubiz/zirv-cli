@@ -19,7 +19,12 @@ pub struct ProviderArgs {
 #[derive(Debug, Subcommand)]
 pub enum ProviderVerb {
     /// Hand authentication to the route's official, unmodified provider CLI.
-    Login { route: super::provider::RouteId },
+    Login {
+        route: super::provider::RouteId,
+        /// Arguments passed directly to the official auth login subcommand.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Offline official CLI version, capabilities and non-secret auth status.
     Status { route: super::provider::RouteId },
     /// Internal MCP relay; not a credential transport.
@@ -128,14 +133,14 @@ fn run_with(
     };
     match &args.command {
         ProviderVerb::Init | ProviderVerb::Bridge => unreachable!(),
-        ProviderVerb::Login { route } | ProviderVerb::Status { route } => {
+        ProviderVerb::Login { route, .. } | ProviderVerb::Status { route } => {
             use super::runtime::execution;
             let execution = cfg.routes.get(route).and_then(|route| route.execution.as_ref())
                 .ok_or("select a route with execution.adapter = 'claude-code'; direct API credentials use provider credential set")?;
             execution.validate(&cfg, route)?;
             let adapter = execution::discover(execution, repo, home, env)?;
-            if matches!(args.command, ProviderVerb::Login { .. }) {
-                adapter.login()
+            if let ProviderVerb::Login { args, .. } = &args.command {
+                adapter.login(args)
             } else {
                 writeln!(
                     w,

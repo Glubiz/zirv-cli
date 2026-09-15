@@ -375,9 +375,18 @@ impl NativeConfig {
                 )
                 .into());
             };
+            let execution_only = self
+                .routes
+                .values()
+                .any(|route| &route.account == id && route.execution.is_some())
+                && !self
+                    .routes
+                    .values()
+                    .any(|route| &route.account == id && route.execution.is_none());
             if account.billing == BillingClass::Api
                 && spec.id != "openai-compatible"
                 && account.credential.is_none()
+                && !execution_only
             {
                 return Err(format!(
                     "{}: `account.{id}.credential` is required for provider `{}`",
@@ -646,6 +655,36 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn execution_api_accounts_do_not_relax_direct_api_credential_requirements() {
+        let mut config: NativeConfig = toml::from_str(
+            r#"
+            schema=1
+            [account.code]
+            provider='anthropic'
+            billing='api'
+            [route.code]
+            account='code'
+            model='sonnet'
+            execution={adapter='claude-code'}
+        "#,
+        )
+        .unwrap();
+        config.validate(Path::new("native.toml")).unwrap();
+        let mut direct = config.routes.values().next().unwrap().clone();
+        direct.execution = None;
+        config
+            .routes
+            .insert(RouteId::new("direct").unwrap(), direct);
+        assert!(
+            config
+                .validate(Path::new("native.toml"))
+                .unwrap_err()
+                .to_string()
+                .contains("credential")
+        );
     }
 
     #[test]

@@ -600,7 +600,7 @@ pub fn offers_from_config(config: &super::provider::config::NativeConfig) -> Vec
             // nor silently incomplete.
             let billing = match account.map(|a| (a.billing, a.credential.is_some())) {
                 Some((BillingClass::Subscription, _)) => BillingPosture::Subscription,
-                Some((_, false)) => BillingPosture::Local,
+                Some((_, false)) if route.execution.is_none() => BillingPosture::Local,
                 _ => BillingPosture::Api,
             };
             let spec = account.and_then(|a| super::provider::provider(a.provider.as_ref()));
