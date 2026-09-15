@@ -39,6 +39,7 @@ pub mod learn;
 pub mod ledger;
 pub mod log;
 pub mod mail;
+pub mod mcp;
 pub mod measure;
 pub mod memory;
 pub mod memory_cli;
@@ -423,6 +424,8 @@ pub struct CtxCli {
 
 #[derive(Debug, Subcommand)]
 pub enum CtxVerb {
+    /// Serve read-only, repository-scoped tools over MCP stdio.
+    Mcp(mcp::McpArgs),
     /// Show or edit operator ~/.zirv/ctx.toml; set/add ask for approval in wrapped sessions.
     Config(config_cmd::ConfigArgs),
     /// Rot-score a session transcript and print JSON.
@@ -629,6 +632,7 @@ pub fn dispatch(args: &[String]) -> i32 {
 
     let mut out = std::io::stdout();
     let result = match &cli.verb {
+        CtxVerb::Mcp(a) => mcp::run(a),
         CtxVerb::Config(a) => config_cmd::run(a, &mut out),
         CtxVerb::Score(a) => score::run(a, &mut out),
         CtxVerb::Handoff(a) => handoff::run(a, &mut out),

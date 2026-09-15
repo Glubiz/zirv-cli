@@ -43,6 +43,7 @@
   - [Maintain loop](#maintain-loop)
   - [Frontend quality](#frontend-quality)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
+  - [MCP bridge](#mcp-bridge)
   - [Cross-harness fallback and handover](#cross-harness-fallback-and-handover)
   - [Permission auditing and safe-list proposals](#permission-auditing-and-safe-list-proposals-issue-178)
 - [Supported harnesses and models](#supported-harnesses-and-models)
@@ -518,6 +519,8 @@ to the section that documents it in depth.
 
 ### Harness supervision (`zirv ctx`)
 
+- **MCP bridge** — `mcp` (`zirv ctx mcp serve`) exposes repository-scoped session, memory,
+  workflow, and artifact reads to wrapped MCP hosts. See [MCP bridge](#mcp-bridge).
 - **Harness adapters** — one adapter per supported harness: `claude`,
   `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, and `qwen`, each
   enabled or disabled per repo in `.zirv/.settings.toml`. See
@@ -1399,6 +1402,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
 | `zirv ctx status [--json]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON |
+| `zirv ctx mcp serve [--stdio] [--repo <path>]` | Serves four read-only MCP tools for one repository/worktree; see [MCP bridge](#mcp-bridge) |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat |
@@ -1408,6 +1412,88 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
 | `zirv ctx handover [--agent <name>] [--model <tier\|id>] [--dry-run] [--force]` | Swaps the orchestrator seat's harness or model in place mid-session, carrying a handoff packet across the swap — see [Cross-harness fallback and handover](#cross-harness-fallback-and-handover) below |
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
+
+### MCP bridge
+
+`zirv ctx mcp serve` lets an MCP host such as Codex or Claude Code read zirv
+state through structured tools. The host launches it as a local subprocess;
+stdin/stdout carry MCP JSON-RPC and diagnostics go to stderr. Stdio is the
+only transport (`--stdio` is optional). `--repo` fixes the authorized directory
+at startup; without it, the server uses its launch directory. Use an absolute
+path to the installed zirv executable and an explicit repository path in host
+configuration so a host's working directory cannot select the wrong project.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `session_snapshot` | `{}` | Up to 64 session registry records for this directory, requested policy, and memory gates. Liveness and host enforcement are explicitly unverified; stale records are preserved. |
+| `memory_search` | `query`, optional `limit` and `max_bytes` | Ranked private/global/shared facts with provenance and verification dates. Uses the existing retrieval engine and trusted-key precedence. |
+| `workflow_status` | `{}` | Active workflow, current step/skill, approval state, and up to 64 registered artifact IDs, newest first. An absent workflow stays absent. |
+| `artifact_read` | `id`, optional `offset` and `max_bytes` | A UTF-8 text page from an artifact registered with `zirv artifact render`. Returns `next_offset` for subsequent pages. |
+
+All successful responses contain `captured_at` (Unix seconds), `repository`,
+and `data`, with both an output schema and structured JSON. Tool failures
+return `isError: true` with an explanation. Each serialized structured result
+is capped at 32 KiB (the MCP text fallback repeats that JSON). Memory queries
+must be nonblank and at most 2048 bytes. Memory limits default to 6 entries /
+2048 bytes, may be lowered, and cannot exceed 32 entries / 16384 bytes or the
+operator's configured retrieval budgets. Artifact pages default to 8192 bytes
+(range 4..8192); files must be regular UTF-8 text no larger than 1 MiB.
+Offsets are byte positions on UTF-8 boundaries. Registered files remain live
+files, so callers should restart pagination if they change between reads.
+
+For Codex, add a server entry to the operator's `~/.codex/config.toml`, using
+the real absolute paths:
+
+```toml
+[mcp_servers.zirv]
+command = "/absolute/path/to/zirv"
+args = ["ctx", "mcp", "serve", "--repo", "/absolute/path/to/project"]
+```
+
+For Claude Code, save this as an operator-owned `zirv-mcp.json` and pass it
+for a single wrapped launch with
+`zirv ctx wrap -- claude --mcp-config /absolute/path/to/zirv-mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "zirv": {
+      "command": "/absolute/path/to/zirv",
+      "args": ["ctx", "mcp", "serve", "--repo", "/absolute/path/to/project"]
+    }
+  }
+}
+```
+
+On Windows, use the installed `zirv.exe` path; forward slashes work in JSON
+and TOML paths. Preserve the host's existing server entries. If the host
+must use a custom zirv state directory or operator environment override,
+forward that setting through its MCP server environment configuration.
+See the official [Codex MCP](https://developers.openai.com/codex/mcp) and
+[Claude Code MCP](https://code.claude.com/docs/en/mcp) configuration references.
+
+The server does not register itself automatically or change host settings.
+Its four tools neither consume mail nor write memory, run commands, launch
+workers, or advance workflows. Existing hooks, CLI checkpoints and supervisor
+recovery continue independently. Reading a registered report does not certify
+that its claims are correct. Worker result storage, mail mutations, dispatch,
+and incoming event delivery are follow-on work tracked in
+[issue #658](https://github.com/Glubiz/zirv-cli/issues/658).
+
+MCP reads use the current repository state buckets and never migrate legacy
+buckets. If an older installation's state has not been adopted yet, run the
+ordinary zirv CLI for that repository before starting the host.
+
+#### MCP trust boundary
+
+| Surface | Authority and enforcement |
+|---|---|
+| Executable and `--repo` | Chosen by the operator's host configuration at launch; tool arguments cannot change either. The repository directory is opened once for artifact access. |
+| `policy.tool_access` | Re-read for every call. `deny` and `ask` refuse calls; this server has no approval-granting channel. A malformed configuration also refuses reads. |
+| Memory | Existing `memory.enabled`, `memory.shared_enabled`, and retrieval budgets apply. A shared key cannot shadow an enabled private/global key, even if that trusted fact misses the query budget. |
+| Artifact IDs | Resolved in this repository's existing artifact registry. Payload access uses a directory capability to reject traversal and symlink escapes; arbitrary file paths are not tool arguments. |
+| Returned text | Memory provenance is retained; repository artifacts and shared facts are labeled untrusted information, never operator instructions. |
+| OS account and local state | Operator-owned state is trusted as with the CLI. This local service does not isolate mutually hostile processes that already share filesystem access under the same account. |
 
 ### Signals and verdicts
 
