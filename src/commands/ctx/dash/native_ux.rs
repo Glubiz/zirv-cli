@@ -2051,14 +2051,9 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 /// display-only shape rather than `runtime::context::ResolvedInstructionSource`
 /// directly: this module stays presentation-only, and the caller (mirroring
 /// how `/status` needs live `StatusFacts` `apply_slash_command` cannot
-/// produce) is the one with repo/home/config access to assemble it.
-// No production caller yet: `native_pane.rs`'s `/context` dispatch renders
-// with an empty source list until live repo/home/config access is wired
-// through it (issue #538, decision 4's deferred half) -- this module's own
-// test (`context_view_lists_provenance_and_version`) exercises every field
-// in the meantime, the same dormancy pattern this codebase already uses for
-// a type with no production caller yet.
-#[allow(dead_code)]
+/// produce) is the one with repo/home/config access to assemble it --
+/// `NativePaneRuntime::context_view_facts` (chunk C), reading the journal's
+/// own recorded `ContextCompiled` provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextViewSource {
     pub path: String,
