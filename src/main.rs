@@ -191,17 +191,63 @@ fn is_top_level_native_alias(argv: &[String]) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("native"))
 }
 
-/// True for exactly `zirv native --help`/`zirv native -h` (case-insensitive
-/// on `native`, matching `is_top_level_native_alias`; the flag itself is not
-/// case-folded, the same convention `is_top_level_help` already uses for
-/// `--help`/`-h`). Intercepted before the ordinary argv rewrite below so
-/// `zirv native --help` prints its own experimental-labelled prose
+/// True for `zirv native --help`/`-h` (case-insensitive on `native`,
+/// matching `is_top_level_native_alias`; the flag itself is not case-folded,
+/// the same convention `is_top_level_help` already uses for `--help`/`-h`).
+/// Matches `--help`/`-h` ANYWHERE in the trailing argv, not only as the sole
+/// token -- `zirv native --foo --help` and `zirv native --help extra` are
+/// both a help request, the same way clap itself treats `--help` as
+/// short-circuiting regardless of what else is on the line. Stops looking at
+/// a bare `--`: everything after that separator is opaque extra argv for the
+/// adapter (`ChatArgs::extra`), not a flag for this alias to interpret, so a
+/// literal `--help` string an operator meant to hand to the harness itself
+/// must not be swallowed here.
+///
+/// Intercepted before the ordinary argv rewrite below so `zirv native
+/// --help` prints its own experimental-labelled prose
 /// (`ctx::chat::native_help_text`) rather than clap's generated help for the
 /// ordinary `chat` verb tree, which says nothing about any of this.
 fn is_top_level_native_help(argv: &[String]) -> bool {
-    is_top_level_native_alias(argv)
-        && argv.len() == 3
-        && matches!(argv[2].as_str(), "--help" | "-h")
+    if !is_top_level_native_alias(argv) {
+        return false;
+    }
+    for arg in &argv[2..] {
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--help" || arg == "-h" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Review finding (issue #540): `zirv native` always selects the native
+/// runtime by splicing `--runtime native` onto the FRONT of the rewritten
+/// argv (see `rewrite_native_alias_args` below) -- but `ChatArgs::runtime`
+/// is a plain `Option<String>`, and clap lets a LATER `--runtime` occurrence
+/// win over an earlier one. Without this guard, `zirv native --runtime
+/// harness` rewrote to `ctx chat --runtime native --runtime harness`, clap
+/// resolved `args.runtime` to `Some("harness")`, and `run_with` silently
+/// launched the ordinary wrapped harness -- exactly the "silently select a
+/// legacy runtime" the issue's own contract forbids. Checked against the raw
+/// trailing argv, both spellings (`--runtime harness` and
+/// `--runtime=harness`), anywhere before a `--` separator (matching
+/// `is_top_level_native_help`'s own boundary: past `--` is opaque extra argv
+/// for the adapter, not a flag for this alias).
+fn native_alias_has_user_supplied_runtime(argv: &[String]) -> bool {
+    if !is_top_level_native_alias(argv) {
+        return false;
+    }
+    for arg in &argv[2..] {
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--runtime" || arg.starts_with("--runtime=") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Rewrites `zirv native [args...]` into the `ctx chat --runtime native
@@ -211,7 +257,10 @@ fn is_top_level_native_help(argv: &[String]) -> bool {
 /// nesting, TTY, journal and pane startup for both spellings. Every argument
 /// after `native` forwards unchanged, so a native-compatible `zirv chat`
 /// option (and the existing native validator's exact refusal for a
-/// wrapped-only one) behaves identically either way.
+/// wrapped-only one) behaves identically either way. Callers must check
+/// `native_alias_has_user_supplied_runtime` first: this function does not
+/// itself guard against a caller-supplied `--runtime` silently overriding
+/// the one it splices in.
 fn rewrite_native_alias_args(argv: &[String]) -> Vec<String> {
     let mut args = vec![
         "ctx".to_string(),
@@ -415,6 +464,23 @@ async fn main() {
             print!("{}", ctx::chat::native_help_text());
             return;
         }
+        // Review finding (issue #540): a user-supplied `--runtime` would
+        // otherwise be silently appended after the `--runtime native` this
+        // rewrite splices in, and clap's `Option<String>` lets the LATER
+        // occurrence win -- see `native_alias_has_user_supplied_runtime`'s
+        // own doc comment for exactly how that let `zirv native --runtime
+        // harness` launch the wrapped harness with no indication anything
+        // was overridden. Refused outright, before the rewrite ever runs,
+        // rather than left for `chat.rs` to notice (it can't: by the time
+        // clap parses `ChatArgs`, only the LAST value survives, so there is
+        // no "two runtimes were given" signal left to check downstream).
+        if native_alias_has_user_supplied_runtime(&argv) {
+            eprintln!(
+                "zirv native: always selects the native runtime; drop --runtime or use `zirv \
+                 chat --runtime <x>`"
+            );
+            std::process::exit(2);
+        }
         // Issue #540: deliberately NO `maybe_run_first_run_wizard` call here
         // (unlike the `chat` alias above) -- native prerequisites are
         // diagnosed by `zirv ctx doctor`, never the wrapped-harness first-run
@@ -430,13 +496,17 @@ async fn main() {
         // that function already goes through, so it can print the one-time
         // experimental banner only for this alias spelling, never for an
         // explicit `zirv chat --runtime native`, even though both launch
-        // through the exact same function.
+        // through the exact same function. `run_native_chat` clears it again
+        // immediately after that one read, so no child process this session
+        // later spawns (`wrap.rs`'s harness PTY, `dash/pane.rs`'s worker
+        // panes -- neither clears the environment before spawning) inherits
+        // it.
         //
-        // SAFETY: this runs at the very top of `main`, before any other
-        // thread in this process has been created or could be reading the
-        // environment concurrently -- `#[tokio::main]`'s runtime worker
-        // threads exist but are idle until `ctx::dispatch` below actually
-        // schedules work onto them.
+        // SAFETY: `#[tokio::main]`'s runtime worker threads already exist at
+        // this point, but nothing has been scheduled onto them yet --
+        // `ctx::dispatch` below is the first call that does real work, and
+        // it has not run yet -- so no other thread in this process can be
+        // reading or writing the environment concurrently here.
         unsafe {
             std::env::set_var(ctx::chat::NATIVE_ALIAS_ENV, "true");
         }
@@ -709,12 +779,12 @@ mod tests {
         );
     }
 
-    /// `zirv native --help`/`-h` is detected only for exactly that shape --
-    /// a bare `zirv native`, or `--help` anywhere but immediately after
-    /// `native`, falls through to the ordinary argv rewrite (and therefore
-    /// to `chat.rs`'s own clap-driven parsing) instead.
+    /// `zirv native --help`/`-h` is detected anywhere in the trailing argv
+    /// (matching clap's own "--help short-circuits everything" convention),
+    /// up to but not past a `--` separator -- text after that belongs to the
+    /// adapter, not this alias.
     #[test]
-    fn native_help_is_detected_only_for_the_exact_help_flag_shape() {
+    fn native_help_is_detected_anywhere_before_a_double_dash() {
         assert!(is_top_level_native_help(&argv(&[
             "zirv", "native", "--help"
         ])));
@@ -722,12 +792,75 @@ mod tests {
         assert!(is_top_level_native_help(&argv(&[
             "zirv", "NATIVE", "--help"
         ])));
+        // Review finding: `--help` after some other flag, or with a
+        // trailing argument after it, must still be detected -- only a
+        // literal `--` boundary opts a later `--help` out.
+        assert!(is_top_level_native_help(&argv(&[
+            "zirv", "native", "--foo", "--help"
+        ])));
+        assert!(is_top_level_native_help(&argv(&[
+            "zirv", "native", "--help", "extra"
+        ])));
         assert!(!is_top_level_native_help(&argv(&["zirv", "native"])));
         assert!(!is_top_level_native_help(&argv(&[
             "zirv", "native", "--foo"
         ])));
+        // `--help` past a `--` is an opaque extra argument meant for the
+        // adapter, not a request for this alias's own help text.
         assert!(!is_top_level_native_help(&argv(&[
-            "zirv", "native", "--foo", "--help"
+            "zirv", "native", "--", "--help"
+        ])));
+    }
+
+    /// Review finding (issue #540): `zirv native --runtime harness` used to
+    /// rewrite to `ctx chat --runtime native --runtime harness`, and clap's
+    /// `Option<String>` let the LATER `--runtime` win, so the alias silently
+    /// launched the wrapped harness. Both spellings (`--runtime harness` and
+    /// `--runtime=harness`) must be caught, case-insensitively on `native`,
+    /// and a `--runtime` past a `--` separator (opaque extra argv for the
+    /// adapter) must not trip the guard.
+    #[test]
+    fn native_alias_refuses_a_user_supplied_runtime() {
+        assert!(native_alias_has_user_supplied_runtime(&argv(&[
+            "zirv",
+            "native",
+            "--runtime",
+            "harness"
+        ])));
+        assert!(native_alias_has_user_supplied_runtime(&argv(&[
+            "zirv",
+            "native",
+            "--runtime=harness"
+        ])));
+        assert!(native_alias_has_user_supplied_runtime(&argv(&[
+            "zirv",
+            "NATIVE",
+            "--force-pace",
+            "--runtime",
+            "native"
+        ])));
+        assert!(!native_alias_has_user_supplied_runtime(&argv(&[
+            "zirv", "native"
+        ])));
+        assert!(!native_alias_has_user_supplied_runtime(&argv(&[
+            "zirv",
+            "native",
+            "--force-pace"
+        ])));
+        assert!(!native_alias_has_user_supplied_runtime(&argv(&[
+            "zirv",
+            "native",
+            "--",
+            "--runtime",
+            "harness"
+        ])));
+        // Not the `native` alias at all -- must not false-positive on an
+        // ordinary `zirv chat --runtime harness`.
+        assert!(!native_alias_has_user_supplied_runtime(&argv(&[
+            "zirv",
+            "chat",
+            "--runtime",
+            "harness"
         ])));
     }
 
