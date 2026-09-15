@@ -2034,10 +2034,83 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/agents", "list the resolved agent roster"),
     ("/clear", "clear queued native input"),
     ("/compact", "report that native compaction is unavailable"),
+    (
+        "/context",
+        "show the compiled instruction provenance and context version",
+    ),
     ("/help", "show the shortcut list"),
+    ("/instructions", "alias for /context"),
     ("/status", "show the authoritative session status"),
     ("/team", "show or recompile the current team plan"),
 ];
+
+/// One instruction surface as the native `/context` (alias `/instructions`)
+/// view renders it -- the same columns `zirv context status` shows for the
+/// wrapped harness (issue #538, acceptance bullet 6's native half): path,
+/// trust, scope, bytes, sha256, decision+reason. Deliberately a local,
+/// display-only shape rather than `runtime::context::ResolvedInstructionSource`
+/// directly: this module stays presentation-only, and the caller (mirroring
+/// how `/status` needs live `StatusFacts` `apply_slash_command` cannot
+/// produce) is the one with repo/home/config access to assemble it.
+// No production caller yet: `native_pane.rs`'s `/context` dispatch renders
+// with an empty source list until live repo/home/config access is wired
+// through it (issue #538, decision 4's deferred half) -- this module's own
+// test (`context_view_lists_provenance_and_version`) exercises every field
+// in the meantime, the same dormancy pattern this codebase already uses for
+// a type with no production caller yet.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextViewSource {
+    pub path: String,
+    pub trust: &'static str,
+    pub scope: String,
+    pub bytes: usize,
+    /// `None` for a shadowed/duplicate/excluded source -- nothing was
+    /// delivered, so there is no content to hash.
+    pub sha256: Option<String>,
+    /// `included` / `shadowed by <path>` / `duplicate of <path>` /
+    /// `excluded: <reason>` -- `runtime::context::chunk_a::Decision::render()`
+    /// verbatim.
+    pub decision: String,
+}
+
+/// Renders the native `/context` view (issue #538, decision 4): the current
+/// compiled instruction provenance, the context version
+/// (`CompiledNativeContext::stable_prefix_sha256`), and whether the last
+/// turn recompiled it -- the same journal columns `JournalEvent::
+/// ContextCompiled` records, and the same per-surface facts `zirv context
+/// status` reports for the wrapped harness.
+pub fn render_context_view(
+    sources: &[ContextViewSource],
+    context_version: &str,
+    recompiled_last_turn: bool,
+) -> String {
+    let mut lines = vec![
+        format!("context version: {context_version}"),
+        format!(
+            "last turn: {}",
+            if recompiled_last_turn {
+                "recompiled"
+            } else {
+                "reused"
+            }
+        ),
+    ];
+    if sources.is_empty() {
+        lines.push("instruction sources: (none found)".to_string());
+        return lines.join("\n");
+    }
+    lines.push("instruction sources:".to_string());
+    for source in sources {
+        let hash = source.sha256.as_deref().unwrap_or("--");
+        let hash12 = &hash[..hash.len().min(12)];
+        lines.push(format!(
+            "  {} ({}, {}) -- {}B, sha256 {hash12} -- {}",
+            source.path, source.trust, source.scope, source.bytes, source.decision
+        ));
+    }
+    lines.join("\n")
+}
 
 pub fn slash_completions(draft: &str) -> Vec<Completion> {
     let prefix = draft.split_whitespace().next().unwrap_or("");
@@ -3628,7 +3701,15 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "/agent", "/agents", "/clear", "/compact", "/help", "/status", "/team"
+                "/agent",
+                "/agents",
+                "/clear",
+                "/compact",
+                "/context",
+                "/help",
+                "/instructions",
+                "/status",
+                "/team"
             ]
         );
         for absent in ["/approve", "/artifacts", "/follow-up"] {
@@ -3712,6 +3793,53 @@ mod tests {
         assert_eq!(
             render_agent_plan(&Err("unknown manifest 'ghost'".to_string())),
             "refused: unknown manifest 'ghost'"
+        );
+    }
+
+    /// Issue #538, decision 4: the native `/context` (alias `/instructions`)
+    /// view renders path, trust, scope, bytes, sha256 and decision+reason --
+    /// the same per-surface facts `zirv context status` reports for the
+    /// wrapped harness -- plus the context version and whether the last turn
+    /// recompiled it.
+    #[test]
+    fn context_view_lists_provenance_and_version() {
+        let sources = vec![
+            ContextViewSource {
+                path: "/repo/ZIRV.md".to_string(),
+                trust: "repo-untrusted",
+                scope: "repo".to_string(),
+                bytes: 42,
+                sha256: Some("abcdef0123456789".to_string()),
+                decision: "included".to_string(),
+            },
+            ContextViewSource {
+                path: "/repo/CLAUDE.md".to_string(),
+                trust: "repo-untrusted",
+                scope: "repo".to_string(),
+                bytes: 0,
+                sha256: None,
+                decision: "shadowed by /repo/ZIRV.md".to_string(),
+            },
+        ];
+        let rendered = render_context_view(&sources, "deadbeef", true);
+
+        assert!(rendered.contains("context version: deadbeef"), "{rendered}");
+        assert!(rendered.contains("last turn: recompiled"), "{rendered}");
+        assert!(rendered.contains("/repo/ZIRV.md"), "{rendered}");
+        assert!(rendered.contains("repo-untrusted"), "{rendered}");
+        assert!(rendered.contains("42B"), "{rendered}");
+        assert!(rendered.contains("abcdef012345"), "{rendered}");
+        assert!(rendered.contains("included"), "{rendered}");
+        assert!(
+            rendered.contains("shadowed by /repo/ZIRV.md"),
+            "a shadowed source's decision names its winner: {rendered}"
+        );
+
+        let unchanged = render_context_view(&[], "deadbeef", false);
+        assert!(unchanged.contains("last turn: reused"), "{unchanged}");
+        assert!(
+            unchanged.contains("(none found)"),
+            "an empty instruction layer is still reported, not omitted: {unchanged}"
         );
     }
 
