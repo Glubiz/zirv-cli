@@ -4437,6 +4437,8 @@ mod tests {
             optional_capabilities: Vec::new(),
             context_budget_bytes: 4096,
             instructions: "Do the thing.".to_string(),
+            team_role: None,
+            skills: Vec::new(),
         };
         let task = AgentTask {
             prompt: "do the thing".to_string(),
