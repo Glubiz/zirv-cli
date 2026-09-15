@@ -1374,6 +1374,7 @@ fn event_kind(event: &JournalEvent) -> &'static str {
         JournalEvent::Checkpoint { .. } => "checkpoint",
         JournalEvent::GenerationAdvanced { .. } => "generation_advanced",
         JournalEvent::SessionEnded { .. } => "session_ended",
+        JournalEvent::ContextCompiled { .. } => "context_compiled",
     }
 }
 

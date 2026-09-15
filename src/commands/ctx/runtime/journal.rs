@@ -285,6 +285,21 @@ pub enum JournalEvent {
     SessionEnded {
         reason: String,
     },
+    /// Issue #538 (chunk B): the native context compiler's own stable-prefix
+    /// version and instruction-layer provenance as of one compile or
+    /// recompile. `context_version` is `CompiledNativeContext::stable_
+    /// prefix_sha256`; `sources` is a JSON array of `{path, scope, trust,
+    /// decision, sha256}` (`runtime::context::ResolvedInstructionSource`,
+    /// serialized directly). Recorded once at session start and once per
+    /// recompile (`NativeLoop::recompile_instructions_if_changed`), always
+    /// scoped to the turn in progress via `EventScope::turn` -- "which
+    /// compiled version shaped each turn" is then `the latest ContextCompiled
+    /// event at or before that turn's own sequence`.
+    ContextCompiled {
+        context_version: String,
+        sources: serde_json::Value,
+        at_ms: Option<u64>,
+    },
 }
 
 impl JournalEvent {
@@ -299,6 +314,7 @@ impl JournalEvent {
             Self::Checkpoint { .. } => "checkpoint",
             Self::GenerationAdvanced { .. } => "generation_advanced",
             Self::SessionEnded { .. } => "session_ended",
+            Self::ContextCompiled { .. } => "context_compiled",
         }
     }
 
@@ -334,7 +350,9 @@ impl JournalEvent {
                 checkpoint: Some(checkpoint_id),
                 ..IndexedIds::default()
             },
-            Self::GenerationAdvanced { .. } | Self::SessionEnded { .. } => IndexedIds::default(),
+            Self::GenerationAdvanced { .. }
+            | Self::SessionEnded { .. }
+            | Self::ContextCompiled { .. } => IndexedIds::default(),
         }
     }
 }
@@ -613,6 +631,10 @@ impl ConversationState {
                 JournalEvent::SessionEnded { reason } => {
                     state.ended_reason = Some(reason.clone());
                 }
+                // Issue #538 (chunk B): informational provenance only -- read
+                // back via `latest_event_of_type`/`events`, not folded into
+                // this reduced conversation state.
+                JournalEvent::ContextCompiled { .. } => {}
             }
         }
         for message in &state.messages {
@@ -1141,6 +1163,33 @@ impl Journal {
                 checkpoint_id,
                 kind,
                 portable_state,
+            },
+            committed_at,
+        )
+    }
+
+    /// Issue #538 (chunk B): records which compiled context version shaped
+    /// this turn (or the session, before its first turn). `scope.turn`
+    /// should name the turn in progress when one exists, so a later reader
+    /// can find "the latest `ContextCompiled` at or before this turn's own
+    /// sequence" via [`Self::latest_event_of_type`].
+    pub fn record_context_compiled(
+        &mut self,
+        session: &JournalSessionId,
+        generation: u64,
+        scope: &EventScope,
+        context_version: String,
+        sources: serde_json::Value,
+        committed_at: u64,
+    ) -> JournalResult<SequenceId> {
+        self.append(
+            session,
+            generation,
+            scope,
+            JournalEvent::ContextCompiled {
+                context_version,
+                sources,
+                at_ms: Some(committed_at),
             },
             committed_at,
         )
@@ -1724,7 +1773,8 @@ impl Journal {
                 | JournalEvent::TaskReceipt { .. }
                 | JournalEvent::Checkpoint { .. }
                 | JournalEvent::GenerationAdvanced { .. }
-                | JournalEvent::SessionEnded { .. } => {}
+                | JournalEvent::SessionEnded { .. }
+                | JournalEvent::ContextCompiled { .. } => {}
             }
         }
         Ok(projected)
@@ -3313,5 +3363,56 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Issue #538 (chunk B), decision 3: a compile (or recompile) records
+    /// `context_version` (the compiled context's `stable_prefix_sha256`) and
+    /// the instruction layer's `context_sources`, scoped to the turn in
+    /// progress, readable back via the existing `latest_event_of_type` --
+    /// "the journal records which compiled version shaped each turn".
+    #[test]
+    fn a_turn_records_the_context_version_and_sources() {
+        let (_dir, mut journal) = journal();
+        let session = jid("session-1");
+        journal.create_session(&identity(session.as_str())).unwrap();
+        let scope = scope();
+
+        let sources = json!([{
+            "path": "/repo/ZIRV.md",
+            "scope": "repo",
+            "trust": "repository_untrusted",
+            "decision": "included",
+            "sha256": "abc123",
+        }]);
+        journal
+            .record_context_compiled(
+                &session,
+                7,
+                &scope,
+                "stable-prefix-hash-1".to_string(),
+                sources.clone(),
+                1_000,
+            )
+            .unwrap();
+
+        let stored = journal
+            .latest_event_of_type(&session, "context_compiled")
+            .unwrap()
+            .expect("the event is recorded");
+        assert_eq!(
+            stored.scope.turn, scope.turn,
+            "scoped to the turn in progress"
+        );
+        match stored.event {
+            JournalEvent::ContextCompiled {
+                context_version,
+                sources: recorded_sources,
+                ..
+            } => {
+                assert_eq!(context_version, "stable-prefix-hash-1");
+                assert_eq!(recorded_sources, sources);
+            }
+            other => panic!("expected ContextCompiled, got {other:?}"),
+        }
     }
 }
