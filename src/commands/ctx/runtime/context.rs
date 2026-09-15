@@ -1020,11 +1020,18 @@ pub struct ResolvedInstructionSource {
     pub scope: String,
     pub trust: SourceTrust,
     /// `chunk_a::Decision::render()` -- `included` / `shadowed by <path>` /
-    /// `duplicate of <path>` / `excluded: <reason>`.
+    /// `duplicate of <path>` / `included by reference from <path>` /
+    /// `excluded: <reason>`.
     pub decision: String,
-    /// `Some` only when `decision == "included"` and the file's content was
-    /// actually read.
+    /// `Some` only when this file's own content was actually read -- an
+    /// `Included` winner, or an `IncludedByReference` file whose text is
+    /// what a winner elsewhere actually delivers.
     pub sha256: Option<String>,
+    /// Review fix (issue #538, item 5): this file's own raw byte count,
+    /// `Some` under the same condition as `sha256` -- so a consumer that
+    /// only has this journal-recorded provenance (the native `/context`
+    /// pane) can report a real size instead of a placeholder `0`.
+    pub raw_bytes: Option<usize>,
 }
 
 /// Issue #538 (chunk B), decision 2: the chunk A same-directory-precedence
@@ -1056,16 +1063,26 @@ pub fn resolve_active_scope_instructions(
     in_scope
         .into_iter()
         .map(|r| {
-            let sha256 = matches!(r.decision, chunk_a::Decision::Included)
-                .then(|| surfaces.iter().find(|s| s.path == r.path))
-                .flatten()
-                .map(|s| memory::sha256_hex(&s.text));
+            // Review fix (issue #538): an `IncludedByReference` entry's own
+            // text IS what actually reaches the session (via the winner
+            // that imports it), so its fingerprint must track that text too
+            // -- otherwise editing it would never be seen as a scope change
+            // by `recompile_instructions_if_changed`'s equality check.
+            let own_surface = matches!(
+                r.decision,
+                chunk_a::Decision::Included | chunk_a::Decision::IncludedByReference { .. }
+            )
+            .then(|| surfaces.iter().find(|s| s.path == r.path))
+            .flatten();
+            let sha256 = own_surface.map(|s| memory::sha256_hex(&s.text));
+            let raw_bytes = own_surface.map(|s| s.text.len());
             ResolvedInstructionSource {
                 path: r.path.clone(),
                 scope: native_scope_label(repo, r.layer, &r.path),
                 trust: native_source_trust(r.layer),
                 decision: r.decision.render(),
                 sha256,
+                raw_bytes,
             }
         })
         .collect()
@@ -1110,7 +1127,22 @@ fn push_native_instruction_sources(out: &mut Vec<Candidate>, request: &CompileRe
         let scope = native_scope_label(request.repo, resolved.layer, &resolved.path);
         let trust = native_source_trust(resolved.layer);
 
-        let chunk_a::Decision::Included = &resolved.decision else {
+        // Review fix (issue #538): a candidate whose content is actually
+        // delivered has TWO shapes now -- an ordinary winner (deliver its
+        // own text) and a winner whose content is a lone import of another
+        // candidate (`delivers_from`, deliver THAT candidate's real text
+        // instead of the literal `@AGENTS.md`-shaped stub). Anything else
+        // (`Shadowed`/`Duplicate`/`Excluded`, and the imported file's own
+        // `IncludedByReference` entry, which is reported but never delivers
+        // a second copy of what the winner already delivered) is a
+        // zero-text provenance-only stub.
+        if resolved.decision != chunk_a::Decision::Included {
+            let (stub_decision, note) = match &resolved.decision {
+                chunk_a::Decision::IncludedByReference { .. } => {
+                    (SourceDecision::Referenced, resolved.decision.render())
+                }
+                _ => (SourceDecision::Excluded, resolved.decision.render()),
+            };
             out.push(Candidate {
                 id,
                 source: SourceKind::NativeInstructions,
@@ -1121,15 +1153,20 @@ fn push_native_instruction_sources(out: &mut Vec<Candidate>, request: &CompileRe
                 text: String::new(),
                 retention: Retention::Optional,
                 stable: true,
-                initial_decision: Some((SourceDecision::Excluded, resolved.decision.render())),
+                initial_decision: Some((stub_decision, note)),
                 scope: Some(scope),
                 sha256: None,
             });
             continue;
         };
+
+        let source_path: &Path = resolved
+            .delivers_from
+            .as_deref()
+            .unwrap_or(resolved.path.as_path());
         let Some(raw_text) = surfaces
             .iter()
-            .find(|s| s.path == resolved.path)
+            .find(|s| s.path == source_path)
             .map(|s| s.text.as_str())
         else {
             continue;
@@ -1139,33 +1176,42 @@ fn push_native_instruction_sources(out: &mut Vec<Candidate>, request: &CompileRe
         }
         let raw_bytes = raw_text.len();
         let sha256 = memory::sha256_hex(raw_text);
+        // Review fix (issue #538): provenance names BOTH paths for a
+        // delivered-by-import candidate -- `id`/`path` stay the winner's
+        // own (it is still that directory's precedence winner), and the
+        // reason records where the delivered content actually came from.
+        let import_note = resolved
+            .delivers_from
+            .as_ref()
+            .map(|from| format!("content delivered from {} (lone import)", from.display()));
         let (text, initial_decision) = if raw_bytes <= budget_remaining {
             budget_remaining -= raw_bytes;
-            (raw_text.to_string(), None)
+            (
+                raw_text.to_string(),
+                import_note.map(|note| (SourceDecision::Included, note)),
+            )
         } else if budget_remaining > 0 {
             let truncated =
                 crate::utils::truncate_bytes(raw_text.to_string(), Some(budget_remaining));
             let used = truncated.len();
             budget_remaining = 0;
-            (
-                truncated,
-                Some((
-                    SourceDecision::Truncated,
-                    format!(
-                        "native instruction layer aggregate cap ({instructions_max_bytes} bytes) retained {used} of {raw_bytes} bytes"
-                    ),
-                )),
-            )
+            let mut reason = format!(
+                "native instruction layer aggregate cap ({instructions_max_bytes} bytes) retained {used} of {raw_bytes} bytes"
+            );
+            if let Some(note) = import_note {
+                reason.push_str(" -- ");
+                reason.push_str(&note);
+            }
+            (truncated, Some((SourceDecision::Truncated, reason)))
         } else {
-            (
-                String::new(),
-                Some((
-                    SourceDecision::Excluded,
-                    format!(
-                        "native instruction layer aggregate cap ({instructions_max_bytes} bytes) reached"
-                    ),
-                )),
-            )
+            let mut reason = format!(
+                "native instruction layer aggregate cap ({instructions_max_bytes} bytes) reached"
+            );
+            if let Some(note) = import_note {
+                reason.push_str(" -- ");
+                reason.push_str(&note);
+            }
+            (String::new(), Some((SourceDecision::Excluded, reason)))
         };
         out.push(Candidate {
             id,
@@ -1874,6 +1920,77 @@ mod tests {
             provenance.sha256.as_deref(),
             Some(memory::sha256_hex("- always run the full test suite\n").as_str())
         );
+    }
+
+    /// Review fix (issue #538, item 1 -- blocker): a `ZIRV.md` whose entire
+    /// content is `@AGENTS.md` -- the exact compatibility-link pattern
+    /// `--report`/the README tell users to create -- must deliver the real
+    /// `AGENTS.md` text, not the eight literal bytes `@AGENTS.md`. This is
+    /// the end-to-end proof, through the real `compile()` entry point: the
+    /// real rules reach a compiled message, the literal import stub never
+    /// does, and `AGENTS.md`'s own provenance says `included by reference`
+    /// rather than a blank `shadowed by`.
+    #[test]
+    fn a_zirv_md_that_only_imports_agents_md_delivers_agents_mds_real_text() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("ZIRV.md"), "@AGENTS.md\n").unwrap();
+        std::fs::write(
+            repo.path().join("AGENTS.md"),
+            "- the real rules live here\n",
+        )
+        .unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let req = request(
+            None,
+            repo.path(),
+            &state,
+            &cfg,
+            "implement it",
+            ample_budget(),
+        );
+        let compiled = compile(&req).unwrap();
+
+        let text = compiled
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("the real rules live here"),
+            "AGENTS.md's real content must reach a compiled message: {text}"
+        );
+        assert!(
+            !text.contains("@AGENTS.md"),
+            "the literal import stub must never be delivered as content: {text}"
+        );
+
+        let zirv_md = compiled
+            .provenance
+            .iter()
+            .find(|p| p.path.as_deref() == Some(repo.path().join("ZIRV.md").as_path()))
+            .expect("ZIRV.md has a provenance entry");
+        assert_eq!(zirv_md.decision, SourceDecision::Included);
+        assert_eq!(
+            zirv_md.sha256.as_deref(),
+            Some(memory::sha256_hex("- the real rules live here\n").as_str()),
+            "ZIRV.md's own provenance hash must reflect the DELIVERED (imported) text"
+        );
+
+        let agents_md = compiled
+            .provenance
+            .iter()
+            .find(|p| p.path.as_deref() == Some(repo.path().join("AGENTS.md").as_path()))
+            .expect("AGENTS.md has a provenance entry");
+        assert_eq!(agents_md.decision, SourceDecision::Referenced);
+        assert!(
+            agents_md.reason.contains("included by reference"),
+            "{}",
+            agents_md.reason
+        );
+        assert_eq!(agents_md.delivered_bytes, 0, "no duplicate delivery");
     }
 
     /// Acceptance bullet 5 (native half): a same-directory-shadowed and a
