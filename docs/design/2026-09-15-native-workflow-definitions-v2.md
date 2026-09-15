@@ -687,3 +687,152 @@ gate -- `pm-status-report` and `sre-incident-triage` from chunk 4, plus
 `sre-deploy-or-rollback` from chunk 5), and a bounded model tie-break for
 selection (still unnecessary -- no chunk-5 pack landed near the selection
 floor in a way the deterministic algorithm got wrong).
+
+## Review fixes (FIX verdict, same day)
+
+A review pass on chunks 1-5 raised seven blockers, eleven should-fixes and
+six nits; all are closed here. Two workers picked this up in sequence
+(sessions ending mid-task); this section covers the whole round in one
+place rather than per-worker.
+
+### Blockers
+
+1. `registry.rs`'s `widening_violation` only checked a repository step's own
+   declared `capabilities` -- a hostile pack could smuggle a watched
+   capability (`agent.spawn`, via `delegate`) past the check by referencing a
+   skill that requires it without declaring it explicitly. Both the built-in
+   baseline and the candidate step are now unioned with their referenced
+   skills' `required_capabilities` first
+   (`a_repository_pack_cannot_widen_through_a_skills_required_capabilities`).
+2. A step's `effect` was purely descriptive -- nothing gated on it.
+   `WorkflowDefinitionV2::validate` now refuses an `External`-effect step
+   that is neither `approval = true` nor listed in `gates.approval`
+   (`a_definition_with_an_ungated_external_step_is_rejected`); the engine's
+   own `WorkflowState::step_requires_approval` (and the initial-status
+   computation in `start_with_definition`) also treats an External-effect
+   step as gated even when only `gates.approval` names it, independent of
+   the pack's own `approval` field
+   (`the_engine_refuses_to_enter_an_unapproved_external_step`).
+3. `tests/fixtures/workflow/state-v4/feature.json` is a genuine pre-#542 v4
+   state file -- `schema_version: 4`, no `definition` key ever existed --
+   captured from base commit `eabc14db`'s own serializer (a scratch
+   worktree, a throwaway test calling that commit's own `WorkflowState::
+   start`/`save`, the resulting file copied out verbatim), not synthesized
+   by stripping the field from the CURRENT serializer's output. Only the
+   `"repo"` field is rewritten at test time, to point at that test's own
+   temp repo. `a_schema_four_state_file_still_loads_resumes_and_advances`
+   loads it directly via `include_str!`.
+4. `a_pinned_repository_definition_survives_registry_drift` (chunk 3a) only
+   proved a BUILT-IN pack's pin survives save/reload with drift simulated by
+   hand-mutating the hash field. `tests/fixtures/workflow/packs/drift-
+   fixture.toml` plus
+   `a_pinned_repository_definition_survives_registry_drift_inline` starts
+   from a genuine on-disk repository pack, edits the file after the run has
+   pinned its own inline copy, and proves both that resume/advance still
+   walks the ORIGINAL steps and that a fresh registry load of the edited
+   file now hashes differently than the pin.
+5+6. `native/541`'s twelve built-in agent manifests are in this base now
+   (`agents.rs`), so `no_builtin_pack_references_an_unknown_skill_or_role`
+   drops the fixed `KNOWN_ROLES` allowlist chunk 4 introduced as a stand-in
+   and cross-checks the live `AgentRegistry` instead (role resolution is by
+   manifest `id`). `every_builtin_pack_starts_and_materialises` proves
+   `workflow start` actually works for every one of the (now 32) built-in
+   packs -- each starts through `start_from_pack`, the exact path the CLI/
+   native tool use, and materialises a real first step whose `agent_role` (if
+   any) resolves.
+7. `apply_deploy_tier` unconditionally set a Deploy-phase step's `approval`
+   from `tier >= DeployTier::Staging` alone, silently DROPPING a gate a pack
+   author declared unconditionally (`devops-ci-cd-change`'s `deploy` step) at
+   a lower tier. The tier condition may now only WIDEN the gate:
+   `step.approval = step.approval || tier >= DeployTier::Staging`
+   (`a_pack_authored_approval_gate_survives_a_lower_deploy_tier`).
+
+### Should-fixes
+
+8. The gate-floor widening check's domain-intersection filter matched
+   NOTHING against an empty `domains` list, so a repository pack could skip
+   the whole gate-floor comparison (and drop any built-in gate category) by
+   simply omitting `domains`. A repository pack must now declare at least
+   one domain outright (`a_repository_pack_with_no_domains_is_rejected`),
+   with the gate-floor comparison also falling back to the FULL built-in set
+   when `domains` is empty as defense in depth. Two existing repository-pack
+   test fixtures (`broken-agent`, `parallel-fixture`) needed a `domains` tag
+   added once this landed.
+9. `GitWorktree` added to `WATCHED_CAPABILITIES` (folded into blocker 1's
+   commit).
+10. `.gitattributes` pins `src/commands/workflow/packs/*.toml` and
+    `tests/fixtures/workflow/**` to `text eol=lf`, renormalized -- the same
+    "a Windows checkout must not be able to differ from CI" reasoning the
+    file's existing entries already document for other fixture sets.
+11. `apply_brainstorm_selection` rewrote ANY Intent-phase step's skill to
+    `brainstorm`/`write-intent`, unconditionally. `start_from_pack` maps a
+    pack with no legacy `WorkflowKind` counterpart to the harmless `Feature`
+    placeholder for `kind`, and `default_brainstorm_for_kind(Feature)` is
+    `true` -- so every non-legacy pack (all thirty-plus chunk-4/5 packs, none
+    of which ever declares a `brainstorm` skill) had its authored
+    `write-intent` intent step silently swapped to `brainstorm` at start.
+    Gated on `legacy_eligible` (`WorkflowKind::from_pack_id(&definition.id)
+    .is_some()`) at every call site now; `a_non_legacy_pack_never_gets_the_
+    brainstorm_skill_swap` proves it directly against `sre-postmortem`.
+12. `materialize_from_definition` (initial build) and `apply_profile`
+    (reclassify) each independently decided which phases a domain variant
+    can never override -- one hardcoded the list, the other only "skipped"
+    them by the accident of no built-in pack ever authoring a variant for
+    them. Both now share one `PROFILE_INVARIANT_PHASES` constant;
+    `a_frontend_variant_deploy_step_is_ignored_by_both_materialize_and_
+    reclassify` proves it with a hand-built Deploy-phase variant fixture (no
+    real built-in pack authors one, which is exactly why nothing had caught
+    the drift risk before).
+13. `sre-deploy-or-rollback` and `devops-infrastructure-change` -- the two
+    packs singled out for `effects = "external"` -- had no `phase = "deploy"`
+    step at all, so `apply_deploy_tier` (which only ever acts on Deploy-phase
+    steps) had nothing to widen for either regardless of the operator's
+    deploy-tier policy. Both packs gained an explicit, `approval = true`
+    Deploy-phase step (`execute-decision`/`apply-change`) behind their
+    existing approval gate, still stopping there until #539's typed tooling
+    exists. `external_effects_packs_now_carry_a_deploy_phase_step` proves the
+    gate survives every tier; both packs' end-to-end fixtures were updated
+    for the new step.
+14+15. A gate-only approval's `current_step_approved` could go stale: if an
+    earlier artifact drifted (`reopen_artifact_gate`'s rewind) or a deploy-
+    tier escalation un-completed a later step (`apply_effective_deploy_
+    tier`'s cutoff), a PRIOR grant for that same step id would still match
+    when the run reached it again, silently skipping a fresh approval. Both
+    sites now clear `current_step_approved` when it names a step they just
+    invalidated (`a_stale_gate_only_approval_is_cleared_when_an_earlier_
+    artifact_reopens`, `tightening_to_production_clears_a_stale_gate_only_
+    approval_for_a_rewound_step`).
+16. `selection::score_pack` matched a `domains` tag by plain substring
+    (`"data"` inside `"database"`, `"pm"` inside `"shipment"`) -- now matched
+    against whole word tokens only
+    (`a_domain_tag_only_matches_a_whole_word_not_a_substring`).
+17. `workflow start`/`show`'s `id` positional was a closed clap `ValueEnum`
+    before #542; an unrecognized value failed at PARSE time (exit 2). Now a
+    plain string, the identical "you typed an id that does not exist"
+    condition only surfaced as an ordinary runtime error (exit 1) --
+    `dispatch` restores exit 2 specifically for an "unknown workflow" error
+    from these two subcommands, wording unchanged, so no README update was
+    needed (`an_unknown_registry_id_exits_2_like_the_old_closed_enum_did`).
+18. `a_pack_needing_a_missing_integration_stops_at_an_explicit_gate`
+    (selection.rs) only ever checked the DEFINITION, never drove the engine
+    -- renamed to `a_pack_needing_a_missing_integration_gates_in_its_own_
+    definition` and documented that the engine-level proof lives in each
+    pack's own end-to-end fixture in `engine.rs`, rather than duplicating
+    engine plumbing into a selection-layer test.
+
+### Nits
+
+`StepV2::agent_role`'s doc comment now says "resolves by manifest id" (it
+never resolved by the separate, more general `AgentManifest::role` string);
+stale test-name citations in `sre-deploy-or-rollback.toml`/`devops-
+infrastructure-change.toml`'s header comments corrected; the parity oracle's
+`shape` closure now also compares `condition`; a gate-only `approve` grants
+the same `ArtifactAccepted` telemetry event the artifact-gated path already
+does (no `artifact_stage`); `WorkflowState` persists the `Selection` that
+chose its pack (`#[serde(default)]`, `Eq` dropped from the struct's own
+derive since `Selection::confidence` is an `f64`) so `status` can explain why
+a pack was chosen without a separate `workflow classify` call; the synthetic
+production-tier review step (`apply_deploy_tier`) uses the reserved id
+`__review` (never a valid AUTHORED id -- `valid_id` rejects a leading `_`)
+instead of `"review"`, so it can never collide with a pack-authored step
+that happens to name itself `"review"` for some other phase.
