@@ -37,12 +37,40 @@ const MAX_WORKFLOW_DIRECTORY_ENTRIES: usize = 512;
 /// Capabilities the widening refusal polices (issue #542 architecture §2):
 /// a repository pack may only declare one of these on a step when some
 /// built-in pack already declares it on one of its own steps, anywhere.
-const WATCHED_CAPABILITIES: [CapabilityId; 4] = [
+const WATCHED_CAPABILITIES: [CapabilityId; 5] = [
     CapabilityId::RepoWrite,
     CapabilityId::ShellExec,
     CapabilityId::NetworkAccess,
     CapabilityId::AgentSpawn,
+    CapabilityId::GitWorktree,
 ];
+
+/// The watched capabilities a step actually carries: its own declared
+/// `capabilities`, UNION each referenced skill's `required_capabilities`
+/// (resolved through `skills`). A repository pack could otherwise smuggle a
+/// widened capability past the check simply by omitting it from the step's
+/// own `capabilities` field while still referencing a skill that requires it
+/// -- the skill's requirement is authority the step exercises regardless of
+/// whether the pack author wrote it down explicitly. A skill id that fails to
+/// resolve contributes nothing here; `validate()` (and, for a repository
+/// pack, `WorkflowRegistry::load`'s own known-skill-id check) already refuses
+/// an unknown skill before this ever runs.
+fn effective_watched_capabilities(
+    step: &super::definition::StepV2,
+    skills: &SkillRegistry,
+) -> BTreeSet<CapabilityId> {
+    step.capabilities
+        .iter()
+        .copied()
+        .chain(step.skills.iter().flat_map(|skill_id| {
+            skills
+                .get(skill_id)
+                .map(|skill| skill.manifest.required_capabilities.clone())
+                .unwrap_or_default()
+        }))
+        .filter(|capability| WATCHED_CAPABILITIES.contains(capability))
+        .collect()
+}
 
 /// `(id, embedded pack text)` for every built-in pack. Order here is
 /// cosmetic (the registry keys on `id`); this only needs to name each file
@@ -264,6 +292,7 @@ impl WorkflowRegistry {
                     home,
                     WorkflowSource::OperatorGlobal,
                     &known_skill_ids,
+                    skills,
                     &mut workflows,
                     &mut warnings,
                 )?;
@@ -274,6 +303,7 @@ impl WorkflowRegistry {
                     repo,
                     WorkflowSource::Repository,
                     &known_skill_ids,
+                    skills,
                     &mut workflows,
                     &mut warnings,
                 )?;
@@ -330,6 +360,7 @@ fn load_dir(
     allowed_root: &Path,
     source: WorkflowSource,
     known_skill_ids: &BTreeSet<&str>,
+    skills: &SkillRegistry,
     workflows: &mut BTreeMap<String, RegisteredWorkflow>,
     warnings: &mut Vec<String>,
 ) -> CtxResult<()> {
@@ -456,7 +487,7 @@ fn load_dir(
                     ));
                     continue;
                 }
-                if let Some(reason) = widening_violation(&definition, workflows) {
+                if let Some(reason) = widening_violation(&definition, workflows, skills) {
                     warnings.push(format!(
                         "repository workflow '{}' ({}) is ignored: {reason}",
                         definition.id,
@@ -487,6 +518,7 @@ fn load_dir(
 fn widening_violation(
     candidate: &WorkflowDefinitionV2,
     registered: &BTreeMap<String, RegisteredWorkflow>,
+    skills: &SkillRegistry,
 ) -> Option<String> {
     if candidate.effects == EffectClass::External {
         return Some(
@@ -502,15 +534,12 @@ fn widening_violation(
                 .definition
                 .steps
                 .iter()
-                .flat_map(|step| step.capabilities.iter().copied())
+                .flat_map(|step| effective_watched_capabilities(step, skills))
         })
-        .filter(|capability| WATCHED_CAPABILITIES.contains(capability))
         .collect();
     for step in &candidate.steps {
-        for capability in &step.capabilities {
-            if WATCHED_CAPABILITIES.contains(capability)
-                && !builtin_capabilities.contains(capability)
-            {
+        for capability in effective_watched_capabilities(step, skills) {
+            if !builtin_capabilities.contains(&capability) {
                 return Some(format!(
                     "step '{}' requires capability '{capability}', which no built-in pack uses",
                     step.id
@@ -919,6 +948,59 @@ present_as = "summary"
                 .warnings()
                 .iter()
                 .any(|w| w.contains("approval gate"))
+        );
+    }
+
+    /// A repository pack cannot smuggle a watched capability past the
+    /// widening check merely by referencing a skill that REQUIRES it, even
+    /// when the step's own `capabilities` field never names it. `delegate`'s
+    /// `required_capabilities` is exactly `[agent.spawn]`, and no built-in
+    /// workflow pack step declares `agent.spawn` (explicitly or through a
+    /// skill it references) -- see `widening_violation`'s own doc comment.
+    #[test]
+    fn a_repository_pack_cannot_widen_through_a_skills_required_capabilities() {
+        let repo = tempdir().unwrap();
+        let dir = repo.path().join(".zirv/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(
+            &dir.join("hostile-skill-capability.toml"),
+            r#"
+schema_version = 1
+id = "hostile-skill-capability"
+version = 1
+title = "Hostile skill capability"
+description = "Tries to widen authority via a skill's required capability."
+effects = "repository"
+
+[[steps]]
+id = "only"
+title = "Only step"
+phase = "implement"
+skills = ["delegate"]
+condition = "always"
+
+[failure]
+escalate_to = "human"
+
+[completion]
+present_as = "summary"
+"#,
+        );
+
+        let registry = WorkflowRegistry::load(repo.path(), None, true, true, &skills()).unwrap();
+        assert!(
+            registry.get("hostile-skill-capability").is_err(),
+            "a step whose SKILL requires agent.spawn must be refused even with no explicit \
+             capabilities field"
+        );
+        assert_eq!(registry.warnings().len(), 1, "{:?}", registry.warnings());
+        assert!(
+            registry
+                .warnings()
+                .iter()
+                .any(|w| w.contains("agent.spawn")),
+            "{:?}",
+            registry.warnings()
         );
     }
 }
