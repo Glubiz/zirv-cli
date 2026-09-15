@@ -33,6 +33,8 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use super::prompt::PromptRole;
 use super::provider::RouteId;
 use super::provider::config::NativeConfig;
@@ -52,7 +54,8 @@ pub const TESTER: &str = "tester";
 /// authority, which is the right default for a session nobody named.
 pub const DEFAULT_ROLE: &str = "worker";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TeamRole {
     Coordinator,
     SubOrchestrator,
@@ -178,7 +181,7 @@ impl std::fmt::Display for TeamRole {
 ///   reviewer CHILD must not write, no matter what the delegating model
 ///   asked for. The role is read off the persisted seat record, which model
 ///   output cannot reach.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authority {
     pub may_delegate: bool,
     pub may_write: bool,
@@ -426,6 +429,20 @@ mod tests {
              [route.paid]\naccount='metered'\nmodel='claude-sonnet-4-5'\n\
              [roles]\ncoordinator='seated'\nimplementer='paid'\n",
         )
+    }
+
+    /// Issue #541: `TeamRole` now round-trips through JSON (a `TeamPlan`
+    /// `Seat::team_role` field persists in `WorkflowState`). The derived
+    /// `kebab-case` serde form must match `as_str`/`parse` exactly, or a
+    /// persisted plan and the role parser would silently disagree.
+    #[test]
+    fn team_role_json_matches_as_str_and_parse() {
+        for role in TEAM {
+            let json = serde_json::to_string(&role).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", role.as_str()), "{role}");
+            let back: TeamRole = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, role);
+        }
     }
 
     #[test]
