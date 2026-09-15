@@ -1134,13 +1134,19 @@ impl WorkflowState {
     }
 
     /// Whether `step` (assumed to be the current step) still needs an
-    /// operator's approval -- `step.approval` is true AND this exact step id
-    /// has not already been approved via the gate-only path recorded in
+    /// operator's approval -- `step.approval` is true, OR the step's own
+    /// `effect` is `External` (issue #542 review finding 2: an external
+    /// effect is never metadata-only -- the engine itself refuses to enter
+    /// an unapproved external-effect step regardless of whether the pack
+    /// author also remembered to set `approval = true`, so a definition-
+    /// level authoring gap can never let one through) -- AND this exact step
+    /// id has not already been approved via the gate-only path recorded in
     /// `current_step_approved` (issue #542 chunk 5). An artifact-gated step
     /// never sets that field, so this is equivalent to plain `step.approval`
     /// for it, unchanged from before this fix.
     fn step_requires_approval(&self, step: &WorkflowStep) -> bool {
-        step.approval && self.current_step_approved.as_deref() != Some(step.id.as_str())
+        (step.approval || step.effect == super::definition::EffectClass::External)
+            && self.current_step_approved.as_deref() != Some(step.id.as_str())
     }
 
     /// Starts a workflow for one of the five legacy kind ids. Signature
@@ -1227,7 +1233,14 @@ impl WorkflowState {
             deploy_tier,
             brainstorm,
         );
-        let status = if steps.first().is_some_and(|step| step.approval) {
+        // Issue #542 review finding 2: mirrors `step_requires_approval` --
+        // an `External`-effect first step must gate even when the pack
+        // author only listed it in `gates.approval` rather than setting its
+        // own `approval = true` (no `current_step_approved` can exist yet
+        // for a workflow that has not started).
+        let status = if steps.first().is_some_and(|step| {
+            step.approval || step.effect == super::definition::EffectClass::External
+        }) {
             WorkflowStatus::AwaitingApproval
         } else {
             WorkflowStatus::Running
@@ -1507,6 +1520,17 @@ fn reopen_artifact_gate(state: &mut WorkflowState, stage: ArtifactStage) -> CtxR
     state
         .completed_steps
         .retain(|completed| !invalid.contains(completed));
+    // Issue #542 review finding 14: a gate-only approval recorded further
+    // along the (now rewound) step list must not silently count as still
+    // granted if/when this run walks forward past it again -- `invalid`
+    // covers exactly the steps this rewind un-completes.
+    if state
+        .current_step_approved
+        .as_deref()
+        .is_some_and(|id| invalid.iter().any(|invalid_id| invalid_id == id))
+    {
+        state.current_step_approved = None;
+    }
     state.current_step = index;
     state.status = WorkflowStatus::AwaitingApproval;
     if let Some(record) = state.artifacts.get_mut(stage.key()) {
@@ -2230,6 +2254,18 @@ fn apply_effective_deploy_tier(state: &mut WorkflowState, effective: DeployTier)
         state
             .completed_steps
             .retain(|completed| safe_ids.contains(completed));
+        // Issue #542 review finding 15: a deploy-tier escalation can
+        // invalidate steps the same way `reopen_artifact_gate`'s rewind
+        // does -- a gate-only approval recorded for a step this escalation
+        // just un-completed must not be treated as still granted if this
+        // run walks forward past it again.
+        if state
+            .current_step_approved
+            .as_deref()
+            .is_some_and(|id| !safe_ids.iter().any(|safe_id| safe_id == id))
+        {
+            state.current_step_approved = None;
+        }
     }
 
     state.deploy_tier = target;
@@ -5279,6 +5315,49 @@ mod tests {
             state.completed_steps,
             ["intent", "plan", "implement", "test"],
             "verify evidence after the inserted production review must be replayed"
+        );
+    }
+
+    /// Issue #542 review finding 15: a deploy-tier escalation can invalidate
+    /// (un-complete) a step the same way `reopen_artifact_gate`'s rewind
+    /// does -- see `tightening_to_production_rewinds_later_completed_
+    /// evidence`, which this test otherwise mirrors exactly. A stale
+    /// `current_step_approved` recorded for a step this escalation just
+    /// un-completed must not survive it, or `step_requires_approval` would
+    /// treat that step as already granted the next time it is reached.
+    #[test]
+    fn tightening_to_production_clears_a_stale_gate_only_approval_for_a_rewound_step() {
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
+        let mut state = WorkflowState::start(
+            PathBuf::from("repo"),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        state.completed_steps = vec!["intent", "plan", "implement", "test", "verify"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        state.status = WorkflowStatus::Running;
+        state.current_step_approved = Some("verify".to_string());
+
+        apply_effective_deploy_tier(&mut state, DeployTier::Production);
+
+        assert_eq!(
+            state.completed_steps,
+            ["intent", "plan", "implement", "test"],
+        );
+        assert_eq!(
+            state.current_step_approved, None,
+            "a stale gate-only approval for a step this escalation un-completed must be cleared"
         );
     }
 
@@ -10363,6 +10442,194 @@ present_as = "summary"
                 .iter()
                 .any(|id| id == "brief-approval")
         );
+    }
+
+    /// Issue #542 review finding 14: when an earlier artifact drifts after a
+    /// LATER gate-only step has already been approved, `reopen_artifact_
+    /// gate`'s rewind must clear `current_step_approved` -- otherwise, once
+    /// the run walks forward again, `step_requires_approval` would see the
+    /// stale id still recorded and silently treat the gate-only step as
+    /// already approved a second time, without a fresh operator decision.
+    #[test]
+    fn a_stale_gate_only_approval_is_cleared_when_an_earlier_artifact_reopens() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        git_init_with_commit(repo.path());
+        let mut state = start_pack_fixture(
+            repo.path(),
+            "pm-requirements",
+            "gather requirements for the export feature",
+            low_classification(),
+        );
+
+        assert_eq!(state.current().unwrap().id, "intake");
+        ensure_current_artifact_template(&state).expect("template");
+        let intent_path =
+            workflow_artifact_path(&state, ArtifactStage::Intent).expect("artifact path");
+        std::fs::write(&intent_path, "# Fixture\n\nSubstantive intake content.\n")
+            .expect("write");
+        state = approve(&state_dir, state).expect("approve intake");
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("advance past constraints");
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("advance past acceptance-criteria");
+        assert_eq!(state.current().unwrap().id, "brief-approval");
+
+        state = approve(&state_dir, state).expect("approve the gate-only step");
+        assert_eq!(
+            state.current_step_approved.as_deref(),
+            Some("brief-approval")
+        );
+
+        // The `intake` artifact drifts after the LATER `brief-approval` gate
+        // was already granted.
+        std::fs::write(
+            &intent_path,
+            "# Fixture\n\nChanged after intake was accepted.\n",
+        )
+        .expect("rewrite");
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect_err("a drifted earlier artifact must reopen its gate");
+        assert!(error.to_string().contains("intent artifact changed"), "{error}");
+
+        let reopened = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(reopened.current().unwrap().id, "intake");
+        assert_eq!(
+            reopened.current_step_approved, None,
+            "the stale brief-approval grant must not survive the rewind"
+        );
+    }
+
+    /// Issue #542 review finding 2: "external effects are metadata only" --
+    /// before this fix, a step's own `effect` field was purely descriptive
+    /// and the engine never consulted it. This fixture's `second` step is
+    /// gated only through `gates.approval` (the definition-level summary),
+    /// deliberately leaving the step's own `approval` field `false`, to
+    /// prove the ENGINE itself -- not just a pack author remembering to set
+    /// `approval = true` -- refuses to enter an unapproved `External`-effect
+    /// step.
+    #[test]
+    fn the_engine_refuses_to_enter_an_unapproved_external_step() {
+        use super::super::definition::{
+            CompletionContract, EffectClass, EscalateTo, FailurePolicy, GateSpec, Limits,
+            PresentAs, StepV2, WorkflowDefinitionV2,
+        };
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+
+        let definition = WorkflowDefinitionV2 {
+            schema_version: super::super::definition::DEFINITION_SCHEMA_VERSION,
+            id: "external-gate-fixture".into(),
+            version: 1,
+            title: "External gate fixture".into(),
+            description: "Proves the engine gates an External-effect step even without its own \
+                           approval field."
+                .into(),
+            domains: vec![],
+            triggers: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            steps: vec![
+                StepV2 {
+                    id: "first".into(),
+                    title: "First".into(),
+                    phase: WorkflowPhase::Intent,
+                    skills: vec!["write-intent".into()],
+                    agent_role: None,
+                    capabilities: vec![],
+                    depends_on: vec![],
+                    parallel_group: None,
+                    condition: StepCondition::Always,
+                    approval: false,
+                    artifact: None,
+                    max_attempts: 3,
+                    effect: EffectClass::None,
+                    reason: None,
+                    domains: vec![],
+                    overrides_step: None,
+                },
+                StepV2 {
+                    id: "second".into(),
+                    title: "Second".into(),
+                    phase: WorkflowPhase::Implement,
+                    skills: vec!["implement".into()],
+                    agent_role: None,
+                    capabilities: vec![],
+                    depends_on: vec!["first".into()],
+                    parallel_group: None,
+                    condition: StepCondition::Always,
+                    approval: false,
+                    artifact: None,
+                    max_attempts: 3,
+                    effect: EffectClass::External,
+                    reason: None,
+                    domains: vec![],
+                    overrides_step: None,
+                },
+            ],
+            gates: GateSpec {
+                approval: vec!["second".into()],
+                validation: vec![],
+                independent_review: vec![],
+            },
+            limits: Limits::default(),
+            failure: FailurePolicy {
+                escalate_to: EscalateTo::Human,
+                retry: false,
+            },
+            effects: EffectClass::External,
+            idempotency: None,
+            completion: CompletionContract {
+                required_outputs: vec![],
+                present_as: PresentAs::Summary,
+            },
+            presentation: None,
+            override_builtin: false,
+        };
+        let known_skills: BTreeSet<&str> = ["write-intent", "implement"].into_iter().collect();
+        definition
+            .validate(&known_skills)
+            .expect("the fixture itself is gated via gates.approval, so validate must accept it");
+
+        let pack = super::super::registry::RegisteredWorkflow {
+            definition: definition.clone(),
+            source: super::super::registry::WorkflowSource::Repository,
+            source_path: None,
+            hash: definition.hash().unwrap(),
+        };
+        let mut state = WorkflowState::start_from_pack(
+            repo.path().to_path_buf(),
+            "task".into(),
+            &pack,
+            None,
+            true,
+            low_classification(),
+        );
+        assert_eq!(state.current().unwrap().id, "first");
+        assert_eq!(state.status, WorkflowStatus::Running);
+
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("advance past the ungated first step");
+        assert_eq!(state.current().unwrap().id, "second");
+        assert!(!state.current().unwrap().approval, "the step's own approval field stays false");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::AwaitingApproval,
+            "an External-effect step must gate even though its own `approval` field is false"
+        );
+
+        // The existing gate-only approval path still grants it.
+        state = approve(&state_dir, state).expect("approve the gate-only external step");
+        assert_eq!(state.status, WorkflowStatus::Running);
+        assert_eq!(state.current().unwrap().id, "second");
+        assert_eq!(state.current_step_approved.as_deref(), Some("second"));
+
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("an approved external step must be advanceable");
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert!(state.completed_steps.iter().any(|id| id == "second"));
     }
 
     #[test]
