@@ -1,0 +1,75 @@
+# Built-in workflow pack: architecture-decision-record (issue #542 chunk 4).
+# Context/constraints -> materially different options and a decision ->
+# independent review -> the recorded ADR (context, constraints, options,
+# decision, consequences, evidence).
+schema_version = 1
+id = "architecture-decision-record"
+version = 1
+title = "Architecture decision record"
+description = "Record an architecture decision with context, constraints, materially different options, the decision, consequences and evidence."
+domains = ["architecture"]
+triggers = ["adr", "architecture decision", "decide between", "architectural options", "which approach"]
+effects = "none"
+
+[[inputs]]
+name = "question"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "adr"
+kind = "decision"
+
+[[steps]]
+id = "context"
+title = "Context and constraints"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = "always"
+
+[[steps]]
+id = "options"
+title = "Options and decision"
+phase = "design"
+skills = ["design"]
+agent_role = "architect"
+artifact = "spec"
+approval = true
+depends_on = ["context"]
+condition = "always"
+reason = "an ADR that compares only one option is not a decision record -- materially different options must be shown before the recommendation"
+
+[[steps]]
+id = "review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["options"]
+condition = "always"
+
+[[steps]]
+id = "record"
+title = "Record the ADR"
+phase = "present"
+skills = ["verify"]
+depends_on = ["options", "review"]
+condition = "always"
+reason = "an architecture workflow does not mutate production merely because its recommendation contains commands"
+
+[gates]
+approval = ["context", "options"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["adr"]
+present_as = "report"

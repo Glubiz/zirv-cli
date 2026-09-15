@@ -279,6 +279,18 @@ are registry entries under `runtime::tools`, not command verbs and not
 model-calling call sites, so they add no row to either table -- the same
 treatment N14's thirteen capability tools get.
 
+Issue #542 chunk 3b adds two native workflow tools, `workflow_list` and
+`workflow_start`, plus three native slash commands (`/workflows`,
+`/workflow <id>`, `/workflow status`) in the dashboard pane. Neither adds a
+`## Commands` row: `workflow_list`/`workflow_start` are registry entries
+under `runtime::tools`, the same treatment the four pre-existing workflow
+tools and N14's capability tools get, and the slash commands are pane-local
+dispatch that calls the very same `workflow::engine` writer functions
+(`write_registry_list`/`write_registry_entry`/`write_state`/
+`write_definition_status`/`write_start_outcome`) the `workflow list`/`show`/
+`status`/`start` verbs already call -- not a new surface, and not a
+model-calling call site, so no row in either table.
+
 N09 adds the two rows that actually DRIVE a model rather than transport one
 request: `NativeLoop::stream_once`, the single place the loop reaches a
 `ProviderAdapter` (and therefore the only place a response retry can happen),

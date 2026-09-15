@@ -1,0 +1,82 @@
+# Built-in workflow pack: data-question-to-report (issue #542 chunk 4).
+# Question/metric definition -> source/provenance audit -> analysis
+# (extraction/cleaning) -> independent validation -> findings/limitations.
+schema_version = 1
+id = "data-question-to-report"
+version = 1
+title = "Data question to report"
+description = "Answer a data question with reproducible analysis, source provenance, independent validation and disclosed limitations."
+domains = ["data"]
+triggers = ["data question", "analyze the data", "data report", "metric definition", "what does the data say"]
+effects = "none"
+
+[[inputs]]
+name = "question"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "report"
+kind = "report"
+
+[[steps]]
+id = "question-definition"
+title = "Define the question and metric"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "an ambiguous question produces an unfalsifiable answer -- the metric and its definition are pinned before analysis starts"
+
+[[steps]]
+id = "source-audit"
+title = "Source and provenance audit"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "researcher"
+depends_on = ["question-definition"]
+condition = "always"
+reason = "every downstream number must trace back to a named, reproducible source"
+
+[[steps]]
+id = "analysis"
+title = "Extract, clean and analyze"
+phase = "implement"
+skills = ["implement"]
+agent_role = "data-analyst"
+depends_on = ["source-audit"]
+condition = "always"
+
+[[steps]]
+id = "independent-validation"
+title = "Independent validation"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["analysis"]
+condition = "always"
+reason = "a numeric sanity check from a seat that did not produce the analysis, separating analytical evidence from narrative interpretation"
+
+[[steps]]
+id = "findings-report"
+title = "Findings, visualization and limitations"
+phase = "present"
+skills = ["verify"]
+depends_on = ["analysis", "independent-validation"]
+condition = "always"
+
+[gates]
+approval = ["question-definition"]
+independent_review = ["independent-validation"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["report"]
+present_as = "report"

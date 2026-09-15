@@ -1312,11 +1312,11 @@ and database/schema changes cannot be downgraded below High risk.
 ### The full verb set
 
 ```bash
-zirv workflow list                              # built-in workflow definitions
-zirv workflow show feature                       # one definition's steps
+zirv workflow list [--json] [--built-in-only] [--repo <path>]        # registry ids: layer/version/hash/domains
+zirv workflow show feature [--json] [--built-in-only] [--repo <path>] # one definition's steps
 zirv workflow classify --task "..."               # classify without starting
 zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>]
-zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off and per-step wall-clock
+zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off, per-step wall-clock, and pinned definition/drift
 zirv workflow resume <id>                         # restore as the active workflow
 zirv workflow context [id]                        # the current step's resolved skill context
 zirv workflow artifacts <id> [--json]              # committed work-product state
@@ -1330,6 +1330,171 @@ zirv workflow review package <id> | run <id> --agent <name> | add | ...
 zirv workflow maintain scan [--repo <path>] [--json]
 zirv workflow stats                               # local bounded telemetry
 ```
+
+### Workflow definitions v2 (issue #542)
+
+`zirv workflow list`/`show`/`start` resolve any id against a layered,
+validated **registry** of `WorkflowDefinitionV2` packs instead of a fixed Rust
+enum:
+
+1. **Built-ins.** Versioned Zirv packs compiled into the binary
+   (`src/commands/workflow/packs/*.toml`) -- today `feature`, `bugfix`,
+   `refactor`, `spike`, and `review`, reproducing the same step ids, phases,
+   skills, conditions, approvals, and artifacts the pre-#542 engine used.
+2. **Operator-global** (`~/.zirv/workflows/*.{toml,yaml,yml}`). Trusted: may
+   replace a built-in id, but only when the file itself sets `override =
+   true`; otherwise a colliding id is ignored with a warning, never silently
+   dropped or silently active.
+3. **Repository** (`<repo>/.zirv/workflows/*.{toml,yaml,yml}`, gated by
+   `workflow.repo_workflows_enabled`, default `false`). Untrusted: may only
+   ADD a non-colliding id, and additionally can never widen authority beyond
+   what some built-in pack already exercises -- `effects = "external"`, a
+   `repo.write`/`shell.exec`/`network.access`/`agent.spawn` capability no
+   built-in step ever declares, or dropping an approval/validation/
+   independent-review gate category a same-domain built-in establishes are
+   each refused (dropped with a warning, not a hard failure of the rest of
+   the layer). Symlinked directories/files, path escapes, and oversized
+   (>32&nbsp;KB) manifests are hard refusals, mirroring `.zirv/skills/`.
+
+A definition's fields: stable `id`/`version`/`title`/`description`, free-form
+`domains` tags and example `triggers`, typed `inputs`/`outputs`, a DAG of
+`steps` (each with `id`, `title`, `phase`, `skills`, an optional `agent_role`,
+`capabilities`, `depends_on`, an optional `parallel_group`, `condition`,
+`approval`, `artifact`, `max_attempts`, `effect`, a human-readable `reason`,
+and the domain-variant pair `domains`/`overrides_step`), `gates` (approval/
+validation/independent-review step-id sets), `limits`, a `failure` policy, a
+top-level `effects` ceiling, an optional `idempotency` note, and a
+`completion` contract. Validation (id shape, uniqueness, cycle detection,
+unreachable-step detection, unknown skill/dependency/gate-reference
+detection, and the 32&nbsp;KB size cap) runs before a pack is ever
+registered; `zirv workflow list`/`show --json` expose the resolved shape and
+each pack's stable content hash.
+
+`zirv workflow start <id>` executes ANY registry id through the same v2
+materialization path (issue #542 chunk 3a) -- not just the five built-in
+kinds; a step whose `agent_role` names nothing in the (registry-aware)
+`AgentRegistry` fails the start before any state is written.
+`materialize_from_definition` prunes steps by `condition` (unchanged
+semantics), resolves each surviving step's data, and orders the result by
+`depends_on` with a stable topological sort (ties broken by declaration
+order); `parallel_group` is carried onto the materialized step as
+informational metadata for a future concurrent scheduler -- the state
+machine itself is still the single `current_step` sequence it always was, so
+two steps sharing a `parallel_group` tag still execute one after the other
+today. `effect` (`none`/`repository`/`external`) is likewise carried onto
+the materialized step for downstream effect-aware tooling.
+
+**Domain variants (frontend, for now).** A step whose data should differ by
+domain -- today only `"frontend"` -- is authored as a SEPARATE `[[steps]]`
+entry with `domains = ["frontend"]` and `overrides_step = "<canonical id>"`,
+supplying that id's `skills`/`agent_role`/`capabilities`/`approval`/
+`artifact`/`max_attempts`/`effect` when the classified profile matches. A
+variant step is a data donor, not its own DAG node: it must declare no
+`depends_on` of its own, and the materialized step keeps the CANONICAL id,
+phase, `depends_on`, `parallel_group` and `condition` from the step it
+overrides regardless of which variant supplied its data -- switching profile
+(`zirv workflow reclassify --profile ...`) never changes a step's id. This
+replaces the old hardcoded `WorkflowProfile`-keyed Rust match table: a new
+pack adds a `domains`/`overrides_step` entry instead of an engine.rs change.
+
+**Brainstorm and deploy-tier tags.** These two overlays are NOT pack fields
+at all -- they are engine transforms keyed purely on `WorkflowPhase`, so any
+pack's steps opt in automatically by using the same phase as a built-in:
+a step with `phase = "intent"` gets the brainstorm/`--no-brainstorm` skill
+swap (`brainstorm` vs `write-intent`); a step with `phase = "deploy"` gets
+its `approval` set to `deploy_tier >= staging`, and if the deploy tier is
+`production` and no step anywhere has `phase = "review"`, a synthetic
+independent-review step is inserted immediately before the first
+`phase = "verify"` step as a production-readiness floor.
+
+A workflow started from a registry id pins that pack's `id`/`version`/hash
+(and, for a non-built-in pack, the full definition inline) on the running
+`WorkflowState`, so update, resume, and orchestrator rollover cannot change
+the run's meaning silently; `zirv workflow status` prints the pin and a
+`definition drifted from registry` note when the registry's current copy no
+longer hashes the same.
+
+### Built-in packs (issue #542 chunks 4-5)
+
+| id | group | effects | output |
+|---|---|---|---|
+| `feature` | software | repository | `change` |
+| `bugfix` | software | repository | `change` |
+| `refactor` | software | repository | `change` |
+| `spike` | software | repository | `findings` |
+| `review` | software | none | `disposition` |
+| `adaptive-work` | (generic fallback) | none | `result` |
+| `pm-requirements` | pm | none | `brief` |
+| `pm-status-report` | pm | none | `update` |
+| `pm-backlog-triage` | pm | none | `backlog-update` |
+| `pm-cycle-planning` | pm | none | `committed-plan` |
+| `pm-risk-review` | pm | none | `risk-register` |
+| `pm-retrospective` | pm | none | `retro-summary` |
+| `data-question-to-report` | data | none | `report` |
+| `data-quality-investigation` | data | none | `findings` |
+| `data-anomaly-investigation` | data | none | `findings` |
+| `data-recurring-kpi-review` | data | none | `kpi-summary` |
+| `architecture-decision-record` | architecture | none | `adr` |
+| `architecture-design-review` | architecture | none | `disposition` |
+| `architecture-discovery` | architecture | none | `discovery-report` |
+| `architecture-migration-roadmap` | architecture | none | `roadmap` |
+| `architecture-threat-scale-cost-review` | architecture | none | `assessment` |
+| `sre-incident-triage` | sre | none | `triage-report` |
+| `sre-deploy-or-rollback` | sre | external | `decision-receipt` |
+| `sre-postmortem` | sre | none | `postmortem` |
+| `sre-capacity-reliability-review` | sre | none | `review-summary` |
+| `devops-ci-cd-change` | devops | repository | `change` |
+| `devops-infrastructure-change` | devops | external | `change-receipt` |
+| `dependency-upgrade` | software | repository | `change` |
+| `security-remediation` | software, security | repository | `change` |
+| `schema-data-migration` | software | repository | `change` |
+| `performance-investigation` | software | repository | `change` |
+| `documentation-runbook-change` | software | repository | `change` |
+
+Every pack's `effects` is `none` or `repository`, except
+`devops-infrastructure-change` and `sre-deploy-or-rollback` (issue #542
+chunk 5), which declare `external` as their ceiling for the day #539 ships
+typed cloud/deployment-ops tools -- neither one actually mutates anything
+outside this checkout TODAY: every step stays `effect = "none"`, the
+workflow starts read-only, and every mutating step sits behind an explicit
+operator approval whose `reason` names the missing integration rather than
+acting through raw/untyped access. A pack that would otherwise need an
+integration (Kibana logs for `sre-incident-triage`'s diagnosis, a Linear/Jira
+ticket for `pm-requirements`/`pm-backlog-triage`/`pm-retrospective`, a live
+metrics/BI pull for `data-recurring-kpi-review`/
+`sre-capacity-reliability-review`) says so in the relevant step's `reason`
+and stops at an explicit approval gate instead of guessing. The repository
+trust layer (above) refuses `effects = "external"` on ANY repository-provided
+pack unconditionally, regardless of what a built-in declares -- only zirv's
+own versioned built-ins may ever reach for it.
+
+**How a workflow is chosen.** `zirv workflow start` without an id runs
+`selection::select_definition` deterministically against the resolved
+classification and `--task` text -- no model call. A pack scores by matching
+`--task` text against its `triggers` (3 points each), a `domains` tag
+appearing in the task text (2 points), and the classified work-domain
+aligning with a `domains` entry (1 point); scores below a floor are dropped,
+and the highest-scoring survivor wins, ties broken toward fewer external
+effects and then alphabetically by id -- both the score and the tie-break are
+recorded in `Selection::reasons`/`alternatives` and printed alongside the
+started workflow (`--json` adds a `selection` object; `workflow classify
+--json` adds the same field as a preview with no side effect). A legacy
+intent (`Feature`/`BugFix`/`Refactor`/`Spike`/`Review`) that classification
+already produces with high confidence selects that kind's pack outright,
+skipping scoring entirely, so the five pre-#542 workflows keep their exact
+historical selection behavior. Nothing above the floor selects
+`adaptive-work`, a small five-step (understand/plan/execute/validate/present)
+fallback pack with no domain/trigger tags of its own (so it never competes
+for another pack's task) that prunes itself down to three steps
+(understand/execute/present) for a trivial task. An explicit id
+(`zirv workflow start <id> --task ...`, or the native `/workflow <id> <task>`
+slash command) always wins outright with no selection performed at all, and
+that choice survives `resume`/`reclassify` as the pinned `definition` on the
+running state. A bounded model tie-break for a close, ambiguous score is
+deferred -- the deterministic algorithm's every decision is already
+explainable from `reasons` alone, which a model call would only obscure for
+the near-certain-floor cases it would actually apply to; see the design note
+for the full reasoning.
 
 ### Lifecycle and artifacts
 
@@ -2005,7 +2170,13 @@ checks `--seat` uses, never persisted); `/team` shows the plan stored for
 this repository and `/team plan <objective>` compiles and persists a new
 one — all three render through the identical functions the headless `zirv
 workflow agent list`/`team show|plan` commands print through, so the two
-surfaces cannot drift (issue #541 chunk C). `@` file references
+surfaces cannot drift (issue #541 chunk C). `/workflows` lists the workflow
+registry and `/workflow <id>` shows that pack's definition (or, given
+trailing text as a task, starts it) and `/workflow status [id]` shows a
+running workflow's status -- all three rendered through the exact same
+`workflow::engine` writer functions the headless `--json`/text CLI uses
+(issue #542 chunk 3b), so the pane and `zirv workflow list`/`show`/`status`
+can never disagree about the same state. `@` file references
 (`resolve_file_refs`, containment-checked against the workdir) and a
 `!`-prefixed shell line are not wired into this loop yet.
 
@@ -3002,6 +3173,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `workflow.repo_checks_enabled` | `ZIRV_CTX_WORKFLOW_REPO_CHECKS` |
 | `workflow.repo_skills_enabled` | `ZIRV_CTX_WORKFLOW_REPO_SKILLS` |
 | `workflow.repo_agents_enabled` | `ZIRV_CTX_WORKFLOW_REPO_AGENTS` |
+| `workflow.repo_workflows_enabled` | `ZIRV_CTX_WORKFLOW_REPO_WORKFLOWS` |
 | `workflow.deploy.tier` | `ZIRV_CTX_WORKFLOW_DEPLOY_TIER` |
 | `workflow.adoption` | `ZIRV_CTX_WORKFLOW_ADOPTION` |
 | `workflow.maintain` | `~/.zirv/ctx.toml only` |

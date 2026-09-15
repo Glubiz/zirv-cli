@@ -1,0 +1,72 @@
+# Built-in workflow pack: pm-retrospective (issue #542 chunk 5). Gather
+# signals -> what worked/what didn't -> action items -> retro summary. Linear
+# is #539's typed tool, not yet available: gather-signals declares that gap
+# in its own reason and gates explicitly rather than inventing outcomes.
+schema_version = 1
+id = "pm-retrospective"
+version = 1
+title = "Retrospective"
+description = "Gather signals from the cycle, assess what worked and what didn't, and produce action items and a retro summary."
+domains = ["pm"]
+triggers = ["retrospective", "retro", "sprint retrospective", "run a retro", "post-sprint review"]
+effects = "none"
+
+[[inputs]]
+name = "cycle"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "retro-summary"
+kind = "report"
+
+[[steps]]
+id = "gather-signals"
+title = "Gather signals"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "planner"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "requires a Linear integration (#539) for live cycle metrics; without it, this step collects an offline artifact from the operator and says so explicitly rather than inventing outcomes"
+
+[[steps]]
+id = "findings"
+title = "What worked, what didn't"
+phase = "implement"
+skills = ["implement"]
+agent_role = "planner"
+depends_on = ["gather-signals"]
+condition = "always"
+
+[[steps]]
+id = "action-items"
+title = "Action items"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "planner"
+depends_on = ["findings"]
+condition = "always"
+
+[[steps]]
+id = "retro-summary"
+title = "Retro summary"
+phase = "present"
+skills = ["verify"]
+depends_on = ["action-items"]
+condition = "always"
+
+[gates]
+approval = ["gather-signals"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["retro-summary"]
+present_as = "summary"

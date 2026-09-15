@@ -1,0 +1,81 @@
+# Built-in workflow pack: data-anomaly-investigation (issue #542 chunk 5).
+# Symptom -> reproduce/gather evidence -> root cause -> independent
+# validation -> findings.
+schema_version = 1
+id = "data-anomaly-investigation"
+version = 1
+title = "Data anomaly investigation"
+description = "Investigate an unexpected metric change with reproducible evidence, root-cause analysis and independent validation."
+domains = ["data"]
+triggers = ["anomaly", "investigate anomaly", "data anomaly", "metric spike", "unexpected metric change"]
+effects = "none"
+
+[[inputs]]
+name = "symptom"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "findings"
+kind = "report"
+
+[[steps]]
+id = "scope"
+title = "Scope the anomaly"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = "always"
+
+[[steps]]
+id = "reproduce-evidence"
+title = "Reproduce and gather evidence"
+phase = "implement"
+skills = ["implement"]
+agent_role = "data-analyst"
+depends_on = ["scope"]
+condition = "always"
+reason = "an anomaly claim needs a reproducible query or extract before root-cause analysis starts"
+
+[[steps]]
+id = "root-cause"
+title = "Root-cause analysis"
+phase = "debug"
+skills = ["systematic-debugging"]
+agent_role = "data-analyst"
+depends_on = ["reproduce-evidence"]
+condition = "always"
+
+[[steps]]
+id = "independent-validation"
+title = "Independent validation"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["root-cause"]
+condition = "always"
+reason = "a numeric sanity check from a seat that did not produce the analysis, separating analytical evidence from narrative interpretation"
+
+[[steps]]
+id = "findings"
+title = "Findings"
+phase = "present"
+skills = ["verify"]
+depends_on = ["root-cause", "independent-validation"]
+condition = "always"
+
+[gates]
+approval = ["scope"]
+independent_review = ["independent-validation"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["findings"]
+present_as = "report"

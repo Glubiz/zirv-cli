@@ -1,0 +1,75 @@
+# Built-in workflow pack: sre-capacity-reliability-review (issue #542
+# chunk 5). A routine, recurring review: collect metrics -> assess risk ->
+# recommendations proportionally -> summary. A live observability
+# integration is #539's typed tool, not yet available: collect-metrics
+# declares that gap in its own reason and gates explicitly rather than
+# inventing values.
+schema_version = 1
+id = "sre-capacity-reliability-review"
+version = 1
+title = "Capacity and reliability review"
+description = "Collect capacity/reliability metrics, assess risk against thresholds, and recommend action proportionally."
+domains = ["sre"]
+triggers = ["capacity review", "reliability review", "capacity and reliability", "slo review", "review capacity headroom"]
+effects = "none"
+
+[[inputs]]
+name = "service"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "review-summary"
+kind = "report"
+
+[[steps]]
+id = "collect-metrics"
+title = "Collect metrics"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "devops-sre"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "requires a live metrics/observability integration (#539) for automatic pulls; without it, this step collects an offline artifact from the operator and says so explicitly rather than inventing values"
+
+[[steps]]
+id = "assess-risk"
+title = "Assess risk"
+phase = "implement"
+skills = ["implement"]
+agent_role = "devops-sre"
+depends_on = ["collect-metrics"]
+condition = "always"
+
+[[steps]]
+id = "recommendations"
+title = "Recommendations"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "devops-sre"
+depends_on = ["assess-risk"]
+condition = { risk-at-least = "medium" }
+reason = "a healthy-headroom review does not need a separate recommendations pass; a flagged risk does"
+
+[[steps]]
+id = "review-summary"
+title = "Review summary"
+phase = "present"
+skills = ["verify"]
+depends_on = ["assess-risk", "recommendations"]
+condition = "always"
+
+[gates]
+approval = ["collect-metrics"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["review-summary"]
+present_as = "summary"

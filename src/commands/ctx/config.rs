@@ -1209,6 +1209,14 @@ pub struct WorkflowConfig {
     /// the operator explicitly enables this layer, and may never replace a
     /// trusted built-in/operator id.
     pub repo_agents_enabled: bool,
+    /// Whether untrusted repository-provided `.zirv/workflows/` definition
+    /// packs (`WorkflowDefinitionV2`, issue #542) are loaded at all. Off by
+    /// default, same posture as `repo_agents_enabled`: a checkout may
+    /// propose a new pack only after the operator explicitly enables this
+    /// layer, and a loaded pack may still never replace a trusted built-
+    /// in/operator id or widen authority -- see `workflow::registry::
+    /// WorkflowRegistry`.
+    pub repo_workflows_enabled: bool,
     pub deploy: WorkflowDeployConfig,
     pub maintain: WorkflowMaintainConfig,
     /// Local workflow telemetry. Previously read straight from the process
@@ -1279,6 +1287,7 @@ impl Default for WorkflowConfig {
             repo_checks_enabled: true,
             repo_skills_enabled: true,
             repo_agents_enabled: false,
+            repo_workflows_enabled: false,
             deploy: WorkflowDeployConfig::default(),
             maintain: WorkflowMaintainConfig::default(),
             telemetry_enabled: true,
@@ -3033,6 +3042,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_WORKFLOW_REPO_WORKFLOWS",
+        &["workflow", "repo_workflows_enabled"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
         &["workflow", "deploy", "tier"],
         EnvKind::Str,
@@ -3938,6 +3952,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "repo_agents_enabled"],
         "ZIRV_CTX_WORKFLOW_REPO_AGENTS",
+    ),
+    // Issue #542: the workflow-definition-pack analogue of the two entries
+    // right above -- a repo must not be able to turn its own untrusted
+    // `.zirv/workflows/` layer on for an operator who left it off.
+    (
+        &["workflow", "repo_workflows_enabled"],
+        "ZIRV_CTX_WORKFLOW_REPO_WORKFLOWS",
     ),
     (
         &["workflow", "deploy", "tier"],
@@ -11376,6 +11397,7 @@ mod tests {
         ("workflow", "repo_checks_enabled"),
         ("workflow", "repo_skills_enabled"),
         ("workflow", "repo_agents_enabled"),
+        ("workflow", "repo_workflows_enabled"),
         ("workflow.deploy", "tier"),
         ("workflow.deploy", "minimum_tier"),
         ("workflow", "adoption"),

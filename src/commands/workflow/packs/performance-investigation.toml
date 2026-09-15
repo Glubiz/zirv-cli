@@ -1,0 +1,100 @@
+# Built-in workflow pack: performance-investigation (issue #542 chunk 5).
+# Reproducible profile -> root cause -> implement -> test -> review -> verify
+# -> deploy, proportional to complexity/risk like dependency-upgrade.
+schema_version = 1
+id = "performance-investigation"
+version = 1
+title = "Performance investigation"
+description = "Reproduce a performance regression, isolate the root cause, and implement, test and review a fix."
+domains = ["software"]
+triggers = ["performance investigation", "investigate performance", "performance regression", "slow query", "latency investigation"]
+effects = "repository"
+
+[[inputs]]
+name = "symptom"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change"
+kind = "patch"
+
+[[steps]]
+id = "profile"
+title = "Profile and reproduce"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = { complexity-or-risk = { complexity = "bounded", risk = "medium" } }
+effect = "repository"
+reason = "a reproducible profile or benchmark gets an explicit record before a fix is attempted; a trivial, obviously-local hotspot does not need the extra ceremony"
+
+[[steps]]
+id = "root-cause"
+title = "Root-cause analysis"
+phase = "debug"
+skills = ["systematic-debugging"]
+agent_role = "debugger"
+depends_on = ["profile"]
+condition = "always"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+phase = "implement"
+skills = ["implement"]
+agent_role = "implementer"
+depends_on = ["root-cause"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "test"
+title = "Test"
+phase = "test"
+skills = ["testing"]
+depends_on = ["implement"]
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["test"]
+condition = { risk-at-least = "medium" }
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["review"]
+condition = "always"
+
+[[steps]]
+id = "deploy"
+title = "Finish branch"
+phase = "deploy"
+skills = ["finish-branch"]
+depends_on = ["verify"]
+condition = "always"
+effect = "repository"
+
+[gates]
+approval = ["profile"]
+validation = ["test", "verify"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change"]
+present_as = "patch"

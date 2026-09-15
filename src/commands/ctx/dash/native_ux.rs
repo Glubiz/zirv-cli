@@ -2042,6 +2042,11 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/instructions", "alias for /context"),
     ("/status", "show the authoritative session status"),
     ("/team", "show or recompile the current team plan"),
+    (
+        "/workflow",
+        "start or show a workflow pack by id, or its status",
+    ),
+    ("/workflows", "list the registry's workflow packs"),
 ];
 
 /// One instruction surface as the native `/context` (alias `/instructions`)
@@ -3704,7 +3709,9 @@ mod tests {
                 "/help",
                 "/instructions",
                 "/status",
-                "/team"
+                "/team",
+                "/workflow",
+                "/workflows"
             ]
         );
         for absent in ["/approve", "/artifacts", "/follow-up"] {

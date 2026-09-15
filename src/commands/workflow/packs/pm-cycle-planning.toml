@@ -1,0 +1,76 @@
+# Built-in workflow pack: pm-cycle-planning (issue #542 chunk 5).
+# Capacity/evidence -> candidate scope -> dependencies/risks -> committed
+# plan. A committed plan is consequential, so the final step is always an
+# explicit approval, not proportionally skipped.
+schema_version = 1
+id = "pm-cycle-planning"
+version = 1
+title = "Cycle planning"
+description = "Turn capacity and evidence into a candidate scope, surface dependencies and risks, and produce a committed plan."
+domains = ["pm"]
+triggers = ["cycle planning", "sprint planning", "plan the next cycle", "iteration planning", "capacity planning"]
+effects = "none"
+
+[[inputs]]
+name = "cycle"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "committed-plan"
+kind = "decision"
+
+[[steps]]
+id = "capacity-evidence"
+title = "Capacity and evidence"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "planner"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "a committed cycle plan starts from an explicit statement of available capacity and evidence, not an assumed velocity"
+
+[[steps]]
+id = "candidate-scope"
+title = "Candidate scope"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "planner"
+depends_on = ["capacity-evidence"]
+condition = "always"
+
+[[steps]]
+id = "dependencies-risks"
+title = "Dependencies and risks"
+phase = "implement"
+skills = ["implement"]
+agent_role = "planner"
+depends_on = ["candidate-scope"]
+condition = "always"
+
+[[steps]]
+id = "committed-plan"
+title = "Commit the plan"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["dependencies-risks"]
+approval = true
+condition = "always"
+reason = "committing the team to a cycle's scope is always an explicit decision point, regardless of complexity -- a gate-only approval, since the plan is the dependencies-risks step's own output, not a separate artifact to re-review"
+
+[gates]
+approval = ["capacity-evidence", "committed-plan"]
+independent_review = ["committed-plan"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["committed-plan"]
+present_as = "report"

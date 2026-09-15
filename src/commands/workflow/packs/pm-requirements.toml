@@ -1,0 +1,73 @@
+# Built-in workflow pack: pm-requirements (issue #542 chunk 4). Raw request
+# -> constraints/stakeholders -> acceptance criteria -> approved brief.
+schema_version = 1
+id = "pm-requirements"
+version = 1
+title = "Requirements gathering"
+description = "Turn a raw request into constraints, stakeholders, acceptance criteria and an approved brief."
+domains = ["pm"]
+triggers = ["gather requirements", "write a brief", "requirements gathering", "stakeholder requirements", "acceptance criteria"]
+effects = "none"
+
+[[inputs]]
+name = "request"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "brief"
+kind = "report"
+
+[[steps]]
+id = "intake"
+title = "Capture the raw request"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "a brief always starts from an explicit, reviewable statement of the request"
+
+[[steps]]
+id = "constraints"
+title = "Constraints and stakeholders"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "planner"
+depends_on = ["intake"]
+condition = "always"
+
+[[steps]]
+id = "acceptance-criteria"
+title = "Acceptance criteria"
+phase = "implement"
+skills = ["implement"]
+agent_role = "planner"
+depends_on = ["constraints"]
+condition = "always"
+
+[[steps]]
+id = "brief-approval"
+title = "Approve the brief"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["acceptance-criteria"]
+approval = true
+condition = "always"
+reason = "the brief is the durable contract the rest of the work is judged against; a gate-only approval, since the brief itself is the acceptance-criteria step's output, not a separate artifact to re-review"
+
+[gates]
+approval = ["intake", "brief-approval"]
+independent_review = ["brief-approval"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["brief"]
+present_as = "report"

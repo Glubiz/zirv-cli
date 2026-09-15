@@ -1,0 +1,75 @@
+# Built-in workflow pack: sre-incident-triage (issue #542 chunk 4).
+# Read-only diagnosis first; any mitigation is a production mutation and
+# stops at an explicit gate rather than acting -- Kibana investigation is
+# #539's typed tool, not yet available.
+schema_version = 1
+id = "sre-incident-triage"
+version = 1
+title = "Incident triage"
+description = "Read-only incident diagnosis: logs, deploy history and recent changes, stopping at an explicit gate before any mitigation."
+domains = ["sre"]
+triggers = ["incident", "triage", "outage", "service down", "something is down"]
+effects = "none"
+
+[[inputs]]
+name = "symptom"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "triage-report"
+kind = "report"
+
+[[steps]]
+id = "diagnosis"
+title = "Read-only diagnosis"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "devops-sre"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "requires a Kibana integration (#539) for live logs; without it, diagnosis proceeds from whatever evidence is directly available and says so explicitly"
+
+[[steps]]
+id = "root-cause"
+title = "Root-cause analysis"
+phase = "implement"
+skills = ["implement"]
+agent_role = "devops-sre"
+depends_on = ["diagnosis"]
+condition = "always"
+reason = "logs, deploy history and recent changes -- still read-only, no mitigation attempted yet"
+
+[[steps]]
+id = "mitigation-gate"
+title = "Mitigation gate"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["root-cause"]
+approval = true
+condition = "always"
+reason = "any mitigation is a production mutation requiring explicit operator approval and the typed ops tooling from #539; this workflow stops here rather than acting -- a gate-only approval, since there is no separate mitigation artifact to review yet"
+
+[[steps]]
+id = "report"
+title = "Triage report"
+phase = "present"
+skills = ["verify"]
+depends_on = ["root-cause", "mitigation-gate"]
+condition = "always"
+
+[gates]
+approval = ["diagnosis", "mitigation-gate"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["triage-report"]
+present_as = "report"

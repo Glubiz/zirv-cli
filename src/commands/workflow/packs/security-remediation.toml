@@ -1,0 +1,94 @@
+# Built-in workflow pack: security-remediation (issue #542 chunk 4).
+# Repository changes plus mandatory review/approval gates -- no external
+# mutation, stays within the "no wider than repository" effect bound.
+schema_version = 1
+id = "security-remediation"
+version = 1
+title = "Security remediation"
+description = "Remediate a security finding with mandatory intent capture, review and deploy approval."
+domains = ["software", "security"]
+triggers = ["security vulnerability", "cve", "security remediation", "patch vulnerability", "security finding"]
+effects = "repository"
+
+[[inputs]]
+name = "finding"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change"
+kind = "patch"
+
+[[steps]]
+id = "intent"
+title = "Capture the finding"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "a security fix always gets an explicit record of the finding, its severity and the intended remediation -- never proportionally skipped"
+effect = "repository"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+phase = "implement"
+skills = ["implement"]
+agent_role = "implementer"
+depends_on = ["intent"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "test"
+title = "Test"
+phase = "test"
+skills = ["testing"]
+depends_on = ["implement"]
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Independent security review"
+phase = "review"
+skills = ["review"]
+agent_role = "security-scanner"
+depends_on = ["test"]
+condition = "always"
+reason = "a security remediation always gets an independent review, never proportionally skipped"
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["review"]
+condition = "always"
+
+[[steps]]
+id = "deploy"
+title = "Finish branch"
+phase = "deploy"
+skills = ["finish-branch"]
+depends_on = ["verify"]
+approval = true
+condition = "always"
+effect = "repository"
+reason = "shipping a security fix is always an explicit approval"
+
+[gates]
+approval = ["intent", "deploy"]
+validation = ["test", "verify"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change"]
+present_as = "patch"

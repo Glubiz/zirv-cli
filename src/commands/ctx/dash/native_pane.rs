@@ -980,8 +980,9 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
             Some(String::new())
         }
         "/help" => Some(
-            "commands: /clear /compact /context /status /agents /agent /team \u{b7} keys: \
-             Enter submit, Esc interrupt, Ctrl+C Ctrl+C quit, Shift+Tab cycle mode"
+            "commands: /clear /compact /context /status /agents /agent /team /workflows \
+             /workflow \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C Ctrl+C quit, Shift+Tab \
+             cycle mode"
                 .to_string(),
         ),
         "/compact" => {
@@ -2395,9 +2396,10 @@ fn composer_height(presentation: &NativePresentation, width: usize) -> u16 {
 
 /// How many completion rows the `/`, `@` and `!` entry modes may show.
 /// Issue #541 chunk C bumped this from 6 to 7 alongside `/agent`/`/agents`/
-/// `/team`; issue #538 chunk C bumped it to 9 for `/context`/`/instructions`,
-/// so a bare `/` still shows every slash command at once.
-pub const COMPLETION_ROWS: usize = 9;
+/// `/team`; issue #538 chunk C bumped it to 9 for `/context`/`/instructions`;
+/// issue #542 chunk 3b bumped it to 11 for `/workflow`/`/workflows`, so a
+/// bare `/` still shows every slash command at once.
+pub const COMPLETION_ROWS: usize = 11;
 
 /// Issue #490: the bordered composer, its hint line, and -- when the draft
 /// starts an entry mode -- the completion list above it. The box is drawn
@@ -4271,6 +4273,18 @@ impl NativePaneRuntime {
             ));
             return;
         }
+        // Issue #542 chunk 3b (decision 5): `/workflows` and `/workflow`
+        // need live registry/state-directory access `apply_slash_command`'s
+        // pure helper does not have, so -- like `/status` above -- they are
+        // handled here. Every branch renders through the SAME engine
+        // functions (`write_registry_list`/`write_registry_entry`/
+        // `write_state`/`write_definition_status`/`write_start_outcome`)
+        // the headless `--json`/text CLI uses, so the two surfaces can never
+        // print conflicting information for the same state.
+        if let Some(notice) = self.workflow_slash_notice(&text) {
+            self.notice = Some(notice);
+            return;
+        }
         if let Some(notice) = apply_slash_command(&mut self.presentation, &text) {
             if !notice.is_empty() {
                 self.notice = Some(notice);
@@ -4417,6 +4431,127 @@ impl NativePaneRuntime {
             );
         }
         None
+    }
+
+    /// Recognises `/workflows` and `/workflow ...`, returning the notice to
+    /// display, or `None` when `text` is neither (falls through to
+    /// `apply_slash_command`/ordinary submission). Issue #542 chunk 3b,
+    /// decision 5.
+    ///
+    /// `/workflows` lists the registry (read-only). `/workflow status
+    /// [id]` shows a running workflow's status, defaulting to this repo's
+    /// active one. `/workflow <id>` shows that registry pack's definition
+    /// when given alone (read-only, mirrors `workflow show`); with trailing
+    /// text it starts that pack, treating the trailing text as the task
+    /// (mirrors `workflow start <id> --task ...`) -- "start or show" per
+    /// the brief, disambiguated by whether a task was actually supplied so
+    /// a bare id never has a side effect.
+    fn workflow_slash_notice(&self, text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        let head = trimmed.split_whitespace().next()?;
+        match head {
+            "/workflows" => Some(self.render_workflow_list()),
+            "/workflow" => {
+                let rest = trimmed["/workflow".len()..].trim();
+                if rest.is_empty() {
+                    return Some(
+                        "usage: /workflow <id> [task...] | /workflow status [id]".to_string(),
+                    );
+                }
+                let mut rest_parts = rest.splitn(2, char::is_whitespace);
+                let first = rest_parts.next().unwrap_or("");
+                let remainder = rest_parts.next().unwrap_or("").trim();
+                if first == "status" {
+                    let id = if remainder.is_empty() {
+                        None
+                    } else {
+                        Some(remainder)
+                    };
+                    Some(self.render_workflow_status(id))
+                } else if remainder.is_empty() {
+                    Some(self.render_workflow_show(first))
+                } else {
+                    Some(self.render_workflow_start(first, remainder))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn render_workflow_list(&self) -> String {
+        use crate::commands::workflow::engine;
+        match engine::load_workflow_registry(&self.repo, false) {
+            Ok(registry) => {
+                let entries: Vec<_> = registry.list().collect();
+                let mut buf = Vec::new();
+                let _ = engine::write_registry_list(&mut buf, &entries);
+                String::from_utf8_lossy(&buf).trim_end().to_string()
+            }
+            Err(err) => format!("workflow registry unavailable: {err}"),
+        }
+    }
+
+    fn render_workflow_show(&self, id: &str) -> String {
+        use crate::commands::workflow::engine;
+        match engine::load_workflow_registry(&self.repo, false) {
+            Ok(registry) => match registry.get(id) {
+                Ok(workflow) => {
+                    let mut buf = Vec::new();
+                    let _ = engine::write_registry_entry(&mut buf, workflow);
+                    String::from_utf8_lossy(&buf).trim_end().to_string()
+                }
+                Err(err) => format!("unknown workflow '{id}': {err}"),
+            },
+            Err(err) => format!("workflow registry unavailable: {err}"),
+        }
+    }
+
+    fn render_workflow_status(&self, id: Option<&str>) -> String {
+        use crate::commands::workflow::engine;
+        let outcome: Result<engine::WorkflowState, Box<dyn std::error::Error>> = (|| match id {
+            Some(id) => engine::load(&self.state, &self.repo, id),
+            None => engine::load_active(&self.state, &self.repo)?
+                .ok_or_else(|| "no active workflow".into()),
+        })();
+        match outcome {
+            Ok(state) => {
+                let mut buf = Vec::new();
+                let _ = engine::write_state(&mut buf, &state, false);
+                let _ = engine::write_definition_status(&mut buf, &state);
+                String::from_utf8_lossy(&buf).trim_end().to_string()
+            }
+            Err(err) => format!("{err}"),
+        }
+    }
+
+    fn render_workflow_start(&self, id: &str, task: &str) -> String {
+        use crate::commands::workflow::engine;
+        let args = engine::StartArgs {
+            id: Some(id.to_string()),
+            task: task.to_string(),
+            agent: None,
+            built_in_only: false,
+            repo: Some(self.repo.clone()),
+            paths: Vec::new(),
+            changed_lines: None,
+            tests_changed: false,
+            complexity: None,
+            risk: None,
+            branch: None,
+            frontend_root: None,
+            brainstorm: false,
+            no_brainstorm: false,
+            profile: None,
+            json: false,
+        };
+        match engine::start_workflow(&self.state, &args) {
+            Ok(outcome) => {
+                let mut buf = Vec::new();
+                let _ = engine::write_start_outcome(&mut buf, &outcome, false);
+                String::from_utf8_lossy(&buf).trim_end().to_string()
+            }
+            Err(err) => format!("could not start '{id}': {err}"),
+        }
     }
 
     fn current_identity(&self) -> super::native_ux::SeatIdentity {
@@ -6445,6 +6580,100 @@ mod tests {
         assert_eq!(
             apply_slash_command(&mut presentation, "not a command"),
             None
+        );
+    }
+
+    /// A minimal git repository so `workflow start`'s classification (no
+    /// `--changed-lines` override in the native path) can fingerprint a
+    /// HEAD, mirroring `workflow::engine`'s own test helper of the same
+    /// name.
+    fn git_init_with_commit(repo: &Path) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git command")
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").expect("write readme");
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+    }
+
+    /// Issue #542 chunk 3b (decision 5): `/workflows`, `/workflow <id>` and
+    /// `/workflow status` must render from the SAME structs the headless
+    /// `--json`/text CLI prints -- proven here by reconstructing each
+    /// expected string directly from `workflow::engine`'s shared writer
+    /// functions over the identical registry/state, and asserting the
+    /// slash command's own notice equals it exactly.
+    #[test]
+    fn workflow_views_render_the_headless_structs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        git_init_with_commit(&repo);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = pane_fixture(&state, "s1", "sess-wf", 1, None);
+        pane.repo = repo.clone();
+
+        let registry = crate::commands::workflow::engine::load_workflow_registry(&repo, false)
+            .expect("registry");
+        let entries: Vec<_> = registry.list().collect();
+        let mut expected_list = Vec::new();
+        crate::commands::workflow::engine::write_registry_list(&mut expected_list, &entries)
+            .expect("write list");
+        let expected_list = String::from_utf8(expected_list)
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert_eq!(
+            pane.workflow_slash_notice("/workflows"),
+            Some(expected_list)
+        );
+
+        let workflow = registry
+            .get("pm-requirements")
+            .expect("pm-requirements pack");
+        let mut expected_show = Vec::new();
+        crate::commands::workflow::engine::write_registry_entry(&mut expected_show, workflow)
+            .expect("write entry");
+        let expected_show = String::from_utf8(expected_show)
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert_eq!(
+            pane.workflow_slash_notice("/workflow pm-requirements"),
+            Some(expected_show)
+        );
+
+        let start_notice = pane
+            .workflow_slash_notice("/workflow adaptive-work a trivial fixture task")
+            .expect("start notice");
+        assert!(start_notice.contains("status: Running"), "{start_notice:?}");
+
+        let active = crate::commands::workflow::engine::load_active(&pane.state, &pane.repo)
+            .expect("load active")
+            .expect("an active workflow");
+        assert_eq!(
+            active.definition.as_ref().map(|d| d.id.as_str()),
+            Some("adaptive-work"),
+            "explicit id must pin the definition, not fall through to a default kind"
+        );
+        let mut expected_status = Vec::new();
+        crate::commands::workflow::engine::write_state(&mut expected_status, &active, false)
+            .expect("write state");
+        crate::commands::workflow::engine::write_definition_status(&mut expected_status, &active)
+            .expect("write definition status");
+        let expected_status = String::from_utf8(expected_status)
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert_eq!(
+            pane.workflow_slash_notice("/workflow status"),
+            Some(expected_status)
         );
     }
 

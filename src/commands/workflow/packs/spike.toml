@@ -1,0 +1,106 @@
+# Built-in workflow pack: spike. Declarative reproduction of the legacy
+# WorkflowKind::Spike literal in engine.rs (issue #542, chunks 1+2).
+schema_version = 1
+id = "spike"
+version = 1
+title = "Spike"
+description = "Capture intent, run time-bounded exploration and record explicit findings."
+domains = ["software"]
+triggers = ["explore", "investigate feasibility", "spike on"]
+effects = "repository"
+idempotency = "a spike's findings artifact is the durable record; re-running exploration after a crash overwrites it rather than appending"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "findings"
+kind = "report"
+
+[[steps]]
+id = "intent"
+title = "Capture intent"
+phase = "intent"
+skills = ["brainstorm"]
+capabilities = ["repo.read", "repo.write"]
+artifact = "intent"
+approval = true
+condition = "always"
+effect = "repository"
+reason = "a spike always starts from an explicit question and scope"
+
+[[steps]]
+id = "design"
+title = "Design the exploration"
+phase = "design"
+skills = ["design"]
+capabilities = ["repo.read", "repo.write"]
+depends_on = ["intent"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "implement"
+title = "Explore"
+phase = "implement"
+skills = ["implement"]
+agent_role = "implementer"
+capabilities = ["repo.read", "repo.write"]
+depends_on = ["design"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "verify"
+title = "Record findings"
+phase = "verify"
+skills = ["verify"]
+capabilities = ["test.run"]
+depends_on = ["implement"]
+condition = { risk-at-least = "medium" }
+reason = "medium-or-higher risk exploration gets a fresh evidence check before findings are reported"
+
+# Frontend domain variants (issue #542 chunk 3a) -- see feature.toml's own
+# comment on this section for the mechanism.
+[[steps]]
+id = "design-frontend"
+title = "Design the exploration (frontend)"
+phase = "design"
+skills = ["frontend-design"]
+domains = ["frontend"]
+overrides_step = "design"
+effect = "repository"
+
+[[steps]]
+id = "implement-frontend"
+title = "Explore (frontend)"
+phase = "implement"
+skills = ["frontend-implement"]
+agent_role = "implementer"
+domains = ["frontend"]
+overrides_step = "implement"
+effect = "repository"
+
+[[steps]]
+id = "verify-frontend"
+title = "Record findings (frontend)"
+phase = "verify"
+skills = ["frontend-verify"]
+domains = ["frontend"]
+overrides_step = "verify"
+
+[gates]
+validation = ["verify"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["findings"]
+present_as = "report"

@@ -1,0 +1,86 @@
+# Built-in workflow pack: architecture-migration-roadmap (issue #542
+# chunk 5). Current state -> target and materially different phasing
+# options -> phased plan -> independent review -> the roadmap. An
+# architecture workflow does not mutate production merely because its
+# roadmap names commands.
+schema_version = 1
+id = "architecture-migration-roadmap"
+version = 1
+title = "Architecture migration roadmap"
+description = "Record a phased migration roadmap with current state, materially different phasing options, review and evidence."
+domains = ["architecture"]
+triggers = ["migration roadmap", "architecture migration", "plan the migration", "phased migration plan", "migration plan"]
+effects = "none"
+
+[[inputs]]
+name = "question"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "roadmap"
+kind = "decision"
+
+[[steps]]
+id = "current-state"
+title = "Current state"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "architect"
+artifact = "intent"
+approval = true
+condition = "always"
+
+[[steps]]
+id = "target-and-options"
+title = "Target state and options"
+phase = "design"
+skills = ["design"]
+agent_role = "architect"
+artifact = "spec"
+approval = true
+depends_on = ["current-state"]
+condition = "always"
+reason = "a migration roadmap that shows only one target is not a decision record -- materially different phasing options must be shown before the recommendation"
+
+[[steps]]
+id = "phased-plan"
+title = "Phased plan"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "architect"
+depends_on = ["target-and-options"]
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["phased-plan"]
+condition = "always"
+
+[[steps]]
+id = "roadmap"
+title = "Record the roadmap"
+phase = "present"
+skills = ["verify"]
+depends_on = ["phased-plan", "review"]
+condition = "always"
+reason = "an architecture workflow does not mutate production merely because its roadmap names commands"
+
+[gates]
+approval = ["current-state", "target-and-options"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["roadmap"]
+present_as = "report"

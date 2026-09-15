@@ -1,0 +1,80 @@
+# Built-in workflow pack: architecture-threat-scale-cost-review (issue #542
+# chunk 5). Intake -> parallel threat and scale/cost assessments ->
+# independent review -> disposition.
+schema_version = 1
+id = "architecture-threat-scale-cost-review"
+version = 1
+title = "Threat, scale and cost review"
+description = "Assess a design's security threat exposure, scaling limits and cost, then produce an inspectable disposition."
+domains = ["architecture"]
+triggers = ["threat model", "scale review", "cost review", "threat scale cost", "capacity and cost review"]
+effects = "none"
+
+[[inputs]]
+name = "design"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "assessment"
+kind = "report"
+
+[[steps]]
+id = "intake"
+title = "Intake the design"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "architect"
+condition = "always"
+
+[[steps]]
+id = "threat-assessment"
+title = "Threat assessment"
+phase = "review"
+skills = ["review"]
+agent_role = "security-scanner"
+depends_on = ["intake"]
+parallel_group = "assessment"
+condition = "always"
+reason = "a dedicated security-scanner seat evaluates threat exposure independently from scale and cost"
+
+[[steps]]
+id = "scale-cost-assessment"
+title = "Scale and cost assessment"
+phase = "implement"
+skills = ["implement"]
+agent_role = "architect"
+depends_on = ["intake"]
+parallel_group = "assessment"
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["threat-assessment", "scale-cost-assessment"]
+condition = "always"
+
+[[steps]]
+id = "disposition"
+title = "Disposition"
+phase = "present"
+skills = ["verify"]
+depends_on = ["review"]
+condition = "always"
+
+[gates]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["assessment"]
+present_as = "report"

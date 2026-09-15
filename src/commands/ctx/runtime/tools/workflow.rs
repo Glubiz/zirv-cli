@@ -52,6 +52,18 @@ pub(super) struct WorkflowAdvanceArgs {
     pub note: Option<String>,
 }
 
+/// Issue #542 chunk 3b: `workflow_start` mirrors `zirv workflow start`'s own
+/// id/task shape exactly -- omitting `id` runs the same deterministic
+/// `selection::select_definition` the CLI does, against `task` and the
+/// resolved classification; an explicit `id` always wins outright.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkflowStartArgs {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub task: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +91,28 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<WorkflowLookupArgs>(r#"{"branch":"main"}"#).is_err());
+    }
+
+    #[test]
+    fn start_arguments_accept_an_optional_id_and_are_closed() {
+        let selected: WorkflowStartArgs =
+            serde_json::from_str(r#"{"task":"investigate the KPI drop"}"#)
+                .expect("id is optional, selection resolves it");
+        assert_eq!(selected.id, None);
+        assert_eq!(selected.task, "investigate the KPI drop");
+
+        let explicit: WorkflowStartArgs =
+            serde_json::from_str(r#"{"id":"bugfix","task":"fix the retry loop"}"#)
+                .expect("an explicit id parses too");
+        assert_eq!(explicit.id.as_deref(), Some("bugfix"));
+
+        assert!(
+            serde_json::from_str::<WorkflowStartArgs>(r#"{}"#).is_err(),
+            "task is required"
+        );
+        assert!(
+            serde_json::from_str::<WorkflowStartArgs>(r#"{"task":"x","agent":"claude"}"#).is_err(),
+            "an undeclared field must be refused, not silently ignored"
+        );
     }
 }
