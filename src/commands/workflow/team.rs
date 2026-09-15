@@ -109,6 +109,33 @@ pub struct TeamPlan {
     pub created_at: u64,
 }
 
+impl TeamPlan {
+    /// Every seat id `seat_id` transitively depends on, issue #541 chunk C
+    /// review finding: an ancestor in the dependency graph is a HAND-OFF
+    /// the plan already accounts for, never a claim conflict, however wide
+    /// its own claim is -- `delegation::delegate`'s claim-overlap check
+    /// excludes exactly this set. `seat_id` naming no seat in this plan (or
+    /// a seat with no `depends_on`) returns an empty set -- never an error,
+    /// since the caller already knows whether a seat matched before asking.
+    pub fn ancestors_of(&self, seat_id: &str) -> std::collections::BTreeSet<&str> {
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut stack: Vec<&str> = self
+            .seats
+            .iter()
+            .find(|seat| seat.id == seat_id)
+            .map(|seat| seat.depends_on.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        while let Some(id) = stack.pop() {
+            if seen.insert(id)
+                && let Some(seat) = self.seats.iter().find(|seat| seat.id == id)
+            {
+                stack.extend(seat.depends_on.iter().map(String::as_str));
+            }
+        }
+        seen
+    }
+}
+
 fn limits_for(execution: ExecutionMode) -> (usize, usize, SpendClass) {
     match execution {
         ExecutionMode::Direct => (0, 0, SpendClass::Low),
@@ -1222,6 +1249,54 @@ mod tests {
         .expect("direct plan compiles");
         assert!(plan.seats.is_empty(), "{plan:?}");
         assert!(plan.groups.is_empty(), "{plan:?}");
+    }
+
+    /// Issue #541 chunk C review finding 1, half 2: `ancestors_of` walks the
+    /// FULL transitive `depends_on` chain, not just direct parents, and
+    /// returns empty for an unknown seat or one with no dependencies rather
+    /// than erroring.
+    #[test]
+    fn ancestors_of_finds_the_full_transitive_chain() {
+        let plan = compile(
+            "fix the null pointer crash",
+            &profile_for(
+                Intent::Bugfix,
+                Complexity::Bounded,
+                RiskBand::Low,
+                2,
+                "fix the null pointer crash",
+            ),
+            &registry(),
+            &skills(),
+            &always_eligible,
+        )
+        .expect("bugfix plan compiles");
+        assert_eq!(
+            plan.ancestors_of("implementer-1"),
+            ["debugger-1"].into_iter().collect(),
+            "{plan:?}"
+        );
+        assert!(
+            plan.ancestors_of("debugger-1").is_empty(),
+            "the debugger has no ancestor of its own"
+        );
+        assert!(
+            plan.ancestors_of("does-not-exist").is_empty(),
+            "an unknown seat id returns empty, never an error"
+        );
+
+        // A three-deep chain: a synthetic plan is the simplest way to pin a
+        // TRANSITIVE (not just direct-parent) walk.
+        let mut chain = plan.clone();
+        chain.seats[0].depends_on = vec!["root".to_string()];
+        chain.seats.push(chain.seats[0].clone());
+        chain.seats[2].id = "root".to_string();
+        chain.seats[2].depends_on = Vec::new();
+        assert_eq!(
+            chain.ancestors_of("implementer-1"),
+            ["debugger-1", "root"].into_iter().collect(),
+            "{chain:?}"
+        );
     }
 
     #[test]

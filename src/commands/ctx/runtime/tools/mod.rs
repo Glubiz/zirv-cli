@@ -2205,6 +2205,28 @@ impl NativeToolClient {
     fn team_plan(&mut self, args: &TeamPlanArgs) -> Result<Value, ToolError> {
         use crate::commands::workflow::team;
 
+        // Issue #541 chunk C review finding: `team_plan` writes the SAME
+        // plan `coordinator::check` later enforces every delegation
+        // against, so any writable seat that could call it could silently
+        // replace a coordinator's compiled plan -- dropping independent
+        // review/test seats and hollowing out that whole enforcement.
+        // Restricted to the two roles `team::Authority::may_delegate` is
+        // true for (`Coordinator`/`SubOrchestrator`) -- the SAME authority
+        // table `coordinator::check` itself reads, so this gate cannot
+        // silently drift from the delegation bounds it protects. Gates the
+        // WHOLE call, `--seat` explicit compiles included: they reach the
+        // identical `store_plan`.
+        let role = self.broker.identity().role.clone();
+        if !crate::commands::ctx::team::authority(&role).may_delegate {
+            return Err(ToolError::new(
+                ToolErrorCode::AuthorizationDenied,
+                format!(
+                    "a `{role}` seat may not compile or store a team plan: team_plan is \
+                     restricted to coordinator/sub-orchestrator seats"
+                ),
+            ));
+        }
+
         // Matches `zirv workflow team plan`'s own resolution
         // (`workflow::team::run_plan`) so the native tool and the wrapped-
         // harness CLI agree on which operator/repository manifests apply.

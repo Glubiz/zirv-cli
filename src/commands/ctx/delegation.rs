@@ -1357,13 +1357,26 @@ pub fn delegate(
         .map(|seat| seat.id.as_str());
     let matched_claim_paths: &[String] =
         matched_seat.map_or(&empty_paths, |seat| &seat.claim.paths);
+    // Issue #541 chunk C review finding: `ancestors` are the seats
+    // `matched_seat` transitively `depends_on` -- a planned HAND-OFF, never
+    // a conflict, however wide their own claim is (a bug-fix plan's
+    // `debugger-1` and `implementer-1` share a claim on purpose). And a
+    // seat only holds its claim while IN FLIGHT (`seat_claim_active`, not
+    // `seat_filled`): a settled seat -- `Completed`, `Failed`, `Cancelled`
+    // -- has released it, which is what lets a sequential hand-off admit
+    // its successor instead of refusing it as a permanent conflict.
+    let ancestor_ids: std::collections::BTreeSet<&str> = match (&resolved_plan, matched_seat) {
+        (Some(plan), Some(seat)) => plan.ancestors_of(&seat.id),
+        _ => std::collections::BTreeSet::new(),
+    };
     let active_claim_paths: Vec<&[String]> = resolved_plan
         .as_ref()
         .map(|plan| {
             plan.seats
                 .iter()
                 .filter(|seat| Some(seat.id.as_str()) != request.task.as_deref())
-                .filter(|seat| graph.seat_filled(&seat.id))
+                .filter(|seat| !ancestor_ids.contains(seat.id.as_str()))
+                .filter(|seat| graph.seat_claim_active(&seat.id))
                 .map(|seat| seat.claim.paths.as_slice())
                 .collect()
         })
@@ -2453,6 +2466,226 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("unknown manifest"), "{error}");
         assert!(launcher.launches.lock().expect("lock").is_empty());
+    }
+
+    /// A REAL compiled bug-fix plan: `debugger-1` then `implementer-1`
+    /// (`depends_on: ["debugger-1"]`), both claiming `["primary"]` -- the
+    /// exact shape `team::compile` gives a low-risk bug fix, and the shape
+    /// review finding 1 (issue #541 chunk C) showed could never actually
+    /// dispatch its second seat.
+    fn bugfix_plan(repo: &Path) -> crate::commands::workflow::team::TeamPlan {
+        use crate::commands::workflow::agents::AgentRegistry;
+        use crate::commands::workflow::classify::{
+            Classification, Complexity, DomainClassification, Intent, RiskBand, RiskMeasurement,
+        };
+        use crate::commands::workflow::profile::ExecutionProfile;
+        use crate::commands::workflow::skill::SkillRegistry;
+        use crate::commands::workflow::team;
+
+        let classification = Classification {
+            intent: Intent::Bugfix,
+            complexity: Complexity::Bounded,
+            risk: RiskBand::Low,
+            risk_score: 0,
+            changed_files: 2,
+            changed_lines: 20,
+            changed_paths: Vec::new(),
+            declared_scope: false,
+            work_domain: DomainClassification::default(),
+            risk_measurement: RiskMeasurement::Measured,
+            reasons: vec!["test fixture".to_string()],
+        };
+        let profile = ExecutionProfile::derive("fix the null pointer crash", &classification);
+        let registry = AgentRegistry::load(repo, None, false, false).expect("registry");
+        let skills = SkillRegistry::load(repo, None, false, false).expect("skills");
+        let plan = team::compile(
+            "fix the null pointer crash",
+            &profile,
+            &registry,
+            &skills,
+            &|_role| Ok(()),
+        )
+        .expect("bugfix plan compiles");
+        assert_eq!(
+            plan.seats.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["debugger-1", "implementer-1"],
+            "fixture drifted from team::compile's own bugfix shape: {plan:?}"
+        );
+        plan
+    }
+
+    /// Issue #541 chunk C review finding 1, half 1 (settlement releases a
+    /// claim): `debugger-1` and `implementer-1` share a claim on purpose --
+    /// a sequential hand-off, not a genuine overlap -- so once the debugger
+    /// SETTLES, the dependent implementer is admitted rather than refused
+    /// with `ClaimConflict` forever.
+    #[test]
+    fn a_settled_debuggers_claim_is_released_so_the_dependent_implementer_is_admitted() {
+        let (_dir, state, repo, cfg) = fixture();
+        let plan = bugfix_plan(&repo);
+        super::super::coordinator::update(&state, &repo, |graph| {
+            graph.store_team_plan_inline(plan, 1);
+        })
+        .expect("store plan");
+
+        let mut debugger_request = launch_request(super::super::team::IMPLEMENTER, false);
+        debugger_request.manifest = Some("debugger".to_string());
+        debugger_request.task = Some("debugger-1".to_string());
+        let mut launcher = RecordingLauncher::default();
+        let (debugger_record, _publication) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &debugger_request,
+            &coordinator_parent(),
+            10,
+        )
+        .expect("debugger-1 dispatched");
+
+        // Settle it: publish the terminal outcome and let the coordinator
+        // consume the receipt, exactly like a real restart/poll would.
+        publish_terminal(
+            &state,
+            &repo,
+            &cfg,
+            &debugger_record.handle.delegation,
+            Phase::Completed,
+            Some(0),
+            Some("root cause found".to_string()),
+            None,
+            20,
+        )
+        .expect("publish debugger outcome");
+        let mut graph = super::super::coordinator::load(&state, &repo);
+        super::super::coordinator::consume_pending(&state, &repo, &mut graph, 21)
+            .expect("consume debugger receipt");
+        assert!(
+            !graph.seat_claim_active("debugger-1"),
+            "a completed seat's claim must be released"
+        );
+
+        // The dependent implementer -- SAME claim, `depends_on: [debugger-1]`
+        // -- is now admitted, not refused with ClaimConflict.
+        let mut implementer_request = launch_request(super::super::team::IMPLEMENTER, false);
+        implementer_request.manifest = Some("implementer".to_string());
+        implementer_request.task = Some("implementer-1".to_string());
+        let (implementer_record, _publication) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &implementer_request,
+            &coordinator_parent(),
+            22,
+        )
+        .expect("implementer-1 admitted once the debugger has settled");
+        assert_eq!(
+            implementer_record.handle.manifest.as_deref(),
+            Some("implementer")
+        );
+    }
+
+    /// Issue #541 chunk C review finding 1, half 2 (ancestor exclusion) plus
+    /// the negative case: two seats with NO dependency relationship that
+    /// genuinely claim the same paths are still refused, even while the
+    /// first is still in flight -- the fix narrows the conflict rule, it
+    /// does not disable it.
+    #[test]
+    fn two_independent_writers_with_overlapping_claims_are_still_refused() {
+        use crate::commands::workflow::agents::AgentRegistry;
+        use crate::commands::workflow::classify::{
+            Classification, Complexity, DomainClassification, Intent, RiskBand, RiskMeasurement,
+        };
+        use crate::commands::workflow::profile::ExecutionProfile;
+        use crate::commands::workflow::skill::SkillRegistry;
+        use crate::commands::workflow::team;
+
+        let (_dir, state, repo, cfg) = fixture();
+        let classification = Classification {
+            intent: Intent::Feature,
+            complexity: Complexity::Trivial,
+            risk: RiskBand::Low,
+            risk_score: 0,
+            changed_files: 1,
+            changed_lines: 5,
+            changed_paths: Vec::new(),
+            declared_scope: false,
+            work_domain: DomainClassification::default(),
+            risk_measurement: RiskMeasurement::Measured,
+            reasons: vec!["test fixture".to_string()],
+        };
+        let profile = ExecutionProfile::derive("two independent writers", &classification);
+        let registry = AgentRegistry::load(&repo, None, false, false).expect("registry");
+        let skills = SkillRegistry::load(&repo, None, false, false).expect("skills");
+        let always_eligible = |_role: super::super::team::TeamRole| Ok(());
+        let mut plan = team::compile_explicit(
+            "implement A",
+            &profile,
+            &registry,
+            &skills,
+            &always_eligible,
+            "implementer",
+        )
+        .expect("seat a compiles");
+        let mut seat_a = plan.seats.remove(0);
+        seat_a.id = "implementer-a".to_string();
+        seat_a.claim.paths = vec!["src/shared.rs".to_string()];
+        let plan_b = team::compile_explicit(
+            "implement B",
+            &profile,
+            &registry,
+            &skills,
+            &always_eligible,
+            "implementer",
+        )
+        .expect("seat b compiles");
+        let mut seat_b = plan_b.seats.into_iter().next().expect("seat b");
+        seat_b.id = "implementer-b".to_string();
+        // Genuinely overlapping, and deliberately NOT an ancestor of `seat_a`
+        // (no `depends_on` either way): the shape the conflict rule must
+        // still catch.
+        seat_b.claim.paths = vec!["src/shared.rs".to_string()];
+        plan.seats = vec![seat_a, seat_b];
+        super::super::coordinator::update(&state, &repo, |graph| {
+            graph.store_team_plan_inline(plan, 1);
+        })
+        .expect("store plan");
+
+        let mut request_a = launch_request(super::super::team::IMPLEMENTER, false);
+        request_a.manifest = Some("implementer".to_string());
+        request_a.task = Some("implementer-a".to_string());
+        let mut launcher = RecordingLauncher::default();
+        delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &request_a,
+            &coordinator_parent(),
+            10,
+        )
+        .expect("the first independent writer is admitted");
+
+        let mut request_b = launch_request(super::super::team::IMPLEMENTER, false);
+        request_b.manifest = Some("implementer".to_string());
+        request_b.task = Some("implementer-b".to_string());
+        let error = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &request_b,
+            &coordinator_parent(),
+            11,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("claims paths another currently-dispatched seat"),
+            "{error}"
+        );
     }
 
     /// Issue #485 item 3: a delegation that cannot be admitted leaves NO

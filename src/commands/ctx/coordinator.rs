@@ -341,6 +341,21 @@ impl Coordinator {
             .get(seat_id)
             .is_some_and(|node| matches!(node.state, NodeState::Delegated | NodeState::Completed))
     }
+
+    /// Issue #541 chunk C review finding: whether `seat_id`'s CLAIM is
+    /// currently active -- true only while a delegation is IN FLIGHT for it
+    /// (`Delegated`). Deliberately narrower than [`Self::seat_filled`],
+    /// which answers a different question (may this seat be matched again)
+    /// and treats `Completed` as filled forever: a settled seat --
+    /// `Completed`, `Failed`, `Cancelled` -- has released its claim, so a
+    /// bug-fix plan's `debugger-1` and `implementer-1` sharing a claim can
+    /// hand off sequentially (the debugger settles, THEN the implementer is
+    /// admitted) without either treating the other as a permanent conflict.
+    pub fn seat_claim_active(&self, seat_id: &str) -> bool {
+        self.nodes
+            .get(seat_id)
+            .is_some_and(|node| node.state == NodeState::Delegated)
+    }
 }
 
 /// Issue #541 chunk C, decision 1: resolves the [`TeamPlan`] a coordinator
@@ -1074,6 +1089,34 @@ mod tests {
             record.nodes["implementer-1"].delegation.as_deref(),
             Some("deleg-2")
         );
+    }
+
+    /// Issue #541 chunk C review finding 1, half 1: a seat's claim is
+    /// active only while a delegation is IN FLIGHT for it -- `seat_filled`
+    /// (matching) and `seat_claim_active` (conflict) diverge exactly on
+    /// `Completed`: a finished seat may never be re-matched, but it no
+    /// longer excludes anything from a claim-conflict check.
+    #[test]
+    fn a_completed_seats_claim_is_released_but_a_delegated_seats_is_not() {
+        let mut record = Coordinator::default();
+        assert!(!record.seat_claim_active("debugger-1"), "no node at all");
+
+        record.dispatched("debugger-1", team::IMPLEMENTER, "native", "deleg-1", 1);
+        assert!(record.seat_claim_active("debugger-1"), "in flight");
+        assert!(record.seat_filled("debugger-1"));
+
+        record.settled("debugger-1", NodeState::Completed, None, 2);
+        assert!(
+            !record.seat_claim_active("debugger-1"),
+            "a completed seat's claim is released"
+        );
+        assert!(
+            record.seat_filled("debugger-1"),
+            "but it is still filled -- it must never be re-matched"
+        );
+
+        record.settled("debugger-1", NodeState::Failed, None, 3);
+        assert!(!record.seat_claim_active("debugger-1"), "a failed seat too");
     }
 
     #[test]

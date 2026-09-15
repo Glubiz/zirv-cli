@@ -247,6 +247,68 @@ stay under their existing 3,600-byte ship cap.
    four-files-per-group count bucket only when it is empty (older
    classification, or one measured with none).
 
+   **Plain statement of what this does NOT cover** (so acceptance criterion
+   7 -- "restart, retry and rollover cannot duplicate exclusive work" -- is
+   never read as fully met by this alone): the claim-conflict check keys
+   every seat by its OWN id, matched against the delegation's `task` field.
+   A delegation whose `task` is NOT a plan seat id (an ad-hoc card, or a
+   role/manifest with no plan at all) gets NO plan-level claim protection
+   in this release -- `PlanBounds` is `None` for it, exactly as if no plan
+   existed. The pre-existing card-level exclusivity
+   (`task::claim_locked`: one live claimant per card) still applies
+   regardless, so two workers still cannot claim the SAME card -- what is
+   NOT covered is two DIFFERENT cards whose claim paths happen to overlap
+   when neither (or only one) names a plan seat.
+
+   **Review finding 1 fix (same day): a settled seat releases its claim,
+   and an ancestor is a hand-off, not a conflict.** The first cut counted
+   every seat `coordinator::Coordinator::seat_filled` called filled --
+   `Delegated` OR `Completed` -- as an active claim holder forever, so a
+   real bug-fix plan's `debugger-1` and `implementer-1` (both claiming
+   `["primary"]`, `implementer-1` depending on `debugger-1`) could never
+   actually dispatch its second seat: the completed debugger still "held"
+   the claim. Two independent fixes, one per half of the bug: (a) a new
+   `Coordinator::seat_claim_active(seat_id)` -- true only for `Delegated`
+   (in flight), so a settled seat (`Completed`, `Failed`, `Cancelled`)
+   releases its claim, while `seat_filled` is UNCHANGED and still treats
+   `Completed` as filled for MATCHING (a finished seat must never be
+   re-dispatched -- those are two different questions with two different
+   answers now); (b) `TeamPlan::ancestors_of(seat_id)` walks the full
+   transitive `depends_on` chain, and `delegate()` excludes those ids from
+   the claim-conflict check entirely, so a seat and an in-flight ancestor
+   it depends on never conflict even before the ancestor settles -- a
+   planned hand-off the plan itself already accounts for. Tests:
+   `coordinator::tests::a_completed_seats_claim_is_released_but_a_
+   delegated_seats_is_not` covers (a); `workflow::team::tests::ancestors_
+   of_finds_the_full_transitive_chain` covers (b); `delegation::tests::a_
+   settled_debuggers_claim_is_released_so_the_dependent_implementer_is_
+   admitted` is the end-to-end regression for the original bug (a REAL
+   `team::compile`-produced bug-fix plan, dispatch debugger-1, settle it,
+   dispatch implementer-1, assert admitted); `delegation::tests::two_
+   independent_writers_with_overlapping_claims_are_still_refused` pins that
+   the fix narrows the rule rather than disabling it (two seats with no
+   dependency relationship, genuinely overlapping claims, the second still
+   refused with `ClaimConflict` while the first is in flight).
+
+   **Review finding 2 fix (same day): `team_plan` and `/team plan` are
+   restricted to coordinating seats.** The first cut let ANY seat call
+   `team_plan` (or `/team plan`) and silently overwrite a coordinator's
+   compiled plan -- including dropping the independent review/test seats a
+   risk-driven validation profile required -- which would have hollowed
+   out decision 2's whole enforcement from underneath it. Both entry points
+   now check the CALLING seat's own role against `team::Authority::
+   may_delegate` (`ctx::runtime::tools::mod::NativeToolClient::team_plan`
+   reads it off `self.broker.identity().role`; the native pane's `/team
+   plan` reads it off `seat::load(&self.state, &self.short)`, its own
+   persisted seat record, never a claim the pane makes about itself) --
+   the SAME authority table `coordinator::check` itself reads, so the gate
+   cannot silently drift from the delegation bounds it protects. `--seat`
+   explicit compiles are gated identically: they reach the same
+   `store_plan`. Refused with `AuthorizationDenied` and the same wording
+   both entry points share: `` a `{role}` seat may not compile or store a
+   team plan: team_plan is restricted to coordinator/sub-orchestrator
+   seats ``.
+
 4. **Slash commands** in `dash::native_ux.rs`/`dash::native_pane.rs`:
    `/agents` (the roster, through `workflow::agents::write_agent_table` --
    the SAME function `zirv workflow agent list`'s text output calls, not a

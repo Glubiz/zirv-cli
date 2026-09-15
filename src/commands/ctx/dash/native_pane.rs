@@ -4311,6 +4311,22 @@ impl NativePaneRuntime {
             if objective.is_empty() {
                 return Some("usage: /team plan <objective>".to_string());
             }
+            // Issue #541 chunk C review finding: `/team plan` reaches the
+            // SAME `store_plan` the native `team_plan` tool does, and a
+            // writable non-coordinating pane calling it could silently
+            // replace a coordinator's compiled plan. Gated on this pane's
+            // OWN persisted seat role (never a claim the pane makes about
+            // itself), the same `team::Authority::may_delegate` table
+            // `coordinator::check` itself reads.
+            let role = super::super::seat::load(&self.state, &self.short)
+                .map(|seat| seat.role)
+                .unwrap_or_default();
+            if !crate::commands::ctx::team::authority(&role).may_delegate {
+                return Some(format!(
+                    "refused: a `{role}` seat may not compile or store a team plan: team_plan \
+                     is restricted to coordinator/sub-orchestrator seats"
+                ));
+            }
             return Some(
                 match crate::commands::workflow::team::compile_for_objective(
                     &self.repo,
