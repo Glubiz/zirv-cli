@@ -35,6 +35,7 @@
 //! matter how long that worker ran.
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2029,10 +2030,13 @@ pub struct Completion {
 /// can already do, so the list never advertises a verb with no
 /// implementation behind it.
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/agent", "compile and show an explicit one-seat plan"),
+    ("/agents", "list the resolved agent roster"),
     ("/clear", "clear queued native input"),
     ("/compact", "report that native compaction is unavailable"),
     ("/help", "show the shortcut list"),
     ("/status", "show the authoritative session status"),
+    ("/team", "show or recompile the current team plan"),
 ];
 
 pub fn slash_completions(draft: &str) -> Vec<Completion> {
@@ -2046,6 +2050,52 @@ pub fn slash_completions(draft: &str) -> Vec<Completion> {
             detail: (*what).to_string(),
         })
         .collect()
+}
+
+// =========================================================================
+// Issue #541 chunk C: `/agents`, `/agent`, `/team` -- rendered from the SAME
+// structs the headless `zirv workflow agent list|show`/`team show|plan`
+// surfaces print, through the SAME formatting functions, never a duplicated
+// table. These are pure: the pane (which alone holds the repo/state access
+// a registry or a stored plan needs) reads the data and calls one of these
+// to turn it into the notice text it shows.
+// =========================================================================
+
+/// `/agents`: the resolved roster, straight through
+/// `workflow::agents::write_agent_table` -- the exact function `zirv
+/// workflow agent list`'s own text output calls.
+pub fn render_agents(registry: &crate::commands::workflow::agents::AgentRegistry) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = crate::commands::workflow::agents::write_agent_table(registry, &mut buf);
+    String::from_utf8_lossy(&buf).trim_end().to_string()
+}
+
+/// `/team` (no argument): the plan stored on the active workflow, or "no
+/// plan" when none has been compiled yet -- through
+/// `workflow::team::print_plan_text`, the exact function `zirv workflow
+/// team show` calls.
+pub fn render_team_plan(plan: Option<&crate::commands::workflow::team::TeamPlan>) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    match plan {
+        Some(plan) => {
+            let _ = crate::commands::workflow::team::print_plan_text(plan, &mut buf);
+        }
+        None => {
+            let _ = writeln!(&mut buf, "no team plan stored for this workflow");
+        }
+    }
+    String::from_utf8_lossy(&buf).trim_end().to_string()
+}
+
+/// `/agent <id> <task>`: an explicit one-seat plan (or its refusal reason),
+/// rendered the same way `/team`'s own plan is.
+pub fn render_agent_plan(
+    result: &Result<crate::commands::workflow::team::TeamPlan, String>,
+) -> String {
+    match result {
+        Ok(plan) => render_team_plan(Some(plan)),
+        Err(reason) => format!("refused: {reason}"),
+    }
 }
 
 #[cfg(test)]
@@ -2633,6 +2683,8 @@ mod tests {
                 group: None,
                 objective: None,
                 workdir: PathBuf::from("/repo/wt"),
+                manifest: None,
+                plan_override: false,
             },
             parent_session: Some("orch".to_string()),
             phase,
@@ -3573,14 +3625,94 @@ mod tests {
             .iter()
             .map(|completion| completion.label.as_str())
             .collect();
-        assert_eq!(labels, ["/clear", "/compact", "/help", "/status"]);
-        for absent in ["/agents", "/approve", "/artifacts", "/follow-up"] {
+        assert_eq!(
+            labels,
+            [
+                "/agent", "/agents", "/clear", "/compact", "/help", "/status", "/team"
+            ]
+        );
+        for absent in ["/approve", "/artifacts", "/follow-up"] {
             assert!(!labels.contains(&absent));
         }
         for absent in ["@", "!"] {
             assert!(!SHORTCUTS.iter().any(|shortcut| shortcut.keys == absent));
         }
         assert!(slash_completions("/zzz").is_empty());
+    }
+
+    /// Issue #541 chunk C: `/agents` and `/team` render from the SAME
+    /// structs (and the SAME formatting functions) the headless
+    /// `zirv workflow agent list`/`team show` commands print -- not a
+    /// duplicated table that could drift from them.
+    #[test]
+    fn agents_agent_and_team_views_render_the_headless_structs() {
+        use crate::commands::workflow::agents::AgentRegistry;
+        use crate::commands::workflow::classify::{
+            Classification, Complexity, DomainClassification, Intent, RiskBand, RiskMeasurement,
+        };
+        use crate::commands::workflow::profile::ExecutionProfile;
+        use crate::commands::workflow::skill::SkillRegistry;
+        use crate::commands::workflow::team;
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let registry = AgentRegistry::load(repo.path(), None, false, false).expect("registry");
+
+        // `render_agents` must be byte-for-byte what `write_agent_table`
+        // (the function `zirv workflow agent list`'s text output calls)
+        // produces for the identical registry.
+        let mut expected: Vec<u8> = Vec::new();
+        crate::commands::workflow::agents::write_agent_table(&registry, &mut expected)
+            .expect("table");
+        assert_eq!(
+            render_agents(&registry),
+            String::from_utf8_lossy(&expected).trim_end()
+        );
+        assert!(render_agents(&registry).contains("implementer"));
+
+        // `/team`: no plan stored yet.
+        assert!(render_team_plan(None).contains("no team plan"));
+
+        // `/team` and `/agent` with a real compiled plan: `render_team_plan`
+        // must be byte-for-byte what `print_plan_text` (the function
+        // `zirv workflow team show` calls) produces for the identical plan.
+        let classification = Classification {
+            intent: Intent::Feature,
+            complexity: Complexity::Trivial,
+            risk: RiskBand::Low,
+            risk_score: 0,
+            changed_files: 1,
+            changed_lines: 5,
+            changed_paths: Vec::new(),
+            declared_scope: false,
+            work_domain: DomainClassification::default(),
+            risk_measurement: RiskMeasurement::Measured,
+            reasons: vec!["test fixture".to_string()],
+        };
+        let profile = ExecutionProfile::derive("review the change", &classification);
+        let skills = SkillRegistry::load(repo.path(), None, false, false).expect("skills");
+        let plan = team::compile_explicit(
+            "review the change",
+            &profile,
+            &registry,
+            &skills,
+            &|_role| Ok(()),
+            "reviewer",
+        )
+        .expect("plan compiles");
+        let mut expected_plan: Vec<u8> = Vec::new();
+        team::print_plan_text(&plan, &mut expected_plan).expect("plan text");
+        assert_eq!(
+            render_team_plan(Some(&plan)),
+            String::from_utf8_lossy(&expected_plan).trim_end()
+        );
+        assert_eq!(
+            render_agent_plan(&Ok(plan.clone())),
+            render_team_plan(Some(&plan))
+        );
+        assert_eq!(
+            render_agent_plan(&Err("unknown manifest 'ghost'".to_string())),
+            "refused: unknown manifest 'ghost'"
+        );
     }
 
     #[test]

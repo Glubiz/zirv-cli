@@ -978,8 +978,8 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
             Some(String::new())
         }
         "/help" => Some(
-            "commands: /clear /compact /status \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C \
-             Ctrl+C quit, Shift+Tab cycle mode"
+            "commands: /clear /compact /status /agents /agent /team \u{b7} keys: Enter submit, \
+             Esc interrupt, Ctrl+C Ctrl+C quit, Shift+Tab cycle mode"
                 .to_string(),
         ),
         "/compact" => {
@@ -2388,7 +2388,9 @@ fn composer_height(presentation: &NativePresentation, width: usize) -> u16 {
 }
 
 /// How many completion rows the `/`, `@` and `!` entry modes may show.
-pub const COMPLETION_ROWS: usize = 6;
+/// Issue #541 chunk C: bumped from 6 to 7 alongside `/agent`/`/agents`/
+/// `/team` so a bare `/` still shows every slash command at once.
+pub const COMPLETION_ROWS: usize = 7;
 
 /// Issue #490: the bordered composer, its hint line, and -- when the draft
 /// starts an entry mode -- the completion list above it. The box is drawn
@@ -4185,6 +4187,17 @@ impl NativePaneRuntime {
             ));
             return;
         }
+        // Issue #541 chunk C: `/agents`, `/agent <id> <task>` and `/team
+        // [plan <objective>]` all need this pane's own repo/state access a
+        // pure helper cannot have, so -- like `/status` -- they are handled
+        // here rather than in `apply_slash_command`. Each renders through
+        // `dash::native_ux::render_*`, the SAME functions the headless
+        // `zirv workflow agent list`/`team show|plan` commands print
+        // through, so the two surfaces cannot silently drift.
+        if let Some(notice) = self.handle_team_slash(&text) {
+            self.notice = Some(notice);
+            return;
+        }
         if let Some(notice) = apply_slash_command(&mut self.presentation, &text) {
             if !notice.is_empty() {
                 self.notice = Some(notice);
@@ -4245,6 +4258,76 @@ impl NativePaneRuntime {
             }
         }
         self.sync_continuity();
+    }
+
+    /// Issue #541 chunk C: recognises `/agents`, `/agent <manifest-id>
+    /// <task>` and `/team` / `/team plan <objective>`, rendering each
+    /// through `dash::native_ux::render_*` -- the SAME functions the
+    /// headless `zirv workflow agent list`/`team show|plan` commands print
+    /// through. `None` for anything else, so an unrecognised `/`-prefixed
+    /// line still falls through to `apply_slash_command` and then to the
+    /// ordinary text path.
+    fn handle_team_slash(&self, text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        if trimmed == "/agents" {
+            let registry = crate::commands::workflow::agents::AgentRegistry::load_for_repo(
+                &self.repo,
+                dirs::home_dir().as_deref(),
+                true,
+            )
+            .ok()?;
+            return Some(super::native_ux::render_agents(&registry));
+        }
+        if let Some(rest) = trimmed.strip_prefix("/agent") {
+            let rest = rest.trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let manifest_id = parts.next().unwrap_or("").trim();
+            let task = parts.next().unwrap_or("").trim();
+            if manifest_id.is_empty() || task.is_empty() {
+                return Some("usage: /agent <manifest-id> <task>".to_string());
+            }
+            // A dry-run preview, deliberately never persisted: it never
+            // supersedes a coordinator's own compiled plan. Still goes
+            // through the identical capability/team-role/route checks
+            // `compile_explicit` always applies -- explicit selection never
+            // bypasses policy.
+            let result = crate::commands::workflow::team::compile_for_objective(
+                &self.repo,
+                dirs::home_dir().as_deref(),
+                task,
+                Some(manifest_id),
+            )
+            .map_err(|error| error.to_string());
+            return Some(super::native_ux::render_agent_plan(&result));
+        }
+        if trimmed == "/team" {
+            let graph = super::super::coordinator::load(&self.state, &self.repo);
+            let plan =
+                super::super::coordinator::resolve_team_plan(&self.state, &self.repo, &graph);
+            return Some(super::native_ux::render_team_plan(plan.as_ref()));
+        }
+        if let Some(objective) = trimmed.strip_prefix("/team plan") {
+            let objective = objective.trim();
+            if objective.is_empty() {
+                return Some("usage: /team plan <objective>".to_string());
+            }
+            return Some(
+                match crate::commands::workflow::team::compile_for_objective(
+                    &self.repo,
+                    dirs::home_dir().as_deref(),
+                    objective,
+                    None,
+                )
+                .and_then(|plan| {
+                    crate::commands::workflow::team::store_plan(&self.state, &self.repo, &plan)?;
+                    Ok(plan)
+                }) {
+                    Ok(plan) => super::native_ux::render_team_plan(Some(&plan)),
+                    Err(error) => format!("refused: {error}"),
+                },
+            );
+        }
+        None
     }
 
     fn current_identity(&self) -> super::native_ux::SeatIdentity {
@@ -5314,9 +5397,14 @@ mod tests {
         .iter()
         .map(StyledLine::to_plain_string)
         .collect();
-        assert!(text[0].contains("/clear"));
+        // Issue #541 chunk C: `/agents`/`/agent`/`/team` are now real,
+        // dispatch-backed commands (`NativePaneRuntime::handle_team_slash`),
+        // so they are deliberately no longer excluded from this list.
+        assert!(text[0].contains("/agent"));
+        assert!(text.iter().any(|line| line.contains("/clear")));
         assert!(text.iter().any(|line| line.contains("/status")));
-        assert!(!text.iter().any(|line| line.contains("/agents")));
+        assert!(text.iter().any(|line| line.contains("/agents")));
+        assert!(text.iter().any(|line| line.contains("/team")));
     }
 
     #[test]
