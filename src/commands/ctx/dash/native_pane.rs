@@ -4152,12 +4152,11 @@ impl NativePaneRuntime {
                     _ => "repo-untrusted",
                 },
                 scope: source.scope,
-                // Issue #538 (chunk C): the journal's own `ContextCompiled`
-                // provenance does not carry a byte count (only path/scope/
-                // trust/decision/sha256) -- see the design note's chunk C
-                // section for why this is a deliberate, documented gap
-                // rather than a fresh re-read of each file's size.
-                bytes: 0,
+                // Review fix (issue #538, item 5): the journal's own
+                // `ContextCompiled` provenance now carries `raw_bytes`
+                // (`ResolvedInstructionSource`), so this is the file's real
+                // size, not a placeholder.
+                bytes: source.raw_bytes.unwrap_or(0),
                 sha256: source.sha256,
                 decision: source.decision,
             })
@@ -6780,6 +6779,24 @@ mod tests {
         assert!(
             notice.contains("duplicate of"),
             "the identical AGENTS.md must show its chunk A decision: {notice}"
+        );
+        // Review fix (issue #538, item 5): the journal now carries a real
+        // byte count, so the live pane must report it, not a `0B`
+        // placeholder for every row -- "- always run tests\n" is 19 bytes.
+        assert!(
+            notice.contains("19B"),
+            "the winner's real byte count must be reported, not 0B: {notice}"
+        );
+        // The duplicate AGENTS.md row legitimately shows 0B -- it delivers no
+        // content of its own -- so scope the placeholder check to the
+        // winning ZIRV.md row rather than the whole notice.
+        let zirv_line = notice
+            .lines()
+            .find(|line| line.contains("ZIRV.md ("))
+            .unwrap_or_else(|| panic!("no ZIRV.md row in notice: {notice}"));
+        assert!(
+            !zirv_line.contains("-- 0B"),
+            "the delivered ZIRV.md row must not fall back to the placeholder byte count: {zirv_line}"
         );
     }
 
