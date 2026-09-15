@@ -1094,10 +1094,14 @@ fn repo_dir(state: &StateDir, repo: &Path) -> PathBuf {
 }
 
 fn state_path(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
+    state_path_in(&repo_dir(state, repo), id)
+}
+
+fn state_path_in(dir: &Path, id: &str) -> CtxResult<PathBuf> {
     if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!("invalid workflow id '{id}'").into());
     }
-    Ok(repo_dir(state, repo).join(format!("{id}.json")))
+    Ok(dir.join(format!("{id}.json")))
 }
 
 fn active_path(state: &StateDir, repo: &Path) -> PathBuf {
@@ -1140,7 +1144,11 @@ fn save_inactive_if_active(state_dir: &StateDir, state: &WorkflowState) -> CtxRe
 }
 
 pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState> {
-    let path = state_path(state, repo, id)?;
+    load_from_dir(&repo_dir(state, repo), id)
+}
+
+fn load_from_dir(dir: &Path, id: &str) -> CtxResult<WorkflowState> {
+    let path = state_path_in(dir, id)?;
     // Every verb that resolves a workflow by id (`status`, `resume`,
     // `context`, `artifacts`, `approve`, `advance`, ...) goes through this
     // one function, so checking here once is enough to keep a bogus id from
@@ -1161,12 +1169,28 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
 }
 
 pub fn load_active(state: &StateDir, repo: &Path) -> CtxResult<Option<WorkflowState>> {
-    let path = active_path(state, repo);
+    load_active_from_dir(&repo_dir(state, repo))
+}
+
+/// Read current state without the CLI's automatic legacy-bucket migration.
+pub(crate) fn load_active_read_only(
+    state: &StateDir,
+    repo: &Path,
+) -> CtxResult<Option<WorkflowState>> {
+    load_active_from_dir(
+        &state
+            .workflows()
+            .join(crate::commands::ctx::state::repo_slug_read_only(repo)),
+    )
+}
+
+fn load_active_from_dir(dir: &Path) -> CtxResult<Option<WorkflowState>> {
+    let path = dir.join("active");
     if !path.exists() {
         return Ok(None);
     }
     let id = std::fs::read_to_string(path)?;
-    load(state, repo, id.trim()).map(Some)
+    load_from_dir(dir, id.trim()).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

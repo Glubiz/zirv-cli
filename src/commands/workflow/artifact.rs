@@ -152,10 +152,14 @@ fn artifact_dir(state: &StateDir, repo: &Path) -> PathBuf {
 }
 
 fn record_path(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
+    record_path_in(&artifact_dir(state, repo), id)
+}
+
+fn record_path_in(dir: &Path, id: &str) -> CtxResult<PathBuf> {
     if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!("invalid artifact id '{id}'").into());
     }
-    Ok(artifact_dir(state, repo).join(format!("{id}.json")))
+    Ok(dir.join(format!("{id}.json")))
 }
 
 pub fn register(
@@ -204,13 +208,39 @@ pub fn register(
 }
 
 pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<ArtifactRecord> {
+    load_from_dir(&artifact_dir(state, repo), id)
+}
+
+/// Read current state without the CLI's automatic legacy-bucket migration.
+pub(crate) fn load_read_only(state: &StateDir, repo: &Path, id: &str) -> CtxResult<ArtifactRecord> {
+    load_from_dir(
+        &state
+            .artifacts()
+            .join(crate::commands::ctx::state::repo_slug_read_only(repo)),
+        id,
+    )
+}
+
+fn load_from_dir(dir: &Path, id: &str) -> CtxResult<ArtifactRecord> {
     Ok(serde_json::from_str(&std::fs::read_to_string(
-        record_path(state, repo, id)?,
+        record_path_in(dir, id)?,
     )?)?)
 }
 
 pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<ArtifactRecord>> {
-    let dir = artifact_dir(state, repo);
+    list_from_dir(&artifact_dir(state, repo))
+}
+
+/// List current state without the CLI's automatic legacy-bucket migration.
+pub(crate) fn list_read_only(state: &StateDir, repo: &Path) -> CtxResult<Vec<ArtifactRecord>> {
+    list_from_dir(
+        &state
+            .artifacts()
+            .join(crate::commands::ctx::state::repo_slug_read_only(repo)),
+    )
+}
+
+fn list_from_dir(dir: &Path) -> CtxResult<Vec<ArtifactRecord>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
