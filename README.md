@@ -126,6 +126,36 @@ zirv setup reset codex --scope global --yes
 zirv setup reset all --scope all --yes
 ```
 
+### `ZIRV.md` instruction files
+
+Zirv's own native instruction file. Sources, closest scope first:
+
+1. nested `ZIRV.md` files between the repository root and the files/worktree
+   scope currently being acted on;
+2. repository `ZIRV.md` at the repo root, or `.zirv/ZIRV.md` when the root
+   file is absent — if both exist, the root file wins and `.zirv/ZIRV.md` is
+   reported shadowed, never merged;
+3. optional operator-global `~/.zirv/ZIRV.md`.
+
+The portable `AGENTS.md` convention is a first-class source alongside it, and
+existing `CLAUDE.md` repositories work unmigrated. At the same directory,
+`ZIRV.md` outranks `AGENTS.md`, which outranks `CLAUDE.md`, which outranks the
+singular `AGENT.md` compatibility alias — `AGENT.md` is only ever a candidate
+when no `AGENTS.md` exists in that directory, and always carries a migration
+diagnostic recommending rename to `AGENTS.md`. A compatibility file whose
+content duplicates the winning file (identical text, a symlink resolving to
+it, or a lone `@AGENTS.md`-style import of it) is reported as a duplicate
+consumed once, not as separate shadowed content — the same rules never reach
+a session twice. `zirv ctx optimize`'s report and `zirv context status` (see
+[Reviewing your instruction files](#reviewing-your-instruction-files)) list
+every discovered `ZIRV.md`/`AGENTS.md`/`CLAUDE.md`/`AGENT.md` surface with its
+trust class, scope, content hash, and precedence decision
+(included/shadowed/duplicate/excluded, with a reason). **Instructions are
+context, never permissions**: like every native instruction file, `ZIRV.md`
+can steer a session's prose but can never change sandboxing, approvals,
+credentials, provider/account/billing routing, tool grants, workflow policy
+floors, or settings precedence — see [Trust boundary](#trust-boundary) below.
+
 ### `zirv chat` and `zirv agent`
 
 `zirv chat` and `zirv agent` are shorter top-level aliases for `zirv ctx
@@ -2741,6 +2771,22 @@ Set `output.filter_defaults = false` to drop the bundled rules entirely and
 keep only your own.
 
 #### Trust boundary
+
+| Surface | Trust | Narrowing? |
+|---|---|---|
+| `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
+| `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
+
+Every native instruction file inside the repository checkout — `ZIRV.md`
+(root, `.zirv/` fallback, or nested), `AGENTS.md`, `CLAUDE.md`, and the
+singular `AGENT.md` compatibility alias — is `RepoUntrusted`: it can steer a
+session's prose but can never widen sandboxing, approvals, credentials,
+provider/account/billing routing, tool grants, workflow policy floors, or
+settings precedence, the same asymmetry `REPO_FORBIDDEN` enforces for
+`ctx.toml` below. Only the operator-global `~/.zirv/ZIRV.md` (and its
+`CLAUDE.md`/`AGENTS.md` counterparts) carries `Operator` trust, and even then
+only as prose context — instructions are context, never permissions, at
+every scope.
 
 A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
