@@ -1621,6 +1621,8 @@ mod tests {
             group: None,
             objective: None,
             workdir: repo.clone(),
+            manifest: None,
+            plan_override: false,
         };
         delegation::record_launch(&state, &repo, handle("live"), None, 10).expect("launch");
         delegation::record_launch(&state, &repo, handle("done"), None, 11).expect("launch");

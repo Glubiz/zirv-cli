@@ -28,10 +28,13 @@ pub const GROUP_CREATE: &str = "group_create";
 pub const GROUP_STATUS: &str = "group_status";
 pub const OBJECTIVE_STATUS: &str = "objective_status";
 pub const TEAM_STATUS: &str = "team_status";
+/// Issue #541 chunk C, decision 1: compile the proportional team for an
+/// objective and persist it (coordinator/sub-orchestrator seats only).
+pub const TEAM_PLAN: &str = "team_plan";
 
 /// Every team tool name, in registry order. One list, so the registry, the
 /// parser and the dispatcher cannot drift apart.
-pub const ALL: [&str; 7] = [
+pub const ALL: [&str; 8] = [
     TASK_CREATE,
     TASK_CLAIM,
     TASK_LIST,
@@ -39,6 +42,7 @@ pub const ALL: [&str; 7] = [
     GROUP_STATUS,
     OBJECTIVE_STATUS,
     TEAM_STATUS,
+    TEAM_PLAN,
 ];
 
 /// How many cards or graph nodes one listing may return. A coordinator that
@@ -113,6 +117,37 @@ pub(super) struct GroupStatusArgs {
     pub group: Option<String>,
 }
 
+/// `team_plan`: issue #541 chunk C, decision 1. `seat`, when given, bypasses
+/// the proportional selection rules and compiles a single explicit seat for
+/// this manifest id -- the same `compile_explicit` path `zirv workflow team
+/// plan --seat` uses, through the identical capability/team-role/route
+/// checks. `task`, only meaningful together with `seat`, overrides that
+/// one seat's task text with something more specific than `objective` --
+/// ignored when `seat` is absent, since a proportional plan's seats each
+/// already get their own task text from the compiler.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TeamPlanArgs {
+    pub objective: String,
+    #[serde(default)]
+    pub seat: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+}
+
+impl TeamPlanArgs {
+    pub(super) fn validate(&self) -> Result<(), ToolError> {
+        non_empty(&self.objective, "objective")?;
+        if let Some(seat) = &self.seat {
+            non_empty(seat, "seat")?;
+        }
+        if let Some(task) = &self.task {
+            non_empty(task, "task")?;
+        }
+        Ok(())
+    }
+}
+
 fn non_empty(value: &str, field: &str) -> Result<(), ToolError> {
     if value.trim().is_empty() {
         return Err(ToolError::new(
@@ -183,6 +218,26 @@ impl GroupCreateArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn team_plan_needs_a_non_empty_objective_and_nothing_else_is_accepted() {
+        let ok: TeamPlanArgs =
+            serde_json::from_str(r#"{"objective":"ship the export feature"}"#).expect("parse");
+        ok.validate().expect("valid");
+        assert_eq!(ok.seat, None);
+
+        let with_seat: TeamPlanArgs =
+            serde_json::from_str(r#"{"objective":"x","seat":"reviewer","task":"review the diff"}"#)
+                .expect("parse");
+        with_seat.validate().expect("valid");
+
+        let blank: TeamPlanArgs = serde_json::from_str(r#"{"objective":"  "}"#).expect("parse");
+        assert!(blank.validate().is_err());
+
+        assert!(
+            serde_json::from_str::<TeamPlanArgs>(r#"{"objective":"x","surprise":true}"#).is_err()
+        );
+    }
 
     #[test]
     fn the_tool_name_list_has_no_duplicates() {

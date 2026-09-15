@@ -40,6 +40,7 @@ use super::CtxResult;
 use super::delegation;
 use super::state::{StateDir, create_private_dir_all, repo_slug, write_private};
 use super::team;
+use crate::commands::workflow::team::TeamPlan;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -144,8 +145,25 @@ pub struct Coordinator {
     pub nodes: BTreeMap<String, Node>,
     #[serde(default)]
     pub decisions: Vec<Decision>,
+    /// Where the [`TeamPlan`] for this objective lives (issue #541 chunk C,
+    /// decision 1). `None` until `team_plan` is compiled at least once.
+    #[serde(default)]
+    pub team_plan: Option<TeamPlanLocation>,
     #[serde(default)]
     pub updated_at: u64,
+}
+
+/// One source of truth for a compiled [`TeamPlan`]: a workflow OWNS it when
+/// one is active for this objective (the SAME `WorkflowState::team_plan`
+/// `zirv workflow team` itself reads and writes), and this record carries
+/// only the workflow's id -- never a second copy that could drift from the
+/// first. `Inline` is the fallback for a coordinator with no active
+/// workflow at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TeamPlanLocation {
+    Workflow { workflow_id: String },
+    Inline { plan: Box<TeamPlan> },
 }
 
 fn default_schema_version() -> u32 {
@@ -162,6 +180,7 @@ impl Default for Coordinator {
             cancelled: false,
             nodes: BTreeMap::new(),
             decisions: Vec::new(),
+            team_plan: None,
             updated_at: 0,
         }
     }
@@ -290,6 +309,55 @@ impl Coordinator {
             .collect();
         nodes.sort_by_key(|node| node.updated_at);
         nodes
+    }
+
+    /// Issue #541 chunk C, decision 1: the `team_plan` tool's storage rule --
+    /// a workflow that is active for this objective OWNS the plan, and this
+    /// record keeps only its id.
+    pub fn store_team_plan_workflow(&mut self, workflow_id: &str, now: u64) {
+        self.team_plan = Some(TeamPlanLocation::Workflow {
+            workflow_id: workflow_id.to_string(),
+        });
+        self.updated_at = now;
+    }
+
+    /// The fallback for a coordinator running with no active workflow.
+    pub fn store_team_plan_inline(&mut self, plan: TeamPlan, now: u64) {
+        self.team_plan = Some(TeamPlanLocation::Inline {
+            plan: Box::new(plan),
+        });
+        self.updated_at = now;
+    }
+
+    /// Issue #541 chunk C, decision 2: whether `seat_id` in this coordinator's
+    /// team plan already has an active answerer. `Filled` covers `Delegated`
+    /// (a live delegation is answering for it) and `Completed` (the seat's
+    /// work is done, so the plan is satisfied and must not be re-dispatched);
+    /// anything else -- no node at all, `Planned`, `Failed`, `Cancelled` -- is
+    /// `Empty` and free to (re)fill, which is what lets a retry after a
+    /// failure re-fill the SAME seat rather than being permanently refused.
+    pub fn seat_filled(&self, seat_id: &str) -> bool {
+        self.nodes
+            .get(seat_id)
+            .is_some_and(|node| matches!(node.state, NodeState::Delegated | NodeState::Completed))
+    }
+}
+
+/// Issue #541 chunk C, decision 1: resolves the [`TeamPlan`] a coordinator
+/// record points at, following [`TeamPlanLocation::Workflow`] through the
+/// workflow engine's own store when the plan lives there. `None` when no
+/// plan has been compiled yet, or when a `Workflow` reference names a
+/// workflow that no longer exists (deleted, or a state directory an
+/// operator pruned) -- read failure here is "no plan", never an error a
+/// bounds check has no way to surface.
+pub fn resolve_team_plan(state: &StateDir, repo: &Path, record: &Coordinator) -> Option<TeamPlan> {
+    match record.team_plan.as_ref()? {
+        TeamPlanLocation::Inline { plan } => Some(plan.as_ref().clone()),
+        TeamPlanLocation::Workflow { workflow_id } => {
+            crate::commands::workflow::engine::load(state, repo, workflow_id)
+                .ok()
+                .and_then(|workflow| workflow.team_plan)
+        }
     }
 }
 
@@ -481,6 +549,61 @@ pub struct Bounds<'a> {
     pub cancelled: bool,
     /// What the caller asked the child's mode to be. Only ever narrowed.
     pub requested_write: bool,
+    /// Issue #541 chunk C, decision 2: identity facts about the manifest this
+    /// delegation named (or the role's own default). `None` when the child
+    /// role is outside the closed team (`worker`, `seat`, an operator's own
+    /// label) -- the manifest/team-plan system applies only to a recognised
+    /// [`team::TeamRole`], exactly like `team::authority` itself.
+    pub manifest: Option<ManifestBounds<'a>>,
+    /// Issue #541 chunk C, decision 2/3: what the caller has already resolved
+    /// about the team plan for this objective, gathered from the
+    /// coordinator's own graph and the plan before `check` is called (a
+    /// registry/plan lookup is I/O, so it cannot happen inside this pure
+    /// function). `None` when there is no plan concept to check against --
+    /// same rule as `manifest`.
+    pub plan: Option<PlanBounds<'a>>,
+}
+
+/// Issue #541 chunk C, decision 2: what the caller resolved about the
+/// manifest a delegation named.
+#[derive(Clone, Copy, Debug)]
+pub struct ManifestBounds<'a> {
+    pub requested_id: &'a str,
+    /// `None` when `requested_id` names no manifest the registry knows.
+    pub known: Option<ManifestFacts>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ManifestFacts {
+    pub team_role: team::TeamRole,
+    pub may_write: bool,
+}
+
+/// Issue #541 chunk C, decision 2/3: what the caller resolved about the team
+/// plan for this objective and this delegation's place in it.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanBounds<'a> {
+    /// A plan exists for this objective -- even a zero-seat one (a Direct
+    /// execution objective) counts, so an empty plan still refuses a
+    /// delegation that does not match anything in it.
+    pub exists: bool,
+    /// The seat id this delegation's (manifest, role) resolves to in the
+    /// plan, when it names one that is not already filled
+    /// ([`Coordinator::seat_filled`]).
+    pub matching_unfilled_seat: Option<&'a str>,
+    /// The matched seat's own claim paths (empty for an independent,
+    /// no-claim seat, or when there is no match at all).
+    pub matched_claim_paths: &'a [String],
+    /// Claim paths of every OTHER seat this coordinator's graph currently
+    /// shows as filled, gathered by the caller from the plan and the graph --
+    /// so two writers whose claims overlap are refused before the second
+    /// one's receipt exists, not after.
+    pub active_claim_paths: &'a [&'a [String]],
+    /// Whether the DELEGATING seat is itself the coordinator -- only the
+    /// coordinator seat may pass `override_requested`.
+    pub is_coordinator: bool,
+    /// The caller asked to bypass the "must match an unfilled seat" rule.
+    pub override_requested: bool,
 }
 
 /// What the child is actually allowed, once its own role has had its say.
@@ -495,6 +618,11 @@ pub struct Grant {
     pub write: bool,
     /// The depth the child's envelope starts from.
     pub depth: u8,
+    /// Issue #541 chunk C, decision 2: whether this grant used the
+    /// coordinator's `override: true` escape from the team-plan match rule --
+    /// recorded so the launch receipt can carry it rather than leaving an
+    /// override invisible after the fact.
+    pub plan_override: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -505,6 +633,26 @@ pub enum Refusal {
     ParentMayNotDelegate { role: String },
     /// The delegating session's envelope is out of delegation hops.
     DepthExhausted,
+    /// Issue #541 chunk C, decision 2: the named manifest is not one the
+    /// registry knows.
+    UnknownManifest { manifest_id: String },
+    /// The manifest's own team role does not match the role this delegation
+    /// requested for it.
+    ManifestRoleMismatch {
+        manifest_id: String,
+        manifest_team_role: String,
+        requested_role: String,
+    },
+    /// The manifest may write but the requested role is read-only by
+    /// identity: the manifest would grant authority wider than the role's.
+    ManifestWiderThanRole { manifest_id: String, role: String },
+    /// A team plan exists for this objective and this delegation matches no
+    /// unfilled seat in it.
+    NotInTeamPlan,
+    /// The matched seat's claim overlaps a claim another currently-filled
+    /// seat already holds; two overlapping writers may not both be
+    /// dispatched.
+    ClaimConflict { seat_id: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -521,6 +669,30 @@ impl std::fmt::Display for Refusal {
             Self::DepthExhausted => f.write_str(
                 "this session's delegation envelope has depth 0; it may not delegate further",
             ),
+            Self::UnknownManifest { manifest_id } => {
+                write!(f, "unknown manifest '{manifest_id}'")
+            }
+            Self::ManifestRoleMismatch {
+                manifest_id,
+                manifest_team_role,
+                requested_role,
+            } => write!(
+                f,
+                "manifest '{manifest_id}' maps to team role '{manifest_team_role}', not the \
+                 requested '{requested_role}'"
+            ),
+            Self::ManifestWiderThanRole { manifest_id, role } => write!(
+                f,
+                "manifest '{manifest_id}' may write, which is wider than role '{role}''s own \
+                 authority"
+            ),
+            Self::NotInTeamPlan => {
+                f.write_str("not in the team plan; run team_plan again or pass override: true")
+            }
+            Self::ClaimConflict { seat_id } => write!(
+                f,
+                "seat '{seat_id}' claims paths another currently-dispatched seat already holds"
+            ),
         }
     }
 }
@@ -529,6 +701,12 @@ impl std::error::Error for Refusal {}
 
 /// The pure bounds decision. No clock, no filesystem, no config: identical
 /// inputs give an identical verdict, the same discipline `rot.rs` keeps.
+///
+/// Issue #541 chunk C: the manifest identity check and the team-plan match
+/// happen AFTER role/depth/cancellation but still entirely before any
+/// durable launch receipt exists -- a refused delegation here leaves no
+/// receipt naming work nobody started, exactly like the pre-existing three
+/// checks above them.
 pub fn check(bounds: &Bounds<'_>) -> Result<Grant, Refusal> {
     if bounds.cancelled {
         return Err(Refusal::Cancelled);
@@ -541,10 +719,70 @@ pub fn check(bounds: &Bounds<'_>) -> Result<Grant, Refusal> {
     if bounds.depth == 0 {
         return Err(Refusal::DepthExhausted);
     }
+
+    if let Some(manifest) = &bounds.manifest {
+        match manifest.known {
+            None => {
+                return Err(Refusal::UnknownManifest {
+                    manifest_id: manifest.requested_id.to_string(),
+                });
+            }
+            Some(facts) => {
+                if team::TeamRole::parse(bounds.child_role) != Some(facts.team_role) {
+                    return Err(Refusal::ManifestRoleMismatch {
+                        manifest_id: manifest.requested_id.to_string(),
+                        manifest_team_role: facts.team_role.as_str().to_string(),
+                        requested_role: bounds.child_role.to_string(),
+                    });
+                }
+                if facts.may_write && !team::authority(bounds.child_role).may_write {
+                    return Err(Refusal::ManifestWiderThanRole {
+                        manifest_id: manifest.requested_id.to_string(),
+                        role: bounds.child_role.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut plan_override = false;
+    if let Some(plan) = &bounds.plan
+        && plan.exists
+    {
+        match plan.matching_unfilled_seat {
+            Some(seat_id) => {
+                if plan
+                    .active_claim_paths
+                    .iter()
+                    .any(|other| claim_paths_overlap(plan.matched_claim_paths, other))
+                {
+                    return Err(Refusal::ClaimConflict {
+                        seat_id: seat_id.to_string(),
+                    });
+                }
+            }
+            None => {
+                if plan.is_coordinator && plan.override_requested {
+                    plan_override = true;
+                } else {
+                    return Err(Refusal::NotInTeamPlan);
+                }
+            }
+        }
+    }
+
     Ok(Grant {
         write: bounds.requested_write && team::authority(bounds.child_role).may_write,
         depth: bounds.depth.saturating_sub(1),
+        plan_override,
     })
+}
+
+/// Two claims overlap when they share a path AND neither is the "no claim"
+/// empty set -- an independent (read-only, `Claim::none()`) seat never
+/// conflicts with anything.
+fn claim_paths_overlap(a: &[String], b: &[String]) -> bool {
+    !a.is_empty() && !b.is_empty() && a.iter().any(|path| b.contains(path))
 }
 
 #[cfg(test)]
@@ -568,6 +806,8 @@ mod tests {
             depth: 2,
             cancelled: false,
             requested_write: true,
+            manifest: None,
+            plan: None,
         }
     }
 
@@ -597,6 +837,245 @@ mod tests {
         }
     }
 
+    /// Issue #541 chunk C, decision 2: an unknown manifest is refused before
+    /// any receipt -- the caller resolves `known: None` from a failed
+    /// registry lookup, and `check` never invents a manifest to admit.
+    #[test]
+    fn a_delegation_with_an_unknown_manifest_is_refused_before_the_receipt() {
+        let refusal = check(&Bounds {
+            manifest: Some(ManifestBounds {
+                requested_id: "does-not-exist",
+                known: None,
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect_err("unknown manifest refused");
+        assert_eq!(
+            refusal,
+            Refusal::UnknownManifest {
+                manifest_id: "does-not-exist".to_string()
+            }
+        );
+    }
+
+    /// Issue #541 chunk C, decision 2: the manifest's OWN team role has to
+    /// agree with the role this delegation requested for it, and a writable
+    /// manifest may never be admitted for a role whose own authority is
+    /// read-only -- both directions of "a manifest is a routing hint, never
+    /// an authorization grant".
+    #[test]
+    fn a_manifest_whose_team_role_does_not_match_is_refused() {
+        let refusal = check(&Bounds {
+            manifest: Some(ManifestBounds {
+                requested_id: "reviewer",
+                known: Some(ManifestFacts {
+                    team_role: team::TeamRole::Reviewer,
+                    may_write: false,
+                }),
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect_err("role mismatch refused");
+        assert!(
+            matches!(refusal, Refusal::ManifestRoleMismatch { .. }),
+            "{refusal:?}"
+        );
+
+        let refusal = check(&Bounds {
+            manifest: Some(ManifestBounds {
+                requested_id: "implementer",
+                known: Some(ManifestFacts {
+                    team_role: team::TeamRole::Reviewer,
+                    may_write: true,
+                }),
+            }),
+            ..bounds(team::COORDINATOR, team::REVIEWER)
+        })
+        .expect_err("wider-than-role refused");
+        assert!(
+            matches!(refusal, Refusal::ManifestWiderThanRole { .. }),
+            "{refusal:?}"
+        );
+
+        // A matching, correctly-scoped manifest is admitted.
+        let grant = check(&Bounds {
+            manifest: Some(ManifestBounds {
+                requested_id: "implementer",
+                known: Some(ManifestFacts {
+                    team_role: team::TeamRole::Implementer,
+                    may_write: true,
+                }),
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect("matching manifest admitted");
+        assert!(grant.write);
+    }
+
+    /// Issue #541 chunk C, decision 2: once a plan exists for the objective,
+    /// a delegation must match an unfilled seat in it -- refused with
+    /// `NotInTeamPlan` otherwise, unless the COORDINATOR (never any other
+    /// role) passes `override_requested`, which is recorded on the grant.
+    #[test]
+    fn a_delegation_outside_the_team_plan_is_refused_unless_overridden_by_the_coordinator() {
+        let no_match = PlanBounds {
+            exists: true,
+            matching_unfilled_seat: None,
+            matched_claim_paths: &[],
+            active_claim_paths: &[],
+            is_coordinator: false,
+            override_requested: false,
+        };
+        assert_eq!(
+            check(&Bounds {
+                plan: Some(no_match),
+                ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+            }),
+            Err(Refusal::NotInTeamPlan)
+        );
+
+        // A non-coordinator's override is ignored: only the coordinator seat
+        // may bypass the team-plan match.
+        assert_eq!(
+            check(&Bounds {
+                plan: Some(PlanBounds {
+                    override_requested: true,
+                    is_coordinator: false,
+                    ..no_match
+                }),
+                ..bounds(team::SUB_ORCHESTRATOR, team::IMPLEMENTER)
+            }),
+            Err(Refusal::NotInTeamPlan)
+        );
+
+        // The coordinator's own override is admitted and recorded.
+        let grant = check(&Bounds {
+            plan: Some(PlanBounds {
+                override_requested: true,
+                is_coordinator: true,
+                ..no_match
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect("coordinator override admitted");
+        assert!(grant.plan_override);
+
+        // A matching unfilled seat needs no override at all.
+        let grant = check(&Bounds {
+            plan: Some(PlanBounds {
+                matching_unfilled_seat: Some("implementer-1"),
+                ..no_match
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect("matching seat admitted");
+        assert!(!grant.plan_override);
+    }
+
+    /// Issue #541 chunk C, decision 3: two seats whose claims overlap may
+    /// never both be dispatched -- the caller gathers every OTHER currently
+    /// filled seat's claim from the graph, and `check` refuses a match
+    /// against any of them.
+    #[test]
+    fn overlapping_seat_claims_cannot_both_be_dispatched() {
+        let seat_a_claim = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let active: &[&[String]] = &[&seat_a_claim];
+
+        let seat_b_claim = vec!["src/b.rs".to_string()];
+        let refusal = check(&Bounds {
+            plan: Some(PlanBounds {
+                exists: true,
+                matching_unfilled_seat: Some("implementer-2"),
+                matched_claim_paths: &seat_b_claim,
+                active_claim_paths: active,
+                is_coordinator: false,
+                override_requested: false,
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect_err("overlapping claim refused");
+        assert_eq!(
+            refusal,
+            Refusal::ClaimConflict {
+                seat_id: "implementer-2".to_string()
+            }
+        );
+
+        // A disjoint claim is admitted.
+        let seat_c_claim = vec!["docs/readme.md".to_string()];
+        let grant = check(&Bounds {
+            plan: Some(PlanBounds {
+                exists: true,
+                matching_unfilled_seat: Some("implementer-3"),
+                matched_claim_paths: &seat_c_claim,
+                active_claim_paths: active,
+                is_coordinator: false,
+                override_requested: false,
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect("disjoint claim admitted");
+        assert!(grant.write);
+    }
+
+    /// Issue #541 chunk C, decision 2/3: a seat that is currently filled
+    /// cannot be matched again (refused, exactly like being outside the
+    /// plan) -- but once it settles to `Failed`, a retry names the SAME seat
+    /// id and `Coordinator::dispatched` reuses the identical graph node,
+    /// never creating a second, competing writer for it.
+    #[test]
+    fn a_retry_refills_the_same_seat_and_never_creates_a_second_writer() {
+        let mut record = Coordinator::default();
+        record.plan("implementer-1", team::IMPLEMENTER, &[], 1);
+        assert!(!record.seat_filled("implementer-1"));
+
+        record.dispatched("implementer-1", team::IMPLEMENTER, "native", "deleg-1", 2);
+        assert!(record.seat_filled("implementer-1"));
+
+        let no_match = PlanBounds {
+            exists: true,
+            matching_unfilled_seat: None,
+            matched_claim_paths: &[],
+            active_claim_paths: &[],
+            is_coordinator: false,
+            override_requested: false,
+        };
+        assert_eq!(
+            check(&Bounds {
+                plan: Some(no_match),
+                ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+            }),
+            Err(Refusal::NotInTeamPlan),
+            "a filled seat cannot be matched a second time while it is still filled"
+        );
+
+        record.settled("implementer-1", NodeState::Failed, None, 3);
+        assert!(
+            !record.seat_filled("implementer-1"),
+            "a failed seat is free to retry"
+        );
+
+        let grant = check(&Bounds {
+            plan: Some(PlanBounds {
+                matching_unfilled_seat: Some("implementer-1"),
+                ..no_match
+            }),
+            ..bounds(team::COORDINATOR, team::IMPLEMENTER)
+        })
+        .expect("retry admitted");
+        assert!(grant.write);
+        record.dispatched("implementer-1", team::IMPLEMENTER, "native", "deleg-2", 4);
+        assert_eq!(
+            record.nodes.len(),
+            1,
+            "the retry reused the same node, never a second one"
+        );
+        assert_eq!(
+            record.nodes["implementer-1"].delegation.as_deref(),
+            Some("deleg-2")
+        );
+    }
+
     #[test]
     fn a_seat_whose_role_grants_no_delegation_authority_is_refused() {
         let refusal = check(&bounds(team::REVIEWER, team::IMPLEMENTER)).expect_err("refused");
@@ -619,6 +1098,23 @@ mod tests {
         let mut cancelled = bounds(team::COORDINATOR, team::IMPLEMENTER);
         cancelled.cancelled = true;
         assert_eq!(check(&cancelled), Err(Refusal::Cancelled));
+    }
+
+    /// Issue #541 chunk C, decision 1: a `Workflow` reference to a workflow
+    /// that no longer exists resolves to "no plan" rather than an error --
+    /// read failure here is a fact a bounds check has no way to surface, not
+    /// a caller-visible failure. `seat_filled` on a seat with no node at all
+    /// is `false`, the same "free to (re)fill" answer an absent node and a
+    /// settled-failed one both give.
+    #[test]
+    fn a_dangling_workflow_reference_resolves_to_no_plan() {
+        let (_dir, state, repo) = fixture();
+        let mut record = Coordinator::default();
+        assert!(resolve_team_plan(&state, &repo, &record).is_none());
+        assert!(!record.seat_filled("implementer-1"));
+
+        record.store_team_plan_workflow("no-such-workflow", 1);
+        assert!(resolve_team_plan(&state, &repo, &record).is_none());
     }
 
     #[test]
@@ -684,6 +1180,8 @@ mod tests {
                 group: None,
                 objective: None,
                 workdir: repo.to_path_buf(),
+                manifest: None,
+                plan_override: false,
             },
             Some("coord-1".to_string()),
             10,
@@ -811,6 +1309,8 @@ mod tests {
                 depth: 2,
                 cancelled: record.cancelled,
                 requested_write: true,
+                manifest: None,
+                plan: None,
             }),
             Err(Refusal::Cancelled)
         );
