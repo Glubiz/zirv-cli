@@ -978,12 +978,27 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
             Some(String::new())
         }
         "/help" => Some(
-            "commands: /clear /compact /status \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C \
-             Ctrl+C quit, Shift+Tab cycle mode"
+            "commands: /clear /compact /context /status \u{b7} keys: Enter submit, Esc \
+             interrupt, Ctrl+C Ctrl+C quit, Shift+Tab cycle mode"
                 .to_string(),
         ),
         "/compact" => {
             Some("/compact is not yet wired to the native pane's compaction envelope".to_string())
+        }
+        // Issue #538 (chunk B): the render path itself (`native_ux::
+        // render_context_view`) is real and tested; assembling its
+        // `ContextViewSource` list from a LIVE compile needs repo/home/
+        // config access `apply_slash_command` does not hold -- same shape of
+        // gap as `/status` above it. Rendered here with an empty source list
+        // and a placeholder version so the notice is honest about what is
+        // still missing rather than a bare string. See the design note.
+        "/context" | "/instructions" => {
+            let mut notice = super::native_ux::render_context_view(&[], "not yet wired", false);
+            notice.push_str(
+                "\n(live instruction provenance is not yet wired into this pane -- see the \
+                 design note)",
+            );
+            Some(notice)
         }
         _ => None,
     }
