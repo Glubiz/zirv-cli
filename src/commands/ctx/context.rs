@@ -160,21 +160,39 @@ fn is_singular_agent_md(layer: Layer) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Included,
-    Shadowed { by: PathBuf },
-    Duplicate { of: PathBuf },
-    Excluded { reason: String },
+    Shadowed {
+        by: PathBuf,
+    },
+    Duplicate {
+        of: PathBuf,
+    },
+    /// Review fix (issue #538): this file was shadowed by its directory's
+    /// rank winner, but the WINNER's own content is a lone import of THIS
+    /// file -- so this file's real text is what actually reaches the
+    /// session (under the winner's own provenance, via `Resolved::
+    /// delivers_from` on the winner's entry), not a blank shadow. `by`
+    /// names the winner (the import stub that references it).
+    IncludedByReference {
+        by: PathBuf,
+    },
+    Excluded {
+        reason: String,
+    },
 }
 
 impl Decision {
-    /// The `included | shadowed by <path> | duplicate of <path> | excluded:
-    /// <reason>` vocabulary `zirv context status` renders verbatim (issue
-    /// #538, acceptance bullet 6: "context status shows ... included/
-    /// shadowed/truncated reason").
+    /// The `included | shadowed by <path> | duplicate of <path> | included
+    /// by reference from <path> | excluded: <reason>` vocabulary `zirv
+    /// context status` renders verbatim (issue #538, acceptance bullet 6:
+    /// "context status shows ... included/shadowed/truncated reason").
     pub fn render(&self) -> String {
         match self {
             Decision::Included => "included".to_string(),
             Decision::Shadowed { by } => format!("shadowed by {}", by.display()),
             Decision::Duplicate { of } => format!("duplicate of {}", of.display()),
+            Decision::IncludedByReference { by } => {
+                format!("included by reference from {}", by.display())
+            }
             Decision::Excluded { reason } => format!("excluded: {reason}"),
         }
     }
@@ -192,6 +210,14 @@ pub struct Resolved {
     /// Set only for a singular `AGENT.md` candidate: a diagnostic
     /// recommending rename to `AGENTS.md`, independent of `decision`.
     pub migration: Option<String>,
+    /// Review fix (issue #538): `Some(target)` only on an `Included` winner
+    /// whose own content is a lone import of another already-collected
+    /// surface -- the DELIVERED text for this entry must be read from
+    /// `target`, not from `path`, so a `ZIRV.md` reading `@AGENTS.md`
+    /// actually delivers `AGENTS.md`'s real content instead of the eight
+    /// literal bytes `@AGENTS.md`. `None` in every other case (deliver this
+    /// entry's own text, the ordinary path).
+    pub delivers_from: Option<PathBuf>,
 }
 
 fn scope_rank(scope: surface::Scope) -> u8 {
@@ -250,6 +276,22 @@ fn escapes_trust_root(path: &Path, layer: Layer, repo: &Path, home: Option<&Path
     }
 }
 
+/// Path equality for import/dedup resolution, matching how the rest of the
+/// collector already treats paths on Windows -- `logical_dir` above already
+/// compares the `ZIRV.md`/`.zirv` filename segments with `eq_ignore_ascii_
+/// case` for the same reason. Review fix (issue #538): without this, `@AGENTS.MD`
+/// never matched an on-disk `AGENTS.md` on a case-insensitive filesystem,
+/// silently falling through to `Shadowed` (or worse, `Excluded`) instead of
+/// the dedup/import-expansion rules this module exists to apply.
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(b.to_string_lossy().as_ref())
+    } else {
+        a == b
+    }
+}
+
 /// The single import/include target named by `text`, when `text`'s entire
 /// non-blank content is exactly one recognized import line -- the dedup
 /// contract's "whose entire non-blank content is a single import of the
@@ -303,6 +345,11 @@ enum ImportResolution {
     Resolves(PathBuf),
     Cycle,
     EscapesTrustRoot,
+    /// Review fix (issue #538): a genuinely non-cyclic import chain deeper
+    /// than `MAX_IMPORT_DEPTH` hops -- distinct from `Cycle` (which means a
+    /// path was revisited), so the reported reason does not accuse a
+    /// legitimate long chain of looping when it never did.
+    DepthExceeded,
 }
 
 const MAX_IMPORT_DEPTH: usize = 3;
@@ -322,26 +369,33 @@ fn resolve_import_chain(
         if escapes_trust_root(&current, start.layer, repo, home) {
             return Some(ImportResolution::EscapesTrustRoot);
         }
-        if visited.contains(&current) {
+        if visited.iter().any(|seen| paths_equal(seen, &current)) {
             return Some(ImportResolution::Cycle);
         }
         visited.push(current.clone());
-        match surfaces.iter().find(|s| s.path == current) {
+        match surfaces.iter().find(|s| paths_equal(&s.path, &current)) {
+            // Item 4 (nit): once matched, resolve to the SURFACE's own
+            // canonical on-disk path, not the as-written import string's
+            // normalized form -- `@AGENTS.MD` must deliver from the real
+            // `/repo/AGENTS.md` a caller's own `surfaces` list (and every
+            // later exact-path lookup against it) actually holds, not a
+            // differently-cased path nothing downstream will match.
             Some(next) => match parse_lone_import(&next.text) {
                 Some(next_target) => {
                     let Some(next_dir) = next.path.parent() else {
-                        return Some(ImportResolution::Resolves(current));
+                        return Some(ImportResolution::Resolves(next.path.clone()));
                     };
                     current = optimize::normalize_lexically(next_dir, Path::new(&next_target));
                 }
-                None => return Some(ImportResolution::Resolves(current)),
+                None => return Some(ImportResolution::Resolves(next.path.clone())),
             },
             None => return Some(ImportResolution::Resolves(current)),
         }
     }
-    // Depth exhausted without settling on a final target: indistinguishable
-    // from a cycle from the outside, and both outcomes are `Excluded`.
-    Some(ImportResolution::Cycle)
+    // Depth exhausted without settling on a final target. Unlike `Cycle`
+    // (a path was actually revisited), nothing here repeated -- this is a
+    // real, if unusually long, import chain that simply exceeds the bound.
+    Some(ImportResolution::DepthExceeded)
 }
 
 /// Resolves same-directory precedence among every collected instruction
@@ -375,6 +429,7 @@ pub fn resolve_instruction_winners(
                 layer: s.layer,
                 decision: Decision::Included,
                 migration: None,
+                delivers_from: None,
             });
             continue;
         }
@@ -399,7 +454,9 @@ pub fn resolve_instruction_winners(
                 }
             } else {
                 match resolve_import_chain(s, surfaces, repo, home) {
-                    Some(ImportResolution::Resolves(target)) if target == winner_path => {
+                    Some(ImportResolution::Resolves(target))
+                        if paths_equal(&target, &winner_path) =>
+                    {
                         Decision::Duplicate {
                             of: winner_path.clone(),
                         }
@@ -409,6 +466,9 @@ pub fn resolve_instruction_winners(
                     },
                     Some(ImportResolution::Cycle) => Decision::Excluded {
                         reason: "import cycle".to_string(),
+                    },
+                    Some(ImportResolution::DepthExceeded) => Decision::Excluded {
+                        reason: "import depth exceeded".to_string(),
                     },
                     Some(ImportResolution::EscapesTrustRoot) => Decision::Excluded {
                         reason: "escapes trust root".to_string(),
@@ -420,6 +480,7 @@ pub fn resolve_instruction_winners(
                 layer: s.layer,
                 decision,
                 migration,
+                delivers_from: None,
             });
         }
     }
@@ -436,7 +497,7 @@ pub fn resolve_instruction_winners(
         let resolves_to_a_winner = exclusion.symlink_target.as_ref().is_some_and(|target| {
             result
                 .iter()
-                .any(|r| r.decision == Decision::Included && &r.path == target)
+                .any(|r| r.decision == Decision::Included && paths_equal(&r.path, target))
         });
         let decision = if resolves_to_a_winner {
             Decision::Duplicate {
@@ -452,7 +513,54 @@ pub fn resolve_instruction_winners(
             layer: exclusion.layer,
             decision,
             migration,
+            delivers_from: None,
         });
+    }
+
+    // Review fix (issue #538): a WINNER's own content can itself be a lone
+    // import -- the file-and-precedence contract's compatibility-link
+    // pattern (`ZIRV.md` containing exactly `@AGENTS.md`) is a winner doing
+    // this, not a loser. Without this pass, that winner delivered its own
+    // literal stub text and the file it names stayed `Shadowed`, silently
+    // dropping the repository's real instructions. For every `Included`
+    // entry whose own surface text is a lone import resolving (bounded,
+    // cycle- and trust-root-checked, exactly like the loser-side chase
+    // above) to another already-collected surface: record where the winner
+    // must actually deliver its text FROM, and -- when the imported file is
+    // itself one of THIS run's `Resolved` entries and is not already
+    // `Included` -- promote it from `Shadowed`/`Duplicate`/`Excluded` to
+    // `IncludedByReference`, naming the winner. A cycle or a trust-root
+    // escape on the WINNER's own chase is left alone: the winner still
+    // delivers its literal (un-expandable) text, exactly as before this fix,
+    // since there is nothing safe to substitute it with.
+    let mut deliveries: Vec<(usize, PathBuf)> = Vec::new();
+    for (index, resolved) in result.iter().enumerate() {
+        if resolved.decision != Decision::Included {
+            continue;
+        }
+        let Some(surface) = surfaces
+            .iter()
+            .find(|s| paths_equal(&s.path, &resolved.path))
+        else {
+            continue;
+        };
+        if let Some(ImportResolution::Resolves(target)) =
+            resolve_import_chain(surface, surfaces, repo, home)
+            && !paths_equal(&target, &surface.path)
+            && surfaces.iter().any(|s| paths_equal(&s.path, &target))
+        {
+            deliveries.push((index, target));
+        }
+    }
+    for (index, target) in deliveries {
+        result[index].delivers_from = Some(target.clone());
+        let winner_path = result[index].path.clone();
+        if let Some(referenced) = result
+            .iter_mut()
+            .find(|r| paths_equal(&r.path, &target) && r.decision != Decision::Included)
+        {
+            referenced.decision = Decision::IncludedByReference { by: winner_path };
+        }
     }
 
     result
@@ -823,5 +931,173 @@ mod tests {
             "{:?}",
             zirv.decision
         );
+    }
+
+    // -- review fix (issue #538): winner-side import expansion --------------
+
+    /// Item 1 (blocker): the WINNER's own content can be a lone import too --
+    /// exactly the compatibility-link pattern `--report`/the README tell
+    /// users to create (`ZIRV.md` containing only `@AGENTS.md`). The
+    /// winner's literal stub text must never be delivered as-is: the
+    /// imported file's real content is what the winner actually delivers
+    /// (`delivers_from`), and the imported file's own entry is `Included
+    /// ByReference`, not a blank `Shadowed` that would silently drop the
+    /// repository's real instructions.
+    #[test]
+    fn a_winner_that_only_imports_the_loser_delivers_the_losers_real_text() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            surface(Layer::RepoZirvMd, repo.join("ZIRV.md"), "@AGENTS.md\n"),
+            surface(
+                Layer::RepoAgentsMd,
+                repo.join("AGENTS.md"),
+                "- the real rules live here\n",
+            ),
+        ];
+        let resolved = resolve_instruction_winners(&surfaces, &[], repo, None);
+
+        let winner = resolved
+            .iter()
+            .find(|r| r.path.ends_with("ZIRV.md"))
+            .expect("ZIRV.md entry present");
+        assert_eq!(winner.decision, Decision::Included);
+        assert_eq!(
+            winner.delivers_from,
+            Some(repo.join("AGENTS.md")),
+            "the winner must deliver AGENTS.md's real text, not its own @AGENTS.md stub"
+        );
+
+        let imported = resolved
+            .iter()
+            .find(|r| r.path.ends_with("AGENTS.md"))
+            .expect("AGENTS.md entry present");
+        assert_eq!(
+            imported.decision,
+            Decision::IncludedByReference {
+                by: repo.join("ZIRV.md")
+            },
+            "the imported file must be reported as reached, not merely shadowed"
+        );
+    }
+
+    /// Item 1 (blocker), the other direction: a LOSER that only imports the
+    /// winner is `Duplicate`, unaffected by the winner-side fix above --
+    /// `a_claude_md_that_only_imports_agents_md_is_consumed_once` already
+    /// pins this; this test names it explicitly as "both directions" the
+    /// review asked for, using a `ZIRV.md` winner instead of `AGENTS.md`, so
+    /// the two tests are not accidentally exercising the same code path.
+    #[test]
+    fn a_loser_that_only_imports_the_winner_is_a_duplicate_not_included_by_reference() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            surface(
+                Layer::RepoZirvMd,
+                repo.join("ZIRV.md"),
+                "- the real rules\n",
+            ),
+            surface(Layer::RepoAgentsMd, repo.join("AGENTS.md"), "@ZIRV.md\n"),
+        ];
+        let resolved = resolve_instruction_winners(&surfaces, &[], repo, None);
+
+        let winner = resolved
+            .iter()
+            .find(|r| r.path.ends_with("ZIRV.md"))
+            .expect("ZIRV.md entry present");
+        assert_eq!(winner.decision, Decision::Included);
+        assert_eq!(
+            winner.delivers_from, None,
+            "the winner does not import anything itself"
+        );
+
+        let loser = resolved
+            .iter()
+            .find(|r| r.path.ends_with("AGENTS.md"))
+            .expect("AGENTS.md entry present");
+        assert_eq!(
+            loser.decision,
+            Decision::Duplicate {
+                of: repo.join("ZIRV.md")
+            }
+        );
+    }
+
+    /// Item 3 (should): a genuinely non-cyclic import chain deeper than
+    /// `MAX_IMPORT_DEPTH` gets its own reason, distinct from "import
+    /// cycle" -- nothing in this chain was ever revisited.
+    #[test]
+    fn an_import_chain_deeper_than_the_limit_is_excluded_as_depth_exceeded_not_a_cycle() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            surface(
+                Layer::RepoAgentsMd,
+                repo.join("AGENTS.md"),
+                "- the winner\n",
+            ),
+            surface(Layer::RepoClaudeMd, repo.join("CLAUDE.md"), "@a.md\n"),
+            surface(Layer::ContextCommon, repo.join("a.md"), "@b.md\n"),
+            surface(Layer::ContextCommon, repo.join("b.md"), "@c.md\n"),
+            surface(Layer::ContextCommon, repo.join("c.md"), "@d.md\n"),
+            surface(Layer::ContextCommon, repo.join("d.md"), "- real content\n"),
+        ];
+        let resolved = resolve_instruction_winners(&surfaces, &[], repo, None);
+
+        let claude = resolved
+            .iter()
+            .find(|r| r.path.ends_with("CLAUDE.md"))
+            .expect("CLAUDE.md entry present");
+        assert!(
+            matches!(&claude.decision, Decision::Excluded { reason } if reason == "import depth exceeded"),
+            "a long-but-non-cyclic chain must not be misreported as a cycle: {:?}",
+            claude.decision
+        );
+    }
+
+    /// Item 4 (nit): import/dedup path comparisons must match how the rest
+    /// of the collector already treats paths on Windows.
+    #[test]
+    fn paths_equal_is_case_insensitive_on_windows_and_exact_elsewhere() {
+        let a = Path::new("/repo/AGENTS.md");
+        let b = Path::new("/repo/agents.md");
+        assert!(paths_equal(a, a));
+        if cfg!(windows) {
+            assert!(
+                paths_equal(a, b),
+                "Windows paths compare case-insensitively"
+            );
+        } else {
+            assert!(!paths_equal(a, b), "non-Windows paths compare exactly");
+        }
+    }
+
+    /// Item 4 (nit), end to end: `@AGENTS.MD` (different case) must still
+    /// resolve to an on-disk `AGENTS.md` on a case-insensitive filesystem.
+    #[test]
+    fn an_import_with_different_case_resolves_on_a_case_insensitive_filesystem() {
+        let repo = Path::new("/repo");
+        let surfaces = vec![
+            surface(Layer::RepoZirvMd, repo.join("ZIRV.md"), "@AGENTS.MD\n"),
+            surface(
+                Layer::RepoAgentsMd,
+                repo.join("AGENTS.md"),
+                "- the real rules\n",
+            ),
+        ];
+        let resolved = resolve_instruction_winners(&surfaces, &[], repo, None);
+        let winner = resolved
+            .iter()
+            .find(|r| r.path.ends_with("ZIRV.md"))
+            .expect("ZIRV.md entry present");
+        if cfg!(windows) {
+            assert_eq!(
+                winner.delivers_from,
+                Some(repo.join("AGENTS.md")),
+                "Windows: @AGENTS.MD must resolve to the on-disk AGENTS.md"
+            );
+        } else {
+            assert_eq!(
+                winner.delivers_from, None,
+                "a case-sensitive filesystem must not match a differently-cased import"
+            );
+        }
     }
 }
