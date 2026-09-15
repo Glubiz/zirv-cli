@@ -23,8 +23,10 @@ pub mod frontend;
 pub mod frontend_detector;
 pub mod frontend_render;
 pub mod maintain;
+pub mod profile;
 pub mod review;
 pub mod skill;
+pub mod team;
 pub mod telemetry;
 pub mod verification;
 

@@ -98,6 +98,10 @@ diff, one focused test per behaviour change, format, lint and test before report
 - Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
 runs at low or medium effort on the roster's review model, never high or above (that forks \
 this seat's model), and never when a `zirv workflow` review gate covers the change.
+- Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
+spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
+honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
+explicit choice.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
 by ONE designated integrator worker; a writer touching one says so in its report. Git \
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
@@ -132,6 +136,10 @@ diff, one focused test per behaviour change, format, lint and test before report
 - Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
 runs at low or medium effort on the roster's review model, never high or above (that forks \
 this seat's model), and never when a `zirv workflow` review gate covers the change.
+- Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
+spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
+honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
+explicit choice.
 - Shared manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, lockfiles) are edited \
 by ONE designated integrator worker; a writer touching one says so in its report. Git \
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
@@ -6636,6 +6644,28 @@ mod tests {
         assert!(
             ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
             "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
+        );
+    }
+
+    /// Issue #541: before delegating substantial work, this seat compiles
+    /// the proportional team through `zirv workflow team plan` rather than
+    /// guessing which specialists to spawn, and briefs each compiled seat
+    /// through `zirv workflow team brief` rather than re-deriving its
+    /// instructions.
+    #[test]
+    fn the_orchestrator_conventions_name_workflow_team_plan() {
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow team plan"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.contains("zirv workflow team brief"),
+            "got:\n{ORCHESTRATOR_PROMPT}"
+        );
+        assert!(
+            ORCHESTRATOR_PROMPT.len() < 3_600,
+            "this ships on every claude session: {} bytes",
+            ORCHESTRATOR_PROMPT.len()
         );
     }
 

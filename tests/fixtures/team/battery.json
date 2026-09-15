@@ -1,0 +1,95 @@
+[
+  {
+    "objective": "fix a typo in the README",
+    "intent": "other",
+    "complexity": "trivial",
+    "risk": "low",
+    "changed_files": 1,
+    "required_manifest_ids": [],
+    "forbidden_manifest_ids": [
+      "implementer", "reviewer", "tester", "debugger", "planner", "architect",
+      "security-scanner", "data-analyst", "devops-sre", "doc-keeper", "researcher", "explorer"
+    ],
+    "max_team_size": 0
+  },
+  {
+    "objective": "fix the null pointer crash on logout",
+    "intent": "bugfix",
+    "complexity": "bounded",
+    "risk": "low",
+    "changed_files": 2,
+    "required_manifest_ids": ["debugger", "implementer"],
+    "forbidden_manifest_ids": ["reviewer", "tester", "planner", "architect"],
+    "max_team_size": 2
+  },
+  {
+    "objective": "fix the authentication bypass in the login flow",
+    "intent": "bugfix",
+    "complexity": "substantial",
+    "risk": "high",
+    "changed_files": 6,
+    "required_manifest_ids": ["debugger", "implementer", "reviewer", "security-scanner", "tester"],
+    "forbidden_manifest_ids": ["planner", "architect"],
+    "max_team_size": 6
+  },
+  {
+    "objective": "implement CSV export for the billing dashboard report",
+    "intent": "feature",
+    "complexity": "substantial",
+    "risk": "medium",
+    "changed_files": 12,
+    "required_manifest_ids": ["planner", "implementer", "tester"],
+    "forbidden_manifest_ids": ["debugger", "architect"],
+    "max_team_size": 6
+  },
+  {
+    "objective": "redesign the plugin system architecture and migration path",
+    "intent": "feature",
+    "complexity": "architectural",
+    "risk": "medium",
+    "changed_files": 5,
+    "required_manifest_ids": ["architect", "planner", "implementer", "tester"],
+    "forbidden_manifest_ids": ["debugger"],
+    "max_team_size": 6
+  },
+  {
+    "objective": "harden credential storage across the payments service",
+    "intent": "feature",
+    "complexity": "substantial",
+    "risk": "high",
+    "changed_files": 4,
+    "required_manifest_ids": ["implementer", "reviewer", "security-scanner", "tester", "planner"],
+    "forbidden_manifest_ids": ["debugger", "architect"],
+    "max_team_size": 6
+  },
+  {
+    "objective": "analyze the query performance across the reporting dataset",
+    "intent": "other",
+    "complexity": "bounded",
+    "risk": "low",
+    "changed_files": 1,
+    "required_manifest_ids": ["implementer", "data-analyst"],
+    "forbidden_manifest_ids": ["reviewer", "tester", "planner", "architect", "devops-sre", "security-scanner", "doc-keeper"],
+    "max_team_size": 2
+  },
+  {
+    "objective": "fix the CI/CD deployment pipeline for the docker build",
+    "intent": "other",
+    "complexity": "bounded",
+    "risk": "low",
+    "changed_files": 2,
+    "required_manifest_ids": ["implementer", "devops-sre"],
+    "forbidden_manifest_ids": ["reviewer", "tester", "planner", "architect", "debugger", "security-scanner", "data-analyst"],
+    "max_team_size": 2
+  },
+  {
+    "objective": "update the README and changelog for the new command",
+    "intent": "other",
+    "complexity": "bounded",
+    "risk": "low",
+    "changed_files": 2,
+    "required_manifest_ids": ["implementer", "doc-keeper"],
+    "forbidden_manifest_ids": ["reviewer", "tester", "planner", "architect", "debugger", "security-scanner", "data-analyst", "devops-sre"],
+    "max_team_size": 2
+  }
+]

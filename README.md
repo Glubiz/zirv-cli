@@ -40,6 +40,7 @@
   - [Deploy tiers](#deploy-tiers)
   - [Workflow adoption](#workflow-adoption)
   - [Agent registry](#agent-registry)
+  - [Team composition](#team-composition)
   - [Maintain loop](#maintain-loop)
   - [Frontend quality](#frontend-quality)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
@@ -672,6 +673,11 @@ to the section that documents it in depth.
   trust provenance; `dispatch --runtime native` runs a read-only seat on
   zirv's own runtime with no coding harness installed. See [Agent
   registry](#agent-registry).
+- **Team composition** — `team` (`plan`/`show`/`brief`) compiles the
+  smallest capable team for a request from the agent/skill registries,
+  persists it on a workflow, and briefs one compiled seat with only its own
+  manifest instructions and attached skills. See [Team
+  composition](#team-composition).
 - **Review** — `review` (`package`/`run`/`add`/`dispose`/`list`/
   `ingest-pr-comments`) builds compact review packages and persists finding
   dispositions; `run --runtime native` runs the reviewer seat natively.
@@ -1273,6 +1279,9 @@ zirv workflow resume <id>                         # restore as the active workfl
 zirv workflow context [id]                        # the current step's resolved skill context
 zirv workflow artifacts <id> [--json]              # committed work-product state
 zirv workflow agents list|show <id>|dispatch <id> --adapter <name> --prompt <task>
+zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run] [--seat <id>] [--json]
+zirv workflow team show [--workflow <id>|active] [--json]
+zirv workflow team brief <seat-id> [--json]       # Agent-tool-ready brief for one compiled seat
 zirv workflow approve <id>                        # approve the current gated step
 zirv workflow advance <id> --outcome success|failure
 zirv workflow review package <id> | run <id> --agent <name> | add | ...
@@ -1393,15 +1402,82 @@ with no active `zirv workflow`:
 ### Agent registry
 
 Workflow seats are provider-neutral data, not harness-specific plugins: a
-`WorkflowStep.agent` addresses one by id. Built-in seats are `implementer`,
-`reviewer`, `doc-keeper`, `security-scanner`, and `explorer` — `reviewer` is
-pinned read-only by its own adapter. `~/.zirv/agents/*` (operator-global) may
-replace a built-in seat; `.zirv/agents/*` (repository) is disabled unless the
-operator sets `workflow.repo_agents_enabled`, and even then may only add
-non-colliding ids — a repository manifest can never rewrite `reviewer` or grant
-itself capabilities it does not already have. `zirv workflow agents list|show`
-inspects the resolved registry and provenance; `zirv workflow agents dispatch
-<id> --adapter <name> --prompt <task>` launches that seat directly.
+`WorkflowStep.agent` addresses one by id. The prebuilt roster has twelve
+built-in manifests, each mapped to the closed native team role
+(`ctx::team::TeamRole`) whose authority it holds — a manifest's `role` field
+is a display label, never an authorization grant:
+
+| id | team role | write posture | deliverable |
+|---|---|---|---|
+| `implementer` | implementer | writable | bounded implementation unit + evidence |
+| `reviewer` | reviewer | read-only | independent structured findings |
+| `doc-keeper` | implementer | writable | synchronized documentation |
+| `security-scanner` | reviewer | read-only | security/trust-boundary findings |
+| `explorer` | researcher | read-only | bounded investigation findings |
+| `researcher` | researcher | read-only | sourced external/repo research |
+| `planner` | planner | read-only | dependency-ordered task breakdown |
+| `architect` | planner | read-only | ADR-quality decision record |
+| `debugger` | implementer | writable | reproduction test + root-cause note |
+| `tester` | tester | read-only | independent test results + triage |
+| `data-analyst` | researcher | read-only | reproducible data/query analysis |
+| `devops-sre` | implementer | writable | CI/CD, infrastructure, deployment change |
+
+`reviewer`/`security-scanner`/`explorer` are pinned read-only by their own
+adapter. `~/.zirv/agents/*` (operator-global) may replace a built-in seat;
+`.zirv/agents/*` (repository) is disabled unless the operator sets
+`workflow.repo_agents_enabled`, and even then may only add non-colliding ids —
+a repository manifest can never rewrite `reviewer` or grant itself
+capabilities it does not already have. An operator/repository manifest may
+omit `team_role`; it is then derived from `read_only` alone (read-only →
+`researcher`, writable → `implementer`), so a manifest written before this
+field existed keeps loading unchanged. A manifest's `skills` list attaches
+existing `zirv skill` ids to a seat by reference (never by copying instruction
+text); an unknown or version-mismatched reference is refused by
+`AgentRegistry::validate_against`. `zirv workflow agents list|show` inspects
+the resolved registry and provenance; `zirv workflow agents dispatch <id>
+--adapter <name> --prompt <task>` launches that seat directly.
+
+### Team composition
+
+`zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run]
+[--seat <manifest-id>] [--json]` compiles the smallest capable team for a
+request: it classifies the objective exactly like `zirv workflow classify`,
+derives the minimal execution profile (`intent`/`complexity`/`risk` →
+`Direct`/`Bounded`/`Orchestrated`, plus which independent-review/test/security
+gates apply), and deterministically selects seats from the agent roster
+above. Unless `--dry-run`, the compiled `TeamPlan` is stored on the active (or
+`--workflow`-named) workflow; with no active workflow it prints without
+storing and says so. `zirv workflow team show [--workflow <id>|active]
+[--json]` re-prints the stored plan, and `zirv workflow team brief <seat-id>
+[--json]` prints an Agent-tool-ready brief for one compiled seat — the seat
+manifest's own instructions plus the bodies of only the skills that seat's
+manifest references, never the whole skill catalogue. `--seat <manifest-id>`
+bypasses the proportional rules for one explicit seat, but still passes the
+same capability/team-role/route checks a compiled seat does — explicit
+selection never bypasses policy.
+
+**How a team is chosen.** Mechanical/trivial work (`Direct` execution) spawns
+nobody. Bounded work gets one implementer (or the matching domain
+specialist); an independent reviewer joins only when the validation profile
+requires it. A bug fix gets a `debugger` (reproduction test + root-cause
+note) then an `implementer` scoped to that root cause. Substantial features
+add a `planner`; architectural ones also add an `architect`; implementers
+split one per claim-boundary group, capped by the profile's fan-out limit.
+Security/data/docs/dev-ops signals in the request or the diff add the
+matching specialist with a concrete deliverable — never a duplicate of a
+gate already covered (a security signal is satisfied by the same independent
+`security-scanner` gate risk alone would require, not a second seat).
+Independent review/test/security seats never share a writer's claim or
+worktree and depend only on the writers having finished, never on reading
+their transcript. An unknown manifest or a team role with no eligible route
+is never invented into a plan: the seat is omitted with a stated reason, and
+the plan still compiles. Fan-out (`Bounded`: 2, `Orchestrated`: 6) and
+dependency-depth limits are enforced before the plan is returned — a plan
+that would exceed them is refused outright, not silently truncated. The team
+compiler never spawns every role; see
+`docs/design/2026-09-15-native-team-composition.md` for the full rule set and
+what is deferred to #537's full execution profile and chunk C's native
+`/agents`/`/agent`/`/team` slash commands and coordinator enforcement.
 
 ### Maintain loop
 
