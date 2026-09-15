@@ -1063,6 +1063,16 @@ pub struct LaunchRequest {
     /// ever honoured (`coordinator::check`); anyone else's is silently
     /// ignored rather than erroring, since asking is not itself a violation.
     pub plan_override_requested: bool,
+    /// Issue #541 chunk C follow-up: the CALLER's own agent registry (built-
+    /// ins plus, where the caller resolved them, operator-global/repository
+    /// manifests), used ONLY to answer "is `manifest` (or the role's own
+    /// default) a known manifest, and what does it grant". `delegate` itself
+    /// must stay pure -- no filesystem read, no home-directory lookup -- so
+    /// it never builds this registry on its own. `None` falls back to
+    /// `delegate`'s own built-in-only lookup, exactly as before this field
+    /// existed: every caller that does not yet plumb a registry through (and
+    /// every non-`HomeGuard` test) keeps working unchanged.
+    pub manifest_registry: Option<std::sync::Arc<crate::commands::workflow::agents::AgentRegistry>>,
     pub read_only: bool,
     pub budget_tokens: Option<u64>,
     pub max_tool_calls: Option<u32>,
@@ -1291,10 +1301,14 @@ pub fn delegate(
     // Issue #541 chunk C, decision 2: resolve the manifest identity and
     // team-plan facts the pure `coordinator::check` needs, from trusted
     // runtime state -- a registry lookup and a plan read are both I/O, so
-    // they happen HERE, never inside `check` itself. Built-ins only
-    // (`AgentRegistry::load` with no custom/repo layer): an operator/
-    // repository manifest override is a deliberate scope cut for this
-    // check, left to a follow-up (see the design note).
+    // they happen HERE, never inside `check` itself. Chunk C follow-up: the
+    // registry itself is never built here -- when the caller supplied one
+    // (`request.manifest_registry`, resolved with the operator's home
+    // directory and this repository's own layer), an operator-global or
+    // repository manifest is honoured exactly as `team_plan`/the slash
+    // commands already honour it; a caller that has not plumbed one through
+    // falls back to the built-in-only lookup this had before, so `delegate`
+    // still never reads a filesystem or a home directory on its own.
     let team_role_requested = super::team::TeamRole::parse(&request.role);
     let requested_manifest_id: Option<String> = team_role_requested.and_then(|role| {
         request
@@ -1303,9 +1317,17 @@ pub fn delegate(
             .or_else(|| super::team::default_manifest_for_role(role).map(str::to_string))
     });
     let manifest_facts = requested_manifest_id.as_ref().and_then(|id| {
-        let registry =
-            crate::commands::workflow::agents::AgentRegistry::load(repo, None, false, false)
+        let owned_fallback;
+        let registry = match &request.manifest_registry {
+            Some(registry) => registry.as_ref(),
+            None => {
+                owned_fallback = crate::commands::workflow::agents::AgentRegistry::load(
+                    repo, None, false, false,
+                )
                 .ok()?;
+                &owned_fallback
+            }
+        };
         let agent = registry.get(id).ok()?;
         Some(super::coordinator::ManifestFacts {
             team_role: crate::commands::workflow::agents::team_role_for(&agent.manifest),
@@ -2331,6 +2353,7 @@ mod tests {
             workdir: None,
             manifest: None,
             plan_override_requested: false,
+            manifest_registry: None,
             read_only,
             budget_tokens: None,
             max_tool_calls: None,
@@ -2353,6 +2376,83 @@ mod tests {
             generation: None,
             generation_locked: false,
         }
+    }
+
+    /// Issue #541 chunk C follow-up: `delegate` itself never reads a
+    /// filesystem or a home directory, but when the CALLER resolves an
+    /// operator-global (or repository) manifest and hands the registry in
+    /// through `LaunchRequest.manifest_registry`, that manifest is admitted
+    /// exactly like a built-in one -- the gap that made a real coordinator
+    /// unable to delegate with anything but the twelve built-ins.
+    #[test]
+    fn a_delegation_with_an_operator_manifest_is_admitted_when_the_caller_resolves_it() {
+        let (_dir, state, repo, cfg) = fixture();
+        let home = tempfile::tempdir().expect("home");
+        let global = home.path().join(".zirv").join("agents");
+        std::fs::create_dir_all(&global).expect("agents dir");
+        std::fs::write(
+            global.join("custom-implementer.yaml"),
+            "schema_version: 1\nid: custom-implementer\nversion: 1\nname: Custom\n\
+             description: operator custom implementer\nrole: custom\nmodel_tier: standard\n\
+             read_only: false\nrequired_capabilities: [repo.read, repo.write]\n\
+             context_budget_bytes: 64\ninstructions: implement only the assigned scope\n\
+             team_role: implementer\n",
+        )
+        .expect("write manifest");
+        let registry = crate::commands::workflow::agents::AgentRegistry::load(
+            &repo,
+            Some(home.path()),
+            true,
+            false,
+        )
+        .expect("registry");
+
+        let mut request = launch_request(super::super::team::IMPLEMENTER, false);
+        request.manifest = Some("custom-implementer".to_string());
+        request.manifest_registry = Some(std::sync::Arc::new(registry));
+
+        let mut launcher = RecordingLauncher::default();
+        let (record, _publication) = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &request,
+            &coordinator_parent(),
+            10,
+        )
+        .expect("an operator manifest the caller resolved is admitted");
+        assert_eq!(
+            record.handle.manifest.as_deref(),
+            Some("custom-implementer")
+        );
+    }
+
+    /// The other direction: a caller that resolves NOTHING (`manifest_
+    /// registry: None`, the same as every pre-existing caller) still gets
+    /// the built-in-only refusal for an id that is not a built-in either --
+    /// the fallback is a narrower lookup, never a bypass of the check
+    /// itself.
+    #[test]
+    fn an_unknown_manifest_is_still_refused_when_the_caller_resolves_nothing() {
+        let (_dir, state, repo, cfg) = fixture();
+        let mut request = launch_request(super::super::team::IMPLEMENTER, false);
+        request.manifest = Some("does-not-exist".to_string());
+        request.manifest_registry = None;
+
+        let mut launcher = RecordingLauncher::default();
+        let error = delegate(
+            &state,
+            &repo,
+            &cfg,
+            &mut launcher,
+            &request,
+            &coordinator_parent(),
+            10,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown manifest"), "{error}");
+        assert!(launcher.launches.lock().expect("lock").is_empty());
     }
 
     /// Issue #485 item 3: a delegation that cannot be admitted leaves NO

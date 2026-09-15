@@ -208,8 +208,16 @@ stay under their existing 3,600-byte ship cap.
    workable roles; `None` for `Coordinator`/`SubOrchestrator`, which have no
    single natural built-in manifest and so skip the check entirely, same as
    any role outside the closed team). Manifest facts are resolved against
-   BUILT-IN manifests only (`AgentRegistry::load(repo, None, false, false)`)
-   -- a deliberate scope cut, see Deferred. A delegation names its plan seat
+   whichever registry the CALLER supplies through the new `LaunchRequest.
+   manifest_registry: Option<Arc<AgentRegistry>>` -- built-in-only when a
+   caller passes `None` (every pre-existing caller, and every non-`HomeGuard`
+   test), the operator's real registry (built-ins plus operator-global/
+   repository manifests) for the one production caller, the native
+   `delegate` tool, which resolves it through `AgentRegistry::load_for_repo`
+   with the real home directory before calling `delegate()` -- so `delegate`
+   itself still never touches a filesystem or a home directory (see the
+   "Follow-up" section below; this closed a real gap the issue's own
+   acceptance criteria required). A delegation names its plan seat
    by passing that seat's id as `task` (the SAME field `Coordinator::
    dispatched` already keys its graph node by), so "seat filled" is exactly
    `Coordinator::seat_filled(seat_id)` -- `Delegated` or `Completed` is
@@ -293,6 +301,29 @@ stay under their existing 3,600-byte ship cap.
   `workflow::team::tests::
   a_real_changed_path_list_splits_implementers_by_top_level_boundary`.
 
+### Follow-up: operator/repository manifest identity in delegation (closed)
+
+Chunk C's own first cut resolved manifest facts inside `delegate()` against
+BUILT-IN manifests only, to avoid a real, un-isolated home-directory read
+on every delegation -- a real gap: a coordinator delegating with an
+operator-global or repository manifest got refused as `unknown manifest`,
+even though `team_plan` and the `/agents`/`/agent`/`/team` slash commands
+already honoured those manifests. Closed the same day by threading the
+registry in from the CALLER instead of building it inside `delegate()`:
+`LaunchRequest` gained `manifest_registry: Option<Arc<AgentRegistry>>`;
+`delegate()` uses it when present and falls back to its own built-in-only
+lookup exactly as before when it is `None` -- so `delegate` itself still
+never touches a filesystem or a home directory, and every pre-existing
+caller (and every non-`HomeGuard` test) is unchanged. The one production
+caller, the native `delegate` tool (`runtime::tools::mod::NativeToolClient::
+delegate`), now resolves through `AgentRegistry::load_for_repo` with the
+operator's real home directory -- the same resolution `team_plan`/the slash
+commands already use -- via a new `manifest_registry()` helper, and passes
+it through. Tests: `delegation::tests::
+a_delegation_with_an_operator_manifest_is_admitted_when_the_caller_resolves_
+it`, `delegation::tests::
+an_unknown_manifest_is_still_refused_when_the_caller_resolves_nothing`.
+
 ### Deferred
 
 - **Literal `task::claim_locked`/worktree wiring from a compiled seat.** A
@@ -304,18 +335,6 @@ stay under their existing 3,600-byte ship cap.
   A follow-up that has the coordinator (or a new helper) walk a stored
   plan's seats and mint their cards/worktrees automatically would close
   this the rest of the way.
-- **Operator/repository manifest identity in the delegation bounds check.**
-  `delegate()`'s manifest-facts resolution reads BUILT-IN manifests only, to
-  avoid a real, un-isolated home-directory read on every delegation (the
-  registry loader's operator-global layer reads `dirs::home_dir()`, which a
-  unit test cannot safely point at a fixture without env-var isolation the
-  existing delegation test suite does not carry). The native `team_plan`
-  tool and the `/agents`/`/agent`/`/team` slash commands DO honor operator/
-  repository manifests (same resolution `zirv workflow team plan` uses);
-  only the per-delegation bounds check in `coordinator::check`'s caller is
-  narrowed. Widening it needs either a registry passed through the seat's
-  own resolved config (avoiding a fresh disk read per delegation) or a
-  `HomeGuard`-equivalent seam `delegate()`'s own test fixtures adopt.
 - A bounded model tie-break for the team compiler (still unneeded: every
   rule resolves without ambiguity).
 - #537's full execution profile, #539's portable skill bundles, and

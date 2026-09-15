@@ -2245,6 +2245,25 @@ impl NativeToolClient {
         crate::commands::ctx::provider::config::NativeConfig::load(&home, &self.repo).ok()?
     }
 
+    /// Issue #541 chunk C follow-up: the registry `delegation::delegate`
+    /// checks a requested manifest against, resolved HERE -- where the repo
+    /// and the operator's home directory are already known -- rather than
+    /// inside `delegate` itself, which must stay pure. Matches `zirv
+    /// workflow team plan`'s own resolution (and the native `team_plan`
+    /// tool's), so an operator-global or repository manifest a coordinator
+    /// delegates with is admitted exactly like `team_plan`/the slash
+    /// commands already admit it. `None` on a registry load failure --
+    /// `delegate` falls back to its own built-in-only lookup rather than
+    /// failing the whole delegation over an unrelated load error.
+    fn manifest_registry(&self) -> Option<crate::commands::workflow::agents::AgentRegistry> {
+        crate::commands::workflow::agents::AgentRegistry::load_for_repo(
+            &self.repo,
+            dirs::home_dir().as_deref(),
+            true,
+        )
+        .ok()
+    }
+
     fn delegate(&mut self, args: DelegateArgs) -> Result<Value, ToolError> {
         use crate::commands::ctx::delegation as service;
         use crate::commands::ctx::team;
@@ -2289,6 +2308,7 @@ impl NativeToolClient {
             workdir,
             manifest: args.manifest.clone(),
             plan_override_requested: args.override_,
+            manifest_registry: self.manifest_registry().map(std::sync::Arc::new),
             read_only: args.mode == delegation::ToolMode::ReadOnly,
             budget_tokens: args.budget_tokens,
             max_tool_calls: args.max_tool_calls,
