@@ -418,6 +418,24 @@ fn run_native_chat<E: Write>(
     if env(NATIVE_ALIAS_ENV).as_deref() == Some("true") {
         writeln!(stderr, "{NATIVE_ALIAS_BANNER}")?;
     }
+    // Review finding (issue #540): the read above is the ONE consumer of
+    // this signal -- clear it from the real process environment immediately
+    // afterward, whether or not it was set, so it never outlives that one
+    // read. Left set, every child this session spawns onward (`wrap.rs`'s
+    // harness PTY, `dash/pane.rs`'s worker panes) would inherit it too,
+    // since neither clears the environment before spawning; harmless today
+    // (nothing else reads this key), but a latent trap for a future reader
+    // who adds one.
+    //
+    // SAFETY: this still runs before `dash::run_dashboard`/`wrap::run_with`
+    // below have spawned anything or handed control to another thread --
+    // `main.rs`'s own `set_var` call (this key's only writer) already
+    // documents why the environment is not read or written concurrently
+    // this early in the process, and nothing between that call and this one
+    // has changed that.
+    unsafe {
+        std::env::remove_var(NATIVE_ALIAS_ENV);
+    }
     // Issue #531 review: this used to reimplement the harness/native decision
     // inline. Routing through `runtime::selected()` makes it the one place a
     // `--runtime` flag is turned into a decision, and reusing its own error
@@ -2286,6 +2304,65 @@ mod tests {
             "an explicit `--runtime native` (no alias env) must never print the alias banner: \
              {msg}"
         );
+    }
+
+    /// Review finding (issue #540): `NATIVE_ALIAS_ENV` is main.rs's own
+    /// internal signal, meant to be read exactly once. Left set, every child
+    /// process this session later spawns (`wrap.rs`'s harness PTY,
+    /// `dash/pane.rs`'s worker panes) would inherit it, since neither
+    /// clears the environment before spawning. This proves `run_native_chat`
+    /// clears the REAL process environment (not just its own local `env`
+    /// closure argument) immediately after its one read, so a "nested" read
+    /// afterward -- standing in for such a child reading its own inherited
+    /// environment -- sees it unset.
+    #[test]
+    fn native_alias_env_is_cleared_from_the_real_process_environment_after_one_read() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let cfg = CtxConfig::default();
+        // SAFETY: nextest isolates each test in its own process (this
+        // repo's own convention, documented in CLAUDE.md), so no other test
+        // can be reading or writing this key concurrently.
+        unsafe {
+            std::env::set_var(NATIVE_ALIAS_ENV, "true");
+        }
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("native".to_string()),
+            extra: Vec::new(),
+        };
+        let real_env = env_from_process();
+        let mut err_out = Vec::new();
+        let _ = run_native_chat(
+            "native",
+            &cfg,
+            repo.path(),
+            &real_env,
+            &mut err_out,
+            &args,
+            false,
+            false,
+            false,
+        );
+        // The one read happened -- the banner proves it.
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(msg.contains(NATIVE_ALIAS_BANNER), "got: {msg}");
+        // A nested read afterward, through the identical closure, must see
+        // it unset -- proving the real process environment was cleared, not
+        // just some local copy.
+        assert_eq!(
+            real_env(NATIVE_ALIAS_ENV),
+            None,
+            "NATIVE_ALIAS_ENV must be cleared from the real process environment \
+             immediately after run_native_chat's one read"
+        );
+        assert!(std::env::var(NATIVE_ALIAS_ENV).is_err());
     }
 
     /// `zirv native --help`'s prose (`main.rs` prints `native_help_text()`
