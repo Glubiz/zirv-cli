@@ -181,6 +181,48 @@ fn rewrite_ctx_alias_args(verb: &str, argv: &[String]) -> Vec<String> {
     args
 }
 
+/// Issue #540: `zirv native` is a thin, case-insensitive top-level alias for
+/// `zirv chat --runtime native`, matched against raw argv exactly like
+/// `top_level_ctx_alias` above so it runs before clap ever sees `Input`.
+/// Reserved case-insensitively in `utils::RESERVED_COMMANDS` too, so a
+/// same-named script or shortcut can never shadow it.
+fn is_top_level_native_alias(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|s| s.eq_ignore_ascii_case("native"))
+}
+
+/// True for exactly `zirv native --help`/`zirv native -h` (case-insensitive
+/// on `native`, matching `is_top_level_native_alias`; the flag itself is not
+/// case-folded, the same convention `is_top_level_help` already uses for
+/// `--help`/`-h`). Intercepted before the ordinary argv rewrite below so
+/// `zirv native --help` prints its own experimental-labelled prose
+/// (`ctx::chat::native_help_text`) rather than clap's generated help for the
+/// ordinary `chat` verb tree, which says nothing about any of this.
+fn is_top_level_native_help(argv: &[String]) -> bool {
+    is_top_level_native_alias(argv)
+        && argv.len() == 3
+        && matches!(argv[2].as_str(), "--help" | "-h")
+}
+
+/// Rewrites `zirv native [args...]` into the `ctx chat --runtime native
+/// [args...]` shape `ctx::dispatch` expects -- the same `args[0] == "ctx"`
+/// convention `rewrite_ctx_alias_args` uses -- so `chat.rs`'s own
+/// `run_with`/`run_native_chat` is the ONE code path that owns validation,
+/// nesting, TTY, journal and pane startup for both spellings. Every argument
+/// after `native` forwards unchanged, so a native-compatible `zirv chat`
+/// option (and the existing native validator's exact refusal for a
+/// wrapped-only one) behaves identically either way.
+fn rewrite_native_alias_args(argv: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "ctx".to_string(),
+        "chat".to_string(),
+        "--runtime".to_string(),
+        "native".to_string(),
+    ];
+    args.extend(argv.iter().skip(2).cloned());
+    args
+}
+
 /// What a bare `zirv` invocation (no arguments at all) does: open an
 /// interactive chat when this looks like a zirv-managed repo and *both*
 /// stdin and stdout are a real terminal, or fall back to the ordinary help
@@ -366,6 +408,39 @@ async fn main() {
             );
         }
         std::process::exit(ctx::dispatch(&rewrite_ctx_alias_args(verb, &argv)));
+    }
+
+    if is_top_level_native_alias(&argv) {
+        if is_top_level_native_help(&argv) {
+            print!("{}", ctx::chat::native_help_text());
+            return;
+        }
+        // Issue #540: deliberately NO `maybe_run_first_run_wizard` call here
+        // (unlike the `chat` alias above) -- native prerequisites are
+        // diagnosed by `zirv ctx doctor`, never the wrapped-harness first-run
+        // wizard, and this alias must not silently select a legacy runtime
+        // either, so nothing here decides one: the rewritten argv always
+        // names `--runtime native` explicitly.
+        //
+        // `NATIVE_ALIAS_ENV` is set on the process environment rather than
+        // threaded through the rewritten argv (which would need a new hidden
+        // flag on `ChatArgs`, visible to `zirv chat`'s own `--help` and
+        // `zirv commands --json`): `run_native_chat` reads it back through
+        // the same `EnvLookup` closure every other environment signal in
+        // that function already goes through, so it can print the one-time
+        // experimental banner only for this alias spelling, never for an
+        // explicit `zirv chat --runtime native`, even though both launch
+        // through the exact same function.
+        //
+        // SAFETY: this runs at the very top of `main`, before any other
+        // thread in this process has been created or could be reading the
+        // environment concurrently -- `#[tokio::main]`'s runtime worker
+        // threads exist but are idle until `ctx::dispatch` below actually
+        // schedules work onto them.
+        unsafe {
+            std::env::set_var(ctx::chat::NATIVE_ALIAS_ENV, "true");
+        }
+        std::process::exit(ctx::dispatch(&rewrite_native_alias_args(&argv)));
     }
 
     if argv.len() == 1 {
@@ -573,6 +648,120 @@ mod tests {
             "zirv", "REPORT", "feature", "title"
         ])));
         assert!(!is_top_level_report(&argv(&["zirv", "reports"])));
+    }
+
+    /// Issue #540: `zirv native` (any casing) is intercepted as a top-level
+    /// alias before clap ever runs, exactly like `chat`/`agent` above, and is
+    /// reserved so a same-named script/shortcut can never shadow it.
+    #[test]
+    fn native_is_intercepted_case_insensitively_and_reserved() {
+        assert!(is_top_level_native_alias(&argv(&["zirv", "native"])));
+        assert!(is_top_level_native_alias(&argv(&["zirv", "Native"])));
+        assert!(is_top_level_native_alias(&argv(&[
+            "zirv", "NATIVE", "--foo"
+        ])));
+        assert!(!is_top_level_native_alias(&argv(&["zirv", "natives"])));
+        assert!(!is_top_level_native_alias(&argv(&["zirv"])));
+        assert!(utils::is_reserved_command("native"));
+        assert!(utils::is_reserved_command("Native"));
+    }
+
+    /// The argv rewrite forwards every trailing argument byte-for-byte after
+    /// splicing in `--runtime native`, so a native-compatible `zirv chat`
+    /// option (or the existing native validator's exact refusal for a
+    /// wrapped-only one) reaches `chat.rs` exactly as it would for `zirv chat
+    /// --runtime native` directly.
+    #[test]
+    fn native_alias_rewrites_argv_to_chat_runtime_native() {
+        assert_eq!(
+            rewrite_native_alias_args(&argv(&["zirv", "native"])),
+            vec![
+                "ctx".to_string(),
+                "chat".to_string(),
+                "--runtime".to_string(),
+                "native".to_string(),
+            ]
+        );
+        assert_eq!(
+            rewrite_native_alias_args(&argv(&["zirv", "native", "--foo"])),
+            vec![
+                "ctx".to_string(),
+                "chat".to_string(),
+                "--runtime".to_string(),
+                "native".to_string(),
+                "--foo".to_string(),
+            ]
+        );
+        // Case-insensitive: the rewrite itself does not re-check argv[1]'s
+        // casing (its caller, `is_top_level_native_alias`, already did), so
+        // a mis-cased `NATIVE` still rewrites to the canonical lowercase
+        // `--runtime native` value, the same way `rewrite_ctx_alias_args`
+        // never re-derives the alias's own name from argv either.
+        assert_eq!(
+            rewrite_native_alias_args(&argv(&["zirv", "NATIVE", "--force-pace"])),
+            vec![
+                "ctx".to_string(),
+                "chat".to_string(),
+                "--runtime".to_string(),
+                "native".to_string(),
+                "--force-pace".to_string(),
+            ]
+        );
+    }
+
+    /// `zirv native --help`/`-h` is detected only for exactly that shape --
+    /// a bare `zirv native`, or `--help` anywhere but immediately after
+    /// `native`, falls through to the ordinary argv rewrite (and therefore
+    /// to `chat.rs`'s own clap-driven parsing) instead.
+    #[test]
+    fn native_help_is_detected_only_for_the_exact_help_flag_shape() {
+        assert!(is_top_level_native_help(&argv(&[
+            "zirv", "native", "--help"
+        ])));
+        assert!(is_top_level_native_help(&argv(&["zirv", "native", "-h"])));
+        assert!(is_top_level_native_help(&argv(&[
+            "zirv", "NATIVE", "--help"
+        ])));
+        assert!(!is_top_level_native_help(&argv(&["zirv", "native"])));
+        assert!(!is_top_level_native_help(&argv(&[
+            "zirv", "native", "--foo"
+        ])));
+        assert!(!is_top_level_native_help(&argv(&[
+            "zirv", "native", "--foo", "--help"
+        ])));
+    }
+
+    /// Exercised through the real built binary (the same pattern
+    /// `memory_is_intercepted_before_script_lookup` below uses): the
+    /// interception happens on raw argv before `Input::parse()`, which a
+    /// purely in-process call to `main`'s own helpers cannot prove end to
+    /// end, including the process exit code.
+    #[test]
+    fn native_help_exits_0_and_prints_the_experimental_notice() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let bin = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("target/debug")
+            .join("zirv");
+
+        let out = std::process::Command::new(&bin)
+            .args(["native", "--help"])
+            .output()
+            .expect("run zirv");
+
+        assert!(
+            out.status.success(),
+            "exit code: {:?}, stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("EXPERIMENTAL / WORK IN PROGRESS"),
+            "got: {text}"
+        );
+        assert!(text.contains("zirv chat --runtime native"), "got: {text}");
     }
 
     #[test]

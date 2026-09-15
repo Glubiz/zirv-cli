@@ -130,6 +130,7 @@ criterion).
 | `memory rollback` | shared |  |
 | `memory status` | shared |  |
 | `memory verify` | shared |  |
+| `native` | N11 (#480) | issue #540: thin top-level alias for `chat --runtime native` (`main.rs` rewrites argv to `ctx chat --runtime native`); no duplicate native launch logic, so it carries `ctx chat`'s own owner |
 | `report` | shared |  |
 | `report bug` | shared |  |
 | `report feature` | shared |  |

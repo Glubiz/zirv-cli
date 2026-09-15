@@ -160,6 +160,7 @@ means it runs on any supported OS with no provider configured at all.
 | `memory rollback` | `ctx::memory` | same zirv code | none | `memory::tests::rollback_of_an_overwrite_restores_the_prior_body` | `unit` |
 | `memory status` | `ctx::memory_cli` | same zirv code | none | `memory_cli::tests::status_counts_entries_and_bytes_per_scope_without_printing_bodies` | `unit` |
 | `memory verify` | `ctx::memory_cli` | same zirv code | none | `memory_cli::tests::verify_reports_an_error_and_nonzero_when_the_key_is_absent` | `unit` |
+| `native` | rewrites to `chat`'s own native path (`main.rs`'s `rewrite_native_alias_args` -> `--runtime native`, reaching `native::spawn_interactive`) | none -- the alias always forces `--runtime native`, so the wrapped-harness launch path is unreachable through it | same as `chat`: a real terminal; a route for the `orchestrator` role | `chat::tests::native_alias_env_prints_the_banner_once`, `command_schema::tests::native_carries_experimental_stability_and_native_runtime` | `unit` |
 | `report` | `commands::report` | same zirv code | none | `report::tests::body_sources_are_mutually_exclusive` | `unit` |
 | `report bug` | `commands::report` | same zirv code | none | `report::tests::bug_report_appends_environment_and_uses_bug_label` | `unit` |
 | `report feature` | `commands::report` | same zirv code | none | `report::tests::feature_report_reads_body_file_and_uses_enhancement_label` | `unit` |
