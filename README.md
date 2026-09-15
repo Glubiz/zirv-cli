@@ -2150,6 +2150,33 @@ implementation and the test that pins it — is
 behind this step are in
 [`docs/design/2026-09-13-native-workflows.md`](docs/design/2026-09-13-native-workflows.md).
 
+#### Instructions in native sessions
+
+A native session's instruction layer (`SourceKind::NativeInstructions`, data,
+never a provider instruction message) is built the same [`ZIRV.md`
+precedence](#zirvmd-instruction-files) the wrapped harness reports, in a fixed
+order: operator-global `~/.zirv/ZIRV.md` first, then the unchanged repo
+`.zirv/system-prompt.md` layer, then the resolved `ZIRV.md`/`AGENTS.md`/
+`CLAUDE.md`/`AGENT.md` winners for the repo root and the active scope's
+ancestor directory chain. **Scope rule**: only the repo root plus directories
+that contain a path this session has actually touched (a tool call's
+read/write/edit target) load their nested instruction files — a large
+monorepo's unrelated crates are never pulled in. A shadowed, duplicate or
+excluded chunk A decision still gets a provenance entry (`Excluded`, naming
+the exact reason) rather than vanishing, and the whole layer is capped by
+`context.instructions_max_bytes` (default 32 KiB) on top of the existing
+per-file cap. **Recompile on change**: at the start of a turn, the resolved
+instruction file list (paths and content hashes) is recomputed for the
+session's touched-path scope; when it differs from what shaped the current
+system/preamble — a new nested file entered scope, a file changed on disk, a
+file was removed — the whole standing context recompiles and replaces it
+before that turn is sent, without restarting the session. Recompiling only
+ever touches the instruction layer: tools, policy, permissions and the route
+are untouched. Every compile/recompile is journaled
+(`context_version` = the compiled context's stable-prefix hash, plus the
+per-source path/scope/trust/decision), and the native `/context` (alias
+`/instructions`) pane command surfaces the same facts live.
+
 ### Native teams and the coordinating seat
 
 Zirv can run the coordinator itself. A native session seated as
@@ -2784,6 +2811,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
 | `context.max_harness_roster_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES` |
+| `context.instructions_max_bytes` | `ZIRV_CTX_CONTEXT_INSTRUCTIONS_MAX_BYTES` |
 | `context.lint_max_pairs` | `ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS` |
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
