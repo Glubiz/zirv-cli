@@ -1,0 +1,36 @@
+# Issue #542 review finding 4: a repository-layer pack fixture used to prove
+# a running instance keeps its PINNED inline copy of this definition even
+# after the on-disk file (this exact file, rewritten by the test at a
+# temp-repo copy) is edited out from under it -- see
+# `registry::tests::a_pinned_repository_definition_survives_registry_drift_inline`
+# in src/commands/workflow/registry.rs.
+schema_version = 1
+id = "drift-fixture"
+version = 1
+title = "Drift fixture"
+description = "A minimal two-step repository pack used to prove a pinned inline definition survives registry drift."
+domains = ["testing"]
+triggers = ["run the drift fixture"]
+effects = "repository"
+
+[[steps]]
+id = "first"
+title = "First"
+phase = "intent"
+skills = ["write-intent"]
+condition = "always"
+
+[[steps]]
+id = "second"
+title = "Second"
+phase = "implement"
+skills = ["implement"]
+depends_on = ["first"]
+condition = "always"
+effect = "repository"
+
+[failure]
+escalate_to = "human"
+
+[completion]
+present_as = "summary"

@@ -10,6 +10,8 @@
 //! `domains`/`triggers` vocabulary -- see the design note for the exact
 //! reasoning and what would justify revisiting it.
 
+use std::collections::BTreeSet;
+
 use super::classify::{Classification, WorkDomain};
 use super::definition::EffectClass;
 use super::engine::WorkflowKind;
@@ -29,7 +31,7 @@ const WORK_DOMAIN_ALIGNMENT_SCORE: u32 = 1;
 /// answer when nothing else clears the floor.
 pub const ADAPTIVE_WORK_ID: &str = "adaptive-work";
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Selection {
     pub definition_id: String,
     /// A simple, deterministic 0.0-1.0 readout of the winning score --
@@ -44,6 +46,17 @@ pub struct Selection {
     /// surfaces) can show what else was considered without re-running
     /// selection itself.
     pub alternatives: Vec<(String, u32)>,
+}
+
+/// Issue #542 review finding 16: `objective_lower` split into whole word
+/// tokens (any non-alphanumeric byte is a separator), so a domain tag only
+/// matches a WHOLE word in the objective text -- plain substring containment
+/// let short tags false-positive inside unrelated words ("data" inside
+/// "database", "pm" inside "shipment").
+fn word_tokens(text: &str) -> BTreeSet<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 fn work_domain_tag(domain: WorkDomain) -> &'static str {
@@ -78,9 +91,10 @@ fn score_pack(
         ));
     }
 
+    let objective_words = word_tokens(objective_lower);
     let mut domain_hits = 0u32;
     for domain in domains {
-        if !domain.trim().is_empty() && objective_lower.contains(domain.as_str()) {
+        if !domain.trim().is_empty() && objective_words.contains(domain.as_str()) {
             domain_hits += 1;
         }
     }
@@ -256,6 +270,19 @@ mod tests {
         assert!(!first.reasons.is_empty(), "a selection must explain itself");
     }
 
+    /// Issue #542 review finding 16: a domain tag must only match a WHOLE
+    /// word in the objective text, never a substring inside an unrelated
+    /// word. "database" contains "data" and "shipment" contains "pm", but
+    /// neither objective actually mentions either pack's domain.
+    #[test]
+    fn a_domain_tag_only_matches_a_whole_word_not_a_substring() {
+        assert_eq!(score_pack(&["data".into()], &[], &classification(Intent::Other), "investigate the database schema").0, 0);
+        assert_eq!(score_pack(&["pm".into()], &[], &classification(Intent::Other), "track the shipment status").0, 0);
+        // The genuine whole-word case still scores.
+        assert!(score_pack(&["data".into()], &[], &classification(Intent::Other), "look at the data quality").0 > 0);
+        assert!(score_pack(&["pm".into()], &[], &classification(Intent::Other), "update the pm backlog").0 > 0);
+    }
+
     #[test]
     fn an_unmatched_task_falls_back_to_adaptive_work() {
         let registry = registry();
@@ -415,12 +442,21 @@ present_as = "summary"
         }
     }
 
-    /// Issue #542 chunk 4: a pack whose real completion would need a
+    /// Issue #542 chunk 4, renamed per review finding 18: this checks the
+    /// DEFINITION only (`step.approval`/`step.reason` as authored) -- it
+    /// does not drive the engine through the gate. The engine-level proof
+    /// that this gate actually blocks a real run lives with each pack's own
+    /// end-to-end fixture in `engine.rs` (for these two:
+    /// `pm_status_report_end_to_end_walks_to_completion_with_its_artifact`
+    /// and `sre_incident_triage_end_to_end_stays_read_only_until_the_
+    /// mitigation_gate`, which starts the pack and walks it to completion,
+    /// necessarily passing through -- and being blocked by, until approved
+    /// -- this same gate). A pack whose real completion would need a
     /// Linear/Kibana/cloud tool (#539, not yet available) must declare that
     /// gap in the relevant step's own `reason` and gate explicitly there,
     /// rather than silently proceeding as if it had live data.
     #[test]
-    fn a_pack_needing_a_missing_integration_stops_at_an_explicit_gate() {
+    fn a_pack_needing_a_missing_integration_gates_in_its_own_definition() {
         for (pack_id, step_id) in [
             ("pm-status-report", "source-collection"),
             ("sre-incident-triage", "diagnosis"),
