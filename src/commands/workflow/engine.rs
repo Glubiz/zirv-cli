@@ -836,7 +836,11 @@ fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>) {
     }
     for step in steps {
         if step.phase == WorkflowPhase::Deploy {
-            step.approval = tier >= DeployTier::Staging;
+            // Issue #542 review finding 7: this must only ever WIDEN the
+            // gate, never clear one the pack itself authored -- a lower
+            // deploy tier is not license to silently drop an approval a
+            // pack's own Deploy-phase step declared unconditionally.
+            step.approval = step.approval || tier >= DeployTier::Staging;
         }
     }
 }
@@ -4770,6 +4774,39 @@ mod tests {
         assert!(review < verify && verify < deploy);
         assert!(production[review].agent.as_deref() == Some("reviewer"));
         assert!(production[deploy].approval);
+    }
+
+    /// Issue #542 review finding 7: `apply_deploy_tier` must only ever WIDEN
+    /// a Deploy-phase step's `approval`, never clear one the pack itself
+    /// authored. `devops-ci-cd-change`'s `deploy` step declares `approval =
+    /// true` unconditionally ("a pipeline change reaching production
+    /// infrastructure is always an explicit approval, regardless of the
+    /// operator's default deploy tier") -- at `DeployTier::Development`, the
+    /// tier-derived condition (`tier >= DeployTier::Staging`) alone would be
+    /// `false`, so the old `step.approval = tier >= DeployTier::Staging`
+    /// unconditional assignment silently dropped the pack-authored gate.
+    #[test]
+    fn a_pack_authored_approval_gate_survives_a_lower_deploy_tier() {
+        let classification = low_classification();
+        let definition =
+            crate::commands::workflow::registry::builtin_definition("devops-ci-cd-change")
+                .expect("devops-ci-cd-change pack");
+
+        let development = materialize_from_definition(
+            &definition,
+            &classification,
+            WorkflowProfile::Standard,
+            DeployTier::Development,
+            true,
+        );
+        let deploy = development
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Deploy)
+            .expect("deploy step present");
+        assert!(
+            deploy.approval,
+            "a pack-authored Deploy-phase approval gate must survive a lower deploy tier"
+        );
     }
 
     fn at_phase(mut state: WorkflowState, phase: WorkflowPhase) -> WorkflowState {
