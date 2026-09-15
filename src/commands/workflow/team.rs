@@ -250,16 +250,56 @@ fn try_add(
     }
 }
 
-/// One implementer seat per claim boundary, capped by `max_fan_out`.
-///
-/// The compiler only has [`Classification::changed_files`] (a count) to
-/// work with -- [`Classification`] does not retain the actual changed-path
-/// list a real per-path claim split would need. This buckets by count
-/// instead (four files per claim group) as the pragmatic stand-in; see the
-/// design note's "deferred" section.
+/// One implementer seat per claim boundary, capped by `max_fan_out`. The
+/// FALLBACK count when [`Classification::changed_paths`] is empty (older
+/// durable state, or a classification measured with no path list at all):
+/// four files per claim group, as an approximation of a real path split.
 fn implementer_seat_count(classification: &Classification, max_fan_out: usize) -> usize {
     let files = classification.changed_files.max(1);
     files.div_ceil(4).clamp(1, max_fan_out.max(1))
+}
+
+/// Groups `paths` into claim boundaries by TOP-LEVEL path component
+/// (`src/foo/x.rs` and `src/foo/y.rs` share a claim group; `docs/x.md` gets
+/// its own), merging the smallest groups together until the result is no
+/// more than `max_fan_out` groups -- a repository with many top-level
+/// directories still gets a BOUNDED number of implementer seats rather than
+/// one per directory. Empty in, empty out: an empty `paths` means "no real
+/// path list to split by", which [`claim_groups_for`] falls back from to
+/// the count-based bucket.
+fn claim_groups_from_paths(paths: &[String], max_fan_out: usize) -> Vec<Vec<String>> {
+    if paths.is_empty() || max_fan_out == 0 {
+        return Vec::new();
+    }
+    let mut by_root: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in paths {
+        let root = path.split('/').next().unwrap_or(path.as_str()).to_string();
+        by_root.entry(root).or_default().push(path.clone());
+    }
+    let mut groups: Vec<Vec<String>> = by_root.into_values().collect();
+    groups.sort_by_key(|group| group.len());
+    while groups.len() > max_fan_out {
+        let smallest = groups.remove(0);
+        let mut into = groups.remove(0);
+        into.extend(smallest);
+        groups.push(into);
+        groups.sort_by_key(|group| group.len());
+    }
+    groups
+}
+
+/// The claim groups this Orchestrated implementer split actually uses: real
+/// path-boundary groups from [`Classification::changed_paths`] when the
+/// classification carries them, else the count-based bucket
+/// [`implementer_seat_count`] always could (issue #541 chunk C, decision 3
+/// -- resolves chunk B's "deferred: real per-path claim splitting").
+fn claim_groups_for(classification: &Classification, max_fan_out: usize) -> Vec<Vec<String>> {
+    let real = claim_groups_from_paths(&classification.changed_paths, max_fan_out);
+    if !real.is_empty() {
+        return real;
+    }
+    let count = implementer_seat_count(classification, max_fan_out);
+    (1..=count).map(|n| vec![format!("group-{n}")]).collect()
 }
 
 /// Dependency-respecting parallel groups: seats with no unresolved
@@ -454,8 +494,10 @@ pub fn compile(
                             ),
                         );
                     }
-                    let implementer_count = implementer_seat_count(classification, max_fan_out);
-                    for n in 1..=implementer_count {
+                    let claim_groups = claim_groups_for(classification, max_fan_out);
+                    let implementer_count = claim_groups.len();
+                    for (idx, group_paths) in claim_groups.into_iter().enumerate() {
+                        let n = idx + 1;
                         let id = format!("implementer-{n}");
                         let seat_id = try_add(
                             &mut seats,
@@ -475,7 +517,7 @@ pub fn compile(
                                     ),
                                     depends_on: Vec::new(),
                                     claim: Claim {
-                                        paths: vec![format!("group-{n}")],
+                                        paths: group_paths,
                                         worktree: implementer_count > 1,
                                     },
                                     consumer: "coordinator".to_string(),
@@ -713,6 +755,80 @@ fn default_route_eligibility(repo: &Path) -> Box<dyn Fn(TeamRole) -> Result<(), 
     })
 }
 
+/// Compiles the team plan for `objective` -- proportionally, or (with
+/// `seat`) a single explicit manifest -- without persisting it. Issue #541
+/// chunk C: shared by the native `team_plan` tool and the native pane's
+/// `/team plan`/`/agent` slash commands, so the two never grow independent
+/// copies of "classify, derive the profile, load the registry, compile".
+pub fn compile_for_objective(
+    repo: &Path,
+    home: Option<&Path>,
+    objective: &str,
+    seat: Option<&str>,
+) -> CtxResult<TeamPlan> {
+    let classification = classify::from_args(&classify::ClassifyArgs {
+        task: objective.to_string(),
+        paths: Vec::new(),
+        changed_lines: None,
+        tests_changed: false,
+        intent: None,
+        complexity: None,
+        risk: None,
+        repo: Some(repo.to_path_buf()),
+        branch: None,
+        json: false,
+    })?;
+    let profile = ExecutionProfile::derive(objective, &classification);
+    let registry = AgentRegistry::load_for_repo(repo, home, true)?;
+    let skills = SkillRegistry::load_for_repo(repo, home, true)?;
+    registry.validate_against(&skills)?;
+    let eligibility = default_route_eligibility(repo);
+    match seat {
+        Some(manifest_id) => compile_explicit(
+            objective,
+            &profile,
+            &registry,
+            &skills,
+            eligibility.as_ref(),
+            manifest_id,
+        ),
+        None => compile(
+            objective,
+            &profile,
+            &registry,
+            &skills,
+            eligibility.as_ref(),
+        ),
+    }
+}
+
+/// Persists `plan`: the active workflow owns it when one exists for this
+/// repository, else the coordinator record does (issue #541 chunk C,
+/// decision 1). Shared for the same reason [`compile_for_objective`] is.
+pub fn store_plan(
+    state: &crate::commands::ctx::state::StateDir,
+    repo: &Path,
+    plan: &TeamPlan,
+) -> CtxResult<()> {
+    let now = crate::commands::ctx::state::now_secs();
+    match engine::load_active(state, repo)? {
+        Some(mut workflow) => {
+            workflow.team_plan = Some(plan.clone());
+            engine::save_preserving_active(state, &workflow)?;
+            let workflow_id = workflow.id.clone();
+            crate::commands::ctx::coordinator::update(state, repo, |graph| {
+                graph.store_team_plan_workflow(&workflow_id, now);
+            })?;
+        }
+        None => {
+            crate::commands::ctx::coordinator::update(state, repo, |graph| {
+                graph.store_team_plan_inline(plan.clone(), now);
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Args)]
 pub struct TeamArgs {
     #[command(subcommand)]
@@ -898,7 +1014,11 @@ fn run_show(args: &TeamShowArgs, writer: &mut impl Write) -> CtxResult<i32> {
     Ok(0)
 }
 
-fn print_plan_text(plan: &TeamPlan, writer: &mut impl Write) -> CtxResult<()> {
+/// Issue #541 chunk C: the native `/team` slash command calls this SAME
+/// function (`dash::native_ux::render_team_plan`) so the headless
+/// `zirv workflow team show|plan` text and the native pane's view are one
+/// rendering, never two.
+pub(crate) fn print_plan_text(plan: &TeamPlan, writer: &mut impl Write) -> CtxResult<()> {
     writeln!(
         writer,
         "objective: {}\nexecution: {:?}\nlimits: fan_out<={} depth<={} spend={:?}",
@@ -1060,6 +1180,11 @@ mod tests {
             risk_score: 0,
             changed_files,
             changed_lines: changed_files * 20,
+            // Deliberately empty: every existing test in this module exercises
+            // the count-based fallback (`implementer_seat_count`), which is
+            // what an EMPTY `changed_paths` selects. The real per-path split
+            // has its own dedicated test below, with an explicit path list.
+            changed_paths: Vec::new(),
             declared_scope: false,
             work_domain: DomainClassification::default(),
             risk_measurement: RiskMeasurement::Measured,
@@ -1187,6 +1312,58 @@ mod tests {
             claims.len(),
             3,
             "each implementer owns a distinct claim: {plan:?}"
+        );
+    }
+
+    /// Issue #541 chunk C, decision 3: when the classification carries a real
+    /// changed-path list, the Orchestrated implementer split buckets by
+    /// TOP-LEVEL path component instead of by the count-based fallback (4
+    /// files per group) -- resolves chunk B's own "deferred: real per-path
+    /// claim splitting" note.
+    #[test]
+    fn a_real_changed_path_list_splits_implementers_by_top_level_boundary() {
+        let mut classification =
+            classification_with(Intent::Feature, Complexity::Substantial, RiskBand::Low, 6);
+        classification.changed_paths = vec![
+            "src/a.rs".to_string(),
+            "src/b.rs".to_string(),
+            "docs/readme.md".to_string(),
+            "docs/guide.md".to_string(),
+            "tests/one.rs".to_string(),
+            "tests/two.rs".to_string(),
+        ];
+        let profile = ExecutionProfile::derive("split by directory", &classification);
+        let plan = compile(
+            "split by directory",
+            &profile,
+            &registry(),
+            &skills(),
+            &always_eligible,
+        )
+        .expect("plan compiles");
+        let implementers: Vec<&Seat> = plan
+            .seats
+            .iter()
+            .filter(|seat| seat.manifest_id == "implementer")
+            .collect();
+        // Three top-level roots (src/, docs/, tests/) -> three claim groups,
+        // NOT `div_ceil(6, 4) == 2` the count-based fallback would give.
+        assert_eq!(implementers.len(), 3, "{plan:?}");
+        let mut claimed_paths: Vec<String> = implementers
+            .iter()
+            .flat_map(|seat| seat.claim.paths.clone())
+            .collect();
+        claimed_paths.sort();
+        assert_eq!(
+            claimed_paths,
+            [
+                "docs/guide.md",
+                "docs/readme.md",
+                "src/a.rs",
+                "src/b.rs",
+                "tests/one.rs",
+                "tests/two.rs",
+            ]
         );
     }
 
