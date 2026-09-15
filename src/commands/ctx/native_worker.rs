@@ -313,6 +313,8 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         group: args.group.clone(),
         objective: None,
         workdir: request.launch_repo.clone(),
+        manifest: None,
+        plan_override: false,
     };
     let parent_session = super::mail::session_identity(&env);
     delegation::record_launch(state, repo, handle, parent_session.clone(), now)?;
@@ -866,6 +868,8 @@ worker='opus'
             depth: observed.delegation_depth,
             cancelled: false,
             requested_write: true,
+            manifest: None,
+            plan: None,
         })
         .expect("one nested worker may launch");
         assert_eq!(first.depth, 0);
@@ -876,6 +880,8 @@ worker='opus'
                 depth: first.depth,
                 cancelled: false,
                 requested_write: true,
+                manifest: None,
+                plan: None,
             }),
             Err(coordinator::Refusal::DepthExhausted)
         );

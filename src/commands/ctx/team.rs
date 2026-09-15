@@ -224,6 +224,27 @@ pub fn prompt_role(role: &str) -> PromptRole {
         .unwrap_or(PromptRole::Worker)
 }
 
+/// The roster's default built-in manifest id for a team role (issue #541
+/// chunk C, decision 2): what a `delegate` call that names a role but no
+/// manifest resolves to. `None` for the two coordinating roles, which have
+/// no natural single built-in manifest of their own -- a coordinator or
+/// sub-orchestrator delegation names no manifest to check, and the identity
+/// check this feeds is skipped entirely rather than guessing one.
+///
+/// A caller wanting a DIFFERENT concrete manifest for a role (an operator's
+/// own `researcher` replacement, `data-analyst` instead of `researcher`) says
+/// so explicitly with `manifest`; this is only the fallback when it did not.
+pub fn default_manifest_for_role(role: TeamRole) -> Option<&'static str> {
+    match role {
+        TeamRole::Coordinator | TeamRole::SubOrchestrator => None,
+        TeamRole::Researcher => Some("researcher"),
+        TeamRole::Planner => Some("planner"),
+        TeamRole::Implementer => Some("implementer"),
+        TeamRole::Reviewer => Some("reviewer"),
+        TeamRole::Tester => Some("tester"),
+    }
+}
+
 /// Which team roles this machine can actually staff, in team order.
 ///
 /// Item 2's "preserve the operator's preferred team composition": a
@@ -500,6 +521,22 @@ mod tests {
         assert_eq!(authority("worker"), Authority::worker());
         assert_eq!(authority("something-new"), Authority::worker());
         assert!(authority("worker").may_delegate);
+    }
+
+    #[test]
+    fn the_coordinating_roles_have_no_default_manifest() {
+        for role in [TeamRole::Coordinator, TeamRole::SubOrchestrator] {
+            assert_eq!(default_manifest_for_role(role), None, "{role}");
+        }
+        for (role, id) in [
+            (TeamRole::Researcher, RESEARCHER),
+            (TeamRole::Planner, PLANNER),
+            (TeamRole::Implementer, IMPLEMENTER),
+            (TeamRole::Reviewer, REVIEWER),
+            (TeamRole::Tester, TESTER),
+        ] {
+            assert_eq!(default_manifest_for_role(role), Some(id), "{role}");
+        }
     }
 
     #[test]

@@ -801,6 +801,34 @@ fn registry(repo: Option<&Path>, built_in_only: bool) -> CtxResult<(PathBuf, Age
     Ok((repo, registry))
 }
 
+/// The `zirv workflow agent list --json`-equivalent text table: id, version,
+/// team role, model tier, write posture, provenance. Issue #541 chunk C:
+/// the native `/agents` slash command calls this SAME function so the two
+/// surfaces render from one table, never two.
+pub(crate) fn write_agent_table(
+    registry: &AgentRegistry,
+    writer: &mut impl Write,
+) -> CtxResult<()> {
+    writeln!(writer, "ID\tVERSION\tTEAM_ROLE\tTIER\tMODE\tSOURCE")?;
+    for agent in registry.list() {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            agent.manifest.id,
+            agent.manifest.version,
+            team_role_for(&agent.manifest),
+            agent.manifest.model_tier,
+            if agent.manifest.read_only {
+                "read-only"
+            } else {
+                "writable"
+            },
+            agent.source
+        )?;
+    }
+    Ok(())
+}
+
 pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
     match &args.command {
         AgentCommand::List(args) => {
@@ -812,23 +840,7 @@ pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 serde_json::to_writer_pretty(&mut *writer, &registry.list().collect::<Vec<_>>())?;
                 writeln!(writer)?;
             } else {
-                writeln!(writer, "ID\tVERSION\tROLE\tTIER\tMODE\tSOURCE")?;
-                for agent in registry.list() {
-                    writeln!(
-                        writer,
-                        "{}\t{}\t{}\t{}\t{}\t{}",
-                        agent.manifest.id,
-                        agent.manifest.version,
-                        agent.manifest.role,
-                        agent.manifest.model_tier,
-                        if agent.manifest.read_only {
-                            "read-only"
-                        } else {
-                            "writable"
-                        },
-                        agent.source
-                    )?;
-                }
+                write_agent_table(&registry, writer)?;
             }
             Ok(0)
         }

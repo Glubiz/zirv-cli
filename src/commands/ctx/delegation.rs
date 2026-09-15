@@ -109,6 +109,17 @@ pub struct WorkerHandle {
     #[serde(default)]
     pub objective: Option<String>,
     pub workdir: PathBuf,
+    /// Issue #541 chunk C, decision 2: the manifest identity this delegation
+    /// was checked against (the caller's explicit choice, or the role's own
+    /// default) -- `None` for a role outside the closed team, which skips
+    /// the manifest/team-plan checks entirely. Older durable records default
+    /// safely to `None`.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// Whether this delegation used the coordinator's `plan_override`
+    /// escape from the "must match an unfilled team-plan seat" rule.
+    #[serde(default)]
+    pub plan_override: bool,
 }
 
 /// One attempt at the same delegation. A follow-up that has to launch a
@@ -1041,6 +1052,17 @@ pub struct LaunchRequest {
     pub task: Option<String>,
     pub group: Option<String>,
     pub workdir: Option<PathBuf>,
+    /// Issue #541 chunk C, decision 2: the workflow agent manifest id this
+    /// delegation names. `None` defers to the role's own default manifest
+    /// (`team::default_manifest_for_role`); a role outside the closed team
+    /// (`worker`, `seat`, an operator's own label) skips the manifest/
+    /// team-plan checks entirely regardless of this field.
+    pub manifest: Option<String>,
+    /// Issue #541 chunk C, decision 2: bypass the "must match an unfilled
+    /// team-plan seat" rule. Only the COORDINATOR seat's request for this is
+    /// ever honoured (`coordinator::check`); anyone else's is silently
+    /// ignored rather than erroring, since asking is not itself a violation.
+    pub plan_override_requested: bool,
     pub read_only: bool,
     pub budget_tokens: Option<u64>,
     pub max_tool_calls: Option<u32>,
@@ -1265,12 +1287,84 @@ pub fn delegate(
         super::seat::guard(state, parent.short, generation)?;
     }
     let mut graph = super::coordinator::load(state, repo);
+
+    // Issue #541 chunk C, decision 2: resolve the manifest identity and
+    // team-plan facts the pure `coordinator::check` needs, from trusted
+    // runtime state -- a registry lookup and a plan read are both I/O, so
+    // they happen HERE, never inside `check` itself. Built-ins only
+    // (`AgentRegistry::load` with no custom/repo layer): an operator/
+    // repository manifest override is a deliberate scope cut for this
+    // check, left to a follow-up (see the design note).
+    let team_role_requested = super::team::TeamRole::parse(&request.role);
+    let requested_manifest_id: Option<String> = team_role_requested.and_then(|role| {
+        request
+            .manifest
+            .clone()
+            .or_else(|| super::team::default_manifest_for_role(role).map(str::to_string))
+    });
+    let manifest_facts = requested_manifest_id.as_ref().and_then(|id| {
+        let registry =
+            crate::commands::workflow::agents::AgentRegistry::load(repo, None, false, false)
+                .ok()?;
+        let agent = registry.get(id).ok()?;
+        Some(super::coordinator::ManifestFacts {
+            team_role: crate::commands::workflow::agents::team_role_for(&agent.manifest),
+            may_write: !agent.manifest.read_only,
+        })
+    });
+    let manifest_bounds =
+        requested_manifest_id
+            .as_deref()
+            .map(|id| super::coordinator::ManifestBounds {
+                requested_id: id,
+                known: manifest_facts,
+            });
+
+    let resolved_plan = super::coordinator::resolve_team_plan(state, repo, &graph);
+    let empty_paths: Vec<String> = Vec::new();
+    let matched_seat = resolved_plan.as_ref().and_then(|plan| {
+        let task_id = request.task.as_deref()?;
+        plan.seats.iter().find(|seat| {
+            seat.id == task_id
+                && requested_manifest_id.as_deref() == Some(seat.manifest_id.as_str())
+                && team_role_requested == Some(seat.team_role)
+        })
+    });
+    let matching_unfilled_seat = matched_seat
+        .filter(|seat| !graph.seat_filled(&seat.id))
+        .map(|seat| seat.id.as_str());
+    let matched_claim_paths: &[String] =
+        matched_seat.map_or(&empty_paths, |seat| &seat.claim.paths);
+    let active_claim_paths: Vec<&[String]> = resolved_plan
+        .as_ref()
+        .map(|plan| {
+            plan.seats
+                .iter()
+                .filter(|seat| Some(seat.id.as_str()) != request.task.as_deref())
+                .filter(|seat| graph.seat_filled(&seat.id))
+                .map(|seat| seat.claim.paths.as_slice())
+                .collect()
+        })
+        .unwrap_or_default();
+    let plan_bounds = resolved_plan
+        .as_ref()
+        .map(|_| super::coordinator::PlanBounds {
+            exists: true,
+            matching_unfilled_seat,
+            matched_claim_paths,
+            active_claim_paths: &active_claim_paths,
+            is_coordinator: parent.role == super::team::COORDINATOR,
+            override_requested: request.plan_override_requested,
+        });
+
     let grant = super::coordinator::check(&super::coordinator::Bounds {
         parent_role: parent.role,
         child_role: &request.role,
         depth: parent.depth,
         cancelled: graph.cancelled,
         requested_write: !request.read_only,
+        manifest: manifest_bounds,
+        plan: plan_bounds,
     })
     .map_err(|refusal| refusal.to_string())?;
 
@@ -1302,6 +1396,8 @@ pub fn delegate(
             .workdir
             .clone()
             .unwrap_or_else(|| repo.to_path_buf()),
+        manifest: requested_manifest_id.clone(),
+        plan_override: grant.plan_override,
     };
     // The coordinator's own graph, written beside the launch receipt: which
     // task this delegation answers for, which role took it and on which
@@ -1460,6 +1556,8 @@ mod tests {
             group: None,
             objective: None,
             workdir: PathBuf::from("."),
+            manifest: None,
+            plan_override: false,
         }
     }
 
@@ -2231,6 +2329,8 @@ mod tests {
             task: Some(format!("task-{role}")),
             group: None,
             workdir: None,
+            manifest: None,
+            plan_override_requested: false,
             read_only,
             budget_tokens: None,
             max_tool_calls: None,

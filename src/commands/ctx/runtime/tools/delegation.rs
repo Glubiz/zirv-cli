@@ -91,6 +91,15 @@ pub struct DelegateArgs {
     pub budget_tokens: Option<u64>,
     #[serde(default)]
     pub max_tool_calls: Option<u32>,
+    /// Issue #541 chunk C, decision 2: the workflow agent manifest id this
+    /// worker is filling. Absent defers to `role`'s own default manifest.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// Bypass the "must match an unfilled team-plan seat" rule. Honoured
+    /// only when the delegating seat is itself the coordinator
+    /// (`coordinator::check`); anyone else's is silently ignored.
+    #[serde(default, rename = "override")]
+    pub override_: bool,
 }
 
 /// The four tools that only ever name an existing delegation.
@@ -163,6 +172,9 @@ impl DelegateArgs {
         if let Some(task) = &self.task {
             require(task, "task")?;
         }
+        if let Some(manifest) = &self.manifest {
+            require(manifest, "manifest")?;
+        }
         Ok(())
     }
 
@@ -214,6 +226,8 @@ mod tests {
         assert_eq!(args.role_or_default(), "worker");
         assert_eq!(args.action_task(), "ad-hoc");
         assert_eq!(args.mode, ToolMode::Writing);
+        assert_eq!(args.manifest, None);
+        assert!(!args.override_);
 
         let empty: DelegateArgs =
             serde_json::from_value(serde_json::json!({"brief": "  "})).expect("parse");
@@ -260,6 +274,30 @@ mod tests {
             serde_json::from_value(serde_json::json!({"delegation":"a","max_bytes":1}))
                 .expect("parse");
         assert_eq!(tiny.bounded_bytes(), 256);
+    }
+
+    /// Issue #541 chunk C, decision 2: the JSON key is the reserved word
+    /// `override` (a Rust keyword, so the field itself is named
+    /// `override_`), and `manifest` round-trips as an ordinary optional
+    /// string.
+    #[test]
+    fn manifest_and_override_parse_from_their_json_keys() {
+        let args: DelegateArgs = serde_json::from_value(serde_json::json!({
+            "brief": "implement the thing",
+            "manifest": "implementer",
+            "override": true,
+        }))
+        .expect("parse");
+        args.validate().expect("valid");
+        assert_eq!(args.manifest.as_deref(), Some("implementer"));
+        assert!(args.override_);
+
+        let blank_manifest: DelegateArgs = serde_json::from_value(serde_json::json!({
+            "brief": "x",
+            "manifest": "  ",
+        }))
+        .expect("parse");
+        assert!(blank_manifest.validate().is_err());
     }
 
     #[test]

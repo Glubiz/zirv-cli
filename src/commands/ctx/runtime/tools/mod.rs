@@ -40,6 +40,7 @@ use self::process::{
 };
 use self::team::{
     CardFilter, GroupCreateArgs, GroupStatusArgs, TaskCreateArgs, TaskIdArgs, TaskListArgs,
+    TeamPlanArgs,
 };
 use self::workflow::{WorkflowAdvanceArgs, WorkflowLookupArgs};
 use super::capabilities::{CapabilityError, CapabilityServices};
@@ -192,7 +193,8 @@ pub const WORKFLOW_CONTEXT: &str = "workflow_context";
 pub const WORKFLOW_ADVANCE: &str = "workflow_advance";
 pub const WORKFLOW_APPROVE: &str = "workflow_approve";
 pub use team::{
-    GROUP_CREATE, GROUP_STATUS, OBJECTIVE_STATUS, TASK_CLAIM, TASK_CREATE, TASK_LIST, TEAM_STATUS,
+    GROUP_CREATE, GROUP_STATUS, OBJECTIVE_STATUS, TASK_CLAIM, TASK_CREATE, TASK_LIST, TEAM_PLAN,
+    TEAM_STATUS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -462,6 +464,7 @@ impl ToolRegistry {
             GROUP_STATUS => parse!(GroupStatus, GroupStatusArgs),
             OBJECTIVE_STATUS => parse!(ObjectiveStatus, EmptyArgs),
             TEAM_STATUS => parse!(TeamStatus, EmptyArgs),
+            TEAM_PLAN => parse!(TeamPlan, TeamPlanArgs),
             _ => unreachable!("registry membership and parser match stay in lockstep"),
         }?;
         parsed.validate()?;
@@ -591,6 +594,7 @@ enum ParsedTool {
     GroupStatus(GroupStatusArgs),
     ObjectiveStatus(EmptyArgs),
     TeamStatus(EmptyArgs),
+    TeamPlan(TeamPlanArgs),
 }
 
 impl ParsedTool {
@@ -755,6 +759,7 @@ impl ParsedTool {
                 }
                 Ok(())
             }
+            Self::TeamPlan(args) => args.validate(),
         }
     }
 
@@ -1049,6 +1054,17 @@ impl ParsedTool {
                 key: None,
                 write: false,
             },
+            // Issue #541 chunk C, decision 1: compiling and persisting a
+            // team plan writes the active workflow's state (or the
+            // coordinator record when there is none) -- shared state, same
+            // footing as `task_create`/`group_create` above.
+            Self::TeamPlan(_) => ExecutionAction::Knowledge {
+                service: "coordinator".into(),
+                operation: "team_plan".into(),
+                scope: Some("shared".into()),
+                key: None,
+                write: true,
+            },
         })
     }
 
@@ -1103,6 +1119,11 @@ impl ParsedTool {
             Self::TaskCreate(_) | Self::TaskClaim(_) | Self::GroupCreate(_) => {
                 RetryPolicy::Reconcile
             }
+            // Deterministic given the same inputs, but the workflow/
+            // coordinator state it writes into may have moved between a
+            // call and its retry, so the caller reconciles rather than
+            // assuming a first attempt never landed.
+            Self::TeamPlan(_) => RetryPolicy::Reconcile,
             Self::WriteFile(_)
             | Self::ApplyPatch(_)
             | Self::ProcessWrite(_)
@@ -1836,6 +1857,7 @@ impl NativeToolClient {
             ParsedTool::GroupStatus(args) => self.group_status(args.group.as_deref()),
             ParsedTool::ObjectiveStatus(_) => self.objective_status(),
             ParsedTool::TeamStatus(_) => self.team_status(),
+            ParsedTool::TeamPlan(args) => self.team_plan(&args),
         }
     }
 
@@ -2173,6 +2195,37 @@ impl NativeToolClient {
         }))
     }
 
+    /// `team_plan` (issue #541 chunk C, decision 1): runs the SAME chunk B
+    /// compiler `zirv workflow team plan` runs -- classification from the
+    /// repo plus the objective text, the minimal execution profile, then
+    /// `compile`/`compile_explicit` -- and persists it: the active workflow
+    /// OWNS the plan when one exists for this repository, and the
+    /// coordinator record keeps only a reference to it; with no active
+    /// workflow, the coordinator record holds the plan itself.
+    fn team_plan(&mut self, args: &TeamPlanArgs) -> Result<Value, ToolError> {
+        use crate::commands::workflow::team;
+
+        // Matches `zirv workflow team plan`'s own resolution
+        // (`workflow::team::run_plan`) so the native tool and the wrapped-
+        // harness CLI agree on which operator/repository manifests apply.
+        let home = dirs::home_dir();
+        let mut plan = team::compile_for_objective(
+            &self.repo,
+            home.as_deref(),
+            &args.objective,
+            args.seat.as_deref(),
+        )
+        .map_err(ToolError::external)?;
+        if args.seat.is_some()
+            && let Some(task) = &args.task
+            && let Some(seat) = plan.seats.first_mut()
+        {
+            seat.task = task.clone();
+        }
+        team::store_plan(&self.state, &self.repo, &plan).map_err(ToolError::external)?;
+        serde_json::to_value(&plan).map_err(ToolError::external)
+    }
+
     // -- the delegation tools (issue #479, roadmap N10) -------------------
     //
     // Every one of these is a thin adaptor over the SAME `ctx::delegation`
@@ -2234,6 +2287,8 @@ impl NativeToolClient {
             task: args.task.clone(),
             group: args.group.clone(),
             workdir,
+            manifest: args.manifest.clone(),
+            plan_override_requested: args.override_,
             read_only: args.mode == delegation::ToolMode::ReadOnly,
             budget_tokens: args.budget_tokens,
             max_tool_calls: args.max_tool_calls,
@@ -2290,6 +2345,8 @@ impl NativeToolClient {
             "runtime": record.handle.runtime.as_str(),
             "phase": record.phase.as_str(),
             "task": record.handle.task,
+            "manifest": record.handle.manifest,
+            "plan_override": record.handle.plan_override,
             "exit_code": record.exit_code,
             "delivery": publication.as_ref().map(|publication| &publication.identity),
             "mailed": publication.is_some_and(|publication| publication.mailed),
@@ -3705,6 +3762,26 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &[ResourceClaimKind::ReadRoot],
             (CancellationContract::NotApplicable, RetryPolicy::Safe),
         ),
+        definition(
+            TEAM_PLAN,
+            "Compile the smallest capable team for an objective (coordinator/sub-orchestrator \
+             seats only) and persist it: the active workflow owns the plan when one exists, else \
+             the coordinator's own record does. `seat` bypasses proportional selection for a \
+             single explicit manifest id, through the identical capability/team-role/route checks. \
+             Returns the compiled plan.",
+            object_schema(
+                &["objective"],
+                json!({
+                    "objective":{"type":"string","minLength":1},
+                    "seat":{"type":"string","minLength":1},
+                    "task":{"type":"string","minLength":1}
+                }),
+            ),
+            &write_caps,
+            ToolExecutionMode::Immediate,
+            &[ResourceClaimKind::WorktreeWrite],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
     ]
 }
 
@@ -3765,7 +3842,7 @@ mod tests {
     /// and the 7 team tools (#485). Asserted as a number on purpose: a tool
     /// added without a deliberate decision here is a tool the model was
     /// handed silently.
-    const NATIVE_TOOL_COUNT: usize = 47;
+    const NATIVE_TOOL_COUNT: usize = 48;
 
     #[test]
     fn registry_names_are_unique_and_schemas_are_closed_objects() {
@@ -4556,6 +4633,8 @@ mod tests {
                 group: None,
                 objective: None,
                 workdir: fixture.repo.clone(),
+                manifest: None,
+                plan_override: false,
             },
             None,
             1,
@@ -4811,6 +4890,197 @@ mod tests {
         assert_eq!(result_of(&status)["scope"], "ship N16");
     }
 
+    /// Issue #541 chunk C, decision 1: `team_plan` runs the same compiler
+    /// `zirv workflow team plan` runs and persists the result -- on the
+    /// coordinator record when (as here) no workflow is active -- and the
+    /// stored plan agrees byte-for-byte with what the tool returned.
+    #[test]
+    fn team_plan_tool_stores_the_plan_and_returns_it() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let mut fixture = fixture_with(0, "coordinator", true);
+        // `classify::from_args` measures the repository's own git history
+        // when no explicit `--path`/`--changed-lines` is given -- which is
+        // exactly how the native tool calls it -- so the fixture repo needs
+        // at least one commit to measure against.
+        std::fs::write(fixture.repo.join("README.md"), "hello\n").expect("seed file");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&fixture.repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let receipt = call(
+            &mut fixture.client,
+            TEAM_PLAN,
+            json!({"objective": "fix the null pointer crash in the parser"}),
+        );
+        assert_eq!(receipt.state, ToolReceiptState::Completed, "{receipt:?}");
+        let plan = receipt.result.expect("plan");
+        assert_eq!(
+            plan["objective"],
+            "fix the null pointer crash in the parser"
+        );
+        assert!(plan["seats"].is_array());
+
+        let graph = crate::commands::ctx::coordinator::load(&fixture.state, &fixture.repo);
+        assert!(
+            graph.team_plan.is_some(),
+            "the plan is stored on the coordinator record (no active workflow in this fixture)"
+        );
+        let resolved = crate::commands::ctx::coordinator::resolve_team_plan(
+            &fixture.state,
+            &fixture.repo,
+            &graph,
+        )
+        .expect("resolved plan");
+        assert_eq!(
+            serde_json::to_value(&resolved).expect("json"),
+            plan,
+            "the stored plan is exactly what the tool returned"
+        );
+    }
+
+    /// Builds a two-seat plan (an implementer and an independent reviewer)
+    /// straight from the real `compile_explicit` path -- so every field
+    /// (authority, route tier, required capabilities) is what the compiler
+    /// itself would produce -- rather than depending on a real git diff to
+    /// drive the proportional compiler to a particular shape.
+    fn two_seat_mixed_plan(repo: &Path) -> crate::commands::workflow::team::TeamPlan {
+        use crate::commands::workflow::agents::AgentRegistry;
+        use crate::commands::workflow::classify::{
+            Classification, Complexity, DomainClassification, Intent, RiskBand, RiskMeasurement,
+        };
+        use crate::commands::workflow::profile::ExecutionProfile;
+        use crate::commands::workflow::skill::SkillRegistry;
+        use crate::commands::workflow::team;
+
+        let classification = Classification {
+            intent: Intent::Feature,
+            complexity: Complexity::Trivial,
+            risk: RiskBand::Low,
+            risk_score: 0,
+            changed_files: 1,
+            changed_lines: 5,
+            changed_paths: Vec::new(),
+            declared_scope: false,
+            work_domain: DomainClassification::default(),
+            risk_measurement: RiskMeasurement::Measured,
+            reasons: vec!["test fixture".to_string()],
+        };
+        let profile = ExecutionProfile::derive("mixed-runtime dispatch", &classification);
+        let registry = AgentRegistry::load(repo, None, false, false).expect("registry");
+        let skills = SkillRegistry::load(repo, None, false, false).expect("skills");
+        let always_eligible = |_role: crate::commands::ctx::team::TeamRole| Ok(());
+
+        let mut plan = team::compile_explicit(
+            "implement the change",
+            &profile,
+            &registry,
+            &skills,
+            &always_eligible,
+            "implementer",
+        )
+        .expect("implementer seat compiles");
+        let mut implementer_seat = plan.seats.remove(0);
+        implementer_seat.id = "implementer-1".to_string();
+
+        let reviewer_plan = team::compile_explicit(
+            "review the change",
+            &profile,
+            &registry,
+            &skills,
+            &always_eligible,
+            "reviewer",
+        )
+        .expect("reviewer seat compiles");
+        let mut reviewer_seat = reviewer_plan
+            .seats
+            .into_iter()
+            .next()
+            .expect("reviewer seat");
+        reviewer_seat.id = "reviewer-1".to_string();
+        // `compile_explicit` gives every explicit seat the same "primary"
+        // claim regardless of role; an independent reviewer holds none, the
+        // same invariant the proportional compiler enforces.
+        reviewer_seat.claim.paths.clear();
+        reviewer_seat.claim.worktree = false;
+
+        plan.seats = vec![implementer_seat, reviewer_seat];
+        plan
+    }
+
+    /// Issue #541 chunk C, decision 5: a wrapped-harness worker seat
+    /// dispatched from a native coordinator goes through the SAME
+    /// manifest/team-plan checks a native seat does -- the mixed-team test
+    /// pattern, now against a stored plan.
+    #[test]
+    fn a_mixed_team_still_dispatches_through_the_plan_checks() {
+        let mut fixture = fixture_with(0, "coordinator", true);
+        let plan = two_seat_mixed_plan(&fixture.repo);
+        crate::commands::ctx::coordinator::update(&fixture.state, &fixture.repo, |graph| {
+            graph.store_team_plan_inline(plan, state::now_secs());
+        })
+        .expect("store plan");
+
+        let native = handle_from(call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({
+                "brief": "implement",
+                "role": "implementer",
+                "task": "implementer-1",
+                "runtime": "native",
+            }),
+        ));
+        let wrapped = handle_from(call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({
+                "brief": "review",
+                "role": "reviewer",
+                "task": "reviewer-1",
+                "runtime": "harness",
+                "target": "claude",
+            }),
+        ));
+        assert_ne!(native, wrapped);
+
+        let launches = fixture.launches.lock().expect("lock");
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[0].runtime, super::super::RuntimeKind::Native);
+        assert_eq!(launches[1].runtime, super::super::RuntimeKind::Harness);
+        drop(launches);
+
+        // A THIRD delegation for the SAME seat, while it is still filled, is
+        // refused -- the plan match rule, not a legacy claim rule.
+        let refused = call(
+            &mut fixture.client,
+            DELEGATE,
+            json!({
+                "brief": "implement again",
+                "role": "implementer",
+                "task": "implementer-1",
+                "runtime": "native",
+            }),
+        );
+        assert_eq!(refused.state, ToolReceiptState::Failed, "{refused:?}");
+    }
+
     /// Acceptance criterion 3, the ownership half: the claim the tool takes is
     /// the SHARED one, so a second claimant is refused with the reason rather
     /// than paid to redo the first one's work.
@@ -4973,6 +5243,7 @@ mod tests {
                 risk_score: 0,
                 changed_files: 1,
                 changed_lines: 5,
+                changed_paths: Vec::new(),
                 declared_scope: false,
                 work_domain: Default::default(),
                 risk_measurement: crate::commands::workflow::classify::RiskMeasurement::Measured,
