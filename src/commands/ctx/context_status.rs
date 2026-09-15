@@ -52,6 +52,7 @@ use super::CtxResult;
 use super::adapters;
 use super::compile;
 use super::config::{ContextConfig, CtxConfig, EnvLookup, env_from_process};
+use super::context;
 use super::context_cli;
 use super::drift;
 use super::handoff;
@@ -61,6 +62,7 @@ use super::optimize::{self, Finding, Layer, Severity, Surface};
 use super::prompt::{self, PromptRole};
 use super::resume;
 use super::state::{StateDir, now_secs, repo_slug};
+use super::surface as surface_mod;
 use super::surface::Kind;
 use crate::style::{self, Tone};
 
@@ -148,10 +150,30 @@ fn oversized_threshold(layer: Layer, cfg: &ContextConfig) -> Option<usize> {
     })
 }
 
+/// Trust/scope label vocabulary for the per-surface provenance line below --
+/// the same words `surface::Trust`/`surface::Scope` already carry as
+/// variants, spelled out for a plain-text report rather than `{:?}`-debugged.
+fn trust_label(trust: surface_mod::Trust) -> &'static str {
+    match trust {
+        surface_mod::Trust::Operator => "operator",
+        surface_mod::Trust::RepoUntrusted => "repo-untrusted",
+    }
+}
+
+fn scope_label(scope: surface_mod::Scope) -> &'static str {
+    match scope {
+        surface_mod::Scope::Global => "global",
+        surface_mod::Scope::Repo => "repo",
+        surface_mod::Scope::Nested => "nested",
+        surface_mod::Scope::LocalPrivate => "local-private",
+    }
+}
+
 fn render_surface_line<W: Write>(
     w: &mut W,
     surface: &Surface,
     cfg: &ContextConfig,
+    decisions: &std::collections::HashMap<&Path, &context::Resolved>,
     indent: &str,
     colour: bool,
 ) -> CtxResult<()> {
@@ -189,6 +211,37 @@ fn render_surface_line<W: Write>(
         ),
         style::paint(managed_note, Tone::Muted, colour),
     )?;
+
+    // Issue #538: trust/scope/hash/decision, one line per surface -- "context
+    // status shows source path, trust, scope, bytes, hash and included/
+    // shadowed/truncated reason". `bytes` is already shown on the line
+    // above; this line adds the four columns that were missing.
+    let mut decision_text = decisions
+        .get(surface.path.as_path())
+        .map(|resolved| resolved.decision.render())
+        .unwrap_or_else(|| "included".to_string());
+    if oversized {
+        decision_text.push_str(", oversized");
+    }
+    let migration_note = decisions
+        .get(surface.path.as_path())
+        .and_then(|resolved| resolved.migration.as_deref())
+        .map(|migration| format!(" -- migration: {migration}"))
+        .unwrap_or_default();
+    let hash12 = &memory::sha256_hex(&surface.text)[..12];
+    writeln!(
+        w,
+        "{indent}  {}",
+        style::paint(
+            &format!(
+                "trust: {} -- scope: {} -- sha256: {hash12} -- {decision_text}{migration_note}",
+                trust_label(surface.layer.trust()),
+                scope_label(surface.layer.scope()),
+            ),
+            Tone::Muted,
+            colour
+        )
+    )?;
     Ok(())
 }
 
@@ -201,12 +254,15 @@ fn render_surface_line<W: Write>(
 fn render_instruction_surfaces<W: Write>(
     w: &mut W,
     surfaces: &[Surface],
+    excluded_only: &[Surface],
     cfg: &ContextConfig,
+    decisions: &std::collections::HashMap<&Path, &context::Resolved>,
     colour: bool,
 ) -> CtxResult<()> {
     let mut instructions: Vec<&Surface> = surfaces
         .iter()
         .filter(|s| s.layer.kind() == Kind::Instructions)
+        .chain(excluded_only)
         .collect();
     instructions.sort_by(|a, b| a.path.cmp(&b.path));
     let (canonical, native): (Vec<&Surface>, Vec<&Surface>) = instructions
@@ -239,7 +295,7 @@ fn render_instruction_surfaces<W: Write>(
         )?;
     }
     for surface in &canonical {
-        render_surface_line(w, surface, cfg, "    ", colour)?;
+        render_surface_line(w, surface, cfg, decisions, "    ", colour)?;
     }
 
     writeln!(
@@ -260,7 +316,7 @@ fn render_instruction_surfaces<W: Write>(
         )?;
     }
     for surface in &native {
-        render_surface_line(w, surface, cfg, "    ", colour)?;
+        render_surface_line(w, surface, cfg, decisions, "    ", colour)?;
     }
 
     let settings_count = surfaces
@@ -936,7 +992,36 @@ pub fn run_with<W: Write>(
 
     let surfaces =
         optimize::collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
-    render_instruction_surfaces(w, &surfaces, &cfg.context, colour)?;
+    let exclusions = optimize::collect_instruction_exclusions(
+        home.as_deref(),
+        repo,
+        cfg.optimize.max_surface_bytes,
+    );
+    // Issue #538: every refused candidate (a symlinked ZIRV.md/AGENTS.md/
+    // CLAUDE.md/AGENT.md, or a symlinked nested directory) still gets a
+    // line in the surfaces report -- a synthetic zero-byte `Surface` so
+    // `render_surface_line` can render it the same way as a real one, its
+    // `decision` (below) spelling out why it carries no content.
+    let excluded_only: Vec<Surface> = exclusions
+        .iter()
+        .map(|e| Surface {
+            layer: e.layer,
+            path: e.path.clone(),
+            text: String::new(),
+        })
+        .collect();
+    let resolved =
+        context::resolve_instruction_winners(&surfaces, &exclusions, repo, home.as_deref());
+    let decisions: std::collections::HashMap<&Path, &context::Resolved> =
+        resolved.iter().map(|r| (r.path.as_path(), r)).collect();
+    render_instruction_surfaces(
+        w,
+        &surfaces,
+        &excluded_only,
+        &cfg.context,
+        &decisions,
+        colour,
+    )?;
 
     let findings = drift::analyze(&context_cli::surfaces_for_drift(&surfaces));
     render_drift_section(w, &findings, args.verbose, colour)?;
@@ -1529,6 +1614,29 @@ mod tests {
             after.len(),
             1,
             "the swept message is gone; the still-pending one remains"
+        );
+    }
+
+    /// Issue #538, acceptance bullet 6: "context status shows source path,
+    /// trust, scope, bytes, hash and included/shadowed/truncated reason".
+    /// `CLAUDE.md` here has the same content as `ZIRV.md`, so it must render
+    /// as a `duplicate of` line rather than merely `shadowed by`.
+    #[test]
+    fn context_status_lists_trust_scope_hash_and_decision() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.repo.join("ZIRV.md"), "- always run tests\n").expect("write");
+        std::fs::write(fixture.repo.join("CLAUDE.md"), "- always run tests\n").expect("write");
+
+        let (_, out) = fixture.run(&default_args());
+
+        assert!(out.contains("trust: repo-untrusted"), "got {out}");
+        assert!(out.contains("scope: repo"), "got {out}");
+        assert!(out.contains("sha256: "), "got {out}");
+        assert!(out.contains("included"), "got {out}");
+        assert!(
+            out.contains("duplicate of") && out.contains("ZIRV.md"),
+            "an identical CLAUDE.md must be reported as consuming ZIRV.md's content once, not \
+             merely shadowed: {out}"
         );
     }
 }
