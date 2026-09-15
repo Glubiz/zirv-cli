@@ -1462,7 +1462,9 @@ specialist); an independent reviewer joins only when the validation profile
 requires it. A bug fix gets a `debugger` (reproduction test + root-cause
 note) then an `implementer` scoped to that root cause. Substantial features
 add a `planner`; architectural ones also add an `architect`; implementers
-split one per claim-boundary group, capped by the profile's fan-out limit.
+split one per claim-boundary group (by TOP-LEVEL path from the
+classification's own changed-path list when it has one, capped by the
+profile's fan-out limit — a count-based bucket only when it does not).
 Security/data/docs/dev-ops signals in the request or the diff add the
 matching specialist with a concrete deliverable — never a duplicate of a
 gate already covered (a security signal is satisfied by the same independent
@@ -1476,8 +1478,10 @@ dependency-depth limits are enforced before the plan is returned — a plan
 that would exceed them is refused outright, not silently truncated. The team
 compiler never spawns every role; see
 `docs/design/2026-09-15-native-team-composition.md` for the full rule set and
-what is deferred to #537's full execution profile and chunk C's native
-`/agents`/`/agent`/`/team` slash commands and coordinator enforcement.
+what is deferred to #537's full execution profile. A native coordinator or
+sub-orchestrator seat compiles the same plan itself with the `team_plan`
+tool, and the native pane's `/agents`, `/agent` and `/team` slash commands —
+see "The native meta-orchestrator" below.
 
 ### Maintain loop
 
@@ -1952,7 +1956,14 @@ the transcript, where `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` scroll
 `e`/`Enter` expands or collapses the most recent tool call. A `/`-prefixed
 submission is a pane-local command, never a turn: `/clear` drops the queued
 backlog, `/help` and `/status` report the key contract and the live session
-facts, `/compact` is an honest inert stub. `@` file references
+facts, `/compact` is an honest inert stub. `/agents` lists the resolved
+agent roster; `/agent <manifest-id> <task>` compiles and shows an explicit
+one-seat plan (a dry-run preview through the same capability/team-role/route
+checks `--seat` uses, never persisted); `/team` shows the plan stored for
+this repository and `/team plan <objective>` compiles and persists a new
+one — all three render through the identical functions the headless `zirv
+workflow agent list`/`team show|plan` commands print through, so the two
+surfaces cannot drift (issue #541 chunk C). `@` file references
 (`resolve_file_refs`, containment-checked against the workdir) and a
 `!`-prefixed shell line are not wired into this loop yet.
 
@@ -2226,12 +2237,13 @@ the same billing posture you seated that role on.
 zirv ctx exec --runtime native --role coordinator --prompt "ship issue #123"
 ```
 
-Seven typed tools give that seat the board: `task_create`, `task_claim`,
-`task_list`, `group_create`, `group_status`, `objective_status` and
-`team_status`. Each is a thin adaptor over the same `zirv ctx task|group|
-objective` service the CLI verb calls, so there is one definition of "this
-card is claimed" and one of "this group is full". The three that change shared
-state need a writer permit; the four that read do not.
+Eight typed tools give that seat the board: `task_create`, `task_claim`,
+`task_list`, `group_create`, `group_status`, `objective_status`,
+`team_status` and `team_plan`. Each is a thin adaptor over the same `zirv
+ctx task|group|objective`/`zirv workflow team` service the CLI verb calls, so
+there is one definition of "this card is claimed" and one of "this group is
+full". The four that change shared state need a writer permit; the four that
+read do not.
 
 **Who may do what comes from the seat, not from the request.** A reviewer or
 tester is read-only by identity, however the delegation was spelled; a
@@ -2241,6 +2253,28 @@ checkout ownership, group admission and the provider token ceiling are the
 same limits the rest of zirv already enforces — there is no second counter,
 and a delegation that fails any of them starts nothing and leaves no receipt
 behind.
+
+**A delegation is checked against its manifest and the team plan (issue
+#541 chunk C).** `delegate` accepts `manifest: <id>` (defaulting to the
+requesting role's own built-in manifest — `implementer` for `implementer`,
+`reviewer` for `reviewer`, and so on); an unknown manifest, or one whose own
+team role disagrees with the requested role, or one that may write for a
+role that is read-only by identity, is refused before any receipt exists.
+`team_plan` (coordinator/sub-orchestrator seats only) compiles the SAME
+proportional team `zirv workflow team plan` compiles — classification,
+execution profile, then `compile`/`compile_explicit` for `seat: <manifest
+id>` — and stores it: the active workflow owns the plan when one exists for
+the repository, and the coordinator's own record does otherwise. Once a plan
+exists, a `delegate` call must name (as its `task`) an unfilled seat whose
+manifest and role match one in it, or it is refused with `not in the team
+plan; run team_plan again or pass override: true`; `override: true` bypasses
+the match but is honoured only for the coordinator seat, and is recorded on
+the launch receipt either way. Seats are marked filled the moment they are
+dispatched (the SAME graph node `task_create`/`team_status` already key by
+task id); a retry after a failure re-fills the identical seat rather than
+creating a second one, and two seats whose claimed paths overlap can never
+both be dispatched at once — a wrapped-harness worker seat goes through
+these exact checks too, whichever runtime the coordinator itself runs on.
 
 **A coordinator survives a restart.** Its task graph, decisions, evidence
 references and your standing constraints are durable. On restart it consumes
