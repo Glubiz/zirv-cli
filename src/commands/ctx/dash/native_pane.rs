@@ -2394,9 +2394,10 @@ fn composer_height(presentation: &NativePresentation, width: usize) -> u16 {
 }
 
 /// How many completion rows the `/`, `@` and `!` entry modes may show.
-/// Issue #541 chunk C: bumped from 6 to 7 alongside `/agent`/`/agents`/
-/// `/team` so a bare `/` still shows every slash command at once.
-pub const COMPLETION_ROWS: usize = 7;
+/// Issue #541 chunk C bumped this from 6 to 7 alongside `/agent`/`/agents`/
+/// `/team`; issue #538 chunk C bumped it to 9 for `/context`/`/instructions`,
+/// so a bare `/` still shows every slash command at once.
+pub const COMPLETION_ROWS: usize = 9;
 
 /// Issue #490: the bordered composer, its hint line, and -- when the draft
 /// starts an entry mode -- the completion list above it. The box is drawn
