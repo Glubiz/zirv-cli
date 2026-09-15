@@ -5,7 +5,7 @@
 # through raw/untyped access. `effects = "external"` is the pack's declared
 # ceiling for the day #539 lands, not a claim that this version mutates
 # anything today -- every step below stays `effect = "none"` (the default),
-# proven by `an_external_effects_pack_stays_read_only_until_its_gate`.
+# proven by `external_effects_packs_stay_read_only_until_their_gate`.
 schema_version = 1
 id = "devops-infrastructure-change"
 version = 1
@@ -70,15 +70,26 @@ condition = "always"
 reason = "requires the typed cloud-ops tooling from #539, not yet available; this workflow stops at an explicit operator approval rather than applying the change through raw/untyped access"
 
 [[steps]]
+id = "apply-change"
+title = "Apply the change"
+phase = "deploy"
+skills = ["finish-branch"]
+agent_role = "devops-sre"
+depends_on = ["apply-gate"]
+approval = true
+condition = "always"
+reason = "the actual mutating action against live infrastructure -- still requires the typed cloud-ops tooling from #539, not yet available, so this step is itself approval-gated rather than acting through raw/untyped access; a real Deploy-phase step also lets the operator's deploy-tier policy (apply_deploy_tier) apply to this pack the same way it does to every other"
+
+[[steps]]
 id = "receipt"
 title = "Change receipt"
 phase = "present"
 skills = ["verify"]
-depends_on = ["apply-gate"]
+depends_on = ["apply-change"]
 condition = "always"
 
 [gates]
-approval = ["scope", "plan", "apply-gate"]
+approval = ["scope", "plan", "apply-gate", "apply-change"]
 validation = ["preconditions"]
 
 [limits]

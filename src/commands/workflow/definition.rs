@@ -190,8 +190,10 @@ pub struct StepV2 {
     pub title: String,
     pub phase: WorkflowPhase,
     pub skills: Vec<String>,
-    /// A provider-neutral organizational role (`agents::AgentManifest::role`),
-    /// resolved against the live [`super::agents::AgentRegistry`] at
+    /// A provider-neutral agent seat, resolved by manifest `id` (NOT the
+    /// separate, more general `agents::AgentManifest::role` string, and not
+    /// the closed `team::TeamRole` enum #541 uses for write-authority
+    /// classification) against the live [`super::agents::AgentRegistry`] at
     /// MATERIALISE time, not here -- kept separate from the dispatch-time
     /// writable-seat refusal per the issue's own decision.
     #[serde(default)]

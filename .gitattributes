@@ -49,3 +49,14 @@
 # after a serde round trip (runtime/protocol.rs every_*_fixture_round_trips),
 # so a CRLF checkout on Windows (core.autocrlf=true) fails them. Pin to LF.
 /tests/fixtures/runtime/** text eol=lf
+
+# Issue #542 review finding 10: `WorkflowDefinitionV2::hash()` is a function
+# of the PARSED value, not raw bytes, so an EOL difference alone cannot
+# change a pack's hash -- but `include_str!` still embeds these files'
+# literal bytes into the binary (`MAX_DEFINITION_BYTES`/`MAX_MANIFEST_BYTES`
+# size checks, and any fixture test that compares file text verbatim, e.g.
+# `engine::tests::a_pinned_repository_definition_survives_registry_drift_
+# inline`'s on-disk edit), so a CRLF checkout on Windows must not be able to
+# make these differ from what CI (Linux/macOS) sees. Pin to LF.
+/src/commands/workflow/packs/*.toml text eol=lf
+/tests/fixtures/workflow/** text eol=lf

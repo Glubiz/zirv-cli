@@ -646,7 +646,9 @@ fn legacy_materialize(
 ) -> Vec<WorkflowStep> {
     let mut steps = definition(kind).materialize(classification);
     legacy_apply_profile(kind, profile, &mut steps);
-    apply_brainstorm_selection(brainstorm, &mut steps);
+    // Always one of the five legacy kinds by construction (`kind` is a
+    // `WorkflowKind`, not an arbitrary pack id).
+    apply_brainstorm_selection(brainstorm, true, &mut steps);
     apply_deploy_tier(deploy_tier, &mut steps);
     steps
 }
@@ -721,6 +723,24 @@ pub struct AcceptedPreexistingFindings {
 /// pack with no frontend variant for this step -- for example `WorkflowPhase
 /// ::Intent`/`Deploy` -- behaves identically under either profile, matching
 /// the old table's explicit `continue` for those phases).
+/// Issue #542 review finding 12: the phases a domain variant can never
+/// override -- shared by `materialize_from_definition` (the initial build)
+/// and `apply_profile` (a later `workflow reclassify`/mid-run Frontend
+/// detection re-selection), so the two can never drift apart on which
+/// phases are profile-invariant. Before this fix, `materialize_from_
+/// definition` skipped no phase at all (relying entirely on no built-in pack
+/// happening to author a variant for these phases, an implicit invariant),
+/// while `apply_profile` hardcoded the identical-looking list separately;
+/// a future pack authoring e.g. a Deploy-phase frontend variant would then
+/// have made the initial materialize and a later reclassify silently
+/// disagree.
+const PROFILE_INVARIANT_PHASES: [WorkflowPhase; 4] = [
+    WorkflowPhase::Intent,
+    WorkflowPhase::Deploy,
+    WorkflowPhase::Delegate,
+    WorkflowPhase::Present,
+];
+
 fn select_step_data<'a>(
     definition: &'a super::definition::WorkflowDefinitionV2,
     primary: &'a super::definition::StepV2,
@@ -754,13 +774,7 @@ fn apply_profile(
     steps: &mut [WorkflowStep],
 ) {
     for step in steps {
-        if matches!(
-            step.phase,
-            WorkflowPhase::Intent
-                | WorkflowPhase::Deploy
-                | WorkflowPhase::Delegate
-                | WorkflowPhase::Present
-        ) {
+        if PROFILE_INVARIANT_PHASES.contains(&step.phase) {
             continue;
         }
         let Some(primary) = definition
@@ -795,11 +809,25 @@ fn default_brainstorm_for_kind(kind: WorkflowKind) -> bool {
     matches!(kind, WorkflowKind::Feature | WorkflowKind::Spike)
 }
 
-/// Selects the intent step's skill, same shape as `apply_profile`. Already
-/// keyed on `WorkflowPhase`, never on `WorkflowKind` or any pack id -- any
-/// pack's intent-phase step works with this unchanged (issue #542 chunk 3a
-/// decision 2).
-fn apply_brainstorm_selection(brainstorm: bool, steps: &mut [WorkflowStep]) {
+/// Selects the intent step's skill, same shape as `apply_profile`. Keyed on
+/// `WorkflowPhase`, but -- issue #542 review finding 11 -- gated on
+/// `legacy_eligible` (whether this run's pack is one of the five legacy kind
+/// ids: `WorkflowKind::from_pack_id` resolves it): the "brainstorm" vs.
+/// "write-intent" toggle is a legacy Feature/Bugfix/Refactor/Spike/Review
+/// concept, not a general one. Before this fix, `start_from_pack`'s harmless
+/// `WorkflowKind::Feature` placeholder for a pack with no legacy counterpart
+/// fed straight into `default_brainstorm_for_kind`, which returns `true` for
+/// `Feature` -- so EVERY non-legacy pack (all thirty-plus chunk-4/5
+/// professional packs, none of which ever declares a `brainstorm` skill)
+/// silently had its authored `write-intent` intent step swapped to
+/// `brainstorm` at start, a skill the pack author never chose and the pack's
+/// own `validate()` never even required to exist for it. `legacy_eligible ==
+/// false` now leaves every non-legacy pack's intent step exactly as its
+/// definition authored it, regardless of the resolved `brainstorm` bool.
+fn apply_brainstorm_selection(brainstorm: bool, legacy_eligible: bool, steps: &mut [WorkflowStep]) {
+    if !legacy_eligible {
+        return;
+    }
     for step in steps {
         if step.phase == WorkflowPhase::Intent {
             step.skill = if brainstorm {
@@ -825,8 +853,18 @@ fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>) {
     {
         steps.insert(
             verify_index,
+            // Issue #542 review nit: `__review` rather than `review` -- a
+            // reserved id `valid_id` itself can never accept for an authored
+            // step (it must start with a lowercase letter or digit, never
+            // `_`), so this synthetic production-safety step can never
+            // collide with a pack-authored step that happens to name itself
+            // "review" for some OTHER phase (an authored Review-phase step
+            // named "review", like several built-in packs have, is never a
+            // collision risk in the first place: the `!steps.iter().any(...
+            // WorkflowPhase::Review)` guard above already skips this
+            // insertion whenever any Review-phase step already exists).
             step(
-                "review",
+                "__review",
                 WorkflowPhase::Review,
                 "review",
                 StepCondition::Always,
@@ -925,7 +963,15 @@ fn materialize_from_definition(
         .into_iter()
         .map(|id| {
             let primary = primaries_by_id[id];
-            let effective = select_step_data(definition, primary, profile);
+            // Issue #542 review finding 12: explicit now, not merely
+            // implicit in no built-in pack ever authoring a variant for
+            // these phases -- see `PROFILE_INVARIANT_PHASES`'s own doc
+            // comment.
+            let effective = if PROFILE_INVARIANT_PHASES.contains(&primary.phase) {
+                primary
+            } else {
+                select_step_data(definition, primary, profile)
+            };
             WorkflowStep {
                 id: primary.id.clone(),
                 phase: primary.phase,
@@ -945,7 +991,11 @@ fn materialize_from_definition(
         })
         .collect();
 
-    apply_brainstorm_selection(brainstorm, &mut steps);
+    apply_brainstorm_selection(
+        brainstorm,
+        WorkflowKind::from_pack_id(&definition.id).is_some(),
+        &mut steps,
+    );
     apply_deploy_tier(deploy_tier, &mut steps);
     steps
 }
@@ -1014,7 +1064,11 @@ fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<S
     ids
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` dropped (issue #542 review nit -- persisting `selection`): `Selection`
+// carries an `f64` confidence score, which cannot implement `Eq`; nothing in
+// this crate needs `WorkflowState: Eq` (`PartialEq`, used by every existing
+// `assert_eq!`/`==` on a `WorkflowState`, is unaffected).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowState {
     pub schema_version: u32,
     pub id: String,
@@ -1124,6 +1178,16 @@ pub struct WorkflowState {
     /// same as every other additive field on this struct.
     #[serde(default)]
     pub team_plan: Option<super::team::TeamPlan>,
+    /// Issue #542 review nit: the [`super::selection::Selection`] that
+    /// chose this run's pack, when `zirv workflow start` (or the native
+    /// `workflow_start` tool) picked one deterministically rather than
+    /// being given an explicit id -- persisted so `zirv workflow status`
+    /// can explain why a pack was chosen without the caller having to
+    /// separately re-run `workflow classify` against the same task text.
+    /// `None` for an explicit-id start (no selection ever ran) and for
+    /// state persisted before this field existed.
+    #[serde(default)]
+    pub selection: Option<super::selection::Selection>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -1287,6 +1351,7 @@ impl WorkflowState {
             closed_reason: None,
             closed_at: None,
             team_plan: None,
+            selection: None,
             created_at: now,
             updated_at: now,
         }
@@ -2740,12 +2805,35 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     // would recompute `status` from this same still-current step's
     // declarative `approval = true` and immediately re-derive
     // `AwaitingApproval`, making the approval just granted unobservable.
+    let approved_phase = state.current().map(|step| step.phase);
     if let Some(step) = state.current() {
         state.current_step_approved = Some(step.id.clone());
     }
     state.status = WorkflowStatus::Running;
     state.updated_at = now_secs();
     save(state_dir, &state, true)?;
+
+    // Issue #542 review nit: a gate-only approval is still an approval --
+    // emit the same `ArtifactAccepted` telemetry event the artifact branch
+    // above does (with no `artifact_stage`, since there is none), so an
+    // operator/dashboard reading this event stream sees every approval
+    // grant, not only the artifact-gated ones.
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ArtifactAccepted);
+    event.workflow_id = Some(state.id.clone());
+    event.phase = approved_phase;
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
+    event.succeeded = Some(true);
+    let _ = super::telemetry::record(
+        state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+    );
+
     record_workflow_attention(
         crate::commands::ctx::attention::Attention::None,
         "step approved",
@@ -3589,15 +3677,11 @@ pub(crate) fn write_start_outcome(
             serde_json::to_writer_pretty(&mut *writer, &value)?;
             writeln!(writer)?;
         }
-        (Some(selection), false) => {
-            write_state(writer, &outcome.state, false)?;
-            writeln!(
-                writer,
-                "selected: {} ({})",
-                selection.definition_id,
-                selection.reasons.join("; ")
-            )?;
-        }
+        // Issue #542 review nit: `write_state` itself now prints "selected:
+        // ..." from `state.selection` (persisted alongside it, above), so
+        // this no longer needs its own separate print -- `outcome.state.
+        // selection` is set from this same `outcome.selection` value.
+        (Some(_), false) => write_state(writer, &outcome.state, false)?,
         (None, json) => write_state(writer, &outcome.state, json)?,
     }
     Ok(())
@@ -4071,6 +4155,19 @@ pub(crate) fn write_state(
     } else {
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
+        // Issue #542 review nit: `state.selection` persists the deterministic
+        // selection that chose this run's pack (when one ran at all -- an
+        // explicit id at start never populates it), so `status` can explain
+        // why a pack was chosen without a separate `workflow classify` call
+        // against the same task text.
+        if let Some(selection) = &state.selection {
+            writeln!(
+                writer,
+                "selected: {} ({})",
+                selection.definition_id,
+                selection.reasons.join("; ")
+            )?;
+        }
         writeln!(
             writer,
             "profile: {:?} ({})",
@@ -4278,13 +4375,18 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
         !args.built_in_only,
         classification,
     );
+    state.selection = selection.clone();
     state.branch = args
         .branch
         .clone()
         .unwrap_or_else(|| super::verification::current_branch(&state.repo));
     if brainstorm != state.brainstorm {
         state.brainstorm = brainstorm;
-        apply_brainstorm_selection(brainstorm, &mut state.steps);
+        apply_brainstorm_selection(
+            brainstorm,
+            WorkflowKind::from_pack_id(&pack.definition.id).is_some(),
+            &mut state.steps,
+        );
     }
     if let Some(forced_profile) = args.profile {
         state.set_profile(forced_profile);
@@ -4810,6 +4912,11 @@ mod tests {
         assert!(review < verify && verify < deploy);
         assert!(production[review].agent.as_deref() == Some("reviewer"));
         assert!(production[deploy].approval);
+        // Issue #542 review nit: the synthetic step uses the reserved id
+        // `__review` (never a valid AUTHORED id -- `definition::valid_id`
+        // rejects a leading `_`), so it can never collide with a pack-
+        // authored step that names itself "review" for some other phase.
+        assert_eq!(production[review].id, "__review");
     }
 
     /// Issue #542 review finding 7: `apply_deploy_tier` must only ever WIDEN
@@ -5473,7 +5580,7 @@ mod tests {
         assert!(!bugfix.brainstorm);
 
         let mut overridden = bugfix;
-        apply_brainstorm_selection(true, &mut overridden.steps);
+        apply_brainstorm_selection(true, true, &mut overridden.steps);
         assert_eq!(overridden.current().unwrap().skill, "brainstorm");
     }
 
@@ -5565,6 +5672,125 @@ mod tests {
             !design.approval,
             "leaving Frontend must restore the kind's own authored approval default"
         );
+    }
+
+    /// Issue #542 review finding 12: `materialize_from_definition` and
+    /// `apply_profile` must agree on which phases a domain variant can
+    /// never override (`PROFILE_INVARIANT_PHASES`) -- proven directly with a
+    /// hand-built fixture carrying a Deploy-phase frontend variant (no real
+    /// built-in pack authors one today, which is exactly why the two code
+    /// paths could previously drift apart without any existing fixture
+    /// catching it: one skipped Intent/Deploy/Delegate/Present explicitly,
+    /// the other only "skipped" them by accident, because nothing had ever
+    /// authored a variant for them). Both the initial materialize AND a
+    /// later reclassify must ignore the variant identically.
+    #[test]
+    fn a_frontend_variant_deploy_step_is_ignored_by_both_materialize_and_reclassify() {
+        use super::super::definition::{
+            CompletionContract, EffectClass, EscalateTo, FailurePolicy, GateSpec, Limits,
+            PresentAs, StepV2, WorkflowDefinitionV2,
+        };
+        let definition = WorkflowDefinitionV2 {
+            schema_version: super::super::definition::DEFINITION_SCHEMA_VERSION,
+            id: "deploy-variant-fixture".into(),
+            version: 1,
+            title: "Deploy variant fixture".into(),
+            description: "Proves a Deploy-phase frontend variant is ignored by both \
+                           materialize and reclassify."
+                .into(),
+            domains: vec![],
+            triggers: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            steps: vec![
+                StepV2 {
+                    id: "only".into(),
+                    title: "Deploy".into(),
+                    phase: WorkflowPhase::Deploy,
+                    skills: vec!["finish-branch".into()],
+                    agent_role: None,
+                    capabilities: vec![],
+                    depends_on: vec![],
+                    parallel_group: None,
+                    condition: StepCondition::Always,
+                    approval: false,
+                    artifact: None,
+                    max_attempts: 3,
+                    effect: EffectClass::None,
+                    reason: None,
+                    domains: vec![],
+                    overrides_step: None,
+                },
+                StepV2 {
+                    id: "only-frontend".into(),
+                    title: "Deploy (frontend)".into(),
+                    phase: WorkflowPhase::Deploy,
+                    skills: vec!["frontend-finish".into()],
+                    agent_role: None,
+                    capabilities: vec![],
+                    depends_on: vec![],
+                    parallel_group: None,
+                    condition: StepCondition::Always,
+                    approval: true,
+                    artifact: None,
+                    max_attempts: 3,
+                    effect: EffectClass::None,
+                    reason: None,
+                    domains: vec!["frontend".into()],
+                    overrides_step: Some("only".into()),
+                },
+            ],
+            gates: GateSpec::default(),
+            limits: Limits::default(),
+            failure: FailurePolicy {
+                escalate_to: EscalateTo::Human,
+                retry: false,
+            },
+            effects: EffectClass::None,
+            idempotency: None,
+            completion: CompletionContract {
+                required_outputs: vec![],
+                present_as: PresentAs::Summary,
+            },
+            presentation: None,
+            override_builtin: false,
+        };
+
+        // Materializing directly under Frontend must never pick up the
+        // Deploy-phase variant.
+        let frontend_steps = materialize_from_definition(
+            &definition,
+            &low_classification(),
+            WorkflowProfile::Frontend,
+            DeployTier::Development,
+            true,
+        );
+        let deploy = frontend_steps
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        assert_eq!(deploy.skill, "finish-branch");
+        assert!(!deploy.approval);
+
+        // Reclassifying an already-materialized Standard run to Frontend
+        // must agree with the initial materialize above, never diverge.
+        let mut steps = materialize_from_definition(
+            &definition,
+            &low_classification(),
+            WorkflowProfile::Standard,
+            DeployTier::Development,
+            true,
+        );
+        apply_profile(&definition, WorkflowProfile::Frontend, &mut steps);
+        let deploy = steps
+            .iter()
+            .find(|step| step.phase == WorkflowPhase::Deploy)
+            .unwrap();
+        assert_eq!(
+            deploy.skill, "finish-branch",
+            "reclassify must also ignore the Deploy-phase variant"
+        );
+        assert!(!deploy.approval);
     }
 
     #[test]
@@ -8379,44 +8605,59 @@ mod tests {
         assert!(!String::from_utf8(out).unwrap().contains("brainstorm:"));
     }
 
-    /// Issue #542 chunk 3a: a state file persisted by the pre-#542 binary
-    /// (`schema_version: 4`, no `definition` key at all) must still load,
-    /// resume and advance -- `load` upgrades it in place rather than
-    /// refusing it, and `#[serde(default)]` on `WorkflowState::definition`
-    /// means a v4 file with no such key deserializes as `None`, kind-only
-    /// v1 semantics, exactly as before this schema existed.
+    /// Issue #542 review finding 3: a REAL pre-#542 state file, not one
+    /// synthesized from the current (post-#542) serializer by stripping the
+    /// `definition` key back out. `tests/fixtures/workflow/state-v4/
+    /// feature.json` is the literal, unmodified JSON `WorkflowState::save`
+    /// wrote at base commit `eabc14db` (the pre-#542 `zirv workflow start
+    /// feature` path: `schema_version: 4`, no `definition` key ever
+    /// existed, a plain `WorkflowKind`-keyed run) -- captured by checking
+    /// out that commit into a scratch worktree, adding a throwaway test
+    /// that called its own `WorkflowState::start`/`save`, and copying the
+    /// resulting file out verbatim. Only the `"repo"` field is rewritten
+    /// below, to point at THIS test's own fresh temp repo -- an
+    /// environment-specific path, not part of the schema being proven --
+    /// everything else (`steps`, `status`, `current_step`, field presence)
+    /// is the base commit's own serializer output, unedited.
+    ///
+    /// `load` upgrades this in place rather than refusing it, and
+    /// `#[serde(default)]` on `WorkflowState::definition` means a v4 file
+    /// with no such key deserializes as `None`, kind-only v1 semantics,
+    /// exactly as before this schema existed.
     #[test]
     fn a_schema_four_state_file_still_loads_resumes_and_advances() {
+        const GENUINE_V4_FIXTURE: &str =
+            include_str!("../../../tests/fixtures/workflow/state-v4/feature.json");
+
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let state = skip_leading_artifact_steps(WorkflowState::start(
-            repo.path().to_path_buf(),
-            "small feature".into(),
-            WorkflowKind::Feature,
-            None,
-            true,
-            low_classification(),
-        ));
-        save(&state_dir, &state, true).unwrap();
 
-        // Rewrite the just-saved file as a genuine v4 document: no
-        // `definition` key, and the old version marker.
-        let path = state_path(&state_dir, &state.repo, &state.id).unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(GENUINE_V4_FIXTURE).unwrap();
+        assert_eq!(value["schema_version"], serde_json::json!(4));
+        assert!(
+            value.as_object().unwrap().get("definition").is_none(),
+            "the fixture must genuinely have no `definition` key, not merely a null one"
+        );
+        let id = value["id"].as_str().unwrap().to_string();
         let object = value.as_object_mut().unwrap();
-        object.remove("definition");
-        object.insert("schema_version".into(), serde_json::json!(4));
+        object.insert(
+            "repo".into(),
+            serde_json::json!(repo.path().to_string_lossy()),
+        );
+        let path = state_path(&state_dir, repo.path(), &id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
 
-        let loaded = load(&state_dir, repo.path(), &state.id).unwrap();
+        let loaded = load(&state_dir, repo.path(), &id).unwrap();
         assert_eq!(loaded.schema_version, WORKFLOW_SCHEMA_VERSION);
         assert!(
             loaded.definition.is_none(),
             "a v4 file has no pin -- kind-only v1 semantics"
         );
         assert_eq!(loaded.current().unwrap().phase, WorkflowPhase::Implement);
+        assert_eq!(loaded.status, WorkflowStatus::Running);
+        assert_eq!(loaded.kind, WorkflowKind::Feature);
 
         // Resume-and-advance still works against the migrated state.
         let advanced =
@@ -8426,7 +8667,7 @@ mod tests {
 
         // The upgrade is durable: a fresh load sees schema 5 on disk, not a
         // one-time in-memory patch.
-        let reloaded = load(&state_dir, repo.path(), &state.id).unwrap();
+        let reloaded = load(&state_dir, repo.path(), &id).unwrap();
         assert_eq!(reloaded.schema_version, WORKFLOW_SCHEMA_VERSION);
     }
 
@@ -9668,6 +9909,12 @@ mod tests {
                                     brainstorm,
                                 );
 
+                                // Issue #542 review nit: `condition` joined
+                                // the compared tuple too -- the oracle
+                                // previously proved the two paths agree on
+                                // every OUTPUT field but never on the
+                                // condition a later reclassify/resume re-
+                                // evaluates a step against.
                                 let shape = |steps: &[WorkflowStep]| {
                                     steps
                                         .iter()
@@ -9680,6 +9927,7 @@ mod tests {
                                                 step.artifact,
                                                 step.approval,
                                                 step.max_attempts,
+                                                step.condition,
                                             )
                                         })
                                         .collect::<Vec<_>>()
@@ -9792,6 +10040,7 @@ id = "broken-agent"
 version = 1
 title = "Broken agent"
 description = "References an agent role nothing provides."
+domains = ["testing"]
 effects = "repository"
 
 [[steps]]
@@ -9870,6 +10119,7 @@ id = "parallel-fixture"
 version = 1
 title = "Parallel fixture"
 description = "Two independent steps sharing a parallel_group tag."
+domains = ["testing"]
 effects = "repository"
 
 [[steps]]
@@ -10001,6 +10251,132 @@ present_as = "summary"
         write_definition_status(&mut out, &reloaded).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("definition drifted from registry"), "{text}");
+    }
+
+    /// Issue #542 review finding 4: `a_pinned_definition_survives_registry_
+    /// drift` (above) only proves the PIN itself survives save/reload for a
+    /// BUILT-IN pack, with drift simulated by hand-mutating the hash field
+    /// -- it never actually starts from a genuinely on-disk, editable
+    /// repository-layer pack, nor proves a run RESUMES with its original
+    /// inline steps after the on-disk file is edited out from under it, as
+    /// opposed to merely carrying a stale hash string. This starts from
+    /// `tests/fixtures/workflow/packs/drift-fixture.toml` (a real repository
+    /// pack file, loaded exactly the way `registry.rs`'s own repository-
+    /// layer tests do -- `WorkflowRegistry::load(..., true, ...)` directly,
+    /// bypassing the operator's `repo_workflows_enabled` gate, which is a
+    /// CLI-level concern proven independently and orthogonal to what this
+    /// test is about), edits the on-disk copy after the run has started, and
+    /// proves two things: (1) resuming and advancing still walks the
+    /// ORIGINAL inline steps, never the edited ones, and (2) a fresh
+    /// registry load of the edited file now hashes differently than the
+    /// pin -- the exact comparison `write_definition_status` itself makes
+    /// (`current_hash != reference.hash`) to print "definition drifted from
+    /// registry".
+    #[test]
+    fn a_pinned_repository_definition_survives_registry_drift_inline() {
+        const DRIFT_FIXTURE: &str =
+            include_str!("../../../tests/fixtures/workflow/packs/drift-fixture.toml");
+
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let workflows_dir = repo.path().join(".zirv/workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        let fixture_path = workflows_dir.join("drift-fixture.toml");
+        std::fs::write(&fixture_path, DRIFT_FIXTURE).unwrap();
+
+        let skills = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let registry = crate::commands::workflow::registry::WorkflowRegistry::load(
+            repo.path(),
+            None,
+            true,
+            true,
+            &skills,
+        )
+        .expect("registry with the repository layer enabled");
+        assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
+        let pack = registry.get("drift-fixture").expect("drift-fixture pack");
+        let pinned_hash = pack.hash.clone();
+        assert_eq!(pack.source, super::super::registry::WorkflowSource::Repository);
+
+        let mut state = WorkflowState::start_from_pack(
+            repo.path().to_path_buf(),
+            "run the drift fixture".into(),
+            pack,
+            None,
+            true,
+            low_classification(),
+        );
+        assert_eq!(state.current().unwrap().id, "first");
+        assert!(
+            state
+                .definition
+                .as_ref()
+                .unwrap()
+                .inline
+                .as_ref()
+                .is_some_and(|inline| inline.steps.iter().any(|step| step.id == "second")),
+            "a repository-layer pack must pin its own inline copy"
+        );
+        save(&state_dir, &state, true).unwrap();
+
+        // The on-disk copy drifts AFTER the run has already pinned its own
+        // inline definition: "second"'s skill and title change, and a brand
+        // new third step is added.
+        let edited = DRIFT_FIXTURE
+            .replace(
+                "id = \"second\"\ntitle = \"Second\"\nphase = \"implement\"\nskills = [\"implement\"]",
+                "id = \"second\"\ntitle = \"Second (edited)\"\nphase = \"implement\"\nskills = [\"testing\"]",
+            )
+            .replace(
+                "[failure]",
+                "[[steps]]\nid = \"third\"\ntitle = \"Third\"\nphase = \"verify\"\nskills = [\"verify\"]\ndepends_on = [\"second\"]\ncondition = \"always\"\n\n[failure]",
+            );
+        assert_ne!(edited, DRIFT_FIXTURE, "the fixture text must actually change");
+        std::fs::write(&fixture_path, &edited).unwrap();
+
+        // Resume: reload from disk and advance past "first" -- the run must
+        // still see the ORIGINAL "second" (skill "implement", no "third"
+        // step at all), never the edited on-disk copy.
+        state = load(&state_dir, repo.path(), &state.id).unwrap();
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("advance past 'first'");
+        let second = state.current().expect("still-pinned 'second' step");
+        assert_eq!(second.id, "second");
+        assert_eq!(
+            second.skill, "implement",
+            "the pinned inline copy's original skill must survive the on-disk edit"
+        );
+        let completed = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("advance past the original 'second'");
+        assert_eq!(
+            completed.status,
+            WorkflowStatus::Completed,
+            "the original two-step definition must still be the whole run -- the edited \
+             on-disk 'third' step must never appear"
+        );
+
+        // Separately: a FRESH registry load of the now-edited file hashes
+        // differently than what this run pinned -- exactly the comparison
+        // `write_definition_status` performs to report "definition drifted
+        // from registry" (proven directly against a built-in pack by
+        // `a_pinned_definition_survives_registry_drift`, above; the CLI-
+        // level `repo_workflows_enabled` gate that call site's own
+        // `load_workflow_registry` also applies is a separate, already-
+        // covered concern this test does not re-prove).
+        let drifted_registry = crate::commands::workflow::registry::WorkflowRegistry::load(
+            repo.path(),
+            None,
+            true,
+            true,
+            &skills,
+        )
+        .expect("registry re-load after the on-disk edit");
+        let current_hash = drifted_registry.get("drift-fixture").unwrap().hash.clone();
+        assert_ne!(
+            current_hash, pinned_hash,
+            "the edited on-disk copy must hash differently than the pin"
+        );
     }
 
     /// Issue #542 chunk 3a: `native_completion_gate` (the native loop's own
@@ -10181,6 +10557,58 @@ present_as = "summary"
         );
     }
 
+    /// Issue #542 review nit: `state.selection` persists the deterministic
+    /// [`super::selection::Selection`] that chose a run's pack, so `zirv
+    /// workflow status` can explain why a pack was chosen after the fact --
+    /// not just at the moment `workflow start` printed it. Proven directly
+    /// against a hand-set `Selection` (rather than driving it through
+    /// `classify`'s own intent heuristic, which this test is not about) to
+    /// isolate exactly the two things that matter: the field survives a
+    /// save/reload cycle, and `write_state` renders it.
+    #[test]
+    fn a_persisted_selection_survives_resume_and_explains_status() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        assert!(
+            state.selection.is_none(),
+            "WorkflowState::start (the legacy, explicit-kind path) never runs selection"
+        );
+        state.selection = Some(super::super::selection::Selection {
+            definition_id: "adaptive-work".into(),
+            confidence: 0.42,
+            reasons: vec!["a made-up reason for this test".into()],
+            alternatives: vec![],
+        });
+        save(&state_dir, &state, true).unwrap();
+
+        let reloaded = load(&state_dir, repo.path(), &state.id).unwrap();
+        assert_eq!(
+            reloaded
+                .selection
+                .as_ref()
+                .map(|selection| selection.definition_id.as_str()),
+            Some("adaptive-work"),
+            "a persisted selection must survive resume"
+        );
+
+        let mut out = Vec::new();
+        write_state(&mut out, &reloaded, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("selected: adaptive-work (a made-up reason for this test)"),
+            "{text}"
+        );
+    }
+
     // -- Issue #542 chunk 4: end-to-end fixtures for the first-wave --------
     // -- professional packs -------------------------------------------------
 
@@ -10222,6 +10650,93 @@ present_as = "summary"
             true,
             classification,
         )
+    }
+
+    /// Issue #542 review findings 5+6: `registry::tests::no_builtin_pack_
+    /// references_an_unknown_skill_or_role` now proves every built-in pack's
+    /// `agent_role` resolves against the live `AgentRegistry`, but that is
+    /// still only a static cross-check of the id strings. This proves
+    /// `workflow start` actually WORKS for every one of them: each pack
+    /// starts through the exact same `start_from_pack` path the CLI/native
+    /// tool use, and its first materialized step is a real, present step
+    /// (never an empty step list, and never a step whose own `agent_role`
+    /// -- if any -- fails to resolve through the registry, mirroring the
+    /// CLI `Start` handler's own preflight).
+    #[test]
+    fn every_builtin_pack_starts_and_materialises() {
+        let repo = tempdir().unwrap();
+        git_init_with_commit(repo.path());
+        let skills = SkillRegistry::load(repo.path(), None, false, false).expect("skills");
+        let registry = crate::commands::workflow::registry::WorkflowRegistry::load(
+            repo.path(),
+            None,
+            false,
+            false,
+            &skills,
+        )
+        .expect("registry");
+        let agents = AgentRegistry::load(repo.path(), None, false, false)
+            .expect("every built-in agent manifest must load");
+        let mut checked = 0usize;
+        for pack in registry.list() {
+            let state = WorkflowState::start_from_pack(
+                repo.path().to_path_buf(),
+                format!("exercise {}", pack.definition.id),
+                pack,
+                None,
+                true,
+                full_classification(),
+            );
+            let first = state.current().unwrap_or_else(|| {
+                panic!(
+                    "{}: materialized with no first step",
+                    pack.definition.id
+                )
+            });
+            if let Some(role) = &first.agent {
+                assert!(
+                    agents.get(role).is_ok(),
+                    "{}: first step '{}' references unknown agent role '{}'",
+                    pack.definition.id,
+                    first.id,
+                    role
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            registry.list().count(),
+            "every registered built-in pack must have started and materialised"
+        );
+        assert!(checked >= 32, "expected the full built-in catalogue, checked {checked}");
+    }
+
+    /// Issue #542 review finding 11: `sre-postmortem` has no legacy
+    /// `WorkflowKind` counterpart, so `start_from_pack` resolves `kind` to
+    /// the harmless `WorkflowKind::Feature` placeholder -- which, before
+    /// this fix, fed straight into `default_brainstorm_for_kind` (`true` for
+    /// `Feature`) and silently swapped `timeline`'s authored `write-intent`
+    /// skill to `brainstorm`, a skill this pack never declares and
+    /// `validate()` never required to exist for it. `apply_brainstorm_
+    /// selection` now only ever touches a pack whose id maps to a real
+    /// legacy `WorkflowKind`.
+    #[test]
+    fn a_non_legacy_pack_never_gets_the_brainstorm_skill_swap() {
+        let repo = tempdir().unwrap();
+        git_init_with_commit(repo.path());
+        let state = start_pack_fixture(
+            repo.path(),
+            "sre-postmortem",
+            "write up the postmortem for the outage",
+            full_classification(),
+        );
+        assert_eq!(state.current().unwrap().id, "timeline");
+        assert_eq!(
+            state.current().unwrap().skill,
+            "write-intent",
+            "a non-legacy pack's intent step must never be swapped to \"brainstorm\""
+        );
     }
 
     fn git_init_with_commit(repo: &Path) {
@@ -10441,6 +10956,47 @@ present_as = "summary"
                 .completed_steps
                 .iter()
                 .any(|id| id == "brief-approval")
+        );
+    }
+
+    /// Issue #542 review nit: a gate-only approval must emit the same
+    /// telemetry event the artifact-gated approval path already does (with
+    /// no `artifact_stage`, since there is none), so an operator/dashboard
+    /// reading the event stream sees every approval grant, not only the
+    /// artifact-gated ones.
+    #[test]
+    fn a_gate_only_approval_emits_an_artifact_accepted_telemetry_event() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        git_init_with_commit(repo.path());
+        let mut state = start_pack_fixture(
+            repo.path(),
+            "pm-requirements",
+            "gather requirements for the export feature",
+            low_classification(),
+        );
+        ensure_current_artifact_template(&state).expect("template");
+        let path = workflow_artifact_path(&state, ArtifactStage::Intent).expect("artifact path");
+        std::fs::write(&path, "# Fixture\n\nSubstantive intake content.\n").expect("write");
+        state = approve(&state_dir, state).expect("approve intake");
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("advance past constraints");
+        state = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .expect("advance past acceptance-criteria");
+        assert_eq!(state.current().unwrap().id, "brief-approval");
+
+        state = approve(&state_dir, state).expect("approve the gate-only step");
+
+        let events = super::super::telemetry::list(&state_dir, &state.repo).unwrap_or_default();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == super::super::telemetry::TelemetryKind::ArtifactAccepted
+                    && event.workflow_id.as_deref() == Some(state.id.as_str())
+                    && event.artifact_stage.is_none()
+            }),
+            "expected an ArtifactAccepted event with no artifact_stage for the gate-only \
+             approval: {events:?}"
         );
     }
 
@@ -11169,7 +11725,14 @@ present_as = "summary"
         assert_eq!(completed.status, WorkflowStatus::Completed);
         assert_eq!(
             completed.completed_steps,
-            vec!["scope", "plan", "preconditions", "apply-gate", "receipt"]
+            vec![
+                "scope",
+                "plan",
+                "preconditions",
+                "apply-gate",
+                "apply-change",
+                "receipt"
+            ]
         );
         assert_artifact_accepted(&completed, ArtifactStage::Intent);
         assert_artifact_accepted(&completed, ArtifactStage::Plan);
@@ -11191,9 +11754,83 @@ present_as = "summary"
         assert_eq!(completed.status, WorkflowStatus::Completed);
         assert_eq!(
             completed.completed_steps,
-            vec!["assessment", "options", "decision-gate", "receipt"]
+            vec![
+                "assessment",
+                "options",
+                "decision-gate",
+                "execute-decision",
+                "receipt"
+            ]
         );
         assert_artifact_accepted(&completed, ArtifactStage::Intent);
+    }
+
+    /// Issue #542 review finding 13: before this fix, neither
+    /// `sre-deploy-or-rollback` nor `devops-infrastructure-change` had ANY
+    /// `phase = "deploy"` step, so `apply_deploy_tier` (which only ever acts
+    /// on `WorkflowPhase::Deploy` steps) had nothing to widen for either
+    /// pack regardless of the operator's deploy-tier policy -- the two packs
+    /// the brief specifically singled out for `effects = "external"` were
+    /// exactly the two the deploy-tier mechanism could never reach. Each
+    /// pack now has an explicit Deploy-phase mutating step
+    /// (`execute-decision`/`apply-change`) behind its existing approval
+    /// gate, itself also `approval = true` (so it stays gated at every
+    /// tier -- `a_pack_authored_approval_gate_survives_a_lower_deploy_tier`
+    /// already proves that kind of gate survives `apply_deploy_tier`'s
+    /// tier-derived OR), and `apply_deploy_tier` now has a real step to act
+    /// on for both.
+    #[test]
+    fn external_effects_packs_now_carry_a_deploy_phase_step() {
+        for (pack_id, deploy_step_id, gate_step_id) in [
+            (
+                "devops-infrastructure-change",
+                "apply-change",
+                "apply-gate",
+            ),
+            ("sre-deploy-or-rollback", "execute-decision", "decision-gate"),
+        ] {
+            let definition = super::super::registry::builtin_definition(pack_id)
+                .unwrap_or_else(|| panic!("{pack_id} pack"));
+            let deploy_steps: Vec<_> = definition
+                .steps
+                .iter()
+                .filter(|step| step.phase == WorkflowPhase::Deploy)
+                .collect();
+            assert_eq!(
+                deploy_steps.len(),
+                1,
+                "{pack_id}: expected exactly one Deploy-phase step, found {deploy_steps:?}"
+            );
+            let deploy = deploy_steps[0];
+            assert_eq!(deploy.id, deploy_step_id);
+            assert_eq!(deploy.depends_on, vec![gate_step_id.to_string()]);
+            assert!(
+                deploy.approval,
+                "{pack_id}: the Deploy-phase step must itself stay gated"
+            );
+
+            for tier in [
+                DeployTier::Development,
+                DeployTier::Staging,
+                DeployTier::Production,
+            ] {
+                let materialized = materialize_from_definition(
+                    &definition,
+                    &full_classification(),
+                    WorkflowProfile::Standard,
+                    tier,
+                    true,
+                );
+                let materialized_deploy = materialized
+                    .iter()
+                    .find(|step| step.phase == WorkflowPhase::Deploy)
+                    .unwrap_or_else(|| panic!("{pack_id}: no materialized Deploy step at {tier:?}"));
+                assert!(
+                    materialized_deploy.approval,
+                    "{pack_id}: the Deploy-phase gate must survive every tier ({tier:?})"
+                );
+            }
+        }
     }
 
     /// Issue #542 chunk 5: `devops-infrastructure-change` and

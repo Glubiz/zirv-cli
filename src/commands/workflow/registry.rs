@@ -548,6 +548,20 @@ fn widening_violation(
         }
     }
 
+    // Issue #542 review finding 8: the gate-floor check below only compares
+    // `candidate` against built-in packs whose `domains` INTERSECT its own --
+    // an empty `domains` list intersects nothing, so a repository pack could
+    // silently skip the gate-floor comparison entirely (and every built-in
+    // domain's gate floor with it) simply by omitting `domains`. A
+    // repository pack must now declare at least one domain outright.
+    if candidate.domains.is_empty() {
+        return Some(
+            "must declare at least one `domains` tag -- an empty list would let the gate-floor \
+             widening check below compare against nothing"
+                .into(),
+        );
+    }
+
     type GateFloor = fn(&super::definition::GateSpec) -> bool;
     let floors: [(&str, GateFloor); 3] = [
         ("approval", |gates| !gates.approval.is_empty()),
@@ -559,12 +573,19 @@ fn widening_violation(
     for builtin in registered
         .values()
         .filter(|workflow| workflow.source == WorkflowSource::BuiltIn)
+        // Defense in depth alongside the empty-`domains` rejection just
+        // above (issue #542 review finding 8): even if that check were ever
+        // reordered or bypassed, a candidate with no domains still compares
+        // against the FULL built-in set here rather than an empty
+        // intersection -- it can never silently clear every built-in
+        // domain's gate floor for free.
         .filter(|workflow| {
-            workflow
-                .definition
-                .domains
-                .iter()
-                .any(|domain| candidate.domains.contains(domain))
+            candidate.domains.is_empty()
+                || workflow
+                    .definition
+                    .domains
+                    .iter()
+                    .any(|domain| candidate.domains.contains(domain))
         })
     {
         for (label, has_floor) in floors {
@@ -678,48 +699,26 @@ present_as = "summary"
         assert!(registry.warnings().is_empty());
     }
 
-    /// Issue #542 chunk 4: every built-in pack's steps must resolve against
-    /// a real skill id (already enforced by `validate()`, re-proven here as
-    /// the cross-check the issue's own brief asks for) and a KNOWN agent
-    /// role. Capabilities are a closed enum, so an unrecognized one is
-    /// already rejected at parse time -- there is nothing further to check
-    /// for those here.
-    ///
-    /// Roles: `implementer`/`reviewer` (already registered on this branch)
-    /// plus the full #541 role roster this chunk's (and chunk 4's)
-    /// professional packs draw from (`architect`, `data-analyst`,
-    /// `debugger`, `devops-sre`, `doc-keeper`, `explorer`, `planner`,
-    /// `researcher`, `tester`, `security-scanner`) -- #541 has not merged
-    /// into this worktree, so `AgentRegistry` does not yet carry those
-    /// manifests, and this is a fixed allowlist (the exact 12 built-in
-    /// manifest ids `native/541`'s `agents.rs` registers, confirmed by
-    /// reading that branch's worktree at chunk-5 time) rather than a live
-    /// lookup. Issue #542 chunk 5: replace this with the live
-    /// `AgentRegistry` roster once #541 has actually merged into a shared
-    /// base (see the chunk-5 design note's reconciliation section) -- a
-    /// rebase step, not a chunk-5 gap, since every role used across the
-    /// whole catalogue is one the #541 roster itself defines.
+    /// Issue #542 chunk 4/5, review findings 5+6: every built-in pack's
+    /// steps must resolve against a real skill id (already enforced by
+    /// `validate()`, re-proven here as the cross-check the issue's own
+    /// brief asks for) and a role the live `AgentRegistry` actually
+    /// registers -- `native/541`'s twelve built-in manifests have now merged
+    /// into this branch (`agents.rs`), so this cross-checks the REAL
+    /// registry (role resolution is by manifest id, per `agents.rs`'s own
+    /// `agent_role` doc comment) instead of the fixed allowlist chunk 4
+    /// introduced as a stand-in before #541 had merged. Capabilities are a
+    /// closed enum, so an unrecognized one is already rejected at parse
+    /// time -- there is nothing further to check for those here.
     #[test]
     fn no_builtin_pack_references_an_unknown_skill_or_role() {
-        const KNOWN_ROLES: &[&str] = &[
-            "implementer",
-            "reviewer",
-            "doc-keeper",
-            "security-scanner",
-            "explorer",
-            "researcher",
-            "planner",
-            "architect",
-            "debugger",
-            "tester",
-            "data-analyst",
-            "devops-sre",
-        ];
         let skills = skills();
         let known_skill_ids: BTreeSet<&str> = skills
             .list()
             .map(|skill| skill.manifest.id.as_str())
             .collect();
+        let agents = super::super::agents::AgentRegistry::load(Path::new("."), None, false, false)
+            .expect("every built-in agent manifest must load");
         let registry = WorkflowRegistry::load(Path::new("."), None, false, false, &skills)
             .expect("every built-in pack must load");
         for workflow in registry.list() {
@@ -735,7 +734,7 @@ present_as = "summary"
                 }
                 if let Some(role) = &step.agent_role {
                     assert!(
-                        KNOWN_ROLES.contains(&role.as_str()),
+                        agents.get(role).is_ok(),
                         "{}: step '{}' references unknown agent role '{}'",
                         workflow.definition.id,
                         step.id,
@@ -999,6 +998,35 @@ present_as = "summary"
                 .warnings()
                 .iter()
                 .any(|w| w.contains("agent.spawn")),
+            "{:?}",
+            registry.warnings()
+        );
+    }
+
+    /// Issue #542 review finding 8: the gate-floor widening check only
+    /// compared a candidate against built-in packs whose `domains`
+    /// intersect its own -- an empty `domains` list intersects nothing, so
+    /// a repository pack could silently skip the whole gate-floor
+    /// comparison (and drop any gate category built-ins establish) simply
+    /// by omitting `domains` entirely. A repository pack must now declare
+    /// at least one domain outright.
+    #[test]
+    fn a_repository_pack_with_no_domains_is_rejected() {
+        let repo = tempdir().unwrap();
+        let dir = repo.path().join(".zirv/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        // `minimal_pack` deliberately never sets `domains`, so it defaults
+        // to empty.
+        write(&dir.join("no-domains.toml"), &minimal_pack("no-domains", ""));
+
+        let registry = WorkflowRegistry::load(repo.path(), None, true, true, &skills()).unwrap();
+        assert!(
+            registry.get("no-domains").is_err(),
+            "a repository pack with no domains must be refused"
+        );
+        assert_eq!(registry.warnings().len(), 1, "{:?}", registry.warnings());
+        assert!(
+            registry.warnings()[0].contains("domains"),
             "{:?}",
             registry.warnings()
         );
