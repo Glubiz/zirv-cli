@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::super::CtxResult;
@@ -69,7 +69,7 @@ pub enum SourceKind {
     Documentation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceTrust {
     Zirv,
@@ -1014,7 +1014,7 @@ fn native_source_trust(layer: optimize::Layer) -> SourceTrust {
 /// than a `Candidate`/`SourceProvenance` (no budgeting, no provider message):
 /// just enough identity to compare "did the resolved file set change" and to
 /// render the native `/context` view / journal `context_sources` column.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedInstructionSource {
     pub path: PathBuf,
     pub scope: String,

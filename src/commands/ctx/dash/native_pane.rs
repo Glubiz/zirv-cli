@@ -53,9 +53,10 @@ use crate::style::{self, Tone};
 
 use super::super::CtxResult;
 use super::super::config::{CtxConfig, EnvLookup};
+use super::super::runtime::context::{ResolvedInstructionSource, SourceTrust};
 use super::super::runtime::journal::{
     AssistantBlock, ContentRef, ConversationState, EventScope, ExecutionRecord, ExecutionState,
-    Journal, JournalSessionId, MessageId, MessageRole, RouteIdentity, ToolCallId,
+    Journal, JournalEvent, JournalSessionId, MessageId, MessageRole, RouteIdentity, ToolCallId,
 };
 use super::super::runtime::native::{
     self, InteractiveProgress, InteractiveRequest, InteractiveSession,
@@ -961,10 +962,11 @@ fn toggle_most_recent_tool_call(pane: &mut NativePaneRuntime) {
 /// turn. `/clear` has a real effect (drops the queued backlog); `/help` is
 /// informational; `/compact` is an honest inert stub -- wiring it to the
 /// real compaction envelope needs facts (`NativeSessionConfig`'s own
-/// budget) the pane does not hold today, see the design note. `/status`
-/// needs live `StatusFacts` this pure function cannot produce, so
-/// `NativePaneRuntime::handle_composer_action` handles it directly instead
-/// of routing through here.
+/// budget) the pane does not hold today, see the design note. `/status` and
+/// `/context`/`/instructions` need live facts (`StatusFacts`/`context_view_
+/// facts`) this pure function cannot produce, so `NativePaneRuntime::
+/// handle_composer_action` handles both directly instead of routing through
+/// here.
 ///
 /// Returns `Some(notice)` for a recognised command (`notice` may be empty,
 /// e.g. `/clear`, which has nothing to report), `None` for anything else --
@@ -985,21 +987,10 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
         "/compact" => {
             Some("/compact is not yet wired to the native pane's compaction envelope".to_string())
         }
-        // Issue #538 (chunk B): the render path itself (`native_ux::
-        // render_context_view`) is real and tested; assembling its
-        // `ContextViewSource` list from a LIVE compile needs repo/home/
-        // config access `apply_slash_command` does not hold -- same shape of
-        // gap as `/status` above it. Rendered here with an empty source list
-        // and a placeholder version so the notice is honest about what is
-        // still missing rather than a bare string. See the design note.
-        "/context" | "/instructions" => {
-            let mut notice = super::native_ux::render_context_view(&[], "not yet wired", false);
-            notice.push_str(
-                "\n(live instruction provenance is not yet wired into this pane -- see the \
-                 design note)",
-            );
-            Some(notice)
-        }
+        // Issue #538 (chunk C): `/context`/`/instructions` need this pane's
+        // own live journal, so -- same shape of exception as `/status` --
+        // `NativePaneRuntime::handle_composer_action` handles them directly
+        // (`context_view_facts`) rather than through this pure helper.
         _ => None,
     }
 }
@@ -4123,6 +4114,55 @@ impl NativePaneRuntime {
         }
     }
 
+    /// Issue #538 (chunk C), decision 3: the live data the native `/context`
+    /// (alias `/instructions`) view needs -- read from the journal's own
+    /// most recent `ContextCompiled` event (`Journal::latest_event_of_type`,
+    /// the same read `zirv ctx sessions show`-style tooling would use), never
+    /// a fresh re-derivation from disk. That is deliberate: what shaped the
+    /// live session is exactly what was recorded when it compiled, which can
+    /// disagree with "what would `resolve_active_scope_instructions` say
+    /// right now" if a file changed again since. Returns `(rows, context_
+    /// version, found)`; `found` is `false` when nothing has compiled this
+    /// session yet (a fresh pane before its first turn).
+    fn context_view_facts(&self) -> (Vec<super::native_ux::ContextViewSource>, String, bool) {
+        let Ok(Some(stored)) = self
+            .journal
+            .latest_event_of_type(&self.session_id, "context_compiled")
+        else {
+            return (Vec::new(), "none yet".to_string(), false);
+        };
+        let JournalEvent::ContextCompiled {
+            context_version,
+            sources,
+            ..
+        } = stored.event
+        else {
+            return (Vec::new(), "none yet".to_string(), false);
+        };
+        let parsed: Vec<ResolvedInstructionSource> =
+            serde_json::from_value(sources).unwrap_or_default();
+        let rows = parsed
+            .into_iter()
+            .map(|source| super::native_ux::ContextViewSource {
+                path: source.path.display().to_string(),
+                trust: match source.trust {
+                    SourceTrust::Operator => "operator",
+                    _ => "repo-untrusted",
+                },
+                scope: source.scope,
+                // Issue #538 (chunk C): the journal's own `ContextCompiled`
+                // provenance does not carry a byte count (only path/scope/
+                // trust/decision/sha256) -- see the design note's chunk C
+                // section for why this is a deliberate, documented gap
+                // rather than a fresh re-read of each file's size.
+                bytes: 0,
+                sha256: source.sha256,
+                decision: source.decision,
+            })
+            .collect();
+        (rows, context_version, true)
+    }
+
     pub fn status_facts(&self) -> StatusFacts {
         StatusFacts {
             model: format!("{}/{}", self.route_model_vendor(), self.route_model_id()),
@@ -4197,6 +4237,24 @@ impl NativePaneRuntime {
                 facts.model,
                 status_label(classify_status(&facts)),
                 facts.billing
+            ));
+            return;
+        }
+        // Issue #538 (chunk C), decision 3: `/context`/`/instructions` need
+        // this pane's own live journal (`context_view_facts`), so -- same
+        // shape of exception as `/status` above -- they are handled here
+        // rather than in the pure `apply_slash_command` helper.
+        if matches!(text.trim(), "/context" | "/instructions") {
+            // `found` doubles as the render's "recompiled" flag: the journal
+            // has no cheap way to say "was THIS specific event tied to the
+            // most recent turn" without correlating turn ids across records,
+            // so `found` (a compile has been recorded at all) is the best
+            // available signal -- documented in the design note.
+            let (rows, context_version, found) = self.context_view_facts();
+            self.notice = Some(super::native_ux::render_context_view(
+                &rows,
+                &context_version,
+                found,
             ));
             return;
         }
@@ -6569,6 +6627,56 @@ mod tests {
             cwd: PathBuf::from("."),
             git_branch: None,
         }
+    }
+
+    /// Issue #538 (chunk C), decision 3: `/context` renders real rows from
+    /// the journal's own recorded provenance -- a repo `ZIRV.md` (`Included`)
+    /// and a same-content `AGENTS.md` (`Duplicate`, per chunk A's dedup
+    /// rule), both present with their decisions, not an empty placeholder.
+    #[test]
+    fn context_view_renders_both_a_zirv_md_and_a_shadowed_agents_md_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(repo.path().join("ZIRV.md"), "- always run tests\n").expect("write");
+        std::fs::write(repo.path().join("AGENTS.md"), "- always run tests\n").expect("write");
+
+        let mut pane = pane_fixture(&state, "s1", "sess-1", 1, None);
+        pane.repo = repo.path().to_path_buf();
+        pane.journal
+            .create_session(&identity_for("sess-1", 1))
+            .expect("create session");
+
+        let sources = super::super::runtime::context::resolve_active_scope_instructions(
+            repo.path(),
+            None,
+            &[],
+            1_000_000,
+        );
+        pane.journal
+            .record_context_compiled(
+                &pane.session_id,
+                pane.generation,
+                &EventScope::default(),
+                "test-context-version".to_string(),
+                serde_json::to_value(&sources).expect("serialize sources"),
+                1_000,
+            )
+            .expect("record context compiled");
+
+        pane.presentation.composer.draft = "/context".to_string();
+        pane.presentation.composer.cursor = pane.presentation.composer.draft.len();
+        pane.handle_composer_action(ComposerAction::Submit);
+
+        let notice = pane.notice.clone().expect("a /context notice was set");
+        assert!(notice.contains("test-context-version"), "{notice}");
+        assert!(notice.contains("ZIRV.md"), "{notice}");
+        assert!(notice.contains("AGENTS.md"), "{notice}");
+        assert!(notice.contains("included"), "{notice}");
+        assert!(
+            notice.contains("duplicate of"),
+            "the identical AGENTS.md must show its chunk A decision: {notice}"
+        );
     }
 
     #[test]
