@@ -44,6 +44,26 @@ pub enum Layer {
     ContextCommon,
     ContextClaude,
     ContextCodex,
+    /// zirv's own native instruction file (issue #538): `~/.zirv/ZIRV.md`.
+    /// Unlike `ContextCommon`/`ContextClaude`/`ContextCodex` (rendered by
+    /// zirv itself into a harness's native file), `ZIRV.md` is authored
+    /// directly and read as a sibling source alongside CLAUDE.md/AGENTS.md
+    /// -- see `context::within_tier_rank` for same-directory precedence
+    /// against those.
+    GlobalZirvMd,
+    /// `<repo>/ZIRV.md`, or `<repo>/.zirv/ZIRV.md` when the root file is
+    /// absent. Both may be collected as separate surfaces when both exist;
+    /// `context::resolve_instruction_winners` reports the `.zirv/ZIRV.md`
+    /// copy as shadowed by the root one, never the reverse.
+    RepoZirvMd,
+    NestedZirvMd,
+    /// The singular `AGENT.md` compatibility alias (issue #538): lowest
+    /// same-directory precedence, a candidate only when no `AGENTS.md`
+    /// exists in that directory, and always flagged with a migration
+    /// diagnostic recommending rename to `AGENTS.md`. Shares `AGENTS.md`'s
+    /// own provider (`Provider::Codex`) -- see `provider()` below.
+    RepoAgentMd,
+    NestedAgentMd,
 }
 
 /// Every `Layer` variant, in declaration order. Test-only: exists so a test
@@ -68,6 +88,11 @@ pub const ALL_LAYERS: &[Layer] = &[
     Layer::ContextCommon,
     Layer::ContextClaude,
     Layer::ContextCodex,
+    Layer::GlobalZirvMd,
+    Layer::RepoZirvMd,
+    Layer::NestedZirvMd,
+    Layer::RepoAgentMd,
+    Layer::NestedAgentMd,
 ];
 
 impl Layer {
@@ -87,6 +112,11 @@ impl Layer {
             Layer::ContextCommon => "zirv context common.md",
             Layer::ContextClaude => "zirv context claude.md",
             Layer::ContextCodex => "zirv context codex.md",
+            Layer::GlobalZirvMd => "global ZIRV.md",
+            Layer::RepoZirvMd => "repo ZIRV.md",
+            Layer::NestedZirvMd => "nested ZIRV.md",
+            Layer::RepoAgentMd => "repo AGENT.md",
+            Layer::NestedAgentMd => "nested AGENT.md",
         }
     }
 
@@ -105,10 +135,15 @@ impl Layer {
             Layer::GlobalAgentsMd
             | Layer::RepoAgentsMd
             | Layer::NestedAgentsMd
+            | Layer::RepoAgentMd
+            | Layer::NestedAgentMd
             | Layer::CodexUserSettings
             | Layer::CodexProjectSettings
             | Layer::ContextCodex => surface::Provider::Codex,
-            Layer::ContextCommon => surface::Provider::Zirv,
+            Layer::ContextCommon
+            | Layer::GlobalZirvMd
+            | Layer::RepoZirvMd
+            | Layer::NestedZirvMd => surface::Provider::Zirv,
             _ => surface::Provider::Claude,
         }
     }
@@ -123,7 +158,12 @@ impl Layer {
             | Layer::NestedAgentsMd
             | Layer::ContextCommon
             | Layer::ContextClaude
-            | Layer::ContextCodex => surface::Kind::Instructions,
+            | Layer::ContextCodex
+            | Layer::GlobalZirvMd
+            | Layer::RepoZirvMd
+            | Layer::NestedZirvMd
+            | Layer::RepoAgentMd
+            | Layer::NestedAgentMd => surface::Kind::Instructions,
             Layer::UserSettings
             | Layer::ProjectSettings
             | Layer::LocalSettings
@@ -137,15 +177,21 @@ impl Layer {
             Layer::GlobalClaudeMd
             | Layer::UserSettings
             | Layer::GlobalAgentsMd
-            | Layer::CodexUserSettings => surface::Scope::Global,
+            | Layer::CodexUserSettings
+            | Layer::GlobalZirvMd => surface::Scope::Global,
             Layer::RepoClaudeMd
             | Layer::ProjectSettings
             | Layer::RepoAgentsMd
             | Layer::CodexProjectSettings
             | Layer::ContextCommon
             | Layer::ContextClaude
-            | Layer::ContextCodex => surface::Scope::Repo,
-            Layer::NestedClaudeMd | Layer::NestedAgentsMd => surface::Scope::Nested,
+            | Layer::ContextCodex
+            | Layer::RepoZirvMd
+            | Layer::RepoAgentMd => surface::Scope::Repo,
+            Layer::NestedClaudeMd
+            | Layer::NestedAgentsMd
+            | Layer::NestedZirvMd
+            | Layer::NestedAgentMd => surface::Scope::Nested,
             Layer::LocalSettings => surface::Scope::LocalPrivate,
         }
     }
@@ -153,11 +199,8 @@ impl Layer {
     /// Derived from `scope()` alone (`surface::Scope::trust`) -- see that
     /// method's doc for why this is the property that makes a repo-owned
     /// layer's promotion to operator authority impossible by construction.
-    // No production caller yet, same as `provider()` above -- enforced by
-    // `repo_owned_layers_can_never_carry_operator_trust` until a later task
-    // consumes it directly (issue #39's "impossible by construction, or
-    // tested against").
-    #[allow(dead_code)]
+    /// Consumed by `context_status.rs`'s per-surface trust column (issue
+    /// #538) and by `repo_owned_layers_can_never_carry_operator_trust`.
     pub fn trust(&self) -> surface::Trust {
         self.scope().trust()
     }
@@ -232,8 +275,87 @@ fn read_capped(path: &Path, max_bytes: usize) -> Option<String> {
     Some(crate::utils::truncate_bytes(text, Some(max_bytes)))
 }
 
-fn push_surface(into: &mut Vec<Surface>, layer: Layer, path: PathBuf, max_bytes: usize) {
+/// A repo-owned instruction candidate this run refused to read as content,
+/// with the reason -- issue #538's "record the exclusion instead of
+/// skipping silently", the same posture `runtime/context.rs::push_file`
+/// already holds for the native compiler. Never dropped: `context::
+/// resolve_instruction_winners` reports every one of these as `Excluded`
+/// (or, when a symlink's target resolves to its directory's winner,
+/// `Duplicate`) rather than the collector simply omitting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exclusion {
+    pub layer: Layer,
+    pub path: PathBuf,
+    pub reason: &'static str,
+    /// The symlink's link target, resolved relative to its own directory,
+    /// when `reason` names a symlinked source and the target could be read
+    /// (`fs::read_link`). `None` for a non-symlink exclusion (unreadable
+    /// metadata, not a regular file) or an unreadable link target.
+    pub symlink_target: Option<PathBuf>,
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// Resolves a symlink instruction candidate's link target relative to its
+/// own directory, without ever reading the target's content -- only
+/// `fs::read_link` (the link text itself), never `fs::read_to_string`.
+fn symlink_target(path: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_link(path).ok()?;
+    let dir = path.parent()?;
+    Some(normalize_lexically(dir, &raw))
+}
+
+/// Lexically joins `target` onto `dir` and collapses `.`/`..` components
+/// without touching the filesystem (no `canonicalize`, which would fail for
+/// a dangling or not-yet-existing target). An absolute `target` is used
+/// as-is.
+pub(crate) fn normalize_lexically(dir: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        return target.to_path_buf();
+    }
+    let mut result = dir.to_path_buf();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::Normal(seg) => result.push(seg),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                result.push(component.as_os_str());
+            }
+        }
+    }
+    result
+}
+
+/// Reads `path` into a `Surface` under `layer`, capped at `max_bytes`, unless
+/// the surface cap is already full. A symlinked instruction file is refused
+/// (never read through -- its target is not this repository's own
+/// configuration, mirroring `runtime/context.rs::push_file`'s refusal) and
+/// recorded into `excluded` instead of silently vanishing (issue #538).
+/// Settings/canonical layers are never symlink-checked here: only
+/// `Kind::Instructions` sources are in scope for this issue's same-directory
+/// precedence and dedup work.
+fn push_surface_tracking(
+    into: &mut Vec<Surface>,
+    excluded: &mut Vec<Exclusion>,
+    layer: Layer,
+    path: PathBuf,
+    max_bytes: usize,
+) {
     if into.len() >= MAX_SURFACES {
+        return;
+    }
+    if layer.kind() == surface::Kind::Instructions && is_symlink(&path) {
+        excluded.push(Exclusion {
+            layer,
+            symlink_target: symlink_target(&path),
+            path,
+            reason: "symlinked instruction file",
+        });
         return;
     }
     if let Some(text) = read_capped(&path, max_bytes) {
@@ -241,15 +363,33 @@ fn push_surface(into: &mut Vec<Surface>, layer: Layer, path: PathBuf, max_bytes:
     }
 }
 
-/// Every nested `CLAUDE.md` and every nested `AGENTS.md` found in a
-/// subdirectory of `repo`, up to `MAX_NESTED_DEPTH`, collected in one tree
-/// walk rather than two -- issue #40's review flagged the doubled directory
-/// walk once a second instruction-file convention started sharing this
-/// cap-sensitive path with the first. Same depth cap, same symlink-escape
-/// posture, same skipped directories as the original single-filename walk.
-fn nested_instruction_files(repo: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut claude = Vec::new();
-    let mut agents = Vec::new();
+/// The four nested instruction-file vectors `nested_instruction_files`
+/// collects, plus exclusions found along the way. `agent_singular` is
+/// collected unconditionally -- whether it is actually a usable candidate
+/// (only when no sibling `AGENTS.md` exists in the same directory) is
+/// `context::resolve_instruction_winners`'s call, not the collector's; the
+/// collector's job is only to find every candidate and never drop one
+/// silently.
+#[derive(Debug, Default)]
+pub struct NestedInstructionFiles {
+    pub claude: Vec<PathBuf>,
+    pub agents: Vec<PathBuf>,
+    pub zirv: Vec<PathBuf>,
+    pub agent_singular: Vec<PathBuf>,
+    pub excluded: Vec<Exclusion>,
+}
+
+/// Every nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md` and singular `AGENT.md`
+/// found in a subdirectory of `repo`, up to `MAX_NESTED_DEPTH`, collected in
+/// one tree walk rather than four -- issue #40's review flagged the doubled
+/// directory walk once a second instruction-file convention started sharing
+/// this cap-sensitive path with the first; issue #538 adds two more
+/// conventions to the same walk rather than adding new ones. Same depth cap,
+/// same symlink-escape posture, same skipped directories as the original
+/// single-filename walk -- except a symlinked directory or file is now
+/// recorded as an `Exclusion` rather than silently skipped.
+fn nested_instruction_files(repo: &Path) -> NestedInstructionFiles {
+    let mut out = NestedInstructionFiles::default();
     let mut stack = vec![(repo.to_path_buf(), 0usize)];
 
     while let Some((dir, depth)) = stack.pop() {
@@ -266,6 +406,21 @@ fn nested_instruction_files(repo: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
             // way is read into the report and shipped to the model. Whatever a
             // link points at is not this repository's configuration.
             if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                if path.is_dir() {
+                    // `layer` names no single instruction file here -- an
+                    // entire directory was skipped, not one candidate file --
+                    // so this carries a placeholder (`NestedClaudeMd`, the
+                    // most representative nested layer) purely so `Exclusion`
+                    // does not need an `Option<Layer>` for this one case.
+                    // Callers key off `reason`/`path`, never this field, for
+                    // a directory exclusion.
+                    out.excluded.push(Exclusion {
+                        layer: Layer::NestedClaudeMd,
+                        symlink_target: symlink_target(&path),
+                        path,
+                        reason: "symlinked directory",
+                    });
+                }
                 continue;
             }
             if !path.is_dir() {
@@ -277,22 +432,53 @@ fn nested_instruction_files(repo: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            let claude_candidate = path.join("CLAUDE.md");
-            if claude_candidate.is_file() {
-                claude.push(claude_candidate);
+            // One candidate check per nested instruction-file kind, returning
+            // either a found path or an exclusion rather than mutating two
+            // different fields of `out` at once.
+            fn check(
+                dir: &Path,
+                filename: &str,
+                layer: Layer,
+            ) -> Result<Option<PathBuf>, Exclusion> {
+                let candidate = dir.join(filename);
+                if is_symlink(&candidate) {
+                    return Err(Exclusion {
+                        layer,
+                        symlink_target: symlink_target(&candidate),
+                        path: candidate,
+                        reason: "symlinked instruction file",
+                    });
+                }
+                Ok(candidate.is_file().then_some(candidate))
             }
-            let agents_candidate = path.join("AGENTS.md");
-            if agents_candidate.is_file() {
-                agents.push(agents_candidate);
+            for (filename, layer, bucket) in [
+                ("ZIRV.md", Layer::NestedZirvMd, 0u8),
+                ("AGENTS.md", Layer::NestedAgentsMd, 1u8),
+                ("CLAUDE.md", Layer::NestedClaudeMd, 2u8),
+                ("AGENT.md", Layer::NestedAgentMd, 3u8),
+            ] {
+                match check(&path, filename, layer) {
+                    Ok(Some(found)) => match bucket {
+                        0 => out.zirv.push(found),
+                        1 => out.agents.push(found),
+                        2 => out.claude.push(found),
+                        _ => out.agent_singular.push(found),
+                    },
+                    Ok(None) => {}
+                    Err(exclusion) => out.excluded.push(exclusion),
+                }
             }
             stack.push((path, depth + 1));
         }
     }
 
     // Sorted so two runs over the same tree report in the same order.
-    claude.sort();
-    agents.sort();
-    (claude, agents)
+    out.claude.sort();
+    out.agents.sort();
+    out.zirv.sort();
+    out.agent_singular.sort();
+    out.excluded.sort_by(|a, b| a.path.cmp(&b.path));
+    out
 }
 
 /// Every configuration surface that steers a session in this repo, in a fixed
@@ -310,23 +496,78 @@ fn nested_instruction_files(repo: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// so a large monorepo could silently lose every settings surface instead;
 /// see `settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap`).
 pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> Vec<Surface> {
+    collect_surfaces_and_exclusions(home, repo, max_bytes).0
+}
+
+/// Every repo-owned instruction candidate `collect_surfaces` refused to read
+/// as content this run -- a symlinked `ZIRV.md`/`AGENTS.md`/`CLAUDE.md`/
+/// `AGENT.md` at any scope, or a symlinked directory the nested walk would
+/// otherwise have descended into (issue #538). Same walk as `collect_
+/// surfaces`, so this can never disagree with what it actually collected;
+/// see `collect_surfaces_and_exclusions`.
+pub fn collect_instruction_exclusions(
+    home: Option<&Path>,
+    repo: &Path,
+    max_bytes: usize,
+) -> Vec<Exclusion> {
+    collect_surfaces_and_exclusions(home, repo, max_bytes).1
+}
+
+/// Every configuration surface that steers a session in this repo, in a fixed
+/// order, plus every instruction candidate refused along the way (issue
+/// #538's `Exclusion`s). Missing files are simply absent: most repos have
+/// only some of these. `collect_surfaces`/`collect_instruction_exclusions`
+/// are thin `.0`/`.1` projections of this single walk, so the two views can
+/// never disagree about what was actually found on disk.
+///
+/// Every fixed-path surface (both providers' global/repo instructions, both
+/// providers' settings) is pushed before either nested walk runs. Nested
+/// discovery is open-ended -- a large enough monorepo can genuinely produce
+/// more nested `CLAUDE.md`/`AGENTS.md` files than `MAX_SURFACES` -- and
+/// `push_surface` silently stops once the cap is hit. Pushing the nested
+/// walks last means an oversized nested count can only crowd out further
+/// nested surfaces, never the fixed settings surfaces the dead-reference
+/// lint depends on (a prior ordering pushed the nested walk before settings,
+/// so a large monorepo could silently lose every settings surface instead;
+/// see `settings_surfaces_survive_even_when_nested_instruction_files_exceed_the_cap`).
+///
+/// Within every directory, `ZIRV.md` is pushed ahead of the compatibility
+/// files (`AGENTS.md`/`CLAUDE.md`/`AGENT.md`, in that order) so `MAX_SURFACES`
+/// can never drop a `ZIRV.md` candidate in favour of one of them -- see
+/// `zirv_md_survives_the_surface_cap_ahead_of_compatibility_files`.
+fn collect_surfaces_and_exclusions(
+    home: Option<&Path>,
+    repo: &Path,
+    max_bytes: usize,
+) -> (Vec<Surface>, Vec<Exclusion>) {
     let mut surfaces = Vec::new();
+    let mut excluded = Vec::new();
 
     if let Some(home) = home {
-        push_surface(
+        push_surface_tracking(
             &mut surfaces,
+            &mut excluded,
+            Layer::GlobalZirvMd,
+            home.join(".zirv").join("ZIRV.md"),
+            max_bytes,
+        );
+        push_surface_tracking(
+            &mut surfaces,
+            &mut excluded,
             Layer::GlobalClaudeMd,
             home.join("CLAUDE.md"),
             max_bytes,
         );
-        push_surface(
+        push_surface_tracking(
             &mut surfaces,
+            &mut excluded,
             Layer::GlobalClaudeMd,
             home.join(".claude").join("CLAUDE.md"),
             max_bytes,
         );
-        push_surface(
+        push_surface_tracking(
             &mut surfaces,
+            &mut excluded,
             Layer::GlobalAgentsMd,
             home.join(".codex").join("AGENTS.md"),
             max_bytes,
@@ -342,80 +583,146 @@ pub fn collect_surfaces(home: Option<&Path>, repo: &Path, max_bytes: usize) -> V
     // directly contradicting `drift.rs`'s "the native copy is the redundant
     // one" finding. Repo-owned and entirely optional in every part, read the
     // same capped/absent-is-fine way as every other fixed-path surface here.
-    push_surface(
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
         Layer::ContextCommon,
         context::common_path(repo),
         max_bytes,
     );
-    push_surface(
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
         Layer::ContextClaude,
         context::claude_path(repo),
         max_bytes,
     );
-    push_surface(
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
         Layer::ContextCodex,
         context::codex_path(repo),
         max_bytes,
     );
 
-    push_surface(
+    // Issue #538: `ZIRV.md` candidates first (both the root file and the
+    // `.zirv/` fallback -- `context::resolve_instruction_winners` shadows the
+    // latter by the former when both exist), then the compatibility files in
+    // `context::within_tier_rank` order.
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
+        Layer::RepoZirvMd,
+        repo.join("ZIRV.md"),
+        max_bytes,
+    );
+    push_surface_tracking(
+        &mut surfaces,
+        &mut excluded,
+        Layer::RepoZirvMd,
+        repo.join(".zirv").join("ZIRV.md"),
+        max_bytes,
+    );
+    push_surface_tracking(
+        &mut surfaces,
+        &mut excluded,
         Layer::RepoClaudeMd,
         repo.join("CLAUDE.md"),
         max_bytes,
     );
-    push_surface(
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
         Layer::RepoAgentsMd,
         repo.join("AGENTS.md"),
         max_bytes,
     );
+    push_surface_tracking(
+        &mut surfaces,
+        &mut excluded,
+        Layer::RepoAgentMd,
+        repo.join("AGENT.md"),
+        max_bytes,
+    );
 
     if let Some(home) = home {
-        push_surface(
+        push_surface_tracking(
             &mut surfaces,
+            &mut excluded,
             Layer::UserSettings,
             home.join(".claude").join("settings.json"),
             max_bytes,
         );
-        push_surface(
+        push_surface_tracking(
             &mut surfaces,
+            &mut excluded,
             Layer::CodexUserSettings,
             home.join(".codex").join("config.toml"),
             max_bytes,
         );
     }
-    push_surface(
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
         Layer::ProjectSettings,
         repo.join(".claude").join("settings.json"),
         max_bytes,
     );
-    push_surface(
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
         Layer::CodexProjectSettings,
         repo.join(".codex").join("config.toml"),
         max_bytes,
     );
-    push_surface(
+    push_surface_tracking(
         &mut surfaces,
+        &mut excluded,
         Layer::LocalSettings,
         repo.join(".claude").join("settings.local.json"),
         max_bytes,
     );
 
-    let (nested_claude, nested_agents) = nested_instruction_files(repo);
-    for path in nested_claude {
-        push_surface(&mut surfaces, Layer::NestedClaudeMd, path, max_bytes);
+    let nested = nested_instruction_files(repo);
+    for path in nested.zirv {
+        push_surface_tracking(
+            &mut surfaces,
+            &mut excluded,
+            Layer::NestedZirvMd,
+            path,
+            max_bytes,
+        );
     }
-    for path in nested_agents {
-        push_surface(&mut surfaces, Layer::NestedAgentsMd, path, max_bytes);
+    for path in nested.claude {
+        push_surface_tracking(
+            &mut surfaces,
+            &mut excluded,
+            Layer::NestedClaudeMd,
+            path,
+            max_bytes,
+        );
     }
+    for path in nested.agents {
+        push_surface_tracking(
+            &mut surfaces,
+            &mut excluded,
+            Layer::NestedAgentsMd,
+            path,
+            max_bytes,
+        );
+    }
+    for path in nested.agent_singular {
+        push_surface_tracking(
+            &mut surfaces,
+            &mut excluded,
+            Layer::NestedAgentMd,
+            path,
+            max_bytes,
+        );
+    }
+    excluded.extend(nested.excluded);
 
-    surfaces
+    (surfaces, excluded)
 }
 
 fn strip_bullet(line: &str) -> Option<&str> {
@@ -2598,6 +2905,156 @@ mod tests {
         assert_eq!(surfaces.len(), claude_count + codex_count);
     }
 
+    /// Issue #538: `ZIRV.md` is collected at every scope the file-and-
+    /// precedence contract names -- operator-global, repo root, and nested.
+    #[test]
+    fn zirv_md_is_collected_at_global_repo_and_nested_scopes() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home/.zirv");
+        std::fs::write(home.join(".zirv/ZIRV.md"), "# global zirv\n- global rule\n")
+            .expect("write");
+        std::fs::write(repo.join("ZIRV.md"), "# repo zirv\n- repo rule\n").expect("write");
+        std::fs::write(
+            repo.join("crates/inner/ZIRV.md"),
+            "# nested zirv\n- nested rule\n",
+        )
+        .expect("write");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+
+        let global = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::GlobalZirvMd)
+            .expect("global ZIRV.md present");
+        assert!(global.text.contains("global rule"));
+
+        let repo_surface = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::RepoZirvMd && s.path == repo.join("ZIRV.md"))
+            .expect("repo ZIRV.md present");
+        assert!(repo_surface.text.contains("repo rule"));
+
+        let nested = surfaces
+            .iter()
+            .find(|s| s.layer == Layer::NestedZirvMd)
+            .expect("nested ZIRV.md present");
+        assert!(nested.text.contains("nested rule"));
+    }
+
+    /// Issue #538: when both `<repo>/ZIRV.md` and `<repo>/.zirv/ZIRV.md`
+    /// exist, both are collected as separate surfaces (so the fallback copy
+    /// can be reported, not silently dropped) -- the shadowing decision
+    /// itself is `context::resolve_instruction_winners`'s job.
+    #[test]
+    fn both_root_and_dot_zirv_zirv_md_are_collected_when_both_exist() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::write(repo.join("ZIRV.md"), "# root\n").expect("write");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("mkdir");
+        std::fs::write(repo.join(".zirv/ZIRV.md"), "# fallback\n").expect("write");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        let zirv_md: Vec<&Surface> = surfaces
+            .iter()
+            .filter(|s| s.layer == Layer::RepoZirvMd)
+            .collect();
+        assert_eq!(zirv_md.len(), 2, "{surfaces:#?}");
+        assert!(zirv_md.iter().any(|s| s.path == repo.join("ZIRV.md")));
+        assert!(
+            zirv_md
+                .iter()
+                .any(|s| s.path == repo.join(".zirv").join("ZIRV.md"))
+        );
+    }
+
+    /// Issue #538: the singular `AGENT.md` compatibility alias is collected
+    /// at repo and nested scope (not global -- the file contract names only
+    /// repo/nested for the compatibility alias).
+    #[test]
+    fn singular_agent_md_is_collected_at_repo_and_nested_scope() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::write(repo.join("AGENT.md"), "# repo agent\n- old convention\n").expect("write");
+        std::fs::write(
+            repo.join("crates/inner/AGENT.md"),
+            "# nested agent\n- old convention\n",
+        )
+        .expect("write");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert!(surfaces.iter().any(|s| s.layer == Layer::RepoAgentMd));
+        assert!(surfaces.iter().any(|s| s.layer == Layer::NestedAgentMd));
+    }
+
+    /// Issue #538, item 5: `ZIRV.md` candidates are pushed ahead of every
+    /// compatibility file at repo AND nested scope, so `MAX_SURFACES` can
+    /// never drop a `ZIRV.md` in favour of a `CLAUDE.md`/`AGENTS.md`/
+    /// `AGENT.md`. A repo with `ZIRV.md` plus enough nested `CLAUDE.md`
+    /// files to blow the cap must still keep the `ZIRV.md` surface.
+    #[test]
+    fn zirv_md_survives_the_surface_cap_ahead_of_compatibility_files() {
+        let (_tmp, home, repo) = fixture_tree();
+        std::fs::write(repo.join("ZIRV.md"), "# repo zirv\n").expect("write");
+        for i in 0..MAX_SURFACES + 10 {
+            let dir = repo.join(format!("crates/gen{i}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("CLAUDE.md"), format!("# gen {i}\n")).expect("write");
+        }
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert_eq!(surfaces.len(), MAX_SURFACES, "still capped overall");
+        assert!(
+            surfaces
+                .iter()
+                .any(|s| s.layer == Layer::RepoZirvMd && s.path == repo.join("ZIRV.md")),
+            "ZIRV.md must never be crowded out by the nested CLAUDE.md flood: {surfaces:#?}"
+        );
+    }
+
+    /// Issue #538, item 3 / the collector-side half of "record the
+    /// exclusion instead of skipping silently": a symlinked instruction file
+    /// is never read through (its target is not this repository's own
+    /// configuration), and its refusal is reported via `Exclusion`, not
+    /// merely absent from the surfaces list.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_instruction_files_are_excluded_not_skipped() {
+        let (_tmp, home, repo) = fixture_tree();
+        let outside = repo.join("outside-target.md");
+        std::fs::write(&outside, "not this repo's own configuration\n").expect("write");
+        std::os::unix::fs::symlink(&outside, repo.join("ZIRV.md")).expect("symlink");
+        std::os::unix::fs::symlink(&outside, repo.join("crates/inner").join("AGENT.md"))
+            .expect("symlink");
+
+        let surfaces = collect_surfaces(Some(&home), &repo, 1_000_000);
+        assert!(
+            surfaces
+                .iter()
+                .all(|s| !s.text.contains("not this repo's own configuration")),
+            "a symlinked instruction file must never be read through: {surfaces:#?}"
+        );
+        assert!(
+            surfaces
+                .iter()
+                .all(|s| s.path != repo.join("ZIRV.md") && s.layer != Layer::NestedAgentMd),
+            "a symlinked instruction file must not appear as an ordinary surface: {surfaces:#?}"
+        );
+
+        let excluded = collect_instruction_exclusions(Some(&home), &repo, 1_000_000);
+        assert!(
+            excluded
+                .iter()
+                .any(|e| e.path == repo.join("ZIRV.md") && e.reason.contains("symlinked")),
+            "the refusal must be recorded, not silent: {excluded:#?}"
+        );
+        assert!(
+            excluded
+                .iter()
+                .any(|e| e.path.ends_with(Path::new("AGENT.md"))
+                    && e.path.to_string_lossy().contains("inner")
+                    && e.reason.contains("symlinked")),
+            "{excluded:#?}"
+        );
+    }
+
     /// Issue #41: the canonical `.zirv/context/` layer is optional in every
     /// part -- a repo with none of the three files analyses to nothing extra,
     /// exactly like a repo with no CLAUDE.md today.
@@ -2831,6 +3288,11 @@ mod tests {
                 Layer::ContextCommon => 11,
                 Layer::ContextClaude => 12,
                 Layer::ContextCodex => 13,
+                Layer::GlobalZirvMd => 14,
+                Layer::RepoZirvMd => 15,
+                Layer::NestedZirvMd => 16,
+                Layer::RepoAgentMd => 17,
+                Layer::NestedAgentMd => 18,
             }
         }
 
@@ -3257,6 +3719,7 @@ mod tests {
         assert_eq!(Layer::UserSettings.trust(), surface::Trust::Operator);
         assert_eq!(Layer::GlobalAgentsMd.trust(), surface::Trust::Operator);
         assert_eq!(Layer::CodexUserSettings.trust(), surface::Trust::Operator);
+        assert_eq!(Layer::GlobalZirvMd.trust(), surface::Trust::Operator);
         for layer in [
             Layer::RepoClaudeMd,
             Layer::NestedClaudeMd,
@@ -3268,6 +3731,10 @@ mod tests {
             Layer::ContextCommon,
             Layer::ContextClaude,
             Layer::ContextCodex,
+            Layer::RepoZirvMd,
+            Layer::NestedZirvMd,
+            Layer::RepoAgentMd,
+            Layer::NestedAgentMd,
         ] {
             assert_eq!(
                 layer.trust(),
