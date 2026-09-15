@@ -7600,6 +7600,7 @@ mod tests {
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
+        let modes_for_writer = modes.clone();
         let writer = std::thread::spawn(move || {
             // No session-env log for codex (it never receives `--session-id`
             // at all -- see the fixture's own doc comment), so liveness is
@@ -7610,6 +7611,9 @@ mod tests {
             // nudging -- see `wait_for_live_session_or_panic`'s own doc
             // comment.
             wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
+            // Registration precedes the fixture consuming its first mode.
+            // Wait for readiness so killing it cannot leave `hang` for the relaunch.
+            wait_for_first_line_or_panic(&modes_for_writer, "healthy", Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
@@ -7793,12 +7797,16 @@ mod tests {
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
+        let modes_for_writer = modes.clone();
         let writer = std::thread::spawn(move || {
             // 20s, not the old 5s: honest against this test's own 30s exec
             // timeout, and a give-up now panics instead of silently never
             // nudging -- see `wait_for_live_session_or_panic`'s own doc
             // comment.
             wait_for_live_session_or_panic(&state_for_writer, Duration::from_secs(20));
+            // Registration precedes the fixture consuming its first mode.
+            // Wait for readiness so killing it cannot leave `hang` for the relaunch.
+            wait_for_first_line_or_panic(&modes_for_writer, "healthy", Duration::from_secs(20));
             nudge_live_session(
                 &state_for_writer,
                 &repo_for_writer,
