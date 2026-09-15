@@ -393,15 +393,17 @@ no new "minimal accessor" shared with `/status`: `NativePaneRuntime` already
 holds a live `journal: Journal` and `session_id`, so the read is a single
 existing method call. `ResolvedInstructionSource`/`SourceTrust` gained
 `Deserialize` so the journal's stored JSON round-trips back into typed rows.
-One documented simplification: the journal's `ContextCompiled` provenance
-carries path/scope/trust/decision/sha256 but no byte count, so the live
-view's `ContextViewSource.bytes` is `0` rather than a fresh per-file
-re-read (which would reintroduce the same "could disagree with what
-actually shaped the session" problem this decision's whole design avoids).
-`recompiled_last_turn` in the render is also simplified to "a compile has
+**Review fix**: the journal's `ContextCompiled` provenance
+(`ResolvedInstructionSource`) now carries `raw_bytes` alongside path/scope/
+trust/decision/sha256 -- populated once, at compile/recompile time, from the
+same already-collected surface text `sha256` is computed from, so no
+additional filesystem read was needed to close this gap; the live view's
+`ContextViewSource.bytes` is the file's real size, not a placeholder.
+`recompiled_last_turn` in the render is still simplified to "a compile has
 been recorded at all" rather than a true turn-by-turn correlation, which
 would need matching `EventScope::turn` ids across records with no cheap
-existing read for it.
+existing read for it -- this one remains a documented gap, not a claim of
+full parity with `zirv context status`.
 
 **Migration command** (decision 4). `zirv context sync --init-zirv-md` joins
 the existing `report`/`import`/`generate` `ArgGroup` (now four mutually
