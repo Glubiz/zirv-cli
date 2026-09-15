@@ -133,6 +133,16 @@ pub struct Classification {
     pub risk_score: u16,
     pub changed_files: usize,
     pub changed_lines: usize,
+    /// The changed paths themselves, bounded (issue #541 chunk C, decision
+    /// 3): the team compiler needs REAL path boundaries to split implementer
+    /// seats by claim, not just a count. Capped at
+    /// [`MAX_CHANGED_PATHS`] so a huge diff never inflates a durable
+    /// classification or a persisted `TeamPlan`; `changed_files` above stays
+    /// the true total even when this list was truncated. Older durable state
+    /// defaults safely to empty, which the team compiler treats exactly like
+    /// "no path detail available" (falls back to bucketing by count).
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
     /// The change surface was declared on the command line (`--path`/
     /// `--changed-lines`) rather than measured from Git. Consumers can tell a
     /// measured classification from a stated one; the risk band itself is
@@ -313,12 +323,21 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         risk_score: score,
         changed_files,
         changed_lines: input.changed_lines,
+        changed_paths: lowered_paths
+            .iter()
+            .take(MAX_CHANGED_PATHS)
+            .cloned()
+            .collect(),
         declared_scope: false,
         work_domain,
         risk_measurement: RiskMeasurement::Measured,
         reasons,
     })
 }
+
+/// Bounded so a huge diff never inflates a durable classification or a
+/// persisted `TeamPlan` (issue #541 chunk C, decision 3).
+pub const MAX_CHANGED_PATHS: usize = 200;
 
 fn infer_work_domain(task: &str, paths: &[PathBuf]) -> DomainClassification {
     let mut score = 0u8;
@@ -769,6 +788,38 @@ mod tests {
     fn identical_inputs_produce_identical_classification() {
         let value = input(&["src/lib.rs"], 12);
         assert_eq!(classify(&value).unwrap(), classify(&value).unwrap());
+    }
+
+    /// Issue #541 chunk C, decision 3: the team compiler needs the REAL
+    /// changed-path list to split implementer seats by claim boundary, not
+    /// just a count -- `changed_files` alone (a count) cannot do that.
+    #[test]
+    fn classification_keeps_the_changed_paths() {
+        let value = input(&["src/A.rs", "docs/readme.md"], 10);
+        let classification = classify(&value).unwrap();
+        assert_eq!(classification.changed_files, 2);
+        // Lowercased and forward-slashed, matching the path signal matching
+        // the rest of this function already does -- one normalized form, not
+        // a second one only this field uses.
+        assert_eq!(
+            classification.changed_paths,
+            vec!["src/a.rs".to_string(), "docs/readme.md".to_string()]
+        );
+    }
+
+    /// A huge diff never inflates a durable classification or a persisted
+    /// `TeamPlan`: `changed_paths` is capped at [`MAX_CHANGED_PATHS`] while
+    /// `changed_files` keeps the true total.
+    #[test]
+    fn changed_paths_is_bounded_but_changed_files_keeps_the_true_total() {
+        let paths: Vec<String> = (0..(MAX_CHANGED_PATHS + 20))
+            .map(|n| format!("src/file{n}.rs"))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let value = input(&refs, 10);
+        let classification = classify(&value).unwrap();
+        assert_eq!(classification.changed_files, MAX_CHANGED_PATHS + 20);
+        assert_eq!(classification.changed_paths.len(), MAX_CHANGED_PATHS);
     }
 
     #[test]

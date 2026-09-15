@@ -3884,6 +3884,7 @@ mod tests {
             risk_score: 0,
             changed_files: 1,
             changed_lines: 5,
+            changed_paths: Vec::new(),
             declared_scope: false,
             work_domain: Default::default(),
             risk_measurement: classify::RiskMeasurement::Measured,

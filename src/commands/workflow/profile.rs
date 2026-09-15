@@ -330,6 +330,7 @@ mod tests {
             risk_score: 0,
             changed_files: 0,
             changed_lines: 0,
+            changed_paths: Vec::new(),
             declared_scope: false,
             work_domain: DomainClassification::default(),
             risk_measurement: RiskMeasurement::Measured,
