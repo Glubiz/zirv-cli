@@ -7353,7 +7353,7 @@ fn escape_denied_by_screen(candidate: &str) -> bool {
 /// residual is the accepted interpreter-opacity tradeoff recorded in the
 /// workflow spec's risk table -- this closes only the literal, demonstrated
 /// vector.
-fn text_names_credential_material(candidate: &str) -> bool {
+pub(crate) fn text_names_credential_material(candidate: &str) -> bool {
     const FRAGMENTS: &[&str] = &[
         ".ssh/",
         "id_rsa",
