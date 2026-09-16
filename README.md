@@ -2926,6 +2926,9 @@ name is reserved for this automatic entry during the launch. No project or
 user host settings are edited. On Windows, Zirv writes Claude's generated JSON
 under the private state directory's `mcp-launch/` to keep JSON off shell-shim
 command lines; users do not create or maintain that file.
+Claude launches also pre-approve the bridge's seven named read-only tools so
+headless `dontAsk` sessions can use them. Native deny/ask rules and the server's
+current policy gates still apply; other servers receive no added permissions.
 
 Set `ZIRV_CTX_MCP_AUTOREGISTER=0` (also `false` or `off`) to opt out.
 Claude's explicit `--strict-mcp-config` is respected and suppresses automatic
