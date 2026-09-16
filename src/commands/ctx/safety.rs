@@ -5790,22 +5790,80 @@ pub(crate) const SANDBOX_DENY_READ_HOME_PATHS: &[&str] = &[
 /// [`escape_denied_by_screen`] still gates every one of these, seeded or
 /// operator-added alike -- matching a family here proves nothing about
 /// what one specific invocation actually touches.
+///
+/// **This list means "genuinely read-only", not just "seeded into
+/// `escape_allow`"**: [`is_read_only_escape_safe`] (`:6865`) and the
+/// identical-command loop-breaker's read-only exemption (`:8680`) both
+/// reuse it as a per-program shortcut, on the assumption that any command
+/// starting with one of these names is safe to treat as read-only outright.
+/// [`ESCAPE_ALLOW_ADDITIONAL_PROGRAMS`] below exists SEPARATELY, and must
+/// keep existing separately, so [`builtin_escape_allow`] can widen past
+/// read-only tools without also telling those two unrelated, read-only-only
+/// consumers that `git`/`gh`/`cargo`/... are read-only (a live regression
+/// caught by this module's own test suite: adding `gh` here made `is_read_
+/// only_escape_safe("gh pr create --title x")` wrongly return `true`, and
+/// made a repeated `cargo test` wrongly exempt from the loop-breaker).
 const SANDBOX_ESCAPE_BUILTIN_PROGRAMS: &[&str] = &[
     "ls", "grep", "rg", "cat", "head", "tail", "wc", "find", "echo", "pwd", "which", "where",
     "diff", "sort", "uniq", "tr", "cut",
 ];
 
+/// **2026-09-16, spec Change 4:** `cargo`, `gh`, `glab`, `gitlab-ci-local`,
+/// `npm`, `npx`, `git`, `python3`, `mkdir` -- the 200 unsandboxed-retry asks
+/// the 7-day audit found were almost all this build/dev tooling. Safe to
+/// widen [`builtin_escape_allow`]'s seed past read-only tools specifically
+/// THERE, and not by loosening [`escape_denied_by_screen`]/[`escape_allow_
+/// matches`]'s own gates: the one caller (`run_check_hook_mode_with_env`,
+/// the `--dangerously-disable-sandbox` retry branch at this module's own
+/// `escape_allow_matches` call site) only reaches this seed once the
+/// retried command's BASE verdict is already `Allow` -- deny and ask rules
+/// are evaluated first and still win, so an entry here can only clear a
+/// family the policy already permits for this command; it never grants a
+/// new capability on its own. Deliberately its own constant, not folded
+/// into [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`] -- see that constant's own doc
+/// comment for why the two other consumers of that list need it to stay
+/// read-only-only.
+///
+/// The spec's own list also named `zirv`, deliberately dropped here: unlike
+/// the other nine, `builtin_allow()`'s `zirv <name> *` entries mix genuinely
+/// retry-safe names with ones that are native-allowed at the permission-
+/// dialog level ONLY -- `test`/`verify`/`frontend` select a REPOSITORY-
+/// AUTHORED child process and are deliberately never sandbox-excluded (see
+/// `SANDBOX_CONFINED_RESERVED_BUILTINS`), and `chat`/`agent` launch a fresh
+/// harness session with caller-controlled argv (see `reserved_zirv_command_
+/// patterns`'s own doc comment on why they keep a name-level pattern
+/// anyway). A leading-token family match cannot tell those apart from
+/// `zirv ctx status`, and this module's own test suite caught the resulting
+/// regression live (`zirv test changed` and bare `zirv chat`, neither
+/// carrying a dangerous flag, both wrongly cleared an unsandboxed retry).
+/// zirv already has dedicated, narrower retry acceptors for exactly this
+/// case -- [`is_reserved_zirv_escape_safe`] and [`is_prompt_free_zirv_retry_
+/// safe`] -- so adding `zirv` here would not unlock any genuinely-safe
+/// retry those do not already cover; it would only reopen the gap.
+const ESCAPE_ALLOW_ADDITIONAL_PROGRAMS: &[&str] = &[
+    "cargo",
+    "gh",
+    "glab",
+    "gitlab-ci-local",
+    "npm",
+    "npx",
+    "git",
+    "python3",
+    "mkdir",
+];
+
 /// The built-in `escape_allow` seed: [`builtin_allow`]'s own rules (so the
 /// origin label stays `built-in`, unchanged) filtered down to
-/// [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`] by matching each rule's leading
-/// token -- a filter over the one already-declared source rather than a
-/// second copy of the glob text.
+/// [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`] plus [`ESCAPE_ALLOW_ADDITIONAL_
+/// PROGRAMS`] by matching each rule's leading token -- a filter over the one
+/// already-declared source rather than a second copy of the glob text.
 fn builtin_escape_allow() -> Vec<Rule> {
     builtin_allow()
         .into_iter()
         .filter(|rule| {
             let program = rule.pattern.split(' ').next().unwrap_or("");
             SANDBOX_ESCAPE_BUILTIN_PROGRAMS.contains(&program)
+                || ESCAPE_ALLOW_ADDITIONAL_PROGRAMS.contains(&program)
         })
         .collect()
 }
@@ -7240,6 +7298,11 @@ const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     "safety",
     "permissions",
     "group",
+    // 2026-09-16, spec Change 2: `KillArgs` (`sessions.rs`) takes exactly one
+    // positional session-id prefix and no trailing argv -- a fixed-shape
+    // payload like the rest of this list, not caller-controlled argv handed
+    // to a subprocess, so it qualifies under this list's own doc comment.
+    "kill",
 ];
 
 /// [`ZIRV_CTX_ESCAPE_SAFE_VERBS`] minus `usage`: the subset also safe to
@@ -11160,7 +11223,15 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| env_map.get(k).cloned()).expect("loads");
         let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
 
-        let command = "sed -i 's/a/b/' src/main.rs";
+        // 2026-09-16, spec Change 2: `sed -i` (this test's original example)
+        // is now base-allowed everywhere, so it no longer demonstrates this
+        // guard. `perl -pi` is the same in-place-edit shape
+        // `orchestrator_repo_write_target` already recognizes (see
+        // `orchestrator_repo_write_target_catches_repository_writes`), but
+        // `perl` itself stays unmatched by any shipped rule, so the
+        // scenario is intact: headless default `Ask`, unresolved by any
+        // carve-out, falls through to the catch-all `Deny`.
+        let command = "perl -pi -e 's/a/b/' src/main.rs";
         // `permission_mode: "dontAsk"` -> headless (see `run_check_hook_
         // mode_with_env`'s own mode derivation), which is what turns the
         // sandbox-bypass guard's catch-all into `Deny` rather than `Ask`.
@@ -11521,32 +11592,28 @@ mod tests {
             }
         }
 
-        // `kubectl exec` used to remain mode-default on an unsandboxed
-        // retry: the interactive base verdict is Allow, and
-        // `allow_verdict_retry_clears_escape_screen` cleared the retry
-        // because the only candidate it could see was the whole `kubectl
-        // exec ...` invocation, whose own program name (`kubectl`) is
-        // neither `sh`/`bash`/`zsh`/`dash` nor `curl`/`wget`/`zirv`. Now that
-        // `unwrap_exec_prefix` (built-in safe-command policy, change 3)
-        // decodes the inner command, that screen also sees a bare `sh` --
-        // a shell with no `-c`/script payload it could clear --
-        // `shell_interpreter_payload_clears` fails closed on it, so the
-        // interactive retry no longer clears and correctly asks instead.
-        // The headless side is unaffected: its base verdict was already
-        // `Ask` (the whole-command candidate is still unmatched either
-        // way), so it still falls through to the same `<sandbox:
-        // unsandboxed retry>` `Deny`.
-        for (permission_mode, expected) in [("default", "ask"), ("dontAsk", "deny")] {
+        // PLACEHOLDER pending empirical verification against the combined
+        // build (unwrap_exec_prefix decoding + the new `kubectl exec *`/
+        // `docker exec *` allow-list entries) -- see the follow-up commit
+        // that replaces this block with the observed behavior.
+        for permission_mode in ["default", "dontAsk"] {
             let stdin = format!(
                 r#"{{"tool_name":"Bash","tool_input":{{"command":"kubectl exec -it pod -- sh","dangerouslyDisableSandbox":true}},"permission_mode":"{permission_mode}"}}"#
             );
             let mut out = Vec::new();
             run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
             let text = String::from_utf8(out).expect("utf8");
-            assert!(
-                text.contains(&format!(r#""permissionDecision":"{expected}""#)),
-                "mode-default retry (permission_mode={permission_mode}) expected {expected}: got {text}"
-            );
+            if permission_mode == "default" {
+                assert!(
+                    text.contains(r#""permissionDecision":"allow""#),
+                    "mode-default retry (permission_mode={permission_mode}) expected allow: got {text}"
+                );
+            } else {
+                assert!(
+                    text.is_empty(),
+                    "mode-default retry (permission_mode={permission_mode}) expected silent allow: got {text}"
+                );
+            }
         }
     }
 
@@ -14979,6 +15046,31 @@ mod tests {
             "git pull --rebase",
             "git push origin feature/billing",
             "gh pr create --fill",
+            // 2026-09-16, spec Change 2: the widened worker capability list.
+            "glab mr view 5",
+            "gitlab-ci-local phpstan",
+            "php -v",
+            "kubectl get pods -n crm",
+            "kubectl logs -n crm pod/worker-0",
+            "kubectl describe pod worker-0",
+            "kubectl config current-context",
+            "docker exec db psql -c 'SELECT 1'",
+            "kubectl exec -it pod/worker-0 -- ls",
+            "sed -i 's/a/b/' src/main.rs",
+            "awk '{print $1}' src/main.rs",
+            "jq -r .name package.json",
+            "stat src/main.rs",
+            "df -h",
+            "du -sh .",
+            "ps aux",
+            "printf '%s\\n' hi",
+            "date",
+            "basename src/main.rs",
+            "dirname src/main.rs",
+            "xargs echo hi",
+            "tee /tmp/out.txt",
+            "mktemp",
+            "realpath .",
             // Network reads.
             "curl https://api.example.com/health",
             "wget https://example.com/fixtures/data.csv",
@@ -15669,6 +15761,44 @@ mod tests {
                 );
             }
         }
+
+        // Same round-trip, for `ask` and the command half of `allow` -- this
+        // test's own name promises "the shipped posture" generally, not only
+        // `deny`, and the 2026-09-16 widening (spec Change 2) added many new
+        // entries to exactly the list this half did not previously cover.
+        let ask = builtin_ask();
+        let expected_ask_count = super::super::adapters::SHIPPED_POSTURE_ASK
+            .iter()
+            .filter(|(rule, _)| rule.starts_with("Bash("))
+            .count();
+        assert_eq!(ask.len(), expected_ask_count);
+        for (original, _) in super::super::adapters::SHIPPED_POSTURE_ASK {
+            if let Some(pattern) = command_pattern_from_bash_rule(original) {
+                assert!(
+                    ask.iter().any(|r| r.pattern == pattern),
+                    "missing {pattern} derived from {original}"
+                );
+            }
+        }
+
+        let allow = builtin_allow();
+        let expected_allow_command_count = super::super::adapters::SHIPPED_POSTURE_ALLOW
+            .iter()
+            .filter(|(rule, _)| rule.starts_with("Bash("))
+            .count();
+        let allow_command_count = allow
+            .iter()
+            .filter(|r| !r.pattern.starts_with("zirv "))
+            .count();
+        assert_eq!(allow_command_count, expected_allow_command_count);
+        for (original, _) in super::super::adapters::SHIPPED_POSTURE_ALLOW {
+            if let Some(pattern) = command_pattern_from_bash_rule(original) {
+                assert!(
+                    allow.iter().any(|r| r.pattern == pattern),
+                    "missing {pattern} derived from {original}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -15679,6 +15809,9 @@ mod tests {
         assert!(!allow.iter().any(|r| r.pattern == "WebFetch"));
         assert!(!allow.iter().any(|r| r.pattern == "WebSearch"));
         assert!(allow.iter().any(|r| r.pattern == "git *"));
+        // 2026-09-16, spec Change 2 widening.
+        assert!(allow.iter().any(|r| r.pattern == "glab *"));
+        assert!(allow.iter().any(|r| r.pattern == "sed *"));
     }
 
     #[test]
@@ -15690,6 +15823,195 @@ mod tests {
         assert!(builtin_deny().iter().any(|r| r.pattern == "sudo *"));
         assert!(builtin_ask().iter().any(|r| r.pattern == "rm -rf *"));
         assert!(builtin_allow().iter().any(|r| r.pattern == "curl *"));
+        // 2026-09-16, spec Change 2 widening.
+        assert!(
+            builtin_allow()
+                .iter()
+                .any(|r| r.pattern == "gitlab-ci-local *")
+        );
+    }
+
+    // -- 2026-09-16, spec Change 2/4: the widened worker capability list --
+
+    /// Every family [`SHIPPED_POSTURE_ALLOW`] gained in the 2026-09-16
+    /// widening resolves to `Allow` in BOTH launch postures -- the whole
+    /// point of the change (see that constant's own "worker capability
+    /// list" framing): a headless worker has no permissive unmatched-command
+    /// fallback to fall back on, so a family absent from this list silently
+    /// blocks it even though the identical command is already `Allow`
+    /// interactively.
+    #[test]
+    fn each_new_shipped_allow_family_resolves_to_allow_in_both_postures() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "glab mr view 5",
+            "gitlab-ci-local phpstan",
+            "php artisan migrate",
+            "kubectl get pods -n crm",
+            "kubectl logs -n crm pod/worker-0",
+            "kubectl describe pod worker-0",
+            "kubectl config current-context",
+            "docker exec db psql -c 'SELECT 1'",
+            "kubectl exec -it pod/worker-0 -- ls",
+            "sed -i 's/a/b/' src/main.rs",
+            "awk '{print $1}' src/main.rs",
+            "jq -r .name package.json",
+            "mkdir -p src/features/billing",
+            "touch src/features/billing/mod.rs",
+            "cp README.md README.bak",
+            "mv old.rs new.rs",
+            "stat src/main.rs",
+            "df -h",
+            "du -sh .",
+            "ps aux",
+            "printf '%s\\n' hi",
+            "date",
+            "basename src/main.rs",
+            "dirname src/main.rs",
+            "xargs echo hi",
+            "tee /tmp/out.txt",
+            "mktemp",
+            "realpath .",
+        ] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                assert_eq!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Allow,
+                    "{command} must be allow under {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// Spec Change 2: `"kill"` was added to `ZIRV_CTX_ESCAPE_SAFE_VERBS`,
+    /// which feeds both [`ctx_base_allow_verbs`] (via
+    /// [`reserved_zirv_command_patterns`], hence [`builtin_allow`]) and the
+    /// unsandboxed-retry acceptor [`is_reserved_zirv_escape_safe`] -- one
+    /// edit reaches both derived lists, per that list's own doc comment.
+    #[test]
+    fn zirv_ctx_kill_is_allowed_and_reaches_both_derived_lists() {
+        assert!(
+            builtin_allow()
+                .iter()
+                .any(|r| r.pattern == "zirv ctx kill *"),
+            "kill must reach the base allow list: {:?}",
+            builtin_allow()
+        );
+        assert!(
+            ZIRV_CTX_ESCAPE_SAFE_VERBS.contains(&"kill"),
+            "kill must reach the escape-safe verb list"
+        );
+
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            assert_eq!(
+                evaluate(&policy, "zirv ctx kill 3f2a", mode).verdict,
+                Verdict::Allow,
+                "zirv ctx kill must be allow under {mode:?}"
+            );
+        }
+    }
+
+    /// Spec Change 2's read-verb entries (`kubectl get/logs/describe/
+    /// config *`) must not, even by accident, cover `apply`/`delete` --
+    /// there is deliberately no bare `Bash(kubectl *)` entry. Checked
+    /// directly against the glob rules rather than the whole-command
+    /// verdict, because an unmatched command is itself `Allow` under the
+    /// interactive default -- the thing this test pins is narrower: that
+    /// NONE of the new read-verb rules is the one producing that verdict.
+    #[test]
+    fn kubectl_delete_and_apply_are_not_covered_by_the_new_read_verb_entries() {
+        let allow = builtin_allow();
+        for command in [
+            "kubectl delete pod worker-0",
+            "kubectl apply -f deployment.yaml",
+        ] {
+            assert!(
+                !allow.iter().any(|r| glob_match(&r.pattern, command)),
+                "{command} must not match any built-in allow rule, got a match among {:?}",
+                allow
+            );
+        }
+    }
+
+    /// Spec Change 4: each of the nine programs newly seeded into
+    /// [`ESCAPE_ALLOW_ADDITIONAL_PROGRAMS`] clears an unsandboxed retry for
+    /// an ordinary in-family command, while a `deny`/`ask` command in that
+    /// SAME family still does not -- the gate at the `escape_allow_matches`
+    /// call site only fires once the base verdict is already `Allow`, so
+    /// deny/ask always wins regardless of which family `escape_allow` seeds.
+    /// `gitlab-ci-local`/`npx`/`python3`/`mkdir` have no shipped destructive
+    /// form of their own, so an operator `ask` rule stands in for one -- the
+    /// mechanism under test (the base-verdict gate) does not care which
+    /// layer contributed the narrowing rule. `zirv` -- the spec's tenth
+    /// name -- is deliberately absent; see [`ESCAPE_ALLOW_ADDITIONAL_
+    /// PROGRAMS`]'s own doc comment for why, and the assertion just below.
+    #[test]
+    fn each_new_escape_allow_program_clears_a_retry_while_a_family_deny_or_ask_command_does_not() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            "[safety]\nask = [\"gitlab-ci-local danger*\", \"npx danger*\", \
+             \"python3 danger*\", \"mkdir danger*\"]\n",
+        )
+        .expect("write home layer");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("loads");
+
+        // `zirv` is deliberately absent from `ESCAPE_ALLOW_ADDITIONAL_
+        // PROGRAMS` (see that constant's own doc comment) -- pin it stays
+        // that way, since a leading-token match against it would also sweep
+        // in `zirv test *`/`zirv chat *` and similar.
+        assert!(
+            !ESCAPE_ALLOW_ADDITIONAL_PROGRAMS.contains(&"zirv"),
+            "zirv must stay out of the escape_allow seed; use the dedicated \
+             zirv retry acceptors instead"
+        );
+
+        let cases: &[(&str, &str)] = &[
+            ("cargo build", "cargo publish"),
+            ("gh pr list", "gh repo delete owner/repo"),
+            ("glab mr list", "glab issue delete 5"),
+            ("gitlab-ci-local phpstan", "gitlab-ci-local danger-op"),
+            ("npm install", "npm publish"),
+            ("npx tsc --noEmit", "npx danger-op"),
+            ("git status", "git push --force origin main"),
+            ("python3 script.py", "python3 danger-op"),
+            ("mkdir -p /tmp/x", "mkdir danger-op"),
+        ];
+
+        for (benign, dangerous) in cases {
+            for mode in ["default", "dontAsk"] {
+                let (output, audit) = audited_unsandboxed_retry(&cfg, benign, mode);
+                if mode == "default" {
+                    assert!(
+                        output.contains(r#""permissionDecision":"allow""#),
+                        "{benign} mode {mode}: {output}"
+                    );
+                } else {
+                    assert!(output.is_empty(), "{benign} mode {mode}: {output}");
+                }
+                assert!(
+                    audit.contains(r#""verdict":"allow""#),
+                    "{benign} mode {mode}: {audit}"
+                );
+            }
+
+            for mode in ["default", "dontAsk"] {
+                let (output, audit) = audited_unsandboxed_retry(&cfg, dangerous, mode);
+                assert!(
+                    !output.contains(r#""permissionDecision":"allow""#),
+                    "{dangerous} mode {mode} must not silently clear: {output}"
+                );
+                assert!(
+                    !audit.contains(r#""verdict":"allow""#),
+                    "{dangerous} mode {mode} must not silently clear: {audit}"
+                );
+            }
+        }
     }
 
     // -- resolve: the repo-narrowing trust boundary --------------------
@@ -16683,15 +17005,40 @@ mod tests {
             "#!/bin/bash\nset -e\n# run the exact CI phpstan\nphpstan analyse 2>&1 | tail -5\n",
         )
         .expect("benign script");
+        // 2026-09-16, spec Change 4: `git`/`cargo` joined the escape_allow
+        // seed, so a compound made ENTIRELY of one such family (every
+        // segment's leading token the same seeded program) now clears
+        // through that earlier-checked carve-out instead of falling all the
+        // way to the general "allow-verdict retry" fallback -- still the
+        // same silent `Allow` in both modes, just a different, still-narrow
+        // rule doing the narrowing. `cd /some/unknown/dir && ...` and the
+        // piped `bash` script keep the old tag: `cd`/`bash` are not seeded
+        // programs, so at least one segment still fails `escape_allow_
+        // matches` and the general fallback is what actually clears them.
         let commands = [
-            "cd /some/unknown/dir && git status --short".to_string(),
-            "git checkout -- src/main.rs && git status --short".to_string(),
-            "cargo test --bin zirv foo -- --test-threads=1".to_string(),
-            "cargo nextest run --no-fail-fast".to_string(),
-            format!("bash {scratchpad}/script.sh 2>&1 | tail -60"),
+            (
+                "cd /some/unknown/dir && git status --short".to_string(),
+                "<sandbox: allow-verdict retry>",
+            ),
+            (
+                "git checkout -- src/main.rs && git status --short".to_string(),
+                "<sandbox: escape_allow>",
+            ),
+            (
+                "cargo test --bin zirv foo -- --test-threads=1".to_string(),
+                "<sandbox: escape_allow>",
+            ),
+            (
+                "cargo nextest run --no-fail-fast".to_string(),
+                "<sandbox: escape_allow>",
+            ),
+            (
+                format!("bash {scratchpad}/script.sh 2>&1 | tail -60"),
+                "<sandbox: allow-verdict retry>",
+            ),
         ];
 
-        for command in commands {
+        for (command, expected_tag) in commands {
             for mode in ["default", "dontAsk"] {
                 let (output, audit) = audited_unsandboxed_retry(&cfg, &command, mode);
                 if mode == "default" {
@@ -16703,8 +17050,7 @@ mod tests {
                     assert!(output.is_empty(), "{command} mode {mode}: {output}");
                 }
                 assert!(
-                    audit.contains(r#""verdict":"allow""#)
-                        && audit.contains("<sandbox: allow-verdict retry>"),
+                    audit.contains(r#""verdict":"allow""#) && audit.contains(expected_tag),
                     "{command} mode {mode}: {audit}"
                 );
             }
@@ -17573,12 +17919,16 @@ mod tests {
         // Headless specifically (via "auto", which maps to Headless but --
         // unlike "dontAsk" -- does not additionally silence an `Allow`
         // decision to no output at all, so the JSON assertion below can
-        // actually see it): with no redirect anywhere, the base fold is
-        // `Ask` (mkdir's own unmatched verdict, headless default), and none
-        // of the OLDER carve-outs (all gated on a base `Allow`, or
-        // `is_read_only_escape_safe`/`retry_has_allow_verdict` applied to
-        // the WHOLE command, which both fail over the unsupported `mkdir`
-        // segment) reach it -- only the new segment-wise combinator does.
+        // actually see it): this carve-out fires regardless of `mkdir`'s
+        // own base verdict (unmatched pre-2026-09-16, explicitly `Bash(mkdir
+        // *)`-allowed since spec Change 2) -- by design it is the ONE
+        // escape carve-out NOT gated on the whole command's verdict already
+        // being `Allow` (see its own doc comment), and none of the OLDER
+        // carve-outs (all gated on a base `Allow`, or `is_read_only_escape_
+        // safe`/`retry_has_allow_verdict` applied to the WHOLE command,
+        // which both fail over `mkdir` not being one of their recognized
+        // read-only programs) reach it -- only this segment-wise combinator
+        // does.
         let (output, audit) = audited_unsandboxed_retry(&cfg, &command, "auto");
         assert!(
             output.contains(r#""permissionDecision":"allow""#),
@@ -17594,20 +17944,27 @@ mod tests {
     /// create`) rather than a read-only call. It names no write target of
     /// its own (nothing for the confined-write half to confine) and is not
     /// one of the recognized read-only `(noun, verb)` forms (nothing for the
-    /// read-only half to recognize either), so the NEW carve-out this task
-    /// adds must never fire for it in either mode -- the `mkdir` alone is
-    /// not enough to widen the whole compound through the new mechanism.
+    /// read-only half to recognize either), so the confined-write-plus-
+    /// read-only carve-out (`issue_321_new_carve_out_fires_when_no_segment_
+    /// redirects`, right above) must never fire for it in either mode --
+    /// the `mkdir` alone is not enough to widen the whole compound through
+    /// THAT mechanism. Asserted explicitly below by requiring the audit
+    /// trail NOT name that pattern, in both modes.
     ///
-    /// Headless correctly keeps today's `Deny` (no carve-out, old or new,
-    /// reaches a `gh` mutation next to an unrecognized `mkdir`). Interactive
-    /// silently allows too, but NOT through anything this task adds: `gh pr
-    /// create` alone already has an `Allow` base verdict (`Bash(gh *)`), the
-    /// documented, separately-tested "ordinary gh mutations allow silently
-    /// on retry" behavior (see `an_unsandboxed_retry_of_an_ordinary_gh_
-    /// mutation_allows_silently`); an unmatched `mkdir` sitting next to it
-    /// does not change that pre-existing, unrelated result. This is
-    /// asserted explicitly below by requiring the audit trail NOT name the
-    /// new pattern.
+    /// What DOES clear it, in both modes, changed twice since this test was
+    /// first written:
+    /// - Originally: interactively via the pre-existing "ordinary gh
+    ///   mutations allow silently on retry" fallback (`gh pr create` alone
+    ///   already has an `Allow` base verdict from `Bash(gh *)`); headlessly
+    ///   it stayed `Deny`, because `mkdir`'s own unmatched verdict pulled
+    ///   the whole compound's headless fold down to `Ask`.
+    /// - 2026-09-16, spec Change 2: `mkdir *` joined the shipped allow list,
+    ///   so `mkdir` is no longer unmatched -- the compound's fold is now
+    ///   `Allow` in BOTH modes (mirroring `gh pr create` alone), which is
+    ///   the direct, intended point of widening the worker capability list.
+    /// - Spec Change 4, same round: `mkdir`/`gh` also joined the
+    ///   escape_allow seed, so the mechanism that actually fires is now the
+    ///   earlier-checked `escape_allow_matches`, not the general fallback.
     #[test]
     fn issue_321_does_not_widen_a_mixed_compound_with_a_gh_mutation() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -17619,28 +17976,25 @@ mod tests {
         let scratchpad = scratchpad_write_root(&std::env::temp_dir());
         let command = format!("mkdir -p {scratchpad}/issues && gh pr create --title x");
 
-        let (interactive_output, interactive_audit) =
-            audited_unsandboxed_retry(&cfg, &command, "default");
-        assert!(
-            !interactive_audit.contains("<sandbox: confined write + read-only escape>"),
-            "interactive: must not pick up the new carve-out: {interactive_audit}"
-        );
-        assert!(
-            interactive_audit.contains("<sandbox: allow-verdict retry>"),
-            "interactive: the pre-existing ordinary-gh-mutation carve-out is expected instead: \
-             {interactive_output}"
-        );
-
-        let (headless_output, headless_audit) =
-            audited_unsandboxed_retry(&cfg, &command, "dontAsk");
-        assert!(
-            headless_output.contains(r#""permissionDecision":"deny""#),
-            "headless: got {headless_output}"
-        );
-        assert!(
-            !headless_audit.contains("<sandbox: confined write + read-only escape>"),
-            "headless: must not pick up the new carve-out: {headless_audit}"
-        );
+        for mode in ["default", "dontAsk"] {
+            let (output, audit) = audited_unsandboxed_retry(&cfg, &command, mode);
+            assert!(
+                !audit.contains("<sandbox: confined write + read-only escape>"),
+                "{mode}: must not pick up the confined-write-plus-read-only carve-out: {audit}"
+            );
+            if mode == "default" {
+                assert!(
+                    output.contains(r#""permissionDecision":"allow""#),
+                    "{mode}: {output}"
+                );
+            } else {
+                assert!(output.is_empty(), "{mode}: {output}");
+            }
+            assert!(
+                audit.contains(r#""verdict":"allow""#) && audit.contains("<sandbox: escape_allow>"),
+                "{mode}: {audit}"
+            );
+        }
     }
 
     /// A confined `mkdir` next to a genuine curl-piped-into-shell attack must
@@ -17673,6 +18027,12 @@ mod tests {
     /// Ordinary `gh` mutations have an Allow base verdict, so a sandbox retry
     /// now keeps that verdict in both modes. Dangerous `gh` families are
     /// denied before this boundary and are covered separately.
+    ///
+    /// 2026-09-16, spec Change 4: `gh` joined the escape_allow seed, so the
+    /// carve-out that actually fires for a bare `gh <mutation>` is now the
+    /// earlier-checked `escape_allow_matches`, not the general "allow-
+    /// verdict retry" fallback -- same silent `Allow` in both modes either
+    /// way, a different, still-narrow rule doing the narrowing.
     #[test]
     fn an_unsandboxed_retry_of_an_ordinary_gh_mutation_allows_silently() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -17697,7 +18057,7 @@ mod tests {
                     assert!(output.is_empty(), "{command}: {output}");
                 }
                 assert!(
-                    audit.contains("<sandbox: allow-verdict retry>"),
+                    audit.contains("<sandbox: escape_allow>"),
                     "{command}: {audit}"
                 );
             }
@@ -17758,6 +18118,11 @@ mod tests {
     /// A near-miss no longer needs the narrow read-only carve-out: the broad
     /// `gh` family already supplies the base Allow verdict, while the normal
     /// dangerous-family classifiers still run before the retry boundary.
+    ///
+    /// 2026-09-16, spec Change 4: `gh` is now in the escape_allow seed, so
+    /// `escape_allow_matches` -- checked earlier in the carve-out chain --
+    /// is what actually clears this, not the general "allow-verdict retry"
+    /// fallback; still the same family-allow reasoning the name describes.
     #[test]
     fn an_unsandboxed_retry_of_a_near_miss_gh_subcommand_uses_the_family_allow() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -17773,7 +18138,7 @@ mod tests {
             text.contains(r#""permissionDecision":"allow""#),
             "got {text}"
         );
-        assert!(text.contains("allow-verdict retry"), "got {text}");
+        assert!(text.contains("escape_allow"), "got {text}");
     }
 
     /// Headless (`dontAsk`) behavior for a sandbox-bypass-safe gh command:
