@@ -5860,8 +5860,10 @@ const SANDBOX_ESCAPE_BUILTIN_PROGRAMS: &[&str] = &[
 ];
 
 /// **2026-09-16, spec Change 4:** `cargo`, `gh`, `glab`, `gitlab-ci-local`,
-/// `npm`, `npx`, `git`, `python3`, `mkdir` -- the 200 unsandboxed-retry asks
-/// the 7-day audit found were almost all this build/dev tooling. Safe to
+/// `npm`, `npx`, `git`, `python3`, `mkdir`, plus the fixed macOS SSH-agent
+/// environment lookup through `launchctl getenv` and `export SSH_AUTH_SOCK=`
+/// -- the 200 unsandboxed-retry asks the 7-day audit found were almost all
+/// this build/dev tooling. Safe to
 /// widen [`builtin_escape_allow`]'s seed past read-only tools specifically
 /// THERE, and not by loosening [`escape_denied_by_screen`]/[`escape_allow_
 /// matches`]'s own gates: the one caller (`run_check_hook_mode_with_env`,
@@ -5876,7 +5878,7 @@ const SANDBOX_ESCAPE_BUILTIN_PROGRAMS: &[&str] = &[
 /// read-only-only.
 ///
 /// The spec's own list also named `zirv`, deliberately dropped here: unlike
-/// the other nine, `builtin_allow()`'s `zirv <name> *` entries mix genuinely
+/// the other entries, `builtin_allow()`'s `zirv <name> *` entries mix genuinely
 /// retry-safe names with ones that are native-allowed at the permission-
 /// dialog level ONLY -- `test`/`verify`/`frontend` select a REPOSITORY-
 /// AUTHORED child process and are deliberately never sandbox-excluded (see
@@ -5901,6 +5903,8 @@ const ESCAPE_ALLOW_ADDITIONAL_PROGRAMS: &[&str] = &[
     "git",
     "python3",
     "mkdir",
+    "launchctl",
+    "export",
 ];
 
 /// The built-in `escape_allow` seed: [`builtin_allow`]'s own rules (so the
@@ -6491,7 +6495,24 @@ fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
     } else {
         combined
     };
-    if let Some(rest) = combined.strip_prefix('/') {
+    // `std::fs::canonicalize` returns an extended-length `\\?\C:\...`
+    // path on Windows. After separator normalization that is `//?/C:/...`;
+    // treating it as an ordinary slash-rooted path turns it into the invalid
+    // `/?/C:/...` and makes the repository ancestor walk miss every write.
+    // Strip the verbatim prefix while preserving UNC's double-slash root.
+    let combined = if let Some(rest) = combined.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = combined.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        combined
+    };
+    if let Some(rest) = combined.strip_prefix("//") {
+        Some(format!(
+            "//{}",
+            resolve_lexical_path_components(rest).join("/")
+        ))
+    } else if let Some(rest) = combined.strip_prefix('/') {
         Some(format!(
             "/{}",
             resolve_lexical_path_components(rest).join("/")
@@ -11033,9 +11054,26 @@ mod tests {
             );
             let cfg = CtxConfig::load(repo.path(), &|k| env_map.get(k).cloned()).expect("loads");
             let repo_cwd = repo.path().to_string_lossy().replace('\\', "/");
+            let command = "sed -i 's/a/b/' src/main.rs";
+            let resolved = resolve_repo_write_target("src/main.rs", &repo_cwd)
+                .expect("the relative repository target must resolve");
+            assert!(
+                filesystem_repo_root_of(&resolved).is_some(),
+                "the resolved target {resolved} must retain the fake git ancestor at {repo_cwd}"
+            );
+            assert_eq!(
+                orchestrator_repo_write_target(
+                    command,
+                    &repo_cwd,
+                    &filesystem_repo_root_of,
+                    &|k| env_map.get(k).cloned()
+                ),
+                Some("src/main.rs".to_string()),
+                "the repository-write detector must remain independent of the command allow list"
+            );
 
             let stdin = format!(
-                r#"{{"tool_name":"Bash","tool_input":{{"command":"sed -i 's/a/b/' src/main.rs"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}},"permission_mode":"default","cwd":"{repo_cwd}"}}"#
             );
             let mut out = Vec::new();
             run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|k| env_map.get(k).cloned())
@@ -11645,28 +11683,20 @@ mod tests {
             }
         }
 
-        // PLACEHOLDER pending empirical verification against the combined
-        // build (unwrap_exec_prefix decoding + the new `kubectl exec *`/
-        // `docker exec *` allow-list entries) -- see the follow-up commit
-        // that replaces this block with the observed behavior.
-        for permission_mode in ["default", "dontAsk"] {
+        // The outer `kubectl exec` family is allowed, but an unsandboxed retry
+        // whose decoded inner command is a bare interactive shell stays
+        // ambiguous: ask with a human present, deny headlessly.
+        for (permission_mode, expected) in [("default", "ask"), ("dontAsk", "deny")] {
             let stdin = format!(
                 r#"{{"tool_name":"Bash","tool_input":{{"command":"kubectl exec -it pod -- sh","dangerouslyDisableSandbox":true}},"permission_mode":"{permission_mode}"}}"#
             );
             let mut out = Vec::new();
             run_check_hook_mode(&cfg, &mut out, &stdin).expect("runs");
             let text = String::from_utf8(out).expect("utf8");
-            if permission_mode == "default" {
-                assert!(
-                    text.contains(r#""permissionDecision":"allow""#),
-                    "mode-default retry (permission_mode={permission_mode}) expected allow: got {text}"
-                );
-            } else {
-                assert!(
-                    text.is_empty(),
-                    "mode-default retry (permission_mode={permission_mode}) expected silent allow: got {text}"
-                );
-            }
+            assert!(
+                text.contains(&format!(r#""permissionDecision":"{expected}""#)),
+                "permission_mode={permission_mode} expected {expected}: got {text}"
+            );
         }
     }
 
@@ -15847,25 +15877,44 @@ mod tests {
         }
     }
 
-    /// Ordinary uses of the same families must not have regressed into a
-    /// prompt: `find` without a destructive action, an ordinary push, a
-    /// read-only registry query.
+    /// Ordinary safe commands must not regress into a prompt. These include
+    /// the exact families found in the 2026-09-16 permission audit: reports,
+    /// absolute-path searches, ordinary git operations, and the macOS SSH
+    /// agent environment lookup.
     #[test]
     fn the_narrow_ask_set_does_not_prompt_on_ordinary_uses_of_the_same_tools() {
         let policy = SafetyPolicy::default();
         for command in [
+            "zirv report bug permission-noise",
+            "zirv report feature permission-noise",
+            "export SSH_AUTH_SOCK=$(launchctl getenv SSH_AUTH_SOCK)",
+            "find /Users/example/project -name Cargo.toml",
+            "git merge feature-branch",
+            "git pull",
             "git push origin feature-branch",
             "git push -u origin x",
+            "git branch feature-branch",
             "find . -name foo.rs",
             "find . -name '*.rs' -exec grep -l TODO {} +",
-            "reg query HKLM\\Software\\Example",
         ] {
-            assert_eq!(
-                evaluate(&policy, command, LaunchMode::Interactive).verdict,
-                Verdict::Allow,
-                "{command} must not prompt"
-            );
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                assert_eq!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Allow,
+                    "{command} must not prompt under {mode:?}"
+                );
+            }
         }
+        assert_eq!(
+            evaluate(
+                &policy,
+                "reg query HKLM\\Software\\Example",
+                LaunchMode::Interactive
+            )
+            .verdict,
+            Verdict::Allow,
+            "the pre-existing read-only registry case stays silent interactively"
+        );
     }
 
     /// Issue #83 acceptance, updated for the 2026-08-24 rebalance: a fresh
@@ -16080,7 +16129,7 @@ mod tests {
         }
     }
 
-    /// Spec Change 4: each of the nine programs newly seeded into
+    /// Spec Change 4: each program newly seeded into
     /// [`ESCAPE_ALLOW_ADDITIONAL_PROGRAMS`] clears an unsandboxed retry for
     /// an ordinary in-family command, while a `deny`/`ask` command in that
     /// SAME family still does not -- the gate at the `escape_allow_matches`
@@ -16089,8 +16138,8 @@ mod tests {
     /// `gitlab-ci-local`/`npx`/`python3`/`mkdir` have no shipped destructive
     /// form of their own, so an operator `ask` rule stands in for one -- the
     /// mechanism under test (the base-verdict gate) does not care which
-    /// layer contributed the narrowing rule. `zirv` -- the spec's tenth
-    /// name -- is deliberately absent; see [`ESCAPE_ALLOW_ADDITIONAL_
+    /// layer contributed the narrowing rule. `zirv` is deliberately absent;
+    /// see [`ESCAPE_ALLOW_ADDITIONAL_
     /// PROGRAMS`]'s own doc comment for why, and the assertion just below.
     #[test]
     fn each_new_escape_allow_program_clears_a_retry_while_a_family_deny_or_ask_command_does_not() {
@@ -16127,6 +16176,10 @@ mod tests {
             ("git status", "git push --force origin main"),
             ("python3 script.py", "python3 danger-op"),
             ("mkdir -p /tmp/x", "mkdir danger-op"),
+            (
+                "export SSH_AUTH_SOCK=$(launchctl getenv SSH_AUTH_SOCK)",
+                "export SSH_AUTH_SOCK=$(cat ~/.ssh/id_rsa)",
+            ),
         ];
 
         for (benign, dangerous) in cases {
