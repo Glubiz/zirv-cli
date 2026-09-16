@@ -705,8 +705,8 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
         "locate a command on PATH, read-only (Windows spelling)",
     ),
     (
-        "Bash(launchctl getenv *)",
-        "read one value from launchd's environment, including SSH_AUTH_SOCK",
+        "Bash(launchctl getenv SSH_AUTH_SOCK)",
+        "read the SSH agent socket from launchd's environment",
     ),
     (
         "Bash(export SSH_AUTH_SOCK=*)",

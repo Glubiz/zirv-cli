@@ -127,7 +127,7 @@ Add to `SHIPPED_POSTURE_ALLOW`:
   `touch *`, `cp *`, `mv *`, `stat *`, `df *`, `du *`, `ps *`, `printf *`,
   `date *`, `basename *`, `dirname *`, `xargs *`, `tee *`, `mktemp *`,
   `realpath *`.
-- The fixed macOS SSH-agent lookup: `launchctl getenv *` and
+- The fixed macOS SSH-agent lookup: `launchctl getenv SSH_AUTH_SOCK` and
   `export SSH_AUTH_SOCK=*`. Command substitutions remain separate executable
   candidates, so this does not hide a dangerous command used as the value.
 
