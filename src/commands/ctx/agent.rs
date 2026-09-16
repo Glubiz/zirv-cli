@@ -439,6 +439,15 @@ pub struct DelegationReceipt {
     pub errors: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub capability_warnings: Vec<String>,
+    /// Change 5 follow-up (blocked-command observability): "<family>
+    /// (<count>)" lines, one per family zirv's own command-safety hook
+    /// denied during THIS delegation's own worker session -- shaped
+    /// exactly like `capability_warnings` above (a formatted `Vec<String>`,
+    /// omitted when empty), populated by [`blocked_family_lines`]. Puts the
+    /// block in front of the orchestrator unprompted, rather than relying
+    /// on it to think to check `zirv ctx status`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocked_families: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub note: String,
@@ -499,6 +508,41 @@ pub(crate) fn capability_warning_lines(warnings: &[policy::CapabilityWarning]) -
         .collect()
 }
 
+/// Change 5 follow-up: `"<family> (<count>)"` lines for every family
+/// zirv's own command-safety hook denied in `session`, most-blocked first
+/// (ties broken alphabetically) -- the sibling of `capability_warning_
+/// lines` above, and the same idiom `status::blocked_commands_status_line`
+/// already uses for the orchestrator's own `zirv ctx status`. Bounded,
+/// like that caller: `log::read_recent_safety_decisions` (the identical
+/// day-window/limit the consecutive-denial breaker already relies on),
+/// never the unbounded `log::read_safety_decisions`. `family` is read
+/// as-is from the log -- already the strict `safety::safety_family` value
+/// `audit_hook_decision` persisted, never re-derived here -- so this never
+/// leaks an argument, flag, path, or secret: a session with nothing denied
+/// yields an empty `Vec`.
+pub(crate) fn blocked_family_lines(state: &super::state::StateDir, session: &str) -> Vec<String> {
+    let now_day = super::state::now_secs() / 86_400;
+    let recent = super::log::read_recent_safety_decisions(state, session, 50, now_day);
+    let mut by_family: std::collections::BTreeMap<&str, u64> = Default::default();
+    for record in &recent {
+        if record.verdict != "deny" {
+            continue;
+        }
+        let family = if record.family.is_empty() {
+            "unknown"
+        } else {
+            record.family.as_str()
+        };
+        *by_family.entry(family).or_insert(0) += 1;
+    }
+    let mut families: Vec<_> = by_family.into_iter().collect();
+    families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    families
+        .into_iter()
+        .map(|(family, n)| format!("{family} ({n})"))
+        .collect()
+}
+
 /// Prints exactly one pretty JSON object -- `receipt` -- to `w`, the sole
 /// stdout output a `--json` delegation ever produces.
 pub(crate) fn print_receipt<W: Write>(w: &mut W, receipt: &DelegationReceipt) -> CtxResult<()> {
@@ -546,6 +590,10 @@ fn launch_failure_receipt(
         mail_delivered: false,
         errors: Vec::new(),
         capability_warnings: capability_warning_lines(capability_warnings),
+        // Nothing has run yet at any of this shape's three call sites
+        // (see this function's own doc comment) -- no worker session ever
+        // reached a command-safety hook, so there is nothing to report.
+        blocked_families: Vec::new(),
         reason: Some(reason),
         note: receipt_note(DelegationState::LaunchFailed),
     }
@@ -587,6 +635,11 @@ fn dashboard_answer_receipt(
         mail_delivered: false,
         errors: Vec::new(),
         capability_warnings: facts.capability_warnings.clone(),
+        // `Launched`/`LaunchFailed` both mean "nothing has actually run
+        // yet" (this function's own doc comment) -- an admitted or
+        // claimed dashboard pane worker has not reached a command-safety
+        // hook decision from THIS process's perspective at this point.
+        blocked_families: Vec::new(),
         reason: facts.reason.clone(),
         note: receipt_note(state),
     }
@@ -4729,8 +4782,21 @@ pub fn run_with<W: Write>(
     let mut report_truncated = false;
     let mut mail_delivered = false;
     let mut contract_errors: Vec<String> = Vec::new();
+    // Change 5 follow-up: same "unreachable `StateDir::resolve` failure"
+    // default as the others above -- nothing to report without a state
+    // dir to read the worker's own safety-decision log from.
+    let mut blocked_families: Vec<String> = Vec::new();
 
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
+        // Change 5 follow-up: this delegation's own worker session is
+        // known here regardless of how the run below turns out, so this
+        // is computed unconditionally rather than duplicated into every
+        // branch -- the same reader `status::blocked_commands_status_line`
+        // uses, scoped to `worker_session` (the id this receipt itself
+        // reports back as `session`), not `final_session`: a cross-harness
+        // restart's later segment would otherwise hide a block from an
+        // earlier one.
+        blocked_families = blocked_family_lines(&state_dir, &worker_session);
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         // Issue #317: `--task`'s own completion signal. Without a declared
         // `--result-schema`, a plain exit 0 is the only success evidence this
@@ -5160,6 +5226,7 @@ pub fn run_with<W: Write>(
             mail_delivered,
             errors: contract_errors,
             capability_warnings: capability_warning_lines(&capability_warnings),
+            blocked_families,
             reason: None,
             note: receipt_note(delegation_state),
         };
@@ -5175,6 +5242,13 @@ pub fn run_with<W: Write>(
                 "capability warning: {} -- {}: {}",
                 warning.capability, warning.mechanism, warning.detail
             )?;
+        }
+        // Change 5 follow-up: same idiom as the capability-warning loop
+        // above -- one line per blocked family, only when non-empty, so
+        // the orchestrator sees this without having to think to run `zirv
+        // ctx status` separately.
+        for line in &blocked_families {
+            writeln!(w, "blocked: {line}")?;
         }
     }
 
@@ -7317,6 +7391,72 @@ mod tests {
         );
     }
 
+    /// Change 5 follow-up: a worker session with no denials at all -- the
+    /// common case -- produces an empty `Vec`, so `DelegationReceipt`'s
+    /// own `blocked_families` is omitted rather than an empty array.
+    #[test]
+    fn blocked_family_lines_is_empty_for_a_session_with_no_denials() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(root.path().to_path_buf());
+        assert!(blocked_family_lines(&state, "worker-a").is_empty());
+    }
+
+    /// Change 5 follow-up: two `sudo` denials and one `docker exec` denial
+    /// for THIS worker's session become `["sudo (2)", "docker exec (1)"]`
+    /// (most-blocked first) -- an `ask` row and a different session's
+    /// `deny` row are both excluded. `family` here is round-tripped
+    /// through `safety::safety_family` exactly as `audit_hook_decision`
+    /// would compute it in production, from a command whose only
+    /// non-flag argument is secret-shaped (`sudo systemctl restart
+    /// nginx-prod-7f3a`) -- confirming the receipt's own field never
+    /// leaks that argument, only the family `safety_family` already
+    /// narrowed it to.
+    #[test]
+    fn blocked_family_lines_lists_families_with_counts_and_leaks_no_argument() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let now = super::super::state::now_secs();
+
+        for (session, command, verdict) in [
+            ("worker-a", "sudo systemctl restart nginx-prod-7f3a", "deny"),
+            ("worker-a", "sudo id", "deny"),
+            ("worker-a", "docker exec db psql -c \"select 1\"", "deny"),
+            // Excluded: not a deny.
+            ("worker-a", "git push --force origin main", "ask"),
+            // Excluded: a different worker's session.
+            ("worker-b", "curl https://example.com", "deny"),
+        ] {
+            super::super::log::append_safety(
+                &state,
+                &super::super::log::SafetyDecision {
+                    ts: now,
+                    session,
+                    mode: "headless",
+                    verdict,
+                    family: &super::super::safety::safety_family(command),
+                    command_sha256: "sha",
+                    policy_sha256: "p",
+                    launch_policy_sha256: None,
+                    attestation: "not-present",
+                    matched_pattern: None,
+                    origin: Some("built-in"),
+                    platform: "linux",
+                },
+            )
+            .expect("append");
+        }
+
+        let lines = blocked_family_lines(&state, "worker-a");
+        assert_eq!(
+            lines,
+            vec!["sudo (2)".to_string(), "docker exec (1)".to_string()]
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("nginx-prod-7f3a")),
+            "the secret-shaped argument must never reach a receipt line: {lines:?}"
+        );
+    }
+
     /// Issue #452: a `Launched` receipt (the "nothing has run yet" pane-ack
     /// shape) and a `ReportedContractFailed` receipt (the "an inline worker
     /// ran and its report failed the contract" shape) both serialize with
@@ -7342,6 +7482,7 @@ mod tests {
             mail_delivered: false,
             errors: Vec::new(),
             capability_warnings: Vec::new(),
+            blocked_families: Vec::new(),
             reason: None,
             note: receipt_note(DelegationState::Launched),
         };
@@ -7359,6 +7500,10 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .contains_key("capability_warnings")
+        );
+        assert!(
+            !value.as_object().unwrap().contains_key("blocked_families"),
+            "an empty Vec must be omitted, the same allowance capability_warnings gets"
         );
 
         let failed = DelegationReceipt {
@@ -7378,6 +7523,7 @@ mod tests {
             mail_delivered: true,
             errors: vec!["missing field: status".to_string()],
             capability_warnings: vec!["shell_exec -- sandbox: downgraded".to_string()],
+            blocked_families: vec!["sudo (2)".to_string()],
             reason: None,
             note: receipt_note(DelegationState::ReportedContractFailed),
         };
@@ -7391,6 +7537,7 @@ mod tests {
             value["errors"],
             serde_json::json!(["missing field: status"])
         );
+        assert_eq!(value["blocked_families"], serde_json::json!(["sudo (2)"]));
         assert!(!value.as_object().unwrap().contains_key("reason"));
     }
 

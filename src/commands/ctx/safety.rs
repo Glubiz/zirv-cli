@@ -9162,8 +9162,10 @@ const SAFETY_FAMILY_DISPATCHER_PROGRAMS: &[&str] = &[
 /// The safety-decision log's own family derivation: `hook::command_family`'s
 /// candidate, narrowed to its first word alone unless `argv[0]` is one of
 /// `SAFETY_FAMILY_DISPATCHER_PROGRAMS` -- see that constant's own doc
-/// comment for why a plain narrower rule is not safe enough here.
-fn safety_family(command: &str) -> String {
+/// comment for why a plain narrower rule is not safe enough here. `pub(crate)`
+/// so a test elsewhere (`agent::tests::blocked_family_lines_...`) can build a
+/// realistic fixture record without duplicating this rule.
+pub(crate) fn safety_family(command: &str) -> String {
     let full = super::hook::command_family(command);
     let program = full.split(' ').next().unwrap_or("");
     if program.is_empty() || !SAFETY_FAMILY_DISPATCHER_PROGRAMS.contains(&program) {
