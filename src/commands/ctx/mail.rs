@@ -1999,8 +1999,15 @@ pub fn run_send_with<W: Write>(
             Err(errors) => (None, vec![errors.clone()]),
         };
         let (report, report_truncated) = super::agent::cap_report(Some(&body));
+        // A pane may work in a sibling checkout. Keep its report discoverable
+        // by the supervising parent's repository after the worker unregisters.
+        let report_repo = env(super::agent::PARENT_SESSION_ENV)
+            .and_then(|parent| sessions::load_record(&state, &sessions::short_id(&parent)))
+            .map(|parent| parent.repo)
+            .unwrap_or_else(|| repo.to_path_buf());
         super::agent::store_result(
             &state,
+            &report_repo,
             &short,
             &from.harness,
             &validated,

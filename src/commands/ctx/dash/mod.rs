@@ -10259,7 +10259,12 @@ fn report_settled_pane_with(
         return;
     }
     let recipient_short = sessions::short_id(&recipient);
-    let slug = sessions::load_record(state, &recipient_short)
+    let recipient_record = sessions::load_record(state, &recipient_short);
+    let report_repo = recipient_record
+        .as_ref()
+        .map(|record| record.repo.clone())
+        .unwrap_or_else(|| pane.cwd().to_path_buf());
+    let slug = recipient_record
         .map(|record| record.repo_slug)
         .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
     if mail::sent_since(
@@ -10300,6 +10305,7 @@ fn report_settled_pane_with(
                     let (report, report_truncated) = super::agent::cap_report(Some(&report_text));
                     super::agent::store_result(
                         state,
+                        &report_repo,
                         pane.short(),
                         pane.agent(),
                         &validated,
@@ -10328,6 +10334,7 @@ fn report_settled_pane_with(
                 let (report, report_truncated) = super::agent::cap_report(Some(&report_text));
                 super::agent::store_report_only(
                     state,
+                    &report_repo,
                     pane.short(),
                     pane.agent(),
                     report.as_deref().unwrap_or_default(),

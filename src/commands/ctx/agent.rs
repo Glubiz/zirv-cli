@@ -1526,6 +1526,10 @@ pub(crate) fn evaluate_report(
 /// cleanly.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct DelegationResultRecord {
+    /// Canonical repository authorized to retrieve this report. Old records
+    /// have no provenance and require a scoped delegation reference.
+    #[serde(default)]
+    pub repository: Option<PathBuf>,
     pub outcome: String,
     #[serde(default)]
     pub result: Option<serde_json::Value>,
@@ -1576,6 +1580,7 @@ pub(crate) fn cap_report(text: Option<&str>) -> (Option<String>, bool) {
 #[allow(clippy::too_many_arguments)]
 fn write_delegation_result(
     state: &super::state::StateDir,
+    repo: &Path,
     session: &str,
     agent: &str,
     outcome: &str,
@@ -1588,6 +1593,7 @@ fn write_delegation_result(
     let results_dir = state.logs().join("delegation-results");
     let _ = super::state::create_private_dir_all(&results_dir);
     let record = DelegationResultRecord {
+        repository: repo.canonicalize().ok(),
         outcome: outcome.to_string(),
         result: validated.clone(),
         errors: errors.to_vec(),
@@ -1612,6 +1618,7 @@ fn write_delegation_result(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn store_result(
     state: &super::state::StateDir,
+    repo: &Path,
     session: &str,
     agent: &str,
     validated: &Option<serde_json::Value>,
@@ -1627,6 +1634,7 @@ pub(crate) fn store_result(
     };
     write_delegation_result(
         state,
+        repo,
         session,
         agent,
         outcome,
@@ -1644,6 +1652,7 @@ pub(crate) fn store_result(
 /// is no contract to have validated or failed against.
 pub(crate) fn store_report_only(
     state: &super::state::StateDir,
+    repo: &Path,
     session: &str,
     agent: &str,
     report: &str,
@@ -1651,6 +1660,7 @@ pub(crate) fn store_report_only(
 ) -> PathBuf {
     write_delegation_result(
         state,
+        repo,
         session,
         agent,
         "reported",
@@ -4891,6 +4901,7 @@ pub fn run_with<W: Write>(
             report_truncated = stored_truncated;
             let path = store_result(
                 &state_dir,
+                repo,
                 &worker_session,
                 &args.name,
                 &validated,
@@ -4978,6 +4989,7 @@ pub fn run_with<W: Write>(
                 report_truncated = stored_truncated;
                 let path = store_report_only(
                     &state_dir,
+                    repo,
                     &worker_session,
                     &args.name,
                     stored_report.as_deref().unwrap_or_default(),
@@ -7189,6 +7201,7 @@ mod tests {
         assert_eq!(recorded_contract_exit(&state, "worker01", 0), 0);
         store_result(
             &state,
+            tmp.path(),
             "worker01",
             "claude",
             &None,
@@ -7211,6 +7224,7 @@ mod tests {
         );
         store_result(
             &state,
+            tmp.path(),
             "worker01",
             "claude",
             &Some(serde_json::json!({"status":"done"})),
@@ -7233,6 +7247,7 @@ mod tests {
         let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
         let path = store_result(
             &state,
+            tmp.path(),
             "worker02",
             "claude",
             &Some(serde_json::json!({"status": "done"})),
@@ -7245,6 +7260,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
                 .expect("round-trip deserialize");
         assert_eq!(record.outcome, "validated");
+        assert_eq!(record.repository, tmp.path().canonicalize().ok());
         assert_eq!(
             record.report.as_deref(),
             Some("the worker's full final message")

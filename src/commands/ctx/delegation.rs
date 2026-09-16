@@ -162,6 +162,10 @@ pub struct QueuedMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub schema_version: u32,
+    /// Canonical owning repository, distinct from a worker's checkout.
+    /// Older records may be read only when the checkout establishes scope.
+    #[serde(default)]
+    pub repository: Option<PathBuf>,
     pub handle: WorkerHandle,
     #[serde(default)]
     pub parent_session: Option<String>,
@@ -342,6 +346,7 @@ pub fn record_launch(
     };
     let record = Record {
         schema_version: SCHEMA_VERSION,
+        repository: repo.canonicalize().ok(),
         handle,
         parent_session,
         phase: Phase::Launched,

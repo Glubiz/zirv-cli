@@ -487,6 +487,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     let result_path = if request.result_schema.is_some() {
         Some(super::agent::store_result(
             state,
+            repo,
             &worker_session,
             &args.name,
             &validated,
@@ -499,6 +500,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         stored_report.as_deref().map(|text| {
             super::agent::store_report_only(
                 state,
+                repo,
                 &worker_session,
                 &args.name,
                 text,
