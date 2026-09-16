@@ -419,12 +419,20 @@ pub(crate) fn run_with_clock<W: Write>(
                 announcer.emit(&super::announce::Event::HookIntegrity { summary });
             }
         }
-        let extra: Vec<String> = policy_extra
+        let mut extra: Vec<String> = policy_extra
             .iter()
             .cloned()
             .chain(user_extra.iter().cloned())
             .chain(prompt_args)
             .collect();
+        let mcp_args = super::mcp::launch::arguments(
+            adapter.name(),
+            repo,
+            &state,
+            registry_short.as_deref().unwrap_or(&session_short),
+            &extra,
+        );
+        super::mcp::launch::append(&mut extra, mcp_args);
         // M2: README promises injection attribution "at every session start",
         // and every cycle is a new session, so the entry is written here under
         // that cycle's own id rather than once under a literal "loop".

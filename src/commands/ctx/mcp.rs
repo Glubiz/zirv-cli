@@ -28,6 +28,7 @@ use crate::commands::workflow::{artifact, engine};
 
 mod coordination;
 mod doctor;
+pub(super) mod launch;
 use coordination::{InboxArgs, ResultArgs, WorkerArgs};
 
 const MAX_RESULT_BYTES: usize = 32 * 1024;
