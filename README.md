@@ -4855,7 +4855,8 @@ templates stay silent.
 
 The shipped allow set also covers `zirv report bug|feature`, absolute-path
 `find`, ordinary `git merge`/`pull`/`push`/`branch`, and the macOS SSH-agent
-setup `export SSH_AUTH_SOCK=$(launchctl getenv SSH_AUTH_SOCK)`. The matching
+setup `export SSH_AUTH_SOCK=$(launchctl getenv SSH_AUTH_SOCK)`. Only that
+specific `launchctl` environment key is allowed. The matching
 unsandboxed-retry rules keep those commands silent when the OS sandbox cannot
 reach the required repository, remote, user path, or agent socket. Destructive
 variants such as force/delete pushes, hard resets, and forced branch deletion
