@@ -79,7 +79,23 @@ fn build(
         } else {
             json
         };
-        return Ok(vec![format!("--mcp-config={value}")]);
+        // Registration alone leaves MCP tools denied under Claude's headless
+        // dontAsk mode. Approve only this binary's declared read-only tools;
+        // native deny/ask rules and the server's per-call policy still apply.
+        let allowed = super::tools()
+            .into_iter()
+            .filter(|tool| {
+                tool.annotations
+                    .as_ref()
+                    .is_some_and(|a| a.read_only_hint == Some(true))
+            })
+            .map(|tool| format!("mcp__zirv__{}", tool.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        return Ok(vec![
+            format!("--mcp-config={value}"),
+            format!("--allowedTools={allowed}"),
+        ]);
     }
 
     // Forward names, never credential values on argv. Codex filters its MCP
@@ -134,8 +150,34 @@ fn quoted(value: &str) -> String {
 
 /// Append before an explicit end-of-options delimiter. In particular, a
 /// Claude variadic MCP option must not consume a following positional prompt.
-pub(crate) fn append(argv: &mut Vec<String>, args: Vec<String>) {
+pub(crate) fn append(argv: &mut Vec<String>, mut args: Vec<String>) {
     let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    // Merge into the existing permission argument rather than depending on
+    // a host version's treatment of repeated --allowedTools options.
+    if let Some(index) = args
+        .iter()
+        .position(|arg| arg.starts_with("--allowedTools="))
+    {
+        let allowed = &args[index]["--allowedTools=".len()..];
+        let existing = argv[..at].iter().rposition(|arg| {
+            arg.starts_with("--allowedTools=")
+                || arg.starts_with("--allowed-tools=")
+                || arg == "--allowedTools"
+                || arg == "--allowed-tools"
+        });
+        if let Some(existing) = existing {
+            let value = if argv[existing].contains('=') {
+                existing
+            } else {
+                existing + 1
+            };
+            if value < at && (value == existing || !argv[value].starts_with('-')) {
+                argv[value].push(',');
+                argv[value].push_str(allowed);
+                args.remove(index);
+            }
+        }
+    }
     argv.splice(at..at, args);
 }
 
@@ -189,9 +231,40 @@ mod tests {
         ];
         append(&mut argv, args);
         assert_eq!(argv[1], "--mcp-config=other.json");
-        assert_eq!(&argv[3..], &["--", "prompt"]);
+        let allowed = argv[3].strip_prefix("--allowedTools=").unwrap();
+        let names: Vec<_> = allowed.split(',').collect();
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"mcp__zirv__inbox_read"));
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with("mcp__zirv__") && !name.contains('*'))
+        );
+        assert_eq!(&argv[4..], &["--", "prompt"]);
         assert!(!tmp.path().join(".mcp.json").exists());
         assert!(!state.root().exists());
+    }
+
+    #[test]
+    fn registering_claude_keeps_existing_tool_permissions_in_one_argument() {
+        for mut argv in [
+            vec!["--allowedTools=Read,Bash(git status)".into()],
+            vec!["--allowed-tools".into(), "Read,Bash(git status)".into()],
+        ] {
+            append(
+                &mut argv,
+                vec!["--allowedTools=mcp__zirv__inbox_read".into()],
+            );
+            assert_eq!(
+                argv.iter().filter(|a| a.starts_with("--allowed")).count(),
+                1
+            );
+            assert!(
+                argv.last()
+                    .unwrap()
+                    .ends_with("Read,Bash(git status),mcp__zirv__inbox_read")
+            );
+        }
     }
 
     #[test]

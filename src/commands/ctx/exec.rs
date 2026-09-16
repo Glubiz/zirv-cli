@@ -1370,13 +1370,14 @@ fn run_with_clock_inner<W: Write>(
         },
     });
     if !policy_skip {
-        policy_extra.extend(super::mcp::launch::arguments(
+        let mcp_args = super::mcp::launch::arguments(
             adapter.name(),
             repo,
             &state,
             &registry_short,
             &user_extra,
-        ));
+        );
+        super::mcp::launch::append(&mut policy_extra, mcp_args);
     }
     // Issue #420: heal any self-healable (`Outdated`) hook entry, then warn
     // at most once per 24h if something still drifted. Best-effort: no home
