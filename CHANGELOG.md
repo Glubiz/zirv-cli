@@ -15,6 +15,30 @@ the type/scope is the only breaking-change signal this script reads -- a
 `BREAKING CHANGE:` footer in the commit body is not parsed. Full-rebuild
 command: `scripts/generate-changelog.sh --full`.
 
+## v4.4.0 (2026-09-16)
+
+### Features
+
+- surface blocked commands in the delegation receipt
+- extend the shipped allow list and escape_allow for the worker capability set
+- blocked-command observability (Change 5a/b/d, reduced 5c)
+
+### Fixes
+
+- narrow launchctl SSH agent access
+- silence safe command permission prompts
+- preserve pipe structure across a keyword-stripped segment head
+- keyword-aware segment candidates and docker/kubectl exec decoding
+
+### Documentation
+
+- spec for built-in safe-command policy and blocked-command observability
+- disclaimer, ctx module boundaries, latency targets, generated changelog (#430, #431, #432, #433)
+
+### Chores
+
+- 4.4.0
+
 ## v4.0.2 (2026-09-16)
 
 ### Fixes
