@@ -128,6 +128,17 @@ Stated plainly, because the value of the record above depends on it.
    any latency or token number for a native run. The `live-validated` rung
    exists for exactly this and is unreached; it is the one release blocker
    named in [`native-parity.md`](native-parity.md).
+   **Update 2026-09-16 (issue #592):** the tooling to collect this evidence
+   is now committed -- `docs/evidence/provider-live-contract-manifest.json`
+   is a redacted, schema-versioned manifest with one row per production
+   route (Anthropic Messages, OpenAI Responses, Google Generative AI, and
+   the OpenAI-compatible chat family's representative route), each row
+   `collection_status: "not_collected"` until an operator runs its named
+   `live_*` test with real credentials
+   (`commands::ctx::provider::evidence::record_stream_result` then rewrites
+   that row in place; see `docs/evidence/README.md`). No key exists in this
+   environment, so no row has been collected by this update -- the manifest
+   states that plainly rather than being mistaken for evidence.
 2. **No comparative quality evaluation against real models.**
    `docs/benchmarks/native-runtime-baseline.jsonl` holds two rows today,
    both `"runtime": "harness"` (#470 and #471). There is no `"runtime":
@@ -149,6 +160,17 @@ Stated plainly, because the value of the record above depends on it.
    contacts configured MCP servers, and the CI job runs it with none
    configured. Browser-backed frontend rendering is configuration-gated and
    unverified here.
+   **Update 2026-09-16 (issue #610 scenario 2):** the frontend
+   run-inspect-capture-review acceptance test now exists --
+   `frontend_render::tests::
+   a_frontend_run_inspect_capture_review_scenario_runs_live_or_names_exactly_what_is_missing`
+   -- and checks this live rather than assuming it: it is present, named,
+   and prints exactly why it did no work whenever no Chromium-family
+   browser is discovered (still the case on this machine), or drives a
+   real capture through `render()` when one is. The review half of that
+   same scenario still needs a real, credentialed reviewer even once a
+   browser exists (see the #592 update above), and is reported the same
+   honest way rather than faked.
 6. **`#[cfg(unix)]` PTY paths are not compiled on Windows.** The real-PTY
    wrap tests are Linux/macOS-only by construction. This affects the legacy
    surface, not the native one -- a native session has no PTY -- but it is

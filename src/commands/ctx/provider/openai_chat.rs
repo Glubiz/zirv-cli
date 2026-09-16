@@ -1818,4 +1818,63 @@ mod tests {
             assert_eq!(error.http_status, Some(status));
         }
     }
+
+    /// Issue #592: the fourth production route the manifest covers
+    /// (Anthropic/OpenAI/Google above, the OpenAI-compatible chat-
+    /// completions family here) had no live contract test at all -- every
+    /// existing `openai_chat::tests` proof replays a fixture or a local
+    /// loopback server, never a real vendor endpoint. This is deliberately
+    /// generic rather than pinned to one vendor: the compatible family
+    /// (DeepSeek, xAI, Moonshot, Mistral, Ollama, a self-hosted vLLM/
+    /// LM Studio instance, ...) all speak the exact same wire protocol
+    /// through the `openai-chat-generic` route profile, and an operator
+    /// runs this against whichever one they actually hold a key for.
+    #[test]
+    #[ignore = "live OpenAI-compatible contract; set ZIRV_OPENAI_COMPATIBLE_BASE_URL, \
+                ZIRV_OPENAI_COMPATIBLE_API_KEY and ZIRV_OPENAI_COMPATIBLE_LIVE_MODEL"]
+    fn live_openai_compatible_chat_contract() {
+        let base_url = std::env::var("ZIRV_OPENAI_COMPATIBLE_BASE_URL").expect(
+            "ZIRV_OPENAI_COMPATIBLE_BASE_URL must name a compatible vendor's API base, e.g. \
+             https://api.deepseek.com",
+        );
+        let key = std::env::var("ZIRV_OPENAI_COMPATIBLE_API_KEY")
+            .expect("ZIRV_OPENAI_COMPATIBLE_API_KEY");
+        let model = std::env::var("ZIRV_OPENAI_COMPATIBLE_LIVE_MODEL")
+            .expect("ZIRV_OPENAI_COMPATIBLE_LIVE_MODEL must name an entitled exact model id");
+        let adapter = OpenAiChatAdapter::new(
+            target(base_url, "operator-declared", &model),
+            Some(Credential {
+                secret: Secret::new(key),
+                expires_at: None,
+            }),
+            StreamTimeouts::default(),
+            profile("openai-chat-generic").unwrap(),
+            ChatEndpoint::Compatible,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let mut live_request = request(&model);
+        live_request.messages = vec![ProviderMessage {
+            role: ProviderMessageRole::User,
+            content: vec![ProviderContent::Text {
+                text: "Reply with exactly: zirv-live-ok".into(),
+            }],
+        }];
+        live_request.tools.clear();
+        live_request.thinking = ThinkingConfig::Default;
+        live_request.effort = None;
+        // Issue #592: record the redacted outcome of this live call into the
+        // committed evidence manifest, whichever way it goes, then keep
+        // asserting exactly as before.
+        let response = super::super::evidence::record_stream_result(
+            &adapter,
+            "openai-chat-generic",
+            &model,
+            &["single-turn text completion", "usage tokens reported"],
+            adapter.stream(&live_request, &NeverCancelled, &mut Vec::new()),
+        )
+        .unwrap();
+        assert!(!response.message_id.is_empty());
+        assert!(response.usage.output_tokens > 0);
+    }
 }

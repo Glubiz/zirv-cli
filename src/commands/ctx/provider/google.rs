@@ -2213,7 +2213,7 @@ mod tests {
         )
         .unwrap();
         let mut live_request = request();
-        live_request.model = model;
+        live_request.model = model.clone();
         live_request.messages = vec![ProviderMessage {
             role: ProviderMessageRole::User,
             content: vec![ProviderContent::Text {
@@ -2223,9 +2223,17 @@ mod tests {
         live_request.tools.clear();
         live_request.thinking = ThinkingConfig::Default;
         live_request.effort = None;
-        let response = adapter
-            .stream(&live_request, &NeverCancelled, &mut Vec::new())
-            .unwrap();
+        // Issue #592: record the redacted outcome of this live call into the
+        // committed evidence manifest, whichever way it goes, then keep
+        // asserting exactly as before.
+        let response = super::super::evidence::record_stream_result(
+            &adapter,
+            "google-developer",
+            &model,
+            &["single-turn text completion", "usage tokens reported"],
+            adapter.stream(&live_request, &NeverCancelled, &mut Vec::new()),
+        )
+        .unwrap();
         assert!(!response.message_id.is_empty());
         assert!(response.usage.output_tokens > 0);
     }
