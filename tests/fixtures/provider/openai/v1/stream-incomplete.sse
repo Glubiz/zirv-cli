@@ -1,0 +1,27 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_partial","object":"response","model":"gpt-5.6-sol","status":"in_progress","usage":null}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_partial","status":"in_progress","role":"assistant","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":2,"item_id":"msg_partial","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_partial","output_index":0,"content_index":0,"delta":"Starting."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"type":"message","id":"msg_partial","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Starting.","annotations":[]}]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":5,"output_index":1,"item":{"type":"function_call","id":"fc_partial","call_id":"call_partial","name":"file_read","arguments":"","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":6,"item_id":"fc_partial","output_index":1,"delta":"{\"path\":\"src/lib.rs\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":7,"output_index":1,"item":{"type":"function_call","id":"fc_partial","call_id":"call_partial","name":"file_read","arguments":"{\"path\":\"src/lib.rs\"}","status":"completed"}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","sequence_number":8,"response":{"id":"resp_partial","object":"response","model":"gpt-5.6-sol","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":90,"input_tokens_details":{"cached_tokens":0},"output_tokens":4096,"output_tokens_details":{"reasoning_tokens":4000},"total_tokens":4186}}}
+

@@ -25,3 +25,38 @@
 # would otherwise hand a CRLF `.sh` to `sh`, which chokes on it).
 /tests/fixtures/noisy-output.sh text eol=lf
 /tests/fixtures/noisy-output.cmd text eol=crlf
+
+# Issues #353 and #470: both wire-fixture sets are compared BYTE FOR BYTE
+# against what `serde_json::to_string_pretty` produces (LF), so a CRLF checkout
+# on Windows fails the compatibility guard for a reason that has nothing to do
+# with the wire. `runtime/v1` (#470) shipped without this pin and its three
+# round-trip tests fail on any Windows checkout with core.autocrlf on.
+/tests/fixtures/protocol/v1/*.json text eol=lf
+/tests/fixtures/runtime/v1/*.json text eol=lf
+
+# Issue #478: the native agent loop's provider/tool scripts are parsed with
+# `deny_unknown_fields` and compared against recorded outcomes, so they are
+# pinned to LF for the same reason the two wire-fixture sets above are -- a
+# CRLF checkout must not be able to change what a loop-correctness test sees.
+/tests/fixtures/runtime/native/*.json text eol=lf
+
+# Issue #483 review finding 1: the MCP stdio-cancellation test fixtures are
+# executed by `sh`/`cmd` verbatim, same reason as noisy-output.sh/.cmd above.
+/tests/fixtures/mcp-hang-server.sh text eol=lf
+/tests/fixtures/mcp-hang-server.cmd text eol=crlf
+
+# Issue #493 final pass: the protocol v1 fixtures are compared byte-for-byte
+# after a serde round trip (runtime/protocol.rs every_*_fixture_round_trips),
+# so a CRLF checkout on Windows (core.autocrlf=true) fails them. Pin to LF.
+/tests/fixtures/runtime/** text eol=lf
+
+# Issue #542 review finding 10: `WorkflowDefinitionV2::hash()` is a function
+# of the PARSED value, not raw bytes, so an EOL difference alone cannot
+# change a pack's hash -- but `include_str!` still embeds these files'
+# literal bytes into the binary (`MAX_DEFINITION_BYTES`/`MAX_MANIFEST_BYTES`
+# size checks, and any fixture test that compares file text verbatim, e.g.
+# `engine::tests::a_pinned_repository_definition_survives_registry_drift_
+# inline`'s on-disk edit), so a CRLF checkout on Windows must not be able to
+# make these differ from what CI (Linux/macOS) sees. Pin to LF.
+/src/commands/workflow/packs/*.toml text eol=lf
+/tests/fixtures/workflow/** text eol=lf

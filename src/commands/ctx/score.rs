@@ -809,9 +809,21 @@ impl IncrementalScorer {
             self.model = None;
             self.context_window = None;
             self.model_tracker = ModelTracker::default();
-            // A rewritten transcript's open turn belongs to a conversation
-            // this scorer is no longer following.
-            self.open_turn = OpenTurn::default();
+            // #496 finding 1: a rewritten transcript's open turn belongs to a
+            // conversation this scorer is no longer following, so it is
+            // dropped -- but ONLY then. The condition above also fires when
+            // the transcript is untouched and merely the rot CONFIG changed
+            // (a different window or marker invalidates `built_for`), and for
+            // every poll of an unbounded window, where `RotState::new`
+            // legitimately returns `None`. The rows are the same rows in both
+            // of those cases: dropping the pending turn there threw away the
+            // success and TTFT sample of a turn that had already produced its
+            // reply and was only waiting for the next `TurnStart` to be
+            // provably over, silently shrinking the rolling rate's
+            // denominator on every config edit.
+            if appended.restarted {
+                self.open_turn = OpenTurn::default();
+            }
         }
         // Issue #155 D1: resolved off the committed lines every poll, newest
         // wins, kept across polls (see the `model` field's own doc comment).
@@ -2162,6 +2174,111 @@ mod tests {
             score.verdict,
             rot::Verdict::Healthy,
             "the checkpointed 1M model must still gate {tokens} tokens as healthy: {score:?}"
+        );
+    }
+
+    /// #496 finding 1: the same pending turn, lost to a CONFIG change rather
+    /// than to a resume. `RotState::built_for` fails whenever the rot window
+    /// or marker differs from the one the state was built for, and the
+    /// rebuild that follows used to drop the open turn along with the model
+    /// and the tracker -- but those three belong to a transcript, and the
+    /// transcript here has not changed at all. The finished turn's success
+    /// and TTFT sample were thrown away on every config edit (and, because
+    /// an unbounded window makes `RotState::new` return `None`, on every
+    /// single poll of one).
+    #[test]
+    fn a_config_only_state_rebuild_keeps_the_pending_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        let thresholds = screen::Thresholds::default();
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+
+        let turn_one = concat!(
+            r#"{"type":"user","message":{"content":"go"},"timestamp":"2026-08-20T10:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"thinking"}],"usage":{"input_tokens":10}},"timestamp":"2026-08-20T10:00:00.200Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[zirv] done"}],"usage":{"input_tokens":12}},"timestamp":"2026-08-20T10:00:00.500Z"}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, turn_one).expect("write transcript");
+
+        let before = ScoreConfig::default();
+        let mut scorer = IncrementalScorer::new(transcript.clone());
+        scorer
+            .poll(&adapter, &before, &thresholds)
+            .expect("first poll");
+        assert!(
+            scorer.take_turn_successes().is_empty(),
+            "a turn nothing follows is not yet a finished turn"
+        );
+
+        // The operator widens the rot window. Same scorer, same transcript,
+        // appended to rather than rewritten -- only the config differs.
+        let after = ScoreConfig {
+            window: before.window + 1,
+            ..before.clone()
+        };
+        let turn_two_start = concat!(
+            r#"{"type":"user","message":{"content":"again"},"timestamp":"2026-08-20T10:00:09.000Z"}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, format!("{turn_one}{turn_two_start}")).expect("append");
+        scorer
+            .poll(&adapter, &after, &thresholds)
+            .expect("second poll");
+
+        assert_eq!(
+            scorer.take_turn_successes(),
+            vec![1_787_220_000],
+            "a config-only rebuild must not drop the turn that was already answered"
+        );
+        assert_eq!(
+            scorer
+                .take_turn_latencies()
+                .iter()
+                .map(|sample| sample.ttft_ms)
+                .collect::<Vec<_>>(),
+            vec![200],
+            "and its TTFT survives with it"
+        );
+    }
+
+    /// The other side of #496 finding 1: a RESTARTED transcript (truncated or
+    /// rewritten) may be a different conversation, so its pending turn is
+    /// still dropped.
+    #[test]
+    fn a_restarted_transcript_still_drops_the_pending_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        let cfg = ScoreConfig::default();
+        let thresholds = screen::Thresholds::default();
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+
+        let turn_one = concat!(
+            r#"{"type":"user","message":{"content":"go"},"timestamp":"2026-08-20T10:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[zirv] done"}],"usage":{"input_tokens":12}},"timestamp":"2026-08-20T10:00:00.500Z"}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, turn_one).expect("write transcript");
+        let mut scorer = IncrementalScorer::new(transcript.clone());
+        scorer
+            .poll(&adapter, &cfg, &thresholds)
+            .expect("first poll");
+
+        // A different, shorter session at the same path.
+        let replacement = concat!(
+            r#"{"type":"user","message":{"content":"new"},"timestamp":"2026-08-20T11:00:00.000Z"}"#,
+            "\n",
+        );
+        std::fs::write(&transcript, replacement).expect("rewrite transcript");
+        scorer
+            .poll(&adapter, &cfg, &thresholds)
+            .expect("second poll");
+        assert!(
+            scorer.take_turn_successes().is_empty(),
+            "the old conversation's open turn belongs to a session this scorer left"
         );
     }
 

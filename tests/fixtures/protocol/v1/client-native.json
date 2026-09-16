@@ -1,0 +1,10 @@
+[
+  "session.read",
+  "session.control",
+  "session.wait",
+  "session.report_status",
+  "session.attach",
+  "session.native",
+  "events.subscribe",
+  "idempotency"
+]

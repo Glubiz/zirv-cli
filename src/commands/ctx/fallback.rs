@@ -386,6 +386,12 @@ pub fn capacity_snapshot(
             state: allocator::HarnessState::Unknown,
             state_reason: String::new(),
             health: super::health_store::admission_for(&health, name),
+            // N18: a harness route's identity is the one this module
+            // always implied -- its provider is its billing pool, and it
+            // declares no offer, so nothing about harness placement or
+            // eligibility changes.
+            identity: super::route::RouteIdentity::harness(name, &provider),
+            offer: None,
         };
         let (state, reason) = allocator::classify(&harness, provider_capacity, cfg);
         harness.state = state;
@@ -406,6 +412,97 @@ pub fn capacity_snapshot(
         harnesses,
         degraded,
     }
+}
+
+/// [`capacity_snapshot`], plus a row for every configured NATIVE route
+/// (issue #554, spec #487 items 1-5).
+///
+/// Deliberately additive rather than folded into `capacity_snapshot` itself:
+/// that function is on the dashboard's once-a-second path and a native row
+/// costs a provider-config load and an inventory build. Every native
+/// delegation already loads that config, so the cost lands where the answer
+/// is actually used.
+///
+/// What a native row states that a harness row cannot:
+///
+/// * its capacity is looked up by BILLING POOL -- two routes on one account
+///   resolve to one `ProviderCapacity` (one balance, one `reserved_tokens`),
+///   two accounts at one vendor stay separate;
+/// * its health is the strictest of its three scoped breakers
+///   (`health_store::native_admission`), so an endpoint outage excludes every
+///   route on that host and a model failure excludes only that model;
+/// * it declares a `RouteOffer`, so `allocator::place`'s eligibility gate
+///   (capability, context room, authorized billing) runs BEFORE any ranking.
+pub fn capacity_snapshot_with_native(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    now: u64,
+    requester: Option<&str>,
+    offers: &[super::route::RouteOffer],
+) -> allocator::CapacitySnapshot {
+    let mut snapshot = capacity_snapshot(state, cfg, now, requester, None);
+    let health_policy = cfg.fallback.effective_health();
+    for offer in offers {
+        let pool = offer.identity.pool.clone();
+        if snapshot.provider(&pool).is_none() {
+            // A native pool has no per-account reading of its own yet, so it
+            // inherits the vendor's window. That is evidence, not a licence:
+            // `route::headroom` labels every dimension nothing has reported
+            // as `Estimated`, and an unmeasured dimension is never free.
+            let (capacity, _) = build_provider_capacity(state, cfg, now, &offer.identity.provider);
+            snapshot.providers.push(allocator::ProviderCapacity {
+                provider: pool.clone(),
+                ..capacity
+            });
+        }
+        let name = offer.route.clone();
+        if name.is_empty() {
+            continue;
+        }
+        if snapshot.harness(&name).is_some() {
+            continue;
+        }
+        let Some(provider_capacity) = snapshot.provider(&pool).cloned() else {
+            continue;
+        };
+        let mut row = allocator::HarnessCapacity {
+            name,
+            provider: offer.identity.provider.clone(),
+            enabled: true,
+            ready: true,
+            unready_reason: None,
+            capacity_small: false,
+            counts_tool_calls: false,
+            active: 0,
+            max_active: None,
+            reserve_headroom_pct: cfg.fallback.reserve_headroom_pct(&offer.identity.provider),
+            state: allocator::HarnessState::Unknown,
+            state_reason: String::new(),
+            health: super::health_store::native_admission(
+                state,
+                &offer.identity,
+                now,
+                &health_policy,
+            ),
+            identity: offer.identity.clone(),
+            offer: Some(offer.clone()),
+        };
+        if let Ok(execution) = super::runtime::execution::spec(&offer.identity.endpoint) {
+            let limits = cfg.fallback.harness_limits(execution.harness);
+            row.enabled = cfg.agents.is_enabled(execution.harness);
+            row.max_active = limits.max_active;
+            row.reserve_headroom_pct = cfg.fallback.reserve_headroom_pct(execution.harness);
+            row.active = snapshot
+                .harness(execution.harness)
+                .map_or(0, |h| h.active)
+                .max(super::reservation::active_count(state, &pool));
+        }
+        let (row_state, reason) = allocator::classify(&row, &provider_capacity, cfg);
+        row.state = row_state;
+        row.state_reason = reason;
+        snapshot.harnesses.push(row);
+    }
+    snapshot
 }
 
 /// Refreshes every provider this snapshot is about to rank, not merely the
@@ -1018,6 +1115,7 @@ fn health_names(cfg: &CtxConfig, requested: &str) -> Vec<String> {
 /// every adaptive call site so the mapping cannot drift between them.
 fn work_unit_for(request: RouteRequest<'_>) -> super::allocator::WorkUnit {
     super::allocator::WorkUnit {
+        demand: super::route::Demand::default(),
         id: "delegation".to_string(),
         requested: request.requested.to_string(),
         bounds: request.bounds,
@@ -2076,6 +2174,7 @@ mod tests {
         assert_eq!(claude.state, allocator::HarnessState::Ready);
 
         let unit = allocator::WorkUnit {
+            demand: super::super::route::Demand::default(),
             id: "u1".to_string(),
             requested: "claude".to_string(),
             bounds: TaskBounds {
@@ -2945,6 +3044,7 @@ mod tests {
         );
 
         let unit = allocator::WorkUnit {
+            demand: super::super::route::Demand::default(),
             id: "u1".to_string(),
             requested: "claude".to_string(),
             bounds: TaskBounds {

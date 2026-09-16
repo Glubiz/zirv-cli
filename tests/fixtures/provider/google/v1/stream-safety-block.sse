@@ -1,0 +1,2 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"partial"}]},"finishReason":"SAFETY","safetyRatings":[{"category":"HARM_CATEGORY_DANGEROUS_CONTENT","probability":"HIGH"}],"index":0}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2},"modelVersion":"gemini-2.5-pro","responseId":"resp_safety"}
+

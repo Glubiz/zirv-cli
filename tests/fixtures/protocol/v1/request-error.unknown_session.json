@@ -1,0 +1,8 @@
+{
+  "id": "req-unknown-session",
+  "method": "session.get",
+  "params": {
+    "session_id": "00000000-0000-4000-8000-000000000000"
+  },
+  "v": 1
+}

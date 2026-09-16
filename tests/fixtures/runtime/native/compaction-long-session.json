@@ -1,0 +1,93 @@
+{
+  "shape": "anthropic",
+  "model": "fixture-anthropic-model",
+  "turns": [
+    {
+      "message_id": "msg_1",
+      "blocks": [
+        { "type": "text", "text": "Reading the entry point." },
+        {
+          "type": "tool_use",
+          "id": "call_1",
+          "name": "file_read",
+          "input": { "path": "src/lib.rs" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 100, "output_tokens": 20 }
+    },
+    {
+      "message_id": "msg_2",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_2",
+          "name": "file_read",
+          "input": { "path": "src/main.rs" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 240, "output_tokens": 20 }
+    },
+    {
+      "message_id": "msg_3",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_3",
+          "name": "text_search",
+          "input": { "query": "broken" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 420, "output_tokens": 20 }
+    },
+    {
+      "message_id": "msg_4",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_4",
+          "name": "apply_patch",
+          "input": { "path": "src/lib.rs", "patch": "@@\n-old\n+new\n" }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": {
+        "input_tokens": 400,
+        "cache_read_input_tokens": 300,
+        "output_tokens": 20
+      }
+    },
+    {
+      "message_id": "msg_distill",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "The session was asked to fix a failing test, read the entry point and the binary, searched for the broken symbol and applied one patch. Nothing has been verified yet."
+        }
+      ],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 180, "output_tokens": 60 }
+    },
+    {
+      "message_id": "msg_5",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "id": "call_5",
+          "name": "process_start",
+          "input": { "command": ["cargo", "test"] }
+        }
+      ],
+      "finish_reason": "tool_use",
+      "usage": { "input_tokens": 260, "output_tokens": 20 }
+    },
+    {
+      "message_id": "msg_6",
+      "blocks": [{ "type": "text", "text": "Tests pass." }],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 280, "output_tokens": 30 }
+    }
+  ]
+}

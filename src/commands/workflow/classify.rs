@@ -133,6 +133,16 @@ pub struct Classification {
     pub risk_score: u16,
     pub changed_files: usize,
     pub changed_lines: usize,
+    /// The changed paths themselves, bounded (issue #541 chunk C, decision
+    /// 3): the team compiler needs REAL path boundaries to split implementer
+    /// seats by claim, not just a count. Capped at
+    /// [`MAX_CHANGED_PATHS`] so a huge diff never inflates a durable
+    /// classification or a persisted `TeamPlan`; `changed_files` above stays
+    /// the true total even when this list was truncated. Older durable state
+    /// defaults safely to empty, which the team compiler treats exactly like
+    /// "no path detail available" (falls back to bucketing by count).
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
     /// The change surface was declared on the command line (`--path`/
     /// `--changed-lines`) rather than measured from Git. Consumers can tell a
     /// measured classification from a stated one; the risk band itself is
@@ -313,12 +323,21 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         risk_score: score,
         changed_files,
         changed_lines: input.changed_lines,
+        changed_paths: lowered_paths
+            .iter()
+            .take(MAX_CHANGED_PATHS)
+            .cloned()
+            .collect(),
         declared_scope: false,
         work_domain,
         risk_measurement: RiskMeasurement::Measured,
         reasons,
     })
 }
+
+/// Bounded so a huge diff never inflates a durable classification or a
+/// persisted `TeamPlan` (issue #541 chunk C, decision 3).
+pub const MAX_CHANGED_PATHS: usize = 200;
 
 fn infer_work_domain(task: &str, paths: &[PathBuf]) -> DomainClassification {
     let mut score = 0u8;
@@ -493,16 +512,15 @@ pub(crate) fn is_workflow_work_path(path: &Path) -> bool {
         && matches!(components.next(), Some(std::path::Component::Normal(name)) if name == "work")
 }
 
-pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
-    // The same base `review::package` uses (merge-base against origin/main,
-    // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
-    // classification and review disagree about what "the change" even is:
-    // everything already committed on the branch was invisible here.
-    let base = super::review::default_base(repo)?;
+/// Parses `git diff --numstat`'s output into changed paths and total added
+/// plus removed lines. Shared by [`git_change_input`] (working tree vs a
+/// base) and [`git_change_input_for_branch`] (one named branch vs its own
+/// base, as pure refs).
+fn numstat_paths_and_lines(repo: &Path, args: &[&str]) -> CtxResult<(Vec<PathBuf>, usize)> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff", "--numstat", &base])
+        .args(args)
         .output()?;
     if !output.status.success() {
         return Err(format!(
@@ -527,6 +545,16 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
         lines = lines.saturating_add(added).saturating_add(removed);
         paths.push(PathBuf::from(path));
     }
+    Ok((paths, lines))
+}
+
+pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
+    // The same base `review::package` uses (merge-base against origin/main,
+    // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
+    // classification and review disagree about what "the change" even is:
+    // everything already committed on the branch was invisible here.
+    let base = super::review::default_base(repo)?;
+    let (mut paths, mut lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base])?;
     let untracked = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -580,6 +608,41 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
     })
 }
 
+/// Like [`git_change_input`], but diffs `branch` against its own base as
+/// pure refs (`git diff --numstat <base> <branch>`) rather than `repo`'s
+/// working tree -- for `--branch <name>` (issue #467): the checkout given as
+/// `repo` need not have `branch` checked out at all (an orchestrator's main
+/// checkout classifying a worker's feature branch). No untracked-file scan:
+/// there is no working tree standing in for `branch`'s own content to
+/// sample. A currently-checked-out branch with uncommitted edits given via
+/// `--branch` will therefore not see those edits reflected here -- accepted,
+/// since `--branch`'s purpose is inspecting a branch this checkout is NOT
+/// sitting on; plain `git_change_input` already covers the checkout's own
+/// current branch, uncommitted edits included.
+pub fn git_change_input_for_branch(
+    repo: &Path,
+    branch: &str,
+    task: String,
+) -> CtxResult<ClassificationInput> {
+    let base = super::review::default_base_for(repo, branch)?;
+    let (mut paths, lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base, branch])?;
+    paths.sort();
+    paths.dedup();
+    let tests_changed = paths.iter().any(|path| {
+        let value = path.to_string_lossy().to_ascii_lowercase();
+        value.contains("test") || value.contains("spec")
+    });
+    Ok(ClassificationInput {
+        task,
+        paths,
+        changed_lines: lines,
+        tests_changed,
+        intent_override: None,
+        complexity_override: None,
+        risk_override: None,
+    })
+}
+
 #[derive(Debug, Args)]
 pub struct ClassifyArgs {
     /// Task summary used for deterministic intent inference.
@@ -602,8 +665,27 @@ pub struct ClassifyArgs {
     pub risk: Option<RiskBand>,
     #[arg(long)]
     pub repo: Option<PathBuf>,
+    /// Diff this branch against its own base as refs, instead of `--repo`'s
+    /// working tree (issue #467: classifying a branch `--repo` does not
+    /// have checked out).
+    #[arg(long)]
+    pub branch: Option<String>,
     #[arg(long)]
     pub json: bool,
+}
+
+/// `git_change_input`, or its branch-scoped sibling when `--branch` was
+/// given -- the one seam both of `from_args`'s two measurement points
+/// (the undeclared path, and the declared-input measured floor below) share.
+fn measured_input(
+    repo: &Path,
+    branch: Option<&str>,
+    task: String,
+) -> CtxResult<ClassificationInput> {
+    match branch {
+        Some(branch) => git_change_input_for_branch(repo, branch, task),
+        None => git_change_input(repo, task),
+    }
 }
 
 pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
@@ -620,7 +702,7 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
             risk_override: None,
         }
     } else {
-        git_change_input(&repo, args.task.clone())?
+        measured_input(&repo, args.branch.as_deref(), args.task.clone())?
     };
     input.intent_override = args.intent;
     input.complexity_override = args.complexity;
@@ -641,16 +723,16 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     // exactly the moment a mis-declared low-risk scope is hardest to catch.
     // `mark_unavailable` fails safe instead: it records the unmeasured state
     // and escalates the risk band one step.
-    let Ok(mut measured_input) = git_change_input(&repo, args.task.clone()) else {
+    let Ok(mut measured) = measured_input(&repo, args.branch.as_deref(), args.task.clone()) else {
         mark_unavailable(
             &mut classification,
             "git measurement unavailable (not a repository, or no commits)",
         );
         return Ok(classification);
     };
-    measured_input.intent_override = args.intent;
-    measured_input.complexity_override = args.complexity;
-    let measured = classify(&measured_input)?;
+    measured.intent_override = args.intent;
+    measured.complexity_override = args.complexity;
+    let measured = classify(&measured)?;
     let mut raised = false;
     if measured.risk > classification.risk {
         classification
@@ -706,6 +788,38 @@ mod tests {
     fn identical_inputs_produce_identical_classification() {
         let value = input(&["src/lib.rs"], 12);
         assert_eq!(classify(&value).unwrap(), classify(&value).unwrap());
+    }
+
+    /// Issue #541 chunk C, decision 3: the team compiler needs the REAL
+    /// changed-path list to split implementer seats by claim boundary, not
+    /// just a count -- `changed_files` alone (a count) cannot do that.
+    #[test]
+    fn classification_keeps_the_changed_paths() {
+        let value = input(&["src/A.rs", "docs/readme.md"], 10);
+        let classification = classify(&value).unwrap();
+        assert_eq!(classification.changed_files, 2);
+        // Lowercased and forward-slashed, matching the path signal matching
+        // the rest of this function already does -- one normalized form, not
+        // a second one only this field uses.
+        assert_eq!(
+            classification.changed_paths,
+            vec!["src/a.rs".to_string(), "docs/readme.md".to_string()]
+        );
+    }
+
+    /// A huge diff never inflates a durable classification or a persisted
+    /// `TeamPlan`: `changed_paths` is capped at [`MAX_CHANGED_PATHS`] while
+    /// `changed_files` keeps the true total.
+    #[test]
+    fn changed_paths_is_bounded_but_changed_files_keeps_the_true_total() {
+        let paths: Vec<String> = (0..(MAX_CHANGED_PATHS + 20))
+            .map(|n| format!("src/file{n}.rs"))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let value = input(&refs, 10);
+        let classification = classify(&value).unwrap();
+        assert_eq!(classification.changed_files, MAX_CHANGED_PATHS + 20);
+        assert_eq!(classification.changed_paths.len(), MAX_CHANGED_PATHS);
     }
 
     #[test]
@@ -774,6 +888,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(repo.path().to_path_buf()),
             json: false,
         };
@@ -825,6 +940,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(repo.path().to_path_buf()),
             json: false,
         })
@@ -856,6 +972,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(dir.path().to_path_buf()),
             json: false,
         })
@@ -900,6 +1017,7 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(dir.path().to_path_buf()),
             json: false,
         })
@@ -928,11 +1046,84 @@ mod tests {
             intent: None,
             complexity: None,
             risk: None,
+            branch: None,
             repo: Some(repo.path().to_path_buf()),
             json: false,
         })
         .unwrap();
         assert_eq!(classification.risk_measurement, RiskMeasurement::Measured);
+    }
+
+    /// Issue #467, acceptance 3: undeclared (no `--path`/`--changed-lines`)
+    /// classification measures whichever repository it is given via `git
+    /// diff --numstat <base>` (`git_change_input`) -- so pointing `zirv
+    /// workflow start` at a linked `git worktree add` sibling sees that
+    /// worktree's own branch diff against its base, not an empty diff off
+    /// the main checkout it shares a `.git` with (which never touched the
+    /// feature branch's files at all).
+    #[test]
+    fn git_change_input_sees_a_linked_worktrees_branch_diff_against_its_base() {
+        let main_repo = tempfile::tempdir().expect("tempdir");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "readme\n").expect("write");
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let worktree_dir = tempfile::tempdir().expect("tempdir");
+        let worktree_path = worktree_dir.path().to_path_buf();
+        std::fs::remove_dir(&worktree_path).expect("remove placeholder dir");
+        git(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf-8 path"),
+            ],
+        );
+        for index in 0..8 {
+            std::fs::write(
+                worktree_path.join(format!("src-{index}.rs")),
+                "fn work() {}\n",
+            )
+            .unwrap();
+        }
+        git(&worktree_path, &["add", "."]);
+        git(&worktree_path, &["commit", "-q", "-m", "feature work"]);
+
+        // The main checkout was never touched after "base": its own diff
+        // against its own resolvable history is empty.
+        let from_main = git_change_input(main_repo.path(), "small feature".into()).unwrap();
+        assert!(
+            from_main.paths.is_empty(),
+            "the main checkout was never touched: {from_main:?}"
+        );
+
+        // The worktree's diff against the shared base is real, even though
+        // it shares its `.git` common dir with the (clean) main checkout.
+        let from_worktree = git_change_input(&worktree_path, "small feature".into()).unwrap();
+        assert_eq!(from_worktree.paths.len(), 8, "{from_worktree:?}");
+
+        let measured = classify(&from_worktree).unwrap();
+        assert!(measured.complexity > Complexity::Trivial, "{measured:?}");
     }
 
     #[test]

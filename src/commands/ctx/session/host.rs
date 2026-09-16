@@ -1,0 +1,2003 @@
+//! The runtime service's terminals (issue #352).
+//!
+//! This is the module that owns what the dashboard used to own: the
+//! pty/ConPTY pair, the child process, the `vt100::Parser` that turns its
+//! bytes into a screen, and the attachment bookkeeping that decides who may
+//! type into it. It deliberately reuses the primitives `dash::pane` and
+//! `wrap` already established -- `portable_pty::native_pty_system`,
+//! `sessions::scrub_supervision_env`, `wrap::answer_inherit_cursor_probe`,
+//! `supervise::ChildGuard`, `wrap::quit_child` -- rather than growing a
+//! second spawn path: a pty zirv owns is a pty zirv already knows how to
+//! spawn, supervise and terminate, and the new thing here is only WHO holds
+//! it.
+//!
+//! Three rules shape the whole file:
+//!
+//! - **A client is not a lifetime.** Attaching, detaching, crashing and
+//!   reconnecting all move entries in `clients`/`controller` and touch
+//!   nothing else. The only thing that ends a session is [`RuntimeHost::stop`],
+//!   reached only from `session.stop`.
+//! - **One controller, many observers.** The seat is granted when free,
+//!   refused with `busy` when taken, and moved only by an explicit
+//!   `takeover`. Every change is announced by the protocol server, not here:
+//!   this module reports state, it does not emit events.
+//! - **The screen lives in memory.** Reattachment repaints from the live
+//!   `vt100::Parser`, so the original process never restarts and no terminal
+//!   output has to be written to disk. Tier 3 (`[session] history`) is the
+//!   only thing that would, which is why it is off by default and warned
+//!   about where it is turned on.
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
+
+use super::super::CtxResult;
+use super::super::api::server::SessionHost;
+use super::super::api::wire::{
+    ApiError, AttachMode, AttachRole, Attachment, ErrorCode, ScreenView, SessionFacts, SessionState,
+};
+use super::super::prompt::PromptRole;
+use super::super::runtime::{RuntimeKind, SessionSpec, UiSurface};
+use super::super::state::{self, StateDir};
+use super::super::{INJECTION_SUBMIT_DELAY, adapters, priority, sessions, signal, supervise, wrap};
+
+/// How long a stopped child gets to exit politely before the ladder
+/// escalates. The same 3s `dash::pane` uses for its own quit.
+const QUIT_GRACE: Duration = Duration::from_secs(3);
+
+/// The most bytes one pump pass feeds a single session's parser before it
+/// yields, so one noisy session cannot starve the others. Mirrors
+/// `dash::pane`'s own per-tick budget discipline.
+const PUMP_BUDGET_BYTES: usize = 512 * 1024;
+
+pub use super::MAX_ENDED_SESSIONS;
+
+/// Drops the oldest ended sessions past `cap`. Live sessions are never
+/// touched, whatever the cap is: this bounds HISTORY, not concurrency.
+fn prune_ended(sessions: &mut BTreeMap<String, HostSession>, cap: usize) {
+    let mut ended: Vec<(u64, String)> = sessions
+        .iter()
+        .filter(|(_, session)| session.ended)
+        .map(|(id, session)| (session.ended_at.unwrap_or(0), id.clone()))
+        .collect();
+    if ended.len() <= cap {
+        return;
+    }
+    // (ended_at, id) so sessions that ended in the same second still have a
+    // total order, and pruning is deterministic.
+    ended.sort();
+    let excess = ended.len() - cap;
+    for (_, id) in ended.into_iter().take(excess) {
+        sessions.remove(&id);
+    }
+}
+
+/// What a caller must supply to have the runtime own a session's terminal.
+/// `argv` is already resolved (adapter, model flags, prompt, sandbox flags):
+/// building it is the launch path's job, and duplicating that here would be
+/// a second place for a launch to drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnSpec {
+    pub session_id: String,
+    pub agent: String,
+    pub role: String,
+    pub cwd: PathBuf,
+    /// The repository the registry record is filed against. Usually `cwd`;
+    /// separate because `sessions::Record` keys `repo_slug` off it and a
+    /// worktree launch can legitimately differ.
+    pub repo: PathBuf,
+    /// The registry verb this session is recorded under, so `zirv ctx status`
+    /// tells a runtime-owned chat seat apart from a dashboard pane exactly as
+    /// it already tells `wrap` from `dash`.
+    pub verb: sessions::Verb,
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub rows: u16,
+    pub cols: u16,
+    /// The harness's own conversation reference, when the launch pinned one.
+    /// This -- not the zirv session id -- is what a tier-2 restore resumes.
+    pub conversation: Option<String>,
+    /// Set on a restore: the session id of the predecessor this one continues
+    /// from. Recorded, never reused as an identity.
+    pub restored_from: Option<String>,
+}
+
+/// One entry of the durable topology: enough to put a session back in the
+/// same place, and an honest record of whether it can be RESUMED or merely
+/// relaunched.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TopologyEntry {
+    pub session_id: String,
+    pub short: String,
+    pub agent: String,
+    pub role: String,
+    pub cwd: String,
+    pub rows: u16,
+    pub cols: u16,
+    /// The harness conversation to resume. `None` means there is nothing
+    /// verified to resume -- see [`TopologyEntry::is_resumable`].
+    #[serde(default)]
+    pub conversation: Option<String>,
+    /// The instance of the service that owned this session. A restore under
+    /// a different instance is a NEW session continuing an old conversation,
+    /// never the same session id revived.
+    #[serde(default)]
+    pub instance: String,
+}
+
+impl TopologyEntry {
+    /// Issue #352's tier-2 honesty rule in one predicate: a session is
+    /// resumable only when there is a verified native conversation reference
+    /// to hand the harness. Everything else -- an arbitrary process the
+    /// operator happened to run under a pty, a harness with no resume flag --
+    /// is topology that can be RECREATED, never a process that survived, and
+    /// nothing in zirv may claim otherwise.
+    pub fn is_resumable(&self) -> bool {
+        self.conversation
+            .as_ref()
+            .is_some_and(|reference| !reference.trim().is_empty())
+    }
+}
+
+/// The whole durable topology of one namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Topology {
+    pub written: u64,
+    pub instance: String,
+    pub sessions: Vec<TopologyEntry>,
+}
+
+pub fn topology_path(state: &StateDir, namespace: &str) -> PathBuf {
+    super::namespace::runtime_dir(state)
+        .join(format!("{}-topology.json", state::provider_slug(namespace)))
+}
+
+pub fn write_topology(state: &StateDir, namespace: &str, topology: &Topology) -> CtxResult<()> {
+    state::create_private_dir_all(&super::namespace::runtime_dir(state))?;
+    let body = serde_json::to_string_pretty(topology)?;
+    state::write_private(&topology_path(state, namespace), &body)?;
+    Ok(())
+}
+
+pub fn read_topology(state: &StateDir, namespace: &str) -> Option<Topology> {
+    let body = std::fs::read_to_string(topology_path(state, namespace)).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Splits a stored topology into what may be RESUMED and what may only be
+/// reported. Pure, so the honesty rule is testable without a pty: the caller
+/// relaunches the first list and tells the operator about the second rather
+/// than silently respawning agents onto conversations they never had.
+pub fn partition_resumable(topology: &Topology) -> (Vec<TopologyEntry>, Vec<TopologyEntry>) {
+    topology
+        .sessions
+        .iter()
+        .cloned()
+        .partition(TopologyEntry::is_resumable)
+}
+
+/// One server-owned terminal.
+struct HostSession {
+    id: String,
+    short: String,
+    agent: String,
+    role: String,
+    cwd: PathBuf,
+    conversation: Option<String>,
+    restored_from: Option<String>,
+    started_at: u64,
+    parser: vt100::Parser,
+    /// The pty/ConPTY handles, the writer and the reader channel: everything
+    /// a session needs only while its process is ALIVE. `None` once the
+    /// session has been retired (see [`HostSession::retire`]) -- a stopped or
+    /// exited session holds no terminal, only the screen it left behind.
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    writer: Option<Box<dyn Write + Send>>,
+    output: Option<Receiver<Vec<u8>>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    lifecycle: supervise::ChildGuard,
+    /// The registry record this session is filed under. Held by the SERVICE,
+    /// not by any client, which is the mechanical reason pacing, budgets, rot
+    /// scoring, mail addressing and writer permits keep seeing a session
+    /// nobody is watching: every one of them reads the registry, and the
+    /// registry entry outlives every attachment.
+    guard: sessions::SessionGuard,
+    /// The turn-signal endpoint the harness's own hook posts to. Bound here
+    /// for the same reason `dash::pane::Pane::spawn` binds one: without it a
+    /// session is `unreachable()` in the registry and no turn boundary is
+    /// ever observed.
+    signal: Option<signal::SignalServer>,
+    /// When the last turn signal arrived. Read by `facts` so a detached
+    /// session still reports Working/Idle honestly.
+    last_signal_at: Option<u64>,
+    /// Whether a turn is currently in flight, from the last signal.
+    working: bool,
+    /// Completed turns, for `stamp_in_flight`'s turn number -- the same
+    /// counter `wrap`'s pump loop keeps.
+    turns: u64,
+    /// When this session ended, for the retention order `prune_ended` uses.
+    ended_at: Option<u64>,
+    /// Every attached client id, sorted. A client appears here exactly once
+    /// regardless of how many times it re-attaches, so a crashed-and-
+    /// reconnected client resumes its place rather than accumulating ghosts.
+    clients: Vec<String>,
+    controller: Option<String>,
+    /// Issue #489: when the deferred carriage return of an injection this
+    /// runtime typed is due. The two-phase injection a pane performs, moved
+    /// into the service so a DETACHED session can still be delivered to.
+    pending_submit: Option<Instant>,
+    rows: u16,
+    cols: u16,
+    ended: bool,
+}
+
+impl HostSession {
+    fn attachment_for(&self, caller: &str) -> Attachment {
+        Attachment {
+            controller: self.controller.clone(),
+            clients: self.clients.clone(),
+            rows: self.rows,
+            cols: self.cols,
+            role: if self.controller.as_deref() == Some(caller) {
+                AttachRole::Controller
+            } else if self.clients.iter().any(|id| id == caller) {
+                AttachRole::Observer
+            } else {
+                AttachRole::Detached
+            },
+        }
+    }
+
+    fn facts(&self) -> SessionFacts {
+        SessionFacts {
+            session_id: self.id.clone(),
+            short: self.short.clone(),
+            runtime: RuntimeKind::Harness,
+            generation: 1,
+            // The surface reflects whether a CLIENT is looking, and nothing
+            // else about the session: detaching the last one leaves a
+            // perfectly healthy headless session, which is the entire point
+            // of the feature.
+            surface: if self.clients.is_empty() {
+                UiSurface::Headless
+            } else {
+                UiSurface::Terminal
+            },
+            state: match (self.ended, self.working) {
+                (true, _) => SessionState::Ended,
+                (false, true) => SessionState::Working,
+                (false, false) => SessionState::Idle,
+            },
+            role: Some(self.role.clone()),
+            agent: Some(self.agent.clone()),
+            repo_slug: Some(state::repo_slug(&self.cwd)),
+            started_at: Some(self.started_at),
+            reachable: !self.ended,
+        }
+    }
+
+    fn topology_entry(&self, instance: &str) -> TopologyEntry {
+        TopologyEntry {
+            session_id: self.id.clone(),
+            short: self.short.clone(),
+            agent: self.agent.clone(),
+            role: self.role.clone(),
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            rows: self.rows,
+            cols: self.cols,
+            conversation: self.conversation.clone(),
+            instance: instance.to_string(),
+        }
+    }
+
+    /// Feeds queued pty bytes into the parser. Bounded per pass, and a closed
+    /// channel marks the session ended rather than spinning on it.
+    fn pump(&mut self) {
+        let Some(output) = self.output.as_ref() else {
+            // Retired: there is no channel left to drain, and the screen this
+            // session ended on is already in the parser.
+            return;
+        };
+        let mut spent = 0usize;
+        let mut disconnected = false;
+        while spent < PUMP_BUDGET_BYTES {
+            match output.try_recv() {
+                Ok(chunk) => {
+                    spent += chunk.len();
+                    self.parser.process(&chunk);
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.retire(state::now_secs());
+        }
+    }
+
+    /// Lets go of everything a session needs only while its process is alive:
+    /// the pty master, the writer, the reader channel and the turn-signal
+    /// endpoint. The `vt100::Parser` is deliberately KEPT -- a client that was
+    /// watching, or one that attaches afterwards, still gets the frame the
+    /// agent ended on, which costs a screen's worth of memory rather than a
+    /// whole pseudoterminal.
+    ///
+    /// Idempotent, and it drains one last time before dropping the channel so
+    /// the retained frame is genuinely the last thing the child wrote rather
+    /// than whatever happened to be parsed at the previous tick.
+    fn retire(&mut self, now: u64) {
+        if let Some(output) = self.output.take() {
+            let mut spent = 0usize;
+            while spent < PUMP_BUDGET_BYTES {
+                match output.try_recv() {
+                    Ok(chunk) => {
+                        spent += chunk.len();
+                        self.parser.process(&chunk);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        self.master = None;
+        self.writer = None;
+        self.signal = None;
+        self.working = false;
+        self.ended = true;
+        if self.ended_at.is_none() {
+            self.ended_at = Some(now);
+        }
+    }
+
+    /// Drains the harness's own turn signals. The same edge `wrap`'s pump
+    /// loop and `dash::pane::on_turn_signal` observe, taken here so a session
+    /// with NO client attached still closes its turns: the in-flight witness
+    /// is cleared, the rot verdict the signal carries is recorded by the
+    /// hook's own path, and `zirv ctx status` stops showing a turn that ended
+    /// while nobody was watching.
+    fn drain_signals(&mut self) {
+        let Some(server) = &self.signal else {
+            return;
+        };
+        let mut seen = false;
+        while server.try_recv().is_some() {
+            seen = true;
+            self.turns += 1;
+        }
+        if seen {
+            self.last_signal_at = Some(state::now_secs());
+            self.working = false;
+            self.guard.clear_in_flight();
+        }
+    }
+
+    /// Whether this session may be injected into right now -- the same rule
+    /// `dash::pane::Pane::injectable` applies: no turn in flight, and no
+    /// injection of our own still waiting for its submit.
+    fn injectable(&self) -> bool {
+        !self.ended && !self.working && self.pending_submit.is_none()
+    }
+
+    /// Types one labelled injection into the session's terminal and arms the
+    /// deferred submit. Two phases, exactly as a pane does it (issue #114):
+    /// the harness needs the line to settle before the carriage return, and
+    /// blocking the service's pump thread for that delay would stall every
+    /// other session.
+    fn inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Err("this session no longer holds a terminal".into());
+        };
+        super::super::dash::pane::write_injection_phase1(&mut **writer, label, body)?;
+        writer.flush()?;
+        self.pending_submit = Some(Instant::now() + INJECTION_SUBMIT_DELAY);
+        // The injection starts a turn as surely as an operator's keystroke
+        // does, so the in-flight witness is stamped here for the same reason
+        // `write_raw` stamps one.
+        if !self.working {
+            self.working = true;
+            let verb = self.guard.record().verb.as_str().to_string();
+            self.guard.stamp_in_flight(&verb, self.turns + 1);
+        }
+        Ok(())
+    }
+
+    /// Sends the deferred carriage return once its delay has elapsed.
+    fn submit_pending(&mut self, now: Instant) {
+        let Some(due) = self.pending_submit else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        if let Some(writer) = self.writer.as_mut() {
+            let _ = super::super::dash::pane::write_submit_cr(&mut **writer);
+            let _ = writer.flush();
+        }
+        self.pending_submit = None;
+    }
+
+    fn screen_view(&self) -> ScreenView {
+        let screen = self.parser.screen();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        ScreenView {
+            rows: self.rows,
+            cols: self.cols,
+            cursor_row,
+            cursor_col,
+            cursor_visible: !screen.hide_cursor(),
+            alternate: screen.alternate_screen(),
+            contents: String::from_utf8_lossy(&screen.contents_formatted()).into_owned(),
+        }
+    }
+}
+
+/// The runtime service's session table. Shared by every connection thread,
+/// so every method takes `&self` and locks for the shortest possible span --
+/// never across a blocking pty write.
+#[derive(Debug)]
+pub struct RuntimeHost {
+    state: StateDir,
+    namespace: String,
+    /// The owning service's instance identity. Stamped into the topology so a
+    /// successor can see whose sessions it is looking at.
+    instance: String,
+    scrollback_rows: usize,
+    /// Tier 3. Off by default; see [`RuntimeHost::history_warning`].
+    history: bool,
+    /// How many ENDED sessions the table keeps (see [`MAX_ENDED_SESSIONS`]).
+    /// An atomic rather than a constructor parameter so a test can lower it
+    /// without every caller having to carry a knob nothing else sets.
+    ended_cap: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    shutdown_entered: std::sync::atomic::AtomicBool,
+    sessions: Mutex<BTreeMap<String, HostSession>>,
+    stopping: Mutex<BTreeMap<String, SessionFacts>>,
+}
+
+impl std::fmt::Debug for HostSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostSession")
+            .field("id", &self.id)
+            .field("agent", &self.agent)
+            .field("clients", &self.clients)
+            .field("controller", &self.controller)
+            .field("ended", &self.ended)
+            .finish()
+    }
+}
+
+/// The one-line warning an operator sees whenever tier-3 history is enabled.
+/// A constant rather than an inline string so `zirv session serve`, `zirv
+/// session list` and the design note cannot word it differently.
+pub const HISTORY_WARNING: &str = "[session] history = true: this runtime writes each session's rendered terminal output to \
+     disk, including anything an agent printed -- API keys, tokens, file contents. It is off by \
+     default for that reason; turn it off again with `ZIRV_CTX_SESSION_HISTORY=false`.";
+
+impl RuntimeHost {
+    pub fn new(
+        state: StateDir,
+        namespace: &str,
+        instance: &str,
+        scrollback_rows: usize,
+        history: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            namespace: namespace.to_string(),
+            instance: instance.to_string(),
+            scrollback_rows,
+            history,
+            ended_cap: std::sync::atomic::AtomicUsize::new(MAX_ENDED_SESSIONS),
+            #[cfg(test)]
+            shutdown_entered: std::sync::atomic::AtomicBool::new(false),
+            sessions: Mutex::new(BTreeMap::new()),
+            stopping: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// `Some(warning)` exactly when tier-3 history is on, so no caller has to
+    /// remember to check the flag before printing it.
+    pub fn history_warning(&self) -> Option<&'static str> {
+        self.history.then_some(HISTORY_WARNING)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, HostSession>> {
+        // Same reasoning as `ApiServer::lock`: the state behind this mutex is
+        // a session table, not a half-written invariant, and refusing every
+        // later call would turn one panic into a dead runtime.
+        match self.sessions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn lock_stopping(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, SessionFacts>> {
+        match self.stopping.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Drains every session's pty output into its parser. Called on a timer
+    /// by the service, so a session keeps rendering with no client attached
+    /// at all -- which is what makes notifications, rot scoring and attention
+    /// keep working while nobody is watching.
+    pub fn pump(&self) {
+        let now = state::now_secs();
+        let mut sessions = self.lock();
+        let at = Instant::now();
+        for session in sessions.values_mut() {
+            session.pump();
+            session.drain_signals();
+            // Issue #489: the second half of an injection this runtime typed.
+            // On the pump loop rather than inline, so delivering mail never
+            // blocks the caller for the settle delay.
+            session.submit_pending(at);
+            // Cheap and exact: the child's own exit is the authority on
+            // whether the session ended, not the output channel alone. An
+            // agent that exited on its own releases its terminal here, on the
+            // very next tick -- the operator never asked for it to end, so
+            // nothing else about the session changes.
+            if !session.ended && matches!(session.child.try_wait(), Ok(Some(_))) {
+                session.retire(now);
+            }
+        }
+        prune_ended(&mut sessions, self.ended_cap());
+    }
+
+    /// Issue #489 (and issue #352's mail-injection residual): delivers mail to
+    /// the runtime's own sessions, whether or not anybody is attached.
+    ///
+    /// Before this, mail ADDRESSING worked headless (the service files the
+    /// registry record, so a sender could always reach a detached session) but
+    /// the dashboard was still what typed a delivered message into a pane --
+    /// so a detached session accumulated mail in its queue and only saw it
+    /// when a client attached. The service owns the terminal, so the service
+    /// is what should type into it, and it does so through the dashboard's own
+    /// sweep (`dash::sweep_one_pane` for a worker's body delivery,
+    /// `dash::advise_one_pane` for an orchestrator seat's one-line advisory)
+    /// rather than a second delivery path with its own trust framing, its own
+    /// caps and its own consumption rules.
+    ///
+    /// The idle gate is the same one a pane applies: a session with a turn in
+    /// flight, or one already carrying an unsubmitted injection, is left alone
+    /// until the next tick.
+    pub fn deliver_mail(
+        &self,
+        cfg: &super::super::config::CtxConfig,
+        advised: &mut std::collections::HashMap<String, super::super::mail::AdvisedIds>,
+        errors: &mut super::super::dash::ErrorLog,
+    ) {
+        if !cfg.mail.enabled {
+            return;
+        }
+        let targets: Vec<(String, String, String, String, sessions::Verb)> = self
+            .lock()
+            .values()
+            .filter(|session| !session.ended && session.injectable())
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.agent.clone(),
+                    session.short.clone(),
+                    state::repo_slug(&session.cwd),
+                    session.guard.record().verb,
+                )
+            })
+            .collect();
+        for (id, agent, short, slug, verb) in targets {
+            let mut injector = SessionInjector {
+                host: self,
+                session_id: id.clone(),
+            };
+            if super::super::dash::is_delivery_eligible(verb, true) {
+                super::super::dash::sweep_one_pane(
+                    &mut injector,
+                    &id,
+                    &self.state,
+                    &slug,
+                    &agent,
+                    &short,
+                    cfg.mail.max_delivered_bytes,
+                    errors,
+                    None,
+                    &cfg.screen.thresholds(),
+                );
+            } else if verb == sessions::Verb::Chat {
+                super::super::dash::advise_one_pane(
+                    &mut injector,
+                    &id,
+                    &self.state,
+                    &slug,
+                    &agent,
+                    &short,
+                    advised,
+                    errors,
+                );
+            }
+        }
+    }
+
+    /// Spawns a session whose terminal this runtime owns.
+    pub fn spawn(&self, spec: SpawnSpec) -> CtxResult<String> {
+        let (program, rest) = spec
+            .argv
+            .split_first()
+            .ok_or("zirv session: empty argv, nothing to spawn")?;
+        // The same cmd.exe argv-reparse guard `dash::pane::spawn` applies:
+        // this is a second `CommandBuilder` assembled outside
+        // `supervise::spawn_tapped`, so it needs the policy explicitly.
+        super::super::adapters::guard_cmd_shim_reparse(program, rest)?;
+
+        let pair = native_pty_system().openpty(PtySize {
+            rows: spec.rows,
+            cols: spec.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let mut command = CommandBuilder::new(program);
+        for arg in rest {
+            command.arg(arg);
+        }
+        command.cwd(&spec.cwd);
+        sessions::scrub_supervision_env(&mut command);
+        for (key, value) in &spec.env {
+            command.env(key, value);
+        }
+
+        // Taken and answered before the spawn: on Windows the console host
+        // has to be answered before it will service the child at all.
+        let mut writer = pair.master.take_writer()?;
+        wrap::answer_inherit_cursor_probe(&mut *writer);
+
+        let child = pair.slave.spawn_command(command)?;
+        let lifecycle = supervise::ChildGuard::adopt(child.process_id());
+        if let Some(pid) = child.process_id() {
+            priority::apply_to_child(
+                pid,
+                priority::posture_for(
+                    PromptRole::from_label(&spec.role).unwrap_or(PromptRole::Worker),
+                ),
+            );
+        }
+        drop(pair.slave);
+        let master = pair.master;
+
+        let mut reader = master.try_clone_reader()?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        // The registry half, lifted from `dash::pane::Pane::spawn` rather
+        // than reinvented: the same socket, the same published path, the same
+        // record with the CHILD's pid and start time (not the supervisor's,
+        // or every liveness probe compares the wrong process). The difference
+        // that matters for issue #352 is only whose process holds the guard --
+        // the service's, so detaching every client leaves the registry entry,
+        // and therefore pacing, budgets, rot, mail and permits, exactly where
+        // they were.
+        let signal = signal::SignalServer::bind(&self.state.socket_for(&spec.session_id)).ok();
+        if let Some(server) = &signal {
+            wrap::publish_socket_path(&self.state, &spec.session_id, server.path());
+        }
+        let mut record =
+            sessions::Record::new(&spec.session_id, &spec.agent, &spec.repo, spec.verb)
+                .with_role(&spec.role);
+        if let Some(child_pid) = child.process_id() {
+            record.pid = child_pid;
+            record.start_time = sessions::process_start_secs(child_pid);
+        }
+        let record = if signal.is_some() {
+            record
+        } else {
+            record.unreachable()
+        };
+        let guard = sessions::SessionGuard::register(&self.state, record);
+
+        let session = HostSession {
+            short: sessions::short_id(&spec.session_id),
+            id: spec.session_id.clone(),
+            agent: spec.agent,
+            role: spec.role,
+            cwd: spec.cwd,
+            conversation: spec.conversation,
+            restored_from: spec.restored_from,
+            started_at: state::now_secs(),
+            parser: vt100::Parser::new(spec.rows, spec.cols, self.scrollback_rows),
+            master: Some(master),
+            writer: Some(writer),
+            output: Some(rx),
+            child,
+            lifecycle,
+            guard,
+            signal,
+            last_signal_at: None,
+            working: false,
+            turns: 0,
+            ended_at: None,
+            clients: Vec::new(),
+            controller: None,
+            pending_submit: None,
+            rows: spec.rows,
+            cols: spec.cols,
+            ended: false,
+        };
+        self.lock().insert(spec.session_id.clone(), session);
+        self.persist_topology();
+        Ok(spec.session_id)
+    }
+
+    fn ended_cap(&self) -> usize {
+        self.ended_cap.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test seam: lower the ended-session cap so pruning can be exercised
+    /// without spawning [`MAX_ENDED_SESSIONS`] real ptys.
+    #[cfg(test)]
+    pub fn set_ended_cap_for_test(&self, cap: usize) {
+        self.ended_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn shutdown_entered_for_test(&self) -> bool {
+        self.shutdown_entered
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test seam: whether this session still holds any part of a terminal.
+    #[cfg(test)]
+    pub fn holds_terminal_for_test(&self, session_id: &str) -> Option<bool> {
+        self.lock().get(session_id).map(|session| {
+            session.master.is_some() || session.writer.is_some() || session.output.is_some()
+        })
+    }
+
+    /// The rendered screen of one session, with no attachment required. A
+    /// test seam only: every production reader goes through `session.screen`,
+    /// which checks that the caller is attached first.
+    #[cfg(test)]
+    pub fn screen_for_test(&self, session_id: &str) -> Option<String> {
+        self.lock()
+            .get(session_id)
+            .map(|session| session.screen_view().contents)
+    }
+
+    /// Test seam: whether this session is carrying an injection the runtime
+    /// typed and has not submitted yet -- the observable trace of a delivery
+    /// into a session no client is watching.
+    #[cfg(test)]
+    pub fn pending_injection_for_test(&self, session_id: &str) -> Option<bool> {
+        self.lock()
+            .get(session_id)
+            .map(|session| session.pending_submit.is_some())
+    }
+
+    /// The session this runtime restored `session_id` from, if any -- the
+    /// only place a predecessor id is ever read back, and never as an
+    /// identity.
+    pub fn restored_from(&self, session_id: &str) -> Option<String> {
+        self.lock()
+            .get(session_id)
+            .and_then(|session| session.restored_from.clone())
+    }
+
+    /// Writes the durable topology. Called on every structural change (a
+    /// spawn, a stop) and at shutdown, so a crash loses at most the sessions
+    /// started since the last one.
+    pub fn persist_topology(&self) {
+        let sessions = self.lock();
+        let topology = Topology {
+            written: state::now_secs(),
+            instance: self.instance.clone(),
+            sessions: sessions
+                .values()
+                .filter(|session| !session.ended)
+                .map(|session| session.topology_entry(&self.instance))
+                .collect(),
+        };
+        drop(sessions);
+        let _ = write_topology(&self.state, &self.namespace, &topology);
+    }
+
+    /// The operator's explicit shutdown: every session is drained to the
+    /// topology first, then only the ones named are put through the
+    /// termination ladder. `stop_all = false` is the ordinary case -- the
+    /// service exits, the agents do not.
+    pub fn shutdown(&self, stop_all: bool) {
+        self.persist_topology();
+        if !stop_all {
+            return;
+        }
+        let ids: Vec<String> = self.lock().keys().cloned().collect();
+        for id in ids {
+            let _ = self.stop(&id);
+        }
+    }
+
+    fn locked<T>(
+        &self,
+        session_id: &str,
+        call: impl FnOnce(&mut HostSession) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        let mut sessions = self.lock();
+        let Some(session) = sessions.get_mut(session_id) else {
+            if self.lock_stopping().contains_key(session_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Busy,
+                    format!("session {session_id} is stopping"),
+                ));
+            }
+            return Err(ApiError::new(
+                ErrorCode::UnknownSession,
+                format!("no session {session_id} on this runtime"),
+            ));
+        };
+        call(session)
+    }
+}
+
+impl SessionHost for RuntimeHost {
+    fn sessions(&self) -> Vec<SessionFacts> {
+        let sessions = self.lock();
+        let stopping = self.lock_stopping();
+        sessions
+            .values()
+            .map(HostSession::facts)
+            .chain(stopping.values().cloned())
+            .collect()
+    }
+
+    fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+        // A fresh id, always. Even a restore mints one (see
+        // `session::namespace`'s module doc): the identity a previous service
+        // published is never re-published, only recorded as the conversation
+        // this new session continues.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let spawn = launch_spec(spec, &session_id, &self.state)
+            .map_err(|error| ApiError::new(ErrorCode::InvalidParams, error.to_string()))?;
+        self.spawn(spawn)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+        self.lock()
+            .get(&session_id)
+            .map(HostSession::facts)
+            .ok_or_else(|| {
+                ApiError::new(ErrorCode::Internal, "the session vanished as it was opened")
+            })
+    }
+
+    fn attach(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        mode: AttachMode,
+        size: Option<(u16, u16)>,
+    ) -> Result<Attachment, ApiError> {
+        self.locked(session_id, |session| {
+            if !session.clients.iter().any(|id| id == client_id) {
+                session.clients.push(client_id.to_string());
+                session.clients.sort();
+            }
+            if mode == AttachMode::Controller {
+                match session.controller.clone() {
+                    Some(current) if current != client_id => {
+                        // Refused, never silently taken: the operator typing
+                        // into this session somewhere else must not lose the
+                        // keyboard because another client connected.
+                        return Err(ApiError::new(
+                            ErrorCode::Busy,
+                            format!(
+                                "{current} already controls this session; `session.takeover` \
+                                 takes the seat explicitly"
+                            ),
+                        ));
+                    }
+                    _ => session.controller = Some(client_id.to_string()),
+                }
+                if let Some((rows, cols)) = size {
+                    resize_session(session, rows, cols);
+                }
+            }
+            Ok(session.attachment_for(client_id))
+        })
+    }
+
+    fn detach(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+        self.locked(session_id, |session| {
+            session.clients.retain(|id| id != client_id);
+            if session.controller.as_deref() == Some(client_id) {
+                session.controller = None;
+            }
+            // Nothing else. The child, the pty, the parser and the supervisor
+            // are untouched, which is the acceptance criterion this method
+            // exists to satisfy.
+            Ok(session.attachment_for(client_id))
+        })
+    }
+
+    fn takeover(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+        self.locked(session_id, |session| {
+            if !session.clients.iter().any(|id| id == client_id) {
+                session.clients.push(client_id.to_string());
+                session.clients.sort();
+            }
+            session.controller = Some(client_id.to_string());
+            Ok(session.attachment_for(client_id))
+        })
+    }
+
+    fn resize(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Attachment, ApiError> {
+        self.locked(session_id, |session| {
+            if session.controller.as_deref() != Some(client_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Denied,
+                    "only the controller resizes a session's terminal; an observer renders a \
+                     clipped view of it instead",
+                ));
+            }
+            resize_session(session, rows, cols);
+            Ok(session.attachment_for(client_id))
+        })
+    }
+
+    fn screen(&self, session_id: &str, client_id: &str) -> Result<ScreenView, ApiError> {
+        self.locked(session_id, |session| {
+            if !session.clients.iter().any(|id| id == client_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Denied,
+                    "attach to this session before reading its screen",
+                ));
+            }
+            // Drained here as well as on the timer, so a client that asks
+            // immediately after typing sees the result of its own keystroke
+            // rather than the frame before it.
+            session.pump();
+            Ok(session.screen_view())
+        })
+    }
+
+    fn write_raw(&self, session_id: &str, client_id: &str, bytes: &[u8]) -> Result<(), ApiError> {
+        self.locked(session_id, |session| {
+            if session.controller.as_deref() != Some(client_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Denied,
+                    "only the session's controller may type into it",
+                ));
+            }
+            if session.ended {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    "this session has ended",
+                ));
+            }
+            let Some(writer) = session.writer.as_mut() else {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    "this session no longer holds a terminal",
+                ));
+            };
+            writer
+                .write_all(bytes)
+                .and_then(|()| writer.flush())
+                .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))?;
+            // Issue #281's edge, unchanged: the operator's own keystroke is
+            // what reliably starts a turn. Stamped here so a crash of the
+            // SERVICE (not of a client) still leaves the in-flight witness a
+            // recovering supervisor reads.
+            if !session.working {
+                session.working = true;
+                let verb = session.guard.record().verb.as_str().to_string();
+                session.guard.stamp_in_flight(&verb, session.turns + 1);
+            }
+            Ok(())
+        })
+    }
+
+    fn stop(&self, session_id: &str) -> Result<bool, ApiError> {
+        let mut session = {
+            let mut sessions = self.lock();
+            let Some(session) = sessions.get(session_id) else {
+                if self.lock_stopping().contains_key(session_id) {
+                    return Err(ApiError::new(
+                        ErrorCode::Busy,
+                        format!("session {session_id} is stopping"),
+                    ));
+                }
+                return Err(ApiError::new(
+                    ErrorCode::UnknownSession,
+                    format!("no session {session_id} on this runtime"),
+                ));
+            };
+            if session.ended {
+                return Ok(false);
+            }
+            self.lock_stopping()
+                .insert(session_id.to_string(), session.facts());
+            match sessions.remove(session_id) {
+                Some(session) => session,
+                None => {
+                    return Err(ApiError::new(
+                        ErrorCode::UnknownSession,
+                        format!("no session {session_id} on this runtime"),
+                    ));
+                }
+            }
+        };
+        #[cfg(test)]
+        self.shutdown_entered
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let quit = adapter_by_name(&session.agent)
+            .map(|adapter| adapter.quit_sequence().to_string())
+            .unwrap_or_default();
+        let mut discard = std::io::sink();
+        let sink: &mut dyn Write = match session.writer.as_mut() {
+            Some(writer) => &mut **writer,
+            None => &mut discard,
+        };
+        let _ = wrap::quit_child(sink, &mut session.child, &quit, QUIT_GRACE);
+        session.lifecycle.release();
+        session.guard.release();
+        wrap::unpublish_socket_path(&self.state, &session.id);
+        session.clients.clear();
+        session.controller = None;
+        session.retire(state::now_secs());
+
+        let cap = self.ended_cap();
+        let mut sessions = self.lock();
+        sessions.insert(session_id.to_string(), session);
+        self.lock_stopping().remove(session_id);
+        prune_ended(&mut sessions, cap);
+        drop(sessions);
+        self.persist_topology();
+        Ok(true)
+    }
+}
+
+/// Issue #489: the runtime's own [`dash::Injector`], so the dashboard's mail
+/// sweep can deliver into a session the SERVICE owns.
+///
+/// It holds the session id rather than the session, because the sweep borrows
+/// its injector for the whole call while the host's table has to stay
+/// unlocked between injections -- the same reason `dash::mail_sweep` hands
+/// `sweep_one_pane` a `&mut Pane` and not the whole pane list.
+struct SessionInjector<'a> {
+    host: &'a RuntimeHost,
+    session_id: String,
+}
+
+impl super::super::dash::Injector for SessionInjector<'_> {
+    fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        let mut sessions = self.host.lock();
+        let Some(session) = sessions.get_mut(&self.session_id) else {
+            return Err("this session is no longer on the runtime".into());
+        };
+        session.inject(label, body)
+    }
+}
+
+/// The size a runtime-owned terminal is opened at before any client has said
+/// how big its window is. A controller's `session.attach` carries its real
+/// size and resizes immediately (see [`SessionHost::attach`]), so this is
+/// only ever the geometry of the first few milliseconds -- but it has to be a
+/// usable one, because a session nobody ever attaches to still has to render.
+pub const DEFAULT_ROWS: u16 = 24;
+pub const DEFAULT_COLS: u16 = 80;
+
+/// Turns a protocol [`SessionSpec`] into a launch this runtime is willing to
+/// make.
+///
+/// Everything here is the EXISTING chat launch path -- `chat::
+/// resolve_adapter`, `chat::build_launch`, `chat::dash_orchestrator_pane`
+/// (context compilation, prompt injection, the sandbox posture, the
+/// conversation pin) and `dash::build_turn_env` -- called in the order the
+/// dashboard already calls it. Issue #352 changes WHO holds the resulting
+/// pty, not how a session is composed, so composing one differently here
+/// would be a second launch path to keep in step with the first.
+///
+/// The conversation reference this returns is the one tier 2 later resumes,
+/// and it is deliberately derived from the adapter's own verified pin flag:
+/// an adapter with no `session_pin_args` yields `None`, which is what makes
+/// `TopologyEntry::is_resumable` answer honestly rather than optimistically.
+pub fn launch_spec(spec: &SessionSpec, session_id: &str, state: &StateDir) -> CtxResult<SpawnSpec> {
+    let role = if spec.role.trim().is_empty() {
+        PromptRole::Orchestrator
+    } else {
+        PromptRole::from_label(&spec.role)
+            .ok_or_else(|| format!("unknown session role '{}'", spec.role))?
+    };
+    if role != PromptRole::Orchestrator {
+        // Honest refusal rather than a silently different session: a worker
+        // pane carries a task prompt, a work group, a budget and a report
+        // address that the dashboard assembles (`dash::fulfill_spawn_request`).
+        // Hosting those in the runtime is step N20 (#489), not this change.
+        return Err(format!(
+            "the persistent runtime opens orchestrator seats; '{}' sessions stay with the \
+             dashboard until #489",
+            spec.role
+        )
+        .into());
+    }
+    let repo = spec.cwd.clone();
+    let cfg = super::super::config::CtxConfig::load_for_launch(
+        &repo,
+        &super::super::config::env_from_process(),
+    )?;
+    let (adapter, _rule) = super::super::chat::resolve_adapter(&cfg, spec.agent.as_deref())?;
+    let prompt = spec.prompt.trim();
+    let launch = super::super::chat::build_launch(
+        adapter.as_ref(),
+        (!prompt.is_empty()).then_some(prompt),
+        &spec.extra_args,
+    );
+    let pane = super::super::chat::dash_orchestrator_pane(
+        adapter.as_ref(),
+        launch,
+        &cfg,
+        state,
+        &repo,
+        session_id,
+        false,
+    )?;
+    let (env, _turn_env_error) = super::super::dash::build_turn_env(
+        &cfg,
+        state,
+        &repo,
+        &pane.agent_name,
+        session_id,
+        adapters::LaunchMode::Interactive,
+    );
+    let conversation =
+        (!adapter.session_pin_args(session_id).is_empty()).then(|| session_id.to_string());
+    Ok(SpawnSpec {
+        session_id: session_id.to_string(),
+        agent: pane.agent_name,
+        role: pane.role.label().to_string(),
+        cwd: repo.clone(),
+        repo,
+        verb: pane.verb,
+        argv: pane.argv,
+        env,
+        rows: DEFAULT_ROWS,
+        cols: DEFAULT_COLS,
+        conversation,
+        restored_from: None,
+    })
+}
+
+/// Resizes both the pty and the parser together, so the two can never
+/// disagree about the terminal's shape (the bug class `dash::pane::resize`
+/// guards against for the same reason).
+fn resize_session(session: &mut HostSession, rows: u16, cols: u16) {
+    if let Some(master) = session.master.as_ref() {
+        let _ = master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+    }
+    session.parser.screen_mut().set_size(rows, cols);
+    session.rows = rows;
+    session.cols = cols;
+}
+
+/// The adapter registered under `agent`, by name alone. `adapters::all`'s
+/// `bin` override only changes where a harness binary is found, and nothing
+/// here launches one -- the quit sequence and the resume flags are static
+/// facts of the adapter.
+fn adapter_by_name(agent: &str) -> Option<Box<dyn super::super::adapters::AgentAdapter>> {
+    super::super::adapters::all(None)
+        .into_iter()
+        .find(|adapter| adapter.name() == agent)
+}
+
+/// A verified-resume argv for one topology entry, or `None` when the harness
+/// has no verified resume mechanism for it. The adapter's own `resume_args`
+/// is the authority -- the same one `dash::roster::restore_argv` uses -- so
+/// "resumable" means exactly what it already means everywhere else in zirv.
+pub fn resume_argv(entry: &TopologyEntry) -> Option<Vec<String>> {
+    let conversation = entry.conversation.as_deref()?;
+    let adapter = adapter_by_name(&entry.agent)?;
+    let resume = adapter.resume_args(conversation)?;
+    if resume.is_empty() {
+        return None;
+    }
+    Some(super::super::dash::flatten_command(
+        adapter.interactive_cmd(None, &resume),
+    ))
+}
+
+/// Where a restored session's working directory comes from. Kept separate so
+/// a topology entry naming a directory that no longer exists degrades to the
+/// operator's current one with a visible note rather than failing the whole
+/// restore.
+pub fn restore_cwd(entry: &TopologyEntry, fallback: &Path) -> PathBuf {
+    let recorded = PathBuf::from(&entry.cwd);
+    if recorded.is_dir() {
+        recorded
+    } else {
+        fallback.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child that prints one recognizable line and then stays alive well
+    /// past any of these tests' deadlines. Never a real agent -- the same
+    /// absolute rule, and the same platform split, `dash::pane`'s own pty
+    /// tests already use (`cmd /c` on Windows, `sh -c` on unix).
+    #[cfg(windows)]
+    fn marker_argv(marker: &str) -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            format!("echo {marker} & ping -n 60 127.0.0.1 >nul"),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn marker_argv(marker: &str) -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo {marker}; sleep 60"),
+        ]
+    }
+
+    fn spawn_spec(id: &str, cwd: &Path, marker: &str) -> SpawnSpec {
+        SpawnSpec {
+            session_id: id.to_string(),
+            agent: "claude".to_string(),
+            role: PromptRole::Orchestrator.label().to_string(),
+            cwd: cwd.to_path_buf(),
+            repo: cwd.to_path_buf(),
+            verb: sessions::Verb::Chat,
+            argv: marker_argv(marker),
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            conversation: Some("conv-1".to_string()),
+            restored_from: None,
+        }
+    }
+
+    fn host_for(root: &Path) -> Arc<RuntimeHost> {
+        RuntimeHost::new(
+            StateDir::from_root(root.to_path_buf()),
+            "default",
+            "inst-1",
+            200,
+            false,
+        )
+    }
+
+    /// Pumps until `needle` shows up on `session_id`'s screen, or the deadline
+    /// passes. Returns the screen either way, so a failing assertion can print
+    /// what was actually there.
+    fn pump_until(host: &RuntimeHost, session_id: &str, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            host.pump();
+            let screen = host.screen_for_test(session_id).unwrap_or_default();
+            if screen.contains(needle) || std::time::Instant::now() >= deadline {
+                return screen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The headline acceptance criterion, end to end over a REAL pty (ConPTY
+    /// on Windows, a unix pty elsewhere): a client detaching leaves the
+    /// process running and the rendered screen intact, and reattaching gets
+    /// that same screen back without anything being relaunched.
+    ///
+    /// The proof that nothing relaunched is the pid: the registry record's
+    /// pid before the detach is the same live pid after it. A restart would
+    /// necessarily change it.
+    #[test]
+    fn detaching_leaves_the_process_and_its_screen_alive_for_the_next_client() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "11111111-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVMARKER"))
+            .expect("spawn");
+
+        let screen = pump_until(&host, id, "ZIRVMARKER");
+        assert!(screen.contains("ZIRVMARKER"), "never rendered: {screen:?}");
+
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let pid = sessions::list(&state)
+            .into_iter()
+            .find(|(record, _)| record.session == id)
+            .map(|(record, _)| record.pid)
+            .expect("the runtime files an ordinary registry record");
+        assert!(sessions::is_alive(pid), "the child must be running");
+
+        host.attach(id, "dash-1", AttachMode::Controller, Some((40, 120)))
+            .expect("attach");
+        host.detach(id, "dash-1").expect("detach");
+
+        // The whole point: the client is gone and nothing else moved.
+        assert!(
+            sessions::is_alive(pid),
+            "detaching must not end the process"
+        );
+        let facts = host.sessions();
+        let facts = facts.first().expect("still one session");
+        assert_ne!(facts.state, SessionState::Ended);
+        assert_eq!(
+            facts.surface,
+            UiSurface::Headless,
+            "no client is looking, which is not the same as no session"
+        );
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == id),
+            "the registry record -- and with it pacing, budgets, rot and mail -- survives a detach"
+        );
+
+        // Reattach: the same screen, from the same live parser.
+        let attachment = host
+            .attach(id, "dash-1", AttachMode::Controller, Some((40, 120)))
+            .expect("reattach");
+        assert_eq!(attachment.role, AttachRole::Controller);
+        let screen = host.screen(id, "dash-1").expect("screen");
+        assert!(
+            screen.contents.contains("ZIRVMARKER"),
+            "reattachment must restore the rendered state, not a blank terminal: {:?}",
+            screen.contents
+        );
+        assert!(sessions::is_alive(pid), "and still the same process");
+
+        host.stop(id).expect("stop");
+    }
+
+    /// Many observers, one controller, and a takeover that is explicit rather
+    /// than implicit -- the attachment rules, over a real session.
+    #[test]
+    fn many_observers_may_watch_but_only_one_client_holds_the_keyboard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "22222222-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSEAT"))
+            .expect("spawn");
+
+        host.attach(id, "ctrl", AttachMode::Controller, Some((24, 80)))
+            .expect("first controller");
+        for observer in ["watch-1", "watch-2", "watch-3"] {
+            let attachment = host
+                .attach(id, observer, AttachMode::Observer, None)
+                .expect("observers are never refused");
+            assert_eq!(attachment.role, AttachRole::Observer);
+            assert_eq!(attachment.controller.as_deref(), Some("ctrl"));
+        }
+        let refusal = host
+            .attach(id, "other", AttachMode::Controller, None)
+            .expect_err("a second controller is refused");
+        assert_eq!(refusal.code, ErrorCode::Busy);
+
+        // An observer may not type, and may not resize somebody else's
+        // terminal.
+        assert_eq!(
+            host.write_raw(id, "watch-1", b"x")
+                .expect_err("observers do not type")
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            host.resize(id, "watch-1", 10, 10)
+                .expect_err("observers do not resize")
+                .code,
+            ErrorCode::Denied
+        );
+
+        // Takeover is the one way the seat moves, and it is explicit.
+        let after = host.takeover(id, "watch-1").expect("takeover");
+        assert_eq!(after.controller.as_deref(), Some("watch-1"));
+        assert_eq!(after.role, AttachRole::Controller);
+        assert!(host.write_raw(id, "watch-1", b"").is_ok());
+        assert_eq!(
+            host.write_raw(id, "ctrl", b"x")
+                .expect_err("the displaced controller is now an observer")
+                .code,
+            ErrorCode::Denied
+        );
+
+        host.stop(id).expect("stop");
+    }
+
+    /// `stop` is the ONLY thing that ends a session, and it takes the registry
+    /// record with it. Paired with the detach test above, this is the
+    /// "detach and stop are different operations" criterion in code.
+    #[test]
+    fn stopping_ends_the_process_and_releases_its_registry_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let id = "33333333-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSTOP"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSTOP");
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == id)
+        );
+
+        assert!(host.stop(id).expect("stop"));
+        assert!(
+            !host.stop(id).expect("second stop"),
+            "stopping twice reports that nothing was stopped, rather than failing"
+        );
+        let facts = host.sessions();
+        assert_eq!(facts.first().expect("session").state, SessionState::Ended);
+        assert!(
+            !sessions::list(&state)
+                .iter()
+                .any(|(record, _)| record.session == id),
+            "an explicitly stopped session releases its registry record"
+        );
+    }
+
+    /// Issue #608: one child's full quit grace never holds the shared table
+    /// mutex needed to list or open unrelated sessions.
+    #[test]
+    fn slow_child_shutdown_does_not_block_other_session_operations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "60860860-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSLOW"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSLOW");
+
+        let stopping = Arc::clone(&host);
+        let id = id.to_string();
+        let worker = std::thread::spawn(move || stopping.stop(&id));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !host.shutdown_entered_for_test() {
+            assert!(Instant::now() < deadline, "shutdown did not begin");
+            std::thread::yield_now();
+        }
+        let started = Instant::now();
+        let _ = host.sessions();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "an unrelated list waited behind child shutdown: {:?}",
+            started.elapsed()
+        );
+        worker.join().expect("stop thread").expect("stop");
+    }
+
+    /// Issue #608: while terminal shutdown runs outside the table lock, the
+    /// session remains explicitly stopping rather than becoming unknown.
+    #[test]
+    fn operation_during_shutdown_grace_reports_stopping_not_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "60860861-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSTOPPING"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSTOPPING");
+
+        let stopping = Arc::clone(&host);
+        let owned_id = id.to_string();
+        let worker = std::thread::spawn(move || stopping.stop(&owned_id));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !host.shutdown_entered_for_test() {
+            assert!(Instant::now() < deadline, "shutdown did not begin");
+            std::thread::yield_now();
+        }
+        let error = host
+            .attach(id, "late-client", AttachMode::Observer, None)
+            .expect_err("a stopping session refuses new operations");
+        assert_eq!(error.code, ErrorCode::Busy);
+        assert!(error.message.contains("stopping"));
+        worker.join().expect("stop thread").expect("stop");
+    }
+
+    /// The operator's trailing arguments survive the whole protocol path.
+    ///
+    /// `zirv chat -- --foo` sends them in `session.start`'s `extra_args`, and
+    /// the runtime composes the launch itself -- so if any link in that chain
+    /// drops the field, the flags an operator typed are silently gone and the
+    /// session starts anyway, which is the worst possible failure shape. This
+    /// pins the far end: whatever the client sent arrives in the argv the host
+    /// is about to spawn.
+    #[test]
+    fn the_operators_trailing_arguments_reach_the_hosts_launch_spec() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let spec = SessionSpec {
+            runtime: RuntimeKind::Harness,
+            role: "orchestrator".to_string(),
+            agent: Some("claude".to_string()),
+            provider_route: None,
+            model: None,
+            surface: UiSurface::Terminal,
+            cwd: repo.path().to_path_buf(),
+            prompt: String::new(),
+            extra_args: vec!["--zirv-test-flag".to_string(), "value-42".to_string()],
+        };
+        let launch = launch_spec(&spec, "88888888-2222-4333-8444-555555555555", &state)
+            .expect("launch spec");
+        assert!(
+            launch
+                .argv
+                .windows(2)
+                .any(|pair| pair == ["--zirv-test-flag", "value-42"]),
+            "the operator's own arguments must reach the argv, in order: {:?}",
+            launch.argv
+        );
+    }
+
+    /// A stopped session lets go of its terminal, and the table of ended
+    /// sessions is bounded. Before this, every `zirv session stop` (and so
+    /// every chat restart) on a long-lived runtime left a live pty master, its
+    /// writer and its scrollback behind forever, and `zirv session list` grew
+    /// to include every session the service had ever run.
+    ///
+    /// The cap is lowered for the test rather than spawning
+    /// `MAX_ENDED_SESSIONS` real ptys: what is being proved is that pruning
+    /// happens at the cap, not what the cap's value is.
+    #[test]
+    fn stopped_sessions_release_their_terminals_and_the_table_stays_bounded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        host.set_ended_cap_for_test(1);
+        let ids: Vec<String> = (0..3)
+            .map(|index| format!("7777777{index}-2222-4333-8444-555555555555"))
+            .collect();
+
+        for id in &ids {
+            host.spawn(spawn_spec(id, tmp.path(), "ZIRVLEAK"))
+                .expect("spawn");
+            assert_eq!(
+                host.holds_terminal_for_test(id),
+                Some(true),
+                "a live session holds its pty"
+            );
+        }
+        assert_eq!(host.sessions().len(), 3);
+
+        for id in &ids {
+            assert!(host.stop(id).expect("stop"));
+        }
+
+        // Every session that is still in the table has let go of its
+        // terminal, and only the cap's worth of ended history is kept.
+        let remaining = host.sessions();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "three stops under a cap of one must leave one ended entry, not three"
+        );
+        for facts in &remaining {
+            assert_eq!(facts.state, SessionState::Ended);
+            assert_eq!(
+                host.holds_terminal_for_test(&facts.session_id),
+                Some(false),
+                "an ended session holds no pty master, writer or reader channel"
+            );
+        }
+        // The one that survived pruning is the most recent, and its final
+        // screen is still readable -- retiring frees the terminal, not the
+        // frame the agent ended on.
+        assert_eq!(remaining[0].session_id, ids[2]);
+        assert!(
+            host.screen_for_test(&ids[2])
+                .is_some_and(|screen| screen.contains("ZIRVLEAK")),
+            "the last frame survives the terminal it was drawn on"
+        );
+        assert!(host.holds_terminal_for_test(&ids[0]).is_none());
+    }
+
+    /// A restored session is a NEW session that continues an old
+    /// conversation: the predecessor's id is recorded, never re-published.
+    /// This is the concrete form of "a restarted service never reuses another
+    /// process's session identity".
+    #[test]
+    fn a_restored_session_gets_a_new_identity_and_only_records_its_predecessor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let successor = "44444444-2222-4333-8444-555555555555";
+        let mut spec = spawn_spec(successor, tmp.path(), "ZIRVRESTORE");
+        spec.restored_from = Some("the-old-session".to_string());
+        host.spawn(spec).expect("spawn");
+
+        assert_eq!(
+            host.restored_from(successor).as_deref(),
+            Some("the-old-session")
+        );
+        let facts = host.sessions();
+        assert_eq!(facts.first().expect("session").session_id, successor);
+        assert!(
+            !facts.iter().any(|f| f.session_id == "the-old-session"),
+            "the predecessor's identity is never republished"
+        );
+        // And the topology the successor writes belongs to the NEW instance.
+        host.persist_topology();
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let topology = read_topology(&state, "default").expect("topology");
+        assert_eq!(topology.instance, "inst-1");
+        assert_eq!(topology.sessions.len(), 1);
+        assert_eq!(topology.sessions[0].session_id, successor);
+
+        host.stop(successor).expect("stop");
+    }
+
+    /// Unix only: after every client has detached, the pty MASTER is still
+    /// held by the service, so the child never sees the SIGHUP that closing
+    /// the last descriptor would send it. This is the platform-specific half
+    /// of "closing the dashboard leaves managed sessions running" -- on unix a
+    /// session dies from a hangup, not from a kill, and the assertion has to
+    /// be about the process still being there after the client is gone.
+    ///
+    /// Written conservatively: it cannot be compiled or run on the Windows
+    /// development machine this was written on, so it uses only helpers the
+    /// cross-platform tests above already exercise.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_unix_pty_child_survives_because_the_service_still_holds_the_master() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let id = "55555555-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVHUP"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVHUP");
+        let pid = sessions::list(&state)
+            .into_iter()
+            .find(|(record, _)| record.session == id)
+            .map(|(record, _)| record.pid)
+            .expect("record");
+
+        host.attach(id, "c1", AttachMode::Controller, Some((24, 80)))
+            .expect("attach");
+        host.detach(id, "c1").expect("detach");
+        std::thread::sleep(Duration::from_millis(200));
+        host.pump();
+        assert!(
+            sessions::is_alive(pid),
+            "no client holds the pty, so nothing can hang the child up"
+        );
+        host.stop(id).expect("stop");
+    }
+
+    /// Windows only: a ConPTY resize moves the pseudoconsole and the parser
+    /// together, and the child keeps running across it. The resize path is
+    /// the one place the two platforms differ in kind rather than in detail,
+    /// so it gets its own assertion on the platform that can run it.
+    #[cfg(windows)]
+    #[test]
+    fn a_conpty_session_resizes_without_disturbing_the_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let id = "66666666-2222-4333-8444-555555555555";
+        host.spawn(spawn_spec(id, tmp.path(), "ZIRVSIZE"))
+            .expect("spawn");
+        pump_until(&host, id, "ZIRVSIZE");
+        let pid = sessions::list(&state)
+            .into_iter()
+            .find(|(record, _)| record.session == id)
+            .map(|(record, _)| record.pid)
+            .expect("record");
+
+        host.attach(id, "c1", AttachMode::Controller, Some((50, 132)))
+            .expect("attach resizes to the client's window");
+        let screen = host.screen(id, "c1").expect("screen");
+        assert_eq!((screen.rows, screen.cols), (50, 132));
+
+        host.resize(id, "c1", 30, 100).expect("resize");
+        let screen = host.screen(id, "c1").expect("screen");
+        assert_eq!((screen.rows, screen.cols), (30, 100));
+        assert!(sessions::is_alive(pid), "a resize is not a restart");
+        host.stop(id).expect("stop");
+    }
+
+    /// Render/event fan-out, 1 session against 15 (issue #352's benchmark
+    /// criterion). `#[ignore]`d because it spawns 15 real pty children and
+    /// takes seconds rather than milliseconds; run it with
+    /// `cargo test --bin zirv session::host::tests::render_fanout -- --ignored
+    /// --nocapture`, and record the numbers in the design note.
+    #[test]
+    #[ignore = "benchmark: spawns 15 ptys; run explicitly and record the result"]
+    fn render_fanout_scales_from_one_session_to_fifteen() {
+        fn measure(count: usize) -> (Duration, Duration) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let host = host_for(tmp.path());
+            let ids: Vec<String> = (0..count)
+                .map(|index| format!("{index:08}-2222-4333-8444-555555555555"))
+                .collect();
+            for id in &ids {
+                host.spawn(spawn_spec(id, tmp.path(), "ZIRVBENCH"))
+                    .expect("spawn");
+                host.attach(id, "bench", AttachMode::Observer, None)
+                    .expect("attach");
+            }
+            for id in &ids {
+                pump_until(&host, id, "ZIRVBENCH");
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                host.pump();
+            }
+            let pump = started.elapsed() / 100;
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                for id in &ids {
+                    let _ = host.screen(id, "bench");
+                }
+            }
+            let render = started.elapsed() / 100;
+            for id in &ids {
+                let _ = host.stop(id);
+            }
+            (pump, render)
+        }
+
+        let (pump_one, render_one) = measure(1);
+        let (pump_many, render_many) = measure(15);
+        println!(
+            "fanout: 1 session pump {pump_one:?} render {render_one:?}; \
+             15 sessions pump {pump_many:?} render {render_many:?}"
+        );
+        // The only assertion worth making is the shape: fan-out is linear in
+        // the number of sessions, not quadratic. A wall-clock threshold on a
+        // shared CI box would be a flake generator.
+        assert!(
+            pump_many < pump_one.max(Duration::from_millis(1)) * 60,
+            "pump fan-out should stay linear: {pump_one:?} -> {pump_many:?}"
+        );
+    }
+
+    fn entry(agent: &str, conversation: Option<&str>) -> TopologyEntry {
+        TopologyEntry {
+            session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            short: "11111111".to_string(),
+            agent: agent.to_string(),
+            role: "orchestrator".to_string(),
+            cwd: "/work/repo".to_string(),
+            rows: 24,
+            cols: 80,
+            conversation: conversation.map(str::to_string),
+            instance: "inst-1".to_string(),
+        }
+    }
+
+    /// Issue #352's mail-injection residual, closed for terminals: mail
+    /// addressed to a runtime session with NO client attached is typed into it
+    /// by the service, instead of sitting in the queue until somebody attaches.
+    ///
+    /// The observable trace is the injection the runtime typed and has not
+    /// submitted yet -- proof that something reached the terminal with nobody
+    /// watching. The advisory itself never consumes the message: only the
+    /// session's own `zirv ctx inbox` does, which is the rule
+    /// `dash::advise_one_pane` already enforces and this path reuses rather
+    /// than re-implements.
+    #[test]
+    fn mail_reaches_a_session_no_client_is_attached_to() {
+        use super::super::super::config::CtxConfig;
+        use super::super::super::mail;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = host_for(tmp.path());
+        let id = "cccccccc-1111-4222-8333-444444444444";
+        let mut spec = spawn_spec(id, tmp.path(), "ZIRVMAIL");
+        spec.argv = marker_argv("ZIRVMAIL");
+        host.spawn(spec).expect("spawn");
+
+        // The same state directory `host_for` gave the runtime: mail the
+        // service can see is mail in its own state directory.
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let slug = state::repo_slug(tmp.path());
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "11111111-2222-4333-8444-555555555555".to_string(),
+                from_agent: "codex".to_string(),
+                to: "claude".to_string(),
+                to_session: Some(sessions::short_id(id)),
+                sent: state::now_secs(),
+                body: "the gate is red".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let mut advised = std::collections::HashMap::new();
+        let mut errors = super::super::super::dash::ErrorLog::default();
+        assert_eq!(
+            host.sessions()
+                .iter()
+                .filter(|facts| facts.surface == UiSurface::Headless)
+                .count(),
+            1,
+            "nobody is attached"
+        );
+        assert_eq!(
+            mail::list(&state, &slug, Some("claude"), Some(&sessions::short_id(id)))
+                .expect("list")
+                .len(),
+            1,
+            "the message is addressed to this session and is unread"
+        );
+        host.deliver_mail(&cfg, &mut advised, &mut errors);
+
+        assert_eq!(
+            host.pending_injection_for_test(id),
+            Some(true),
+            "the service typed into a session no client is watching"
+        );
+        assert!(
+            !mail::list(&state, &slug, None, Some(&sessions::short_id(id)))
+                .expect("list")
+                .is_empty(),
+            "an orchestrator advisory points at `zirv ctx inbox`; it never consumes the message"
+        );
+
+        // A second sweep is deduplicated, so an idle seat is not told about
+        // the same message on every heartbeat.
+        let before = host.pending_injection_for_test(id);
+        host.deliver_mail(&cfg, &mut advised, &mut errors);
+        assert_eq!(host.pending_injection_for_test(id), before);
+
+        host.shutdown(true);
+    }
+
+    /// Tier 2's honesty rule, as a predicate: only a session with a verified
+    /// conversation reference may be claimed as resumable. An arbitrary
+    /// process gets no such claim, which is what keeps "restore topology"
+    /// from being sold as "the process survived".
+    #[test]
+    fn only_a_session_with_a_verified_conversation_is_resumable() {
+        assert!(entry("claude", Some("conv-1")).is_resumable());
+        assert!(!entry("claude", None).is_resumable());
+        assert!(
+            !entry("claude", Some("   ")).is_resumable(),
+            "a blank reference is not a reference"
+        );
+    }
+
+    #[test]
+    fn partition_resumable_separates_what_may_be_relaunched_from_what_may_not() {
+        let topology = Topology {
+            written: 10,
+            instance: "inst-1".to_string(),
+            sessions: vec![
+                entry("claude", Some("conv-1")),
+                entry("bash", None),
+                entry("codex", Some("conv-2")),
+            ],
+        };
+        let (resumable, reportable) = partition_resumable(&topology);
+        assert_eq!(resumable.len(), 2);
+        assert_eq!(reportable.len(), 1);
+        assert_eq!(reportable[0].agent, "bash");
+    }
+
+    /// The resume argv comes from the adapter's own verified flag, and an
+    /// agent with no such flag yields `None` rather than a guessed command
+    /// line -- so a restore never invents a way to "resume" something.
+    #[test]
+    fn resume_argv_uses_the_adapters_verified_flag_and_refuses_to_guess() {
+        let argv = resume_argv(&entry("claude", Some("conv-1"))).expect("claude resumes");
+        assert!(argv.iter().any(|token| token == "--resume"), "{argv:?}");
+        assert!(argv.iter().any(|token| token == "conv-1"), "{argv:?}");
+        assert!(resume_argv(&entry("claude", None)).is_none());
+        assert!(
+            resume_argv(&entry("no-such-harness", Some("conv-1"))).is_none(),
+            "an unknown agent has no verified resume path"
+        );
+    }
+
+    #[test]
+    fn a_topology_round_trips_through_the_state_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(read_topology(&state, "default").is_none());
+        let topology = Topology {
+            written: 10,
+            instance: "inst-1".to_string(),
+            sessions: vec![entry("claude", Some("conv-1"))],
+        };
+        write_topology(&state, "default", &topology).expect("write");
+        assert_eq!(read_topology(&state, "default"), Some(topology));
+    }
+
+    /// An old topology file, written before a field existed, still parses:
+    /// the same `#[serde(default)]` discipline `dash::roster` holds, and for
+    /// the same reason -- a hard parse failure would silently discard the
+    /// whole restore.
+    #[test]
+    fn a_topology_entry_from_an_older_build_loads_with_defaults() {
+        let entry: TopologyEntry = serde_json::from_str(
+            r#"{"session_id":"s","short":"s","agent":"claude","role":"worker",
+                "cwd":"/w","rows":24,"cols":80}"#,
+        )
+        .expect("parse");
+        assert_eq!(entry.conversation, None);
+        assert!(!entry.is_resumable());
+    }
+
+    #[test]
+    fn restore_cwd_falls_back_when_the_recorded_directory_is_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut present = entry("claude", Some("c"));
+        present.cwd = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(restore_cwd(&present, Path::new("/fallback")), tmp.path());
+
+        let missing = entry("claude", Some("c"));
+        assert_eq!(
+            restore_cwd(&missing, tmp.path()),
+            tmp.path(),
+            "a vanished checkout must not fail the whole restore"
+        );
+    }
+
+    /// Tier 3 is off unless the operator turned it on, and when it is on the
+    /// warning is unconditional -- there is no path that enables history
+    /// quietly.
+    #[test]
+    fn terminal_history_is_off_by_default_and_warns_when_it_is_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let quiet = RuntimeHost::new(state, "default", "inst-1", 2000, false);
+        assert_eq!(quiet.history_warning(), None);
+
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        let state2 = StateDir::from_root(tmp2.path().to_path_buf());
+        let loud = RuntimeHost::new(state2, "default", "inst-1", 2000, true);
+        let warning = loud.history_warning().expect("a warning is mandatory");
+        assert!(warning.contains("terminal output"), "{warning}");
+        assert!(warning.contains("off by default"), "{warning}");
+    }
+
+    #[test]
+    fn an_unknown_session_is_refused_by_code_rather_than_panicking() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let host = RuntimeHost::new(state, "default", "inst-1", 2000, false);
+        let failure = host
+            .attach("nope", "c1", AttachMode::Observer, None)
+            .expect_err("no such session");
+        assert_eq!(failure.code, ErrorCode::UnknownSession);
+        assert!(host.sessions().is_empty());
+    }
+}

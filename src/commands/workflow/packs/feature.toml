@@ -1,0 +1,188 @@
+# Built-in workflow pack: feature. A declarative WorkflowDefinitionV2
+# reproduction of the legacy WorkflowKind::Feature literal in engine.rs
+# (definitions()) -- same step ids, phases, primary skills, conditions,
+# approvals and artifacts (issue #542, chunks 1+2).
+schema_version = 1
+id = "feature"
+version = 1
+title = "Feature"
+description = "Capture intent, design and plan proportionally, then implement, test and review."
+domains = ["software"]
+triggers = ["add a feature", "implement X", "build a new capability"]
+effects = "repository"
+idempotency = "verify/deploy re-check the final tree state instead of blindly replaying prior edits, so a resumed run after a crash never double-applies a step"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change"
+kind = "patch"
+
+[[steps]]
+id = "intent"
+title = "Capture intent"
+phase = "intent"
+skills = ["brainstorm"]
+capabilities = ["repo.read", "repo.write"]
+artifact = "intent"
+approval = true
+condition = { complexity-or-risk = { complexity = "bounded", risk = "medium" } }
+effect = "repository"
+reason = "bounded-or-riskier work gets an explicit, reviewable intent before design starts"
+
+[[steps]]
+id = "spec"
+title = "Design"
+phase = "design"
+skills = ["design"]
+capabilities = ["repo.read", "repo.write"]
+depends_on = ["intent"]
+artifact = "spec"
+approval = true
+condition = { complexity-or-risk = { complexity = "substantial", risk = "high" } }
+effect = "repository"
+reason = "substantial-or-high-risk work gets a proportional design spec"
+
+[[steps]]
+id = "plan"
+title = "Plan"
+phase = "plan"
+skills = ["plan"]
+capabilities = ["repo.read"]
+depends_on = ["spec"]
+artifact = "plan"
+approval = true
+condition = { complexity-or-risk = { complexity = "bounded", risk = "high" } }
+effect = "repository"
+reason = "bounded-or-high-risk work gets an ordered, verifiable plan"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+phase = "implement"
+skills = ["implement"]
+agent_role = "implementer"
+capabilities = ["repo.read", "repo.write"]
+depends_on = ["plan"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "test"
+title = "Test"
+phase = "test"
+skills = ["testing"]
+capabilities = ["test.run"]
+depends_on = ["implement"]
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+capabilities = ["repo.read"]
+depends_on = ["test"]
+condition = { risk-at-least = "medium" }
+reason = "medium-or-higher risk gets an independent review before verification"
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+capabilities = ["test.run"]
+depends_on = ["review"]
+condition = "always"
+
+[[steps]]
+id = "deploy"
+title = "Finish branch"
+phase = "deploy"
+skills = ["finish-branch"]
+capabilities = ["repo.read"]
+depends_on = ["verify"]
+condition = "always"
+effect = "repository"
+
+# Frontend domain variants (issue #542 chunk 3a): each overrides one step
+# above with the frontend-flavored skill, replicating that step's own
+# artifact/approval/effect exactly so switching profile changes ONLY which
+# skill runs, never the gate shape -- `materialize_from_definition` selects
+# at most one of {primary, variant} per step id, keyed on `WorkflowProfile`.
+[[steps]]
+id = "spec-frontend"
+title = "Design (frontend)"
+phase = "design"
+skills = ["frontend-design"]
+domains = ["frontend"]
+overrides_step = "spec"
+artifact = "spec"
+approval = true
+effect = "repository"
+
+[[steps]]
+id = "plan-frontend"
+title = "Plan (frontend)"
+phase = "plan"
+skills = ["frontend-plan"]
+domains = ["frontend"]
+overrides_step = "plan"
+artifact = "plan"
+approval = true
+effect = "repository"
+
+[[steps]]
+id = "implement-frontend"
+title = "Implement (frontend)"
+phase = "implement"
+skills = ["frontend-implement"]
+agent_role = "implementer"
+domains = ["frontend"]
+overrides_step = "implement"
+effect = "repository"
+
+[[steps]]
+id = "test-frontend"
+title = "Test (frontend)"
+phase = "test"
+skills = ["frontend-test"]
+domains = ["frontend"]
+overrides_step = "test"
+
+[[steps]]
+id = "review-frontend"
+title = "Review (frontend)"
+phase = "review"
+skills = ["frontend-review"]
+agent_role = "reviewer"
+domains = ["frontend"]
+overrides_step = "review"
+
+[[steps]]
+id = "verify-frontend"
+title = "Verify (frontend)"
+phase = "verify"
+skills = ["frontend-verify"]
+domains = ["frontend"]
+overrides_step = "verify"
+
+[gates]
+approval = ["intent", "spec", "plan"]
+validation = ["test", "verify"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change"]
+present_as = "patch"

@@ -724,12 +724,29 @@ pub(crate) fn scratchpad_rules(temp_dir: &Path) -> Vec<String> {
     scratchpad_rules_from_roots(&scratchpad_roots(temp_dir))
 }
 
+/// Claude Code's absolute-path permission-rule form, extracted so every
+/// caller that projects a real filesystem root into an `Edit`/`Read` rule
+/// (this module's own scratchpad rules, and issue #504's `--add-dir`
+/// widening in `adapters::claude::add_dir_edit_read_rules`) spells it
+/// identically rather than duplicating the normalization: forward slashes,
+/// no trailing slash, and a DOUBLED leading slash (`//<path>`, verified live
+/// findings cited in this function's own doc comment above). `root` may
+/// carry either separator -- a raw OS-native path (backslashes on Windows,
+/// as `ClaudeAdapter::grant_path` produces) is normalized here, not just an
+/// already-forward-slash scratchpad root -- and the result always has
+/// exactly two leading slashes, never one or three.
+pub(crate) fn doubled_slash_rule_base(root: &str) -> String {
+    let normalized = root.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    let stripped = normalized.strip_prefix('/').unwrap_or(normalized);
+    format!("//{stripped}")
+}
+
 fn scratchpad_rules_from_roots(roots: &[String]) -> Vec<String> {
     roots
         .iter()
         .flat_map(|root| {
-            let stripped = root.strip_prefix('/').unwrap_or(root);
-            let base = format!("//{stripped}/**");
+            let base = format!("{}/**", doubled_slash_rule_base(root));
             [format!("Read({base})"), format!("Edit({base})")]
         })
         .collect()
@@ -1273,6 +1290,18 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// only has those two leaves) never overrides it and is unaffected.
     fn apply_endpoint(&mut self, endpoint: Option<&super::config::EndpointTarget>) {
         let _ = endpoint;
+    }
+
+    /// Issue #504 (operator-only interactive permission mode): attaches
+    /// `cfg.chat` to this adapter INSTANCE, mirroring `apply_endpoint`
+    /// immediately above -- `select`/`resolve_default` call this exactly
+    /// once, right after constructing the adapter, so `ClaudeAdapter::
+    /// default_sandbox_args`'s interactive `--permission-mode` argv reads
+    /// the same resolved `chat.claude_permission_mode` every other read of
+    /// this adapter instance does. Default no-op: only `ClaudeAdapter`
+    /// overrides it today; codex has no equivalent flag.
+    fn apply_chat_config(&mut self, chat: &super::config::ChatConfig) {
+        let _ = chat;
     }
 
     /// Issue #395: the catalogue vendor slug of this adapter INSTANCE's own
@@ -2874,6 +2903,18 @@ fn apply_endpoint_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig)
     adapter.apply_endpoint(target);
 }
 
+/// Issue #504: attaches `cfg.chat` (via [`AgentAdapter::apply_chat_config`])
+/// the same way [`apply_endpoint_override`] attaches `cfg.endpoint` --
+/// called at each of that function's own call sites, right after
+/// constructing the adapter. Whole-`ChatConfig` rather than a single
+/// resolved field: `apply_endpoint_override` picks per-adapter because
+/// `[endpoint.claude]`/`[endpoint.codex]` are two different tables, but
+/// `[chat]` has no per-adapter split, so every adapter's own `apply_chat_
+/// config` reads the one shared config directly.
+fn apply_chat_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
+    adapter.apply_chat_config(&cfg.chat);
+}
+
 /// Issue #395: the credential-presence check both `ClaudeAdapter::ready`
 /// and `CodexAdapter::ready` apply when an operator endpoint override is
 /// configured. Named by the environment variable's own NAME only, never its
@@ -3288,6 +3329,7 @@ pub(crate) fn adapter_liveness(
     let names_other = agent_bin_names_a_different_adapter(bin, name).is_some();
     let mut adapter = if names_other { ctor(None) } else { ctor(bin) };
     apply_endpoint_override(&mut adapter, cfg);
+    apply_chat_override(&mut adapter, cfg);
     adapter.ready().map_err(|err| err.to_string())?;
     let program = adapter.program().to_string();
     let resolved_bin = if names_other { None } else { bin };
@@ -3813,6 +3855,7 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
                 )
             })?;
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -3826,6 +3869,7 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
     for (name, ctor) in ADAPTERS {
         let mut adapter = ctor(bin);
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(name) {
             // Final wave item 3: the same cross-adapter skip Medium 2 gave
             // the enabled-and-ready arm below, applied here too. Without
@@ -3912,6 +3956,7 @@ pub fn select(
             )
         })?;
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -3922,6 +3967,7 @@ pub fn select(
 
     if let Some(mut adapter) = adapters.into_iter().find(|a| a.detect(command)) {
         apply_endpoint_override(&mut adapter, cfg);
+        apply_chat_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4391,6 +4437,8 @@ mod tests {
             optional_capabilities: Vec::new(),
             context_budget_bytes: 4096,
             instructions: "Do the thing.".to_string(),
+            team_role: None,
+            skills: Vec::new(),
         };
         let task = AgentTask {
             prompt: "do the thing".to_string(),
@@ -4760,6 +4808,7 @@ mod tests {
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("haiku".to_string()),
+                claude_permission_mode: None,
             },
             ..permissive_cfg()
         };
@@ -4791,6 +4840,7 @@ mod tests {
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("opus".to_string()),
+                claude_permission_mode: None,
             },
             review: crate::commands::ctx::config::ReviewConfig {
                 claude: Some("opus".to_string()),
@@ -4860,6 +4910,7 @@ mod tests {
         let cfg = CtxConfig {
             chat: crate::commands::ctx::config::ChatConfig {
                 model: Some("sonnet".to_string()),
+                claude_permission_mode: None,
             },
             ..permissive_cfg()
         };

@@ -1,13 +1,13 @@
 name: CI Pipeline
 
-# CI is a merge gate only: it runs on PRs targeting main (and on demand).
-# It deliberately does NOT run on pushes to main — a commit can only reach
-# main through a PR that already passed these exact checks, and the CD
-# pipeline triggers directly on the merge push instead of chaining off a
-# post-merge CI run.
+# CI is a merge gate only: it runs on PRs targeting main or a release/**
+# integration branch (and on demand). It deliberately does NOT run on pushes
+# to main — a commit can only reach main through a PR that already passed
+# these exact checks, and the CD pipeline triggers directly on the merge push
+# instead of chaining off a post-merge CI run.
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ main, 'release/**' ]
   workflow_dispatch:
 
 jobs:
@@ -96,11 +96,11 @@ jobs:
 
       # nextest runs each test in its own process, so the process-wide
       # `env::set_var` races that used to require `--test-threads=1` cannot
-      # happen -- see .config/nextest.toml. `--no-fail-fast` matches serial
-      # `cargo test`'s behavior of running every test and reporting a
-      # complete `failures:`-equivalent list, which the sorted failure-NAME
-      # baseline methodology (CLAUDE.md) depends on -- nextest's own default
-      # is fail-fast, which would otherwise stop at the first failure.
+      # happen -- see .config/nextest.toml. `--no-fail-fast` runs every test
+      # and reports a complete `failures:`-equivalent list, which the sorted
+      # failure-NAME baseline methodology (CLAUDE.md) depends on -- nextest's
+      # own default is fail-fast, which would otherwise stop at the first
+      # failure.
       - name: Run Tests
         run: cargo nextest run --no-fail-fast
 
@@ -135,46 +135,6 @@ jobs:
       - name: Run Clippy Lint (Windows target)
         run: cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 
-  # nextest (above) runs each test in its own process, so it cannot catch the
-  # process-wide `env::set_var` races that serial `cargo test` was written to
-  # guard against -- CLAUDE.md keeps the serial run as a compatibility
-  # fallback and requires both to pass, so this job enforces that in CI. It
-  # runs in parallel with the `test` job (not as an extra step in it) so it
-  # doesn't lengthen that job's critical path.
-  serial-test:
-    name: Serial Test Compatibility
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set Up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo Registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache Cargo Build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
-
-      # cargo test alone never builds target/debug/zirv; some ctx tests spawn it as a subprocess.
-      - name: Build Binary
-        run: cargo build
-
-      - name: Run Tests (serial)
-        run: cargo test --verbose -- --test-threads=1
-
   dependency-audit:
     name: Dependency Advisory Check
     runs-on: ubuntu-latest
@@ -190,16 +150,202 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # CD is idempotent on an already-published version (the release step prints
-  # "release $TAG is already published; nothing to do" and skips the
-  # Homebrew/Chocolatey jobs), so an unbumped merge just deploys nothing --
-  # it does not fail. A bump is what makes a code change actually ship. So
-  # this only requires a version bump when the diff since the base branch
-  # touches a path that changes the shipped binary (src/, Cargo.toml,
-  # Cargo.lock, build.rs); a README/docs/CI-only PR passes unbumped.
+  native-enforcement-platforms:
+    name: Native Enforcement (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The broker suite uses real filesystem roots and a real linked git
+      # worktree. Platform detection may honestly report unavailable, but an
+      # unavailable sandbox must remain a typed refusal rather than a plain
+      # subprocess launch.
+      - name: Verify Native Enforcement Contract
+        run: cargo test --bin zirv runtime::enforcement::tests -- --test-threads=1
+
+  native-tools-platforms:
+    name: Native Tools (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Exercises the closed registry, Unicode/line-ending-safe file tools,
+      # bounded raw-byte output capture and process lifecycle contracts. Tests
+      # that spawn a POSIX shell are cfg(unix); Windows still compiles every
+      # process path and runs its path/argv/junction regressions.
+      - name: Verify Native Coding Tool Contract
+        run: 'cargo test --bin zirv runtime::tools:: -- --test-threads=1'
+
+  # Issue #491 (roadmap N22): the installation acceptance criterion. A fresh
+  # machine on each supported OS must be able to configure native operation
+  # and be told, accurately, what is missing -- with NO coding harness
+  # installed. GitHub runners ship none, and the first step asserts that
+  # rather than assuming it, so the job would fail loudly if an image ever
+  # started shipping one.
+  native-install-platforms:
+    name: Native Install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Issue #609 (roadmap N22, review of #493): every name
+      # `ctx::adapters::ADAPTERS` registers, not the `claude`/`codex` pair
+      # this step used to check alone. This bash list is a best-effort sanity
+      # check on the ambient runner and can drift from the registry if a
+      # ninth adapter is ever added without updating it here; the
+      # authoritative, non-drifting check is the Rust test below
+      # (`a_real_native_worker_and_every_helper_role_complete_with_every_registered_harness_canaried_and_uninvoked`),
+      # which walks `ctx::adapters::ADAPTERS` directly and scrubs `PATH`
+      # itself rather than trusting the runner's ambient state.
+      - name: Assert No Coding Harness Is Installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          for harness in claude codex copilot droid gemini opencode pi qwen; do
+            if command -v "$harness" >/dev/null 2>&1; then
+              echo "$harness is on PATH; this job must run with none installed" >&2
+              exit 1
+            fi
+          done
+          echo "no coding harness on PATH"
+
+      - name: Build Binary
+        run: cargo build --bin zirv
+
+      # Test the ordinary installed executable. Native internals remain covered
+      # by deterministic unit tests, but no shipped binary may activate them.
+      - name: Native Harness Coming Soon Release Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv native_release_ -- --test-threads=1 2>&1 | tee native-release.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' native-release.txt \
+            || { echo "release filter matched no tests" >&2; exit 1; }
+
+      # The three filtered runs below each guard against the same failure a
+      # substring filter always has: a rename makes it match zero tests, and
+      # libtest reports "0 passed" as a SUCCESS. Each captures its output and
+      # requires at least one passing test, so a stale filter fails loudly
+      # here instead of turning the step into a green no-op. Portable across
+      # all three runners: plain `tee`/`grep -E` under `shell: bash`, and
+      # `pipefail` so a genuine test failure is not masked by the pipe.
+      #
+      # The first is the helper-model and team path that must work with no
+      # harness at all: if any of them still shelled out to a vendor CLI,
+      # these are the tests that would notice.
+      - name: Verify Every Helper Path Runs Without A Harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv every_coding_harness -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
+
+      # Issue #609 (roadmap N22, review of #493): the installed-binary proof
+      # the review found missing -- a REAL native worker
+      # (`runtime::native::run_session`, the exact function `zirv ctx exec
+      # --runtime native --provider fixture:` runs) and every helper role,
+      # driven to completion with a CANARY executable standing in for every
+      # name `ctx::adapters::ADAPTERS` registers (enumerated from that
+      # registry, not a hard-coded pair). Each canary leaves evidence if the
+      # OS ever actually runs it, so this fails loudly on a regression that
+      # merely "would have failed a PATH lookup" and could otherwise slip
+      # past an empty-`PATH` assertion alone.
+      - name: Verify The Harness-Free Install Proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv canaried_and_uninvoked -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
+
+      - name: Verify Native Diagnosis Contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv ctx::doctor:: -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
+
+      - name: Verify Config Migration Contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv ctx::config_cmd:: -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
+
+      # Issue #492 (roadmap N23): the mixed-runtime proof and the four
+      # fault-injection invariants run on every supported OS, not only on the
+      # Linux test job -- a seat fence, an approval channel and a mailbox are
+      # all filesystem-and-process shaped, which is exactly the kind of
+      # contract that holds on one platform and not another. Same
+      # stale-filter guard as the steps above: each filter must match at
+      # least one passing test.
+      - name: Verify Mixed Runtime And Fault Invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filter in \
+            a_mixed_board_exchanges_mail_and_survives_a_return_to_the_harness_default \
+            a_fenced_generation_commits_nothing_and_runs_no_effect \
+            a_prompt_channel_dropped_while_a_call_is_blocked_grants_nothing \
+            queued_mail_survives_every_rollover_direction_and_is_delivered_exactly_once \
+            every_direction_and_trigger_commits_without_losing_acknowledged_state; do
+            cargo test --bin zirv "$filter" -- --test-threads=1 2>&1 | tee result.txt
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+              || { echo "filter $filter matched no tests" >&2; exit 1; }
+          done
+
+      # The parity matrix is a release gate, so it is checked where the
+      # release is built, on every OS: ZCHK-NATIVE-PARITY reads
+      # docs/design/native-parity.md against the runtime inventory and the
+      # real tree and fails on any row that claims more than its evidence.
+      - name: Verify Native Parity Matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin zirv checks::parity:: -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter matched no tests" >&2; exit 1; }
+
+  # PRs into `release/**` integration branches share one pinned release
+  # version, so they are exempt. This check still guards every PR into main,
+  # where CD is idempotent on an already-published version and a bump is what
+  # makes a code change actually ship. It only requires a version bump when
+  # the diff since the base branch touches a path that changes the shipped
+  # binary (src/, Cargo.toml, Cargo.lock, build.rs); a README/docs/CI-only PR
+  # passes unbumped.
   version-bump:
     name: Version Bump Check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       # fetch-depth: 0 so `origin/${{ github.base_ref }}...HEAD` has a real
@@ -274,3 +420,32 @@ jobs:
       # The scan proves itself on every run too.
       - name: Advisory scan self-test
         run: bash scripts/security-scan.sh --self-test
+
+  # Issue #615 (N23): an ADVISORY nudge on binary size and build cost, same
+  # shape as the security scan above -- `continue-on-error: true` so it can
+  # never fail a PR, PR-only since it needs a base commit to diff against.
+  # Debug-only (`ZIRV_BENCH_SKIP_RELEASE=1`): the full release measurement is
+  # a from-scratch LTO/codegen-units=1 build of TWO refs, which is too slow
+  # to run on every PR without materially slowing the merge queue -- see
+  # docs/benchmarks/build-cost.md for the reasoning and for how to run the
+  # release half by hand when a change is expected to move it (a large new
+  # dependency, a new provider transport, a new native tool). The recorded
+  # thresholds and this machine's own actual measurements are also there.
+  build-cost:
+    name: Advisory Build Cost
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run advisory build-cost scan
+        env:
+          ZIRV_BENCH_SKIP_RELEASE: "1"
+        run: |
+          bash scripts/bench-build-cost.sh "origin/${{ github.base_ref }}" HEAD \
+            >> "$GITHUB_STEP_SUMMARY"

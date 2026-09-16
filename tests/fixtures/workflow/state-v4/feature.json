@@ -1,0 +1,90 @@
+{
+  "schema_version": 4,
+  "id": "4499f8b0-68ef-43e8-93d6-9bb1023d3f27",
+  "repo": "C:\\Users\\josj\\AppData\\Local\\Temp\\.tmpKxfoLJ",
+  "branch": "",
+  "task": "small feature",
+  "kind": "feature",
+  "profile": "standard",
+  "adapter": null,
+  "include_custom_skills": true,
+  "classification": {
+    "intent": "feature",
+    "complexity": "trivial",
+    "risk": "low",
+    "risk_score": 0,
+    "changed_files": 1,
+    "changed_lines": 5,
+    "declared_scope": false,
+    "work_domain": {
+      "domain": "general",
+      "score": 0,
+      "reasons": []
+    },
+    "risk_measurement": "measured",
+    "reasons": [
+      "small"
+    ]
+  },
+  "deploy_tier": "development",
+  "steps": [
+    {
+      "id": "implement",
+      "phase": "implement",
+      "skill": "implement",
+      "agent": "implementer",
+      "artifact": null,
+      "condition": "always",
+      "approval": false,
+      "max_attempts": 3
+    },
+    {
+      "id": "test",
+      "phase": "test",
+      "skill": "testing",
+      "agent": null,
+      "artifact": null,
+      "condition": "always",
+      "approval": false,
+      "max_attempts": 3
+    },
+    {
+      "id": "verify",
+      "phase": "verify",
+      "skill": "verify",
+      "agent": null,
+      "artifact": null,
+      "condition": "always",
+      "approval": false,
+      "max_attempts": 3
+    },
+    {
+      "id": "deploy",
+      "phase": "deploy",
+      "skill": "finish-branch",
+      "agent": null,
+      "artifact": null,
+      "condition": "always",
+      "approval": false,
+      "max_attempts": 3
+    }
+  ],
+  "current_step": 0,
+  "completed_steps": [],
+  "attempts": {},
+  "step_durations_ms": {},
+  "artifacts": {},
+  "review_findings": [],
+  "review_evidence": [],
+  "usage_checkpoint": null,
+  "frontend_target_root": null,
+  "profile_source": "classified",
+  "accepted_preexisting_findings": null,
+  "phase_started_at": 1789479046,
+  "brainstorm": true,
+  "status": "running",
+  "closed_reason": null,
+  "closed_at": null,
+  "created_at": 1789479046,
+  "updated_at": 1789479046
+}

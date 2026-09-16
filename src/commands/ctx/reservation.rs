@@ -323,6 +323,16 @@ pub fn outstanding(state: &StateDir, provider: &str, now: u64) -> u64 {
         .fold(0u64, |sum, entry| sum.saturating_add(entry.tokens))
 }
 
+/// Number of live, unsettled requests sharing one billing pool.
+pub fn active_count(state: &StateDir, provider: &str) -> u32 {
+    load(state, provider)
+        .entries
+        .iter()
+        .filter(|entry| is_owner_alive(entry))
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
 /// Every reservation currently on disk for `provider`, unfiltered by
 /// liveness -- for `status`-style callers that want to show a dead-owner
 /// entry too (an operator diagnosing why a slot has not yet freed) rather

@@ -1,0 +1,91 @@
+# Built-in workflow pack: sre-deploy-or-rollback (issue #542 chunk 5).
+# Read-only assessment -> materially different options (deploy-forward vs.
+# rollback) -> an explicit approval gate before any mutation, since the
+# typed deployment-ops tooling from #539 is not yet available -- this
+# workflow stops rather than acting through raw/untyped access. `effects =
+# "external"` is the pack's declared ceiling; every step below stays
+# `effect = "none"` (the default) today, proven by
+# `external_effects_packs_stay_read_only_until_their_gate`.
+schema_version = 1
+id = "sre-deploy-or-rollback"
+version = 1
+title = "Deploy or rollback"
+description = "Assess a deploy's health, weigh deploy-forward against rollback, and stop at an explicit approval gate before acting."
+domains = ["sre"]
+triggers = ["rollback", "deploy or rollback", "roll back the deploy", "rollback decision", "should we roll back"]
+effects = "external"
+idempotency = "the decision step re-checks current deployed version and health before acting, so a resumed run after a crash reconciles against live state rather than replaying a stale decision"
+
+[[inputs]]
+name = "service"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "decision-receipt"
+kind = "decision"
+
+[[steps]]
+id = "assessment"
+title = "Health assessment"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "devops-sre"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "a rollback decision starts from an explicit, reviewable assessment of current health and recent changes"
+
+[[steps]]
+id = "options"
+title = "Deploy-forward vs. rollback"
+phase = "design"
+skills = ["design"]
+agent_role = "devops-sre"
+depends_on = ["assessment"]
+condition = "always"
+reason = "deploy-forward and rollback are materially different options; both are named with their risk before a decision is made"
+
+[[steps]]
+id = "decision-gate"
+title = "Decision gate"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["options"]
+approval = true
+condition = "always"
+reason = "requires the typed deployment-ops tooling from #539, not yet available; this workflow stops at an explicit operator approval rather than acting through raw/untyped access"
+
+[[steps]]
+id = "execute-decision"
+title = "Execute the decision"
+phase = "deploy"
+skills = ["finish-branch"]
+agent_role = "devops-sre"
+depends_on = ["decision-gate"]
+approval = true
+condition = "always"
+reason = "the actual mutating action (deploy forward or roll back) -- still requires the typed deployment-ops tooling from #539, not yet available, so this step is itself approval-gated rather than acting through raw/untyped access; a real Deploy-phase step also lets the operator's deploy-tier policy (apply_deploy_tier) apply to this pack the same way it does to every other"
+
+[[steps]]
+id = "receipt"
+title = "Decision receipt"
+phase = "present"
+skills = ["verify"]
+depends_on = ["execute-decision"]
+condition = "always"
+
+[gates]
+approval = ["assessment", "decision-gate", "execute-decision"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["decision-receipt"]
+present_as = "report"

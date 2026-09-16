@@ -120,6 +120,8 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
             "commands/ctx/memory_cli.rs",
             "commands/ctx/learn.rs",
             "commands/ctx/compile.rs",
+            "commands/ctx/runtime/context.rs",
+            "commands/ctx/runtime/tools/mod.rs",
             "commands/ctx/context_status.rs",
             "commands/ctx/status.rs",
             "commands/ctx/chat.rs",
@@ -193,11 +195,32 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::Directory,
         &["commands/ctx/diagnostics.rs"],
     ),
+    // Issue #483: browser evidence a native capability tool captured. The
+    // path is zirv-chosen (a slugified caller label under this bucket), never
+    // caller-supplied, which is why it lives here beside the other
+    // per-repository buckets rather than anywhere a tool argument could name.
+    (
+        "native-evidence",
+        SlugEntry::Directory,
+        &["commands/ctx/runtime/tools/capability.rs"],
+    ),
     ("outputs", SlugEntry::Directory, &["commands/ctx/output.rs"]),
     (
         "tasks",
         SlugEntry::Directory,
-        &["commands/ctx/task.rs", "commands/ctx/agent.rs"],
+        &[
+            "commands/ctx/task.rs",
+            "commands/ctx/agent.rs",
+            "commands/ctx/native_worker.rs",
+        ],
+    ),
+    // Issue #479. Delegation records live under `<state>/delegations/<slug>/`;
+    // the bucket is newer than every legacy slug scheme, so the adoption
+    // rename always no-ops, and the row exists to keep this audit complete.
+    (
+        "delegations",
+        SlugEntry::Directory,
+        &["commands/ctx/delegation.rs"],
     ),
     (
         "worktrees",
@@ -208,6 +231,13 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         "objective",
         SlugEntry::File("", ".json"),
         &["commands/ctx/objective.rs"],
+    ),
+    // Issue #485 (roadmap N16). The native coordinator's task graph, one
+    // slug-keyed JSON file per repository, exactly like `objective` above.
+    (
+        "coordinator",
+        SlugEntry::File("", ".json"),
+        &["commands/ctx/coordinator.rs"],
     ),
     (
         "restart-chains",
@@ -222,7 +252,17 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
     (
         "dash",
         SlugEntry::File("roster-", ".json"),
-        &["commands/ctx/dash/mod.rs", "commands/ctx/dash/roster.rs"],
+        &[
+            "commands/ctx/dash/mod.rs",
+            "commands/ctx/dash/roster.rs",
+            // Issue #490 (roadmap N21). The native pane uses the slug for
+            // exactly one thing: asking the persistent runtime whether it
+            // already holds this repository's seat
+            // (`link::RuntimeLink::seat_for`), the same ownership question
+            // `dash::mod` asks before opening a terminal. It reads no
+            // slug-keyed state-dir entry of its own.
+            "commands/ctx/dash/native_pane.rs",
+        ],
     ),
     (
         "dash",
@@ -250,6 +290,30 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         "ledger",
         SlugEntry::File("", ".sqlite"),
         &["commands/ctx/ledger.rs"],
+    ),
+    // Issue #352. The persistent runtime's own durable state --
+    // `<state>/runtime/<namespace>.json`, its topology and its shutdown
+    // sentinel -- is keyed by NAMESPACE, not by repository slug, so there is
+    // no slug-keyed directory here for `adopt_legacy_slug_state` to move (the
+    // rename it attempts always no-ops as `NotFound`, exactly like the
+    // `ledger` row above). The row exists to keep this consumer audit
+    // complete: both files below only *read* a slug computed elsewhere --
+    // `session/host.rs` publishes it in the redacted protocol facts a session
+    // projects to, and `session/mod.rs` compares it against those facts to
+    // find this repository's existing seat on a runtime.
+    (
+        "runtime",
+        SlugEntry::Directory,
+        &[
+            "commands/ctx/session/host.rs",
+            "commands/ctx/session/mod.rs",
+            // Issue #489: the service test that proves mail reaches a
+            // detached session addresses the mailbox by the same slug.
+            "commands/ctx/session/service.rs",
+            // Issue #489: native conversations publish the same slug in their
+            // protocol facts and address the mailbox by it.
+            "commands/ctx/session/native.rs",
+        ],
     ),
 ];
 
@@ -491,6 +555,16 @@ pub(crate) fn write_atomic(
     contents: &str,
     force_owner_only: bool,
 ) -> std::io::Result<()> {
+    write_atomic_bytes(path, contents.as_bytes(), force_owner_only)
+}
+
+/// Byte-preserving counterpart used by native coding tools for files whose
+/// existing UTF BOM/encoding must survive an atomic edit.
+pub(crate) fn write_atomic_bytes(
+    path: &Path,
+    contents: &[u8],
+    force_owner_only: bool,
+) -> std::io::Result<()> {
     use std::io::Write;
 
     let tmp = temp_sibling(path);
@@ -517,7 +591,7 @@ pub(crate) fn write_atomic(
         {
             file.set_permissions(metadata.permissions())?;
         }
-        file.write_all(contents.as_bytes())?;
+        file.write_all(contents)?;
         file.flush()
     };
 
@@ -532,6 +606,161 @@ pub(crate) fn write_atomic(
             Err(e)
         }
     }
+}
+
+/// Same atomic write as [`write_atomic_bytes`], but re-verifies `path`'s
+/// SHA-256 immediately before the `rename` replaces it, refusing the
+/// replace when it no longer matches `expected_before_sha256`. Issue #582
+/// (roadmap N05): a patch's own hash-then-replace precondition was
+/// otherwise validated once at the start and never re-checked, so a write
+/// that landed in the window between that check and the (potentially slow,
+/// for a large replacement) unconditional rename was silently overwritten.
+/// Checking again right here, as close to the rename as this function can
+/// get, narrows that window to the two syscalls between the check and the
+/// rename -- a plain filesystem `rename` gives no cross-process
+/// transactional guard to close it entirely.
+///
+/// Returns the destination's current sha256 when the write was refused for
+/// that reason (the temp file is discarded either way); `None` on a
+/// successful replace. A dedicated function rather than a parameter on
+/// [`write_atomic_bytes`]: that function's other callers persist
+/// machine-local/session state where an unconditional replace is exactly
+/// the intended semantics, and this adds one extra read plus a full-file
+/// hash that only a stale-content-sensitive caller like `apply_patch`
+/// should pay for.
+pub(crate) fn write_atomic_bytes_if_unchanged(
+    path: &Path,
+    contents: &[u8],
+    force_owner_only: bool,
+    expected_before_sha256: &str,
+) -> std::io::Result<Option<String>> {
+    use std::io::Write;
+
+    let tmp = temp_sibling(path);
+
+    let write_tmp = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        if force_owner_only {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        #[cfg(unix)]
+        if force_owner_only {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        if !force_owner_only
+            && let Ok(metadata) = std::fs::symlink_metadata(path)
+            && metadata.is_file()
+        {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(contents)?;
+        file.flush()
+    };
+
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    let verify = |tmp: &Path| -> std::io::Result<Option<String>> {
+        let current = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                let _ = std::fs::remove_file(tmp);
+                return Err(e);
+            }
+        };
+        let current_sha256 = hex_sha256(&current);
+        if current_sha256 != expected_before_sha256 {
+            let _ = std::fs::remove_file(tmp);
+            return Ok(Some(current_sha256));
+        }
+        Ok(None)
+    };
+
+    if let Some(hash) = verify(&tmp)? {
+        return Ok(Some(hash));
+    }
+
+    // Test-only seam (issue #582 review round 2): a yield-loop racer proved
+    // non-deterministic under CI (#630 -- the racer sometimes lost the race
+    // entirely, and `apply_patch` legitimately succeeded). A no-op here in
+    // every non-test build; in a test, this is the exact point -- after the
+    // check above, before the rename below -- a real concurrent write would
+    // need to land in to be caught, so a test can perform that write
+    // directly instead of racing a real thread against real disk I/O.
+    call_pre_rename_hook();
+
+    // Re-verify one more time, immediately before the rename itself: the
+    // hook above is a no-op in production, so this repeats the same check
+    // with nothing having changed in between (accepted, tiny cost, paid
+    // only by this already-more-expensive stale-content-sensitive path) --
+    // but it is what actually catches whatever a test's hook just did.
+    if let Some(hash) = verify(&tmp)? {
+        return Ok(Some(hash));
+    }
+
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(None),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRE_RENAME_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs [`write_atomic_bytes_if_unchanged`]'s test-only pre-rename hook
+/// for the current thread and returns a guard that clears it on drop --
+/// including on a panicking assertion, the same reason `testenv::EnvGuard`
+/// restores on every path. Nextest isolates each test into its own process,
+/// but this repo's own serial gate (`cargo test -- --test-threads=1`) runs
+/// every test on one thread in one process, so a hook a test forgot to
+/// clear would otherwise leak into whichever test ran next.
+#[cfg(test)]
+pub(crate) fn set_pre_rename_hook(hook: impl FnMut() + 'static) -> PreRenameHookGuard {
+    PRE_RENAME_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    PreRenameHookGuard
+}
+
+#[cfg(test)]
+pub(crate) struct PreRenameHookGuard;
+
+#[cfg(test)]
+impl Drop for PreRenameHookGuard {
+    fn drop(&mut self) {
+        PRE_RENAME_HOOK.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn call_pre_rename_hook() {
+    PRE_RENAME_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn call_pre_rename_hook() {}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Writes `contents` to `path` atomically. On Unix the file is 0600, forced
@@ -615,6 +844,25 @@ impl StateDir {
 
     pub fn root(&self) -> &Path {
         &self.0
+    }
+
+    /// Authoritative native conversation and tool-execution journal
+    /// (`<state>/native-journal.sqlite`, issue #472). This is one
+    /// machine-local database shared by native sessions; every row is keyed
+    /// by the full logical session id and the journal keeps provider/account
+    /// identity separate from repository state.
+    pub fn native_journal(&self) -> PathBuf {
+        self.0.join("native-journal.sqlite")
+    }
+
+    /// Portable native checkpoints (`<state>/native-checkpoints/`, issue
+    /// #486). One JSON export per committed checkpoint. The journal's own
+    /// `Checkpoint` event is the AUTHORITY -- these files are the portable,
+    /// inspectable copy a cross-provider continuation or an operator can
+    /// read without opening the database, so a missing or corrupt export is
+    /// never a reason to refuse a resume.
+    pub fn native_checkpoints(&self) -> PathBuf {
+        self.0.join("native-checkpoints")
     }
 
     pub fn handoffs(&self) -> PathBuf {
@@ -710,6 +958,17 @@ impl StateDir {
     /// file (`super::dash::roster`) hangs off this same root.
     pub fn dash(&self) -> PathBuf {
         self.0.join("dash")
+    }
+
+    /// Issue #480 (roadmap N11): a native pane's persisted composer draft and
+    /// queued input, one file per pane session id
+    /// (`<state>/native-panes/<session>.json`), mirroring `adoption()`'s own
+    /// per-session layout above. Transient presentation (scroll, selection,
+    /// focus, expanded tool calls) is never written here -- only what must
+    /// survive a reconnect/resume: the in-progress draft and anything queued
+    /// but not yet submitted. See `super::dash::native_pane`.
+    pub fn native_panes(&self) -> PathBuf {
+        self.0.join("native-panes")
     }
 
     /// Short on purpose: unix socket paths are capped near 104 bytes on macOS.
@@ -838,6 +1097,17 @@ impl StateDir {
         self.0.join("objective")
     }
 
+    /// `<state>/coordinator` -- one JSON file per repository holding the
+    /// native coordinator's task graph, decisions, evidence references and
+    /// user constraints (issue #485, roadmap N16), keyed by
+    /// `state::repo_slug` exactly the way `objective()` is, and for the same
+    /// reason: the plan outlives any one coordinating session, which is what
+    /// lets a restarted coordinator pick the graph back up instead of
+    /// re-deriving it from a transcript.
+    pub fn coordinator(&self) -> PathBuf {
+        self.0.join("coordinator")
+    }
+
     /// `<state>/restart-chains` -- one JSON file per chain key (issue #310,
     /// 3b), keyed by `state::repo_slug` the same way `objective()` is: a
     /// sibling of it, and for the same reason -- this outlives any one
@@ -857,6 +1127,18 @@ impl StateDir {
     /// after a crash.
     pub fn tasks(&self) -> PathBuf {
         self.0.join("tasks")
+    }
+
+    /// `<state>/delegations/<repo-slug>/<delegation-id>.json` -- one durable
+    /// record per delegation (issue #479, roadmap N10), keyed by
+    /// `state::repo_slug` the same way `tasks()` is. A delegation record
+    /// outlives the worker it launched and the process that launched it: it
+    /// carries the launch receipt written BEFORE anything ran, the stable
+    /// worker handle, and every terminal outcome already published, so a
+    /// consumer that saw a completion twice can tell the second copy apart
+    /// from a genuinely new one.
+    pub fn delegations(&self) -> PathBuf {
+        self.0.join("delegations")
     }
 
     /// Issue #178: captured operator-approved permission prompts, ready for
@@ -1453,6 +1735,60 @@ mod tests {
         reader
             .join()
             .expect("reader thread panicked on a partial read");
+    }
+
+    /// Review round 1 on #582's fix: a direct unit test of the guard itself,
+    /// covering the three cases its doc comment promises -- the race tests
+    /// on `apply_patch`/`write_file` only exercise the "mismatch" branch,
+    /// synchronized on real thread timing; this pins all three
+    /// deterministically, with no threads at all.
+    #[test]
+    fn write_atomic_bytes_if_unchanged_covers_its_three_outcomes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("guarded.txt");
+
+        // Unchanged: the destination still matches what the caller
+        // validated, so the replace goes through.
+        std::fs::write(&path, "before").expect("seed");
+        let before_sha = hex_sha256(b"before");
+        let result = write_atomic_bytes_if_unchanged(&path, b"after", false, &before_sha)
+            .expect("io must succeed");
+        assert_eq!(result, None, "an unchanged destination must be replaced");
+        assert_eq!(std::fs::read(&path).expect("read"), b"after");
+
+        // Mismatch: the destination changed since the caller's own
+        // precondition check landed on `before_sha` -- refused, and the
+        // external bytes must survive untouched.
+        std::fs::write(&path, "raced").expect("simulate an external edit");
+        let result = write_atomic_bytes_if_unchanged(&path, b"clobber", false, &before_sha)
+            .expect("io must succeed");
+        assert_eq!(
+            result,
+            Some(hex_sha256(b"raced")),
+            "a changed destination must be refused and report its current hash"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"raced",
+            "the racing external edit must survive, never the refused replacement"
+        );
+
+        // Missing destination vs. a non-empty expected hash: a destination
+        // that vanished since the caller's check is exactly as much "the
+        // destination changed" as one whose content differs, and must be
+        // refused the same way rather than treated as a fresh create.
+        let missing = tmp.path().join("never-existed.txt");
+        let result = write_atomic_bytes_if_unchanged(&missing, b"content", false, &before_sha)
+            .expect("io must succeed");
+        assert_eq!(
+            result,
+            Some(hex_sha256(b"")),
+            "a missing destination must report the empty-bytes hash, not silently write"
+        );
+        assert!(
+            !missing.exists(),
+            "a refused write must never create the destination"
+        );
     }
 
     /// Unlike `write_private`, `write_shared` must not force 0600: it writes

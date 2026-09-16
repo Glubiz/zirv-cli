@@ -484,6 +484,10 @@ mod tests {
     /// surface. Neither call could produce `Trust::Operator` even if it
     /// didn't panic (both target scopes are `RepoUntrusted`), so this test
     /// is about correctness, not the trust boundary itself.
+    // The refusal is a `debug_assert!`, compiled out in a release build, so
+    // this test only holds under `cfg(debug_assertions)` (it otherwise fails
+    // under `cargo nextest run --release`).
+    #[cfg(debug_assertions)]
     #[test]
     fn into_nested_and_into_local_private_refuse_a_global_surface() {
         let repo = Path::new("/repo");
@@ -514,5 +518,34 @@ mod tests {
             local_private_result.is_err(),
             "into_local_private must refuse a Global-scoped surface"
         );
+    }
+
+    /// Issue #538: `ZIRV.md` is a new native instruction source, but a
+    /// repo-scoped one is bound by exactly the same rule every other
+    /// repo-owned instruction surface is -- `for_path` classifies it as
+    /// `Repo`/`Nested` purely from its path, never `Global`, so it can never
+    /// carry `Trust::Operator`, no matter its content.
+    #[test]
+    fn a_repo_zirv_md_can_never_be_operator_trusted() {
+        let repo = Path::new("/repo");
+        let surface = ContextSurface::for_path(
+            Provider::Zirv,
+            Kind::Instructions,
+            repo.join("ZIRV.md"),
+            repo,
+            None,
+        );
+        assert_ne!(surface.scope(), Scope::Global);
+        assert_eq!(surface.trust(), Trust::RepoUntrusted);
+
+        let nested = ContextSurface::for_path(
+            Provider::Zirv,
+            Kind::Instructions,
+            repo.join("crates/inner/ZIRV.md"),
+            repo,
+            None,
+        )
+        .into_nested();
+        assert_eq!(nested.trust(), Trust::RepoUntrusted);
     }
 }

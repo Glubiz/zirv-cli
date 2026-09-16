@@ -436,6 +436,33 @@ fn git_at(repo: &Path) -> Command {
     command
 }
 
+/// `repo`'s current branch name, or an empty string when it cannot be
+/// resolved (detached HEAD, no commits, `git` missing or not a repository).
+/// Issue #467: recorded on every persisted [`VerificationReport`] and
+/// matched against a workflow's own recorded branch by
+/// [`latest_is_fresh_and_passing`]'s widened sibling-worktree read -- an
+/// empty value never matches another empty or named value, so an
+/// unresolvable branch degrades to "never widens" rather than "widens to
+/// everything".
+pub fn current_branch(repo: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text.is_empty() || text == "HEAD" {
+                String::new()
+            } else {
+                text
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 fn git_paths(stdout: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
     stdout
         .split(|byte| *byte == 0)
@@ -735,6 +762,16 @@ pub struct VerificationReport {
     pub mode: VerificationMode,
     pub source: String,
     pub repo: PathBuf,
+    /// The checkout's branch when this report was produced (`current_branch`),
+    /// or empty when unresolvable (detached HEAD, no commits, `git`
+    /// unavailable). Issue #467: the relatedness key
+    /// `latest_is_fresh_and_passing`'s widened sibling-worktree read matches
+    /// against a workflow's own recorded `WorkflowState::branch` -- an empty
+    /// value never matches, so an unresolvable branch safely narrows rather
+    /// than widens. `#[serde(default)]` for reports persisted before this
+    /// field existed.
+    #[serde(default)]
+    pub branch: String,
     pub change_fingerprint: u64,
     pub changed_paths: Vec<PathBuf>,
     pub fallback_to_full: bool,
@@ -2254,14 +2291,75 @@ pub(crate) fn latest_report_id(state: &StateDir, repo: &Path) -> CtxResult<Optio
     Ok(load_latest(state, repo)?.map(|report| report.id))
 }
 
+/// `branch` is the workflow's own recorded branch (`WorkflowState::branch`),
+/// when the caller has one -- `None` for contexts with no specific workflow
+/// in view (an advisory nudge, a presentation-only status line). It is ONLY
+/// ever used to gate the widened, cross-checkout half of this check; the
+/// literal checkout's own evidence is always trusted regardless, exactly as
+/// before #467.
 pub fn latest_is_fresh_and_passing(
     state: &StateDir,
     repo: &Path,
     final_only: bool,
+    branch: Option<&str>,
+) -> CtxResult<bool> {
+    if latest_is_fresh_and_passing_at(state, repo, final_only, None)? {
+        return Ok(true);
+    }
+    // Issue #467 round 3 (relatedness): `report_dir`/`save_report` stay
+    // keyed by the literal checkout (plain `repo_slug`), so two sibling
+    // worktrees never clobber each other's `zirv test changed` evidence --
+    // but that also means this gate, evaluated from one checkout (typically
+    // the orchestrator's own main checkout, its tree clean), could never see
+    // a worker's fresh, passing evidence recorded in a linked worktree. This
+    // widens only the READ side, and ONLY to a sibling whose OWN recorded
+    // evidence branch matches the workflow's own recorded branch exactly --
+    // review round 2 caught that widening to ANY fresh, passing sibling
+    // (with no relatedness check at all) let an entirely unrelated worker's
+    // evidence on a DIFFERENT branch satisfy this workflow's gate, reaching
+    // as far as `deploy.rs`'s production tier. `branch.filter(|b|
+    // !b.is_empty())` also means a caller with no workflow branch context,
+    // or a workflow whose own branch could not be resolved at `start`, never
+    // widens at all -- there is nothing safe to match against.
+    let Some(branch) = branch.filter(|b| !b.is_empty()) else {
+        return Ok(false);
+    };
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    for sibling in crate::commands::ctx::pathutil::sibling_checkouts(repo) {
+        if sibling == canonical {
+            continue;
+        }
+        if latest_is_fresh_and_passing_at(state, &sibling, final_only, Some(branch))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The single-checkout freshness/pass check: is `repo`'s own latest
+/// persisted report fresh (matches `repo`'s current change fingerprint,
+/// covers the whole changed-check surface, and -- only when
+/// `required_branch` is given -- was produced on that exact branch) and
+/// passing (outright, or every failure covered by the operator's recorded
+/// baseline)? Split out so [`latest_is_fresh_and_passing`]'s widened search
+/// can run the exact same check against a sibling worktree rather than
+/// duplicating it. `required_branch` is always `None` for the literal
+/// checkout's own evidence (trusted unconditionally, as before #467) and
+/// always `Some` for a sibling's (the relatedness gate).
+fn latest_is_fresh_and_passing_at(
+    state: &StateDir,
+    repo: &Path,
+    final_only: bool,
+    required_branch: Option<&str>,
 ) -> CtxResult<bool> {
     let Some(report) = load_latest(state, repo)? else {
         return Ok(false);
     };
+    if let Some(required_branch) = required_branch
+        && report.branch != required_branch
+    {
+        return Ok(false);
+    }
     if !((!final_only || report.mode == VerificationMode::Final)
         // A `--check format` run is evidence about formatting, not about the
         // change set, so it can never satisfy a step gate.
@@ -2429,6 +2527,7 @@ fn run_mode(
             mode,
             source: resolved.origin.to_string(),
             repo: repo.to_path_buf(),
+            branch: current_branch(repo),
             change_fingerprint: change_fingerprint(repo)?,
             changed_paths: Vec::new(),
             fallback_to_full: false,
@@ -2579,6 +2678,7 @@ fn run_mode(
         mode,
         source: resolved.origin.to_string(),
         repo: repo.to_path_buf(),
+        branch: current_branch(repo),
         change_fingerprint,
         changed_paths: paths,
         fallback_to_full,
@@ -2839,7 +2939,10 @@ fn run_baseline_prune(repo: &Path, writer: &mut impl Write) -> CtxResult<i32> {
 pub struct RunArgs {
     #[arg(long)]
     pub repo: Option<PathBuf>,
-    /// Run only the named check; repeat for more than one.
+    /// Run only the named check; repeat for more than one. Narrows the
+    /// repository's discovered checks, or the built-in registry with
+    /// `--builtin`; the default combined report always carries the full
+    /// built-in section.
     #[arg(long = "check")]
     pub checks: Vec<String>,
     #[arg(long)]
@@ -2993,6 +3096,59 @@ fn write_builtin_lines(
     Ok(())
 }
 
+/// Issue #640: resolves `--check` against the builtin registry (case-
+/// insensitive exact id match), in `ALL_IDS` order regardless of the order
+/// given on the command line. An empty filter means "every id". A name that
+/// matches nothing is a hard error naming every valid id -- the builtin path
+/// used to silently ignore an unknown `--check` and run (and pass) the whole
+/// registry instead.
+fn resolve_builtin_check_ids(checks: &[String]) -> CtxResult<Vec<&'static str>> {
+    if checks.is_empty() {
+        return Ok(super::checks::ALL_IDS.to_vec());
+    }
+    let unknown: Vec<&str> = checks
+        .iter()
+        .filter(|requested| {
+            !super::checks::ALL_IDS
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(requested))
+        })
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown --check id(s): {} -- known built-in ids: {}",
+            unknown.join(", "),
+            super::checks::ALL_IDS.join(", ")
+        )
+        .into());
+    }
+    Ok(super::checks::ALL_IDS
+        .iter()
+        .copied()
+        .filter(|id| {
+            checks
+                .iter()
+                .any(|requested| id.eq_ignore_ascii_case(requested))
+        })
+        .collect())
+}
+
+/// `zirv verify --builtin --dry-run`'s output: just the ids that would run,
+/// never invoking a single check function -- mirrors `CheckStatus::DryRun`'s
+/// "preview, not evidence" contract for the repo-supplied path.
+fn write_builtin_dry_run(writer: &mut impl Write, ids: &[&str], json: bool) -> CtxResult<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut *writer, ids)?;
+        writeln!(writer)?;
+    } else {
+        for id in ids {
+            writeln!(writer, "{}\twould-run", scrub_line(id))?;
+        }
+    }
+    Ok(())
+}
+
 /// `zirv verify --builtin`'s own output: just the builtin registry, no
 /// `.zirv/verify.toml`/discovered checks at all.
 fn write_builtin_report(
@@ -3056,14 +3212,29 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
             ));
         }
     }
-    let builtins = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude);
-    // `NotApplicable` counts as passing: most of these checks read zirv's own
-    // files, and their absence in another repository is a fact about that
-    // repository, not a failed invariant. `Inconclusive` still blocks (issue
-    // #268's degraded-gate ban).
-    let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
-
+    // Issue #640: `--builtin` has its own fast path so `--check`/`--dry-run`
+    // can narrow it without ever running (or reporting a stale pass for) the
+    // checks the caller did not ask for.
     if args.builtin {
+        let selected_ids = resolve_builtin_check_ids(&args.run.checks)?;
+        if args.run.dry_run {
+            if let Err(error) = write_builtin_dry_run(writer, &selected_ids, args.run.json) {
+                if !is_broken_pipe(error.as_ref()) {
+                    return Err(error);
+                }
+                crate::output::warn("verification output was cut short (broken pipe)");
+            }
+            return Ok(0);
+        }
+        let builtins: Vec<_> = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude)
+            .into_iter()
+            .filter(|check| selected_ids.contains(&check.id))
+            .collect();
+        // `NotApplicable` counts as passing: most of these checks read
+        // zirv's own files, and their absence in another repository is a
+        // fact about that repository, not a failed invariant.
+        // `Inconclusive` still blocks (issue #268's degraded-gate ban).
+        let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
         if let Err(error) = write_builtin_report(writer, &builtins, args.run.json) {
             if !is_broken_pipe(error.as_ref()) {
                 return Err(error);
@@ -3072,6 +3243,13 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
         }
         return Ok(if builtins_passed { 0 } else { 1 });
     }
+
+    let builtins = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude);
+    // `NotApplicable` counts as passing: most of these checks read zirv's own
+    // files, and their absence in another repository is a fact about that
+    // repository, not a failed invariant. `Inconclusive` still blocks (issue
+    // #268's degraded-gate ban).
+    let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
 
     let mut report = run_mode(
         &repo,
@@ -3412,6 +3590,104 @@ mod tests {
         );
     }
 
+    /// Issue #640: `zirv verify --builtin --check <id>` used to ignore the
+    /// filter entirely and report every builtin check. A lowercase id proves
+    /// the match is case-insensitive, per the brief.
+    #[test]
+    fn builtin_check_filter_runs_only_the_named_check() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let mut output = Vec::new();
+        with_state(state_root.path(), || {
+            run_verify(
+                &VerifyArgs {
+                    run: RunArgs {
+                        repo: Some(repo.path().to_path_buf()),
+                        checks: vec![super::super::checks::eol::ID.to_lowercase()],
+                        dry_run: false,
+                        json: true,
+                    },
+                    builtin: true,
+                },
+                &mut output,
+            )
+            .expect("verify runs")
+        });
+        let builtins: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
+        let ids: Vec<&str> = builtins
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|check| check["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![super::super::checks::eol::ID],
+            "only the named check must run: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    /// Issue #640: an unknown `--check` id used to silently run (and pass)
+    /// the whole builtin registry instead of erroring.
+    #[test]
+    fn builtin_check_filter_rejects_an_unknown_id() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let mut output = Vec::new();
+        let error = with_state(state_root.path(), || {
+            run_verify(
+                &VerifyArgs {
+                    run: RunArgs {
+                        repo: Some(repo.path().to_path_buf()),
+                        checks: vec!["ZCHK-DOES-NOT-EXIST".to_string()],
+                        dry_run: false,
+                        json: true,
+                    },
+                    builtin: true,
+                },
+                &mut output,
+            )
+            .expect_err("an unknown check id must error")
+        });
+        let message = error.to_string();
+        assert!(message.contains("ZCHK-DOES-NOT-EXIST"), "{message}");
+        for id in super::super::checks::ALL_IDS {
+            assert!(
+                message.contains(id),
+                "known id {id} missing from: {message}"
+            );
+        }
+        assert!(output.is_empty(), "an error run must not print a report");
+    }
+
+    /// Issue #640: `--builtin --dry-run` used to ignore `dry_run` altogether
+    /// and execute every check. It must only list what would run.
+    #[test]
+    fn builtin_dry_run_lists_without_executing() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let mut output = Vec::new();
+        let code = with_state(state_root.path(), || {
+            run_verify(
+                &VerifyArgs {
+                    run: RunArgs {
+                        repo: Some(repo.path().to_path_buf()),
+                        checks: vec![super::super::checks::eol::ID.to_string()],
+                        dry_run: true,
+                        json: true,
+                    },
+                    builtin: true,
+                },
+                &mut output,
+            )
+            .expect("verify runs")
+        });
+        assert_eq!(code, 0);
+        let ids: Vec<String> = serde_json::from_slice(&output).expect("valid json");
+        assert_eq!(ids, vec![super::super::checks::eol::ID.to_string()]);
+    }
+
     /// A command that appends a marker to `path` (outside the repo) each time
     /// it actually executes -- unlike `marker_command`, which only ever
     /// proves a single execution, this lets a test count how many times a
@@ -3510,6 +3786,246 @@ mod tests {
                 verify.notes
             );
         });
+    }
+
+    /// Issue #467 review (defect 1): report storage must stay keyed by the
+    /// LITERAL checkout, never merged across `git worktree add` siblings by
+    /// identity -- otherwise two workers running `zirv test changed`
+    /// concurrently in sibling worktrees of the same repository would share
+    /// one `report_dir` and one `latest` pointer, so the second write
+    /// clobbers the first and its own workflow's Test/Verify gate would then
+    /// reject the first worktree's fresh, still-passing evidence as stale.
+    /// Each worktree's own evidence must independently satisfy its own
+    /// gate check.
+    #[test]
+    fn sibling_worktrees_record_and_gate_pass_independently() {
+        let main_repo = tempdir().unwrap();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "hello\n").unwrap();
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let mut worktrees = Vec::new();
+        for name in ["worker-a", "worker-b"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().to_path_buf();
+            std::fs::remove_dir(&path).unwrap();
+            git(
+                main_repo.path(),
+                &["worktree", "add", "-q", "-b", name, path.to_str().unwrap()],
+            );
+            std::fs::write(path.join(format!("{name}.rs")), "fn work() {}\n").unwrap();
+            git(&path, &["add", "."]);
+            git(&path, &["commit", "-q", "-m", name]);
+            worktrees.push((dir, path, name.to_string()));
+        }
+
+        let mut report_ids = Vec::new();
+        for (index, (_dir, path, branch)) in worktrees.iter().enumerate() {
+            let fingerprint = change_fingerprint(path).unwrap();
+            let id = format!("worktree-evidence-{index}");
+            let report = VerificationReport {
+                schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+                id: id.clone(),
+                mode: VerificationMode::Changed,
+                source: "configured".into(),
+                repo: path.clone(),
+                branch: branch.clone(),
+                change_fingerprint: fingerprint,
+                changed_paths: vec![],
+                fallback_to_full: false,
+                narrowed_to: vec![],
+                notes: vec![],
+                started_at: 0,
+                finished_at: 0,
+                checks: vec![CheckResult {
+                    id: "unit".into(),
+                    kind: CheckKind::Unit,
+                    command: "true".into(),
+                    source: CheckSource::DiscoveredToolchain,
+                    status: CheckStatus::Passed,
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                    failure_output: None,
+                    failure_test_names: Vec::new(),
+                    inconclusive_reason: None,
+                }],
+            };
+            save_report(&state_dir, &report).unwrap();
+            report_ids.push(id);
+        }
+
+        // Neither write clobbered the other: each worktree's own `latest`
+        // still names its own report, not whichever was saved last.
+        for ((_dir, path, _branch), expected_id) in worktrees.iter().zip(report_ids.iter()) {
+            let latest = load_latest(&state_dir, path).unwrap().expect("a report");
+            assert_eq!(&latest.id, expected_id, "clobbered by a sibling worktree");
+        }
+
+        // And each worktree's Test gate independently passes against its
+        // OWN evidence (a literal-checkout hit, so no branch is needed).
+        for (_dir, path, _branch) in &worktrees {
+            assert!(
+                latest_is_fresh_and_passing(&state_dir, path, false, None).unwrap(),
+                "worktree {} must gate-pass on its own evidence",
+                path.display()
+            );
+        }
+    }
+
+    /// Builds the shared main-checkout-plus-one-linked-worktree fixture both
+    /// the positive and negative relatedness tests below need: a repo, a
+    /// worktree checked out on `worktree_branch` with a real commit, and a
+    /// passing `VerificationReport` persisted for the worktree, recorded as
+    /// produced on `report_branch`. Returns `(main_repo, worktree_dir,
+    /// worktree_path, state_dir)`; the caller decides what branch to ask
+    /// the gate for.
+    fn main_plus_worktree_with_evidence(
+        worktree_branch: &str,
+        report_branch: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, StateDir) {
+        let main_repo = tempdir().unwrap();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(main_repo.path(), &["init", "-q"]);
+        std::fs::write(main_repo.path().join("README.md"), "hello\n").unwrap();
+        git(main_repo.path(), &["add", "."]);
+        git(main_repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let worktree_dir = tempdir().unwrap();
+        let worktree_path = worktree_dir.path().to_path_buf();
+        std::fs::remove_dir(&worktree_path).unwrap();
+        git(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                worktree_branch,
+                worktree_path.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worktree_path.join("feature.rs"), "fn feature() {}\n").unwrap();
+        git(&worktree_path, &["add", "."]);
+        git(&worktree_path, &["commit", "-q", "-m", "feature work"]);
+
+        // The main checkout records no evidence of its own at all.
+        assert!(
+            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, None).unwrap(),
+            "the main checkout has no evidence yet and must not gate-pass"
+        );
+
+        let fingerprint = change_fingerprint(&worktree_path).unwrap();
+        let report = VerificationReport {
+            schema_version: VERIFY_REPORT_SCHEMA_VERSION,
+            id: "worktree-evidence".into(),
+            mode: VerificationMode::Changed,
+            source: "configured".into(),
+            repo: worktree_path.clone(),
+            branch: report_branch.to_string(),
+            change_fingerprint: fingerprint,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks: vec![CheckResult {
+                id: "unit".into(),
+                kind: CheckKind::Unit,
+                command: "true".into(),
+                source: CheckSource::DiscoveredToolchain,
+                status: CheckStatus::Passed,
+                exit_code: Some(0),
+                duration_ms: 1,
+                failure_output: None,
+                failure_test_names: Vec::new(),
+                inconclusive_reason: None,
+            }],
+        };
+        save_report(&state_dir, &report).unwrap();
+        (main_repo, worktree_dir, worktree_path, state_dir)
+    }
+
+    /// Issue #467 round 3 (Finding 2, positive half): a gate evaluated
+    /// against a checkout with NO evidence of its own (the orchestrator's
+    /// main checkout, its tree clean) must still pass when a linked
+    /// worktree sibling has fresh, passing evidence for its own tree --
+    /// PROVIDED the sibling's recorded branch matches the workflow's own
+    /// recorded branch, the relatedness key `--branch`/`WorkflowState::
+    /// branch` establishes.
+    #[test]
+    fn latest_is_fresh_and_passing_widens_to_a_sibling_worktrees_evidence_on_the_same_branch() {
+        let (main_repo, _worktree_dir, _worktree_path, state_dir) =
+            main_plus_worktree_with_evidence("feature", "feature");
+
+        // The main checkout's OWN report_dir still has nothing -- this can
+        // only pass through the widened, sibling-checkout search, and only
+        // because the workflow's own branch ("feature") matches what the
+        // worktree's evidence was recorded against.
+        assert!(
+            latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, Some("feature"))
+                .unwrap(),
+            "a linked worktree's fresh, passing evidence on the workflow's OWN branch must \
+             satisfy the gate evaluated from the main checkout"
+        );
+    }
+
+    /// Issue #467 round 3 (Finding 2, negative half): the mirror of the
+    /// above -- review round 2 caught that widening with no relatedness
+    /// check at all let ANY sibling's fresh, passing evidence satisfy a
+    /// gate that has nothing to do with it. A worktree on a DIFFERENT
+    /// branch than the one this gate is asked about must never open it,
+    /// no matter how fresh and passing its own evidence is.
+    #[test]
+    fn latest_is_fresh_and_passing_does_not_widen_to_an_unrelated_branch() {
+        let (main_repo, _worktree_dir, _worktree_path, state_dir) =
+            main_plus_worktree_with_evidence("someone-elses-feature", "someone-elses-feature");
+
+        assert!(
+            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, Some("my-feature"))
+                .unwrap(),
+            "an unrelated sibling's evidence, on a different branch, must not open this gate"
+        );
+        // With no workflow branch context at all, the same must hold: there
+        // is nothing to prove relatedness with, so it never widens.
+        assert!(
+            !latest_is_fresh_and_passing(&state_dir, main_repo.path(), false, None).unwrap(),
+            "widening with no branch to check against must never happen"
+        );
     }
 
     #[cfg(unix)]
@@ -3890,6 +4406,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -3912,7 +4429,7 @@ mod tests {
         };
         save_report(&state, &report).unwrap();
         assert!(
-            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            !latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "a narrowed run is not completion evidence"
         );
 
@@ -3920,7 +4437,7 @@ mod tests {
         report.narrowed_to.clear();
         save_report(&state, &report).unwrap();
         assert!(
-            latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "the same run, un-narrowed, is"
         );
     }
@@ -3974,6 +4491,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: PathBuf::from("/repo"),
+            branch: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4029,6 +4547,7 @@ mod tests {
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.to_path_buf(),
+            branch: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4472,6 +4991,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: PathBuf::from("/repo"),
+            branch: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4702,7 +5222,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         save_report(&state, &report).unwrap();
 
         assert!(
-            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            !latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "no baseline recorded yet: must still be strict"
         );
 
@@ -4712,7 +5232,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         )
         .unwrap();
         assert!(
-            latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "the same failure, now baselined, satisfies the gate"
         );
     }
@@ -5377,6 +5897,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -5399,7 +5920,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         };
         save_report(&state, &report).unwrap();
         assert!(
-            !latest_is_fresh_and_passing(&state, repo.path(), true).unwrap(),
+            !latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
             "an Inconclusive report must never satisfy the gate"
         );
 
@@ -5540,6 +6061,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -5584,6 +6106,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             mode: VerificationMode::Final,
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
+            branch: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,

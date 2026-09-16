@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_err","object":"response","model":"gpt-5.6-sol","status":"in_progress","usage":null}}
+
+event: error
+data: {"type":"error","sequence_number":1,"code":"rate_limit_exceeded","message":"Rate limit reached for requests","param":null,"request_id":"req_stream_rate"}
+

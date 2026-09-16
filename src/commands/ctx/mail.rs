@@ -2357,6 +2357,41 @@ pub fn run_inbox_with<W: Write>(
         });
     }
 
+    // Issue #479 (roadmap N10): a consuming inbox read is an orchestrator
+    // checkpoint -- by construction a moment this caller has no approval
+    // dialog open -- so it is the right boundary to retry every delegation
+    // message a worker's own attention latch deferred (#468), and the right
+    // place to drop a DUPLICATE transport delivery of a delegation outcome
+    // this session has already consumed. Mail is at-least-once: the same
+    // terminal outcome can legitimately arrive twice, and showing it twice
+    // would have an orchestrator act on one completion as if it were two.
+    // Only exact repeats of an already-consumed delivery identity are
+    // dropped; anything this repository cannot account for is still shown.
+    //
+    // Review finding: this used to consume every candidate's delivery
+    // identity here, before the byte-cap loop below decides which of them
+    // are actually rendered -- so a message the cap deferred to
+    // `more_unread` was already marked consumed despite never being shown,
+    // and the NEXT call dropped it as a false duplicate. The check here is
+    // now read-only (`is_delivery_consumed`); only a message this call
+    // actually hands over gets marked consumed, in the render loop below.
+    // A genuine duplicate arriving in the SAME batch (both copies still
+    // unconsumed) collapses to its first, oldest occurrence via
+    // `delivery_seen` instead.
+    if !args.peek {
+        let _ = super::delegation::drain_all(&state, repo, &cfg, now_secs());
+        let mut delivery_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        messages.retain(|(_, msg)| {
+            let Some(identity) = super::delegation::delivery_of(&msg.body) else {
+                return true;
+            };
+            if super::delegation::is_delivery_consumed(&state, repo, &identity) {
+                return false;
+            }
+            delivery_seen.insert(identity)
+        });
+    }
+
     // Issue #249: this reading session's own supervising session, if any --
     // read once, from `env` alone (`agent::parent_identity`, never anything
     // in `messages` itself), and reused for every message in this listing.
@@ -2423,6 +2458,13 @@ pub fn run_inbox_with<W: Write>(
             // mailbox from `path`, so a directed cross-slug message moves
             // into the `read/` trail beside the file it came from.
             consume_reading(&state, &slug, path, reader.as_deref())?;
+            // This message really is being handed over now (it survived the
+            // byte-cap above), so its delivery identity -- if it carries one
+            // -- is marked consumed here and only here. A message deferred
+            // to `more_unread` never reaches this line.
+            if let Some(identity) = super::delegation::delivery_of(&msg.body) {
+                super::delegation::mark_delivery_consumed(&state, repo, &identity);
+            }
         }
     }
     if more_unread > 0 {
@@ -4963,6 +5005,238 @@ This is part of the body too.\n";
             env.insert(SESSION_ENV.to_string(), id.to_string());
         }
         env
+    }
+
+    /// Issue #479 (roadmap N10), acceptance criteria (a) and (c): an
+    /// UNCHANGED legacy orchestrator -- a plain `zirv ctx inbox`, no new flag,
+    /// no new verb -- consumes a native worker's terminal outcome, and a
+    /// duplicated transport delivery of that same outcome is dropped rather
+    /// than acted on twice.
+    #[test]
+    fn a_legacy_inbox_consumes_a_native_workers_outcome_once_despite_a_duplicate_delivery() {
+        use crate::commands::ctx::delegation;
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path();
+        let cfg = CtxConfig::default();
+
+        delegation::record_launch(
+            &state,
+            repo,
+            delegation::WorkerHandle {
+                delegation: "nativedeleg1".to_string(),
+                attempt: 1,
+                runtime: RuntimeKind::Native,
+                worker_session: "native-worker-session".to_string(),
+                short: "natv0001".to_string(),
+                role: "worker".to_string(),
+                task: Some("task-12".to_string()),
+                group: None,
+                objective: None,
+                workdir: repo.to_path_buf(),
+                manifest: None,
+                plan_override: false,
+            },
+            Some("orch1234".to_string()),
+            10,
+        )
+        .expect("launch receipt");
+
+        let publication = delegation::publish_terminal(
+            &state,
+            repo,
+            &cfg,
+            "nativedeleg1",
+            delegation::Phase::Completed,
+            Some(0),
+            Some("entry point is src/main.rs".to_string()),
+            Some(repo.join("report.md")),
+            20,
+        )
+        .expect("publish");
+        assert!(publication.published && publication.mailed);
+
+        // At-least-once transport: the identical notification arrives twice.
+        let duplicate = Message {
+            from_session: "native-worker-session".to_string(),
+            from_agent: "native".to_string(),
+            to: "any".to_string(),
+            to_session: Some("orch1234".to_string()),
+            sent: 21,
+            body: format!(
+                "zirv delegation nativedeleg1 (native runtime) completed (exit 0)\ndelivery: {}",
+                publication.identity
+            ),
+        };
+        store(&state, &repo_slug(repo), &duplicate, &cfg).expect("duplicate delivery");
+        assert_eq!(
+            list(&state, &repo_slug(repo), None, Some("orch1234"))
+                .expect("list")
+                .len(),
+            2,
+            "both copies really are sitting in the mailbox"
+        );
+
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "orch1234"),
+        ]);
+        let mut out = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut out, repo, &|k| env.get(k).cloned())
+            .expect("inbox");
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(
+            rendered.contains("nativedeleg1"),
+            "the legacy orchestrator reads the native worker's outcome: {rendered}"
+        );
+        assert!(
+            rendered.contains("full report:"),
+            "and the bounded evidence reference that comes with it: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches(&publication.identity).count(),
+            1,
+            "the duplicate transport delivery is dropped, not shown twice: {rendered}"
+        );
+    }
+
+    /// Review finding on the dedup `retain` above (~2370-2424, before this
+    /// fix): it called the (then-mutating) duplicate check for every
+    /// candidate message BEFORE the byte-cap loop below decided which of
+    /// them the call could actually afford to render, so a message the cap
+    /// deferred to `more_unread` was marked consumed despite never being
+    /// shown -- and the next call dropped it as a false duplicate, forever.
+    /// A tiny `mail.max_delivered_bytes` forces the delegation outcome
+    /// (arriving after an unconditional filler) to be deferred on the first
+    /// call; it must still be rendered on the second, uncapped call -- and a
+    /// genuine duplicate of the same outcome, stored alongside it, must
+    /// still be dropped.
+    #[test]
+    fn a_deferred_delegation_outcome_is_rendered_later_and_a_genuine_duplicate_is_still_dropped() {
+        use crate::commands::ctx::delegation;
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path();
+        let cfg = CtxConfig::default();
+
+        // An unconditional filler: "the first message is always delivered
+        // regardless of its own size" -- oldest, so it sorts before the
+        // delegation outcome below and consumes the whole (tiny) cap.
+        store(&state, &repo_slug(repo), &sample("filler", 1), &cfg).expect("store filler");
+
+        delegation::record_launch(
+            &state,
+            repo,
+            delegation::WorkerHandle {
+                delegation: "nativedeleg2".to_string(),
+                attempt: 1,
+                runtime: RuntimeKind::Native,
+                worker_session: "native-worker-session-2".to_string(),
+                short: "natv0002".to_string(),
+                role: "worker".to_string(),
+                task: Some("task-13".to_string()),
+                group: None,
+                objective: None,
+                workdir: repo.to_path_buf(),
+                manifest: None,
+                plan_override: false,
+            },
+            Some("orch1234".to_string()),
+            10,
+        )
+        .expect("launch receipt");
+
+        let publication = delegation::publish_terminal(
+            &state,
+            repo,
+            &cfg,
+            "nativedeleg2",
+            delegation::Phase::Completed,
+            Some(0),
+            Some("entry point is src/main.rs".to_string()),
+            Some(repo.join("report.md")),
+            20,
+        )
+        .expect("publish");
+        assert!(publication.mailed);
+
+        let capped_env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "orch1234"),
+            ("ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES", "1"),
+        ]);
+
+        // First call: the filler is always delivered; the tiny cap defers
+        // the delegation outcome to `more_unread` rather than dropping it.
+        let mut first_out = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut first_out, repo, &|k| {
+            capped_env.get(k).cloned()
+        })
+        .expect("first inbox call");
+        let first_rendered = String::from_utf8_lossy(&first_out);
+        assert!(
+            !first_rendered.contains(&publication.identity),
+            "the byte-cap defers the delegation outcome on the first call: {first_rendered}"
+        );
+        assert!(
+            first_rendered.contains("more unread"),
+            "the call must say something was left behind: {first_rendered}"
+        );
+
+        // A duplicate transport delivery of the SAME outcome arrives before
+        // the second call.
+        let duplicate = Message {
+            from_session: "native-worker-session-2".to_string(),
+            from_agent: "native".to_string(),
+            to: "any".to_string(),
+            to_session: Some("orch1234".to_string()),
+            sent: 21,
+            body: format!(
+                "zirv delegation nativedeleg2 (native runtime) completed (exit 0)\ndelivery: {}",
+                publication.identity
+            ),
+        };
+        store(&state, &repo_slug(repo), &duplicate, &cfg).expect("duplicate delivery");
+
+        // Second call, cap lifted: the previously-deferred outcome must now
+        // actually be rendered -- it was never shown, so it must not have
+        // been treated as consumed -- and its duplicate must still be
+        // dropped.
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "orch1234"),
+        ]);
+        let mut second_out = Vec::new();
+        run_inbox_with(&inbox_args(false), &mut second_out, repo, &|k| {
+            env.get(k).cloned()
+        })
+        .expect("second inbox call");
+        let second_rendered = String::from_utf8_lossy(&second_out);
+        assert_eq!(
+            second_rendered.matches(&publication.identity).count(),
+            1,
+            "the deferred outcome must be rendered exactly once -- neither silently dropped as \
+             a false duplicate nor shown twice: {second_rendered}"
+        );
     }
 
     #[test]

@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_failed","object":"response","model":"gpt-5.6-sol","status":"in_progress","usage":null}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_failed","status":"in_progress","role":"assistant","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":2,"item_id":"msg_failed","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_failed","output_index":0,"content_index":0,"delta":"Starting to"}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":4,"response":{"id":"resp_failed","object":"response","model":"gpt-5.6-sol","status":"failed","error":{"code":"server_error","message":"The model failed to generate a response."},"incomplete_details":null,"usage":null}}
+

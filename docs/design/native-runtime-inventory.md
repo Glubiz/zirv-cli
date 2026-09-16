@@ -1,0 +1,343 @@
+# Native runtime inventory: implementation owners (issue #470)
+
+**Date:** 2026-09-11 · **Issue:** #470, step N01 of the native-runtime roadmap (#469)
+
+This is the exhaustive, machine-checked list step N01
+(`docs/design/2026-09-11-native-runtime-contracts.md`) promises: every
+command verb the binary accepts, and every place in `src/` that launches or
+drives a model, each with a named implementation owner. `zirv verify
+--builtin`'s `ZCHK-RUNTIME-INVENTORY` check (`src/commands/workflow/checks/
+inventory.rs`) parses both tables below against the real clap model and the
+real source tree on every run, so this document cannot silently drift from
+the binary it describes -- a new command or a new model-calling call site
+lands with an owner here in the same change, or the build fails.
+
+Owner values:
+
+- `shared` -- runtime-neutral today and stays so regardless of which
+  `RuntimeBackend` a session uses (script runner, init, create, help,
+  version, update, report, memory, artifact, frontend, test, verify,
+  workflow state). A `shared` command can still contain a model-calling
+  call site (e.g. `memory optimize`'s consolidation step, `frontend
+  review`'s visual reviewer) -- that call site is owned individually in the
+  second table below; the command's own CRUD/state contract is what stays
+  neutral.
+- `harness-backend` -- a legacy-specific operation whose native equivalent
+  is simply a native session (`ctx wrap` is the reference case: a native
+  runtime has no PTY to supervise, because it never shells out to one).
+- `Nxx (#4yy)` -- owned by that step of the roadmap; see the map below.
+
+Roadmap map: N01 #470 contracts (this step) · N02 #471 provider routes/
+credentials · N03 #472 journal/receipts · N04 #473 tool permissions/sandbox ·
+N05 #474 native tools/shell · N06 #475 instructions/skills/memory compile ·
+N07 #476 Anthropic provider · N08 #477 OpenAI provider · N09 #478 agent
+loop/steer/interrupt · N10 #479 workers/tasks/mail/delegation · N11 #480
+native conversation TUI · N12 #481 Google · N13 #482 compatible endpoints ·
+N14 #483 MCP/web/browser/diagnostics/artifacts · N15 #484 workflows/
+verification/helper-model calls natively · N16 #485 meta-orchestrator/mixed
+teams · N17 #486 compaction/rot recovery/checkpoints · N18 #487 usage/
+spend/health · N19 #488 rollover · N20 #489 persistent runtime/protocol ·
+N21 #490 UX · N22 #491 setup/migration/diagnostics/docs/packaging · N23 #492
+parity proof · N24 #650 official provider execution.
+
+## Commands
+
+Every depth-1 and depth-2 verb `./target/debug/zirv commands --json`
+reports, using the same depth rule as `scripts/check-readme-features.sh`
+(depth counted on the words after the leading `zirv `; `zirv ctx hook audit`
+contributes `ctx` at depth-1 and `ctx hook` at depth-2 -- `audit`, depth-3,
+is not required here either, matching that script's own acceptance
+criterion).
+
+| Verb | Owner | Notes |
+|---|---|---|
+| `agent` | N10 (#479) | `--runtime harness\|native` picks the WORKER's backend; both forks share one task claim, writer permit, reservation, envelope and receipt (`ctx::delegation`) |
+| `artifact` | shared |  |
+| `artifact list` | shared |  |
+| `artifact present` | shared |  |
+| `artifact render` | shared |  |
+| `artifact show` | shared |  |
+| `chat` | N11 (#480) |  |
+| `commands` | shared |  |
+| `context` | N06 (#475) |  |
+| `context lint` | N06 (#475) |  |
+| `context status` | N06 (#475) |  |
+| `context sync` | N06 (#475) |  |
+| `create` | shared |  |
+| `ctx` | shared | command-group umbrella; each subcommand owned individually below |
+| `ctx agent` | N10 (#479) | same surface as `agent`; `--runtime native` forks to `ctx::native_worker` after everything both runtimes share has already happened |
+| `ctx api` | N20 (#489) | the versioned local runtime protocol (issue #353): `schema`/`serve`/`call`. Backend-neutral by construction -- it publishes redacted session facts and a narrow method set over whichever `RuntimeBackend` is attached -- but the persistent runtime it exists to front is N20's, so the verb is owned there rather than marked `shared` |
+| `ctx ask` | N15 (#484) |  |
+| `ctx capabilities` | N14 (#483) | the available/unavailable/unverified integration report the native tool service and workflow admission both read; `--probe` verifies each configured MCP server, `--require` gates a script on the engine's own admission rule |
+| `ctx chat` | N11 (#480) |  |
+| `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |
+| `ctx config` | shared |  |
+| `ctx discover` | N03 (#472) | reads the compaction ledger to size Bash tool-result bloat |
+| `ctx doctor` | N22 (#491) | native-readiness diagnosis: per role, which backend an unflagged session gets and why, which route it would spend, and every problem sorted into exactly one of missing auth material / inaccessible model / missing tool / unsupported isolation / service failure / upstream entitlement. Gathers only from owners that already exist (`provider::inventory`, `runtime::capabilities`, `runtime::enforcement::PlatformIsolation`, `adapters::ADAPTERS`); calls no model; redacts every rendered string through `snapshot::redact_text` |
+| `ctx exec` | N09 (#478) |  |
+| `ctx explain-status` | shared |  |
+| `ctx forget` | N06 (#475) | native `memory_forget` reuses the same locked store and journal semantics |
+| `ctx group` | N10 (#479) | group ids are shared: a native worker's delegation record carries the same `group` a legacy worker's does |
+| `ctx handoff` | N17 (#486) |  |
+| `ctx handover` | N16 (#485) |  |
+| `ctx hook` | N22 (#491) |  |
+| `ctx inbox` | N10 (#479) | a consuming read is an orchestrator checkpoint: it drains delegation messages an attention latch deferred (#468) and drops a duplicate delivery identity (#452) |
+| `ctx kill` | harness-backend | terminates a supervised OS process; a native session is interrupted via the runtime protocol instead |
+| `ctx learn` | N06 (#475) |  |
+| `ctx loop` | N09 (#478) |  |
+| `ctx mcp` | shared | scoped read-only MCP bridge for wrapped hosts; does not start a native session |
+| `ctx measure` | N18 (#487) | transcript-derived proportionality/health metrics with a committed baseline |
+| `ctx nudge` | N10 (#479) | pane-typing surface; the runtime-neutral equivalent for a native worker is `delegation::send`, which queues rather than types at an open dialog |
+| `ctx objective` | N09 (#478) |  |
+| `ctx optimize` | N15 (#484) |  |
+| `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
+| `ctx permissions` | N04 (#473) | canonical policy and approval audit remain shared; native effects consume them through `runtime::enforcement` |
+| `ctx provider` | N02 (#471) | `init`, `list`, `check`, official execution `login`/`status`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
+| `ctx recall` | N06 (#475) | native `memory_recall` preserves session/private/global/shared precedence |
+| `ctx remember` | N06 (#475) | native `memory_remember` defaults to session scope; shared writes retain policy/writer enforcement |
+| `ctx resume` | N17 (#486) |  |
+| `ctx run` | N05 (#474) | its output store, compaction classifier and heavy permits are reused by `runtime::tools`; native process execution itself stays behind N04 authorization/isolation |
+| `ctx safety` | N04 (#473) | the existing command classifier is re-evaluated by the native execution broker at each process boundary |
+| `ctx savings` | N18 (#487) |  |
+| `ctx score` | N17 (#486) |  |
+| `ctx search` | N06 (#475) | explicitly zero-model cross-session recall, also exposed as typed native `context_search` |
+| `ctx send` | N10 (#479) | the mail service the native `send`/`follow_up` tools reach through `ctx::delegation` |
+| `ctx snapshot` | N14 (#483) | redacted diagnostic-state summary |
+| `ctx spend` | N18 (#487) |  |
+| `ctx status` | N17 (#486) |  |
+| `ctx swarm` | N10 (#479) | mints shared task cards; a native worker claims one through the same `task::claim_locked` |
+| `ctx task` | N10 (#479) | the one exclusive-ownership store for work, shared by both runtimes |
+| `ctx usage` | N18 (#487) |  |
+| `ctx wait` | N10 (#479) | bounded wait; the native `wait` tool answers from the same durable delegation record with no model call |
+| `ctx worktree` | shared |  |
+| `ctx wrap` | harness-backend | PTY-supervised interactive session; the example case for this bucket |
+| `frontend` | shared |  |
+| `frontend benchmark` | shared |  |
+| `frontend capabilities` | shared |  |
+| `frontend check` | shared |  |
+| `frontend profile` | shared |  |
+| `frontend render` | shared |  |
+| `frontend review` | shared | CRUD/capture is runtime-neutral; its model-assisted visual review step is tracked as an entry point below |
+| `help` | shared |  |
+| `init` | shared |  |
+| `memory` | shared |  |
+| `memory forget` | shared |  |
+| `memory init` | shared |  |
+| `memory list` | shared |  |
+| `memory optimize` | shared | CRUD/storage is runtime-neutral; its model-assisted consolidation step is tracked as an entry point below |
+| `memory promote` | shared |  |
+| `memory recall` | shared |  |
+| `memory remember` | shared |  |
+| `memory rollback` | shared |  |
+| `memory status` | shared |  |
+| `memory verify` | shared |  |
+| `native` | N11 (#480) | issue #540: thin top-level alias for `chat --runtime native` (`main.rs` rewrites argv to `ctx chat --runtime native`); no duplicate native launch logic, so it carries `ctx chat`'s own owner |
+| `report` | shared |  |
+| `report bug` | shared |  |
+| `report feature` | shared |  |
+| `session` | N20 (#489) | the persistent runtime (#352): a local service owns the PTYs and every UI is a protocol v1 client |
+| `session attach` | N20 (#489) | attaches a terminal as observer or controller |
+| `session detach` | N20 (#489) | releases clients; never ends a process |
+| `session list` | N20 (#489) | reads one runtime's session list over protocol v1 |
+| `session serve` | N20 (#489) | the runtime service itself: owns PTYs, supervisors and registry records |
+| `session stop` | N20 (#489) | the one verb that ends a session, or the runtime |
+| `setup` | N22 (#491) |  |
+| `setup apply` | N22 (#491) |  |
+| `setup profile` | N22 (#491) |  |
+| `setup reset` | N22 (#491) |  |
+| `setup restore` | N22 (#491) |  |
+| `setup status` | N22 (#491) |  |
+| `skill` | N06 (#475) | prints the bundled operator orientation skill |
+| `skill list` | N06 (#475) |  |
+| `skill show` | N06 (#475) |  |
+| `test` | shared |  |
+| `test all` | shared |  |
+| `test baseline` | shared |  |
+| `test changed` | shared |  |
+| `update` | shared |  |
+| `verify` | shared |  |
+| `version` | shared |  |
+| `workflow` | shared |  |
+| `workflow advance` | shared |  |
+| `workflow agents` | N15 (#484) | dispatches/lists/shows built-in agent seats (`dispatch_agent`) |
+| `workflow approve` | shared |  |
+| `workflow artifacts` | shared |  |
+| `workflow classify` | shared |  |
+| `workflow close` | shared |  |
+| `workflow context` | N06 (#475) | prints the current step's resolved skill context |
+| `workflow list` | shared |  |
+| `workflow maintain` | shared |  |
+| `workflow reclassify` | shared |  |
+| `workflow resume` | shared |  |
+| `workflow review` | N15 (#484) | the model-calling cross-harness review flow (`review.rs`) |
+| `workflow show` | shared |  |
+| `workflow start` | shared |  |
+| `workflow stats` | shared |  |
+| `workflow status` | shared |  |
+| `workflow team` | N16 (#485) | compiles/persists/briefs a proportional `TeamPlan` from the execution profile and the agent/skill registries (issue #541) |
+
+## Model-calling entry points
+
+One row per place in `src/` that launches or drives a model: an adapter
+launch-builder call (`headless_cmd`/`interactive_cmd`/`distiller_cmd`/
+`headless_resume_cmd`/`dispatch_agent`), a helper-model child (the shared
+`handoff::run_model` chokepoint that wraps `distiller_cmd`), or a
+self-recursion into zirv (`Command::new(std::env::current_exe())`) that ends
+in a model call. Found by starting from a known set of call sites and
+completing it with:
+
+```
+grep -rnE "interactive_cmd\(|headless_cmd\(|headless_cmd_stdin\(|headless_resume_cmd\(|distiller_cmd\(|dispatch_agent\(|current_exe\(\)" src/
+```
+
+then discarding hits that are trait/adapter definitions (`src/commands/ctx/
+adapters/{claude,codex,copilot,droid,gemini,opencode,pi,qwen}.rs` each
+*define* these methods; they are not call sites), `#[cfg(test)]` fixtures
+that stand a test binary in for `agent_bin` or re-exec `zirv` to test raw-
+argv interception (`agent.rs`, `dash/mod.rs`, `fallback.rs`, `pool.rs`,
+`rollover.rs`, `mod.rs`, `main.rs` each have such a test helper -- none is a
+production model-calling path), and `update.rs`'s `current_exe()` (swaps the
+installed binary during self-update; never spawns it).
+
+| Entry point | Path | Symbol | Owner | Notes |
+|---|---|---|---|---|
+| Official provider execution | `src/commands/ctx/runtime/execution.rs` | `run` | N24 (#650) | official unmodified Claude Code owns model/agent loop; native UI and Zirv MCP broker own presentation/effects; no subscription token transport |
+| Native Anthropic Messages request | `src/commands/ctx/provider/anthropic.rs` | `perform_blocking` | N07 (#476) | direct HTTPS/SSE transport behind `ProviderAdapter`; no vendor CLI or SDK agent loop |
+| Native OpenAI Responses request | `src/commands/ctx/provider/openai.rs` | `perform_blocking` | N08 (#477) | direct HTTPS/SSE transport behind `ProviderAdapter`; no Codex binary, SDK, or App Server |
+| Native Google Gemini request | `src/commands/ctx/provider/google.rs` | `perform_blocking` | N12 (#481) | direct HTTPS/SSE transport behind `ProviderAdapter`; explicit Developer/Vertex protocol profiles, no Gemini CLI |
+| Native chat-completions request | `src/commands/ctx/provider/openai_chat.rs` | `perform_blocking` | N13 (#482) | direct HTTPS/SSE transport behind `ProviderAdapter`; serves every compatible vendor, every local runtime and Azure OpenAI, addressed by the bound route profile |
+| Native Bedrock Converse request | `src/commands/ctx/provider/bedrock.rs` | `perform_blocking` | N13 (#482) | direct SigV4-signed HTTPS request behind `ProviderAdapter`; decodes AWS event-stream frames, no AWS SDK |
+| Native agent loop | `src/commands/ctx/runtime/native.rs` | `stream_once` | N09 (#478) | the one place the loop calls a `ProviderAdapter`; owns retries, the durable barrier and tool scheduling. No vendor CLI, SDK or agent framework |
+| Native compaction distillation | `src/commands/ctx/runtime/compaction.rs` | `distill` | N17 (#486) | summarises a compacted prefix through the session's OWN `ProviderAdapter`, with a bounded output budget and no tool schemas at all; falls back to the deterministic structural summary when no capacity, credential or valid reply exists, so it needs no vendor CLI |
+| Native headless session | `src/commands/ctx/runtime/native.rs` | `run_headless` | N09 (#478) | `zirv ctx exec --runtime native`: resolves the route, builds the direct provider adapter and drives `NativeLoop` to a structured final status |
+| Native interactive dashboard session | `src/commands/ctx/runtime/native.rs` | `spawn_interactive` | N11 (#480) | `zirv chat --runtime native`: resolves transport/journal/seat/writer exactly like `run_session`, then drives a fresh `NativeLoop` to completion once per submitted turn on a background thread for the pane's whole lifetime |
+| Interactive orchestrator launch | `src/commands/ctx/chat.rs` | `build_launch` | N11 (#480) | backs `zirv ctx chat` / `zirv chat` |
+| Wrap first-launch PTY spawn | `src/commands/ctx/wrap.rs` | `run_with` | harness-backend | initial `zirv ctx wrap` PTY `CommandBuilder` |
+| Wrap mid-session PTY relaunch | `src/commands/ctx/wrap.rs` | `relaunch` | harness-backend | in-place restart after compaction/handoff |
+| Dash pane restore | `src/commands/ctx/dash/roster.rs` | `restore_argv` | N11 (#480) | rebuilds a verified resume argv for a restored dashboard pane |
+| Dash pane initial spawn | `src/commands/ctx/dash/pane.rs` | `spawn` | N11 (#480) |  |
+| Dash pane harness handover | `src/commands/ctx/dash/pane.rs` | `handover` | N16 (#485) | swaps the harness under a live pane, same session identity |
+| Dash pane swap launch builder | `src/commands/ctx/dash/pane.rs` | `build_swap_launch` | N19 (#488) | derives one successor launch (argv, turn env, knobs); shared by the in-place handover and the open-then-retire successor seam (#552) |
+| Dash spawn-request fulfillment | `src/commands/ctx/dash/mod.rs` | `fulfill_spawn_request` | N11 (#480) | services a worker/pane spawn request from mail or a dispatch |
+| Headless exec spawn | `src/commands/ctx/exec.rs` | `run_with_clock_inner` | N09 (#478) | `zirv ctx exec`'s main headless spawn via `supervise::spawn_tapped` |
+| Headless in-place resume/compact | `src/commands/ctx/exec.rs` | `compact_in_place` | N09 (#478) | resumes a headless session in place to compact it |
+| Agent loop headless spawn | `src/commands/ctx/run_loop.rs` | `run_with_clock` | N09 (#478) | `zirv ctx loop`'s per-cycle headless spawn |
+| Agent loop objective judge | `src/commands/ctx/run_loop.rs` | `evaluate_objective_after_cycle` | N09 (#478) | distinct helper-model call: judges the objective gate after a loop cycle |
+| Helper-model chokepoint | `src/commands/ctx/handoff.rs` | `helper_answer` | N15 (#484) | the ONE place a non-chat model call is made: native first (`ctx::helper`), harness second. Shared by the distiller, run_loop's judge, memory harvest/consolidation, optimize and ask below |
+| Harness distiller/judge child | `src/commands/ctx/handoff.rs` | `run_model` | N15 (#484) | wraps `distiller_cmd`; reached through `helper_answer` when the helper's role has no native route |
+| Native helper call | `src/commands/ctx/helper.rs` | `run` | N15 (#484) | one bounded, read-only native session per helper call; holds no writer permit, so the broker refuses every mutating effect |
+| Native workflow agent seat | `src/commands/workflow/agents.rs` | `dispatch_native_seat` | N15 (#484) | `workflow agents dispatch --runtime native`; read-only seats only |
+| Resume interactive relaunch | `src/commands/ctx/resume.rs` | `launch_command` | N17 (#486) | `zirv ctx resume` |
+| Agent delegation dispatch | `src/commands/ctx/agent.rs` | `run_with` | N10 (#479) | probes `headless_resume_cmd` before a bounded structural-result retry; `--runtime native` forks to `native_worker::run` before adapter selection |
+| Native delegated worker | `src/commands/ctx/native_worker.rs` | `run` | N10 (#479) | `zirv agent --runtime native`: takes the shared task/permit/reservation ownership, writes the durable launch receipt, drives `native::run_session` and publishes the terminal outcome |
+| Native delegation tool launch | `src/commands/ctx/delegation.rs` | `AgentLauncher` | N10 (#479) | the native `delegate` tool's production launcher -- one `agent::run_with` call, so the tool and the CLI verb are one code path |
+| Built-in seat worker dispatch | `src/commands/workflow/agents.rs` | `dispatch_agent` | N15 (#484) | synchronous `.status()` dispatch of a built-in agent seat; the harness half of `workflow agents dispatch` |
+| Cross-harness review launch | `src/commands/workflow/review.rs` | `launch_reviewer` | N15 (#484) | `reviewer_argv` + self-recursion into `current_exe`; `--runtime native` emits a `zirv agent --runtime native --mode read-only` argv with no adapter flags |
+| Frontend visual reviewer launch | `src/commands/workflow/frontend_render.rs` | `launch_visual_reviewer` | N15 (#484) | reuses `review::reviewer_argv`; self-recursion into `current_exe` |
+| Auto-spawn on workflow gate transition | `src/commands/workflow/engine.rs` | `spawn_auto_worker` | N15 (#484) | issue #242: detached self-recursion into `zirv workflow review run` / `test` / `verify` |
+| `ctx ask` helper-model call | `src/commands/ctx/ask.rs` | `run_model` | N15 (#484) |  |
+| `ctx optimize` judgment call | `src/commands/ctx/optimize.rs` | `run_with` | N15 (#484) |  |
+| Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from exec.rs/wrap.rs restart and session-end seams |
+| Memory optimize consolidation | `src/commands/ctx/memory_optimize.rs` | `apply_consolidation` | N06 (#475) | `zirv memory optimize`'s model-assisted merge |
+| Builtin argv-shape checks | `src/commands/workflow/checks/argv.rs` | `headless_cmd` | shared | Notes: probe/check only -- `ZCHK-ARGV-CODEX-EXEC` / `ZCHK-ARGV-CLAUDE-HEADLESS` build argv to inspect it, never spawn |
+
+Beyond the starter set given in this issue, this pass added: `src/commands/
+ctx/ask.rs` (`run_model`), `src/commands/ctx/optimize.rs` (`run_with`),
+`src/commands/ctx/memory.rs` (`harvest_durable_with_tool_errors`),
+`src/commands/ctx/memory_optimize.rs` (`apply_consolidation`),
+`src/commands/ctx/run_loop.rs`'s second call site (`evaluate_objective_
+after_cycle`, distinct from its main headless spawn),
+`src/commands/workflow/frontend_render.rs` (`launch_visual_reviewer`), and
+`src/commands/workflow/engine.rs` (`spawn_auto_worker`). N07 adds the first
+native direct-model call in `src/commands/ctx/provider/anthropic.rs`
+(`perform_blocking`), N08 the second in
+`src/commands/ctx/provider/openai.rs` (`perform_blocking`), and N12 the third
+in `src/commands/ctx/provider/google.rs` (`perform_blocking`). N13 adds the
+last two transports: `src/commands/ctx/provider/openai_chat.rs`
+(`perform_blocking`), one chat-completions transport for every compatible
+vendor, every local runtime and Azure OpenAI, and
+`src/commands/ctx/provider/bedrock.rs` (`perform_blocking`), the SigV4-signed
+Bedrock Converse transport. Neither adds a command verb: a route profile is
+configuration, not a new surface.
+
+N14 adds one command row, `ctx capabilities`. It calls no model: the report is
+built from configuration, PATH and the repository tree, and `--probe` contacts
+MCP servers over the protocol rather than a provider. The thirteen native
+capability tools it reports on are registry entries under `runtime::tools`, not
+command verbs and not model-calling call sites, so they add no row to either
+table.
+
+N15 adds four rows and no command row. `helper_answer` is the new chokepoint
+every non-chat model call reaches (`run_model` stays, as the harness half
+behind it); `helper::run` is the native session one helper call runs as; and
+`dispatch_native_seat` is the native half of `workflow agents dispatch`. The
+`--runtime`/`--route` flags it adds to `workflow review run`, `workflow agents
+dispatch` and `workflow frontend review`, and the `runtime:` key it adds to a
+script `agent:` step, are flags and script fields on existing surfaces, so no
+`## Commands` row changes. The four native workflow tools
+(`workflow_status`/`workflow_context`/`workflow_advance`/`workflow_approve`)
+are registry entries under `runtime::tools`, not command verbs and not
+model-calling call sites, so they add no row to either table -- the same
+treatment N14's thirteen capability tools get.
+
+Issue #542 chunk 3b adds two native workflow tools, `workflow_list` and
+`workflow_start`, plus three native slash commands (`/workflows`,
+`/workflow <id>`, `/workflow status`) in the dashboard pane. Neither adds a
+`## Commands` row: `workflow_list`/`workflow_start` are registry entries
+under `runtime::tools`, the same treatment the four pre-existing workflow
+tools and N14's capability tools get, and the slash commands are pane-local
+dispatch that calls the very same `workflow::engine` writer functions
+(`write_registry_list`/`write_registry_entry`/`write_state`/
+`write_definition_status`/`write_start_outcome`) the `workflow list`/`show`/
+`status`/`start` verbs already call -- not a new surface, and not a
+model-calling call site, so no row in either table.
+
+N09 adds the two rows that actually DRIVE a model rather than transport one
+request: `NativeLoop::stream_once`, the single place the loop reaches a
+`ProviderAdapter` (and therefore the only place a response retry can happen),
+and `run_headless`, the `zirv ctx exec --runtime native` entry point that
+resolves the route, builds the adapter and runs the loop to a structured
+final status. `--runtime`/`--route`/`--role` are flags on an existing verb,
+so no `## Commands` row changes.
+
+N16 (#485) adds one more native tool with #541 chunk C: `team_plan`
+(coordinator/sub-orchestrator seats only) runs the same deterministic
+`workflow::team::compile`/`compile_explicit` chunk B's `workflow team plan`
+CLI verb already runs and persists the result. It calls no model -- the same
+"registry entry under `runtime::tools`, not a command verb and not a
+model-calling call site" treatment N14's thirteen capability tools and N15's
+four workflow tools get, so it adds no row to either table above.
+
+Issue #617 (N01 follow-up) closed the gap that let a documented row go
+stale without detection: `ZCHK-RUNTIME-INVENTORY` no longer only confirms
+the rows already written above, it independently *rediscovers* production
+model-calling entry points on every run and fails when a real one is
+missing from the table. Discovery walks every `src/**/*.rs` file, drops
+everything from the first `#[cfg(test)] mod tests` marker onward plus any
+file under an `adapters/` directory (trait/implementation definitions, not
+call sites) or `src/commands/update.rs` (swaps the installed binary; never
+spawns it), and flags a line inside a function as an entry point when it
+matches one of the same markers the starter `grep` above already used --
+`interactive_cmd(`, `headless_cmd(`, `headless_cmd_stdin(`,
+`headless_resume_cmd(`, `distiller_cmd(`, `dispatch_agent(`, `current_exe(`
+-- plus the two markers that cover the native direct-transport and
+agent-loop rows the starter grep could not, since neither is a vendor-CLI
+launch: `.stream(` (the loop's one call into a `ProviderAdapter`) and `fn
+perform_blocking(` (each transport's blocking HTTPS/SSE call). A discovered
+`(path, function)` pair counts as documented if it matches an inventory
+row's `Path` and either its `Symbol` or the matched call's own name; anything
+left over fails the check by name. A small, explicit `excluded_model_call`
+allowlist keeps this from false-positiving on shapes that match a marker
+but are not a production entry point in their own right: test-only argv
+probes/builders already owned by their spawning caller
+(`ctx/exec.rs::headless_resume_launch`/`prompt_delivery_via_stdin`,
+`ctx/run_loop.rs::prompt_delivery_via_stdin`/`zirv_invocation`,
+`ctx/dash/mod.rs::task_prompt_fallback_is_safe`), binary
+inspection/self-service (`ctx/measure.rs::current_binary_mtime`,
+`ctx/session/host.rs::resume_argv`, `ctx/session/mod.rs::spawn_service`,
+`ctx/wrap.rs::relaunch_command`), the check's own marker table and scanner
+(`workflow/checks/inventory.rs::model_call_marker`/`perform_blocking`), and
+the dormant `ctx/runtime/harness.rs::start`/`submit` backend -- excluded
+only while `runtime::select` has no production caller, a precondition its
+own regression test enforces so wiring it up trips a visible failure
+instead of silently losing inventory coverage.

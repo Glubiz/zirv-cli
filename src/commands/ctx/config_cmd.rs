@@ -28,6 +28,171 @@ pub enum ConfigCommand {
         #[arg(allow_hyphen_values = true)]
         value: String,
     },
+    /// Bring ~/.zirv/ctx.toml to the current schema, backing up the document
+    /// it replaced; `--downgrade` restores that backup. Idempotent in both
+    /// directions: a second run writes nothing (issue #491).
+    Migrate {
+        /// Which backend an unflagged session gets afterwards. The default
+        /// preserves today's behaviour exactly; `native` is the opt-in.
+        #[arg(long, value_name = "RUNTIME", default_value = "harness")]
+        to: String,
+        /// Restore the pre-migration document and drop the schema marker.
+        #[arg(long)]
+        downgrade: bool,
+        /// Report what would change and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// The schema `zirv ctx config migrate` brings `~/.zirv/ctx.toml` to.
+///
+/// 1 is every operator config written before issue #491 -- no `[runtime]`
+/// table, so `runtime::resolve` answers `harness` for everything. 2 adds the
+/// `[runtime]` table that lets an unflagged session run natively.
+///
+/// The marker lives in a SIDECAR file, never in `ctx.toml` itself, and that
+/// is deliberate: `CtxConfig` is `deny_unknown_fields`, so a `schema` key
+/// inside `ctx.toml` would make an older zirv binary reject the operator's
+/// whole configuration instead of merely ignoring a key it has not heard of.
+/// The downgrade path exists for the same reason -- an older binary still
+/// cannot read a `[runtime]` table, so stepping back restores the document
+/// that predates it rather than editing around it.
+pub const CTX_SCHEMA: u32 = 2;
+
+fn migration_path(ctx_toml: &std::path::Path) -> std::path::PathBuf {
+    ctx_toml.with_file_name("ctx.migration.toml")
+}
+
+fn backup_path(ctx_toml: &std::path::Path) -> std::path::PathBuf {
+    ctx_toml.with_file_name(format!("ctx.toml.pre-schema-{CTX_SCHEMA}.bak"))
+}
+
+/// The schema recorded for this machine. An absent or unreadable sidecar is
+/// schema 1 -- the state every machine was in before N22.
+fn recorded_schema(ctx_toml: &std::path::Path) -> u32 {
+    std::fs::read_to_string(migration_path(ctx_toml))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| doc.get("schema").and_then(Item::as_integer))
+        .and_then(|schema| u32::try_from(schema).ok())
+        .unwrap_or(1)
+}
+
+/// Pure: the schema-2 document for `text`, or `None` when it already is one.
+/// Comment-preserving, like every other edit in this module.
+pub fn migrate_document(text: &str, to: &str) -> CtxResult<Option<String>> {
+    if to.eq_ignore_ascii_case("native") {
+        super::runtime::require_native_available()?;
+    }
+    if !matches!(to, "harness" | "native") {
+        return Err(format!("--to '{to}': expected `harness` or `native`").into());
+    }
+    let mut doc: DocumentMut = text.parse()?;
+    if doc
+        .get("runtime")
+        .and_then(|runtime| runtime.get("default"))
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let target = slot(doc.as_item_mut(), &key_parts("runtime.default")?)?;
+    *target = Item::Value(Value::from(to));
+    Ok(Some(doc.to_string()))
+}
+
+/// Pure: `text` with the whole `[runtime]` table removed, or `None` when it
+/// has none. The no-backup downgrade path; the backup path restores bytes.
+pub fn strip_runtime_table(text: &str) -> CtxResult<Option<String>> {
+    let mut doc: DocumentMut = text.parse()?;
+    if doc.get("runtime").is_none() {
+        return Ok(None);
+    }
+    doc.remove("runtime");
+    Ok(Some(doc.to_string()))
+}
+
+fn migrate(
+    path: &std::path::Path,
+    to: &str,
+    downgrade: bool,
+    dry_run: bool,
+    w: &mut dyn Write,
+) -> CtxResult<i32> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let backup = backup_path(path);
+    let marker = migration_path(path);
+    if downgrade {
+        if recorded_schema(path) <= 1 && strip_runtime_table(&text)?.is_none() {
+            writeln!(w, "already at schema 1 (unchanged)")?;
+            return Ok(0);
+        }
+        let restored = match std::fs::read_to_string(&backup) {
+            Ok(restored) => restored,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                strip_runtime_table(&text)?.unwrap_or_else(|| text.clone())
+            }
+            Err(e) => return Err(e.into()),
+        };
+        config::validate_operator_document(&restored)
+            .map_err(|e| format!("refusing to downgrade {}: {e}", path.display()))?;
+        if dry_run {
+            writeln!(w, "would restore schema 1 into {}", path.display())?;
+            return Ok(0);
+        }
+        state::write_private(path, &restored)?;
+        // Both markers go, so a later `migrate` starts clean rather than
+        // restoring a backup that no longer matches anything.
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(&marker);
+        writeln!(
+            w,
+            "restored schema 1 into {} (native journals, native.toml and session state untouched)",
+            path.display()
+        )?;
+        return Ok(0);
+    }
+    let Some(updated) = migrate_document(&text, to)? else {
+        writeln!(w, "already at schema {CTX_SCHEMA} (unchanged)")?;
+        return Ok(0);
+    };
+    if recorded_schema(path) >= CTX_SCHEMA {
+        // The marker says migrated but the table is gone: the operator
+        // removed it by hand, which is a legitimate way to switch back.
+        writeln!(w, "already at schema {CTX_SCHEMA} (unchanged)")?;
+        return Ok(0);
+    }
+    config::validate_operator_document(&updated)
+        .map_err(|e| format!("refusing to migrate {}: {e}", path.display()))?;
+    if dry_run {
+        writeln!(
+            w,
+            "would migrate {} to schema {CTX_SCHEMA} (runtime.default = {to})",
+            path.display()
+        )?;
+        return Ok(0);
+    }
+    if let Some(parent) = path.parent() {
+        state::create_private_dir_all(parent)?;
+    }
+    state::write_private(&backup, &text)?;
+    state::write_private(path, &updated)?;
+    state::write_private(
+        &marker,
+        &format!("schema = {CTX_SCHEMA}\nbackup = {:?}\n", backup.display()),
+    )?;
+    writeln!(
+        w,
+        "migrated {} to schema {CTX_SCHEMA} (runtime.default = {to}); backup at {}\n\
+         downgrade with `zirv ctx config migrate --downgrade`",
+        path.display(),
+        backup.display()
+    )?;
+    Ok(0)
 }
 
 fn key_parts(key: &str) -> CtxResult<Vec<toml_edit::Key>> {
@@ -54,8 +219,26 @@ fn semantic_value(value: &Value) -> CtxResult<toml::Value> {
     Ok(table["value"].clone())
 }
 
+fn contains_native_runtime(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(value) => value.eq_ignore_ascii_case("native"),
+        toml::Value::Table(table) => table.values().any(contains_native_runtime),
+        toml::Value::Array(values) => values.iter().any(contains_native_runtime),
+        _ => false,
+    }
+}
+
 fn edit(doc: &mut DocumentMut, key: &str, raw: &str, append: bool) -> CtxResult<bool> {
     let mut value = raw.parse::<Value>().unwrap_or_else(|_| Value::from(raw));
+    if key_parts(key)?
+        .first()
+        .is_some_and(|part| part.get() == "runtime")
+    {
+        let parsed = semantic_value(&value)?;
+        if contains_native_runtime(&parsed) {
+            super::runtime::require_native_available()?;
+        }
+    }
     let target = slot(doc.as_item_mut(), &key_parts(key)?)?;
     if append {
         if target.is_none() {
@@ -105,6 +288,14 @@ fn edit(doc: &mut DocumentMut, key: &str, raw: &str, append: bool) -> CtxResult<
 
 pub fn run(args: &ConfigArgs, w: &mut dyn Write) -> CtxResult<i32> {
     let path = config::operator_path()?;
+    if let ConfigCommand::Migrate {
+        to,
+        downgrade,
+        dry_run,
+    } = &args.command
+    {
+        return migrate(&path, to, *downgrade, *dry_run, w);
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -128,6 +319,8 @@ pub fn run(args: &ConfigArgs, w: &mut dyn Write) -> CtxResult<i32> {
         }
         ConfigCommand::Set { key, value } => (key, value, false),
         ConfigCommand::Add { key, value } => (key, value, true),
+        // Handled above, before the document is even read.
+        ConfigCommand::Migrate { .. } => unreachable!(),
     };
     let mut doc: DocumentMut = text.parse()?;
     let changed = edit(&mut doc, key, value, append)?;
@@ -169,6 +362,97 @@ mod tests {
             key: key.into(),
             value: value.into(),
         }
+    }
+
+    fn migrate_cmd(downgrade: bool) -> ConfigCommand {
+        ConfigCommand::Migrate {
+            to: "native".into(),
+            downgrade,
+            dry_run: false,
+        }
+    }
+
+    /// Issue #491: running the migration twice must be a no-op the second
+    /// time -- same bytes in `ctx.toml`, same backup, and a message that says
+    /// so rather than a second backup that has silently overwritten the
+    /// operator's real pre-migration document with the migrated one.
+    #[test]
+    fn migrating_twice_leaves_the_second_run_with_nothing_to_do() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let path = config::operator_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A comment, so the comment-preserving promise is under test too.
+        std::fs::write(&path, "# my notes\n[score]\nwindow = 3\n").unwrap();
+
+        let first = invoke(migrate_cmd(false)).unwrap();
+        assert!(first.contains("schema 2"), "{first}");
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("# my notes"), "{migrated}");
+        assert!(migrated.contains("default = \"native\""), "{migrated}");
+        let backup = super::backup_path(&path);
+        let backed_up = std::fs::read_to_string(&backup).unwrap();
+        assert_eq!(backed_up, "# my notes\n[score]\nwindow = 3\n");
+
+        let second = invoke(migrate_cmd(false)).unwrap();
+        assert!(second.contains("unchanged"), "{second}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), backed_up);
+    }
+
+    /// The rollback half of the same promise: the document that predates the
+    /// migration comes back byte for byte, and native state on disk is not
+    /// part of the transaction at all.
+    #[test]
+    fn a_downgrade_restores_the_pre_migration_document_and_touches_no_native_state() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let path = config::operator_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# my notes\n[score]\nwindow = 3\n";
+        std::fs::write(&path, original).unwrap();
+        // Native state that must survive a round trip in either direction:
+        // the provider config, and a journal naming the harness conversation
+        // a native session took over from.
+        let native = path.with_file_name("native.toml");
+        std::fs::write(&native, "schema=1\n").unwrap();
+        let journal = path.with_file_name("journal.jsonl");
+        std::fs::write(&journal, "{\"harness_session\":\"abc-123\"}\n").unwrap();
+
+        invoke(migrate_cmd(false)).unwrap();
+        let back = invoke(migrate_cmd(true)).unwrap();
+        assert!(back.contains("schema 1"), "{back}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&native).unwrap(), "schema=1\n");
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            "{\"harness_session\":\"abc-123\"}\n"
+        );
+        // Idempotent downwards too.
+        let again = invoke(migrate_cmd(true)).unwrap();
+        assert!(again.contains("unchanged"), "{again}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// With no backup to restore -- an operator who hand-edited the table in
+    /// -- the downgrade still has to leave a document an older binary can
+    /// parse, which means the whole `[runtime]` table goes.
+    #[test]
+    fn a_downgrade_without_a_backup_removes_the_runtime_table() {
+        let stripped =
+            strip_runtime_table("[score]\nwindow = 3\n\n[runtime]\ndefault = \"native\"\n")
+                .unwrap()
+                .expect("a runtime table to remove");
+        assert!(!stripped.contains("runtime"), "{stripped}");
+        let table: toml::Table = toml::from_str(&stripped).unwrap();
+        assert_eq!(table["score"]["window"].as_integer(), Some(3));
+        assert_eq!(strip_runtime_table("[score]\nwindow = 3\n").unwrap(), None);
+    }
+
+    #[test]
+    fn an_unknown_migration_target_is_refused_before_anything_is_written() {
+        let error = migrate_document("", "natve").unwrap_err().to_string();
+        assert!(error.contains("expected `harness` or `native`"), "{error}");
     }
 
     #[test]

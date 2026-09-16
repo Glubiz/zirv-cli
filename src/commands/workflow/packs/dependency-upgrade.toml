@@ -1,0 +1,89 @@
+# Built-in workflow pack: dependency-upgrade (issue #542 chunk 4).
+schema_version = 1
+id = "dependency-upgrade"
+version = 1
+title = "Dependency upgrade"
+description = "Upgrade a dependency with proportional intent capture, implementation, test and review."
+domains = ["software"]
+triggers = ["upgrade dependency", "bump dependency", "update package", "dependency upgrade", "bump version"]
+effects = "repository"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change"
+kind = "patch"
+
+[[steps]]
+id = "scope"
+title = "Scope the upgrade"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = { complexity-or-risk = { complexity = "bounded", risk = "medium" } }
+effect = "repository"
+reason = "a major-version bump gets an explicit note of the breaking changes it may carry; a patch bump does not need one"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+phase = "implement"
+skills = ["implement"]
+agent_role = "implementer"
+depends_on = ["scope"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "test"
+title = "Test"
+phase = "test"
+skills = ["testing"]
+depends_on = ["implement"]
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["test"]
+condition = { risk-at-least = "medium" }
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["review"]
+condition = "always"
+
+[[steps]]
+id = "deploy"
+title = "Finish branch"
+phase = "deploy"
+skills = ["finish-branch"]
+depends_on = ["verify"]
+condition = "always"
+effect = "repository"
+
+[gates]
+approval = ["scope"]
+validation = ["test", "verify"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change"]
+present_as = "patch"

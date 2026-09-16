@@ -1,0 +1,108 @@
+# Built-in workflow pack: schema-data-migration (issue #542 chunk 5). A
+# schema or data migration is never proportionally skipped -- intent and the
+# migration plan are always explicit approval gates, and shipping is always
+# an explicit approval, regardless of the operator's default deploy tier.
+schema_version = 1
+id = "schema-data-migration"
+version = 1
+title = "Schema/data migration"
+description = "Plan, implement, test and review a schema or data migration with an always-explicit plan and deploy approval."
+domains = ["software"]
+triggers = ["schema migration", "data migration", "migrate the schema", "database migration", "migrate the data"]
+effects = "repository"
+idempotency = "the migration itself must be safe to re-run against partially-migrated data; verify/deploy re-check the final tree and data state instead of blindly replaying prior edits"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change"
+kind = "patch"
+
+[[steps]]
+id = "intent"
+title = "Capture intent"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = "always"
+effect = "repository"
+reason = "a schema/data migration always gets an explicit record of the change and its rollback plan -- never proportionally skipped"
+
+[[steps]]
+id = "migration-plan"
+title = "Migration plan"
+phase = "plan"
+skills = ["write-plan"]
+artifact = "plan"
+approval = true
+depends_on = ["intent"]
+condition = "always"
+effect = "repository"
+reason = "a migration plan is always reviewed before implementation -- irreversible data loss is not proportional to complexity alone"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+phase = "implement"
+skills = ["implement"]
+agent_role = "implementer"
+depends_on = ["migration-plan"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "test"
+title = "Test"
+phase = "test"
+skills = ["testing"]
+depends_on = ["implement"]
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["test"]
+condition = "always"
+reason = "a schema/data migration always gets an independent review, never proportionally skipped"
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["review"]
+condition = "always"
+
+[[steps]]
+id = "deploy"
+title = "Finish branch"
+phase = "deploy"
+skills = ["finish-branch"]
+depends_on = ["verify"]
+approval = true
+condition = "always"
+effect = "repository"
+reason = "shipping a data migration is always an explicit approval"
+
+[gates]
+approval = ["intent", "migration-plan", "deploy"]
+validation = ["test", "verify"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change"]
+present_as = "patch"

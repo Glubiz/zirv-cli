@@ -248,6 +248,80 @@ pub struct AgentArgs {
     /// unchanged; this only changes what reaches stdout.
     #[arg(long)]
     pub json: bool,
+    /// Issue #479 (roadmap N10): which runtime drives this WORKER's own
+    /// conversation -- `harness` (the default: zirv supervises an external
+    /// coding-agent process, byte for byte today's behaviour) or `native`
+    /// (zirv conducts the model/tool conversation itself over a direct
+    /// provider route, with no coding harness installed at all). Same flag
+    /// shape and same two values as `zirv ctx exec --runtime`, and equally
+    /// explicit: native is never selected by detection.
+    ///
+    /// `--runtime native` re-reads the positional `<name>` as the native
+    /// ROUTE to spend rather than a harness to launch -- a native worker has
+    /// no harness to name -- with the reserved value `native` meaning "the
+    /// `[roles]` entry for `--role`". [`AgentArgs::route`] overrides it.
+    /// Everything else about the delegation is unchanged: the same task
+    /// claim, worktree allocation, writer permit, envelope narrowing, token
+    /// reservation, result contract, receipt and report-back mail.
+    ///
+    /// The default, `configured` (issue #491), means "whatever `[runtime]` in
+    /// `~/.zirv/ctx.toml` says for this `--role`, harness when it says
+    /// nothing"; `zirv ctx agent::run` resolves it to one of the two literal
+    /// values before anything else in this module sees it.
+    #[arg(long, default_value = super::runtime::CONFIGURED)]
+    pub runtime: String,
+    /// Native runtime only: which `[route]` from the operator's own native
+    /// provider configuration this worker spends, overriding the positional
+    /// `<name>`. Mirrors `zirv ctx exec --route`.
+    #[arg(long)]
+    pub route: Option<String>,
+    /// Internal conversation identity selected by the delegation service.
+    #[arg(skip)]
+    pub session_id: Option<String>,
+    /// Internal cancellation shared with the delegation service.
+    #[arg(skip)]
+    pub cancellation: Option<std::sync::Arc<super::provider::adapter::CancellationFlag>>,
+}
+
+/// The same defaults clap itself applies, so the many call sites that build
+/// an `AgentArgs` in code (the workflow engine's auto-spawn, the review
+/// launcher, tests) keep getting the harness runtime without restating it --
+/// and a field added here later cannot silently become `""` at those sites.
+impl Default for AgentArgs {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            prompt: String::new(),
+            flags: Vec::new(),
+            system_prompt: None,
+            max_restarts: None,
+            timeout_secs: None,
+            quiet: false,
+            role: None,
+            group: None,
+            scope: None,
+            budget_tokens: None,
+            max_tool_calls: None,
+            force: false,
+            workdir: None,
+            mode: WorkerMode::Writing,
+            worktree: false,
+            attach_artifact: None,
+            workflow: None,
+            task_class: None,
+            result_schema: None,
+            result_kind: None,
+            path_scope: Vec::new(),
+            no_network: false,
+            depth: None,
+            task: None,
+            json: false,
+            runtime: super::runtime::RuntimeKind::Harness.to_string(),
+            route: None,
+            session_id: None,
+            cancellation: None,
+        }
+    }
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -333,6 +407,18 @@ pub enum DelegationState {
 pub struct DelegationReceipt {
     pub schema_version: u32,
     pub harness: String,
+    /// Issue #479 (roadmap N10): which backend actually drove this worker's
+    /// conversation -- `harness` or `native`. Additive: a pre-#479 consumer
+    /// that ignores the field reads exactly what it read before, and one that
+    /// reads it never has to infer the backend from `harness`, which names a
+    /// route rather than an adapter for a native worker.
+    pub runtime: &'static str,
+    /// Issue #479: the STABLE delegation handle every follow-up, status,
+    /// result and cancel is addressed to -- independent of the worker's
+    /// provider conversation id, which a resume changes. `None` for the two
+    /// pre-launch receipts, where no delegation record exists yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub mode: DelegationMode,
@@ -358,10 +444,27 @@ pub struct DelegationReceipt {
     pub note: String,
 }
 
+/// Issue #479: the label a receipt carries for the backend this delegation
+/// asked for. An unrecognised `--runtime` never reaches a receipt (it is
+/// refused before any work starts, see [`resolve_runtime`]), so mapping an
+/// unparseable value onto `harness` here is only ever describing the default.
+pub(crate) fn runtime_label(args: &AgentArgs) -> &'static str {
+    resolve_runtime(args)
+        .unwrap_or(super::runtime::RuntimeKind::Harness)
+        .as_str()
+}
+
+/// The one place `--runtime` is turned into a decision. An unknown value is a
+/// hard error, never a silent fall back to the harness -- exactly the rule
+/// `exec::run_with` already applies to its own identical flag.
+pub(crate) fn resolve_runtime(args: &AgentArgs) -> CtxResult<super::runtime::RuntimeKind> {
+    super::runtime::selected(&args.runtime)
+}
+
 /// One sentence of orchestrator guidance derived purely from `state` --
 /// short and factual, never repeating fields the receipt already carries
 /// structurally.
-fn receipt_note(state: DelegationState) -> String {
+pub(crate) fn receipt_note(state: DelegationState) -> String {
     match state {
         DelegationState::Launched => {
             "nothing has run yet; the worker's report arrives as mail -- run `zirv ctx inbox` \
@@ -398,7 +501,7 @@ pub(crate) fn capability_warning_lines(warnings: &[policy::CapabilityWarning]) -
 
 /// Prints exactly one pretty JSON object -- `receipt` -- to `w`, the sole
 /// stdout output a `--json` delegation ever produces.
-fn print_receipt<W: Write>(w: &mut W, receipt: &DelegationReceipt) -> CtxResult<()> {
+pub(crate) fn print_receipt<W: Write>(w: &mut W, receipt: &DelegationReceipt) -> CtxResult<()> {
     let json = serde_json::to_string_pretty(receipt)?;
     writeln!(w, "{json}")?;
     Ok(())
@@ -429,6 +532,8 @@ fn launch_failure_receipt(
     DelegationReceipt {
         schema_version: 1,
         harness: args.name.clone(),
+        runtime: runtime_label(args),
+        delegation: None,
         model: model.map(str::to_string),
         mode: DelegationMode::Inline,
         state: DelegationState::LaunchFailed,
@@ -468,6 +573,8 @@ fn dashboard_answer_receipt(
     DelegationReceipt {
         schema_version: 1,
         harness: args.name.clone(),
+        runtime: runtime_label(args),
+        delegation: None,
         model: model.map(str::to_string),
         mode: DelegationMode::DashboardPane,
         state,
@@ -900,7 +1007,7 @@ impl Drop for WorktreeReclaimGuard<'_> {
 /// and canonicalised by [`validate_workdir`]), else `repo` (today's
 /// behaviour, byte for byte unchanged). Pure so the "workdir wins when
 /// given" invariant is directly testable without spawning anything.
-fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
+pub(crate) fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
     workdir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.to_path_buf())
@@ -1611,7 +1718,7 @@ pub const PRINCIPAL_ENV: &str = "ZIRV_PRINCIPAL";
 /// outright, `None` included, so a stray inherited [`ENVELOPE_ENV`]/
 /// [`PRINCIPAL_ENV`] from further up this process's own delegation chain can
 /// never leak into a worker whose own envelope was computed fresh here.
-fn envelope_env<'a>(
+pub(crate) fn envelope_env<'a>(
     env: EnvLookup<'a>,
     envelope_json: Option<String>,
     principal: Option<String>,
@@ -1667,7 +1774,7 @@ pub(crate) fn root_envelope(cfg: &CtxConfig) -> envelope::WorkerEnvelope {
 /// treated as unbounded by omission. A PRESENT but malformed value is
 /// refused outright rather than treated as absent: a corrupted envelope
 /// must never silently upgrade a bounded child into an unbounded root.
-fn resolve_parent_envelope(
+pub(crate) fn resolve_parent_envelope(
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
 ) -> Result<envelope::WorkerEnvelope, String> {
@@ -1694,7 +1801,7 @@ fn resolve_parent_envelope(
 /// own `network`/`destructive` forward UNCHANGED (never re-requests `true`),
 /// so an ordinary `--mode writing` delegation under an already-restricted
 /// parent never spuriously hits `CannotGrow` merely by existing.
-fn requested_envelope_from_args(
+pub(crate) fn requested_envelope_from_args(
     args: &AgentArgs,
     parent: &envelope::WorkerEnvelope,
     principal: String,
@@ -1797,7 +1904,7 @@ pub(crate) fn automatic_route_message(route: &super::fallback::Route, seat: pace
 /// `run_with` carries it forward to release it via `group::rollback_
 /// admission` on a spawn that never happens, or settle it via `group::
 /// settle_reservation` once the delegation actually completes.
-fn resolve_worker_budget(
+pub(crate) fn resolve_worker_budget(
     env: EnvLookup<'_>,
     args: &AgentArgs,
 ) -> CtxResult<(WorkerBudget, Option<u64>)> {
@@ -2158,7 +2265,7 @@ fn attach_artifact_to_prompt(
 /// returns). `Err` when `--task` names a card this repository has no record
 /// of: a worker sent off with no idea what its own card actually asked for
 /// would burn a whole run on a typo.
-fn attach_task_context_to_prompt(
+pub(crate) fn attach_task_context_to_prompt(
     args: &AgentArgs,
     state: &super::state::StateDir,
     repo: &Path,
@@ -2230,7 +2337,7 @@ fn claim_task_for_delegation(
 /// its verdict, so a crash or an unvalidated report-back returns the card to
 /// `Ready` for a fresh delegation to pick up, or auto-blocks it once the
 /// retry ceiling is reached -- NEVER a silent `Done`.
-fn finish_task_card(
+pub(crate) fn finish_task_card(
     state: &super::state::StateDir,
     repo: &Path,
     args: &AgentArgs,
@@ -2502,7 +2609,7 @@ pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
 /// every other worktree helper in this module (`allocate_worktree`,
 /// `reclaim_worktree`): git missing, `repo` not a work tree, or an
 /// unparseable/uncanonicalizable path all degrade to an empty list, never a
-/// wrong hint. Unlike main's own `adapters::claude::linked_worktree_args`
+/// wrong hint. Unlike main's own `adapters::claude::current_worktree_grant_paths`
 /// (which this deliberately does not depend on -- that helper is `#[cfg(not
 /// (test))]`, so `workdir_visibility_hint`'s own tests could never exercise
 /// it), this always runs, the same as every other git shellout in this file.
@@ -2808,9 +2915,10 @@ fn try_join_dashboard<W: Write>(
         .unwrap_or_else(envelope::WorkerEnvelope::locked);
     let parent_envelope = &parent_envelope;
     let inherited = env(spawnreq::DASH_REQUESTS_ENV).map(std::path::PathBuf::from);
-    let Some(dir) = live_join_target(inherited.as_deref(), env, repo) else {
+    let targets = live_join_targets(inherited.as_deref(), env, repo);
+    if targets.is_empty() {
         return Dispatch::Inline { no_dashboard: true };
-    };
+    }
     // A model pin is the one trailing flag a pane can carry across the
     // untrusted request channel -- it travels in `SpawnRequest::model` and
     // the pane re-checks it before building its own argv (`dash::mod::
@@ -2929,85 +3037,107 @@ fn try_join_dashboard<W: Write>(
             .filter(|text| !text.is_empty())
             .map(str::to_string),
     };
-    let path = match spawnreq::write_request(&dir, &req) {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!(
-                "zirv ctx agent: could not write a spawn request into {}: {e}; running inline in \
-                 this terminal",
-                dir.display()
-            );
-            return Dispatch::Inline {
-                no_dashboard: false,
-            };
-        }
-    };
-    let Some(stem) = spawnreq::request_stem(&path) else {
-        eprintln!(
-            "zirv ctx agent: could not derive a request stem from {}; running inline in this \
-             terminal",
-            path.display()
-        );
-        return Dispatch::Inline {
-            no_dashboard: false,
-        };
-    };
     // Issue #307.3: computed once, here, and threaded through both this
     // ack and `wait_out_a_claimed_request`'s own -- a nudge for THIS
     // session's own visibility into `--workdir`, not the worker's.
     let workdir_hint = workdir_visibility_hint(args.workdir.as_deref(), repo, env);
-    let inline = Dispatch::Inline {
-        no_dashboard: false,
-    };
-    match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
-        Some(ack) => match answer_for_ack(ack, w, workdir_hint.as_deref()) {
-            Some((result, facts)) => Dispatch::Answered(result, facts),
-            None => inline,
-        },
-        // F10: `take_requests` takes the request the moment the dashboard
-        // picks it up, so a timeout here is ambiguous -- nobody was listening,
-        // or somebody took it and is still spawning. Both ends acting on that
-        // ambiguity is how one `zirv ctx agent` became two live sessions
-        // working the same prompt.
-        //
-        // F2: the **removal is the decision**, not a check followed by one.
-        // This used to ask `is_claimed` and then remove the request, which is
-        // check-then-act against a dashboard doing exactly one thing: renaming
-        // this very file into its claim (`spawnreq::take_requests`). A claim
-        // landing between the check and the remove sent this side headless
-        // while the dashboard was already spawning the same prompt. Removing
-        // first collapses the two into one atomic operation that only one side
-        // can win:
-        //
-        // * `Ok` -- this process took its own request back off disk before
-        //   anybody claimed it, and a dashboard's later rename now finds
-        //   nothing, so the headless fallback cannot double-run it;
-        // * `Err`, for any reason -- the file is no longer where this process
-        //   left it (or cannot be removed), and the thing that moves it is a
-        //   claim. Waiting the claim out is the safe reading: the worst case
-        //   is an honest "claimed but never confirmed" failure for a request
-        //   whose directory vanished with a quitting dashboard, against a
-        //   double-run of the operator's task if this guessed the other way.
-        None => {
-            if std::fs::remove_file(&path).is_ok() {
+    // Issue #620/#627: one attempt PER live candidate. A `retryable` refusal
+    // (a foreign-repo dashboard, an unprovable parent claim, a pty that would
+    // not open) is the channel declining to carry this request, not a
+    // judgement on the task -- so the next live dashboard gets it before the
+    // delegation gives up and runs inline. Every other outcome keeps its
+    // existing single-attempt semantics.
+    let last = targets.len().saturating_sub(1);
+    for (index, dir) in targets.iter().enumerate() {
+        let dir = dir.as_path();
+        let path = match spawnreq::write_request(dir, &req) {
+            Ok(path) => path,
+            Err(e) => {
                 eprintln!(
-                    "zirv ctx agent: dashboard did not answer within {ack_timeout:?} (request \
-                     was {}); running inline in this terminal",
-                    path.display()
+                    "zirv ctx agent: could not write a spawn request into {}: {e}; running inline \
+                     in this terminal",
+                    dir.display()
                 );
-                return inline;
+                return Dispatch::Inline {
+                    no_dashboard: false,
+                };
             }
-            match wait_out_a_claimed_request(
-                &dir,
-                &stem,
-                claim_extension,
-                w,
-                workdir_hint.as_deref(),
-            ) {
+        };
+        let Some(stem) = spawnreq::request_stem(&path) else {
+            eprintln!(
+                "zirv ctx agent: could not derive a request stem from {}; running inline in this \
+                 terminal",
+                path.display()
+            );
+            return Dispatch::Inline {
+                no_dashboard: false,
+            };
+        };
+        let inline = Dispatch::Inline {
+            no_dashboard: false,
+        };
+        return match spawnreq::wait_for_ack(dir, &stem, ack_timeout) {
+            Some(ack) => match answer_for_ack(ack, w, workdir_hint.as_deref()) {
                 Some((result, facts)) => Dispatch::Answered(result, facts),
-                None => inline,
+                None => {
+                    if index < last {
+                        eprintln!(
+                            "zirv ctx agent: trying the next live dashboard ({})",
+                            targets[index + 1].display()
+                        );
+                        continue;
+                    }
+                    inline
+                }
+            },
+            // F10: `take_requests` takes the request the moment the dashboard
+            // picks it up, so a timeout here is ambiguous -- nobody was listening,
+            // or somebody took it and is still spawning. Both ends acting on that
+            // ambiguity is how one `zirv ctx agent` became two live sessions
+            // working the same prompt.
+            //
+            // F2: the **removal is the decision**, not a check followed by one.
+            // This used to ask `is_claimed` and then remove the request, which is
+            // check-then-act against a dashboard doing exactly one thing: renaming
+            // this very file into its claim (`spawnreq::take_requests`). A claim
+            // landing between the check and the remove sent this side headless
+            // while the dashboard was already spawning the same prompt. Removing
+            // first collapses the two into one atomic operation that only one side
+            // can win:
+            //
+            // * `Ok` -- this process took its own request back off disk before
+            //   anybody claimed it, and a dashboard's later rename now finds
+            //   nothing, so the headless fallback cannot double-run it;
+            // * `Err`, for any reason -- the file is no longer where this process
+            //   left it (or cannot be removed), and the thing that moves it is a
+            //   claim. Waiting the claim out is the safe reading: the worst case
+            //   is an honest "claimed but never confirmed" failure for a request
+            //   whose directory vanished with a quitting dashboard, against a
+            //   double-run of the operator's task if this guessed the other way.
+            None => {
+                if std::fs::remove_file(&path).is_ok() {
+                    eprintln!(
+                        "zirv ctx agent: dashboard did not answer within {ack_timeout:?} (request \
+                     was {}); running inline in this terminal",
+                        path.display()
+                    );
+                    return inline;
+                }
+                match wait_out_a_claimed_request(
+                    dir,
+                    &stem,
+                    claim_extension,
+                    w,
+                    workdir_hint.as_deref(),
+                ) {
+                    Some((result, facts)) => Dispatch::Answered(result, facts),
+                    None => inline,
+                }
             }
-        }
+        };
+    }
+    Dispatch::Inline {
+        no_dashboard: false,
     }
 }
 
@@ -3138,11 +3268,25 @@ fn candidate_hosts_repo(
 /// The dashboard sessions currently registered against `repo`, by short id.
 /// Best-effort: an unreadable registry simply yields no preference, and the
 /// caller falls back to the machine-wide selection rule.
+///
+/// Issue #620: `Verb::Chat` counts as well as `Verb::Dash`. A dashboard's
+/// token directory is named by the dashboard's own short id, which is the
+/// short id of the ORCHESTRATOR seat it hosts (`dash::run_dashboard`'s
+/// `dashboard_short`) -- and that seat's registry row is `Verb::Chat` from
+/// the moment `zirv ctx` restarts it with handoff and it re-registers. Keying
+/// this only on `Verb::Dash` therefore lost the live dashboard hosting the
+/// caller as soon as its seat was restarted, and a foreign-repo dashboard won
+/// the machine-wide rule in its place.
 fn dash_shorts_for_repo(state: &super::state::StateDir, repo: &Path) -> Vec<String> {
     let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     super::sessions::list(state)
         .into_iter()
-        .filter(|(record, _)| record.verb == super::sessions::Verb::Dash)
+        .filter(|(record, _)| {
+            matches!(
+                record.verb,
+                super::sessions::Verb::Dash | super::sessions::Verb::Chat
+            )
+        })
         .filter(|(record, _)| {
             let record_repo =
                 std::fs::canonicalize(&record.repo).unwrap_or_else(|_| record.repo.clone());
@@ -3159,11 +3303,72 @@ fn dash_shorts_for_repo(state: &super::state::StateDir, repo: &Path) -> Vec<Stri
 /// different repo is display-only and can never misroute the task's working
 /// directory -- see `dash::discover_live_dash_dirs`'s own doc comment -- so
 /// it stays the fallback rather than a refusal.
+#[cfg(test)]
 fn select_join_target<'a>(
     state: &super::state::StateDir,
     candidates: &'a [super::dash::DashCandidate],
     repo: &Path,
+    env: EnvLookup<'_>,
 ) -> Option<&'a super::dash::DashCandidate> {
+    join_targets_in_order(state, candidates, repo, env)
+        .into_iter()
+        .next()
+}
+
+/// The dashboard process THIS caller is hosted by, from the caller's own
+/// registry row: `Record::owner_pid` is the process that filed the record,
+/// which for a pane is the dashboard itself (`dash::pane::Pane::spawn` ->
+/// `sessions::SessionGuard::register`).
+///
+/// Issue #620: this is a stronger answer than either selection rule below,
+/// because it is not an inference about repositories at all -- it names the
+/// dashboard this delegation is literally running inside, whatever verb its
+/// row currently carries and whatever repo the registry thinks it holds. A
+/// caller with no session identity, no record, or no owner pid simply yields
+/// `None` and the ordinary rules decide.
+fn hosting_dash_pid(state: &super::state::StateDir, env: EnvLookup<'_>) -> Option<u32> {
+    let session = env(super::adapters::SESSION_ENV)?;
+    let short = super::sessions::short_id(&session);
+    if short.is_empty() {
+        return None;
+    }
+    super::sessions::list(state)
+        .into_iter()
+        .find(|(record, _)| record.short == short)
+        .and_then(|(record, _)| record.owner_pid)
+}
+
+/// Every live dashboard this delegation may join, best first.
+///
+/// Order: the dashboard hosting this caller ([`hosting_dash_pid`]), then a
+/// live dashboard whose own registry row names THIS repository, then
+/// `dash::select_live_dash_dir`'s machine-wide rule (most recently started
+/// first) over whatever is left. Joining a dashboard that hosts a different
+/// repo is display-only and can never misroute the task's working directory
+/// -- see `dash::discover_live_dash_dirs`'s own doc comment -- so it stays a
+/// lower-ranked candidate rather than a refusal.
+///
+/// Issue #620: a LIST rather than one winner, so a foreign-repo dashboard
+/// that refuses the request (a `retryable` ack) costs the delegation one
+/// round-trip and the next live candidate, instead of ending it inline while
+/// a perfectly willing dashboard sits one directory away.
+fn join_targets_in_order<'a>(
+    state: &super::state::StateDir,
+    candidates: &'a [super::dash::DashCandidate],
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Vec<&'a super::dash::DashCandidate> {
+    let is_live = |c: &super::dash::DashCandidate| {
+        matches!(c.status, super::dash::CandidateStatus::Live { .. })
+    };
+    let mut ordered: Vec<&'a super::dash::DashCandidate> = Vec::new();
+    if let Some(owner) = hosting_dash_pid(state, env)
+        && let Some(host) = candidates.iter().find(
+            |c| matches!(c.status, super::dash::CandidateStatus::Live { pid, .. } if pid == owner),
+        )
+    {
+        ordered.push(host);
+    }
     let shorts = dash_shorts_for_repo(state, repo);
     if !shorts.is_empty() {
         let own_repo: Vec<super::dash::DashCandidate> = candidates
@@ -3173,15 +3378,65 @@ fn select_join_target<'a>(
             .collect();
         if let Some(winner) = super::dash::select_live_dash_dir(&own_repo) {
             let chosen = winner.requests_dir.clone();
-            return candidates.iter().find(|c| c.requests_dir == chosen);
+            if let Some(candidate) = candidates.iter().find(|c| c.requests_dir == chosen)
+                && !ordered
+                    .iter()
+                    .any(|o| o.requests_dir == candidate.requests_dir)
+            {
+                ordered.push(candidate);
+            }
         }
     }
-    super::dash::select_live_dash_dir(candidates)
+    // Whatever is left, newest-started first -- the same ordering
+    // `select_live_dash_dir` applies, just walked rather than maximised.
+    let mut rest: Vec<&'a super::dash::DashCandidate> = candidates
+        .iter()
+        .filter(|c| is_live(c))
+        .filter(|c| !ordered.iter().any(|o| o.requests_dir == c.requests_dir))
+        .collect();
+    rest.sort_by(|a, b| match (a.status, b.status) {
+        (
+            super::dash::CandidateStatus::Live { started_at: sa, .. },
+            super::dash::CandidateStatus::Live { started_at: sb, .. },
+        ) => sb
+            .cmp(&sa)
+            .then_with(|| b.requests_dir.cmp(&a.requests_dir)),
+        _ => std::cmp::Ordering::Equal,
+    });
+    ordered.extend(rest);
+    ordered
 }
 
+#[cfg(test)]
 fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -> Option<PathBuf> {
+    live_join_targets(inherited, env, repo).into_iter().next()
+}
+
+/// [`live_join_target`]'s whole ordered candidate list -- see
+/// [`join_targets_in_order`] for why a refusal needs a next one.
+fn live_join_targets(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -> Vec<PathBuf> {
+    let inherited_live = matches!(
+        inherited.map(|dir| (dir, inherited_dashboard_liveness(dir))),
+        Some((_, Some(super::sessions::OwnerLiveness::Live)))
+    );
+    let mut targets = Vec::new();
+    if inherited_live && let Some(dir) = inherited {
+        targets.push(dir.to_path_buf());
+    }
+    targets.extend(live_join_fallbacks(inherited, env, repo, inherited_live));
+    targets
+}
+
+fn live_join_fallbacks(
+    inherited: Option<&Path>,
+    env: EnvLookup<'_>,
+    repo: &Path,
+    inherited_live: bool,
+) -> Vec<PathBuf> {
     match inherited.map(|dir| (dir, inherited_dashboard_liveness(dir))) {
-        Some((dir, Some(super::sessions::OwnerLiveness::Live))) => return Some(dir.to_path_buf()),
+        // Already the head of the list its caller built: nothing to explain,
+        // and the scan below still runs so a refusal has somewhere to go next.
+        Some((_, Some(super::sessions::OwnerLiveness::Live))) => {}
         Some((dir, Some(super::sessions::OwnerLiveness::Dead(pid)))) => {
             eprintln!(
                 "zirv ctx agent: {} names a dashboard that already quit (owner.pid names \
@@ -3217,7 +3472,7 @@ fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -
                 "zirv ctx agent: could not resolve the state dir to look for a live \
                  dashboard: {e}"
             );
-            return None;
+            return Vec::new();
         }
     };
     // The inherited directory may itself live under `state.dash()` and would
@@ -3234,7 +3489,8 @@ fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -
     // appear exactly once. See this function's own doc comment: "every
     // candidate ... is logged, live or not", which a silent `Live => {}` arm
     // here used to violate for every live sibling that lost the selection.
-    let winner = select_join_target(&state, &others, repo);
+    let ordered = join_targets_in_order(&state, &others, repo, env);
+    let winner = ordered.first().copied();
     for candidate in &others {
         let is_winner = winner.is_some_and(|w| w.requests_dir == candidate.requests_dir);
         match candidate.status {
@@ -3255,29 +3511,43 @@ fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -
     }
     match winner {
         Some(winner) => {
-            eprintln!(
-                "zirv ctx agent: joining {} instead",
-                winner.requests_dir.display()
-            );
-            Some(winner.requests_dir.clone())
+            // `instead` only when something was actually rejected above: a
+            // live inherited channel is the head of the list, not a
+            // replacement for one.
+            if inherited_live {
+                eprintln!(
+                    "zirv ctx agent: {} is also live and available if the first refuses",
+                    winner.requests_dir.display()
+                );
+            } else {
+                eprintln!(
+                    "zirv ctx agent: joining {} instead",
+                    winner.requests_dir.display()
+                );
+            }
         }
         None => {
-            let considered: Vec<String> = others
-                .iter()
-                .map(|c| c.requests_dir.display().to_string())
-                .collect();
-            eprintln!(
-                "zirv ctx agent: no live dashboard found under {} ({})",
-                state.dash().display(),
-                if considered.is_empty() {
-                    "no other candidates".to_string()
-                } else {
-                    format!("candidates: {}", considered.join(", "))
-                }
-            );
-            None
+            if !inherited_live {
+                let considered: Vec<String> = others
+                    .iter()
+                    .map(|c| c.requests_dir.display().to_string())
+                    .collect();
+                eprintln!(
+                    "zirv ctx agent: no live dashboard found under {} ({})",
+                    state.dash().display(),
+                    if considered.is_empty() {
+                        "no other candidates".to_string()
+                    } else {
+                        format!("candidates: {}", considered.join(", "))
+                    }
+                );
+            }
         }
     }
+    ordered
+        .into_iter()
+        .map(|candidate| candidate.requests_dir.clone())
+        .collect()
 }
 
 /// Issue #223 §E: `workflow.adoption = enforce`'s delegation gate. Refuses
@@ -3371,7 +3641,13 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
-    if let Some(message) = same_harness_refusal(args, env) {
+    // Issue #479 (roadmap N10): resolved first, and an unknown value is a
+    // hard error here rather than a silent fall back to the harness. Every
+    // check below that reads `args.name` as an ADAPTER name -- the
+    // same-harness refusal, `adapters::select`, cross-harness rerouting --
+    // is meaningless for a native worker, whose `<name>` is a provider route.
+    let native = resolve_runtime(args)? == super::runtime::RuntimeKind::Native;
+    if !native && let Some(message) = same_harness_refusal(args, env) {
         return Err(message.into());
     }
     // Issue #318: resolved up front, before anything else in this
@@ -3583,6 +3859,42 @@ pub fn run_with<W: Write>(
         }
         return Ok(2);
     }
+
+    // Issue #479 (roadmap N10): the runtime fork. Everything above this line
+    // -- `--workdir`/`--worktree` allocation, the prompt assembly, the
+    // delegation envelope, the task-card claim -- is shared by both
+    // runtimes and has already happened exactly once. Everything below it is
+    // harness-specific: adapter selection, cross-harness rerouting, the
+    // spawn gate and the dashboard pane fork all assume there is a vendor
+    // CLI to launch, and a native worker has none. `worktree_guard` is
+    // disarmed because the native fork owns the reclaim from here on (it
+    // runs the checkout itself and returns through this same call).
+    if native {
+        worktree_guard.disarm();
+        let launch_repo = effective_launch_repo(canonical_workdir.as_deref(), repo);
+        let code = super::native_worker::run(
+            super::native_worker::Request {
+                args,
+                prompt,
+                repo,
+                launch_repo,
+                state: &state,
+                cfg: &cfg,
+                parent_envelope: &parent_envelope,
+                result_schema: result_schema.as_ref(),
+                provider_override: None,
+            },
+            w,
+            env,
+        );
+        if args.worktree
+            && let Some(path) = canonical_workdir.as_deref()
+        {
+            reclaim_worktree_and_report(&state, repo, path);
+        }
+        return code;
+    }
+
     let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
     let live_inherited_dashboard = env(spawnreq::DASH_REQUESTS_ENV)
         .map(PathBuf::from)
@@ -4007,7 +4319,10 @@ pub fn run_with<W: Write>(
         adapters::LaunchMode::Headless,
     )
     .degraded_capabilities();
-    let worker_session = SessionId::new_v4().to_string();
+    let worker_session = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| SessionId::new_v4().to_string());
     // Issue #170: this delegation binds `args.group` (if any) to the child
     // about to run headlessly as its SubOrchestrator -- first-claim-wins, so
     // a group shared by an operator across several `--group` invocations is
@@ -4195,6 +4510,11 @@ pub fn run_with<W: Write>(
                 args.name
             ),
             &tree,
+            // Issue #488: a legacy worker launch is driven from a process
+            // whose only statement about a seat is its own environment, so
+            // the env-derived (supersession-only) fence is the honest answer
+            // here -- see `permit::SeatFence`.
+            None,
         ) {
             Ok(writer_permit) => Some(writer_permit),
             Err(refusal) => {
@@ -4290,6 +4610,8 @@ pub fn run_with<W: Write>(
         // harness-handover restart can move it to the new provider mid-run
         // -- see `ExecArgs::reservation_id`'s own doc comment.
         reservation_id: reservation_id.clone(),
+        cancellation: args.cancellation.clone(),
+        ..Default::default()
     };
 
     announcer.emit(&Event::DelegatedStart {
@@ -4794,11 +5116,13 @@ pub fn run_with<W: Write>(
         let receipt = DelegationReceipt {
             schema_version: 1,
             harness: args.name.clone(),
+            runtime: super::runtime::RuntimeKind::Harness.as_str(),
+            delegation: None,
             model,
             mode: DelegationMode::Inline,
             state: delegation_state,
             exit_code: Some(code),
-            session: Some(super::sessions::short_id(&worker_session)),
+            session: Some(worker_session.clone()),
             task: args.task.clone(),
             workdir: Some(launch_repo.clone()),
             result_path,
@@ -4889,7 +5213,22 @@ fn append_execution_segments(
 pub fn run<W: Write>(args: &AgentArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env)
+    // Issue #491: same seam as `exec::run` -- the operator's opt-in
+    // `[runtime]` default becomes an explicit backend here, at the CLI entry,
+    // so `run_with` and every receipt below it still see one of exactly two
+    // literal values. A `--role` this delegation names picks the row.
+    let choice = super::runtime::resolve_for_cli(
+        &args.runtime,
+        &repo,
+        &env,
+        args.role.as_deref().unwrap_or("worker"),
+    )?;
+    if let Some(note) = &choice.note {
+        eprintln!("zirv ctx agent: {note}");
+    }
+    let mut args = args.clone();
+    args.runtime = choice.kind.as_str().to_string();
+    run_with(&args, w, &repo, &env)
 }
 
 #[cfg(test)]
@@ -6955,6 +7294,8 @@ mod tests {
         let launched = DelegationReceipt {
             schema_version: 1,
             harness: "codex".to_string(),
+            runtime: "harness",
+            delegation: None,
             model: None,
             mode: DelegationMode::DashboardPane,
             state: DelegationState::Launched,
@@ -6989,6 +7330,8 @@ mod tests {
         let failed = DelegationReceipt {
             schema_version: 1,
             harness: "claude".to_string(),
+            runtime: "harness",
+            delegation: None,
             model: Some("sonnet".to_string()),
             mode: DelegationMode::Inline,
             state: DelegationState::ReportedContractFailed,
@@ -7254,7 +7597,41 @@ mod tests {
             depth: None,
             task: None,
             json: false,
+            runtime: super::super::runtime::RuntimeKind::Harness.to_string(),
+            route: None,
+            session_id: None,
+            cancellation: None,
         }
+    }
+
+    /// Issue #479, acceptance criterion (a) at the flag boundary: an
+    /// unchanged caller -- one that has never heard of `--runtime` -- is the
+    /// harness delegation, and an unrecognised value is refused rather than
+    /// quietly treated as one.
+    #[test]
+    fn an_absent_runtime_flag_is_the_harness_delegation_and_a_bad_one_is_refused() {
+        let unchanged = args_for("claude", "do the thing");
+        assert_eq!(
+            resolve_runtime(&unchanged).expect("default"),
+            super::super::runtime::RuntimeKind::Harness
+        );
+        assert_eq!(runtime_label(&unchanged), "harness");
+
+        let mut native = args_for("work-sonnet", "do the thing");
+        native.runtime = "native".to_string();
+        assert_eq!(
+            resolve_runtime(&native).expect("native"),
+            super::super::runtime::RuntimeKind::Native
+        );
+        assert_eq!(runtime_label(&native), "native");
+
+        let mut nonsense = args_for("claude", "do the thing");
+        nonsense.runtime = "magic".to_string();
+        let error = resolve_runtime(&nonsense).expect_err("unknown runtime");
+        assert!(
+            error.to_string().contains("expected `harness` or `native`"),
+            "{error}"
+        );
     }
 
     /// Whether `git` is on `PATH` at all in this test environment -- the
@@ -8188,7 +8565,7 @@ mod tests {
         // The SAME canonicalisation `run_with`'s own writer-permit check
         // applies to `launch_repo` (here, `repo` itself -- no `--workdir`).
         let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree, None)
             .expect("writer permit pre-held for the test");
 
         let args = args_for("claude", "go");
@@ -8228,7 +8605,7 @@ mod tests {
         let state = StateDir::from_root(state_path);
 
         let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree, None)
             .expect("writer permit pre-held for the test");
 
         let args = args_for("claude", "go");
@@ -8260,7 +8637,7 @@ mod tests {
         let state = StateDir::from_root(state_path);
 
         let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree, None)
             .expect("writer permit pre-held for the test");
 
         let mut args = args_for("claude", "go");
@@ -8324,7 +8701,7 @@ mod tests {
         let elsewhere = tmp.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).expect("mkdir");
         let elsewhere = std::fs::canonicalize(&elsewhere).expect("canonicalize");
-        let held = permit::acquire_writer(&state, 1, "worker-a", &elsewhere)
+        let held = permit::acquire_writer(&state, 1, "worker-a", &elsewhere, None)
             .expect("writer permit pre-held for the test");
 
         let mut args = args_for("claude", "go");
@@ -10694,6 +11071,104 @@ mod tests {
         );
     }
 
+    /// Issue #620, behaviour 1: the dashboard HOSTING this caller wins, even
+    /// when a more recently started dashboard for another repository would
+    /// win the machine-wide rule. `owner_pid` on the caller's own registry
+    /// row names it, and that answer survives the seat's row being re-created
+    /// by a restart with handoff.
+    #[test]
+    fn the_dashboard_hosting_this_caller_is_preferred_over_a_newer_foreign_one() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+
+        // The caller's own registry row, exactly as a dashboard-hosted seat
+        // re-registers it after a restart: verb `chat`, and `owner_pid` the
+        // dashboard's (this process, here).
+        let session = "e84d72bc-1111-4222-8333-444444444444";
+        let record = super::super::sessions::Record::new(
+            session,
+            "claude",
+            tmp.path(),
+            super::super::sessions::Verb::Chat,
+        );
+        let _guard = super::super::sessions::SessionGuard::register(&state, record);
+
+        let hosting = state.dash().join("aaaa1111-hosting").join("requests");
+        let foreign = state.dash().join("bbbb2222-foreign").join("requests");
+        let base = std::time::SystemTime::now();
+        let candidates = vec![
+            // Newer, so it wins `select_live_dash_dir` outright -- and it is
+            // the foreign-repo dashboard from the bug report.
+            super::super::dash::DashCandidate {
+                requests_dir: foreign.clone(),
+                status: super::super::dash::CandidateStatus::Live {
+                    started_at: base + std::time::Duration::from_secs(60),
+                    pid: crate::commands::ctx::testenv::dead_pid(),
+                },
+            },
+            super::super::dash::DashCandidate {
+                requests_dir: hosting.clone(),
+                status: super::super::dash::CandidateStatus::Live {
+                    started_at: base,
+                    pid: std::process::id(),
+                },
+            },
+        ];
+
+        let mut env = base_env(state.root());
+        env.insert(
+            super::super::adapters::SESSION_ENV.to_string(),
+            session.to_string(),
+        );
+        let chosen = select_join_target(&state, &candidates, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a live dashboard is selected");
+        assert_eq!(
+            chosen.requests_dir, hosting,
+            "the dashboard this seat is hosted by must win over a newer foreign one"
+        );
+
+        // With no session identity at all the machine-wide rule is unchanged.
+        let plain = base_env(state.root());
+        let chosen =
+            select_join_target(&state, &candidates, tmp.path(), &|k| plain.get(k).cloned())
+                .expect("a live dashboard is still selected");
+        assert_eq!(chosen.requests_dir, foreign);
+    }
+
+    /// Issue #620, behaviour 2: a dashboard-hosted seat re-registered as
+    /// `verb = chat` still makes its dashboard a repo match. The token
+    /// directory is named by the dashboard's short id, which IS that seat's
+    /// short id -- keying the repo preference on `Verb::Dash` alone lost the
+    /// live dashboard the moment the seat was restarted.
+    #[test]
+    fn a_restarted_hosted_seats_chat_record_still_names_its_dashboard_for_this_repo() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().join("state"));
+        let session = "e84d72bc-1111-4222-8333-444444444444";
+        let short = super::super::sessions::short_id(session);
+        let record = super::super::sessions::Record::new(
+            session,
+            "claude",
+            tmp.path(),
+            super::super::sessions::Verb::Chat,
+        );
+        let _guard = super::super::sessions::SessionGuard::register(&state, record);
+
+        let shorts = dash_shorts_for_repo(&state, tmp.path());
+        assert!(
+            shorts.contains(&short),
+            "the hosted seat's own row names its dashboard for this repo: {shorts:?}"
+        );
+        let candidate = super::super::dash::DashCandidate {
+            requests_dir: state
+                .dash()
+                .join(format!("{short}-0123456789abcdef"))
+                .join("requests"),
+            status: super::super::dash::CandidateStatus::NoOwnerPid,
+        };
+        assert!(candidate_hosts_repo(&candidate, &shorts));
+    }
+
     /// F2 (defense in depth): the request's prompt is encoded positionally
     /// into the pane's argv, so a prompt shaped like a flag would reach the
     /// real harness child as one. The dashboard refuses such a request at the
@@ -11161,6 +11636,72 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&out).contains("bbbb2222"),
             "got {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Issue #620, behaviour 3: a `retryable` refusal from the first live
+    /// dashboard (the foreign-repo one from the bug report) costs the
+    /// delegation one round-trip and the NEXT live candidate -- not the whole
+    /// delegation. Only after every live dashboard has declined does it run
+    /// inline.
+    #[test]
+    fn a_foreign_repo_refusal_tries_the_next_live_dashboard_before_running_inline() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // The inherited channel is live, and is tried first.
+        let (first, env) = live_dashboard_dir(tmp.path());
+        // A second live dashboard, under the state dir, never inherited.
+        let second = tmp
+            .path()
+            .join("state")
+            .join("dash")
+            .join("bbbb2222-secondtoken")
+            .join("requests");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+        std::fs::write(
+            second.parent().expect("parent").join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write owner.pid");
+
+        let refuser = std::thread::spawn({
+            let dir = first.clone();
+            move || {
+                respond_to_next_request(
+                    dir,
+                    r#"{"ok":false,"short":null,"reason":"this dashboard only spawns panes in its own repo","retryable":true}"#,
+                )
+            }
+        });
+        let accepter = std::thread::spawn({
+            let dir = second.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"feed5678","reason":null}"#)
+        });
+
+        let args = joinable_args("claude", "go");
+        let mut out = Vec::new();
+        let joined = try_join_dashboard(
+            &args,
+            &args.prompt,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            None,
+        );
+        refuser.join().expect("refuser thread");
+        accepter.join().expect("accepter thread");
+
+        let code = joined
+            .expect_answer("the second live dashboard took it")
+            .expect("writes its line");
+        assert_eq!(code, 0);
+        assert!(
+            String::from_utf8_lossy(&out).contains("feed5678"),
+            "the delegation must land in the next live dashboard, not inline: {}",
             String::from_utf8_lossy(&out)
         );
     }

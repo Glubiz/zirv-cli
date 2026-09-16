@@ -1,0 +1,11 @@
+{
+  "id": "req-report-status",
+  "idempotency_key": "report-1",
+  "method": "session.report_status",
+  "params": {
+    "generation": 1,
+    "session_id": "fake-1",
+    "state": "idle"
+  },
+  "v": 1
+}

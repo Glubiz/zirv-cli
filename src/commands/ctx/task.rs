@@ -986,6 +986,34 @@ pub struct SwarmArgs {
     pub group: Option<String>,
 }
 
+/// Mints one card and appends its `Created` event, returning the new id.
+///
+/// Split out of [`run_create`] for issue #485 (roadmap N16): a native
+/// coordinator's `task_create` tool mints a card for a repository it knows by
+/// path, not by the process's current directory, and both surfaces have to
+/// write the same event through the same append. `repo_slug` is therefore a
+/// parameter rather than resolved here.
+pub fn create_card(
+    state: &StateDir,
+    repo_slug: &str,
+    args: &CreateArgs,
+    now: u64,
+) -> CtxResult<String> {
+    let id = format!("task-{}", uuid::Uuid::new_v4());
+    let event = Event::Created {
+        id: id.clone(),
+        repo_slug: repo_slug.to_string(),
+        title: args.title.clone(),
+        brief: args.brief.clone(),
+        parents: args.parents.clone(),
+        group_id: args.group.clone(),
+        workdir: args.workdir.clone(),
+        at: now,
+    };
+    append_event(state, repo_slug, &event)?;
+    Ok(id)
+}
+
 pub fn run_create<W: Write>(
     state: &StateDir,
     w: &mut W,
@@ -994,18 +1022,7 @@ pub fn run_create<W: Write>(
 ) -> CtxResult<String> {
     super::seat::fence(state)?;
     let repo_slug = resolve_repo_slug()?;
-    let id = format!("task-{}", uuid::Uuid::new_v4());
-    let event = Event::Created {
-        id: id.clone(),
-        repo_slug: repo_slug.clone(),
-        title: args.title.clone(),
-        brief: args.brief.clone(),
-        parents: args.parents.clone(),
-        group_id: args.group.clone(),
-        workdir: args.workdir.clone(),
-        at: now,
-    };
-    append_event(state, &repo_slug, &event)?;
+    let id = create_card(state, &repo_slug, args, now)?;
     writeln!(w, "{id}")?;
     Ok(id)
 }

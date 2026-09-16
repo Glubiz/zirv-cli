@@ -1,0 +1,26 @@
+{
+  "shape": "anthropic",
+  "model": "fixture-anthropic-model",
+  "turns": [
+    {
+      "failure": {
+        "class": "transport",
+        "message": "connection reset before the first event",
+        "retryable": true
+      }
+    },
+    {
+      "failure": {
+        "class": "overloaded",
+        "message": "provider is overloaded",
+        "retryable": true
+      }
+    },
+    {
+      "message_id": "msg_recovered",
+      "blocks": [{ "type": "text", "text": "Recovered after two disconnects." }],
+      "finish_reason": "end_turn",
+      "usage": { "input_tokens": 20, "output_tokens": 7 }
+    }
+  ]
+}

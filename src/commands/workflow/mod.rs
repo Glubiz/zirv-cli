@@ -17,14 +17,19 @@ pub mod artifact;
 pub mod capability;
 pub mod checks;
 pub mod classify;
+pub mod definition;
 pub mod deploy;
 pub mod engine;
 pub mod frontend;
 pub mod frontend_detector;
 pub mod frontend_render;
 pub mod maintain;
+pub mod profile;
+pub mod registry;
 pub mod review;
+pub mod selection;
 pub mod skill;
+pub mod team;
 pub mod telemetry;
 pub mod verification;
 
@@ -82,6 +87,14 @@ pub(crate) struct RepoGates {
     pub checks: bool,
     pub skills: bool,
     pub agents: bool,
+    /// Operator-owned `[workflow] repo_workflows_enabled` (REPO_FORBIDDEN,
+    /// off by default, issue #542) -- whether untrusted repository-provided
+    /// `.zirv/workflows/` definition packs are loaded at all. Off by default,
+    /// same posture as `agents`: a checkout may propose a new pack only
+    /// after the operator explicitly enables this layer, and even then may
+    /// never replace a trusted built-in/operator id or widen authority --
+    /// see `registry::WorkflowRegistry`.
+    pub workflows: bool,
     /// Operator-owned `[workflow] check_env_passthrough` (REPO_FORBIDDEN,
     /// `~/.zirv/ctx.toml`/`ZIRV_CTX_*` only) -- extra environment variable
     /// names ADDED to `verification::DEFAULT_CHECK_ENV_PASSTHROUGH` when a
@@ -123,6 +136,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
             checks: cfg.workflow.repo_checks_enabled,
             skills: cfg.workflow.repo_skills_enabled,
             agents: cfg.workflow.repo_agents_enabled,
+            workflows: cfg.workflow.repo_workflows_enabled,
             check_env_passthrough: cfg.workflow.check_env_passthrough,
             allow_empty_verify: cfg.workflow.allow_empty_verify,
             builtin_checks_exclude: cfg.workflow.builtin_checks_exclude,
@@ -133,6 +147,7 @@ pub(crate) fn repo_gates(repo: &std::path::Path) -> RepoGates {
                 checks: false,
                 skills: false,
                 agents: false,
+                workflows: false,
                 check_env_passthrough: Vec::new(),
                 allow_empty_verify: false,
                 builtin_checks_exclude: Vec::new(),
@@ -238,8 +253,35 @@ pub fn dispatch(args: &[String]) -> i32 {
     match run(&cli, &mut std::io::stdout()) {
         Ok(code) => code,
         Err(err) => {
+            // Issue #542 review finding 17: `StartArgs`/`ShowArgs`'s
+            // positional was a closed `WorkflowKind` `ValueEnum` before
+            // #542 -- an unrecognized value failed AT CLAP PARSE TIME
+            // (exit 2, the `Err` branch above), before `run` ever ran. Now
+            // that it is a plain registry id string, clap always accepts
+            // it and the same "unknown workflow" condition only surfaces
+            // here, as an ordinary runtime error (which unconditionally
+            // exits 1) -- a user-facing behavior change the issue never
+            // asked for. Restore the old exit code for exactly this
+            // condition on exactly these two subcommands (the ones that
+            // used to be clap-validated); every other "unknown workflow"
+            // error (e.g. an unknown RUN id to `status`/`approve`) was
+            // already a plain string before #542 and keeps exiting 1,
+            // unchanged.
+            let is_registry_id_lookup = matches!(
+                &cli.command,
+                WorkflowCommand::Workflow(args)
+                    if matches!(
+                        args.command,
+                        engine::WorkflowSubcommand::Start(_) | engine::WorkflowSubcommand::Show(_)
+                    )
+            );
+            let text = err.to_string();
             crate::output::error(err);
-            1
+            if is_registry_id_lookup && text.starts_with("unknown workflow '") {
+                2
+            } else {
+                1
+            }
         }
     }
 }
@@ -273,6 +315,59 @@ mod tests {
         assert!(matches!(cli.command, WorkflowCommand::Frontend(_)));
     }
 
+    /// Issue #542 review finding 17: `StartArgs.id`/`ShowArgs.id` used to be
+    /// a closed `WorkflowKind` `ValueEnum`, so an unrecognized value failed
+    /// AT CLAP PARSE TIME (`dispatch`'s own `Err` branch, exit 2) before
+    /// #542 ever changed it to a plain registry id string. Losing that exit
+    /// code for the exact same "you typed an id that does not exist"
+    /// condition would be a user-facing regression a script relying on
+    /// `$? == 2` for a usage error would silently stop seeing -- `dispatch`
+    /// now restores it specifically for `start`/`show`'s own registry
+    /// lookup failure, at the full CLI entry point (not just `run`'s
+    /// return value), so this is the exact path a real invocation takes.
+    #[test]
+    fn an_unknown_registry_id_exits_2_like_the_old_closed_enum_did() {
+        let repo = tempfile::tempdir().unwrap();
+
+        let start_args = [
+            "zirv",
+            "workflow",
+            "start",
+            "totally-unknown-workflow-id",
+            "--task",
+            "do something",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--changed-lines",
+            "5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            dispatch(&start_args),
+            2,
+            "an unknown `workflow start` id must exit 2, matching the old closed-enum behavior"
+        );
+
+        let show_args = [
+            "zirv",
+            "workflow",
+            "show",
+            "totally-unknown-workflow-id",
+            "--repo",
+            repo.path().to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            dispatch(&show_args),
+            2,
+            "an unknown `workflow show` id must exit 2, matching the old closed-enum behavior"
+        );
+    }
+
     // Issue #209/v3 §D: `active_workflow_summary`, the dashboard footer's
     // own read of the same active-workflow state `zirv workflow status`
     // resolves.
@@ -285,6 +380,7 @@ mod tests {
             risk_score: 0,
             changed_files: 1,
             changed_lines: 10,
+            changed_paths: Vec::new(),
             declared_scope: true,
             work_domain: classify::DomainClassification::default(),
             risk_measurement: classify::RiskMeasurement::default(),

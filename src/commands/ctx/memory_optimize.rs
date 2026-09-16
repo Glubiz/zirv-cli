@@ -754,7 +754,13 @@ pub fn apply_consolidation(
         let prompt = consolidation_prompt(&survivor.entry, &others);
         // Issue #89.
         super::adapters::announce_sandbox_residual_once(adapter, cfg.chrome.events);
-        let Ok(answer) = super::handoff::run_model(adapter, model, &prompt, timeout) else {
+        let Ok(answer) = super::handoff::helper_answer(
+            super::helper::ROLE_DISTILLER,
+            adapter,
+            model,
+            &prompt,
+            timeout,
+        ) else {
             continue;
         };
         let Some(merged_body) = parse_and_validate_consolidation(&answer, &group.survivor_key, cfg)

@@ -1,0 +1,6 @@
+messageStart	{"role":"assistant"}
+contentBlockDelta	{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"unsigned thinking"}}}
+contentBlockStop	{"contentBlockIndex":0}
+contentBlockDelta	{"contentBlockIndex":1,"delta":{"text":"Answer."}}
+contentBlockStop	{"contentBlockIndex":1}
+messageStop	{"stopReason":"end_turn"}

@@ -1,0 +1,16 @@
+# One AWS event-stream frame per line: <:event-type><TAB><payload JSON>.
+# The binary framing itself is built by the test from these rows, so the
+# fixture stays reviewable while the real frame decoder is still exercised.
+messageStart	{"role":"assistant"}
+contentBlockDelta	{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"Read both files first."}}}
+contentBlockDelta	{"contentBlockIndex":0,"delta":{"reasoningContent":{"signature":"sig-abc"}}}
+contentBlockStop	{"contentBlockIndex":0}
+contentBlockDelta	{"contentBlockIndex":1,"delta":{"text":"Reading "}}
+contentBlockDelta	{"contentBlockIndex":1,"delta":{"text":"both files."}}
+contentBlockStop	{"contentBlockIndex":1}
+contentBlockStart	{"contentBlockIndex":2,"start":{"toolUse":{"toolUseId":"tool_1","name":"file_read"}}}
+contentBlockDelta	{"contentBlockIndex":2,"delta":{"toolUse":{"input":"{\"path\":"}}}
+contentBlockDelta	{"contentBlockIndex":2,"delta":{"toolUse":{"input":"\"src/lib.rs\"}"}}}
+contentBlockStop	{"contentBlockIndex":2}
+messageStop	{"stopReason":"tool_use"}
+metadata	{"usage":{"inputTokens":130,"outputTokens":44,"cacheReadInputTokens":20,"cacheWriteInputTokens":5}}

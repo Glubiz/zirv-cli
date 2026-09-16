@@ -17,6 +17,7 @@ use super::dash;
 use super::dash::pane::PaneSpec;
 use super::event::SessionId;
 use super::prompt::PromptRole;
+use super::runtime::{self as runtime_kind, RuntimeKind};
 use super::state::StateDir;
 use super::term;
 use super::wrap::{self, WrapArgs};
@@ -58,6 +59,21 @@ pub struct ChatArgs {
     /// be threaded through `WrapArgs`/`PaneSpec` by hand.
     #[arg(long, default_value_t = false)]
     pub pin_harness: bool,
+    /// Issue #352: never use the persistent runtime, even when the operator
+    /// has turned it on. The compatibility and debugging escape hatch -- this
+    /// process owns the pty, and the session ends when it does, exactly as
+    /// every `zirv chat` did before the runtime existed.
+    #[arg(long, default_value_t = false)]
+    pub no_session: bool,
+    /// Issue #480 (roadmap N11): `native` opens a structured native
+    /// conversation pane (N09's in-process agent loop, no coding harness
+    /// installed, no PTY) instead of a wrapped-harness session. Every other
+    /// value, and the default (unset), is today's wrapped-harness dashboard.
+    /// A native pane never accepts `--agent`, `--simple`, `--resume` or
+    /// `extra` -- see `run_with`'s own refusal for a value combined with any
+    /// of those.
+    #[arg(long)]
+    pub runtime: Option<String>,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -175,7 +191,7 @@ fn orchestrator_initial_prompt(
 /// Also returns the `HarnessRule` that picked the adapter, for the launch
 /// banner: an explicit `--agent` never reaches `resolve_default`, so that
 /// rule cannot come from `DefaultOrigin` alone.
-fn resolve_adapter(
+pub(crate) fn resolve_adapter(
     cfg: &CtxConfig,
     requested: Option<&str>,
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
@@ -294,6 +310,165 @@ fn probe_terminal() -> (bool, bool, bool, (u16, u16), Option<term::VtGuard>) {
     (stdout_is_tty, stdin_is_tty, vt_ok, size, vt_guard)
 }
 
+/// Issue #540: set by `main.rs`'s `zirv native` alias rewrite
+/// (`rewrite_native_alias_args`) on the process environment, immediately
+/// before it calls `ctx::dispatch` -- never by an operator directly. Read
+/// back here (through the same `EnvLookup` closure every other environment
+/// signal in this function already goes through, e.g. `quiet_env`'s
+/// `ZIRV_CTX_QUIET`) so `run_native_chat` can tell the `zirv native` alias
+/// apart from an explicit `zirv chat --runtime native`, even though both
+/// launch through this exact same function -- there is no second native
+/// launch path anywhere for the alias to have its own copy of. An argv-based
+/// signal (a hidden flag on `ChatArgs`) was the alternative; the environment
+/// was chosen because it needs no new clap surface on a struct an operator's
+/// own `--help` already renders, and it keeps `command_schema.rs`'s
+/// `zirv chat` flag list identical to what an operator can actually pass.
+pub const NATIVE_ALIAS_ENV: &str = "ZIRV_CTX_NATIVE_ALIAS";
+
+/// The one-time, low-noise notice `run_native_chat` prints on `stderr` when
+/// launched through the `zirv native` alias (see [`NATIVE_ALIAS_ENV`]) --
+/// never for an explicit `zirv chat --runtime native`, and never repeated
+/// per turn or folded into the model's own context.
+pub const NATIVE_ALIAS_BANNER: &str =
+    "zirv native is experimental; `zirv chat` remains the stable harness.";
+
+/// Shared verbatim between `run_native_chat`'s own refusal and `zirv native
+/// --help`'s prose (`main.rs`'s `native_help_text`), so the two descriptions
+/// of the same limitation can never drift apart.
+pub const NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL: &str = "--runtime native accepts no --agent, --simple, --resume, --pin-harness or trailing \
+     arguments -- those are wrapped-harness-only";
+
+/// Same sharing as [`NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL`], for the TTY
+/// requirement.
+pub const NATIVE_TTY_REFUSAL: &str =
+    "zirv chat --runtime native needs an interactive terminal on both stdin and stdout";
+
+/// `zirv native --help`'s own text (`main.rs` prints this verbatim and exits
+/// 0 for `zirv native --help`/`-h`, before the argv rewrite, so this never
+/// falls through to clap's generated help for the ordinary `chat` verb tree,
+/// which does not mention any of this). Syntax, prerequisites, limitations
+/// and where state/journal live, plus a prominent experimental notice --
+/// the limitations reuse [`NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL`]/
+/// [`NATIVE_TTY_REFUSAL`] verbatim rather than restating them, so this text
+/// and `run_native_chat`'s own refusals can never drift apart.
+pub fn native_help_text() -> String {
+    format!("{}\n", runtime_kind::NATIVE_COMING_SOON)
+}
+
+/// `zirv chat --runtime native`'s own refusal/dispatch, split out of
+/// `run_with` so the wrapped-harness path above it never has to know this
+/// branch exists. Refuses a runtime value this build does not recognize and
+/// every wrapped-harness-only flag (`--agent`, `--simple`, `--resume`, a
+/// trailing `extra` argv) rather than silently ignoring them -- a flag that
+/// looks accepted but does nothing is worse than a refusal that says why.
+#[allow(clippy::too_many_arguments)]
+fn run_native_chat<E: Write>(
+    runtime: &str,
+    cfg: &CtxConfig,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    stderr: &mut E,
+    args: &ChatArgs,
+    stdout_is_tty: bool,
+    stdin_is_tty: bool,
+    vt_ok: bool,
+) -> CtxResult<i32> {
+    runtime_kind::require_native_available()?;
+    // Issue #540: printed exactly once -- this function runs once per
+    // process invocation -- and only for the `zirv native` alias spelling,
+    // never for a direct `zirv chat --runtime native` (which never sets
+    // `NATIVE_ALIAS_ENV`). Before the runtime/flag/TTY checks below, so an
+    // operator sees it even when the launch goes on to refuse for some other
+    // reason -- the notice is about which spelling was used, not about
+    // whether the launch succeeds.
+    if env(NATIVE_ALIAS_ENV).as_deref() == Some("true") {
+        writeln!(stderr, "{NATIVE_ALIAS_BANNER}")?;
+    }
+    // Review finding (issue #540): the read above is the ONE consumer of
+    // this signal -- clear it from the real process environment immediately
+    // afterward, whether or not it was set, so it never outlives that one
+    // read. Left set, every child this session spawns onward (`wrap.rs`'s
+    // harness PTY, `dash/pane.rs`'s worker panes) would inherit it too,
+    // since neither clears the environment before spawning; harmless today
+    // (nothing else reads this key), but a latent trap for a future reader
+    // who adds one.
+    //
+    // SAFETY: this still runs before `dash::run_dashboard`/`wrap::run_with`
+    // below have spawned anything or handed control to another thread --
+    // `main.rs`'s own `set_var` call (this key's only writer) already
+    // documents why the environment is not read or written concurrently
+    // this early in the process, and nothing between that call and this one
+    // has changed that.
+    unsafe {
+        std::env::remove_var(NATIVE_ALIAS_ENV);
+    }
+    // Issue #531 review: this used to reimplement the harness/native decision
+    // inline. Routing through `runtime::selected()` makes it the one place a
+    // `--runtime` flag is turned into a decision, and reusing its own error
+    // text for a value it has never heard of keeps the two from drifting.
+    match runtime_kind::selected(runtime) {
+        Ok(RuntimeKind::Native) => {}
+        Ok(_) => {
+            writeln!(
+                stderr,
+                "--runtime '{runtime}': expected `native` (omit --runtime for a wrapped harness)"
+            )?;
+            return Ok(1);
+        }
+        Err(error) => {
+            writeln!(stderr, "{error}")?;
+            return Ok(1);
+        }
+    }
+    if args.agent.is_some()
+        || args.simple
+        || args.resume
+        || args.pin_harness
+        || !args.extra.is_empty()
+    {
+        writeln!(stderr, "{NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL}")?;
+        return Ok(1);
+    }
+    if !(stdout_is_tty && stdin_is_tty && vt_ok) {
+        writeln!(stderr, "{NATIVE_TTY_REFUSAL}")?;
+        return Ok(1);
+    }
+    // `run_with`'s own nesting refusal (F2) already ran, before `cfg` was
+    // even loaded, and covers this branch too -- not repeated here.
+    let state = StateDir::resolve(env)?;
+    // Issue #490 (roadmap N21 item A): the native conversation is the FIRST
+    // PANE of the ordinary dashboard now, not a loop of its own. Everything
+    // the dashboard already provides -- the sidebar roster, the mail sweep,
+    // attention, the spawn-request channel, the restore roster, the footer
+    // spend -- therefore applies to it unchanged, and a wrapped harness pane
+    // can be spawned beside it in the same process.
+    let session = uuid::Uuid::new_v4().to_string();
+    dash::run_dashboard(
+        cfg,
+        repo,
+        env,
+        &state,
+        dash::PaneSpec {
+            agent_name: super::runtime::RuntimeKind::Native.as_str().to_string(),
+            argv: Vec::new(),
+            role: super::prompt::PromptRole::Orchestrator,
+            verb: super::sessions::Verb::Chat,
+            session_id: session,
+            title: "orch".to_string(),
+        },
+        Some(dash::native_pane::NativeDashboardSpec {
+            repo: repo.to_path_buf(),
+            role: "orchestrator".to_string(),
+            route: None,
+            writing: true,
+            provider: None,
+            seat: None,
+            initial_input: None,
+        }),
+        args.force_pace,
+    )
+}
+
 /// `stderr` is a second, explicit writer -- not `std::io::stderr()` reached
 /// for directly -- so the one diagnostic this function ever prints on its
 /// own (the no-adapter/config error below) stays testable the same way
@@ -306,6 +481,13 @@ pub fn run_with<W: Write, E: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    if args
+        .runtime
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("native"))
+    {
+        runtime_kind::require_native_available()?;
+    }
     // F2, first of all: before any config load, adapter resolution, terminal
     // probe or VT mode change. A `chat` started inside an existing agent
     // session can take that outer session down (see
@@ -329,6 +511,62 @@ pub fn run_with<W: Write, E: Write>(
     // the console's original VT mode before `wrap`'s own raw-mode session
     // (which relies on VT already being on) even opens.
     let (stdout_is_tty, stdin_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
+
+    // Issue #480 (roadmap N11): `--runtime native` branches out to the
+    // structured native pane before any of the wrapped-harness setup below
+    // (adapter resolution, `ChromeCaps`, `dash_eligible`) -- none of it
+    // applies to a session with no coding harness and no PTY. `_vt_guard`
+    // stays in scope across this call (it is a `let`-bound local of this
+    // same function, not dropped until `run_with` itself returns), so the
+    // native pane's own `ratatui`/`crossterm` setup sees the same VT mode
+    // `wrap`'s raw-mode session would have.
+    //
+    // Issue #491 (roadmap N22): with no `--runtime` at all, the operator's
+    // own `[runtime]` table decides, through the same `runtime::resolve`
+    // ladder `exec`/`agent` use, at the `orchestrator` role this seat runs
+    // as. An unconfigured table resolves to the harness, so the wrapped path
+    // below stays the behaviour of every build before N22.
+    let configured = runtime_kind::resolve(
+        args.runtime.as_deref().unwrap_or(runtime_kind::CONFIGURED),
+        &cfg.runtime,
+        "orchestrator",
+    );
+    if !runtime_kind::native_available() {
+        configured.as_ref().map_err(|error| error.to_string())?;
+    }
+    if let Ok(choice) = &configured
+        && let Some(note) = &choice.note
+    {
+        writeln!(stderr, "zirv chat: {note}")?;
+    }
+    // Issue #593 (roadmap N22): an explicit `--runtime` always wins over the
+    // configured default -- including an explicit `--runtime harness`, which
+    // must launch the ordinary wrapped chat even when `[runtime] default =
+    // "native"`. Only the ABSENCE of the flag falls back to `configured`
+    // (which already folds in `[runtime.roles]`/`[runtime] default`). An
+    // explicit value this build does not recognise (anything but `harness`)
+    // still routes into `run_native_chat`, which re-validates it through
+    // `runtime_kind::selected` and reuses that function's own error text.
+    let native = match args.runtime.as_deref() {
+        Some(flag) => !flag.eq_ignore_ascii_case(RuntimeKind::Harness.as_str()),
+        None => configured.is_ok_and(|choice| choice.kind == RuntimeKind::Native),
+    };
+    if native {
+        return run_native_chat(
+            args.runtime
+                .as_deref()
+                .unwrap_or(RuntimeKind::Native.as_str()),
+            &cfg,
+            repo,
+            env,
+            stderr,
+            args,
+            stdout_is_tty,
+            stdin_is_tty,
+            vt_ok,
+        );
+    }
+
     let chrome = ChromeCaps::probe(stdout_is_tty, vt_ok, size, &cfg.chrome, args.simple, false);
 
     let (adapter, rule) = match resolve_adapter(&cfg, args.agent.as_deref()) {
@@ -431,6 +669,39 @@ pub fn run_with<W: Write, E: Write>(
     // independently of whether a banner was printed at all.
     announce_model_choice(stderr, &cfg, args.quiet);
 
+    // Issue #352: the persistent runtime, when the operator has turned it on
+    // and there is a terminal to attach. Checked before the dashboard branch
+    // because it replaces BOTH launch paths below -- the session is opened on
+    // the runtime and this process becomes a client of it.
+    //
+    // A failure here falls back to the ordinary in-process launch with one
+    // line on stderr rather than failing the invocation: the runtime is
+    // experimental, and an experiment must not be able to stop an operator
+    // from getting a session.
+    if super::session::chat_route(
+        cfg.session.persistent,
+        args.no_session,
+        stdin_is_tty,
+        stdout_is_tty,
+    ) == super::session::ChatRoute::Runtime
+    {
+        match super::session::chat_via_runtime(
+            &state,
+            adapter.name(),
+            initial_prompt.as_deref(),
+            &extra,
+            repo,
+            w,
+        ) {
+            Ok(code) => return Ok(code),
+            Err(error) => writeln!(
+                stderr,
+                "zirv chat: the persistent runtime is unavailable ({error}); \
+                 starting a session in this process instead"
+            )?,
+        }
+    }
+
     if chrome::dash_eligible(
         stdout_is_tty,
         stdin_is_tty,
@@ -448,7 +719,7 @@ pub fn run_with<W: Write, E: Write>(
             session.as_str(),
             args.simple,
         )?;
-        return dash::run_dashboard(&cfg, repo, &env, &state, pane, args.force_pace);
+        return dash::run_dashboard(&cfg, repo, &env, &state, pane, None, args.force_pace);
     }
 
     // Ineligible because the dashboard is on but the terminal is too small
@@ -1760,6 +2031,8 @@ mod tests {
             allow_nested: false,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
+            runtime: None,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1805,6 +2078,8 @@ mod tests {
             allow_nested: false,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
+            runtime: None,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1817,6 +2092,261 @@ mod tests {
         let msg = String::from_utf8(err_out).expect("utf8");
         assert!(msg.contains("claude"), "got {msg}");
         assert!(msg.contains("disabled"), "got {msg}");
+    }
+
+    /// PR #531 review finding 3: `--runtime` used to reimplement the
+    /// harness/native decision inline instead of calling
+    /// `runtime::selected()`, the one place that decision is supposed to be
+    /// made. An unrecognised value must be refused with THAT function's own
+    /// wording, not a bespoke message this module drifted from it.
+    #[test]
+    fn an_unknown_runtime_value_is_refused_with_runtime_selected_s_own_error() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("bogus".to_string()),
+            extra: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_with(&args, &mut out, &mut err_out, repo.path(), &|k| {
+            empty.get(k).cloned()
+        })
+        .expect("prints and exits 1 rather than propagating an Err");
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        let msg = String::from_utf8(err_out).expect("utf8");
+        let expected = runtime_kind::selected("bogus")
+            .expect_err("bogus is not a known runtime")
+            .to_string();
+        assert_eq!(msg.trim_end(), expected);
+    }
+
+    /// Issue #593 (roadmap N22): an explicit `--runtime harness` must
+    /// override a configured `[runtime] default = "native"` and launch the
+    /// normal wrapped chat -- not the native dashboard pane. Every agent is
+    /// disabled so `resolve_adapter` fails deterministically, the same setup
+    /// `chat_with_no_enabled_and_ready_adapter_names_each_candidate_and_its_
+    /// reason` uses: reaching THAT message (naming every harness candidate)
+    /// rather than `run_native_chat`'s own refusal text is the proof the
+    /// wrapped path, not the native one, was taken.
+    #[test]
+    fn chat_runtime_harness_overrides_configured_native_default() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            crate::commands::ctx::adapters::ADAPTERS
+                .iter()
+                .map(|(name, _)| format!("[agents.{name}]\nenabled = false\n"))
+                .collect::<String>(),
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            "[runtime]\ndefault = 'native'\n",
+        )
+        .expect("write ctx.toml");
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("harness".to_string()),
+            extra: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_with(&args, &mut out, &mut err_out, repo.path(), &|k| {
+            empty.get(k).cloned()
+        })
+        .expect("prints and exits 1 rather than propagating an Err");
+        assert_eq!(code, 1, "nothing is both enabled and ready");
+        assert!(out.is_empty(), "no dashboard/banner is ever built here");
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(
+            msg.contains("claude") && msg.contains("codex") && msg.contains("opencode"),
+            "reaching resolve_adapter's every-candidate message proves the wrapped harness \
+             path was taken, not run_native_chat: {msg}"
+        );
+        assert!(
+            !msg.contains("needs an interactive terminal"),
+            "run_native_chat's own refusal text must never appear: {msg}"
+        );
+    }
+
+    /// Issue #540: `run_native_chat` prints the one-time experimental banner
+    /// when launched through the `zirv native` alias -- signalled by
+    /// `NATIVE_ALIAS_ENV`, exactly the flag `main.rs`'s alias rewrite sets --
+    /// and prints it exactly once, before any of its own refusals (proven
+    /// here by asserting it appears even though a non-terminal test process
+    /// makes this call reach the TTY refusal too).
+    #[test]
+    fn native_alias_env_prints_the_banner_once() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let cfg = CtxConfig::default();
+        let env_map: std::collections::HashMap<String, String> =
+            [(NATIVE_ALIAS_ENV.to_string(), "true".to_string())]
+                .into_iter()
+                .collect();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("native".to_string()),
+            extra: Vec::new(),
+        };
+        let mut err_out = Vec::new();
+        let _ = run_native_chat(
+            "native",
+            &cfg,
+            repo.path(),
+            &|k| env_map.get(k).cloned(),
+            &mut err_out,
+            &args,
+            false,
+            false,
+            false,
+        );
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert_eq!(
+            msg.matches(NATIVE_ALIAS_BANNER).count(),
+            1,
+            "the banner must print exactly once: {msg}"
+        );
+    }
+
+    /// The mirror of the test above: an explicit `zirv chat --runtime
+    /// native` never sets `NATIVE_ALIAS_ENV`, so it must never print the
+    /// alias banner even though it launches through this exact same
+    /// function.
+    #[test]
+    fn plain_runtime_native_never_prints_the_alias_banner() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let cfg = CtxConfig::default();
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("native".to_string()),
+            extra: Vec::new(),
+        };
+        let mut err_out = Vec::new();
+        let _ = run_native_chat(
+            "native",
+            &cfg,
+            repo.path(),
+            &|k| empty.get(k).cloned(),
+            &mut err_out,
+            &args,
+            false,
+            false,
+            false,
+        );
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(
+            !msg.contains(NATIVE_ALIAS_BANNER),
+            "an explicit `--runtime native` (no alias env) must never print the alias banner: \
+             {msg}"
+        );
+    }
+
+    /// Review finding (issue #540): `NATIVE_ALIAS_ENV` is main.rs's own
+    /// internal signal, meant to be read exactly once. Left set, every child
+    /// process this session later spawns (`wrap.rs`'s harness PTY,
+    /// `dash/pane.rs`'s worker panes) would inherit it, since neither
+    /// clears the environment before spawning. This proves `run_native_chat`
+    /// clears the REAL process environment (not just its own local `env`
+    /// closure argument) immediately after its one read, so a "nested" read
+    /// afterward -- standing in for such a child reading its own inherited
+    /// environment -- sees it unset.
+    #[test]
+    fn native_alias_env_is_cleared_from_the_real_process_environment_after_one_read() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let cfg = CtxConfig::default();
+        // SAFETY: nextest isolates each test in its own process (this
+        // repo's own convention, documented in CLAUDE.md), so no other test
+        // can be reading or writing this key concurrently.
+        unsafe {
+            std::env::set_var(NATIVE_ALIAS_ENV, "true");
+        }
+        let args = ChatArgs {
+            agent: None,
+            resume: false,
+            simple: false,
+            quiet: false,
+            allow_nested: false,
+            force_pace: false,
+            pin_harness: false,
+            no_session: false,
+            runtime: Some("native".to_string()),
+            extra: Vec::new(),
+        };
+        let real_env = env_from_process();
+        let mut err_out = Vec::new();
+        let _ = run_native_chat(
+            "native",
+            &cfg,
+            repo.path(),
+            &real_env,
+            &mut err_out,
+            &args,
+            false,
+            false,
+            false,
+        );
+        // The one read happened -- the banner proves it.
+        let msg = String::from_utf8(err_out).expect("utf8");
+        assert!(msg.contains(NATIVE_ALIAS_BANNER), "got: {msg}");
+        // A nested read afterward, through the identical closure, must see
+        // it unset -- proving the real process environment was cleared, not
+        // just some local copy.
+        assert_eq!(
+            real_env(NATIVE_ALIAS_ENV),
+            None,
+            "NATIVE_ALIAS_ENV must be cleared from the real process environment \
+             immediately after run_native_chat's one read"
+        );
+        assert!(std::env::var(NATIVE_ALIAS_ENV).is_err());
+    }
+
+    #[test]
+    fn native_help_text_reports_coming_soon_without_setup_instructions() {
+        let text = native_help_text();
+        assert!(text.contains("coming soon"), "{text}");
+        assert!(text.contains("cannot be enabled"), "{text}");
+        assert!(!text.contains("provider init"), "{text}");
     }
 
     #[test]
@@ -1863,6 +2393,8 @@ mod tests {
             allow_nested: false,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
+            runtime: None,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1882,6 +2414,29 @@ mod tests {
         assert!(printed.contains("disabled"), "got {printed}");
     }
 
+    /// Issue #352: the escape hatch exists on the command line and is OFF
+    /// unless it is typed. A `zirv chat` that quietly opted into an
+    /// experimental runtime would be the opposite of staging it behind a
+    /// flag.
+    #[test]
+    fn no_session_is_an_explicit_opt_out_that_defaults_to_off() {
+        use clap::Parser;
+        let cli = crate::commands::ctx::CtxCli::try_parse_from(["zirv ctx", "chat"])
+            .expect("plain chat parses");
+        let crate::commands::ctx::CtxVerb::Chat(args) = cli.verb else {
+            panic!("expected chat");
+        };
+        assert!(!args.no_session);
+
+        let cli =
+            crate::commands::ctx::CtxCli::try_parse_from(["zirv ctx", "chat", "--no-session"])
+                .expect("--no-session parses");
+        let crate::commands::ctx::CtxVerb::Chat(args) = cli.verb else {
+            panic!("expected chat");
+        };
+        assert!(args.no_session);
+    }
+
     // F2: the nesting guard, checked before anything touches the terminal.
 
     fn chat_args(allow_nested: bool) -> ChatArgs {
@@ -1893,6 +2448,8 @@ mod tests {
             allow_nested,
             force_pace: false,
             pin_harness: false,
+            no_session: false,
+            runtime: None,
             extra: Vec::new(),
         }
     }

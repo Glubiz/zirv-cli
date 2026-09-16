@@ -1,0 +1,57 @@
+# Built-in workflow pack: architecture-design-review (issue #542 chunk 4).
+schema_version = 1
+id = "architecture-design-review"
+version = 1
+title = "Architecture design review"
+description = "Independent architecture review of a proposed design, with inspectable disposition."
+domains = ["architecture"]
+triggers = ["design review", "review this architecture", "architecture review", "review the design"]
+effects = "none"
+
+[[inputs]]
+name = "design"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "disposition"
+kind = "report"
+
+[[steps]]
+id = "intake"
+title = "Intake the design"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "architect"
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Independent review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["intake"]
+condition = "always"
+
+[[steps]]
+id = "disposition"
+title = "Disposition"
+phase = "present"
+skills = ["verify"]
+depends_on = ["review"]
+condition = "always"
+
+[gates]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["disposition"]
+present_as = "report"

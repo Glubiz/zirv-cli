@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Native pane mock (#490 · N21)</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #101318;
+    --panel-border: #2a2f37;
+    --text: #d7dbe0;
+    --muted: #767f8c;
+    --dim: #4b5561;
+    --cyan: #4fd7e0;
+    --cyan-bold: #6be3ea;
+    --green: #57c785;
+    --yellow: #e0c15c;
+    --red: #e2685f;
+    --magenta: #c77ee0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    padding: 24px 20px 64px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 40px 0 4px; color: var(--cyan-bold); border-bottom: 1px solid var(--panel-border); padding-bottom: 6px; }
+  h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  p.lede { color: var(--muted); font-size: 13px; max-width: 980px; line-height: 1.55; }
+  .legend { font-size: 12px; color: var(--muted); max-width: 980px; line-height: 1.65; margin-bottom: 10px; }
+  .legend code { color: var(--cyan); }
+  .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+  .col { flex: 0 0 auto; }
+  .col-label { font-size: 11px; color: var(--dim); text-align: center; margin-bottom: 6px; letter-spacing: .03em; text-transform: uppercase; }
+  .term { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; box-shadow: 0 6px 18px rgba(0,0,0,.35); margin-bottom: 14px; }
+  .term-bar { background: #14181e; border-bottom: 1px solid var(--panel-border); padding: 4px 10px; font-size: 10px; color: var(--dim); display: flex; justify-content: space-between; }
+  .term pre { margin: 0; padding: 6px 8px; font-size: 12px; line-height: 1.34; white-space: pre; }
+  .w40 pre { font-size: 13px; }
+  .w80 pre { font-size: 12.4px; }
+  .w96 pre { font-size: 11.6px; }
+  .w120 pre { font-size: 10.6px; }
+  .w200 pre { font-size: 7.6px; }
+  .d { color: var(--dim); }
+  .mu { color: var(--muted); }
+  .c { color: var(--cyan); }
+  .cb { color: var(--cyan-bold); font-weight: 700; }
+  .g { color: var(--green); }
+  .y { color: var(--yellow); }
+  .r { color: var(--red); font-weight: 700; }
+  .m { color: var(--magenta); }
+  .b { font-weight: 700; color: #eef1f4; }
+  .u { background: #171b21; color: #aeb6c0; }
+  .sel { background: #1d2530; color: #e6ebf0; }
+</style>
+</head>
+<body>
+<h1>Native pane — N21 (#490)</h1>
+<p class="lede">
+  The native pane modelled on Claude Code's interactive UI: <code>⏺</code> assistant and tool
+  bullets with <code>⎿</code> result tree lines, <code>&gt;</code> user lines on a shaded
+  background, a bordered composer with a hint line, a spinner line with verb/elapsed/tokens,
+  numbered approval dialogs, unified diffs with line numbers, and <code>/</code>, <code>@</code>
+  and <code>!</code> entry modes. Zirv's own dashboard chrome — header chip, fixed sidebar,
+  footer key line — stays around the pane. Every glyph carries state without relying on colour:
+  <code>⏵</code> running, <code>⏸</code> blocked, <code>⚑</code> approval, <code>✔</code> done,
+  <code>•</code> unread, <code>✖</code> failed, <code>⧗</code> queued, <code>◍</code> draining.
+</p>
+
+<h2>Terminal sizes</h2>
+<h3>80 × 24 — one native pane, no sidebar</h3>
+<div class="col"><div class="col-label">80 × 24</div><div class="term w80"><div class="term-bar"><span>80×24</span><span>zirv ctx dash</span></div><pre><span class="cb">▌zirv</span> <span class="d">·</span> <span class="c">native</span> <span class="d">▸</span> orchestrator                         <span class="mu">◐ 3 agents</span>  <span class="y">✉ 2</span>  <span class="r">⚑ 1</span>
+<span class="d">────────────────────────────────────────────────────────────────────────────────</span>
+<span class="u">&gt; refactor the writer lease onto the seat generation fence</span>
+
+<span class="cb">⏺</span> Reading the seat module first.
+
+<span class="cb">⏺</span> <span class="b">Read</span>(src/commands/ctx/seat.rs)
+  <span class="d">⎿</span>  Read 2596 lines <span class="d">(ctrl+r to expand)</span>
+
+<span class="cb">⏺</span> The lease keys on the session id; the fence wants the logical seat.
+
+<span class="cb">⏺</span> <span class="b">Update</span>(src/commands/ctx/seat.rs)
+  <span class="d">⎿</span>  Updated with <span class="g">12 additions</span> and <span class="r">4 removals</span>
+     <span class="d">412</span> <span class="r">-   let lease = Lease::for_session(session_id);</span>
+     <span class="d">412</span> <span class="g">+   let lease = Lease::for_seat(seat.logical, generation);</span>
+
+<span class="cb">⏺</span> <span class="b">Bash</span>(cargo nextest run seat::)
+  <span class="d">⎿</span>  41 tests run · <span class="g">41 passed</span> <span class="d">(ctrl+r to expand)</span>
+
+<span class="m">✻</span> Wrangling… <span class="d">(esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>
+<span class="d">╭──────────────────────────────────────────────────────────────────────────────╮</span>
+<span class="d">│</span> <span class="cb">&gt;</span> keep the old constructor as a deprecated shim<span class="cb">▌</span>                             <span class="d">│</span>
+<span class="d">╰──────────────────────────────────────────────────────────────────────────────╯</span>
+  <span class="d">? for shortcuts</span>             <span class="mu">accept edits on (shift+tab)</span>             <span class="y">⧗ 1 queued</span></pre></div></div>
+
+<h3>120 × 40 — sidebar + native pane + provenance strip</h3>
+<div class="col"><div class="col-label">120 × 40</div><div class="term w120"><div class="term-bar"><span>120×40</span><span>zirv ctx dash</span></div><pre><span class="cb">▌zirv</span> <span class="d">·</span> dash <span class="d">·</span> 3 panes <span class="d">(</span><span class="c">native</span><span class="d">, claude, codex)</span>                                  <span class="mu">◐ 4 agents</span>  <span class="y">✉ 2</span>  <span class="r">⚑ 1</span>  <span class="d">ctx 62%</span>  <span class="d">12:04</span>
+<span class="d">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="cb">AGENTS</span>      <span class="mu">4/6</span>      <span class="d">│</span> <span class="cb">native</span><span class="d"> ▸ orchestrator · opus-5 · seat s-7 gen 2</span>                                   <span class="g">⏵ running</span>     
+<span class="d">──────────────────────</span><span class="d">│</span><span class="d">─────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="sel">▸⏵ orch    native   </span>  <span class="d">│</span><span class="cb">⏺</span> <span class="d">⟳</span> Compacted <span class="b">142</span> messages → <span class="b">8.1k</span> tokens <span class="d">(ctrl+r to expand)</span>                                      
+ <span class="y">⏸</span> w/482   native   <span class="r">⚑</span> <span class="d">│</span>                                                                                                 
+ <span class="g">✔</span> w/483   claude   <span class="y">•1</span><span class="d">│</span><span class="u">&gt; refactor the writer lease onto the seat generation fence</span>                                       
+ <span class="r">✖</span> w/484   codex      <span class="d">│</span>                                                                                                 
+ <span class="d">⧗</span> w/485   native     <span class="d">│</span><span class="cb">⏺</span> Reading the seat module first.                                                                 
+ <span class="mu">◍</span> w/486   native   <span class="mu">⏻</span> <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span><span class="cb">⏺</span> <span class="b">Read</span>(src/commands/ctx/seat.rs)                                                                 
+ <span class="cb">TASKS</span>                <span class="d">│</span>  <span class="d">⎿</span>  Read 2596 lines <span class="d">(ctrl+r to expand)</span>                                                          
+<span class="d">──────────────────────</span><span class="d">│</span>                                                                                                 
+ <span class="g">▣</span> T1 seat fence <span class="g">⏵</span>    <span class="d">│</span><span class="cb">⏺</span> The lease keys on the session id; the fence wants the logical seat.                            
+ <span class="y">▢</span> T2 journal    <span class="r">⚑</span>    <span class="d">│</span>                                                                                                 
+ <span class="g">▣</span> T3 docs       <span class="g">✔</span>    <span class="d">│</span><span class="cb">⏺</span> <span class="b">Update</span>(src/commands/ctx/seat.rs)                                                               
+ <span class="d">▢</span> T4 bench      <span class="d">⧗</span>    <span class="d">│</span>  <span class="d">⎿</span>  Updated with <span class="g">12 additions</span> and <span class="r">4 removals</span>                                                    
+                      <span class="d">│</span>     <span class="d">412</span> <span class="r">-   let lease = Lease::for_session(session_id);</span>                                         
+ <span class="cb">MAIL</span>                 <span class="d">│</span>     <span class="d">412</span> <span class="g">+   let lease = Lease::for_seat(seat.logical, generation);</span>                              
+<span class="d">──────────────────────</span><span class="d">│</span>                                                                                                 
+ <span class="y">✉</span> w/483 result       <span class="d">│</span><span class="cb">⏺</span> <span class="b">Bash</span>(cargo nextest run seat::)                                                                 
+ <span class="y">✉</span> w/485 blocked      <span class="d">│</span>  <span class="d">⎿</span>  41 tests run · <span class="g">41 passed</span> <span class="d">(ctrl+r to expand)</span>                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span><span class="m">✻</span> Wrangling… <span class="d">(esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>                                         
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span>                                                                                                 
+                      <span class="d">│</span><span class="d">╭───────────────────────────────────────────────────────────────────────────────────────────────╮</span>
+                      <span class="d">│</span><span class="d">│</span> <span class="cb">&gt;</span> keep the old constructor as a deprecated shim<span class="cb">▌</span>                                              <span class="d">│</span>
+                      <span class="d">│</span><span class="d">╰───────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+                      <span class="d">│</span>  <span class="d">? for shortcuts</span>                     <span class="mu">accept edits on (shift+tab)</span>                      <span class="y">⧗ 1 queued</span>
+ <span class="cb">usage</span> in <span class="b">184.2k</span> <span class="g">(measured)</span> · out <span class="b">21.9k</span> <span class="g">(measured)</span> · cache <span class="b">92.1k</span> <span class="g">(measured)</span> · ctx <span class="g">62%</span></pre></div></div>
+
+<h3>200 × 50 — sidebar + native pane + agent/task overview + full provenance strip</h3>
+<div class="col"><div class="col-label">200 × 50</div><div class="term w200"><div class="term-bar"><span>200×50</span><span>zirv ctx dash</span></div><pre><span class="cb">▌zirv</span> <span class="d">·</span> dash <span class="d">·</span> 6 panes <span class="d">(</span><span class="c">3 native</span><span class="d">, 2 claude, 1 codex)</span> <span class="d">·</span> team <span class="b">seat-fence</span>                                                                     <span class="mu">◐ 4 agents</span>  <span class="y">✉ 2</span>  <span class="r">⚑ 1 approval</span>  <span class="d">ctx 62%</span>  <span class="d">billing sub (max-20x)</span>
+<span class="d">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="cb">AGENTS</span>        <span class="mu">4/6</span>      <span class="d">│</span> <span class="cb">native</span><span class="d"> ▸ orchestrator · opus-5 · native/anthropic · seat s-7 gen 2</span>                                 <span class="g">⏵ running</span>  <span class="d">│</span> <span class="cb">AGENT &amp; TASK OVERVIEW</span>                <span class="d">↑↓ select  ⏎ inspect</span>     
+<span class="d">────────────────────────</span><span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────────────────────────────────────────────────────</span><span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────</span>
+<span class="sel">▸⏵ orch    native   </span>    <span class="d">│</span><span class="cb">⏺</span> <span class="d">⤓</span> Rollover: opus-5 5h window exhausted → <span class="b">sonnet-4.6</span> <span class="d">(seat s-7 gen 1→2 · draft kept · 0 input lost)</span>           <span class="d">│</span><span class="sel"> <span class="g">⏵ RUNNING</span>     coordinator · orchestrator            </span>      
+ <span class="y">⏸</span> w/482   native   <span class="r">⚑</span>   <span class="d">│</span><span class="cb">⏺</span> <span class="d">⇄</span> Reconnected to the persistent runtime after 12s <span class="d">(journal cursor 4182 · 0 events lost)</span>                      <span class="d">│</span>    <span class="mu">model</span>   opus-5 <span class="g">(measured)</span>                                  
+ <span class="g">✔</span> w/483   claude   <span class="y">•1</span>  <span class="d">│</span>                                                                                                               <span class="d">│</span>    <span class="mu">backend</span> native/anthropic   <span class="mu">owns</span> ~\zirv-490                 
+ <span class="r">✖</span> w/484   codex        <span class="d">│</span><span class="u">&gt; refactor the writer lease onto the seat generation fence</span>                                                     <span class="d">│</span>    <span class="mu">task</span>    T1 seat fence      <span class="mu">since</span> 4m 20s                    
+ <span class="d">⧗</span> w/485   native       <span class="d">│</span>                                                                                                               <span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────</span>
+ <span class="mu">◍</span> w/486   native   <span class="mu">⏻</span>   <span class="d">│</span><span class="cb">⏺</span> Reading the seat module first.                                                                               <span class="d">│</span> <span class="y">⏸ BLOCKED</span>     w/482 · implementer      <span class="r">⚑ approval</span>             
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>    <span class="mu">model</span>   sonnet-4.6 <span class="g">(measured)</span>                              
+ <span class="cb">TASKS</span>                  <span class="d">│</span><span class="cb">⏺</span> <span class="b">Read</span>(src/commands/ctx/seat.rs)                                                                               <span class="d">│</span>    <span class="mu">backend</span> native/anthropic   <span class="mu">owns</span> ~\zirv-482                 
+<span class="d">────────────────────────</span><span class="d">│</span>  <span class="d">⎿</span>  Read 2596 lines <span class="d">(ctrl+r to expand)</span>                                                                        <span class="d">│</span>    <span class="mu">task</span>    T2 journal cursor  <span class="mu">waiting</span> 1m 40s                  
+ <span class="g">▣</span> T1 seat fence <span class="g">⏵</span>      <span class="d">│</span>                                                                                                               <span class="d">│</span>    <span class="r">decision</span> Write(src/commands/ctx/journal.rs) — <span class="b">⏎ answer</span>     
+ <span class="y">▢</span> T2 journal    <span class="r">⚑</span>      <span class="d">│</span><span class="cb">⏺</span> The lease keys on the session id; the fence wants the logical seat.                                          <span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────</span>
+ <span class="g">▣</span> T3 docs       <span class="g">✔</span>      <span class="d">│</span>                                                                                                               <span class="d">│</span> <span class="g">✔ DONE·UNREAD</span> w/483 · reviewer         <span class="y">•</span> result 1.2 kB        
+ <span class="d">▢</span> T4 bench      <span class="d">⧗</span>      <span class="d">│</span><span class="cb">⏺</span> <span class="b">Update</span>(src/commands/ctx/seat.rs)                                                                             <span class="d">│</span>    <span class="mu">model</span>   claude-sonnet-4.6 <span class="y">(wrapped adapter, estimated)</span>     
+                        <span class="d">│</span>  <span class="d">⎿</span>  Updated with <span class="g">12 additions</span> and <span class="r">4 removals</span>                                                                  <span class="d">│</span>    <span class="mu">backend</span> wrapped/claude     <span class="mu">owns</span> ~\zirv-483                 
+ <span class="cb">MAIL</span>                   <span class="d">│</span>     <span class="d">412</span> <span class="r">-   let lease = Lease::for_session(session_id);</span>                                                       <span class="d">│</span>    <span class="mu">result</span>  bounded manifest · 3 artifacts — <span class="b">⏎ open</span>            
+<span class="d">────────────────────────</span><span class="d">│</span>     <span class="d">412</span> <span class="g">+   let lease = Lease::for_seat(seat.logical, generation);</span>                                            <span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────</span>
+ <span class="y">✉</span> w/483 result         <span class="d">│</span>                                                                                                               <span class="d">│</span> <span class="r">✖ FAILED</span>      w/484 · implementer      <span class="r">exit 101</span>               
+ <span class="y">✉</span> w/485 blocked        <span class="d">│</span><span class="cb">⏺</span> <span class="b">Bash</span>(cargo nextest run seat::)                                                                               <span class="d">│</span>    <span class="mu">reason</span>  route exhausted: openai/gpt-5 cooldown 4m          
+                        <span class="d">│</span>  <span class="d">⎿</span>  41 tests run · <span class="g">41 passed</span> <span class="d">(ctrl+r to expand)</span>                                                               <span class="d">│</span>    <span class="mu">backend</span> native/openai      <span class="mu">owns</span> ~\zirv-484                 
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span><span class="d">───────────────────────────────────────────────────────────────</span>
+                        <span class="d">│</span><span class="cb">⏺</span> <span class="b">Task</span>(implementer · w/482) <span class="d">→ T2 journal cursor</span>                                                                <span class="d">│</span> <span class="d">⧗ QUEUED</span>      w/485 · tester           <span class="d">awaiting seat</span>          
+                        <span class="d">│</span>  <span class="d">⎿</span>  <span class="y">⏸ blocked on approval</span> <span class="d">(ctrl+r to expand · ⏎ to answer)</span>                                                    <span class="d">│</span> <span class="mu">◍ DRAINING</span>   w/486 · scout            <span class="mu">parked (rollover)</span>       
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span><span class="m">✻</span> Wrangling… <span class="d">(esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>                                                       <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span>                                                                                                               <span class="d">│</span>                                                               
+                        <span class="d">│</span><span class="d">╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮</span><span class="d">│</span>                                                               
+                        <span class="d">│</span><span class="d">│</span> <span class="cb">&gt;</span> keep the old constructor as a deprecated shim<span class="cb">▌</span>                                                            <span class="d">│</span><span class="d">│</span>                                                               
+                        <span class="d">│</span><span class="d">╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯</span><span class="d">│</span>                                                               
+                        <span class="d">│</span>  <span class="d">? for shortcuts</span>                            <span class="mu">accept edits on (shift+tab)</span>                             <span class="y">⧗ 1 queued</span><span class="d">│</span>                                                               
+ <span class="cb">usage</span>  in <span class="b">184.2k</span> <span class="g">(measured)</span> · out <span class="b">21.9k</span> <span class="g">(measured)</span> · cache <span class="b">92.1k</span> <span class="g">(measured)</span> · ctx left <span class="g">62%</span>
+ <span class="cb">spend</span>  <span class="b">$3.41</span> <span class="g">measured</span> · <span class="b">$0.28</span> <span class="y">estimated (wrapped panes)</span> · pool <span class="d">unknown (no data ≠ $0.00)</span></pre></div></div>
+
+<h3>40 columns — the narrow floor</h3>
+<p class="legend">At 40 columns the sidebar and the overview collapse; the transcript, the
+composer and the status facts survive with elided paths. Nothing becomes colour-only.</p>
+<div class="col"><div class="col-label">40 × 22</div><div class="term w40"><div class="term-bar"><span>40×22</span><span>zirv ctx dash</span></div><pre><span class="cb">▌zirv</span> <span class="d">·</span> <span class="c">native</span>            <span class="r">⚑1</span> <span class="y">✉2</span> <span class="mu">◐4</span>
+<span class="d">────────────────────────────────────────</span>
+<span class="u">&gt; refactor the writer lease</span>
+
+<span class="cb">⏺</span> <span class="b">Read</span>(…/ctx/seat.rs)
+  <span class="d">⎿</span>  2596 lines <span class="d">(ctrl+r)</span>
+
+<span class="cb">⏺</span> <span class="b">Update</span>(…/ctx/seat.rs)
+  <span class="d">⎿</span>  <span class="g">+12</span> <span class="r">−4</span>
+
+<span class="cb">⏺</span> <span class="b">Bash</span>(cargo nextest seat::)
+  <span class="d">⎿</span>  <span class="g">41 passed</span>
+
+<span class="m">✻</span> Wrangling… <span class="d">(esc · 1m12s)</span>
+<span class="d">╭──────────────────────────────────────╮</span>
+<span class="d">│</span> <span class="cb">&gt;</span> deprecated shim<span class="cb">▌</span>                   <span class="d">│</span>
+<span class="d">╰──────────────────────────────────────╯</span>
+  <span class="d">?</span>           <span class="mu">accept edits</span>            <span class="y">⧗1</span>
+<span class="d">opus-5 · native · ctx </span><span class="g">62%</span>
+<span class="d">native/490</span></pre></div></div>
+
+<h2>N21 surfaces</h2>
+
+<h3>Agent &amp; task overview (item 1)</h3>
+<p class="legend">Fed by the coordinator graph, the delegation receipts and the seat records —
+never by scraping transcripts. Role, <em>actual</em> model and backend (with provenance),
+ownership/worktree, running / blocked / done-unread / failed / queued / draining, the pending
+decision, and bounded result access. Rows are clickable and keyboard-navigable.</p>
+<div class="term w96"><pre> <span class="cb">AGENT &amp; TASK OVERVIEW</span>                <span class="d">↑↓ select  ⏎ inspect</span>
+<span class="d">───────────────────────────────────────────────────────────────</span>
+<span class="sel"> <span class="g">⏵ RUNNING</span>     coordinator · orchestrator            </span>
+    <span class="mu">model</span>   opus-5 <span class="g">(measured)</span>
+    <span class="mu">backend</span> native/anthropic   <span class="mu">owns</span> ~\zirv-490
+    <span class="mu">task</span>    T1 seat fence      <span class="mu">since</span> 4m 20s
+<span class="d">───────────────────────────────────────────────────────────────</span>
+ <span class="y">⏸ BLOCKED</span>     w/482 · implementer      <span class="r">⚑ approval</span>
+    <span class="mu">model</span>   sonnet-4.6 <span class="g">(measured)</span>
+    <span class="mu">backend</span> native/anthropic   <span class="mu">owns</span> ~\zirv-482
+    <span class="mu">task</span>    T2 journal cursor  <span class="mu">waiting</span> 1m 40s
+    <span class="r">decision</span> Write(src/commands/ctx/journal.rs) — <span class="b">⏎ answer</span>
+<span class="d">───────────────────────────────────────────────────────────────</span>
+ <span class="g">✔ DONE·UNREAD</span> w/483 · reviewer         <span class="y">•</span> result 1.2 kB
+    <span class="mu">model</span>   claude-sonnet-4.6 <span class="y">(wrapped adapter, estimated)</span>
+    <span class="mu">backend</span> wrapped/claude     <span class="mu">owns</span> ~\zirv-483
+    <span class="mu">result</span>  bounded manifest · 3 artifacts — <span class="b">⏎ open</span>
+<span class="d">───────────────────────────────────────────────────────────────</span>
+ <span class="r">✖ FAILED</span>      w/484 · implementer      <span class="r">exit 101</span>
+    <span class="mu">reason</span>  route exhausted: openai/gpt-5 cooldown 4m
+    <span class="mu">backend</span> native/openai      <span class="mu">owns</span> ~\zirv-484
+<span class="d">───────────────────────────────────────────────────────────────</span>
+ <span class="d">⧗ QUEUED</span>      w/485 · tester           <span class="d">awaiting seat</span>
+ <span class="mu">◍ DRAINING</span>   w/486 · scout            <span class="mu">parked (rollover)</span></pre></div>
+
+<h3>Focused worker inspection (item 2)</h3>
+<p class="legend">Opens a worker's <em>bounded</em> manifest and its evidence (diffs, test
+output, artifacts, frontend screenshots) and offers a targeted follow-up. The coordinator's
+own conversation never receives the worker's transcript.</p>
+<div class="term w96"><pre> <span class="cb">WORKER w/482</span><span class="d"> · implementer · seat s-9 gen 1 · writer lease held</span>                    <span class="d">[esc] back</span>
+<span class="d">────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="mu">task</span>     T2 journal cursor <span class="d">(from the coordinator graph, not a transcript)</span>
+ <span class="mu">model</span>    sonnet-4.6 <span class="g">(measured)</span>   <span class="mu">backend</span> native/anthropic   <span class="mu">owns</span> ~\zirv-482
+ <span class="mu">state</span>    <span class="y">⏸ blocked</span>  <span class="r">⚑ approval outstanding 1m 40s</span>
+ <span class="mu">result</span>   bounded manifest <span class="b">1.2 kB</span> · 3 artifacts <span class="d">(never the whole transcript)</span>
+<span class="d">────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="cb">⏺</span> <span class="b">Update</span>(src/commands/ctx/journal.rs)     <span class="d">⎿</span> <span class="g">+34</span> <span class="r">−6</span>          <span class="d">[d] diff</span>
+ <span class="cb">⏺</span> <span class="b">Bash</span>(cargo nextest run journal::)       <span class="d">⎿</span> <span class="g">62 passed</span>         <span class="d">[t] output</span>
+ <span class="cb">⏺</span> <span class="b">Artifact</span>(journal-cursor.patch)         <span class="d">⎿</span> 4.1 kB             <span class="d">[o] open</span>
+ <span class="cb">⏺</span> <span class="b">Artifact</span>(frontend/cursor.png)          <span class="d">⎿</span> 118 kB <span class="d">image</span>       <span class="d">[o] open</span>
+<span class="d">────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="mu">follow-up</span> <span class="d">(N10 bounded follow-up — nothing is replayed into the coordinator)</span>
+ <span class="d">╭────────────────────────────────────────────────────────────────────────────────────────────╮</span>
+ <span class="d">│</span> <span class="cb">&gt;</span> also cover the empty-journal case<span class="cb">▌</span>                                                       <span class="d">│</span>
+ <span class="d">╰────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+   <span class="d">enter sends to w/482</span>                     <span class="mu">shift+tab: plan mode</span>                     <span class="y">⧗ 0 queued</span></pre></div>
+
+<h3>Approval dialog with exact scope (item 5)</h3>
+<p class="legend">Numbered, answered with 1–3 or ↑↓ then ⏎, never from the composer. The scope
+shown is the scope granted: the exact tool, the exact path, the exact directory the
+"don't ask again" option would widen to.</p>
+<div class="term w96"><pre><span class="d">╭─ </span><span class="cb">Tool use · approval needed</span><span class="d"> ────────────────────────────────────────────╮</span>
+<span class="d">│</span> <span class="b">Write</span>(src/commands/ctx/journal.rs)                                       <span class="d">│</span>
+<span class="d">│</span>                                                                          <span class="d">│</span>
+<span class="d">│</span>   <span class="mu">scope</span>    write <span class="b">1 file</span> inside <span class="b">D:\GitHub\zirv-482</span>                        <span class="d">│</span>
+<span class="d">│</span>   <span class="mu">actor</span>    w/482 · implementer · seat s-9 gen 1 (writer lease held)      <span class="d">│</span>
+<span class="d">│</span>   <span class="mu">why</span>      repo policy permits src/ edits for a writer seat; this        <span class="d">│</span>
+<span class="d">│</span>            <span class="mu">path is outside the pane's last granted scope</span>                 <span class="d">│</span>
+<span class="d">│</span>   <span class="mu">change</span>   <span class="g">+34</span> <span class="r">−6</span> <span class="d">· preview below (ctrl+r for the full diff)</span>             <span class="d">│</span>
+<span class="d">│</span>                                                                          <span class="d">│</span>
+<span class="d">│</span>   <span class="d">  312</span> <span class="r">-    let cursor = self.cursor;</span>                                   <span class="d">│</span>
+<span class="d">│</span>   <span class="d">  312</span> <span class="g">+    let cursor = self.cursor.max(committed);</span>                    <span class="d">│</span>
+<span class="d">│</span>                                                                          <span class="d">│</span>
+<span class="d">│</span> <span class="b">Do you want to proceed?</span>                                                  <span class="d">│</span>
+<span class="d">│</span> <span class="cb">❯ 1. Yes</span>                                                                 <span class="d">│</span>
+<span class="d">│</span>   2. Yes, and don't ask again for <span class="b">Write</span> in <span class="b">D:\GitHub\zirv-482</span>            <span class="d">│</span>
+<span class="d">│</span>   3. No, and tell the agent what to do differently <span class="d">(esc)</span>                 <span class="d">│</span>
+<span class="d">│</span>                                                                          <span class="d">│</span>
+<span class="d">│</span> <span class="d">1-3 or ↑↓ then ⏎ · never answered from the composer · esc = No</span>           <span class="d">│</span>
+<span class="d">╰──────────────────────────────────────────────────────────────────────────╯</span></pre></div>
+
+<h3>Compaction, rollover and reconnect notices (item 4)</h3>
+<p class="legend">Rendered inline as ordinary <code>⏺</code> bullets so they scroll with the
+conversation, and mirrored into the status line. Drafts, selection, focus, scrollback and
+acknowledged input survive all three; a queued line is re-targeted to the logical seat's
+<em>current</em> session, never to the retired generation.</p>
+<div class="term w96"><pre><span class="cb">⏺</span> <span class="d">⟳</span> Compacted <span class="b">142</span> messages → <span class="b">8.1k</span> tokens <span class="d">· scrollback kept · draft kept (ctrl+r to expand)</span>
+  <span class="d">⎿</span>  <span class="mu">checkpoint cp-19 · 4 tool results summarised · nothing acknowledged was dropped</span>
+
+<span class="cb">⏺</span> <span class="d">⤓</span> Rollover: opus-5 5h window exhausted → <span class="b">sonnet-4.6</span>
+  <span class="d">⎿</span>  <span class="mu">seat s-7 gen 1 → gen 2 · tried anthropic/opus-5 (limit), openai/gpt-5 (cooldown)</span>
+  <span class="d">⎿</span>  <span class="mu">draft, selection, focus and scrollback preserved · 1 queued line re-targeted to gen 2</span>
+
+<span class="cb">⏺</span> <span class="d">⇄</span> Reconnected to the persistent runtime after 12s
+  <span class="d">⎿</span>  <span class="mu">journal cursor 4182 · 0 events lost · 2 deferred mails delivered · attention resumed</span>
+
+<span class="cb">⏺</span> <span class="r">⚑</span> Delivery deferred while blocked: <span class="b">2 mails</span>, <span class="b">1 attention ping</span> <span class="d">— resumed automatically</span></pre></div>
+
+<h3>Usage &amp; health provenance (item 3)</h3>
+<p class="legend">Measured and estimated are labelled and never summed into one silent number;
+"unknown" is never rendered as <code>$0.00</code>; exclusions carry their reason and their
+cooldown; draining and parked seats are visible.</p>
+<div class="term w200"><pre><span class="d">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="cb">usage</span>  in <span class="b">184.2k</span> <span class="g">(measured)</span> · out <span class="b">21.9k</span> <span class="g">(measured)</span> · cache <span class="b">92.1k</span> <span class="g">(measured)</span> · ctx left <span class="g">62%</span>
+ <span class="cb">spend</span>  <span class="b">$3.41</span> <span class="g">measured</span> · <span class="b">$0.28</span> <span class="y">estimated (wrapped panes)</span> · pool <span class="d">unknown (no data ≠ $0.00)</span>
+ <span class="cb">routes</span> anthropic/opus-5 <span class="g">✔ ready</span> · openai/gpt-5 <span class="r">✖ excluded: 429 cooldown 4m</span> · google/gemini-3 <span class="r">✖ excluded: no credential</span> · local/ollama <span class="mu">◍ draining</span>
+ <span class="cb">seats</span>  4 active · 1 <span class="mu">parked (rollover)</span> · 1 <span class="mu">draining</span> · billing <span class="b">subscription (max-20x)</span> · window resets <span class="b">1h 12m</span></pre></div>
+
+<h3>Slash commands, the file picker and the shell line (item 7)</h3>
+<p class="legend">The <code>@</code> picker reuses the containment-safe path resolver, so it can
+only offer paths inside the pane's own worktree; <code>!</code> runs through the pane's existing
+process tool under the same approval rules as any other tool call.</p>
+<div class="term w200"><pre><span class="d">╭────────────────────────────────────────────────────╮</span>  <span class="d">╭────────────────────────────────────────────────────╮</span>  <span class="d">╭────────────────────────────────────────────────────╮</span>
+<span class="d">│</span> <span class="cb">&gt;</span> /<span class="b">a</span>                                               <span class="d">│</span>  <span class="d">│</span> <span class="cb">&gt;</span> review @<span class="b">seat</span>                                     <span class="d">│</span>  <span class="d">│</span> <span class="cb">&gt;</span> !<span class="b">cargo nextest run seat::</span>                        <span class="d">│</span>
+<span class="d">│</span> <span class="d">──────────────────────────────────────────────────</span> <span class="d">│</span>  <span class="d">│</span> <span class="d">──────────────────────────────────────────────────</span> <span class="d">│</span>  <span class="d">│</span> <span class="d">──────────────────────────────────────────────────</span> <span class="d">│</span>
+<span class="d">│</span> <span class="sel">❯ /agents      the agent &amp; task overview          </span> <span class="d">│</span>  <span class="d">│</span> <span class="sel">❯ src/commands/ctx/seat.rs                        </span> <span class="d">│</span>  <span class="d">│</span>   <span class="mu">runs through the pane's own process tool</span>         <span class="d">│</span>
+<span class="d">│</span>   /approve     answer the pending approval         <span class="d">│</span>  <span class="d">│</span>   src/commands/ctx/seat_lease.rs                   <span class="d">│</span>  <span class="d">│</span>   <span class="mu">same approval + scope rules as any tool call</span>     <span class="d">│</span>
+<span class="d">│</span>   /artifacts   open the bounded result evidence    <span class="d">│</span>  <span class="d">│</span>   tests/fixtures/seat-record.json                  <span class="d">│</span>  <span class="d">│</span>   <span class="d">output lands in the transcript as ⏺ Bash(…)</span>      <span class="d">│</span>
+<span class="d">│</span>   /compact     compact this conversation now       <span class="d">│</span>  <span class="d">│</span>   <span class="d">(paths outside the worktree are never offered)</span>   <span class="d">│</span>  <span class="d">│</span>                                                    <span class="d">│</span>
+<span class="d">│</span>   /status      the authoritative facts as JSON     <span class="d">│</span>  <span class="d">│</span>                                                    <span class="d">│</span>  <span class="d">│</span>                                                    <span class="d">│</span>
+<span class="d">╰────────────────────────────────────────────────────╯</span>  <span class="d">╰────────────────────────────────────────────────────╯</span>  <span class="d">╰────────────────────────────────────────────────────╯</span></pre></div>
+</body>
+</html>

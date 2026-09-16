@@ -1,0 +1,3685 @@
+//! The protocol v1 reference server (issue #353).
+//!
+//! Issue #353 explicitly allows an in-process reference server for this
+//! stage: "No runtime daemon is required to merge this issue". So this is
+//! not a daemon. It is the one implementation of the v1 method set, holding
+//! the SHARED RUNTIME FACTS (which sessions exist, their stable ids,
+//! generations, lifecycle state and the event log) and nothing else --
+//! layout, colour, sidebar selection, mouse state and modals stay in
+//! whichever client is drawing them, and no method here can read or write
+//! any of that.
+//!
+//! Two deliberate limits, both of which belong to later issues rather than
+//! to a weaker version of this one:
+//!
+//! - PTY ownership stays in the dashboard (issue #352). A server with no
+//!   [`RuntimeBackend`] attached serves every read method off the session
+//!   registry and refuses the three mutating ones with
+//!   [`ErrorCode::Unsupported`], naming the issue -- never a silent success.
+//! - Session facts come from a [`SessionSource`], which today is either the
+//!   real session registry or a fixed list. Nothing else in zirv is
+//!   reachable through the protocol.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use super::transport::{Connection, Endpoint, Listener, MAX_FRAME_BYTES, server_uid};
+use super::wire::{
+    ADVERTISED, ADVERTISED_WITHOUT_HOST, ApiError, ApiEvent, ApprovalDecision, AttachMode,
+    Attachment, Capability, ErrorCode, EventFrame, Hello, InputAck, InputMode, Method,
+    NativeHistory, NativePage, Outcome, PROTOCOL_VERSION, Request, Response, SERVER_NAME,
+    ScreenView, SessionFacts, SessionState, TaskOutcome, WaitUntil, spec_for,
+};
+use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::runtime::{
+    RuntimeBackend, RuntimeError, RuntimeKind, SessionHandle, SessionSpec, UiSurface,
+};
+use crate::commands::ctx::sessions::{self, Liveness};
+use crate::commands::ctx::state::StateDir;
+
+/// How many event frames the server keeps for replay. A subscriber that
+/// asks for a revision older than the oldest retained frame gets a visible
+/// GAP (the first frame it receives is not `after_revision + 1`), which is
+/// exactly the signal issue #353 asks for: refresh a snapshot rather than
+/// drift.
+const MAX_EVENTS: usize = 512;
+const MAX_SUBSCRIBER_BACKLOG: usize = MAX_EVENTS;
+
+/// How many idempotency keys the server remembers, evicted oldest-first.
+const MAX_IDEMPOTENCY: usize = 256;
+
+/// Issue #489: the hard bound on one `session.history` or `session.journal`
+/// page. Fan-out has to be bounded at the server, not by a client's own
+/// politeness: a cursor read of an hour-long conversation would otherwise
+/// serialize the whole journal into one frame.
+const MAX_PAGE: usize = 256;
+
+const DEFAULT_WAIT_MS: u64 = 30_000;
+const MAX_WAIT_MS: u64 = 600_000;
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+const SUBSCRIBE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Where the server's session facts come from. A trait so the deterministic
+/// tests and the frozen-fixture replay can seed exact facts, and so nothing
+/// but the implementations in this file can decide what the protocol
+/// publishes.
+pub trait SessionSource: Send + Sync + std::fmt::Debug {
+    fn sessions(&self) -> Vec<SessionFacts>;
+}
+
+/// The real one: the existing session registry, projected down to the
+/// redacted [`SessionFacts`] shape.
+#[derive(Debug)]
+pub struct RegistrySource {
+    state: StateDir,
+}
+
+impl RegistrySource {
+    pub fn new(state: StateDir) -> Self {
+        Self { state }
+    }
+}
+
+impl SessionSource for RegistrySource {
+    fn sessions(&self) -> Vec<SessionFacts> {
+        sessions::list(&self.state)
+            .iter()
+            .map(|(record, liveness)| facts_from_record(record, *liveness))
+            .collect()
+    }
+}
+
+/// Issue #352: the seam to a runtime that OWNS the sessions' terminals.
+///
+/// `ApiServer` deliberately holds no pty, no child process and no vt100
+/// parser of its own: it is the protocol, and the protocol must not grow a
+/// second, private implementation of the thing `session::host` already does.
+/// A server with no host attached is exactly the server issue #353 shipped --
+/// every read method answers off the session source, and the five attachment
+/// methods are refused with a structured `unsupported` that names #352.
+///
+/// `&self` throughout (not `&mut self`) because a host is shared by every
+/// connection thread and does its own interior locking; the server's single
+/// mutex must never be held across a pty write.
+pub trait SessionHost: Send + Sync + std::fmt::Debug {
+    /// Facts for the sessions this host owns, in the same redacted shape a
+    /// registry record projects to.
+    fn sessions(&self) -> Vec<SessionFacts>;
+    /// Opens a NEW server-owned terminal for `spec`. Reached from
+    /// `session.start` whenever a host is attached, so a client asks for a
+    /// session with the same method whether a pty or a native backend ends up
+    /// carrying it -- issue #352 adds no second "start" verb, because a
+    /// client that had to know which kind of runtime it was talking to before
+    /// it could ask for a session would not be speaking one protocol.
+    ///
+    /// The host, not the caller, turns the spec into a command line: the
+    /// endpoint is owner-only, but "owner-only" is not a reason to accept an
+    /// arbitrary argv over a socket when the only launches a runtime ever
+    /// needs to make are an adapter's own.
+    fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError>;
+    fn attach(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        mode: AttachMode,
+        size: Option<(u16, u16)>,
+    ) -> Result<Attachment, ApiError>;
+    fn detach(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    fn takeover(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    fn resize(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Attachment, ApiError>;
+    fn screen(&self, session_id: &str, client_id: &str) -> Result<ScreenView, ApiError>;
+    /// The controller's literal keystrokes. Refused for anyone else.
+    fn write_raw(&self, session_id: &str, client_id: &str, bytes: &[u8]) -> Result<(), ApiError>;
+    /// The operator's explicit `zirv session stop`: terminate the child
+    /// through the existing ladder. Detaching a client never reaches this.
+    fn stop(&self, session_id: &str) -> Result<bool, ApiError>;
+}
+
+/// Issue #489: the seam to the runtime that owns the NATIVE conversations,
+/// the exact counterpart of [`SessionHost`] for sessions that have a journal
+/// instead of a pseudoterminal.
+///
+/// It is a second trait rather than more methods on [`SessionHost`] because
+/// the two own genuinely different things: a pty host can be resized, typed
+/// into and screen-read, and none of those verbs mean anything for a native
+/// conversation; a native host can be interrupted mid-turn, have an approval
+/// decided and have its journal paged by durable cursor, and none of those
+/// mean anything for a supervised harness process. One server can hold both,
+/// and `zirv session serve` does -- which is what makes "one versioned local
+/// runtime" true rather than two daemons wearing one endpoint.
+///
+/// `&self` throughout for the same reason [`SessionHost`] uses it: the host is
+/// shared by every connection thread and does its own interior locking.
+pub trait NativeHost: Send + Sync + std::fmt::Debug {
+    /// Facts for the native sessions this host owns.
+    fn sessions(&self) -> Vec<SessionFacts>;
+    /// Whether this host is the owner of `session_id`. The routing predicate:
+    /// a server holding both hosts asks this before it reaches for either.
+    fn owns(&self, session_id: &str) -> bool;
+    /// Opens a new native conversation. Reached from `session.start` when the
+    /// spec names `runtime: native`.
+    fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError>;
+    /// Records one input durably and queues the turn it belongs to.
+    /// `idempotency` is the caller's own key: a retry carrying the same one
+    /// returns the first acknowledgement's identity and queues nothing.
+    fn submit(
+        &self,
+        session_id: &str,
+        input: &str,
+        steering: bool,
+        idempotency: Option<&str>,
+    ) -> Result<InputAck, ApiError>;
+    /// Cancels the turn in flight. The session is untouched otherwise -- this
+    /// is the "cancel" that issue #489 separates from "stop".
+    fn interrupt(&self, session_id: &str) -> Result<bool, ApiError>;
+    fn approve(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+        note: Option<&str>,
+    ) -> Result<bool, ApiError>;
+    fn task_result(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        outcome: TaskOutcome,
+        receipt: &Value,
+    ) -> Result<bool, ApiError>;
+    fn history(
+        &self,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<NativeHistory, ApiError>;
+    fn journal(&self, session_id: &str, after: u64, limit: usize) -> Result<NativePage, ApiError>;
+    fn attach(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        mode: AttachMode,
+    ) -> Result<Attachment, ApiError>;
+    fn detach(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    fn takeover(&self, session_id: &str, client_id: &str) -> Result<Attachment, ApiError>;
+    /// The seat as it stands: whether ANY client is attached, and who holds
+    /// the controller. The server asks this before every native mutation --
+    /// see [`ApiServer::native_controller_check`].
+    fn seat(&self, session_id: &str) -> Result<(bool, Option<String>), ApiError>;
+    /// Ends the conversation. The one verb that does.
+    fn stop(&self, session_id: &str) -> Result<bool, ApiError>;
+}
+
+/// A fixed list. The deterministic source the frozen-fixture replay and the
+/// unit tests seed exact facts through; production always uses
+/// [`RegistrySource`], hence the allow.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct StaticSource(pub Vec<SessionFacts>);
+
+impl SessionSource for StaticSource {
+    fn sessions(&self) -> Vec<SessionFacts> {
+        self.0.clone()
+    }
+}
+
+/// The registry -> protocol projection, in one place so the redaction rule
+/// is auditable: the absolute `repo` path, the transcript path, the in-flight
+/// witness's own details and the owner pid are all dropped here.
+///
+/// `generation` is 1 for every registry record: the registry has no
+/// generation of its own (the orchestrator seat does, and a persistent
+/// runtime will -- issues #352/#489). Publishing a constant is honest;
+/// inventing one from, say, a restart count would let a client believe a
+/// pin means something it does not.
+pub fn facts_from_record(record: &sessions::Record, liveness: Liveness) -> SessionFacts {
+    let state = match (liveness, record.in_flight.is_some()) {
+        (Liveness::Live, true) => SessionState::Working,
+        (Liveness::Live, false) => SessionState::Idle,
+        _ => SessionState::Ended,
+    };
+    SessionFacts {
+        session_id: record.session.clone(),
+        short: record.short.clone(),
+        runtime: record.runtime,
+        generation: 1,
+        surface: UiSurface::Headless,
+        state,
+        role: record.role.clone(),
+        agent: Some(record.agent.clone()),
+        repo_slug: Some(record.repo_slug.clone()),
+        started_at: Some(record.started_at),
+        reachable: record.reachable,
+    }
+}
+
+#[derive(Debug)]
+struct Inner {
+    revision: u64,
+    sessions: BTreeMap<String, SessionFacts>,
+    /// Backend handles for sessions this server itself started. A session
+    /// that only came from the registry has none, so a mutation on it is
+    /// refused rather than sent to a backend that never heard of it.
+    handles: BTreeMap<String, SessionHandle>,
+    events: VecDeque<EventFrame>,
+    idempotency: BTreeMap<String, Value>,
+    idempotency_order: VecDeque<String>,
+    subscribers: Vec<SyncSender<EventFrame>>,
+    /// Lifecycle states a CLIENT reported (`session.report_status`) or this
+    /// server itself caused (`session.send_input`, `session.stop`). A
+    /// refresh from the session source must not silently undo them: the
+    /// registry projection is a coarse "is the process alive and is a turn
+    /// in flight", and the client driving a session knows better. Every
+    /// other field still comes from the source on every refresh.
+    reported: BTreeMap<String, SessionState>,
+    /// Issue #352: the controller seat this server last ANNOUNCED for each
+    /// session, so `controller_changed` is emitted once per real change
+    /// rather than once per attachment call.
+    controllers: BTreeMap<String, Option<String>>,
+    live_attachments: BTreeSet<(String, String)>,
+}
+
+impl Inner {
+    /// The one place `revision` moves. Exactly +1 per emitted event, which
+    /// is what makes `revision != last + 1` a reliable gap signal for a
+    /// subscriber.
+    fn emit(&mut self, session_id: Option<String>, generation: Option<u64>, payload: ApiEvent) {
+        self.revision += 1;
+        let frame = EventFrame {
+            version: PROTOCOL_VERSION,
+            revision: self.revision,
+            session_id,
+            generation,
+            payload,
+        };
+        self.events.push_back(frame.clone());
+        while self.events.len() > MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.subscribers
+            .retain(|subscriber| match subscriber.try_send(frame.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            });
+    }
+
+    fn remember(&mut self, key: String, result: Value) {
+        if self.idempotency.contains_key(&key) {
+            return;
+        }
+        self.idempotency.insert(key.clone(), result);
+        self.idempotency_order.push_back(key);
+        while self.idempotency_order.len() > MAX_IDEMPOTENCY
+            && let Some(oldest) = self.idempotency_order.pop_front()
+        {
+            self.idempotency.remove(&oldest);
+        }
+    }
+}
+
+/// The server itself. Shared behind an [`Arc`]: one accept loop, one thread
+/// per connection, all serialised on the single mutex below. v1 is a local
+/// control plane with a handful of clients, so a single lock is the right
+/// amount of machinery -- every method is a map lookup or one backend call.
+#[derive(Debug)]
+pub struct ApiServer {
+    inner: Mutex<Inner>,
+    backend: Mutex<Option<Box<dyn RuntimeBackend + Send>>>,
+    source: Box<dyn SessionSource>,
+    /// Issue #352. `None` for every server issue #353 shipped, which is why
+    /// the attachment capability is negotiated away rather than advertised
+    /// and then refused.
+    host: Mutex<Option<Arc<dyn SessionHost>>>,
+    /// Issue #489. `None` for every server that owns no native conversations,
+    /// which is why the native capability is negotiated away rather than
+    /// advertised and then refused.
+    native: Mutex<Option<Arc<dyn NativeHost>>>,
+    /// Issue #352. Serialises "mutate the host's attachment table, then
+    /// announce the controller it produced" into one critical section.
+    ///
+    /// The two pieces of state involved live behind two different mutexes --
+    /// the HOST's session table and this server's `controllers` cache -- and
+    /// composing two locks by taking them in sequence composes nothing: two
+    /// racing takeovers could each mutate the host in one order and publish in
+    /// the other, leaving every subscriber told about a controller that is no
+    /// longer the one holding the seat, until the next change happened to
+    /// correct it. Ordering the whole operation here is the smallest fix that
+    /// makes the announced controller always the one the host actually
+    /// granted; it is never held across a pty write, because the host's own
+    /// methods only touch its table.
+    attachment_gate: Mutex<()>,
+    stopping: Arc<AtomicBool>,
+    owner_uid: Option<u32>,
+}
+
+impl ApiServer {
+    pub fn new(
+        source: Box<dyn SessionSource>,
+        backend: Option<Box<dyn RuntimeBackend + Send>>,
+    ) -> Arc<Self> {
+        let server = Arc::new(Self {
+            inner: Mutex::new(Inner {
+                revision: 0,
+                sessions: BTreeMap::new(),
+                handles: BTreeMap::new(),
+                events: VecDeque::new(),
+                idempotency: BTreeMap::new(),
+                idempotency_order: VecDeque::new(),
+                subscribers: Vec::new(),
+                reported: BTreeMap::new(),
+                controllers: BTreeMap::new(),
+                live_attachments: BTreeSet::new(),
+            }),
+            backend: Mutex::new(backend),
+            source,
+            host: Mutex::new(None),
+            native: Mutex::new(None),
+            attachment_gate: Mutex::new(()),
+            stopping: Arc::new(AtomicBool::new(false)),
+            owner_uid: server_uid(),
+        });
+        server.refresh_from_source();
+        server
+    }
+
+    /// Issue #352: hands this server the runtime that owns the terminals.
+    /// Called once, by `session::service`, before the listener binds --
+    /// attaching a host mid-flight would let two connections disagree about
+    /// which capabilities were advertised to them.
+    pub fn attach_host(&self, host: Arc<dyn SessionHost>) {
+        match self.host.lock() {
+            Ok(mut guard) => *guard = Some(host),
+            Err(poisoned) => *poisoned.into_inner() = Some(host),
+        }
+    }
+
+    /// The attachment gate, poison-tolerant for the same reason `lock` is:
+    /// the state it orders is a table, not a half-written invariant, and
+    /// refusing every later attach would turn one panic into a runtime whose
+    /// sessions can never be reattached.
+    fn attachment_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.attachment_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Issue #489: hands this server the runtime that owns the native
+    /// conversations. Called once, by `session::service`, before the listener
+    /// binds -- same rule, and same reason, as [`Self::attach_host`].
+    pub fn attach_native(&self, native: Arc<dyn NativeHost>) {
+        match self.native.lock() {
+            Ok(mut guard) => *guard = Some(native),
+            Err(poisoned) => *poisoned.into_inner() = Some(native),
+        }
+    }
+
+    fn host(&self) -> Option<Arc<dyn SessionHost>> {
+        match self.host.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn native(&self) -> Option<Arc<dyn NativeHost>> {
+        match self.native.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// The native host, but only when it actually owns `session_id`. The
+    /// routing predicate for every method a server holding both hosts has to
+    /// dispatch: nothing is guessed from the session's `runtime` field, which
+    /// a registry record could carry for a session this process does not own.
+    fn native_owner(&self, session_id: &str) -> Option<Arc<dyn NativeHost>> {
+        self.native().filter(|native| native.owns(session_id))
+    }
+
+    /// What THIS server advertises, as opposed to what the protocol defines:
+    /// the attachment surface only when some host owns sessions to attach to,
+    /// and the native surface only when a native host is behind it. The
+    /// filtering is here rather than at the call sites so `hello`,
+    /// `server.capabilities` and any future advertiser cannot disagree.
+    pub fn advertised(&self) -> Vec<Capability> {
+        let attachable = self.host().is_some() || self.native().is_some();
+        let native = self.native().is_some();
+        if !attachable {
+            return ADVERTISED_WITHOUT_HOST.to_vec();
+        }
+        ADVERTISED
+            .iter()
+            .copied()
+            .filter(|capability| match capability {
+                Capability::SessionNative => native,
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn with_host<T>(
+        &self,
+        call: impl FnOnce(&dyn SessionHost) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        let Some(host) = self.host() else {
+            return Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "this server owns no terminals: attach, detach, takeover, resize and screen \
+                 need the persistent runtime (issue #352), started with `zirv session serve`",
+            ));
+        };
+        call(host.as_ref())
+    }
+
+    /// Pulls the current session facts from the source, emitting one event
+    /// per added, changed or removed session. Called once at construction
+    /// and again before every snapshot/list, so a client never sees a
+    /// registry change only after some unrelated call happened to notice it.
+    pub fn refresh_from_source(&self) {
+        let fresh = self.source.sessions();
+        let mut inner = self.lock();
+        let mut seen: Vec<String> = Vec::new();
+        for mut facts in fresh {
+            seen.push(facts.session_id.clone());
+            if let Some(reported) = inner.reported.get(&facts.session_id) {
+                facts.state = *reported;
+            }
+            match inner.sessions.get(&facts.session_id) {
+                Some(existing) if *existing == facts => {}
+                Some(_) => {
+                    inner
+                        .sessions
+                        .insert(facts.session_id.clone(), facts.clone());
+                    inner.emit(
+                        Some(facts.session_id.clone()),
+                        Some(facts.generation),
+                        ApiEvent::SessionUpdated { session: facts },
+                    );
+                }
+                None => {
+                    inner
+                        .sessions
+                        .insert(facts.session_id.clone(), facts.clone());
+                    inner.emit(
+                        Some(facts.session_id.clone()),
+                        Some(facts.generation),
+                        ApiEvent::SessionStarted { session: facts },
+                    );
+                }
+            }
+        }
+        // A session this server started itself is not in the registry, so it
+        // must not be swept by a refresh that cannot see it.
+        let gone: Vec<String> = inner
+            .sessions
+            .keys()
+            .filter(|id| !seen.contains(id) && !inner.handles.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            inner.sessions.remove(&id);
+            inner.emit(
+                Some(id.clone()),
+                None,
+                ApiEvent::SessionEnded { session_id: id },
+            );
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // A poisoned lock means a previous holder panicked mid-method. The
+        // state behind it is a session map and an event log, not a
+        // half-written invariant, and refusing every later call would turn
+        // one panic into a dead control plane -- so the guard is recovered.
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.lock().revision
+    }
+
+    pub fn hello(&self) -> Hello {
+        Hello {
+            version: PROTOCOL_VERSION,
+            server: SERVER_NAME.to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            revision: self.revision(),
+            capabilities: self.advertised(),
+        }
+    }
+
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    // -----------------------------------------------------------------
+    // Dispatch
+    // -----------------------------------------------------------------
+
+    /// Answers one request. Never panics and never blocks on the mutex for
+    /// longer than one map operation -- `session.wait` releases the lock
+    /// between polls on purpose, or one waiting client would freeze every
+    /// other one.
+    pub fn handle(&self, request: &Request) -> Response {
+        if request.version != PROTOCOL_VERSION {
+            return self.error(
+                request,
+                ApiError::new(
+                    ErrorCode::VersionMismatch,
+                    format!(
+                        "protocol version {} does not match {PROTOCOL_VERSION}",
+                        request.version
+                    ),
+                ),
+            );
+        }
+        let Some(spec) = spec_for(request.method) else {
+            return self.error(
+                request,
+                ApiError::new(ErrorCode::UnknownMethod, "unrecognized method"),
+            );
+        };
+
+        // Idempotent replay: a mutation retried with the same key returns
+        // the first attempt's result without touching the backend again.
+        let cache_key = request
+            .idempotency_key
+            .as_ref()
+            .filter(|_| spec.mutation)
+            .map(|key| {
+                let session = request
+                    .params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                format!("{}:{session}:{key}", spec.name)
+            });
+        // The lookup is its own statement on purpose: an `if let` chain
+        // would hold the guard across the `self.ok` call in its body, and
+        // `self.ok` locks again to read the revision.
+        let cached = cache_key
+            .as_ref()
+            .and_then(|key| self.lock().idempotency.get(key).cloned());
+        if let Some(cached) = cached {
+            return self.ok(request, cached);
+        }
+
+        let result = match request.method {
+            Method::ServerPing => Ok(json!({
+                "server": SERVER_NAME,
+                "server_version": env!("CARGO_PKG_VERSION"),
+                "protocol": PROTOCOL_VERSION,
+            })),
+            Method::ServerCapabilities => Ok(self.capabilities_result()),
+            Method::SessionSnapshot => Ok(self.snapshot_result()),
+            Method::SessionList => self.list_result(&request.params),
+            Method::SessionGet => self.get_result(&request.params),
+            Method::SessionStart => self.start_result(&request.params),
+            Method::SessionStop => self.stop_result(&request.params),
+            Method::SessionRead => self.read_result(&request.params),
+            Method::SessionSendInput => {
+                self.send_input_result(&request.params, request.idempotency_key.as_deref())
+            }
+            Method::SessionWait => self.wait_result(&request.params),
+            Method::SessionReportStatus => self.report_status_result(&request.params),
+            Method::SessionAttach => self.attach_result(&request.params),
+            Method::SessionDetach => self.detach_result(&request.params),
+            Method::SessionTakeover => self.takeover_result(&request.params),
+            Method::SessionResize => self.resize_result(&request.params),
+            Method::SessionScreen => self.screen_result(&request.params),
+            Method::SessionInterrupt => self.interrupt_result(&request.params),
+            Method::SessionApprove => self.approve_result(&request.params),
+            Method::SessionTaskResult => self.task_result_result(&request.params),
+            Method::SessionHistory => self.history_result(&request.params),
+            Method::SessionJournal => self.journal_result(&request.params),
+            // The reply is produced here; the streaming half lives in
+            // `serve_connection`, which is the only place that owns a
+            // connection to stream on.
+            Method::EventsSubscribe => Ok(json!({
+                "subscribed": true,
+                "revision": self.revision(),
+            })),
+            Method::Unknown => Err(ApiError::new(
+                ErrorCode::UnknownMethod,
+                "unrecognized method",
+            )),
+        };
+
+        match result {
+            Ok(value) => {
+                if let Some(key) = cache_key {
+                    self.lock().remember(key, value.clone());
+                }
+                self.ok(request, value)
+            }
+            Err(error) => self.error(request, error),
+        }
+    }
+
+    fn ok(&self, request: &Request, result: Value) -> Response {
+        Response {
+            version: PROTOCOL_VERSION,
+            id: request.id.clone(),
+            revision: self.revision(),
+            outcome: Outcome::Ok { result },
+        }
+    }
+
+    fn error(&self, request: &Request, error: ApiError) -> Response {
+        Response {
+            version: PROTOCOL_VERSION,
+            id: request.id.clone(),
+            revision: self.revision(),
+            outcome: Outcome::Error { error },
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Methods
+    // -----------------------------------------------------------------
+
+    fn capabilities_result(&self) -> Value {
+        let runtime = match self.backend.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .and_then(|backend| serde_json::to_value(backend.capabilities()).ok()),
+            Err(_) => None,
+        };
+        let advertised = self.advertised();
+        // Only the methods this server's own capabilities cover: a client
+        // reading `methods` must not find one it could never call.
+        let methods: Vec<&'static str> = super::wire::METHODS
+            .iter()
+            .filter(|spec| advertised.contains(&spec.capability))
+            .map(|spec| spec.name)
+            .collect();
+        let mut value = json!({
+            "protocol": PROTOCOL_VERSION,
+            "capabilities": advertised.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            "methods": methods,
+        });
+        if let Some(runtime) = runtime
+            && let Some(map) = value.as_object_mut()
+        {
+            map.insert("runtime".to_string(), runtime);
+        }
+        value
+    }
+
+    fn snapshot_result(&self) -> Value {
+        self.refresh_from_source();
+        let inner = self.lock();
+        json!({
+            "revision": inner.revision,
+            "sessions": inner.sessions.values().cloned().collect::<Vec<_>>(),
+        })
+    }
+
+    fn list_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Default, Deserialize)]
+        struct Params {
+            #[serde(default)]
+            state: Option<SessionState>,
+        }
+        let params: Params = parse_params(params)?;
+        self.refresh_from_source();
+        let inner = self.lock();
+        let sessions: Vec<SessionFacts> = inner
+            .sessions
+            .values()
+            .filter(|facts| params.state.is_none_or(|state| facts.state == state))
+            .cloned()
+            .collect();
+        Ok(json!({ "sessions": sessions }))
+    }
+
+    fn get_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+        }
+        let params: Params = parse_params(params)?;
+        self.refresh_from_source();
+        let inner = self.lock();
+        let facts = inner
+            .sessions
+            .get(&params.session_id)
+            .cloned()
+            .ok_or_else(|| unknown_session(&params.session_id))?;
+        Ok(json!({ "session": facts }))
+    }
+
+    fn start_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            #[serde(default)]
+            runtime: RuntimeKind,
+            #[serde(default)]
+            role: String,
+            #[serde(default)]
+            agent: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            surface: UiSurface,
+            cwd: String,
+            prompt: String,
+            /// Issue #352: the operator's own trailing arguments. Defaulted,
+            /// so a caller that never sends them is unchanged -- but parsed,
+            /// because dropping them silently is how `zirv chat -- --model x`
+            /// quietly became `zirv chat`.
+            #[serde(default)]
+            extra_args: Vec<String>,
+        }
+        let params: Params = parse_params(params)?;
+        let spec = SessionSpec {
+            runtime: params.runtime,
+            role: params.role.clone(),
+            agent: params.agent.clone(),
+            provider_route: None,
+            model: params.model.clone(),
+            surface: params.surface,
+            cwd: std::path::PathBuf::from(params.cwd),
+            prompt: params.prompt,
+            extra_args: params.extra_args,
+        };
+        // Issue #489: a native spec goes to the native host when there is one.
+        // Checked BEFORE the pty host, because `session.start` is one verb for
+        // both kinds of session -- a client that had to know which runtime it
+        // was talking to before it could ask for a session would not be
+        // speaking one protocol.
+        if spec.runtime == RuntimeKind::Native
+            && let Some(native) = self.native()
+        {
+            let facts = native.start(&spec)?;
+            let mut inner = self.lock();
+            inner
+                .sessions
+                .insert(facts.session_id.clone(), facts.clone());
+            inner.emit(
+                Some(facts.session_id.clone()),
+                Some(facts.generation),
+                ApiEvent::SessionStarted {
+                    session: facts.clone(),
+                },
+            );
+            return Ok(json!({ "session": facts }));
+        }
+        // Issue #352: a runtime that owns terminals answers `session.start`
+        // itself. Checked before the backend, and only when a host is
+        // attached at all, so the server issue #353 shipped is unaffected.
+        if let Some(host) = self.host() {
+            let facts = host.start(&spec)?;
+            let mut inner = self.lock();
+            inner
+                .sessions
+                .insert(facts.session_id.clone(), facts.clone());
+            inner.emit(
+                Some(facts.session_id.clone()),
+                Some(facts.generation),
+                ApiEvent::SessionStarted {
+                    session: facts.clone(),
+                },
+            );
+            return Ok(json!({ "session": facts }));
+        }
+        let handle = self.with_backend(|backend| backend.start(&spec))?;
+        let facts = SessionFacts {
+            session_id: handle.logical_id.clone(),
+            short: handle.short.clone(),
+            runtime: handle.runtime,
+            generation: handle.generation,
+            surface: handle.surface,
+            state: SessionState::Starting,
+            role: Some(handle.role.clone()),
+            agent: params.agent,
+            repo_slug: None,
+            started_at: None,
+            reachable: true,
+        };
+        let mut inner = self.lock();
+        inner
+            .handles
+            .insert(handle.logical_id.clone(), handle.clone());
+        inner
+            .sessions
+            .insert(facts.session_id.clone(), facts.clone());
+        inner.emit(
+            Some(facts.session_id.clone()),
+            Some(facts.generation),
+            ApiEvent::SessionStarted {
+                session: facts.clone(),
+            },
+        );
+        Ok(json!({ "session": facts }))
+    }
+
+    fn stop_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: TargetParams = parse_params(params)?;
+        let (facts, handle) = self.resolve(&params)?;
+        if facts.state == SessionState::Ended {
+            return Ok(json!({ "stopped": false }));
+        }
+        // Issue #352: a session the runtime host owns is stopped through the
+        // host's own child-termination ladder. This is the ONE path that ends
+        // a session -- `session.detach` and a dropped connection never reach
+        // it, which is what "client disconnection never terminates an agent"
+        // means in code rather than in prose.
+        match (self.native_owner(&facts.session_id), self.host(), handle) {
+            // Issue #489: a native conversation ends through its own host, so
+            // its journal is completed and its registry record released by the
+            // same code that filed them.
+            (Some(native), _, _) => {
+                native.stop(&facts.session_id)?;
+            }
+            (_, Some(host), _)
+                if host
+                    .sessions()
+                    .iter()
+                    .any(|f| f.session_id == facts.session_id) =>
+            {
+                host.stop(&facts.session_id)?;
+            }
+            (_, _, Some(handle)) => self.with_backend(|backend| backend.interrupt(&handle))?,
+            (_, _, None) => return Err(not_this_servers_session(&facts.session_id)),
+        }
+        let mut inner = self.lock();
+        if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
+            entry.state = SessionState::Ended;
+        }
+        inner
+            .reported
+            .insert(facts.session_id.clone(), SessionState::Ended);
+        inner.emit(
+            Some(facts.session_id.clone()),
+            Some(facts.generation),
+            ApiEvent::SessionEnded {
+                session_id: facts.session_id.clone(),
+            },
+        );
+        Ok(json!({ "stopped": true }))
+    }
+
+    fn read_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            after_revision: u64,
+        }
+        let params: Params = parse_params(params)?;
+        let inner = self.lock();
+        if !inner.sessions.contains_key(&params.session_id) {
+            return Err(unknown_session(&params.session_id));
+        }
+        let events: Vec<EventFrame> = inner
+            .events
+            .iter()
+            .filter(|frame| {
+                frame.revision > params.after_revision
+                    && frame.session_id.as_deref() == Some(params.session_id.as_str())
+            })
+            .cloned()
+            .collect();
+        Ok(json!({ "revision": inner.revision, "events": events }))
+    }
+
+    fn send_input_result(
+        &self,
+        params: &Value,
+        idempotency: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            input: String,
+            #[serde(default)]
+            mode: InputMode,
+            #[serde(default)]
+            client_id: Option<String>,
+        }
+        let params: Params = parse_params(params)?;
+        let target = TargetParams {
+            session_id: params.session_id.clone(),
+            generation: params.generation,
+        };
+        let (facts, handle) = self.resolve(&target)?;
+        // Issue #489: a native conversation's input is recorded durably by its
+        // own host, under the caller's idempotency key, before this method can
+        // report it accepted.
+        if let Some(native) = self.native_owner(&facts.session_id) {
+            let steering = match params.mode {
+                InputMode::Submit => false,
+                InputMode::Steer => true,
+                InputMode::Raw => {
+                    return Err(ApiError::new(
+                        ErrorCode::Unsupported,
+                        "a native session has no terminal to type raw bytes into; use mode=submit \
+                         or mode=steer",
+                    ));
+                }
+                InputMode::Unknown => {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidParams,
+                        "mode must be submit, steer or raw",
+                    ));
+                }
+            };
+            self.native_controller_check(
+                native.as_ref(),
+                &facts.session_id,
+                params.client_id.as_deref(),
+            )?;
+            let ack = native.submit(&facts.session_id, &params.input, steering, idempotency)?;
+            if !ack.duplicate {
+                // Refreshed rather than stamped `working`: the native host
+                // knows whether a turn is actually in flight (it is what
+                // spawned the runner), so recording a state the server merely
+                // ASSUMES would leave a conversation reading "working" after
+                // its turn had already finished. The refresh emits whatever
+                // really changed.
+                self.refresh_from_source();
+            }
+            return Ok(json!({
+                "accepted": true,
+                "message_id": ack.message_id,
+                "duplicate": ack.duplicate,
+            }));
+        }
+        // Issue #352: raw bytes belong to the terminal, so they go to the
+        // runtime host and never to a `RuntimeBackend` -- a backend has no
+        // keyboard. Handled before the handle lookup below, because a
+        // host-owned session has no backend handle at all.
+        if params.mode == InputMode::Raw {
+            let Some(client_id) = params.client_id.as_deref() else {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParams,
+                    "mode=raw needs client_id: only the session's controller may type into it",
+                ));
+            };
+            self.with_host(|host| {
+                host.write_raw(&params.session_id, client_id, params.input.as_bytes())
+            })?;
+            return Ok(json!({ "accepted": true }));
+        }
+        let handle = handle.ok_or_else(|| not_this_servers_session(&facts.session_id))?;
+        match params.mode {
+            InputMode::Submit => {
+                self.with_backend(|backend| backend.submit(&handle, &params.input))
+            }
+            InputMode::Steer => self.with_backend(|backend| backend.steer(&handle, &params.input)),
+            // Handled above; repeated here only because the match is
+            // exhaustive over the vocabulary.
+            InputMode::Raw => Ok(()),
+            InputMode::Unknown => Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "mode must be submit, steer or raw",
+            )),
+        }?;
+        self.mark_working(&facts);
+        Ok(json!({ "accepted": true }))
+    }
+
+    /// Records that a session has a turn in flight and announces it. Factored
+    /// out because both the backend path and issue #489's native path owe the
+    /// same state change, and two copies would be two chances to forget the
+    /// `reported` entry that keeps a refresh from undoing it.
+    fn mark_working(&self, facts: &SessionFacts) {
+        let mut inner = self.lock();
+        if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
+            entry.state = SessionState::Working;
+            let updated = entry.clone();
+            inner
+                .reported
+                .insert(facts.session_id.clone(), SessionState::Working);
+            inner.emit(
+                Some(facts.session_id.clone()),
+                Some(facts.generation),
+                ApiEvent::SessionUpdated { session: updated },
+            );
+        }
+    }
+
+    fn report_status_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            state: SessionState,
+        }
+        let params: Params = parse_params(params)?;
+        let target = TargetParams {
+            session_id: params.session_id.clone(),
+            generation: params.generation,
+        };
+        let (facts, _) = self.resolve(&target)?;
+        let mut inner = self.lock();
+        let Some(entry) = inner.sessions.get_mut(&facts.session_id) else {
+            return Err(unknown_session(&facts.session_id));
+        };
+        entry.state = params.state;
+        let updated = entry.clone();
+        inner
+            .reported
+            .insert(facts.session_id.clone(), params.state);
+        inner.emit(
+            Some(facts.session_id.clone()),
+            Some(facts.generation),
+            ApiEvent::SessionUpdated { session: updated },
+        );
+        Ok(json!({ "recorded": true }))
+    }
+
+    // -----------------------------------------------------------------
+    // Native sessions (issue #489)
+    // -----------------------------------------------------------------
+
+    /// Issue #489's controller rule, in one place so all five native
+    /// mutations cannot enforce it five different ways.
+    ///
+    /// A session NOBODY has attached to is driven by whoever can reach the
+    /// owner-only endpoint -- which is exactly the rule that applied before
+    /// this issue, and the rule a headless `zirv ctx exec` needs. The moment
+    /// any client attaches, seats exist to arbitrate between them, and every
+    /// mutation must name a `client_id` holding the controller seat. That
+    /// closes both halves of "observers cannot mutate state": an observer
+    /// naming itself is refused because it is not the controller, and an
+    /// observer omitting the field is refused because a session with clients
+    /// requires one.
+    fn native_controller_check(
+        &self,
+        native: &dyn NativeHost,
+        session_id: &str,
+        client_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let (attached, controller) = native.seat(session_id)?;
+        if !attached {
+            return Ok(());
+        }
+        let Some(client_id) = client_id else {
+            return Err(ApiError::new(
+                ErrorCode::Denied,
+                "this session has attached clients: name your client_id, and it must be the one \
+                 holding the controller seat",
+            ));
+        };
+        if controller.as_deref() == Some(client_id) {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ErrorCode::Denied,
+            match controller {
+                Some(current) => format!(
+                    "{current} holds this session's controller seat; an observer may watch but not \
+                     drive it -- `session.takeover` takes the seat explicitly"
+                ),
+                None => "no client holds this session's controller seat; attach as controller \
+                         before driving it"
+                    .to_string(),
+            },
+        ))
+    }
+
+    /// Resolves a native session, enforces the generation pin, and hands back
+    /// the host that owns it. Every native method starts here, so a call
+    /// naming a pty session or one this server merely read out of the registry
+    /// is refused by code rather than by coincidence.
+    fn native_for(
+        &self,
+        session_id: &str,
+        generation: Option<u64>,
+    ) -> Result<(SessionFacts, Arc<dyn NativeHost>), ApiError> {
+        if self.native().is_none() {
+            return Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "this server owns no native conversations: interrupt, approve, task_result, \
+                 history and journal need the persistent runtime's native integration (issue \
+                 #489), started with `zirv session serve`",
+            ));
+        }
+        let facts = self.pinned_facts(session_id, generation)?;
+        let native = self.native_owner(&facts.session_id).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Unsupported,
+                format!("session {session_id} is not a native conversation this runtime owns"),
+            )
+        })?;
+        Ok((facts, native))
+    }
+
+    fn interrupt_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: NativeParams = parse_params(params)?;
+        let (facts, native) = self.native_for(&params.session_id, params.generation)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let interrupted = native.interrupt(&facts.session_id)?;
+        if interrupted {
+            // An interrupt ends the TURN, never the session: the facts move to
+            // idle and the session stays reachable. `session.stop` is still
+            // the only method that ends one.
+            let mut inner = self.lock();
+            if let Some(entry) = inner.sessions.get_mut(&facts.session_id) {
+                entry.state = SessionState::Idle;
+                let updated = entry.clone();
+                inner
+                    .reported
+                    .insert(facts.session_id.clone(), SessionState::Idle);
+                inner.emit(
+                    Some(facts.session_id.clone()),
+                    Some(facts.generation),
+                    ApiEvent::SessionUpdated { session: updated },
+                );
+            }
+        }
+        Ok(json!({ "interrupted": interrupted }))
+    }
+
+    fn approve_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            #[serde(default)]
+            client_id: Option<String>,
+            request_id: String,
+            decision: ApprovalDecision,
+            #[serde(default)]
+            note: Option<String>,
+        }
+        let params: Params = parse_params(params)?;
+        if params.decision == ApprovalDecision::Unknown {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "decision must be allow or deny",
+            ));
+        }
+        let (facts, native) = self.native_for(&params.session_id, params.generation)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let recorded = native.approve(
+            &facts.session_id,
+            &params.request_id,
+            params.decision,
+            params.note.as_deref(),
+        )?;
+        Ok(json!({ "recorded": recorded }))
+    }
+
+    fn task_result_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            #[serde(default)]
+            client_id: Option<String>,
+            task_id: String,
+            outcome: TaskOutcome,
+            #[serde(default)]
+            receipt: Value,
+        }
+        let params: Params = parse_params(params)?;
+        if params.outcome == TaskOutcome::Unknown {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "outcome must be one of the published task_outcome values",
+            ));
+        }
+        let (facts, native) = self.native_for(&params.session_id, params.generation)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let receipt = if params.receipt.is_null() {
+            json!({})
+        } else {
+            params.receipt
+        };
+        let recorded =
+            native.task_result(&facts.session_id, &params.task_id, params.outcome, &receipt)?;
+        Ok(json!({ "recorded": recorded }))
+    }
+
+    fn history_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: CursorParams = parse_params(params)?;
+        let (facts, native) = self.native_for(&params.session_id, None)?;
+        // A read, but the same seat rule: conversation text is the one thing
+        // this protocol publishes that a bystander must not simply ask for.
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let mut history = native.history(
+            &facts.session_id,
+            params.after_sequence,
+            params.limit.unwrap_or(MAX_PAGE).min(MAX_PAGE),
+        )?;
+        let byte_limit = MAX_FRAME_BYTES as usize - 64 * 1024;
+        while history.entries.len() > 1
+            && serde_json::to_vec(&history).is_ok_and(|encoded| encoded.len() > byte_limit)
+        {
+            history.entries.pop();
+        }
+        history.cursor = history
+            .entries
+            .last()
+            .map_or(params.after_sequence, |entry| entry.sequence);
+        if serde_json::to_vec(&history).is_ok_and(|encoded| encoded.len() > byte_limit) {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "one history entry exceeds the protocol frame limit",
+            ));
+        }
+        serde_json::to_value(history)
+            .map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))
+    }
+
+    fn journal_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: CursorParams = parse_params(params)?;
+        let (facts, native) = self.native_for(&params.session_id, None)?;
+        self.native_controller_check(
+            native.as_ref(),
+            &facts.session_id,
+            params.client_id.as_deref(),
+        )?;
+        let page = native.journal(
+            &facts.session_id,
+            params.after_sequence,
+            params.limit.unwrap_or(MAX_PAGE).min(MAX_PAGE),
+        )?;
+        Ok(json!({ "page": page }))
+    }
+
+    // -----------------------------------------------------------------
+    // Attachment (issue #352)
+    // -----------------------------------------------------------------
+
+    /// Every attachment method takes the same three things, so they parse the
+    /// same struct: which session, which client, and (for the two that can
+    /// move a terminal) how big the caller's own window is.
+    fn attach_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            client_id: String,
+            #[serde(default)]
+            mode: AttachMode,
+            #[serde(default)]
+            rows: Option<u16>,
+            #[serde(default)]
+            cols: Option<u16>,
+        }
+        let params: Params = parse_params(params)?;
+        if params.mode == AttachMode::Unknown {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "mode must be observer or controller",
+            ));
+        }
+        // The generation pin is enforced against the server's own view before
+        // the host is touched at all, exactly like every other mutation: an
+        // attach to a session that has been replaced must fail rather than
+        // silently land on the replacement.
+        let facts = self.pinned_facts(&params.session_id, params.generation)?;
+        let size = match (params.rows, params.cols) {
+            (Some(rows), Some(cols)) => Some((rows, cols)),
+            _ => None,
+        };
+        // Held across both the host mutation and the announcement: see
+        // `attachment_gate`.
+        let gate = self.attachment_gate();
+        // Issue #489: the attachment surface is one surface for both kinds of
+        // session. A native conversation has seats and no terminal, so the
+        // size is simply not passed on -- there is nothing to resize.
+        let attachment = match self.native_owner(&params.session_id) {
+            Some(native) => native.attach(&params.session_id, &params.client_id, params.mode)?,
+            None => self.with_host(|host| {
+                host.attach(&params.session_id, &params.client_id, params.mode, size)
+            })?,
+        };
+        self.publish_controller(&facts, &attachment);
+        drop(gate);
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn detach_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: ClientParams = parse_params(params)?;
+        let facts = self.pinned_facts(&params.session_id, None)?;
+        // Deliberately nothing else: detaching is a CLIENT lifecycle event.
+        // The session keeps its process, its pty or its journal, its
+        // supervisor and its state -- `session.stop` is the only method that
+        // ends one, and `session.interrupt` the only one that cancels a turn.
+        let gate = self.attachment_gate();
+        let attachment = match self.native_owner(&params.session_id) {
+            Some(native) => native.detach(&params.session_id, &params.client_id)?,
+            None => self.with_host(|host| host.detach(&params.session_id, &params.client_id))?,
+        };
+        self.publish_controller(&facts, &attachment);
+        drop(gate);
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn takeover_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: ClientParams = parse_params(params)?;
+        let facts = self.pinned_facts(&params.session_id, None)?;
+        let gate = self.attachment_gate();
+        let attachment = match self.native_owner(&params.session_id) {
+            Some(native) => native.takeover(&params.session_id, &params.client_id)?,
+            None => self.with_host(|host| host.takeover(&params.session_id, &params.client_id))?,
+        };
+        self.publish_controller(&facts, &attachment);
+        drop(gate);
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn resize_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            client_id: String,
+            rows: u16,
+            cols: u16,
+        }
+        let params: Params = parse_params(params)?;
+        self.pinned_facts(&params.session_id, None)?;
+        no_terminal_here(self.native_owner(&params.session_id).is_some(), "resize")?;
+        let attachment = self.with_host(|host| {
+            host.resize(
+                &params.session_id,
+                &params.client_id,
+                params.rows,
+                params.cols,
+            )
+        })?;
+        Ok(json!({ "attachment": attachment }))
+    }
+
+    fn screen_result(&self, params: &Value) -> Result<Value, ApiError> {
+        let params: ClientParams = parse_params(params)?;
+        self.pinned_facts(&params.session_id, None)?;
+        no_terminal_here(self.native_owner(&params.session_id).is_some(), "screen")?;
+        let screen = self.with_host(|host| host.screen(&params.session_id, &params.client_id))?;
+        Ok(json!({ "revision": self.revision(), "screen": screen }))
+    }
+
+    /// The session the server knows under `session_id`, with the caller's
+    /// generation pin enforced. A host-owned session is always in the
+    /// server's own map, because the host is its session source.
+    fn pinned_facts(
+        &self,
+        session_id: &str,
+        generation: Option<u64>,
+    ) -> Result<SessionFacts, ApiError> {
+        let target = TargetParams {
+            session_id: session_id.to_string(),
+            generation,
+        };
+        self.resolve(&target).map(|(facts, _)| facts)
+    }
+
+    /// One `controller_changed` per ACTUAL change, never per call: a client
+    /// that re-attaches as an observer while somebody else is typing must not
+    /// make every other observer redraw a takeover banner.
+    fn publish_controller(&self, facts: &SessionFacts, attachment: &Attachment) {
+        let mut inner = self.lock();
+        let previous = inner.controllers.get(&facts.session_id).cloned().flatten();
+        if previous == attachment.controller {
+            return;
+        }
+        inner
+            .controllers
+            .insert(facts.session_id.clone(), attachment.controller.clone());
+        inner.emit(
+            Some(facts.session_id.clone()),
+            Some(facts.generation),
+            ApiEvent::ControllerChanged {
+                controller: attachment.controller.clone(),
+            },
+        );
+    }
+
+    /// Waits are PINNED: the generation resolved at call time is compared on
+    /// every poll, so a session that is replaced while the wait is running
+    /// fails the wait with `stale_generation` instead of letting the
+    /// replacement satisfy it.
+    fn wait_result(&self, params: &Value) -> Result<Value, ApiError> {
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            generation: Option<u64>,
+            #[serde(default)]
+            until: WaitUntil,
+            #[serde(default)]
+            timeout_ms: Option<u64>,
+        }
+        let params: Params = parse_params(params)?;
+        if params.until == WaitUntil::Unknown {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParams,
+                "until must be idle or ended",
+            ));
+        }
+        let target = TargetParams {
+            session_id: params.session_id.clone(),
+            generation: params.generation,
+        };
+        let (facts, _) = self.resolve(&target)?;
+        let pinned = facts.generation;
+        let budget = params
+            .timeout_ms
+            .unwrap_or(DEFAULT_WAIT_MS)
+            .min(MAX_WAIT_MS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
+
+        loop {
+            let observed = {
+                let inner = self.lock();
+                inner.sessions.get(&params.session_id).cloned()
+            };
+            let Some(observed) = observed else {
+                return Err(unknown_session(&params.session_id));
+            };
+            if observed.generation != pinned {
+                return Err(ApiError::new(
+                    ErrorCode::StaleGeneration,
+                    format!(
+                        "session {} moved from generation {pinned} to {} while the wait was running",
+                        params.session_id, observed.generation
+                    ),
+                ));
+            }
+            let matched = match params.until {
+                WaitUntil::Idle => observed.state == SessionState::Idle,
+                WaitUntil::Ended => observed.state == SessionState::Ended,
+                WaitUntil::Unknown => false,
+            };
+            if matched {
+                return Ok(json!({
+                    "outcome": "matched",
+                    "state": observed.state,
+                    "generation": pinned,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(json!({
+                    "outcome": "timeout",
+                    "state": observed.state,
+                    "generation": pinned,
+                }));
+            }
+            std::thread::sleep(WAIT_POLL);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Shared helpers
+    // -----------------------------------------------------------------
+
+    /// Resolves a session and enforces the generation pin. A caller that
+    /// names a generation which is not the session's current one is refused
+    /// with `stale_generation` in BOTH directions: an older pin means the
+    /// session has been replaced, a newer one means the caller is talking
+    /// about a session this server has never seen.
+    fn resolve(
+        &self,
+        params: &TargetParams,
+    ) -> Result<(SessionFacts, Option<SessionHandle>), ApiError> {
+        let inner = self.lock();
+        let facts = inner
+            .sessions
+            .get(&params.session_id)
+            .cloned()
+            .ok_or_else(|| unknown_session(&params.session_id))?;
+        if let Some(pinned) = params.generation
+            && pinned != facts.generation
+        {
+            return Err(ApiError::new(
+                ErrorCode::StaleGeneration,
+                format!(
+                    "session {} is at generation {}, not {pinned}",
+                    params.session_id, facts.generation
+                ),
+            ));
+        }
+        let handle = inner.handles.get(&params.session_id).cloned();
+        Ok((facts, handle))
+    }
+
+    fn with_backend<T>(
+        &self,
+        call: impl FnOnce(&mut dyn RuntimeBackend) -> CtxResult<T>,
+    ) -> Result<T, ApiError> {
+        let mut guard = match self.backend.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(backend) = guard.as_mut() else {
+            return Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "this server has no runtime backend attached: session mutations arrive with the \
+                 persistent runtime (issue #352) and its native integration (issue #489)",
+            ));
+        };
+        call(backend.as_mut()).map_err(|error| backend_error(error.as_ref()))
+    }
+
+    // -----------------------------------------------------------------
+    // Serving a connection
+    // -----------------------------------------------------------------
+
+    /// Drives one accepted connection to completion: the hello handshake,
+    /// then request/reply, then -- if the client subscribed -- the event
+    /// stream until it disconnects or the server stops.
+    pub fn serve_connection(self: &Arc<Self>, mut connection: Connection) -> CtxResult<()> {
+        if !connection.peer().is_same_user(self.owner_uid) {
+            // Answered rather than dropped silently, so a legitimate client
+            // that somehow reaches the wrong endpoint sees why.
+            let _ = connection.write_frame(&super::wire::ServerFrame::Response(Response {
+                version: PROTOCOL_VERSION,
+                id: String::new(),
+                revision: self.revision(),
+                outcome: Outcome::Error {
+                    error: ApiError::new(
+                        ErrorCode::Denied,
+                        "this endpoint serves only the user that owns it",
+                    ),
+                },
+            }));
+            return Ok(());
+        }
+        connection.write_frame(&super::wire::ServerFrame::Hello(self.hello()))?;
+
+        let mut attachments: Vec<(String, String)> = Vec::new();
+        let result = (|| -> CtxResult<()> {
+            while let Some(request) = connection.read_frame::<Request>()? {
+                let subscribing = request.method == Method::EventsSubscribe
+                    && request.version == PROTOCOL_VERSION;
+                let attachment = if request.version == PROTOCOL_VERSION
+                    && matches!(
+                        request.method,
+                        Method::SessionAttach | Method::SessionTakeover | Method::SessionDetach
+                    ) {
+                    match (
+                        request.params.get("session_id").and_then(Value::as_str),
+                        request.params.get("client_id").and_then(Value::as_str),
+                    ) {
+                        (Some(session_id), Some(client_id)) => {
+                            Some((session_id.to_string(), client_id.to_string()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let locally_owned = attachment
+                    .as_ref()
+                    .is_some_and(|attachment| attachments.contains(attachment));
+                let mut reserved = false;
+                let refused = if matches!(
+                    request.method,
+                    Method::SessionAttach | Method::SessionTakeover
+                ) && !locally_owned
+                    && let Some(attachment) = attachment.as_ref()
+                {
+                    let mut inner = self.lock();
+                    if inner.live_attachments.insert(attachment.clone()) {
+                        reserved = true;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    request.method == Method::SessionDetach
+                        && attachment.is_some()
+                        && !locally_owned
+                };
+                let response = if refused {
+                    Response {
+                        version: PROTOCOL_VERSION,
+                        id: request.id.clone(),
+                        revision: self.revision(),
+                        outcome: Outcome::Error {
+                            error: ApiError::new(
+                                ErrorCode::Busy,
+                                "this client attachment belongs to another live connection",
+                            ),
+                        },
+                    }
+                } else {
+                    self.handle(&request)
+                };
+                let accepted = matches!(response.outcome, Outcome::Ok { .. });
+                if reserved
+                    && !accepted
+                    && let Some(attachment) = attachment.as_ref()
+                {
+                    self.lock().live_attachments.remove(attachment);
+                }
+                if accepted
+                    && matches!(
+                        request.method,
+                        Method::SessionAttach | Method::SessionTakeover
+                    )
+                    && let (Some(session_id), Some(client_id)) = (
+                        request.params.get("session_id").and_then(Value::as_str),
+                        request.params.get("client_id").and_then(Value::as_str),
+                    )
+                {
+                    let attachment = (session_id.to_string(), client_id.to_string());
+                    if !attachments.contains(&attachment) {
+                        attachments.push(attachment);
+                    }
+                } else if accepted
+                    && request.method == Method::SessionDetach
+                    && let (Some(session_id), Some(client_id)) = (
+                        request.params.get("session_id").and_then(Value::as_str),
+                        request.params.get("client_id").and_then(Value::as_str),
+                    )
+                {
+                    attachments
+                        .retain(|entry| entry != &(session_id.to_string(), client_id.to_string()));
+                    self.lock()
+                        .live_attachments
+                        .remove(&(session_id.to_string(), client_id.to_string()));
+                }
+                let after_revision = subscription_start(&request.params);
+                let receiver = if subscribing && accepted {
+                    Some(self.subscribe(after_revision))
+                } else {
+                    None
+                };
+                connection.write_frame(&super::wire::ServerFrame::Response(response))?;
+                if let Some((receiver, backlog)) = receiver {
+                    for frame in backlog {
+                        connection.write_frame(&super::wire::ServerFrame::Event(frame))?;
+                    }
+                    return self.pump(&mut connection, receiver);
+                }
+            }
+            Ok(())
+        })();
+        for (session_id, client_id) in attachments {
+            let _ =
+                self.detach_result(&json!({ "session_id": session_id, "client_id": client_id }));
+            self.lock()
+                .live_attachments
+                .remove(&(session_id, client_id));
+        }
+        result
+    }
+
+    /// Registers a subscriber and returns its channel plus everything it
+    /// missed, both computed under ONE lock so no event can slip between
+    /// the backlog and the live stream.
+    fn subscribe(&self, after_revision: u64) -> (Receiver<EventFrame>, Vec<EventFrame>) {
+        let (tx, rx) = sync_channel(MAX_SUBSCRIBER_BACKLOG);
+        let mut inner = self.lock();
+        inner.subscribers.push(tx);
+        let backlog = inner
+            .events
+            .iter()
+            .filter(|frame| frame.revision > after_revision)
+            .cloned()
+            .collect();
+        (rx, backlog)
+    }
+
+    fn pump(&self, connection: &mut Connection, receiver: Receiver<EventFrame>) -> CtxResult<()> {
+        loop {
+            if self.stopping() {
+                return Ok(());
+            }
+            match receiver.recv_timeout(SUBSCRIBE_POLL) {
+                Ok(frame) => connection.write_frame(&super::wire::ServerFrame::Event(frame))?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+
+    /// The retained event log, for the frozen-fixture guard in
+    /// `super::fixtures`, which has to freeze event frames a reply never
+    /// carries.
+    #[cfg(test)]
+    pub fn frozen_events(&self) -> Vec<EventFrame> {
+        self.lock().events.iter().cloned().collect()
+    }
+
+    /// The emit seam a runtime owner drives events through without going via
+    /// a mutation method -- the tests below, and issue #489's native session
+    /// integration. Nothing inside this module calls it, hence the allow.
+    #[allow(dead_code)]
+    pub fn publish(&self, session_id: Option<String>, generation: Option<u64>, event: ApiEvent) {
+        self.lock().emit(session_id, generation, event);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TargetParams {
+    session_id: String,
+    #[serde(default)]
+    generation: Option<u64>,
+}
+
+/// Issue #352: what `detach`, `takeover` and `screen` all take.
+#[derive(Debug, Deserialize)]
+struct ClientParams {
+    session_id: String,
+    client_id: String,
+}
+
+/// Issue #489: what a native mutation that carries no payload of its own
+/// takes. `client_id` is optional on the wire and enforced conditionally --
+/// see [`ApiServer::native_controller_check`].
+#[derive(Debug, Deserialize)]
+struct NativeParams {
+    session_id: String,
+    #[serde(default)]
+    generation: Option<u64>,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+/// Issue #489: what the two cursor reads take.
+#[derive(Debug, Deserialize)]
+struct CursorParams {
+    session_id: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    after_sequence: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Issue #489: the two terminal-shaped attachment verbs refused for a native
+/// conversation, by name rather than by a confusing "this server owns no
+/// terminals" from a server that owns plenty -- just not one for this session.
+fn no_terminal_here(is_native: bool, verb: &str) -> Result<(), ApiError> {
+    if !is_native {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorCode::Unsupported,
+        format!(
+            "this is a native conversation, not a terminal: `session.{verb}` has nothing to act \
+             on. Read it with `session.history` and drive it with `session.send_input`."
+        ),
+    ))
+}
+
+fn subscription_start(params: &Value) -> u64 {
+    params
+        .get("after_revision")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// `params` is optional on the wire, so a missing value must read as an
+/// empty object rather than as a parse failure.
+fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, ApiError> {
+    let value = if params.is_null() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        params.clone()
+    };
+    serde_json::from_value(value)
+        .map_err(|error| ApiError::new(ErrorCode::InvalidParams, error.to_string()))
+}
+
+fn unknown_session(session_id: &str) -> ApiError {
+    ApiError::new(
+        ErrorCode::UnknownSession,
+        format!("no session {session_id}"),
+    )
+}
+
+fn not_this_servers_session(session_id: &str) -> ApiError {
+    ApiError::new(
+        ErrorCode::Unsupported,
+        format!(
+            "session {session_id} is not driven by this server: it came from the session registry, \
+             and PTY ownership stays with the dashboard until the persistent runtime (issue #352)"
+        ),
+    )
+}
+
+/// Maps a backend failure onto a structured code, reusing the same four
+/// `RuntimeError` classes `runtime::protocol::dispatch` already
+/// distinguishes so the public protocol and the in-process one cannot
+/// disagree about what a given failure means.
+fn backend_error(error: &(dyn std::error::Error + 'static)) -> ApiError {
+    let code = match error.downcast_ref::<RuntimeError>() {
+        Some(RuntimeError::Unsupported(_)) => ErrorCode::Unsupported,
+        Some(RuntimeError::UnknownSession(_)) => ErrorCode::UnknownSession,
+        Some(RuntimeError::Busy(_)) => ErrorCode::Busy,
+        Some(RuntimeError::StaleGeneration { .. }) => ErrorCode::StaleGeneration,
+        None => ErrorCode::Internal,
+    };
+    ApiError::new(code, error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The listening half
+// ---------------------------------------------------------------------------
+
+/// A bound endpoint with an accept loop behind it. Dropping it stops the
+/// loop and removes the endpoint.
+#[derive(Debug)]
+pub struct RunningServer {
+    server: Arc<ApiServer>,
+    listener: Arc<Listener>,
+    endpoint: Endpoint,
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunningServer {
+    pub fn start(endpoint: &Endpoint, server: Arc<ApiServer>) -> CtxResult<Self> {
+        let listener = Arc::new(Listener::bind(endpoint)?);
+        let accept_listener = Arc::clone(&listener);
+        let accept_server = Arc::clone(&server);
+        let accept = std::thread::spawn(move || {
+            loop {
+                if accept_server.stopping() {
+                    return;
+                }
+                let Ok(connection) = accept_listener.accept() else {
+                    // A failed accept on a stopping server is the wake-up
+                    // connection; on a live one it is a transient OS error
+                    // worth one more attempt rather than a dead endpoint.
+                    if accept_server.stopping() {
+                        return;
+                    }
+                    continue;
+                };
+                if accept_server.stopping() {
+                    return;
+                }
+                let connection_server = Arc::clone(&accept_server);
+                std::thread::spawn(move || {
+                    let _ = connection_server.serve_connection(connection);
+                });
+            }
+        });
+        Ok(Self {
+            server,
+            listener,
+            endpoint: endpoint.clone(),
+            accept: Some(accept),
+        })
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        self.server.stop();
+        self.listener.wake();
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+    }
+}
+
+/// The endpoint the CLI wrappers use: always derived from the resolved state
+/// directory, never from anything a repository controls.
+pub fn endpoint_for(state: &StateDir) -> Endpoint {
+    Endpoint::for_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::ctx::api::wire::{HistoryEntry, HistoryRole, ServerFrame};
+    use crate::commands::ctx::runtime::fake::FakeNativeBackend;
+
+    fn facts(id: &str, state: SessionState) -> SessionFacts {
+        let mut facts = SessionFacts::new(id);
+        facts.state = state;
+        facts.agent = Some("claude".to_string());
+        facts.repo_slug = Some("zirv-cli".to_string());
+        facts.reachable = true;
+        facts
+    }
+
+    fn server_with(sessions: Vec<SessionFacts>) -> Arc<ApiServer> {
+        ApiServer::new(
+            Box::new(StaticSource(sessions)),
+            Some(Box::new(FakeNativeBackend::new())),
+        )
+    }
+
+    fn call(server: &Arc<ApiServer>, method: Method, params: Value) -> Response {
+        server.handle(&Request::new("r", method, params))
+    }
+
+    fn result(response: &Response) -> Value {
+        match &response.outcome {
+            Outcome::Ok { result } => result.clone(),
+            other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
+    fn error(response: &Response) -> ApiError {
+        match &response.outcome {
+            Outcome::Error { error } => error.clone(),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_reports_the_server_identity_and_protocol_version() {
+        let server = server_with(Vec::new());
+        let value = result(&call(&server, Method::ServerPing, Value::Null));
+        assert_eq!(value["server"], json!(SERVER_NAME));
+        assert_eq!(value["protocol"], json!(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn a_request_at_another_protocol_version_is_refused() {
+        let server = server_with(Vec::new());
+        let mut request = Request::new("r", Method::ServerPing, Value::Null);
+        request.version = 99;
+        assert_eq!(
+            error(&server.handle(&request)).code,
+            ErrorCode::VersionMismatch
+        );
+    }
+
+    #[test]
+    fn an_unknown_method_is_refused_rather_than_guessed_at() {
+        let server = server_with(Vec::new());
+        let request: Request =
+            serde_json::from_str(r#"{"v":1,"id":"r","method":"session.levitate"}"#).expect("parse");
+        assert_eq!(
+            error(&server.handle(&request)).code,
+            ErrorCode::UnknownMethod
+        );
+    }
+
+    /// Issue #353: "Session IDs remain stable across focus, layout, worktree,
+    /// and client changes." Nothing a client does can change one: the only
+    /// client-owned axis on the wire is `surface`, and changing it leaves the
+    /// id, short id and generation alone.
+    #[test]
+    fn session_ids_are_stable_across_client_and_surface_changes() {
+        let mut first = facts("11111111-2222-4333-8444-555555555555", SessionState::Idle);
+        let server = ApiServer::new(Box::new(StaticSource(vec![first.clone()])), None);
+        let before = result(&call(&server, Method::SessionSnapshot, Value::Null));
+
+        // The same session, now looked at by a dashboard pane in a different
+        // worktree, reported by the source on a later refresh.
+        first.surface = UiSurface::DashboardPane;
+        first.repo_slug = Some("some-other-worktree".to_string());
+        let server = ApiServer::new(Box::new(StaticSource(vec![first.clone()])), None);
+        let after = result(&call(&server, Method::SessionSnapshot, Value::Null));
+
+        assert_eq!(
+            before["sessions"][0]["session_id"],
+            after["sessions"][0]["session_id"]
+        );
+        assert_eq!(
+            before["sessions"][0]["short"],
+            after["sessions"][0]["short"]
+        );
+        assert_eq!(
+            before["sessions"][0]["generation"],
+            after["sessions"][0]["generation"]
+        );
+        assert_ne!(
+            before["sessions"][0]["surface"], after["sessions"][0]["surface"],
+            "the surface is the one axis a client change moves"
+        );
+    }
+
+    #[test]
+    fn get_reports_an_unknown_session_by_code() {
+        let server = server_with(Vec::new());
+        let response = call(
+            &server,
+            Method::SessionGet,
+            json!({"session_id": "nobody-home"}),
+        );
+        assert_eq!(error(&response).code, ErrorCode::UnknownSession);
+    }
+
+    #[test]
+    fn list_filters_by_state() {
+        let server = server_with(vec![
+            facts("aaaaaaaa-0000-4000-8000-000000000001", SessionState::Idle),
+            facts(
+                "bbbbbbbb-0000-4000-8000-000000000002",
+                SessionState::Working,
+            ),
+        ]);
+        let value = result(&call(
+            &server,
+            Method::SessionList,
+            json!({"state": "idle"}),
+        ));
+        let sessions = value["sessions"].as_array().expect("array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["state"], json!("idle"));
+    }
+
+    /// Every emitted event moves the revision by exactly one, which is what
+    /// makes a gap detectable at all.
+    #[test]
+    fn every_event_advances_the_revision_by_exactly_one() {
+        let server = server_with(Vec::new());
+        let before = server.revision();
+        server.publish(Some("s".to_string()), Some(1), ApiEvent::Heartbeat);
+        server.publish(Some("s".to_string()), Some(1), ApiEvent::Heartbeat);
+        assert_eq!(server.revision(), before + 2);
+        let inner = server.lock();
+        let revisions: Vec<u64> = inner.events.iter().map(|frame| frame.revision).collect();
+        for pair in revisions.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "revisions must be consecutive");
+        }
+    }
+
+    /// Issue #353: "Mutations are idempotent where retrying could otherwise
+    /// duplicate work." The retry must not reach the backend a second time,
+    /// which is proven by the event log rather than by the reply alone.
+    #[test]
+    fn a_retried_mutation_with_the_same_key_does_not_duplicate_work() {
+        let server = server_with(vec![facts(
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            SessionState::Idle,
+        )]);
+        let start = Request::new(
+            "r1",
+            Method::SessionStart,
+            json!({"cwd": ".", "prompt": "go", "role": "worker"}),
+        )
+        .with_idempotency_key("start-once");
+        let first = server.handle(&start);
+        let created = result(&first)["session"].clone();
+        let revision_after_first = server.revision();
+
+        let retry = Request::new(
+            "r2",
+            Method::SessionStart,
+            json!({"cwd": ".", "prompt": "go", "role": "worker"}),
+        )
+        .with_idempotency_key("start-once");
+        let second = server.handle(&retry);
+        assert_eq!(
+            result(&second)["session"],
+            created,
+            "same session, not a new one"
+        );
+        assert_eq!(
+            server.revision(),
+            revision_after_first,
+            "the retry must emit no second session_started event"
+        );
+        let inner = server.lock();
+        assert_eq!(
+            inner.handles.len(),
+            1,
+            "the backend must have been asked to start exactly one session"
+        );
+    }
+
+    /// The same retry without a key is a genuinely new call -- idempotency is
+    /// opt-in, so a client that does not ask for it is not silently given it.
+    #[test]
+    fn a_mutation_without_an_idempotency_key_is_not_deduplicated() {
+        let server = server_with(Vec::new());
+        let params = json!({"cwd": ".", "prompt": "go", "role": "worker"});
+        let _ = call(&server, Method::SessionStart, params.clone());
+        let _ = call(&server, Method::SessionStart, params);
+        assert_eq!(server.lock().handles.len(), 2);
+    }
+
+    /// Issue #353: "Waits pin the resolved session generation so a
+    /// replacement cannot satisfy an old wait."
+    #[test]
+    fn a_wait_is_refused_once_the_session_generation_moves() {
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let server = server_with(vec![facts(id, SessionState::Working)]);
+        let waiting = Arc::clone(&server);
+        let session = id.to_string();
+        // The pin is explicit, so this test cannot race: whether the
+        // replacement lands before the wait resolves (refused at resolve
+        // time) or after (refused by the poll), the answer is the same
+        // stale_generation.
+        let waiter = std::thread::spawn(move || {
+            waiting.handle(&Request::new(
+                "w",
+                Method::SessionWait,
+                json!({"session_id": session, "generation": 1, "until": "idle", "timeout_ms": 5000}),
+            ))
+        });
+        // The replacement: same id, new generation, and immediately idle --
+        // exactly the state the wait was asked for. It must NOT satisfy it.
+        loop {
+            let mut inner = server.lock();
+            if let Some(entry) = inner.sessions.get_mut(id) {
+                entry.generation = 2;
+                entry.state = SessionState::Idle;
+                break;
+            }
+            drop(inner);
+            std::thread::sleep(WAIT_POLL);
+        }
+        let response = waiter.join().expect("wait thread");
+        assert_eq!(error(&response).code, ErrorCode::StaleGeneration);
+    }
+
+    #[test]
+    fn a_wait_that_is_already_satisfied_returns_matched_with_its_pinned_generation() {
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let server = server_with(vec![facts(id, SessionState::Idle)]);
+        let value = result(&call(
+            &server,
+            Method::SessionWait,
+            json!({"session_id": id, "until": "idle", "timeout_ms": 50}),
+        ));
+        assert_eq!(value["outcome"], json!("matched"));
+        assert_eq!(value["generation"], json!(1));
+    }
+
+    #[test]
+    fn a_wait_that_does_not_come_true_times_out_rather_than_hanging() {
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let server = server_with(vec![facts(id, SessionState::Working)]);
+        let value = result(&call(
+            &server,
+            Method::SessionWait,
+            json!({"session_id": id, "until": "idle", "timeout_ms": 30}),
+        ));
+        assert_eq!(value["outcome"], json!("timeout"));
+        assert_eq!(value["state"], json!("working"));
+    }
+
+    #[test]
+    fn a_mutation_pinned_to_a_stale_generation_is_refused() {
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let server = server_with(vec![facts(id, SessionState::Idle)]);
+        let response = call(
+            &server,
+            Method::SessionReportStatus,
+            json!({"session_id": id, "generation": 7, "state": "working"}),
+        );
+        assert_eq!(error(&response).code, ErrorCode::StaleGeneration);
+    }
+
+    #[test]
+    fn report_status_records_the_state_and_emits_one_event() {
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let server = server_with(vec![facts(id, SessionState::Idle)]);
+        let before = server.revision();
+        let value = result(&call(
+            &server,
+            Method::SessionReportStatus,
+            json!({"session_id": id, "state": "working"}),
+        ));
+        assert_eq!(value["recorded"], json!(true));
+        assert_eq!(server.revision(), before + 1);
+        let get = result(&call(
+            &server,
+            Method::SessionGet,
+            json!({"session_id": id}),
+        ));
+        assert_eq!(get["session"]["state"], json!("working"));
+    }
+
+    /// Without a backend, a mutation must say so with a structured code --
+    /// never quietly succeed, and never claim the session does not exist.
+    #[test]
+    fn a_server_without_a_backend_refuses_mutations_by_code() {
+        let server = ApiServer::new(Box::new(StaticSource(Vec::new())), None);
+        let response = call(
+            &server,
+            Method::SessionStart,
+            json!({"cwd": ".", "prompt": "go"}),
+        );
+        let error = error(&response);
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert!(error.message.contains("#352"), "{}", error.message);
+    }
+
+    /// A registry session has no backend handle, so input for it is refused
+    /// rather than sent to a backend that never started it.
+    #[test]
+    fn input_for_a_session_this_server_did_not_start_is_refused() {
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let server = server_with(vec![facts(id, SessionState::Idle)]);
+        let response = call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "hello"}),
+        );
+        assert_eq!(error(&response).code, ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn input_for_a_session_this_server_started_reaches_the_backend() {
+        let server = server_with(Vec::new());
+        let started = result(&call(
+            &server,
+            Method::SessionStart,
+            json!({"cwd": ".", "prompt": "go"}),
+        ));
+        let id = started["session"]["session_id"].as_str().expect("id");
+        let value = result(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "hello"}),
+        ));
+        assert_eq!(value["accepted"], json!(true));
+        let read = result(&call(
+            &server,
+            Method::SessionRead,
+            json!({"session_id": id}),
+        ));
+        assert!(
+            !read["events"].as_array().expect("array").is_empty(),
+            "the session's own events must be replayable"
+        );
+    }
+
+    /// Snapshots carry only redacted facts. Proven on the serialized
+    /// snapshot, not just on the struct, because that is what a client sees.
+    #[test]
+    fn a_snapshot_carries_no_transcript_prompt_or_absolute_path() {
+        let server = server_with(Vec::new());
+        let _ = call(
+            &server,
+            Method::SessionStart,
+            json!({"cwd": "/home/somebody/secret-repo", "prompt": "the secret prompt"}),
+        );
+        let snapshot = result(&call(&server, Method::SessionSnapshot, Value::Null));
+        let text = serde_json::to_string(&snapshot).expect("serialize");
+        assert!(!text.contains("the secret prompt"), "{text}");
+        assert!(!text.contains("secret-repo"), "{text}");
+    }
+
+    #[test]
+    fn capabilities_report_the_attached_backends_own_capabilities() {
+        let server = server_with(Vec::new());
+        let value = result(&call(&server, Method::ServerCapabilities, Value::Null));
+        assert_eq!(value["protocol"], json!(PROTOCOL_VERSION));
+        assert!(value["runtime"].is_object(), "{value}");
+        let without = ApiServer::new(Box::new(StaticSource(Vec::new())), None);
+        let value = result(&call(&without, Method::ServerCapabilities, Value::Null));
+        assert!(value["runtime"].is_null(), "{value}");
+    }
+
+    // -----------------------------------------------------------------
+    // Attachment (issue #352)
+    // -----------------------------------------------------------------
+
+    /// The attachment rules with no pty in the way: observers are unbounded,
+    /// the controller seat holds one client, and the seat only ever changes
+    /// through an explicit grant, release or takeover. `session::host` is the
+    /// production implementation of the same trait; this one exists so the
+    /// PROTOCOL's own enforcement is provable without spawning a process.
+    #[derive(Debug, Default)]
+    struct FakeHost {
+        state: Mutex<FakeHostState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeHostState {
+        facts: Vec<SessionFacts>,
+        clients: Vec<String>,
+        controller: Option<String>,
+        rows: u16,
+        cols: u16,
+        typed: Vec<u8>,
+        stopped: Vec<String>,
+    }
+
+    impl FakeHost {
+        fn with(facts: Vec<SessionFacts>) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(FakeHostState {
+                    facts,
+                    rows: 24,
+                    cols: 80,
+                    ..FakeHostState::default()
+                }),
+            })
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeHostState> {
+            match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+
+        fn snapshot(&self, caller: &str) -> Attachment {
+            let state = self.lock();
+            Attachment {
+                controller: state.controller.clone(),
+                clients: state.clients.clone(),
+                rows: state.rows,
+                cols: state.cols,
+                role: if state.controller.as_deref() == Some(caller) {
+                    super::super::wire::AttachRole::Controller
+                } else if state.clients.iter().any(|id| id == caller) {
+                    super::super::wire::AttachRole::Observer
+                } else {
+                    super::super::wire::AttachRole::Detached
+                },
+            }
+        }
+    }
+
+    impl SessionHost for FakeHost {
+        fn sessions(&self) -> Vec<SessionFacts> {
+            self.lock().facts.clone()
+        }
+
+        /// The double owns no pty, so it opens nothing: every test here
+        /// exercises the ATTACHMENT surface over sessions seeded by `with`.
+        /// `session::host`'s own tests cover the spawn.
+        fn start(&self, _spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+            Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "the test host opens no terminals",
+            ))
+        }
+
+        fn attach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            mode: AttachMode,
+            size: Option<(u16, u16)>,
+        ) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                    state.clients.sort();
+                }
+                if mode == AttachMode::Controller {
+                    if let Some(current) = state.controller.clone()
+                        && current != client_id
+                    {
+                        return Err(ApiError::new(
+                            ErrorCode::Busy,
+                            format!("{current} already controls this session"),
+                        ));
+                    }
+                    state.controller = Some(client_id.to_string());
+                    if let Some((rows, cols)) = size {
+                        state.rows = rows;
+                        state.cols = cols;
+                    }
+                }
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn detach(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                state.clients.retain(|id| id != client_id);
+                if state.controller.as_deref() == Some(client_id) {
+                    state.controller = None;
+                }
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn takeover(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                    state.clients.sort();
+                }
+                state.controller = Some(client_id.to_string());
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn resize(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            rows: u16,
+            cols: u16,
+        ) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if state.controller.as_deref() != Some(client_id) {
+                    return Err(ApiError::new(
+                        ErrorCode::Denied,
+                        "only the controller resizes the terminal",
+                    ));
+                }
+                state.rows = rows;
+                state.cols = cols;
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn screen(&self, _session_id: &str, client_id: &str) -> Result<ScreenView, ApiError> {
+            let state = self.lock();
+            if !state.clients.iter().any(|id| id == client_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Denied,
+                    "attach before reading the screen",
+                ));
+            }
+            Ok(ScreenView {
+                rows: state.rows,
+                cols: state.cols,
+                contents: String::from_utf8_lossy(&state.typed).into_owned(),
+                ..ScreenView::default()
+            })
+        }
+
+        fn write_raw(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            bytes: &[u8],
+        ) -> Result<(), ApiError> {
+            let mut state = self.lock();
+            if state.controller.as_deref() != Some(client_id) {
+                return Err(ApiError::new(
+                    ErrorCode::Denied,
+                    "only the controller may type into this session",
+                ));
+            }
+            state.typed.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn stop(&self, session_id: &str) -> Result<bool, ApiError> {
+            self.lock().stopped.push(session_id.to_string());
+            Ok(true)
+        }
+    }
+
+    const HOSTED: &str = "33333333-3333-4333-8333-333333333333";
+
+    fn hosted_server() -> (Arc<ApiServer>, Arc<FakeHost>) {
+        let host = FakeHost::with(vec![facts(HOSTED, SessionState::Idle)]);
+        let server = ApiServer::new(Box::new(StaticSource(host.sessions())), None);
+        server.attach_host(host.clone() as Arc<dyn SessionHost>);
+        (server, host)
+    }
+
+    /// Issue #579: losing the owning socket releases only that connection's
+    /// controller attachment; the hosted session remains available.
+    #[test]
+    fn controller_disconnect_detaches_without_stopping_session() {
+        use crate::commands::ctx::api::client::Client;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::at(tmp.path().join("api.sock"));
+        let (server, host) = hosted_server();
+        let _running = RunningServer::start(&endpoint, Arc::clone(&server)).expect("server");
+        let mut first = Client::connect(&endpoint).expect("first client");
+        first
+            .call(
+                Method::SessionAttach,
+                json!({
+                    "session_id": HOSTED,
+                    "client_id": "crashed",
+                    "mode": "controller"
+                }),
+            )
+            .expect("first attach");
+        let mut duplicate = Client::connect(&endpoint).expect("duplicate client");
+        let refusal = duplicate
+            .call_raw(&Request::new(
+                "duplicate-attach",
+                Method::SessionAttach,
+                json!({
+                    "session_id": HOSTED,
+                    "client_id": "crashed",
+                    "mode": "controller"
+                }),
+            ))
+            .expect("duplicate response");
+        let Outcome::Error { error } = refusal.outcome else {
+            panic!("a second live socket claimed the same attachment")
+        };
+        assert_eq!(error.code, ErrorCode::Busy);
+        drop(first);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while host.lock().controller.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disconnected controller was not detached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut second = Client::connect(&endpoint).expect("second client");
+        second
+            .call(
+                Method::SessionAttach,
+                json!({
+                    "session_id": HOSTED,
+                    "client_id": "replacement",
+                    "mode": "controller"
+                }),
+            )
+            .expect("normal reattach");
+        assert_eq!(host.lock().controller.as_deref(), Some("replacement"));
+        assert!(host.lock().stopped.is_empty(), "disconnect is not stop");
+        assert_eq!(host.sessions()[0].session_id, HOSTED);
+        drop(duplicate);
+    }
+
+    /// Capability negotiation, the direction that matters: a server with no
+    /// terminals never advertises the attachment surface, so a client turns
+    /// the feature off LOCALLY rather than learning about it from a failed
+    /// call. Attaching a host turns it on in the same breath.
+    #[test]
+    fn the_attach_capability_is_advertised_only_by_a_server_that_owns_terminals() {
+        let hostless = ApiServer::new(Box::new(StaticSource(Vec::new())), None);
+        assert!(
+            !hostless
+                .hello()
+                .capabilities
+                .contains(&Capability::SessionAttach),
+            "issue #353's reference server has no terminal to attach to"
+        );
+        let methods = result(&call(&hostless, Method::ServerCapabilities, Value::Null));
+        let listed = serde_json::to_string(&methods["methods"]).expect("serialize");
+        assert!(
+            !listed.contains("session.attach"),
+            "a method a client could never call must not be advertised: {listed}"
+        );
+
+        let (server, _host) = hosted_server();
+        assert!(
+            server
+                .hello()
+                .capabilities
+                .contains(&Capability::SessionAttach)
+        );
+    }
+
+    /// A host that parks INSIDE `takeover`, after it has already moved the
+    /// seat and without holding any lock of its own -- exactly the window
+    /// between the host mutation and the announcement that the two-mutex
+    /// version left open.
+    struct BlockingHost {
+        facts: Vec<SessionFacts>,
+        controller: Mutex<Option<String>>,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl std::fmt::Debug for BlockingHost {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("BlockingHost")
+        }
+    }
+
+    impl BlockingHost {
+        fn snapshot(&self, caller: &str) -> Attachment {
+            let controller = self.controller.lock().expect("controller").clone();
+            Attachment {
+                role: if controller.as_deref() == Some(caller) {
+                    super::super::wire::AttachRole::Controller
+                } else {
+                    super::super::wire::AttachRole::Observer
+                },
+                controller,
+                clients: vec![caller.to_string()],
+                rows: 24,
+                cols: 80,
+            }
+        }
+    }
+
+    impl SessionHost for BlockingHost {
+        fn sessions(&self) -> Vec<SessionFacts> {
+            self.facts.clone()
+        }
+
+        fn start(&self, _spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+            Err(ApiError::new(ErrorCode::Unsupported, "no terminals"))
+        }
+
+        fn attach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            _mode: AttachMode,
+            _size: Option<(u16, u16)>,
+        ) -> Result<Attachment, ApiError> {
+            Ok(self.snapshot(client_id))
+        }
+
+        fn detach(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            Ok(self.snapshot(client_id))
+        }
+
+        fn takeover(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            // The seat moves first, under this host's own lock...
+            {
+                let mut controller = self.controller.lock().expect("controller");
+                *controller = Some(client_id.to_string());
+            }
+            // ...and only then does the call park, holding NOTHING of its
+            // own. Without the server's attachment gate, a second attachment
+            // call sails straight past this point and announces its own
+            // controller while this one is still on its way to announcing.
+            let parked = self.release.lock().expect("release").take();
+            if let Some(parked) = parked {
+                let _ = self.entered.send(());
+                let _ = parked.recv();
+            }
+            Ok(self.snapshot(client_id))
+        }
+
+        fn resize(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<Attachment, ApiError> {
+            Ok(self.snapshot(client_id))
+        }
+
+        fn screen(&self, _session_id: &str, _client_id: &str) -> Result<ScreenView, ApiError> {
+            Ok(ScreenView::default())
+        }
+
+        fn write_raw(
+            &self,
+            _session_id: &str,
+            _client_id: &str,
+            _bytes: &[u8],
+        ) -> Result<(), ApiError> {
+            Ok(())
+        }
+
+        fn stop(&self, _session_id: &str) -> Result<bool, ApiError> {
+            Ok(true)
+        }
+    }
+
+    /// Moving the controller seat and ANNOUNCING the move are one critical
+    /// section, not two.
+    ///
+    /// The host's session table and this server's announced-controller cache
+    /// are separate mutexes; taking them in sequence composes nothing, so two
+    /// racing attachment calls could mutate in one order and publish in the
+    /// other, leaving every subscriber told about a controller that is not the
+    /// one holding the seat. Proved deterministically rather than by racing:
+    /// the first call is parked inside the host with no lock of its own held,
+    /// and a second attachment call must then be unable to finish.
+    #[test]
+    fn an_attachment_change_and_its_announcement_are_one_critical_section() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let host = Arc::new(BlockingHost {
+            facts: vec![facts(HOSTED, SessionState::Idle)],
+            controller: Mutex::new(None),
+            entered: entered_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        let server = ApiServer::new(Box::new(StaticSource(host.sessions())), None);
+        server.attach_host(host.clone() as Arc<dyn SessionHost>);
+
+        let parked_server = Arc::clone(&server);
+        let parked = std::thread::spawn(move || {
+            call(
+                &parked_server,
+                Method::SessionTakeover,
+                json!({"session_id": HOSTED, "client_id": "first"}),
+            );
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first takeover reached the host");
+
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let second_server = Arc::clone(&server);
+        let second = std::thread::spawn(move || {
+            call(
+                &second_server,
+                Method::SessionDetach,
+                json!({"session_id": HOSTED, "client_id": "second"}),
+            );
+            let _ = finished_tx.send(());
+        });
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second attachment change finished while the first had moved the seat but not yet              announced it -- that is the interleaving that publishes a stale controller"
+        );
+
+        let _ = release_tx.send(());
+        parked.join().expect("first");
+        second.join().expect("second");
+
+        let read = result(&call(
+            &server,
+            Method::SessionRead,
+            json!({"session_id": HOSTED, "after_revision": 0}),
+        ));
+        let announced = read["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .rev()
+            .find(|frame| frame["payload"]["kind"] == json!("controller_changed"))
+            .map(|frame| frame["payload"]["controller"].clone())
+            .expect("at least one controller_changed");
+        let held = host.controller.lock().expect("controller").clone();
+        assert_eq!(
+            announced,
+            json!(held),
+            "the last announced controller must be the one the host is holding"
+        );
+    }
+
+    /// A hostless server refuses every attachment method loudly, naming the
+    /// issue -- the same discipline `session.start` already follows, and for
+    /// the same reason: a silent no-op would be worse than no method.
+    #[test]
+    fn a_server_without_a_host_refuses_every_attachment_method() {
+        let server = ApiServer::new(
+            Box::new(StaticSource(vec![facts(HOSTED, SessionState::Idle)])),
+            None,
+        );
+        for method in [
+            Method::SessionAttach,
+            Method::SessionDetach,
+            Method::SessionTakeover,
+            Method::SessionScreen,
+        ] {
+            let failure = error(&call(
+                &server,
+                method,
+                json!({"session_id": HOSTED, "client_id": "c1"}),
+            ));
+            assert_eq!(failure.code, ErrorCode::Unsupported, "{method}");
+            assert!(failure.message.contains("#352"), "{method}: {failure}");
+        }
+    }
+
+    /// The core rule: many observers, at most one controller, and a second
+    /// client asking for the seat is refused rather than silently promoted.
+    #[test]
+    fn many_clients_may_observe_but_only_one_may_control() {
+        let (server, _host) = hosted_server();
+        let first = result(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller", "rows": 40, "cols": 120}),
+        ));
+        assert_eq!(first["attachment"]["role"], json!("controller"));
+        assert_eq!(first["attachment"]["controller"], json!("dash"));
+
+        let watcher = result(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch-1"}),
+        ));
+        assert_eq!(watcher["attachment"]["role"], json!("observer"));
+        let second_watcher = result(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch-2"}),
+        ));
+        assert_eq!(
+            second_watcher["attachment"]["clients"],
+            json!(["dash", "watch-1", "watch-2"]),
+            "observers are unbounded"
+        );
+        assert_eq!(second_watcher["attachment"]["controller"], json!("dash"));
+
+        let refused = error(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch-1", "mode": "controller"}),
+        ));
+        assert_eq!(
+            refused.code,
+            ErrorCode::Busy,
+            "an occupied seat is refused, never quietly handed over: {refused}"
+        );
+    }
+
+    /// Takeover is explicit (its own method) and visible (one
+    /// `controller_changed` event every observer sees). One event per real
+    /// change, not per call.
+    #[test]
+    fn a_takeover_is_explicit_and_announced_to_every_observer() {
+        let (server, _host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let before = server.revision();
+        // Re-attaching as an observer changes nothing, so it announces
+        // nothing.
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        );
+        assert_eq!(
+            server.revision(),
+            before,
+            "an attachment that did not move the seat must not emit an event"
+        );
+
+        let taken = result(&call(
+            &server,
+            Method::SessionTakeover,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        ));
+        assert_eq!(taken["attachment"]["controller"], json!("watch"));
+        let announced = server
+            .frozen_events()
+            .into_iter()
+            .filter(|frame| {
+                matches!(frame.payload, ApiEvent::ControllerChanged { .. })
+                    && frame.session_id.as_deref() == Some(HOSTED)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            announced.len(),
+            2,
+            "one grant and one takeover, each announced exactly once: {announced:?}"
+        );
+        assert!(matches!(
+            &announced[1].payload,
+            ApiEvent::ControllerChanged { controller } if controller.as_deref() == Some("watch")
+        ));
+    }
+
+    /// Detaching is a CLIENT lifecycle event: the seat empties, but the
+    /// session is never stopped. Proven on the host's own stop log, not on a
+    /// status field a caller could have set for some other reason.
+    #[test]
+    fn detaching_releases_the_seat_and_never_stops_the_session() {
+        let (server, host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let detached = result(&call(
+            &server,
+            Method::SessionDetach,
+            json!({"session_id": HOSTED, "client_id": "dash"}),
+        ));
+        assert_eq!(detached["attachment"]["role"], json!("detached"));
+        assert_eq!(detached["attachment"]["controller"], Value::Null);
+        assert!(
+            host.lock().stopped.is_empty(),
+            "a detach must never reach the termination ladder"
+        );
+
+        // ... and `stop` is what does, distinctly.
+        let stopped = result(&call(
+            &server,
+            Method::SessionStop,
+            json!({"session_id": HOSTED}),
+        ));
+        assert_eq!(stopped["stopped"], json!(true));
+        assert_eq!(host.lock().stopped, vec![HOSTED.to_string()]);
+    }
+
+    /// Raw keystrokes and resize both belong to the controller alone: an
+    /// observer that tries either is refused, and after a takeover the roles
+    /// swap without either client having to reattach.
+    #[test]
+    fn only_the_controller_types_into_or_resizes_a_session() {
+        let (server, host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        );
+
+        let refused = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "client_id": "watch", "input": "ls\r", "mode": "raw"}),
+        ));
+        assert_eq!(refused.code, ErrorCode::Denied, "{refused}");
+        let refused = error(&call(
+            &server,
+            Method::SessionResize,
+            json!({"session_id": HOSTED, "client_id": "watch", "rows": 10, "cols": 10}),
+        ));
+        assert_eq!(refused.code, ErrorCode::Denied, "{refused}");
+
+        let accepted = result(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "client_id": "dash", "input": "ls\r", "mode": "raw"}),
+        ));
+        assert_eq!(accepted["accepted"], json!(true));
+        assert_eq!(host.lock().typed, b"ls\r".to_vec());
+
+        let _ = call(
+            &server,
+            Method::SessionTakeover,
+            json!({"session_id": HOSTED, "client_id": "watch"}),
+        );
+        let resized = result(&call(
+            &server,
+            Method::SessionResize,
+            json!({"session_id": HOSTED, "client_id": "watch", "rows": 50, "cols": 200}),
+        ));
+        assert_eq!(resized["attachment"]["rows"], json!(50));
+    }
+
+    /// `mode: raw` without a `client_id` is a parameter error, not an
+    /// unauthenticated write: there is no "the caller must be the controller"
+    /// check that can pass when nobody said who the caller is.
+    #[test]
+    fn raw_input_without_a_client_id_is_refused_rather_than_attributed() {
+        let (server, host) = hosted_server();
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let failure = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "input": "rm -rf /\r", "mode": "raw"}),
+        ));
+        assert_eq!(failure.code, ErrorCode::InvalidParams, "{failure}");
+        assert!(host.lock().typed.is_empty(), "nothing may have been typed");
+    }
+
+    /// The screen is reachable only by a client that actually attached, and
+    /// what comes back is the rendered terminal -- not a snapshot field.
+    #[test]
+    fn the_screen_needs_an_attachment_and_never_leaks_into_a_snapshot() {
+        let (server, _host) = hosted_server();
+        let failure = error(&call(
+            &server,
+            Method::SessionScreen,
+            json!({"session_id": HOSTED, "client_id": "stranger"}),
+        ));
+        assert_eq!(failure.code, ErrorCode::Denied, "{failure}");
+
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "mode": "controller"}),
+        );
+        let _ = call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": HOSTED, "client_id": "dash", "input": "secret", "mode": "raw"}),
+        );
+        let view = result(&call(
+            &server,
+            Method::SessionScreen,
+            json!({"session_id": HOSTED, "client_id": "dash"}),
+        ));
+        assert_eq!(view["screen"]["contents"], json!("secret"));
+
+        let snapshot = serde_json::to_string(&result(&call(
+            &server,
+            Method::SessionSnapshot,
+            Value::Null,
+        )))
+        .expect("serialize");
+        assert!(
+            !snapshot.contains("secret"),
+            "terminal contents must never ride a snapshot: {snapshot}"
+        );
+    }
+
+    /// An attach pinned to a generation the session has moved past is refused
+    /// before the host is touched -- the same rule every other mutation
+    /// follows, so a client cannot attach to a replacement by accident.
+    #[test]
+    fn an_attach_pinned_to_a_stale_generation_never_reaches_the_host() {
+        let (server, host) = hosted_server();
+        let failure = error(&call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": HOSTED, "client_id": "dash", "generation": 7}),
+        ));
+        assert_eq!(failure.code, ErrorCode::StaleGeneration, "{failure}");
+        assert!(host.lock().clients.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Native sessions (issue #489)
+    // -----------------------------------------------------------------
+
+    /// The native surface with no journal and no model in the way.
+    /// `session::native` is the production implementation of the same trait;
+    /// this one exists so the PROTOCOL's own routing and enforcement are
+    /// provable on their own.
+    #[derive(Debug, Default)]
+    struct FakeNative {
+        state: Mutex<FakeNativeState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeNativeState {
+        facts: Vec<SessionFacts>,
+        clients: Vec<String>,
+        controller: Option<String>,
+        inputs: Vec<(String, String, bool, Option<String>)>,
+        approvals: Vec<(String, ApprovalDecision)>,
+        history: Vec<HistoryEntry>,
+        interrupted: usize,
+        stopped: Vec<String>,
+    }
+
+    impl FakeNative {
+        fn with(facts: Vec<SessionFacts>) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(FakeNativeState {
+                    facts,
+                    ..FakeNativeState::default()
+                }),
+            })
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeNativeState> {
+            match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+
+        fn attachment(&self, caller: &str) -> Attachment {
+            let state = self.lock();
+            Attachment {
+                controller: state.controller.clone(),
+                clients: state.clients.clone(),
+                rows: 0,
+                cols: 0,
+                role: if state.controller.as_deref() == Some(caller) {
+                    super::super::wire::AttachRole::Controller
+                } else if state.clients.iter().any(|id| id == caller) {
+                    super::super::wire::AttachRole::Observer
+                } else {
+                    super::super::wire::AttachRole::Detached
+                },
+            }
+        }
+    }
+
+    impl NativeHost for FakeNative {
+        fn sessions(&self) -> Vec<SessionFacts> {
+            self.lock().facts.clone()
+        }
+
+        fn owns(&self, session_id: &str) -> bool {
+            self.lock()
+                .facts
+                .iter()
+                .any(|facts| facts.session_id == session_id)
+        }
+
+        fn start(&self, spec: &SessionSpec) -> Result<SessionFacts, ApiError> {
+            let mut facts = SessionFacts::new(format!("native-{}", self.lock().facts.len() + 1));
+            facts.runtime = RuntimeKind::Native;
+            facts.role = Some(spec.role.clone());
+            facts.state = SessionState::Idle;
+            self.lock().facts.push(facts.clone());
+            Ok(facts)
+        }
+
+        fn submit(
+            &self,
+            session_id: &str,
+            input: &str,
+            steering: bool,
+            idempotency: Option<&str>,
+        ) -> Result<InputAck, ApiError> {
+            let mut state = self.lock();
+            if let Some(key) = idempotency
+                && state.inputs.iter().any(|(seen_session, _, _, seen)| {
+                    seen_session == session_id && seen.as_deref() == Some(key)
+                })
+            {
+                return Ok(InputAck {
+                    message_id: format!("idem-{key}"),
+                    duplicate: true,
+                });
+            }
+            state.inputs.push((
+                session_id.to_string(),
+                input.to_string(),
+                steering,
+                idempotency.map(str::to_string),
+            ));
+            Ok(InputAck {
+                message_id: idempotency
+                    .map(|key| format!("idem-{key}"))
+                    .unwrap_or_else(|| format!("msg-{}", state.inputs.len())),
+                duplicate: false,
+            })
+        }
+
+        fn interrupt(&self, _session_id: &str) -> Result<bool, ApiError> {
+            self.lock().interrupted += 1;
+            Ok(true)
+        }
+
+        fn approve(
+            &self,
+            _session_id: &str,
+            request_id: &str,
+            decision: ApprovalDecision,
+            _note: Option<&str>,
+        ) -> Result<bool, ApiError> {
+            self.lock()
+                .approvals
+                .push((request_id.to_string(), decision));
+            Ok(true)
+        }
+
+        fn task_result(
+            &self,
+            _session_id: &str,
+            _task_id: &str,
+            _outcome: TaskOutcome,
+            _receipt: &Value,
+        ) -> Result<bool, ApiError> {
+            Ok(true)
+        }
+
+        fn history(
+            &self,
+            session_id: &str,
+            after: u64,
+            limit: usize,
+        ) -> Result<NativeHistory, ApiError> {
+            let entries: Vec<_> = self
+                .lock()
+                .history
+                .iter()
+                .filter(|entry| entry.sequence > after)
+                .take(limit)
+                .cloned()
+                .collect();
+            Ok(NativeHistory {
+                session_id: session_id.to_string(),
+                generation: 1,
+                cursor: entries.last().map_or(after, |entry| entry.sequence),
+                last_sequence: self.lock().history.last().map_or(0, |entry| entry.sequence),
+                entries,
+            })
+        }
+
+        fn journal(
+            &self,
+            session_id: &str,
+            after: u64,
+            _limit: usize,
+        ) -> Result<NativePage, ApiError> {
+            Ok(NativePage {
+                session_id: session_id.to_string(),
+                generation: 1,
+                after_sequence: after,
+                cursor: after,
+                last_sequence: 0,
+                gap: false,
+                events: Vec::new(),
+            })
+        }
+
+        fn attach(
+            &self,
+            _session_id: &str,
+            client_id: &str,
+            mode: AttachMode,
+        ) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                }
+                if mode == AttachMode::Controller {
+                    match state.controller.clone() {
+                        Some(current) if current != client_id => {
+                            return Err(ApiError::new(ErrorCode::Busy, "already controlled"));
+                        }
+                        _ => state.controller = Some(client_id.to_string()),
+                    }
+                }
+            }
+            Ok(self.attachment(client_id))
+        }
+
+        fn detach(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                state.clients.retain(|id| id != client_id);
+                if state.controller.as_deref() == Some(client_id) {
+                    state.controller = None;
+                }
+            }
+            Ok(self.attachment(client_id))
+        }
+
+        fn takeover(&self, _session_id: &str, client_id: &str) -> Result<Attachment, ApiError> {
+            {
+                let mut state = self.lock();
+                if !state.clients.iter().any(|id| id == client_id) {
+                    state.clients.push(client_id.to_string());
+                }
+                state.controller = Some(client_id.to_string());
+            }
+            Ok(self.attachment(client_id))
+        }
+
+        fn seat(&self, _session_id: &str) -> Result<(bool, Option<String>), ApiError> {
+            let state = self.lock();
+            Ok((!state.clients.is_empty(), state.controller.clone()))
+        }
+
+        fn stop(&self, session_id: &str) -> Result<bool, ApiError> {
+            self.lock().stopped.push(session_id.to_string());
+            Ok(true)
+        }
+    }
+
+    fn native_server() -> (Arc<ApiServer>, Arc<FakeNative>, String) {
+        let mut facts = facts("native-1", SessionState::Idle);
+        facts.runtime = RuntimeKind::Native;
+        let native = FakeNative::with(vec![facts.clone()]);
+        let server = ApiServer::new(Box::new(StaticSource(vec![facts.clone()])), None);
+        server.attach_native(Arc::clone(&native) as Arc<dyn NativeHost>);
+        (server, native, facts.session_id)
+    }
+
+    /// Issue #489: the native surface is advertised only by a server that
+    /// owns native conversations, so a client negotiates it away rather than
+    /// discovering it through a failed round trip.
+    #[test]
+    fn the_native_capability_is_advertised_only_by_a_server_that_owns_conversations() {
+        let bare = ApiServer::new(Box::new(StaticSource(Vec::new())), None);
+        assert!(!bare.advertised().contains(&Capability::SessionNative));
+        let (server, _, _) = native_server();
+        assert!(server.advertised().contains(&Capability::SessionNative));
+        assert!(
+            server.advertised().contains(&Capability::SessionAttach),
+            "a native host has seats, so the attachment surface comes with it"
+        );
+        let listed = result(&call(&server, Method::ServerCapabilities, Value::Null));
+        let methods: Vec<String> =
+            serde_json::from_value(listed["methods"].clone()).expect("methods");
+        for method in [
+            "session.interrupt",
+            "session.approve",
+            "session.task_result",
+            "session.history",
+            "session.journal",
+        ] {
+            assert!(methods.contains(&method.to_string()), "{methods:?}");
+        }
+    }
+
+    /// Issue #489, criterion 3: once ANY client is attached, only the
+    /// controller may drive a native session. An observer is refused whether
+    /// it names itself or omits the field, and both refusals are `denied`
+    /// rather than a silent success.
+    #[test]
+    fn only_the_controller_drives_a_native_session_and_observers_cannot_mutate() {
+        let (server, _, id) = native_server();
+
+        // Nobody attached: the owner-only endpoint is the only gate, exactly
+        // as it was before this issue.
+        let value = result(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "headless"}),
+        ));
+        assert_eq!(value["accepted"], json!(true));
+
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": id, "client_id": "driver", "mode": "controller"}),
+        );
+        let _ = call(
+            &server,
+            Method::SessionAttach,
+            json!({"session_id": id, "client_id": "watcher", "mode": "observer"}),
+        );
+
+        let denied = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "no", "client_id": "watcher"}),
+        ));
+        assert_eq!(denied.code, ErrorCode::Denied, "{denied}");
+        let anonymous = error(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "no"}),
+        ));
+        assert_eq!(
+            anonymous.code,
+            ErrorCode::Denied,
+            "omitting client_id must not be a way around the seat: {anonymous}"
+        );
+        for (method, params) in [
+            (
+                Method::SessionInterrupt,
+                json!({"session_id": id, "client_id": "watcher"}),
+            ),
+            (
+                Method::SessionApprove,
+                json!({"session_id": id, "client_id": "watcher", "request_id": "r1", "decision": "allow"}),
+            ),
+            (
+                Method::SessionHistory,
+                json!({"session_id": id, "client_id": "watcher"}),
+            ),
+        ] {
+            assert_eq!(
+                error(&call(&server, method, params)).code,
+                ErrorCode::Denied,
+                "{method} must be controller-only"
+            );
+        }
+
+        let accepted = result(&call(
+            &server,
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "yes", "client_id": "driver"}),
+        ));
+        assert_eq!(accepted["accepted"], json!(true));
+    }
+
+    /// Issue #489, item 5 as a protocol property: four verbs, four effects.
+    /// Interrupt leaves the session alive and idle; only stop reaches the
+    /// host's own stop.
+    #[test]
+    fn interrupt_cancels_a_turn_and_stop_is_the_only_verb_that_ends_one() {
+        let (server, native, id) = native_server();
+        let value = result(&call(
+            &server,
+            Method::SessionInterrupt,
+            json!({"session_id": id}),
+        ));
+        assert_eq!(value["interrupted"], json!(true));
+        assert_eq!(native.lock().interrupted, 1);
+        assert!(native.lock().stopped.is_empty(), "interrupt is not stop");
+        let get = result(&call(
+            &server,
+            Method::SessionGet,
+            json!({"session_id": id}),
+        ));
+        assert_eq!(get["session"]["state"], json!("idle"));
+
+        let _ = call(&server, Method::SessionStop, json!({"session_id": id}));
+        assert_eq!(native.lock().stopped, vec![id]);
+    }
+
+    /// A native conversation has no terminal, and the two terminal-shaped
+    /// verbs say so by name instead of reporting a server that owns no
+    /// terminals -- which would be false of a runtime holding plenty.
+    #[test]
+    fn a_native_session_refuses_the_terminal_verbs_by_name() {
+        let (server, _, id) = native_server();
+        for (method, params) in [
+            (
+                Method::SessionScreen,
+                json!({"session_id": id, "client_id": "c"}),
+            ),
+            (
+                Method::SessionResize,
+                json!({"session_id": id, "client_id": "c", "rows": 10, "cols": 20}),
+            ),
+            (
+                Method::SessionSendInput,
+                json!({"session_id": id, "input": "x", "mode": "raw", "client_id": "c"}),
+            ),
+        ] {
+            let refused = error(&call(&server, method, params));
+            assert_eq!(refused.code, ErrorCode::Unsupported, "{method}: {refused}");
+        }
+    }
+
+    /// The idempotency key reaches the host, which is where the DURABLE
+    /// deduplication lives -- the server's own cache is bounded and lost on
+    /// restart, so it can never be the guarantee.
+    #[test]
+    fn a_retried_native_input_carries_its_key_to_the_host() {
+        let (server, native, id) = native_server();
+        let request = Request::new(
+            "r1",
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "go"}),
+        )
+        .with_idempotency_key("k1");
+        let first = result(&server.handle(&request));
+        assert_eq!(first["duplicate"], json!(false));
+        assert_eq!(first["message_id"], json!("idem-k1"));
+
+        // A DIFFERENT request id carrying the same key: the server's cache
+        // keys on the key, so this one is answered from it -- and the host
+        // still saw exactly one input either way.
+        let again = Request::new(
+            "r2",
+            Method::SessionSendInput,
+            json!({"session_id": id, "input": "go"}),
+        )
+        .with_idempotency_key("k1");
+        let second = result(&server.handle(&again));
+        assert_eq!(second["message_id"], json!("idem-k1"));
+        assert_eq!(native.lock().inputs.len(), 1, "{:?}", native.lock().inputs);
+    }
+
+    /// Issue #568: protocol replay keys deduplicate within one target native
+    /// session, never across two independent journals.
+    #[test]
+    fn same_idempotency_key_in_two_sessions_dispatches_once_per_session() {
+        let mut first = facts("native-1", SessionState::Idle);
+        first.runtime = RuntimeKind::Native;
+        let mut second = facts("native-2", SessionState::Idle);
+        second.runtime = RuntimeKind::Native;
+        let native = FakeNative::with(vec![first.clone(), second.clone()]);
+        let server = ApiServer::new(
+            Box::new(StaticSource(vec![first.clone(), second.clone()])),
+            None,
+        );
+        server.attach_native(Arc::clone(&native) as Arc<dyn NativeHost>);
+
+        for (request_id, session_id) in [("one", &first.session_id), ("two", &second.session_id)] {
+            let request = Request::new(
+                request_id,
+                Method::SessionSendInput,
+                json!({"session_id": session_id, "input": request_id}),
+            )
+            .with_idempotency_key("shared-key");
+            assert_eq!(result(&server.handle(&request))["duplicate"], json!(false));
+        }
+        for (request_id, session_id) in [
+            ("retry-one", &first.session_id),
+            ("retry-two", &second.session_id),
+        ] {
+            let retry = Request::new(
+                request_id,
+                Method::SessionSendInput,
+                json!({"session_id": session_id, "input": "ignored retry body"}),
+            )
+            .with_idempotency_key("shared-key");
+            let _ = server.handle(&retry);
+        }
+
+        let inputs = &native.lock().inputs;
+        assert_eq!(inputs.len(), 2, "one dispatch per session: {inputs:?}");
+        assert_eq!(inputs[0].0, first.session_id);
+        assert_eq!(inputs[1].0, second.session_id);
+    }
+
+    /// Issue #600: byte-heavy history is split into wire-safe cursor pages
+    /// without changing order or dropping conversation text.
+    #[test]
+    fn session_history_paginates_below_wire_byte_limit() {
+        let (server, native, id) = native_server();
+        native.lock().history = (1..=12)
+            .map(|sequence| HistoryEntry {
+                sequence,
+                role: HistoryRole::Assistant,
+                text: format!("{sequence}:").repeat(55_000),
+                steering: false,
+            })
+            .collect();
+        let expected: Vec<String> = native
+            .lock()
+            .history
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect();
+        let mut after = 0;
+        let mut actual = Vec::new();
+        while after < 12 {
+            let response = server.handle(&Request::new(
+                "history",
+                Method::SessionHistory,
+                json!({"session_id": id, "after_sequence": after}),
+            ));
+            let frame = ServerFrame::Response(response.clone());
+            assert!(
+                serde_json::to_vec(&frame).expect("frame").len()
+                    < super::super::transport::MAX_FRAME_BYTES as usize,
+                "history response exceeded the wire bound"
+            );
+            let value = result(&response);
+            let page: NativeHistory = serde_json::from_value(value).expect("history");
+            assert!(page.cursor > after, "history cursor must advance");
+            after = page.cursor;
+            actual.extend(page.entries.into_iter().map(|entry| entry.text));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    /// Issue #607: a socket writer that stops reading cannot grow an
+    /// unbounded cloned-event queue; it is disconnected and can resume by
+    /// cursor from retained history.
+    #[test]
+    fn slow_api_subscriber_has_bounded_backlog_and_recovers() {
+        let server = server_with(Vec::new());
+        let (receiver, backlog) = server.subscribe(server.revision());
+        assert!(backlog.is_empty());
+        for _ in 0..=MAX_EVENTS {
+            server.publish(None, None, ApiEvent::Heartbeat);
+        }
+        assert!(
+            server.lock().subscribers.is_empty(),
+            "a full subscriber queue must be disconnected"
+        );
+        let received = receiver.try_iter().count();
+        assert!(received <= MAX_EVENTS, "subscriber backlog stayed bounded");
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "disconnect is the explicit recovery outcome"
+        );
+        let (_, retained) = server.subscribe(0);
+        assert_eq!(
+            retained.len(),
+            MAX_EVENTS,
+            "cursor refresh remains available"
+        );
+    }
+
+    /// The native methods on a server with no native host are refused with a
+    /// structured `unsupported` naming the issue -- never a silent success.
+    #[test]
+    fn a_server_without_a_native_host_refuses_every_native_method() {
+        let server = server_with(vec![facts("s1", SessionState::Idle)]);
+        for method in [
+            Method::SessionInterrupt,
+            Method::SessionApprove,
+            Method::SessionTaskResult,
+            Method::SessionHistory,
+            Method::SessionJournal,
+        ] {
+            let refused = error(&call(
+                &server,
+                method,
+                json!({
+                    "session_id": "s1",
+                    "request_id": "r",
+                    "decision": "allow",
+                    "task_id": "t",
+                    "outcome": "completed"
+                }),
+            ));
+            assert_eq!(refused.code, ErrorCode::Unsupported, "{method}");
+            assert!(refused.message.contains("#489"), "{refused}");
+        }
+    }
+
+    /// `session.start` is ONE verb for both kinds of session: the spec's
+    /// runtime decides which host answers, not a second method.
+    #[test]
+    fn one_start_verb_routes_a_native_spec_to_the_native_host() {
+        let (server, native, _) = native_server();
+        let started = result(&call(
+            &server,
+            Method::SessionStart,
+            json!({"runtime": "native", "role": "worker", "cwd": ".", "prompt": "go"}),
+        ));
+        assert_eq!(started["session"]["runtime"], json!("native"));
+        assert_eq!(started["session"]["role"], json!("worker"));
+        assert_eq!(native.lock().facts.len(), 2);
+    }
+}

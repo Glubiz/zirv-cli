@@ -1,0 +1,11 @@
+{
+  "id": "req-report-status",
+  "outcome": {
+    "result": {
+      "recorded": true
+    },
+    "status": "ok"
+  },
+  "revision": 5,
+  "v": 1
+}

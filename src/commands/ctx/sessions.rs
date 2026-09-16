@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::runtime::RuntimeKind;
 use super::state::{self, StateDir};
 
 /// Mirrors `StateDir::socket_for`'s own derivation exactly: the first eight
@@ -415,6 +416,14 @@ pub struct Record {
     /// other optional field on this struct already follows.
     #[serde(default)]
     pub in_flight: Option<InFlight>,
+    /// Issue #470: which backend actually drives this session --
+    /// `runtime::RuntimeKind::Harness` for every session this build spawns
+    /// today. `#[serde(default)]` so a record written by an older build
+    /// (before this field existed) deserializes as `Harness`, the same
+    /// value `Record::new` itself always stamps right now -- the only
+    /// runtime this codebase can actually run a session under yet.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
 }
 
 /// Issue #281: the crash-interruption witness marker. Stamped by a
@@ -482,6 +491,9 @@ impl Record {
             // Left unset here too: nothing is in flight until a supervisor's
             // own `stamp_in_flight` call says otherwise.
             in_flight: None,
+            // Issue #470: every session this build spawns runs on the
+            // existing harness-process backend.
+            runtime: RuntimeKind::Harness,
         }
     }
 
@@ -822,6 +834,20 @@ impl SessionGuard {
     /// `refresh_session` call immediately above it.
     pub fn short(&self) -> &str {
         &self.record.short
+    }
+
+    /// Gives up this guard's claim on its registry record WITHOUT removing
+    /// anything (issue #552).
+    ///
+    /// One case only: a rollover successor has registered under the SAME
+    /// short id -- the seat's stable address, which by design does not move
+    /// across a rollover -- and the source is retired afterwards. Letting the
+    /// source's guard run its ordinary `release` there would delete the
+    /// record file the successor has just written, so the address would
+    /// answer for nobody. Disowning states the truth instead: this guard no
+    /// longer speaks for that address, and something else does.
+    pub fn disown(&mut self) {
+        self.released = true;
     }
 
     /// Idempotent, like `RawGuard::restore`.
@@ -1644,6 +1670,16 @@ struct NativeConversation {
     session: String,
     /// The harness's own conversation id.
     conversation: String,
+    /// Issue #470: which backend recorded this conversation. Issue #488 makes
+    /// this genuinely vary -- `record_conversation_on` lets a native session
+    /// record its own journal session id here -- and [`native_conversation`]
+    /// refuses a marker whose runtime does not match the reader's, so a
+    /// return can never resume a harness resume-id as a native conversation
+    /// or the other way round. `#[serde(default)]` so a marker written by an
+    /// older build still parses (and, correctly, still answers as
+    /// `Harness`, the only runtime that existed when it was written).
+    #[serde(default)]
+    runtime: RuntimeKind,
 }
 
 fn conversation_marker_path(state: &StateDir, short: &str) -> PathBuf {
@@ -1665,6 +1701,34 @@ pub fn record_native_conversation(
     session: &str,
     conversation: &str,
 ) {
+    record_conversation_on(
+        state,
+        short,
+        agent,
+        session,
+        conversation,
+        RuntimeKind::Harness,
+    )
+}
+
+/// [`record_native_conversation`], naming the BACKEND the reference belongs
+/// to (issue #488).
+///
+/// A conversation id is opaque and its meaning is the backend's: a coding
+/// harness's own resume id and a native journal session id are not
+/// interchangeable, and [`native_conversation`] already refuses to hand back
+/// a marker whose runtime does not match what the reader asked for.
+/// Recording the runtime honestly is what makes that refusal mean anything
+/// for a session that is not a harness -- and it is what stops a rollover
+/// return resuming the wrong kind of conversation id.
+pub fn record_conversation_on(
+    state: &StateDir,
+    short: &str,
+    agent: &str,
+    session: &str,
+    conversation: &str,
+    runtime: RuntimeKind,
+) {
     if agent.is_empty() || session.is_empty() || conversation.is_empty() {
         return;
     }
@@ -1672,6 +1736,7 @@ pub fn record_native_conversation(
         agent: agent.to_string(),
         session: session.to_string(),
         conversation: conversation.to_string(),
+        runtime,
     };
     let Ok(body) = serde_json::to_string(&record) else {
         return;
@@ -1681,19 +1746,24 @@ pub fn record_native_conversation(
 }
 
 /// The native conversation id recorded for `short`, but only when the marker
-/// names this exact `agent` AND this exact zirv `session`. `None` for a
-/// missing, unreadable, malformed or mismatched marker -- the caller then has
-/// no proof about which conversation the harness is in, which is a reason to
-/// relaunch cold, never to guess.
+/// names this exact `agent`, this exact zirv `session`, AND this exact
+/// `runtime` (issue #470: a marker a harness-process backend recorded must
+/// never be handed to a native backend as if it could resume it, and vice
+/// versa). `None` for a missing, unreadable, malformed or mismatched marker
+/// -- the caller then has no proof about which conversation the harness is
+/// in, which is a reason to relaunch cold, never to guess.
 pub fn native_conversation(
     state: &StateDir,
     short: &str,
     agent: &str,
     session: &str,
+    runtime: RuntimeKind,
 ) -> Option<String> {
     let body = std::fs::read_to_string(conversation_marker_path(state, short)).ok()?;
     let record: NativeConversation = serde_json::from_str(&body).ok()?;
-    (record.agent.eq_ignore_ascii_case(agent) && record.session == session)
+    (record.agent.eq_ignore_ascii_case(agent)
+        && record.session == session
+        && record.runtime == runtime)
         .then_some(record.conversation)
         .filter(|conversation| !conversation.is_empty())
 }
@@ -2318,6 +2388,31 @@ mod tests {
         Record::new(session, "claude", repo, verb)
     }
 
+    /// Issue #470: a session record written before the `runtime` field
+    /// existed has to still parse (and default to `Harness`, the only
+    /// runtime any build could have registered a session under before now),
+    /// and a record written by this build must round-trip its `runtime`
+    /// value exactly.
+    #[test]
+    fn a_record_without_a_runtime_field_still_parses_as_harness_and_round_trips_with_it() {
+        let record = record_for(
+            "11111111-2222-4333-8444-555555555555",
+            Path::new("/repo"),
+            Verb::Exec,
+        );
+        let mut without_runtime = serde_json::to_value(&record).expect("serialize");
+        without_runtime
+            .as_object_mut()
+            .expect("record is a JSON object")
+            .remove("runtime");
+        let parsed: Record = serde_json::from_value(without_runtime).expect("deserialize");
+        assert_eq!(parsed.runtime, RuntimeKind::Harness);
+
+        let json = serde_json::to_string(&record).expect("serialize");
+        let round_tripped: Record = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped.runtime, RuntimeKind::Harness);
+    }
+
     /// Issue #243 (review round, F1): the whole point of the sibling file --
     /// a screening write must never open, let alone rewrite, `record_path`
     /// at all. Proven at the strongest level available: the record's own
@@ -2354,28 +2449,109 @@ mod tests {
 
         record_native_conversation(&state, "orch0001", "claude", zirv_session, native);
         assert_eq!(
-            native_conversation(&state, "orch0001", "claude", zirv_session).as_deref(),
+            native_conversation(
+                &state,
+                "orch0001",
+                "claude",
+                zirv_session,
+                RuntimeKind::Harness
+            )
+            .as_deref(),
             Some(native),
         );
         assert_eq!(
-            native_conversation(&state, "orch0001", "Claude", zirv_session).as_deref(),
+            native_conversation(
+                &state,
+                "orch0001",
+                "Claude",
+                zirv_session,
+                RuntimeKind::Harness
+            )
+            .as_deref(),
             Some(native),
             "an agent name differing only in case is the same harness"
         );
         assert_eq!(
-            native_conversation(&state, "orch0001", "codex", zirv_session),
+            native_conversation(
+                &state,
+                "orch0001",
+                "codex",
+                zirv_session,
+                RuntimeKind::Harness
+            ),
             None,
             "a seat rolled over to another harness must not resume claude's conversation"
         );
         assert_eq!(
-            native_conversation(&state, "orch0001", "claude", "some-other-session"),
+            native_conversation(
+                &state,
+                "orch0001",
+                "claude",
+                "some-other-session",
+                RuntimeKind::Harness
+            ),
             None,
             "a marker left by an earlier session at this address is not this one's"
         );
         assert_eq!(
-            native_conversation(&state, "orch0002", "claude", zirv_session),
+            native_conversation(
+                &state,
+                "orch0002",
+                "claude",
+                zirv_session,
+                RuntimeKind::Harness
+            ),
             None,
             "no marker at all is no answer, never a guess"
+        );
+    }
+
+    /// Issue #470: a conversation recorded by the harness backend must
+    /// never be handed to a caller asking on behalf of the native backend,
+    /// even for the exact same agent/session -- the two runtimes' own
+    /// conversation ids live in entirely different namespaces.
+    #[test]
+    fn native_conversation_does_not_answer_for_a_different_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        record_native_conversation(&state, "orch0004", "claude", "sess", "conv");
+        assert_eq!(
+            native_conversation(&state, "orch0004", "claude", "sess", RuntimeKind::Harness)
+                .as_deref(),
+            Some("conv")
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0004", "claude", "sess", RuntimeKind::Native),
+            None,
+            "a marker the harness backend recorded must not resume the native backend"
+        );
+    }
+
+    /// An older build's marker file predates the `runtime` field entirely.
+    /// It must still parse, and must answer as `Harness` -- the only
+    /// runtime that could have written it.
+    #[test]
+    fn a_marker_without_a_runtime_field_still_parses_as_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let _ = super::super::state::create_private_dir_all(&state.sessions());
+        let body = serde_json::json!({
+            "agent": "claude",
+            "session": "sess",
+            "conversation": "conv",
+        })
+        .to_string();
+        super::super::state::write_private(&conversation_marker_path(&state, "orch0005"), &body)
+            .expect("write marker");
+        assert_eq!(
+            native_conversation(&state, "orch0005", "claude", "sess", RuntimeKind::Harness)
+                .as_deref(),
+            Some("conv"),
+            "a pre-#470 marker has no runtime field and must default to Harness"
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0005", "claude", "sess", RuntimeKind::Native),
+            None
         );
     }
 
@@ -2388,7 +2564,7 @@ mod tests {
         record_native_conversation(&state, "orch0003", "claude", "sess", "");
         record_native_conversation(&state, "orch0003", "", "sess", "conv");
         assert_eq!(
-            native_conversation(&state, "orch0003", "claude", "sess"),
+            native_conversation(&state, "orch0003", "claude", "sess", RuntimeKind::Harness),
             None
         );
     }
@@ -5286,6 +5462,72 @@ mod tests {
         write_record(&state, &record);
 
         assert!(take_interrupted_in_flight(&state, &this_repo).is_none());
+    }
+
+    /// Issue #467 review (defect 2): unlike workflow-state lookup, crash
+    /// witnesses must stay keyed by the LITERAL checkout even for a `git
+    /// worktree add` sibling of the same repository -- a new session
+    /// starting in one worktree must never consume (or even see) a crash
+    /// witness left by a session that died in a sibling worktree, since the
+    /// two are different processes working on different trees. `repo_slug`
+    /// (this module's match key) resolves worktree siblings independently
+    /// of `workflow::engine`'s own, deliberately separate, sibling-checkout
+    /// lookup.
+    #[test]
+    fn a_sibling_worktrees_dead_in_flight_record_is_not_reported() {
+        use super::super::testenv::dead_pid;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+
+        let main_repo = tmp.path().join("main-repo");
+        std::fs::create_dir_all(&main_repo).expect("create main repo dir");
+        let git = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&main_repo, &["init", "-q"]);
+        std::fs::write(main_repo.join("README.md"), "hello\n").unwrap();
+        git(&main_repo, &["add", "."]);
+        git(&main_repo, &["commit", "-q", "-m", "base"]);
+
+        let worktree = tmp.path().join("linked-worktree");
+        git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        // The crash witness belongs to the linked worktree.
+        let record = in_flight_record(&worktree, dead_pid(), Some(sample_in_flight()));
+        write_record(&state, &record);
+
+        // A session starting fresh in the main checkout must not see it,
+        // even though both share the same `.git` and the same commit
+        // history.
+        assert!(
+            take_interrupted_in_flight(&state, &main_repo).is_none(),
+            "a sibling worktree's crash witness must never leak into the main checkout"
+        );
+        // The witness is still there for the worktree itself, unconsumed.
+        assert!(take_interrupted_in_flight(&state, &worktree).is_some());
     }
 
     /// Back-compat: a `Record` serialized by a build before this field

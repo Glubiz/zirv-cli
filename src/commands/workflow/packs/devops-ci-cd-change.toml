@@ -1,0 +1,102 @@
+# Built-in workflow pack: devops-ci-cd-change (issue #542 chunk 4).
+schema_version = 1
+id = "devops-ci-cd-change"
+version = 1
+title = "CI/CD pipeline change"
+description = "Plan, implement, test, review and deploy a change to a build or deployment pipeline."
+domains = ["devops"]
+triggers = ["ci/cd", "pipeline change", "build pipeline", "deployment pipeline", "github actions"]
+effects = "repository"
+
+[[inputs]]
+name = "task"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "change"
+kind = "patch"
+
+[[steps]]
+id = "intent"
+title = "Capture intent"
+phase = "intent"
+skills = ["write-intent"]
+artifact = "intent"
+approval = true
+condition = { complexity-or-risk = { complexity = "bounded", risk = "medium" } }
+effect = "repository"
+
+[[steps]]
+id = "plan"
+title = "Plan"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "devops-sre"
+artifact = "plan"
+approval = true
+depends_on = ["intent"]
+condition = { complexity-or-risk = { complexity = "bounded", risk = "high" } }
+effect = "repository"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+phase = "implement"
+skills = ["implement"]
+agent_role = "devops-sre"
+depends_on = ["plan"]
+condition = "always"
+effect = "repository"
+
+[[steps]]
+id = "test"
+title = "Test"
+phase = "test"
+skills = ["testing"]
+depends_on = ["implement"]
+condition = "always"
+
+[[steps]]
+id = "review"
+title = "Review"
+phase = "review"
+skills = ["review"]
+agent_role = "reviewer"
+depends_on = ["test"]
+condition = { risk-at-least = "medium" }
+
+[[steps]]
+id = "verify"
+title = "Verify"
+phase = "verify"
+skills = ["verify"]
+depends_on = ["review"]
+condition = "always"
+
+[[steps]]
+id = "deploy"
+title = "Finish branch"
+phase = "deploy"
+skills = ["finish-branch"]
+depends_on = ["verify"]
+approval = true
+condition = "always"
+effect = "repository"
+reason = "a pipeline change reaching production infrastructure is always an explicit approval, regardless of the operator's default deploy tier"
+
+[gates]
+approval = ["intent", "plan", "deploy"]
+validation = ["test", "verify"]
+independent_review = ["review"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["change"]
+present_as = "patch"

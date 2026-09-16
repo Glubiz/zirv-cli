@@ -1,0 +1,72 @@
+# Built-in workflow pack: pm-backlog-triage (issue #542 chunk 5). Intake ->
+# dedupe/clarify -> priority/risk/dependency -> actionable backlog update.
+# Linear is #539's typed tool, not yet available: intake declares that gap in
+# its own reason and gates explicitly rather than inventing backlog state.
+schema_version = 1
+id = "pm-backlog-triage"
+version = 1
+title = "Backlog triage"
+description = "Intake, dedupe/clarify, assess priority/risk/dependency, and produce an actionable backlog update."
+domains = ["pm"]
+triggers = ["backlog triage", "triage the backlog", "groom the backlog", "backlog grooming", "prioritize the backlog"]
+effects = "none"
+
+[[inputs]]
+name = "scope"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "backlog-update"
+kind = "report"
+
+[[steps]]
+id = "intake"
+title = "Intake"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "planner"
+artifact = "intent"
+approval = true
+condition = "always"
+reason = "requires a Linear integration (#539) for live backlog items; without it, this step collects an offline artifact from the operator and says so explicitly rather than inventing backlog state"
+
+[[steps]]
+id = "dedupe-clarify"
+title = "Dedupe and clarify"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "planner"
+depends_on = ["intake"]
+condition = "always"
+
+[[steps]]
+id = "priority-risk-dependency"
+title = "Priority, risk and dependency"
+phase = "implement"
+skills = ["implement"]
+agent_role = "planner"
+depends_on = ["dedupe-clarify"]
+condition = "always"
+
+[[steps]]
+id = "backlog-update"
+title = "Actionable backlog update"
+phase = "present"
+skills = ["verify"]
+depends_on = ["priority-risk-dependency"]
+condition = "always"
+
+[gates]
+approval = ["intake"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["backlog-update"]
+present_as = "summary"

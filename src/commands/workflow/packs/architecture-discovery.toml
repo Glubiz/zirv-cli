@@ -1,0 +1,70 @@
+# Built-in workflow pack: architecture-discovery (issue #542 chunk 5).
+# Explore/inventory -> constraints and boundaries -> discovery report. Purely
+# read-only investigation, never a mutation.
+schema_version = 1
+id = "architecture-discovery"
+version = 1
+title = "Architecture discovery"
+description = "Inventory the existing architecture and surface its constraints and boundaries in a discovery report."
+domains = ["architecture"]
+triggers = ["architecture discovery", "map the architecture", "explore the codebase architecture", "system inventory", "architecture inventory"]
+effects = "none"
+
+[[inputs]]
+name = "scope"
+kind = "text"
+required = true
+
+[[outputs]]
+name = "discovery-report"
+kind = "report"
+
+[[steps]]
+id = "scope"
+title = "Scope the discovery"
+phase = "intent"
+skills = ["write-intent"]
+agent_role = "architect"
+artifact = "intent"
+approval = true
+condition = "always"
+
+[[steps]]
+id = "inventory"
+title = "Inventory"
+phase = "implement"
+skills = ["implement"]
+agent_role = "architect"
+depends_on = ["scope"]
+condition = "always"
+
+[[steps]]
+id = "constraints-boundaries"
+title = "Constraints and boundaries"
+phase = "plan"
+skills = ["write-plan"]
+agent_role = "architect"
+depends_on = ["inventory"]
+condition = "always"
+
+[[steps]]
+id = "discovery-report"
+title = "Discovery report"
+phase = "present"
+skills = ["verify"]
+depends_on = ["inventory", "constraints-boundaries"]
+condition = "always"
+
+[gates]
+approval = ["scope"]
+
+[limits]
+max_attempts = 3
+
+[failure]
+escalate_to = "human"
+retry = false
+
+[completion]
+required_outputs = ["discovery-report"]
+present_as = "report"
