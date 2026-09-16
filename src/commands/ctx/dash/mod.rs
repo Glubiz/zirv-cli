@@ -6942,14 +6942,35 @@ fn fulfill_spawn_request(
         && spawnreq::role_of(req) == prompt::PromptRole::Worker
     {
         let tree = std::fs::canonicalize(&spawn_cwd).unwrap_or_else(|_| spawn_cwd.clone());
+        // Issue #543 (review F2): the REQUESTING pane's own seat identity,
+        // not the dashboard process's -- `fulfill_spawn_request` runs inside
+        // the long-lived dashboard, a different process than whatever pane
+        // wrote `req`, so the dashboard's own environment says nothing about
+        // whether the ACTUAL requester's rollover has committed (it is
+        // usually unset, silently falling back to the lenient supersession-
+        // only verdict, and even when set it names an unrelated seat). `req.
+        // parent_session`/`req.parent_seat_generation` carry the requester's
+        // own identity instead, fed into the STRICT `seat::guard` verdict via
+        // an explicit `SeatFence` -- an uncommitted successor spawning a
+        // writing pane must not hand it a lease before its own rollover
+        // commits, which `guard_from_env`'s supersession-only check let
+        // through.
+        let identity = req.parent_session.as_deref().and_then(|session| {
+            req.parent_seat_generation
+                .map(|generation| (sessions::short_id(session), generation))
+        });
+        let fence = identity
+            .as_ref()
+            .map(|(short, generation)| super::permit::SeatFence {
+                short,
+                generation: *generation,
+            });
         match super::permit::acquire_writer(
             state,
             cfg.supervise.max_writers,
             &format!("session {registry_short}: {}", req.agent),
             &tree,
-            // Issue #488: the dashboard spawns for a requester whose seat
-            // generation it does not carry; the env fence is what applies.
-            None,
+            fence,
         ) {
             Ok(permit) => Some(permit),
             Err(refusal) => {
@@ -12208,6 +12229,14 @@ fn run_dashboard_inner(
                                                     // prompt this dashboard
                                                     // composes for it.
                                                     system_prompt: None,
+                                                    // No lineage (issue #543):
+                                                    // this spawn IS the
+                                                    // delegation root, same
+                                                    // as `parent_session`
+                                                    // above, so there is no
+                                                    // requester seat to fence
+                                                    // against either.
+                                                    parent_seat_generation: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -19998,6 +20027,7 @@ mod tests {
             max_tool_calls: None,
             flags: Vec::new(),
             system_prompt: None,
+            parent_seat_generation: None,
         }
     }
 
@@ -29141,6 +29171,91 @@ mod tests {
         for pane in &mut panes {
             let _ = pane.shutdown("");
         }
+    }
+
+    /// Issue #543 (review F2/F4): drives the real call site instead of
+    /// constructing a `permit::SeatFence` directly (the retired `permit::
+    /// tests::a_call_site_built_fence_refuses_an_uncommitted_generation_the_
+    /// env_fence_let_through`, which passed regardless of whether this site
+    /// was ever wired up -- `acquire_writer`'s own strict-fence behavior is
+    /// already covered by `permit::tests::
+    /// a_stale_or_uncommitted_generation_may_not_take_a_writer_lease`). `req.
+    /// parent_session`/`req.parent_seat_generation` name a rollover onto this
+    /// seat that is prepared but not committed; this must fail if
+    /// `fulfill_spawn_request` ever goes back to fencing on the DASHBOARD's
+    /// own (here unset) environment instead of the REQUESTER's identity.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_writer_lease_for_an_uncommitted_requester_generation() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+
+        let session = "7b1a2c3d-9999-4000-8000-000000000543";
+        let short = sessions::short_id(session);
+        seat::register(
+            &state,
+            &short,
+            session,
+            "native",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            1,
+        )
+        .expect("register");
+
+        let cfg = CtxConfig {
+            pace: crate::commands::ctx::config::PaceConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..CtxConfig::default()
+        };
+
+        // `spawn_request`'s own default is `WorkerMode::Writing`.
+        let mut req = spawn_request("do the work", &repo);
+        req.parent_session = Some(session.to_string());
+        // One past the seat's own registered generation 1: a rollover onto
+        // this seat prepared but not yet committed.
+        req.parent_seat_generation = Some(2);
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = ErrorLog::default();
+        let requests_dir = tmp.path().join("requests");
+        let result = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+        );
+
+        let refusal =
+            result.expect_err("an uncommitted requester generation must not take a writer lease");
+        assert!(
+            refusal.reason.contains("uncommitted seat generation"),
+            "expected a stale-seat refusal naming the uncommitted generation, got {:?}",
+            refusal.reason
+        );
+        assert!(
+            panes.is_empty(),
+            "a refused request must never have spawned a pane"
+        );
+        assert_eq!(
+            super::super::permit::live_writer_records(&state).len(),
+            0,
+            "a refused request must never have taken a writer slot"
+        );
     }
 
     /// A coordinator pane delegates edits instead of making them, so a

@@ -250,28 +250,32 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     let tree =
         std::fs::canonicalize(&request.launch_repo).unwrap_or_else(|_| request.launch_repo.clone());
     let writer_permit = if args.mode == WorkerMode::Writing {
+        // Issue #543: this process's own seat identity (if any), read the
+        // same way `seat::guard_from_env` does, but fed into the STRICT
+        // `seat::guard` verdict via an explicit `SeatFence` -- an uncommitted
+        // successor delegating a writing worker must not hand that worker a
+        // lease before its own rollover commits, which `guard_from_env`'s
+        // supersession-only check let through. This is NOT the delegated
+        // worker's own future seat: `child_short`'s eventual native session
+        // seat is still created later inside `runtime::native::run_session`
+        // under a fresh identity, and pre-registering one here remains wrong
+        // for the reason PR #535 already gave (an orphaned record `seat::
+        // register`'s hardcoded `RuntimeKind::Harness` couldn't even stand in
+        // for correctly) -- see issue #543's own tracking comment for closing
+        // that separate gap.
+        let identity = super::seat::env_seat_identity();
+        let fence = identity
+            .as_ref()
+            .map(|(short, generation)| permit::SeatFence {
+                short,
+                generation: *generation,
+            });
         match permit::acquire_writer(
             state,
             cfg.supervise.max_writers,
             &format!("session {child_short}: native/{route_id}"),
             &tree,
-            // Issue #488 (review finding 1 follow-up, PR #535): a delegated
-            // worker holds no seat of its own at this point -- the eventual
-            // native session's own seat is created and stored later, inside
-            // `runtime::native::run_session`, under a session identity
-            // `NativeBackend::start` mints fresh (a random uuid/short,
-            // generation 1) and never derived from `child_short`/
-            // `worker_session` above. `seat::register`, the only reusable
-            // registration primitive, also hardcodes `runtime:
-            // RuntimeKind::Harness` for a brand-new record (issue #470), so
-            // it cannot even correctly stand in for one. Pre-registering a
-            // seat for `child_short` here would therefore be a seat this
-            // delegated worker's own real native session never uses, orphaned
-            // in state forever rather than swept the way a real seat is --
-            // worse than the honest answer this env fence already gives (see
-            // `seat::guard_from_env`'s own doc comment for the full list of
-            // callers this reasoning applies to).
-            None,
+            fence,
         ) {
             Ok(permit) => Some(permit),
             Err(refusal) => {

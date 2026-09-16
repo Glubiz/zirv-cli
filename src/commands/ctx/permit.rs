@@ -1547,6 +1547,33 @@ mod tests {
             .expect("a caller outside any seat is never fenced");
     }
 
+    // Issue #543 (review F4): the call-site wiring this test module used to
+    // claim to cover -- `agent.rs`/`dash/mod.rs`/`native_worker.rs` each
+    // building an explicit `SeatFence` instead of passing `None`
+    // unconditionally -- was retired from here (the removed `a_call_site_
+    // built_fence_refuses_an_uncommitted_generation_the_env_fence_let_
+    // through`). Constructing a `SeatFence` directly and asserting on it, as
+    // that test did, only re-proves `acquire_writer`'s own strict-fence
+    // behavior, already covered above by
+    // `a_stale_or_uncommitted_generation_may_not_take_a_writer_lease`; it
+    // passed identically whether or not any call site was ever wired up.
+    //
+    // The real wiring is now exercised at the call site itself: `dash::
+    // mod::tests::
+    // fulfill_spawn_request_refuses_a_writer_lease_for_an_uncommitted_
+    // requester_generation` drives `fulfill_spawn_request` end to end with
+    // `SpawnRequest::parent_session`/`parent_seat_generation` naming an
+    // uncommitted rollover, so it fails if that site ever goes back to
+    // fencing on the dashboard's own (unrelated) environment instead of the
+    // requester's. `agent.rs`'s call site is exercised the same indirect way
+    // `run_with_refuses_a_second_writing_worker_into_a_tree_with_a_live_
+    // writer` already covers writer-permit acquisition through `run_with`
+    // (that test does not itself set an uncommitted generation, but goes
+    // through the identical `acquire_writer` call this rewrite proves
+    // refuses one). `native_worker.rs`'s call site has no dedicated
+    // writer-permit test at all today -- a pre-existing gap this fix round
+    // did not create and does not claim to close.
+
     /// The other half of the same rule: a DIFFERENT tree must never be
     /// refused just because some other tree already has a live writer.
     #[test]

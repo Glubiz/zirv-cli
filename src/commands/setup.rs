@@ -394,7 +394,7 @@ pub(crate) fn codex_config_dir(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".codex"))
 }
 
-fn executable_exists(name: &str) -> bool {
+pub(crate) fn executable_exists(name: &str) -> bool {
     let path = Path::new(name);
     if path.components().count() > 1 {
         return path.is_file();
@@ -420,6 +420,142 @@ fn executable_exists(name: &str) -> bool {
             })
         })
     })
+}
+
+/// The `claude` CLI version zirv's own hardcoded argv (`--permission-mode`,
+/// `--allowedTools`/`--disallowedTools`, `--settings`, `--session-id`,
+/// `--add-dir`, all unconditional -- see `adapters::claude`) was last
+/// verified against (2026-08-24 addendum, issue #147). `zirv setup`'s own
+/// non-blocking floor, not a hard requirement anything else enforces.
+const CLAUDE_VERIFIED_VERSION: (u64, u64, u64) = (2, 1, 241);
+
+/// Parses `claude --version`'s own `"2.1.273 (Claude Code)"`-shaped output
+/// into a comparable (major, minor, patch) tuple. `None` for anything that
+/// does not start with three dot-separated numbers -- a non-blocking probe
+/// must never treat an unexpected format as a hard failure.
+fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
+    let first = output.lines().next()?.trim();
+    let version = first.split_whitespace().next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Parses `claude auth status --json`'s own `{"loggedIn": true, ...}` output
+/// down to the one field `zirv setup` reports on. `None` for anything that
+/// does not parse -- an older CLI's shape, or no output at all -- reported
+/// as "unknown" by the caller rather than guessed at.
+fn parse_claude_logged_in(output: &str) -> Option<bool> {
+    serde_json::from_str::<Value>(output)
+        .ok()?
+        .get("loggedIn")?
+        .as_bool()
+}
+
+/// Bounds `run_claude_probe` below: issue #458's own requirement is that a
+/// stalled or hanging `claude` binary never wedges `zirv setup`, so this
+/// caps a best-effort health probe rather than letting `Command::output`
+/// block indefinitely. Same shape as `adapters::claude::HELP_PROBE_TIMEOUT`/
+/// `adapters::codex::IGNORE_FLAGS_PROBE_TIMEOUT`.
+const CLAUDE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Runs a `claude` subcommand and returns its stdout, or `None` if it could
+/// not even be spawned, its output was not UTF-8, or it did not finish
+/// within [`CLAUDE_PROBE_TIMEOUT`] -- all non-fatal for a best-effort probe.
+///
+/// Issue #458: `Command::output()` blocks until the child exits, so a
+/// stalled `claude` binary used to wedge `zirv setup` forever. Bounded the
+/// same way `adapters::claude::detect_help_flag`/`adapters::codex::
+/// detect_ignore_flags` already bound their own `--help` probes -- spawn
+/// with piped stdout, read it on a background thread so a full pipe buffer
+/// can never stall the child, and poll `try_wait` against a deadline -- no
+/// existing helper already returns a plain `Option<String>` for a timed-out
+/// probe, so this follows the same idiom rather than adding a new one.
+fn run_claude_probe(args: &[&str]) -> Option<String> {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new("claude")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = std::time::Instant::now() + CLAUDE_PROBE_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let bytes = rx.recv_timeout(std::time::Duration::from_secs(1)).ok()?;
+                return String::from_utf8(bytes).ok();
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    // Timed out: kill the child rather than leaking it.
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// Issue #458: `zirv setup` used to check only whether a `claude` executable
+/// exists on `PATH`, never whether it is new enough for the argv zirv
+/// hardcodes or whether the operator is even logged in -- a pane that dies
+/// on launch because of either used to explain nothing. Both probes are
+/// best-effort and NEVER block setup: an unreachable `claude`, or output
+/// this cannot parse, prints an "unknown"/skip line instead of failing the
+/// wizard.
+fn report_claude_cli_health() {
+    match run_claude_probe(&["--version"]) {
+        Some(output) => match parse_claude_version(&output) {
+            Some(version) if version < CLAUDE_VERIFIED_VERSION => {
+                let (major, minor, patch) = CLAUDE_VERIFIED_VERSION;
+                println!(
+                    "claude CLI: version {}.{}.{} is older than the {major}.{minor}.{patch} \
+                     zirv's argv was last verified against -- run `claude update` to refresh it.",
+                    version.0, version.1, version.2
+                );
+            }
+            Some(_) => println!("claude CLI: version {} (up to date)", output.trim()),
+            None => println!("claude CLI: version unknown ({})", output.trim()),
+        },
+        None => {
+            println!("claude CLI: `claude --version` did not run; skipping the version check")
+        }
+    }
+    match run_claude_probe(&["auth", "status", "--json"]) {
+        Some(output) => match parse_claude_logged_in(&output) {
+            Some(true) => println!("claude CLI: logged in"),
+            Some(false) => println!(
+                "claude CLI: not logged in -- run `claude auth login` before using the claude \
+                 harness"
+            ),
+            None => println!(
+                "claude CLI: login status unknown (unrecognized `claude auth status` output)"
+            ),
+        },
+        None => {
+            println!("claude CLI: `claude auth status` did not run; skipping the login check")
+        }
+    }
 }
 
 fn contains_command(value: &Value, command: &str) -> bool {
@@ -2821,6 +2957,9 @@ fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
                 "not detected on PATH"
             }
         );
+        if detected && *name == "claude" {
+            report_claude_cli_health();
+        }
         let enable = dialoguer::Confirm::new()
             .with_prompt(format!("Enable the {name} harness?"))
             .default(detected)
@@ -3778,6 +3917,36 @@ pub fn dispatch(args: &[String]) -> i32 {
 mod tests {
     use super::*;
     use crate::commands::ctx::testenv::{HomeGuard, VarGuard};
+
+    /// Issue #458: `zirv setup`'s claude CLI health probe never blocks on a
+    /// parse failure, so both parsers must return `None` (reported as
+    /// "unknown" by `report_claude_cli_health`) rather than panicking or
+    /// guessing on output an older/newer CLI, or a non-claude program on
+    /// `PATH`, might print.
+    #[test]
+    fn claude_cli_probe_output_parses_version_and_login_state() {
+        assert_eq!(
+            parse_claude_version("2.1.273 (Claude Code)\n"),
+            Some((2, 1, 273))
+        );
+        assert_eq!(parse_claude_version(""), None);
+        assert_eq!(parse_claude_version("not a version\n"), None);
+        assert_eq!(parse_claude_version("2.1\n"), None);
+
+        assert_eq!(
+            parse_claude_logged_in(r#"{"loggedIn": true, "email": "josj@cego.dk"}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_claude_logged_in(r#"{"loggedIn": false}"#),
+            Some(false)
+        );
+        assert_eq!(parse_claude_logged_in(""), None);
+        assert_eq!(parse_claude_logged_in(r#"{"other": 1}"#), None);
+
+        assert!((2, 1, 240) < CLAUDE_VERIFIED_VERSION);
+        assert!((2, 1, 273) >= CLAUDE_VERIFIED_VERSION);
+    }
 
     #[test]
     fn parses_status_apply_and_guarded_reset() {
