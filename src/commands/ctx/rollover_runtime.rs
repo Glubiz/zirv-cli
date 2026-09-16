@@ -771,6 +771,98 @@ pub trait SuccessorLauncher {
     fn launch(&mut self, plan: &SuccessorPlan) -> Result<String, SuccessorRefusal>;
 }
 
+/// The two native-session inputs a successor cannot infer from its seat.
+pub struct NativeSuccessorSpec {
+    /// A writing source keeps a writer permit across the rollover.
+    pub writing: bool,
+    /// Deterministic provider override used by native runtime tests only.
+    pub provider: Option<String>,
+}
+
+impl Default for NativeSuccessorSpec {
+    fn default() -> Self {
+        Self {
+            writing: true,
+            provider: None,
+        }
+    }
+}
+
+/// What a native successor is told first: the source's handoff, acknowledged
+/// input it never answered, and any effect it must reconcile before acting.
+fn native_successor_input(
+    plan: &SuccessorPlan,
+    note: &super::handoff::Handoff,
+    cfg: &super::config::CtxConfig,
+) -> String {
+    let mut text = super::wrap::restart_prompt(note, &cfg.screen.thresholds());
+    if !plan.acknowledged_input.is_empty() {
+        text.push_str(
+            "\n\nAcknowledged input the previous session never answered. Treat each line as an \
+             instruction you still owe:\n",
+        );
+        for input in &plan.acknowledged_input {
+            text.push_str("- ");
+            text.push_str(input);
+            text.push('\n');
+        }
+    }
+    if let Some(halt) = &plan.halted_for {
+        text.push_str("\n\nSTOP AND RECONCILE FIRST: ");
+        text.push_str(halt);
+        text.push('\n');
+    }
+    text
+}
+
+/// Opens the native pane used by every live successor seam.
+///
+/// The pane is fully built before this returns, on the source seat's stable
+/// short id and successor generation. A caller can therefore retire its
+/// source only after `Ok`, while an error leaves that source untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_native_pane(
+    cfg: &super::config::CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    cwd: &Path,
+    verb: super::sessions::Verb,
+    title: String,
+    size: (u16, u16),
+    role: super::prompt::PromptRole,
+    plan: &SuccessorPlan,
+    note: &super::handoff::Handoff,
+    native: &NativeSuccessorSpec,
+) -> Result<super::dash::Pane, SuccessorRefusal> {
+    let state_root = state.root().to_str().map(str::to_string);
+    let process_env = super::config::env_from_process();
+    let env = move |key: &str| {
+        if key == super::state::STATE_ENV {
+            return state_root.clone();
+        }
+        process_env(key)
+    };
+    super::dash::Pane::spawn_native(
+        cfg,
+        state,
+        &env,
+        repo,
+        verb,
+        title,
+        size,
+        super::dash::native_pane::NativeDashboardSpec {
+            repo: cwd.to_path_buf(),
+            role: role.label().to_string(),
+            route: plan.target_route.clone(),
+            writing: native.writing,
+            provider: native.provider.clone(),
+            seat: Some((plan.short.clone(), plan.generation)),
+            initial_input: Some(native_successor_input(plan, note, cfg)),
+        },
+    )
+    .map_err(|error| SuccessorRefusal::LaunchFailed(error.to_string()))
+}
+
 /// Builds the plan for one live swap, from the boundary the source already
 /// reached (issue #552).
 ///
