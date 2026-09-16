@@ -4,8 +4,13 @@ use std::process::Command;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
+pub mod cursor;
 pub mod droid;
 pub mod gemini;
+pub mod goose;
+pub mod grok;
+pub mod kimi;
+pub mod muse;
 pub mod opencode;
 pub mod pi;
 pub mod qwen;
@@ -1317,6 +1322,21 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// `Err` when the adapter exists but is not safe to use yet, so callers
     /// fail loudly instead of scoring garbage.
     fn ready(&self) -> CtxResult<()>;
+
+    /// Whether a `ready()` failure (if any) is a permanent fact of the
+    /// platform this binary is running on, rather than a transient "not
+    /// installed/configured yet" state. `readiness_note()`'s "Not ready yet:
+    /// ... (see issue #11)" clause reads as "go install this," which is
+    /// false for a harness that can never run on this OS at all --
+    /// distinguishing the two lets that function route such an adapter into
+    /// its own "Unsupported on this platform" clause instead. Default
+    /// `false`: every adapter but muse (issue #394, macOS/Linux only -- see
+    /// `MuseAdapter::ready`) fails `ready()` only for reasons a user CAN fix
+    /// (missing binary, missing credential, an unlaunchable `.cmd`/`.py`
+    /// shim), so only muse overrides this.
+    fn platform_unsupported(&self) -> bool {
+        false
+    }
 
     fn detect(&self, command: &[String]) -> bool;
 
@@ -2798,6 +2818,87 @@ impl ProbeCache {
     }
 }
 
+/// Recursively collects every file under `dir` for which `matches` is true.
+fn collect_matching_files(dir: &Path, matches: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_matching_files(&path, matches, out);
+        } else if matches(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// Wave 3 (issues #390-#392): the shared "harness mints its own unpredictable
+/// session directory/id" discovery shape for an adapter whose transcript root
+/// is known but whose per-session subdirectory naming is not fully verified
+/// (grok's url-encoded cwd segment, kimi's md5-of-cwd segment, cursor's
+/// project-hash segment) -- the sibling of `codex::resolve_rollout`, but with
+/// no verified per-line content to cross-check a session's own cwd against,
+/// so this resolves by mtime alone: the NEWEST matching file with an mtime at
+/// or after `floor_ms`. Two sessions of the SAME harness started in the SAME
+/// repo within one poll cannot be told apart -- the same class of residual
+/// `opencode::pinned_session_id`'s own doc comment already discloses for its
+/// own harness.
+fn newest_matching_file_since(
+    root: &Path,
+    floor_ms: u64,
+    matches: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_matching_files(root, matches, &mut files);
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            let ms = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as u64;
+            (ms >= floor_ms).then_some((ms, path))
+        })
+        .max_by_key(|(ms, _)| *ms)
+        .map(|(_, path)| path)
+}
+
+/// Pins [`newest_matching_file_since`]'s answer under
+/// `state.rollouts()/<adapter_name>-<short>.path`, mirroring
+/// `codex::CodexAdapter::pinned_rollout` exactly: read the pin first (a
+/// stable answer, no rescanning, and no drift if a newer session of the same
+/// harness starts in the same repo mid-poll), else resolve and best-effort
+/// write it. `None` when no `StateDir` resolves, this session has no
+/// registered start time yet, or nothing under `root` matches -- the caller
+/// falls back to its own "not found yet" path.
+pub(crate) fn pin_newest_transcript(
+    state: &super::state::StateDir,
+    session: &SessionRef,
+    adapter_name: &str,
+    root: &Path,
+    matches: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let short = super::sessions::short_id(session.id.as_str());
+    let pin = state
+        .rollouts()
+        .join(format!("{adapter_name}-{short}.path"));
+    if let Ok(recorded) = std::fs::read_to_string(&pin) {
+        let recorded = PathBuf::from(recorded.trim());
+        if recorded.is_file() {
+            return Some(recorded);
+        }
+    }
+    let record = super::sessions::load_record(state, &short)?;
+    let floor_ms = record.started_at.saturating_mul(1_000);
+    let resolved = newest_matching_file_since(root, floor_ms, matches)?;
+    if super::state::create_private_dir_all(&state.rollouts()).is_ok() {
+        let _ = super::state::write_private(&pin, &resolved.display().to_string());
+    }
+    Some(resolved)
+}
+
 /// An adapter constructor: the same shape `ClaudeAdapter::new` and
 /// `CodexAdapter::new` already share, named so `ADAPTERS` reads as a table
 /// rather than a wall of type punctuation.
@@ -2815,12 +2916,32 @@ fn make_copilot(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(copilot::CopilotAdapter::new(bin))
 }
 
+fn make_cursor(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(cursor::CursorAdapter::new(bin))
+}
+
 fn make_droid(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(droid::DroidAdapter::new(bin))
 }
 
 fn make_gemini(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(gemini::GeminiAdapter::new(bin))
+}
+
+fn make_goose(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(goose::GooseAdapter::new(bin))
+}
+
+fn make_grok(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(grok::GrokAdapter::new(bin))
+}
+
+fn make_kimi(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(kimi::KimiAdapter::new(bin))
+}
+
+fn make_muse(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(muse::MuseAdapter::new(bin))
 }
 
 fn make_opencode(bin: Option<&str>) -> Box<dyn AgentAdapter> {
@@ -2844,8 +2965,13 @@ pub const ADAPTERS: &[(&str, AdapterCtor)] = &[
     ("claude", make_claude),
     ("codex", make_codex),
     ("copilot", make_copilot),
+    ("cursor-agent", make_cursor),
     ("droid", make_droid),
     ("gemini", make_gemini),
+    ("goose", make_goose),
+    ("grok", make_grok),
+    ("kimi", make_kimi),
+    ("muse", make_muse),
     ("opencode", make_opencode),
     ("pi", make_pi),
     ("qwen", make_qwen),
@@ -3741,11 +3867,14 @@ fn join_with_or(items: &[&str]) -> String {
     }
 }
 
-/// A short clause naming every adapter that is not ready yet, plus one
-/// naming every *ready* adapter whose own `capabilities()` still leaves its
-/// launches degraded (no rot score, usage, turn signal, or injected
-/// system prompt) -- for `zirv ctx --help`'s `about` text. Both halves are
-/// generated from each adapter's own `ready()`/`capabilities()` rather than
+/// A short clause naming every adapter that is not ready yet, a second
+/// naming every adapter whose `ready()` failure is permanent for this
+/// platform (`AgentAdapter::platform_unsupported`) rather than a fixable
+/// "not installed yet" state, plus a third naming every *ready* adapter
+/// whose own `capabilities()` still leaves its launches degraded (no rot
+/// score, usage, turn signal, or injected system prompt) -- for `zirv ctx
+/// --help`'s `about` text. All three are generated from each adapter's own
+/// `ready()`/`platform_unsupported()`/`capabilities()` rather than
 /// hardcoded, so a newly wired-up adapter (or one that later closes a
 /// capability gap) falls in or out of the sentence on its own. Empty only
 /// once every adapter is both ready and fully capable.
@@ -3756,6 +3885,12 @@ fn join_with_or(items: &[&str]) -> String {
 /// honestly all-`false` -- `--agent codex` works, silently missing the four
 /// things claude gets for free, which a user reading `--help` deserves to
 /// see stated plainly rather than only discovering by surprise.
+///
+/// Muse (issue #394) is the adapter the second clause currently discloses on
+/// Windows: its `ready()` refuses outright there since no binary can ever
+/// exist for it on that platform, which is categorically different from
+/// "not ready yet" -- the latter implies installing the binary would fix
+/// it.
 pub fn readiness_note() -> String {
     let mut clauses: Vec<String> = Vec::new();
 
@@ -3766,11 +3901,16 @@ pub fn readiness_note() -> String {
     // process, but the hook/statusline path still goes through it on every
     // invocation before that cache is warm.
     let mut not_ready: Vec<&str> = Vec::new();
+    let mut unsupported: Vec<&str> = Vec::new();
     let mut degraded: Vec<String> = Vec::new();
     for (name, ctor) in ADAPTERS {
         let adapter = ctor(None);
         if adapter.ready().is_err() {
-            not_ready.push(name);
+            if adapter.platform_unsupported() {
+                unsupported.push(name);
+            } else {
+                not_ready.push(name);
+            }
             continue;
         }
         let missing = missing_capability_labels(adapter.capabilities());
@@ -3786,6 +3926,12 @@ pub fn readiness_note() -> String {
         clauses.push(format!(
             "Not ready yet: {} (see issue #11).",
             not_ready.join(", ")
+        ));
+    }
+    if !unsupported.is_empty() {
+        clauses.push(format!(
+            "Unsupported on this platform: {}.",
+            unsupported.join(", ")
         ));
     }
     if !degraded.is_empty() {
@@ -4581,10 +4727,6 @@ mod tests {
             "codex is ready now, not unready: {note}"
         );
         assert!(note.contains("codex"), "got {note}");
-        assert!(
-            !note.contains("rot score"),
-            "issue #86 gave codex real event parsing: {note}"
-        );
         assert!(note.contains("usage"), "got {note}");
         assert!(note.contains("turn signal"), "got {note}");
         // Codex's OWN clause must not claim the "injected prompt" gap --
@@ -4593,6 +4735,12 @@ mod tests {
         // carries that gap (`GEMINI_SYSTEM_MD` is env-var-only, no per-run
         // argv mechanism), so this checks codex's own exact clause rather
         // than asserting the whole note never mentions the phrase at all.
+        // Issue #86 gave codex real event parsing, so its own clause must not
+        // claim "no rot score" either -- wave 3's grok/kimi/cursor-agent/
+        // goose/muse (issues #390-#394) legitimately carry that gap (no
+        // verified row-level transcript schema for any of them), so this
+        // checks codex's own exact clause rather than asserting the whole
+        // note never mentions the phrase at all.
         assert!(
             note.contains("codex (launch-level: no usage or turn signal)"),
             "got {note}"
@@ -4601,6 +4749,43 @@ mod tests {
         assert!(
             !note.contains("claude (launch-level"),
             "claude is fully capable and must not appear in the degraded clause: {note}"
+        );
+    }
+
+    /// Issue #394 review follow-up: on Windows, muse's `ready()` always
+    /// fails (see `MuseAdapter::ready`), but that failure is a permanent
+    /// platform fact, not a "not installed yet" one -- it must land in its
+    /// own "Unsupported on this platform" clause, never in "Not ready yet"
+    /// (which reads as "go install this" and would be false for muse here).
+    /// This runs against the real `ADAPTERS` table with no rigging, since
+    /// muse's Windows refusal is unconditional.
+    #[cfg(windows)]
+    #[test]
+    fn readiness_note_files_muse_as_platform_unsupported_not_not_ready_on_windows() {
+        let note = readiness_note();
+        assert!(note.contains("Unsupported on this platform"), "got {note}");
+        assert!(note.contains("muse"), "got {note}");
+        assert!(
+            !note.to_lowercase().contains("not ready"),
+            "muse's Windows refusal is permanent, not a fixable not-ready state: {note}"
+        );
+    }
+
+    /// Symmetry check for the test immediately above: off Windows, muse's
+    /// `ready()` succeeds (nothing on this codebase requires the binary to
+    /// actually be installed -- see `resolve_program`'s non-Windows arm), so
+    /// it must never appear in either the "Unsupported on this platform" or
+    /// "Not ready yet" clause -- only (legitimately, per issue #394) in
+    /// "Degraded surface", alongside every other wave-3 adapter.
+    #[cfg(not(windows))]
+    #[test]
+    fn readiness_note_never_files_muse_as_unsupported_or_not_ready_off_windows() {
+        let note = readiness_note();
+        assert!(!note.contains("Unsupported on this platform"), "got {note}");
+        assert!(!note.to_lowercase().contains("not ready"), "got {note}");
+        assert!(
+            note.contains("muse (launch-level"),
+            "muse is ready but still degraded (issue #394): {note}"
         );
     }
 
@@ -6325,7 +6510,19 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "claude", "codex", "copilot", "droid", "gemini", "opencode", "pi", "qwen"
+                "claude",
+                "codex",
+                "copilot",
+                "cursor-agent",
+                "droid",
+                "gemini",
+                "goose",
+                "grok",
+                "kimi",
+                "muse",
+                "opencode",
+                "pi",
+                "qwen"
             ]
         );
     }

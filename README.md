@@ -579,8 +579,9 @@ to the section that documents it in depth.
   workflow, artifact, worker-result, and inbox reads to wrapped MCP hosts.
   `zirv ctx mcp doctor` checks a real stdio connection. See [MCP bridge](#mcp-bridge).
 - **Harness adapters** — one adapter per supported harness: `claude`,
-  `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, and `qwen`, each
-  enabled or disabled per repo in `.zirv/.settings.toml`. See
+  `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, `qwen`, `grok`,
+  `kimi`, `cursor-agent`, `goose`, and `muse`, each enabled or disabled per
+  repo in `.zirv/.settings.toml`. See
   [.settings.toml](#settingstoml). For which models
   zirv recognises on each harness, see [Supported harnesses and
   models](#supported-harnesses-and-models).
@@ -5012,9 +5013,10 @@ reaches the volume that originally motivated this feature.
 
 ## Supported harnesses and models
 
-zirv ships eight harness adapters — `claude`, `codex`, `gemini`, `qwen`,
-`opencode`, `pi`, `copilot`, and `droid` — each enabled or disabled per repo
-in [.settings.toml](#settingstoml). The model list below is what zirv
+zirv ships thirteen harness adapters — `claude`, `codex`, `gemini`, `qwen`,
+`opencode`, `pi`, `copilot`, `droid`, `grok`, `kimi`, `cursor-agent`, `goose`,
+and `muse` — each enabled or disabled per repo in
+[.settings.toml](#settingstoml). The model list below is what zirv
 *recognises*: it drives tier translation, pricing, review-model escalation,
 and context-window lookups. Each harness's own CLI still decides what
 actually launches — a model zirv does not recognise is passed through
@@ -5032,6 +5034,11 @@ verbatim but gets no tier translation, since zirv never guesses.
 | `pi` | any catalogue vendor below | model is pinned with `--model provider/id`; zirv resolves the vendor from that prefix and id; an unrecognised model falls back to `pi` |
 | `copilot` | any catalogue vendor below (ladder lookups only) | tier, strength and context window are looked up per model, but billing is always the operator's GitHub Copilot subscription (`github`), regardless of which model answered |
 | `droid` | any catalogue vendor below | bare model ids (no `provider/` prefix) resolve directly against the catalogue; `custom:<id>` BYOK ids never match a vendor and fall back to the `factory` slug, with no tier translation |
+| `grok` | xAI ladder | single vendor; no verified row-level transcript schema, so rot-scoring reports no data (issue #390) |
+| `kimi` | Moonshot ladder | single vendor; no verified row-level transcript schema, so rot-scoring reports no data (issue #391) |
+| `cursor-agent` | none (proprietary) | no catalogue vendor and no verified headless model flag; no verified row-level transcript schema, so rot-scoring reports no data (issue #392) |
+| `goose` | any catalogue vendor below | model is paired with a `--provider` flag derived from the model's own vendor prefix; an unrecognised model falls back to the static `goose` slug; transcript is a single shared SQLite database whose schema is unverified, so rot-scoring reports no data (issue #393) |
+| `muse` | Meta ladder | single vendor; macOS/Linux only; even the transcript location is unverified, so rot-scoring reports no data (issue #394) |
 
 ### Model catalogue
 
