@@ -3036,6 +3036,15 @@ fn try_join_dashboard<W: Write>(
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string),
+        // Issue #543 (review F2): this process's own seat generation, read
+        // the same way `seat::guard_from_env`/`seat::env_seat_identity` read
+        // theirs -- paired with `parent_session` above so `dash::mod::
+        // fulfill_spawn_request` can fence the eventual writer lease against
+        // the REQUESTER's identity instead of the dashboard's own env (see
+        // `SpawnRequest::parent_seat_generation`'s own doc comment).
+        parent_seat_generation: env(super::seat::GENERATION_ENV)
+            .as_deref()
+            .and_then(|g| g.parse::<u64>().ok()),
     };
     // Issue #307.3: computed once, here, and threaded through both this
     // ack and `wait_out_a_claimed_request`'s own -- a nudge for THIS
@@ -4501,6 +4510,19 @@ pub fn run_with<W: Write>(
     // so the tree frees the moment the work is actually done.
     let writer_permit = if args.mode == WorkerMode::Writing {
         let tree = std::fs::canonicalize(&launch_repo).unwrap_or_else(|_| launch_repo.clone());
+        // Issue #543: this process's own seat identity (if any), read the
+        // same way `seat::guard_from_env` does, but fed into the STRICT
+        // `seat::guard` verdict via an explicit `SeatFence` -- an uncommitted
+        // successor delegating a writing worker must not hand that worker a
+        // lease before its own rollover commits, which `guard_from_env`'s
+        // supersession-only check let through.
+        let identity = super::seat::env_seat_identity();
+        let fence = identity
+            .as_ref()
+            .map(|(short, generation)| permit::SeatFence {
+                short,
+                generation: *generation,
+            });
         match permit::acquire_writer(
             &state,
             cfg.supervise.max_writers,
@@ -4510,11 +4532,7 @@ pub fn run_with<W: Write>(
                 args.name
             ),
             &tree,
-            // Issue #488: a legacy worker launch is driven from a process
-            // whose only statement about a seat is its own environment, so
-            // the env-derived (supersession-only) fence is the honest answer
-            // here -- see `permit::SeatFence`.
-            None,
+            fence,
         ) {
             Ok(writer_permit) => Some(writer_permit),
             Err(refusal) => {

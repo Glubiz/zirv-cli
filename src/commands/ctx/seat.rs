@@ -816,6 +816,38 @@ pub fn guard_from_env(state: &StateDir) -> Result<(), StaleGeneration> {
     )
 }
 
+/// The pure half of [`env_seat_identity`]: given the raw `ZIRV_CTX_SESSION`/
+/// `ZIRV_CTX_SEAT_GENERATION` values (if any), resolves the (short,
+/// generation) pair a caller can wrap in a [`super::permit::SeatFence`] to
+/// get the STRICT [`guard`] verdict instead of [`guard_from_env`]'s
+/// supersession-only one. `None` exactly when `guard_from_env` would find
+/// "nothing to fence against" (missing env, or an unparsable generation).
+/// Split out the same way [`superseded_only`] is, so a caller can be tested
+/// without mutating real process environment variables.
+pub(crate) fn seat_identity_from_env_values(
+    session: Option<&str>,
+    generation: Option<&str>,
+) -> Option<(String, u64)> {
+    let short = super::sessions::short_id(session?);
+    let generation = generation?.parse::<u64>().ok()?;
+    Some((short, generation))
+}
+
+/// Issue #543: [`super::adapters::SESSION_ENV`]/[`GENERATION_ENV`] read
+/// straight from this process's own environment and resolved into the same
+/// (short, generation) pair [`guard_from_env`] already reads -- so a
+/// `permit::acquire_writer` caller that used to pass `None` unconditionally
+/// (getting `guard_from_env`'s supersession-only verdict, which lets an
+/// uncommitted generation's writer lease through) can instead build a
+/// strict [`super::permit::SeatFence`] from it. `None` when there is nothing
+/// to fence against, same as `guard_from_env`.
+pub fn env_seat_identity() -> Option<(String, u64)> {
+    seat_identity_from_env_values(
+        std::env::var(super::adapters::SESSION_ENV).ok().as_deref(),
+        std::env::var(GENERATION_ENV).ok().as_deref(),
+    )
+}
+
 fn load_short(state: &StateDir, session: &str) -> Option<Seat> {
     load(state, &super::sessions::short_id(session))
 }

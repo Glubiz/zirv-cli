@@ -280,6 +280,29 @@ pub struct SpawnRequest {
     /// to -- means exactly the behaviour before this field existed.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Issue #543 (review F2): the REQUESTER's own seat generation at the
+    /// moment it wrote this request, read the same way `seat::guard_from_env`
+    /// reads its own (`seat::GENERATION_ENV`) -- paired with `parent_session`
+    /// above to build a `permit::SeatFence` at the fulfilment side.
+    ///
+    /// Before this field existed, `dash::mod::fulfill_spawn_request` had no
+    /// requester identity to fence on at all and fenced against the
+    /// DASHBOARD's *own* process environment instead -- a different process
+    /// than the one asking for the spawn, so that fence was either `None`
+    /// (the dashboard holds no seat itself, the common case) or named some
+    /// unrelated seat, neither of which says anything about whether the
+    /// actual requester's rollover has committed. `None` -- also what a
+    /// request written by an older build deserialises to -- means "the
+    /// requester held no seat", read the same way an absent env var does.
+    ///
+    /// Only ever NARROWS: a forged value can only make `permit::acquire_
+    /// writer` refuse a request that would otherwise have gone through
+    /// unfenced (exactly the outcome omitting the field already gets), never
+    /// grant a lease the state on disk would otherwise refuse -- so, like
+    /// `max_restarts`/`timeout_secs`, `dash::mod::sanitize_file_dropped_
+    /// request` does not need to clear it.
+    #[serde(default)]
+    pub parent_seat_generation: Option<u64>,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -647,6 +670,7 @@ mod tests {
             max_tool_calls: None,
             flags: Vec::new(),
             system_prompt: None,
+            parent_seat_generation: None,
         }
     }
 

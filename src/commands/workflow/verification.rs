@@ -229,6 +229,52 @@ pub fn load_or_discover(repo: &Path) -> CtxResult<ResolvedChecks> {
 
 type SourceFor = fn(&CheckSpec) -> CheckSource;
 
+/// Issue #495: whether `cargo nextest` is installed, i.e. a `cargo-nextest`
+/// binary is on `PATH` -- the same lookup `cargo` itself does to resolve a
+/// subcommand. Reused rather than duplicated: `setup::executable_exists`
+/// already does exactly this PATH/PATHEXT walk for `zirv setup`'s own
+/// toolchain checks.
+fn nextest_available() -> bool {
+    crate::commands::setup::executable_exists("cargo-nextest")
+}
+
+/// The discovered Rust repo's default "test" check command. `.config/
+/// nextest.toml` isolates flake-prone test families (e.g. the
+/// `exec-nudge-restart` group) into their own single-threaded groups, a
+/// protection that only applies under `cargo nextest run` -- the plain
+/// serial `cargo test -- --test-threads=1` this repo's own gate used to run
+/// reads none of it, so a documented flake there fails `zirv test changed`/
+/// `zirv workflow advance --run-checks` on an otherwise green change set.
+/// nextest was dropped as this repo's own serial-run standard on 2026-09-11;
+/// this makes the discovered gate agree, for every Rust repo, without
+/// regressing one that has not installed nextest at all.
+///
+/// Issue #495 follow-up: `cargo nextest run` never executes doctests, so
+/// running it alone silently drops doctest coverage the old `cargo test`
+/// command had -- for a repo `cargo test` would have run any for in the
+/// first place. `has_lib_target` (see its own call site,
+/// `repo.join("src/lib.rs").is_file()`) matters because `cargo test --doc`
+/// HARD ERRORS (`error: no library targets found in package`, exit 101) on
+/// a bin-only crate rather than harmlessly finding zero doctests -- verified
+/// against this repo's own `Cargo.toml`, which has no `[lib]`. Chaining it
+/// unconditionally would trade "silently drops doctest coverage" for
+/// "always fails the gate" on every bin-only Rust repo, including this one.
+/// `command_for_shell` runs this text through a real shell, so chaining
+/// `&& cargo test --doc` when there is a lib target keeps both able to fail
+/// the gate: a nextest failure short-circuits (nonzero exit, doctests don't
+/// need to run to know the gate failed), and a nextest pass still runs
+/// doctests and fails the gate if they don't.
+fn default_rust_test_command(nextest_available: bool, has_lib_target: bool) -> String {
+    match (nextest_available, has_lib_target) {
+        (true, true) => "cargo nextest run --no-fail-fast && cargo test --doc".to_string(),
+        (true, false) => "cargo nextest run --no-fail-fast".to_string(),
+        // `cargo test` alone already covers doctests for a lib target with
+        // no extra flag, so the non-nextest branch never needs to chain
+        // anything -- exactly the pre-#495 command, unchanged either way.
+        (false, _) => "cargo test --verbose -- --test-threads=1".to_string(),
+    }
+}
+
 fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static str, SourceFor)> {
     let path = repo.join(".zirv").join("verify.toml");
     if path.exists() {
@@ -284,7 +330,10 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
             CheckSpec {
                 id: "test".into(),
                 kind: CheckKind::Unit,
-                command: "cargo test --verbose -- --test-threads=1".into(),
+                command: default_rust_test_command(
+                    nextest_available(),
+                    repo.join("src/lib.rs").is_file(),
+                ),
                 paths: rust_paths,
                 changed: true,
                 final_check: true,
@@ -3288,6 +3337,44 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Issue #495: the discovered "test" check must point at `cargo nextest
+    /// run --no-fail-fast` -- the canonical runner since 2026-09-11, and the
+    /// only one `.config/nextest.toml`'s flake-isolation groups actually
+    /// apply under -- when nextest is installed, and fall back to the old
+    /// plain serial command otherwise so a repo without nextest is
+    /// unaffected. Pure, so this never depends on whether nextest happens to
+    /// be on this machine's `PATH`.
+    #[test]
+    fn default_rust_test_command_prefers_nextest_when_available() {
+        // F1 (review): `cargo nextest run` alone never executes doctests, so
+        // when there IS a lib target to doctest, the discovered command must
+        // still chain `cargo test --doc` -- both able to fail the gate (a
+        // shell `&&`, which `command_for_shell` runs this text through,
+        // short-circuits and reports nonzero either way).
+        assert_eq!(
+            default_rust_test_command(true, true),
+            "cargo nextest run --no-fail-fast && cargo test --doc"
+        );
+        // A bin-only crate (like this one -- no `src/lib.rs`) must NOT chain
+        // `cargo test --doc`: it hard errors ("no library targets found",
+        // exit 101) rather than harmlessly finding zero doctests, which
+        // would always fail this repo's own test gate.
+        assert_eq!(
+            default_rust_test_command(true, false),
+            "cargo nextest run --no-fail-fast"
+        );
+        // `cargo test` alone already covers doctests for a lib target with
+        // no extra flag, so the non-nextest branch is identical either way.
+        assert_eq!(
+            default_rust_test_command(false, true),
+            "cargo test --verbose -- --test-threads=1"
+        );
+        assert_eq!(
+            default_rust_test_command(false, false),
+            "cargo test --verbose -- --test-threads=1"
+        );
+    }
 
     #[test]
     fn discovers_rust_checks_without_external_services() {
