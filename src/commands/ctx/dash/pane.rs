@@ -1449,28 +1449,41 @@ impl Pane {
         wrap::answer_inherit_cursor_probe(&mut *first_writer);
         let writer = Arc::new(Mutex::new(first_writer));
 
-        // Publish the inbox identity before the child can start its MCP server.
-        let server = SignalServer::bind(&state.socket_for(&session_id)).ok();
-        if let Some(server) = &server {
-            wrap::publish_socket_path(state, &session_id, server.path());
-        }
+        // Fresh seats publish their inbox identity before the host can start
+        // its bridge. An existing seat belongs to a still-running predecessor:
+        // leave its record AND socket intact until the replacement spawns.
+        let register = || {
+            let server = SignalServer::bind(&state.socket_for(&session_id)).ok();
+            if let Some(server) = &server {
+                wrap::publish_socket_path(state, &session_id, server.path());
+            }
 
-        let mut record = Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
-        // Issue #552: a rollover successor answers to the seat's own address.
-        if let Some(seat_short) = seat_short {
-            record = record.with_stable_short(seat_short);
-        }
-        // `owner_pid` is left unset here: `SessionGuard::register` below
-        // stamps it with this process's own pid -- the dashboard's -- for
-        // every pane, orchestrator and worker alike, the same seam every
-        // other registration path shares (`sessions::Record::owner_pid`,
-        // `dash::assemble_sidebar`).
-        let record = if server.is_some() {
-            record
-        } else {
-            record.unreachable()
+            let mut record =
+                Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
+            // Issue #552: a rollover successor answers to the seat's own address.
+            if let Some(seat_short) = seat_short {
+                record = record.with_stable_short(seat_short);
+            }
+            // `owner_pid` is left unset here: `SessionGuard::register` below
+            // stamps it with this process's own pid -- the dashboard's -- for
+            // every pane, orchestrator and worker alike, the same seam every
+            // other registration path shares (`sessions::Record::owner_pid`,
+            // `dash::assemble_sidebar`).
+            let record = if server.is_some() {
+                record
+            } else {
+                record.unreachable()
+            };
+            (server, SessionGuard::register(state, record))
         };
-        let mut guard = SessionGuard::register(state, record);
+        let registry_short = seat_short
+            .map(str::to_string)
+            .unwrap_or_else(|| sessions::short_id(&session_id));
+        let registered = (!state
+            .sessions()
+            .join(format!("{registry_short}.json"))
+            .exists())
+        .then(register);
 
         let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
@@ -1485,6 +1498,7 @@ impl Pane {
         // report one; there the guard is inert and behaviour is exactly
         // today's.
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
+        let (server, mut guard) = registered.unwrap_or_else(register);
         if let Some(pid) = child.process_id() {
             guard.adopt_child_pid(pid);
         }
@@ -4493,6 +4507,45 @@ pub(crate) mod tests {
             verb: Verb::Dash,
             session_id: session_id.to_string(),
             title: "wrk test".to_string(),
+        }
+    }
+
+    #[test]
+    fn failed_successor_spawn_preserves_the_existing_seat_and_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let old = "11111111-2222-4333-8444-555555555555";
+        let _guard =
+            SessionGuard::register(&state, Record::new(old, "test-agent", &repo, Verb::Dash));
+        let _server = SignalServer::bind(&state.socket_for(old)).unwrap();
+        let record = state.sessions().join("11111111.json");
+        let before = std::fs::read(&record).unwrap();
+        for successor in [old, "aaaaaaaa-2222-4333-8444-555555555555"] {
+            let mut spec = test_spec(successor);
+            spec.argv = vec![
+                tmp.path()
+                    .join("missing-agent")
+                    .to_string_lossy()
+                    .to_string(),
+            ];
+            assert!(
+                Pane::spawn_on_seat(
+                    spec,
+                    &state,
+                    &repo,
+                    &repo,
+                    (80, 24),
+                    &[],
+                    false,
+                    DEFAULT_IDLE_QUIET,
+                    Some("11111111")
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&record).unwrap(), before);
+            assert!(state.socket_for(old).exists());
         }
     }
 
