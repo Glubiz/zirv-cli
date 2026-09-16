@@ -196,7 +196,7 @@ pub struct CompileRequest<'a> {
     pub config: &'a CtxConfig,
     pub role: PromptRole,
     pub session_id: &'a str,
-    pub task: &'a str,
+    pub task: Option<&'a str>,
     pub constraints: &'a [String],
     pub pending_actions: &'a [String],
     /// Issue #538 (chunk B): repository paths touched by tool calls so far
@@ -471,17 +471,19 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
         );
     }
 
-    push(
-        &mut out,
-        "operator:task",
-        SourceKind::UserTask,
-        MessageRole::Data,
-        SourceTrust::Operator,
-        None,
-        request.task.to_string(),
-        Retention::Required,
-        false,
-    );
+    if let Some(task) = request.task {
+        push(
+            &mut out,
+            "operator:task",
+            SourceKind::UserTask,
+            MessageRole::Data,
+            SourceTrust::Operator,
+            None,
+            task.to_string(),
+            Retention::Required,
+            false,
+        );
+    }
 
     for evidence in request.evidence {
         if evidence.handle.is_empty()
@@ -1476,7 +1478,7 @@ mod tests {
             config: cfg,
             role: PromptRole::Worker,
             session_id: "native-session",
-            task,
+            task: Some(task),
             constraints: &[],
             pending_actions: &[],
             scope_paths: &[],

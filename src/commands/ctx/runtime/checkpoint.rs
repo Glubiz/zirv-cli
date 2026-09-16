@@ -260,6 +260,19 @@ pub fn boundary(state: &ConversationState, retain_recent: usize) -> Option<Seque
     Some(covered.sequence)
 }
 
+/// The furthest safe boundary after the provider proved the retained tail
+/// itself does not fit. Unlike [`boundary`], this may cover recent messages,
+/// but it still never crosses an unsettled tool call.
+pub fn overflow_boundary(state: &ConversationState) -> Option<SequenceId> {
+    let unsettled_from = first_unsettled_sequence(state);
+    state
+        .messages
+        .iter()
+        .rev()
+        .find(|message| unsettled_from.is_none_or(|unsettled| message.sequence < unsettled))
+        .map(|message| message.sequence)
+}
+
 /// The sequence of the earliest assistant message holding a tool call whose
 /// latest execution has not settled, or `None` when everything settled.
 fn first_unsettled_sequence(state: &ConversationState) -> Option<SequenceId> {

@@ -741,19 +741,6 @@ pub struct RecompileContext {
     pub home: PathBuf,
     pub cfg: super::super::config::CtxConfig,
     pub repo: PathBuf,
-    /// Review fix (issue #538): the SAME task/prompt text this session's
-    /// own session-start compile used (`request.prompt`/`headless.prompt`
-    /// at each real call site). A recompile that budgeted against a
-    /// DIFFERENT task text (chunk C originally used `""` unconditionally)
-    /// sees a different `SourceKind::UserTask` Required-reservation size,
-    /// which can silently change how much budget is left for every
-    /// Optional source (canonical context, repository instructions,
-    /// memory) -- not just the instruction layer this whole mechanism is
-    /// about. Evidence is not threaded through for the same reason: every
-    /// production `compile_standing_context` call already passes `evidence:
-    /// &[]`, so there is no live evidence to diverge from in the first
-    /// place.
-    pub task: String,
 }
 
 impl std::fmt::Debug for NativeLoop<'_> {
@@ -975,7 +962,6 @@ impl<'a> NativeLoop<'a> {
             &context.home,
             &context.cfg,
             &context.repo,
-            &context.task,
             turn,
             now,
         );
@@ -1005,18 +991,16 @@ impl<'a> NativeLoop<'a> {
     /// built) -- never mid-turn, so a turn already in flight is never
     /// mutated (`a_changed_instruction_file_recompiles_before_the_next_
     /// turn`).
-    #[allow(clippy::too_many_arguments)]
     pub fn recompile_instructions_if_changed(
         &mut self,
         state: &super::super::state::StateDir,
         home: &std::path::Path,
         cfg: &super::super::config::CtxConfig,
         repo: &std::path::Path,
-        task: &str,
         turn: Option<&TurnId>,
         now: u64,
     ) -> CtxResult<bool> {
-        use super::context::{CompileRequest, MessageRole, TokenBudget};
+        use super::context::{CompileRequest, TokenBudget};
 
         let current = super::context::resolve_active_scope_instructions(
             repo,
@@ -1045,16 +1029,7 @@ impl<'a> NativeLoop<'a> {
             config: cfg,
             role: prompt_role(&self.config.role),
             session_id: &session_id,
-            // Review fix (issue #538): the SAME task text the session-start
-            // compile used, not an empty placeholder -- a `SourceKind::
-            // UserTask` Required reservation of a different size silently
-            // changes how much budget is left for every Optional source
-            // (canonical context, repository instructions, memory), not
-            // just the instruction layer this recompile is actually about.
-            // `messages` is still the only part of the result this method
-            // reads; the task's own compiled message is discarded exactly
-            // as before, only the BUDGET it reserves now matches.
-            task,
+            task: None,
             constraints: &[],
             pending_actions: &[],
             scope_paths: &self.touched_paths,
@@ -1071,14 +1046,7 @@ impl<'a> NativeLoop<'a> {
             now,
         })?;
 
-        let mut system = Vec::new();
-        let mut preamble = Vec::new();
-        for message in &compiled.messages {
-            match message.role {
-                MessageRole::Instruction => system.push(message.content.clone()),
-                MessageRole::Data => preamble.push(message.content.clone()),
-            }
-        }
+        let (system, preamble) = split_standing_context(&compiled);
         self.config.system = system;
         self.config.preamble = preamble;
 
@@ -1332,7 +1300,7 @@ impl<'a> NativeLoop<'a> {
             );
             return Ok(false);
         }
-        self.compact_now(scope, &reason)
+        self.compact_now(scope, &reason, true)
     }
 
     /// Evaluates, and compacts when the decision, the policy and the enable
@@ -1356,7 +1324,7 @@ impl<'a> NativeLoop<'a> {
         if !act {
             return Ok(false);
         }
-        self.compact_now(scope, &reason)
+        self.compact_now(scope, &reason, false)
     }
 
     /// Commits one compaction.
@@ -1367,11 +1335,20 @@ impl<'a> NativeLoop<'a> {
     /// than the compaction already in force. That second guard is what stops
     /// a session that is over its budget for some other reason from
     /// compacting on every single request.
-    fn compact_now(&mut self, scope: &EventScope, reason: &str) -> CtxResult<bool> {
+    fn compact_now(
+        &mut self,
+        scope: &EventScope,
+        reason: &str,
+        overflow_recovery: bool,
+    ) -> CtxResult<bool> {
         let state = self.journal.replay(&self.config.session)?;
-        let Some(boundary) =
-            checkpoint::boundary(&state, self.config.compaction.retain_recent_messages)
-        else {
+        let boundary = checkpoint::boundary(&state, self.config.compaction.retain_recent_messages)
+            .or_else(|| {
+                overflow_recovery
+                    .then(|| checkpoint::overflow_boundary(&state))
+                    .flatten()
+            });
+        let Some(boundary) = boundary else {
             self.note(
                 "compaction_skipped",
                 "no_boundary",
@@ -4172,9 +4149,6 @@ pub fn run_session<W: std::io::Write>(
             home: home.clone(),
             cfg: cfg.clone(),
             repo: request.repo.to_path_buf(),
-            // Review fix (issue #538): the same task text the session-start
-            // `compile_standing_context` call above already used.
-            task: request.prompt.to_string(),
         });
         // Issue #645: stamped immediately before the turn actually runs, the
         // same edge `exec.rs`'s own per-cycle spawn stamps at. Left standing
@@ -4284,7 +4258,7 @@ fn compile_standing_context(
     now: u64,
     scope_paths: &[std::path::PathBuf],
 ) -> CtxResult<(Vec<String>, Vec<String>)> {
-    use super::context::{CompileRequest, MessageRole, TokenBudget};
+    use super::context::{CompileRequest, TokenBudget};
 
     let capabilities =
         super::super::provider::capability::declared(route.protocol, &route.model, None);
@@ -4302,7 +4276,7 @@ fn compile_standing_context(
         config: cfg,
         role: prompt_role(request.role),
         session_id: &session_id,
-        task: request.prompt,
+        task: None,
         constraints: &[],
         pending_actions: &[],
         scope_paths,
@@ -4318,6 +4292,14 @@ fn compile_standing_context(
         token_counter: None,
         now,
     })?;
+    Ok(split_standing_context(&compiled))
+}
+
+fn split_standing_context(
+    compiled: &super::context::CompiledNativeContext,
+) -> (Vec<String>, Vec<String>) {
+    use super::context::MessageRole;
+
     let mut system = Vec::new();
     let mut preamble = Vec::new();
     for message in &compiled.messages {
@@ -4326,7 +4308,7 @@ fn compile_standing_context(
             MessageRole::Data => preamble.push(message.content.clone()),
         }
     }
-    Ok((system, preamble))
+    (system, preamble)
 }
 
 /// The prompt role a native session's `--role` names. Unknown values are
@@ -5043,12 +5025,6 @@ pub fn spawn_interactive(
                 home: worker_home.clone(),
                 cfg: worker_cfg.clone(),
                 repo: worker_repo.clone(),
-                // Review fix (issue #538): matches this session's own
-                // session-start compile, which also used an empty prompt
-                // (`headless.prompt = ""` above) -- a pane's task text is
-                // driven turn-by-turn through `acknowledge`, never a fixed
-                // session-wide string.
-                task: String::new(),
             });
             // Issue #554 (review round 1): a pane's turn is accounted like
             // any other native request -- an estimate held against the
@@ -5332,9 +5308,6 @@ pub fn run_hosted_turns<W: std::io::Write>(
         home: home.clone(),
         cfg: cfg.clone(),
         repo: turn.repo.to_path_buf(),
-        // Review fix (issue #538): the same task text the session-start
-        // `compile_standing_context` call above already used.
-        task: request.prompt.to_string(),
     });
     let reservation = execution_pool.as_ref().and_then(|pool| {
         super::super::native_account::reserve_seat_turn(
@@ -6091,6 +6064,144 @@ mod tests {
         assert!(
             all.contains("wire the native workflow tools"),
             "the active workflow's own task must reach the session unseeded: {all}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_native_turn_sends_the_operator_prompt_exactly_once() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = tempfile::tempdir().expect("home");
+        let state = crate::commands::ctx::state::StateDir::from_root(
+            tempfile::tempdir().expect("state").keep(),
+        );
+        let model = "fixture-anthropic-model";
+        let route = route_for(Protocol::AnthropicMessages, model);
+        let (_dir, mut journal, session) = journal_for(&route);
+        let prompt = "issue-649-unique-native-prompt-7d3c9f";
+        let request = HeadlessRequest {
+            repo: repo.path(),
+            prompt,
+            route: None,
+            role: "worker",
+            limits: NativeLimits::default(),
+            session_id: None,
+            cancellation: None,
+            resume: None,
+            provider: None,
+            fixture_tools: None,
+            task: None,
+            writer: None,
+            accounting: Accounting::Seat,
+        };
+        let (system, preamble) = compile_standing_context(
+            &state,
+            home.path(),
+            &Default::default(),
+            &request,
+            &route,
+            &session,
+            1,
+            &[],
+        )
+        .expect("the standing context compiles");
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, model),
+            FixtureScript::from_json(
+                r#"{"model":"fixture-anthropic-model","turns":[{"message_id":"msg_1","blocks":[{"type":"text","text":"done"}],"finish_reason":"end_turn"}]}"#,
+            )
+            .expect("fixture"),
+        );
+        let mut tools = FixtureToolExecutor::new(
+            FixtureToolScript::from_json(r#"{"tools":{}}"#).expect("tools"),
+        );
+        let mut config = config_for(session, route);
+        config.system = system;
+        config.preamble = preamble;
+        {
+            let mut driver = NativeLoop::new(
+                config,
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &|| 1_000,
+                &no_env,
+            );
+            driver.acknowledge(prompt, false).expect("acknowledged");
+            driver.run_to_completion().expect("turn completes");
+        }
+
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 1);
+        let outbound = &sent[0];
+        let occurrences = outbound
+            .system
+            .iter()
+            .map(|text| text.matches(prompt).count())
+            .sum::<usize>()
+            + outbound
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    ProviderContent::Text { text } => Some(text.matches(prompt).count()),
+                    _ => None,
+                })
+                .sum::<usize>();
+        assert_eq!(occurrences, 1, "outbound request: {outbound:?}");
+    }
+
+    #[test]
+    fn a_native_preamble_does_not_charge_the_journaled_task_against_optional_context() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir(repo.path().join(".zirv")).expect("context directory");
+        std::fs::write(
+            repo.path().join(".zirv/system-prompt.md"),
+            "optional repository context survives the task budget",
+        )
+        .expect("repository context");
+        let home = tempfile::tempdir().expect("home");
+        let state = crate::commands::ctx::state::StateDir::from_root(
+            tempfile::tempdir().expect("state").keep(),
+        );
+        let route = route_for(Protocol::AnthropicMessages, "fixture-anthropic-model");
+        let session = JournalSessionId::new("native-budget-invariant").expect("session");
+        let compile = |prompt: &str| {
+            compile_standing_context(
+                &state,
+                home.path(),
+                &Default::default(),
+                &HeadlessRequest {
+                    repo: repo.path(),
+                    prompt,
+                    route: None,
+                    role: "worker",
+                    limits: NativeLimits::default(),
+                    session_id: None,
+                    cancellation: None,
+                    resume: None,
+                    provider: None,
+                    fixture_tools: None,
+                    task: None,
+                    writer: None,
+                    accounting: Accounting::Seat,
+                },
+                &route,
+                &session,
+                1,
+                &[],
+            )
+        };
+
+        let (_, without_task) = compile("").expect("empty task compiles");
+        let large_task = "journaled task text ".repeat(100_000);
+        let (_, with_large_task) = compile(&large_task).expect("large task compiles");
+        assert_eq!(with_large_task, without_task);
+        assert!(
+            with_large_task
+                .iter()
+                .any(|text| text.contains("optional repository context survives")),
+            "optional context must retain the budget the journaled task no longer consumes"
         );
     }
 
@@ -8939,19 +9050,75 @@ mod tests {
         assert_eq!(run.calls, vec!["call_1", "call_2", "call_3"]);
     }
 
-    /// Issue #638 (CLI-config level, not just the fixture test above): drives
-    /// the SAME fixture through [`run_session`] -- the real `zirv ctx exec
-    /// --runtime native` entry point exec.rs calls -- with no
-    /// `retain_recent_messages` override at all, so this proves the CLI's
-    /// actual default `CompactionSettings` (built fresh in `run_session`,
-    /// independent of the `config_for` test helper above) recovers rather
-    /// than failing twice. Before the fix, `RETAIN_RECENT_MESSAGES` (4) kept
-    /// this fixture's whole 3-turn history inside the retained tail, so
-    /// `checkpoint::boundary` found nothing to compact and the run failed
-    /// with the SAME `context_overflow` a second time; no in-tree test had
-    /// ever exercised the untouched default (every compaction test overrides
-    /// it to 2), so the gap between the CLI's defaults and the fixture test
-    /// above went unnoticed.
+    #[test]
+    fn a_first_message_overflow_distills_the_oversized_input_and_continues() {
+        let model = "fixture-anthropic-model";
+        let route = route_for(Protocol::AnthropicMessages, model);
+        let (_dir, mut journal, session) = journal_for(&route);
+        let provider = FixtureProvider::new(
+            fixture_target(Protocol::AnthropicMessages, model),
+            FixtureScript::from_json(
+                r#"{
+                    "model":"fixture-anthropic-model",
+                    "turns":[
+                        {"failure":{"class":"context_overflow","message":"prompt too long"}},
+                        {"failure":{"class":"context_overflow","message":"distillation input too long"}},
+                        {"message_id":"msg_done","blocks":[{"type":"text","text":"continued"}],"finish_reason":"end_turn"}
+                    ]
+                }"#,
+            )
+            .expect("fixture"),
+        );
+        let mut tools = FixtureToolExecutor::new(
+            FixtureToolScript::from_json(r#"{"tools":{}}"#).expect("tools"),
+        );
+        let prompt = "oversized first-turn input ".repeat(4_000);
+        let status = {
+            let mut driver = NativeLoop::new(
+                config_for(session.clone(), route),
+                &provider,
+                &mut tools,
+                &mut journal,
+                Arc::new(CancellationFlag::default()),
+                &|| 1_000,
+                &no_env,
+            );
+            driver.acknowledge(&prompt, false).expect("acknowledged");
+            driver.run_to_completion().expect("turn completes")
+        };
+
+        assert_eq!(status.status, NativeStatus::Completed);
+        assert_eq!(status.compactions.len(), 1);
+        assert_eq!(status.compactions[0].covers_through, 1);
+        assert_eq!(status.compactions[0].summary_source, "structural");
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 3);
+        assert!(
+            sent[1]
+                .system
+                .iter()
+                .any(|text| text.contains("compacting")),
+            "the oversized first message was offered to the bounded distiller"
+        );
+        let text_bytes = |request: &ProviderRequest| {
+            request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    ProviderContent::Text { text } => Some(text.len()),
+                    _ => None,
+                })
+                .sum::<usize>()
+        };
+        assert!(text_bytes(&sent[2]) < text_bytes(&sent[0]));
+        let replayed = journal.replay(&session).expect("replay");
+        assert_eq!(replayed.messages[0].text.as_deref(), Some(prompt.as_str()));
+    }
+
+    /// Drives the same fixture through the real CLI entry point with the
+    /// quality-driven retained-tail default, proving overflow recovery does
+    /// not depend on lowering that default.
     #[test]
     fn headless_native_exec_recovers_a_first_turn_overflow_with_the_cli_defaults() {
         let (repo, _state, _tree, env) = interactive_shutdown_fixture();
@@ -9388,15 +9555,7 @@ mod tests {
         );
 
         let first = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile check");
         assert!(first, "an empty fingerprint always compiles once");
         assert!(
@@ -9410,15 +9569,7 @@ mod tests {
         );
 
         let second = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile check");
         assert!(
             !second,
@@ -9456,28 +9607,12 @@ mod tests {
         );
 
         driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile");
 
         std::fs::write(repo.path().join("ZIRV.md"), "- a changed rule\n").unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile");
         assert!(changed, "a file changed on disk must be detected");
         assert!(
@@ -9547,15 +9682,7 @@ mod tests {
         );
 
         driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile (turn 1)");
         let version_turn_1 = driver.context_version().expect("compiled once").to_string();
         let preamble_turn_1 = driver.config.preamble.clone();
@@ -9568,7 +9695,6 @@ mod tests {
                     home.path(),
                     &cfg,
                     repo.path(),
-                    "go",
                     None,
                     now,
                 )
@@ -9629,7 +9755,6 @@ mod tests {
             home: home.path().to_path_buf(),
             cfg: cfg.clone(),
             repo: repo.path().to_path_buf(),
-            task: "go".to_string(),
         });
 
         assert!(
@@ -9786,11 +9911,10 @@ mod tests {
     /// Decision 2's guard: recompiling the instruction layer touches only
     /// `config.system`/`config.preamble`. Limits, route, write posture and
     /// the workflow gate -- every policy-shaped field -- are untouched.
-    /// Review fix (issue #538, item 2): the recompile also budgets against
-    /// the SAME task text the session-start compile used, so every
-    /// non-instruction Optional source (here, canonical `.zirv/context/
-    /// common.md`) is delivered byte-identically across the recompile too
-    /// -- not merely the config-level fields above.
+    /// The recompile also omits the journaled task exactly like the
+    /// session-start compile, so every non-instruction Optional source (here,
+    /// canonical `.zirv/context/common.md`) is delivered byte-identically
+    /// across the recompile too -- not merely the config-level fields above.
     #[test]
     fn recompilation_never_changes_tools_or_policy() {
         let repo = tempfile::tempdir().unwrap();
@@ -9832,15 +9956,7 @@ mod tests {
         let workflow_gate_before = driver.config.workflow_gate.clone();
 
         driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile");
         let canonical_before = driver
             .config
@@ -9856,15 +9972,7 @@ mod tests {
 
         std::fs::write(repo.path().join("ZIRV.md"), "- rule two\n").unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile");
         assert!(changed);
 
@@ -9877,7 +9985,7 @@ mod tests {
         assert_eq!(
             canonical_before, canonical_after,
             "a non-instruction candidate's delivered content must be byte-identical across a \
-             recompile -- passing the same live task keeps the budget landscape unchanged"
+             recompile -- journaled task text is outside the standing-context budget"
         );
 
         assert_eq!(driver.config.limits, limits_before);
@@ -9934,7 +10042,6 @@ mod tests {
                     home.path(),
                     &cfg,
                     repo.path(),
-                    "go",
                     None,
                     1_000,
                 )
@@ -9996,15 +10103,7 @@ mod tests {
         let route_before = driver.config.route.clone();
 
         driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_000,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_000)
             .expect("first recompile, no instruction file yet");
         assert_eq!(driver.config.route, route_before);
 
@@ -10014,15 +10113,7 @@ mod tests {
         )
         .unwrap();
         let changed = driver
-            .recompile_instructions_if_changed(
-                &state,
-                home.path(),
-                &cfg,
-                repo.path(),
-                "go",
-                None,
-                1_001,
-            )
+            .recompile_instructions_if_changed(&state, home.path(), &cfg, repo.path(), None, 1_001)
             .expect("second recompile, with the adversarial file");
         assert!(changed, "the file change is detected");
         assert_eq!(
