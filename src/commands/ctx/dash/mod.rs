@@ -3899,56 +3899,7 @@ struct PaneSuccessorLauncher<'a> {
     /// test opens a REAL successor pane against `fixture::FixtureProvider`
     /// in a bare temp repo, the same escape `NativeDashboardSpec::provider`
     /// already documents for itself.
-    native: NativeSuccessorSpec,
-}
-
-/// See [`PaneSuccessorLauncher::native`].
-struct NativeSuccessorSpec {
-    /// Whether the successor acquires the per-tree writer permit. A seat that
-    /// was writing keeps writing, which is every production rollover.
-    writing: bool,
-    provider: Option<String>,
-}
-
-impl Default for NativeSuccessorSpec {
-    fn default() -> Self {
-        Self {
-            writing: true,
-            provider: None,
-        }
-    }
-}
-
-/// What a native successor is told first: the handoff packet the source's own
-/// context was distilled into, every acknowledged input the source never
-/// delivered, and the reconciliation it is halted on.
-///
-/// Criterion 2 is the reason acknowledged input is spelled out here rather
-/// than assumed to be in the packet: the packet is a SUMMARY, and an
-/// operator's undelivered instruction is not something a summary may lose.
-fn native_successor_input(
-    plan: &super::rollover_runtime::SuccessorPlan,
-    note: &handoff::Handoff,
-    cfg: &CtxConfig,
-) -> String {
-    let mut text = super::wrap::restart_prompt(note, &cfg.screen.thresholds());
-    if !plan.acknowledged_input.is_empty() {
-        text.push_str(
-            "\n\nAcknowledged input the previous session never answered. Treat each line as an \
-             instruction you still owe:\n",
-        );
-        for input in &plan.acknowledged_input {
-            text.push_str("- ");
-            text.push_str(input);
-            text.push('\n');
-        }
-    }
-    if let Some(halt) = &plan.halted_for {
-        text.push_str("\n\nSTOP AND RECONCILE FIRST: ");
-        text.push_str(halt);
-        text.push('\n');
-    }
-    text
+    native: super::rollover_runtime::NativeSuccessorSpec,
 }
 
 impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
@@ -4011,41 +3962,20 @@ impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
         // Built BEFORE anything is taken away: a failure here leaves the
         // source pane exactly as it was, still holding the seat with all of
         // its durable state (`rollover_runtime`'s own item 7).
-        // The successor's session must be created in the SAME state
-        // directory this pane is registered in: `spawn_interactive` resolves
-        // its own from the environment, and a bare `env_from_process()` would
-        // send the journal somewhere the pane then replays nothing from.
         let state = self.pane.state_dir().clone();
-        let state_root = state.root().to_str().map(str::to_string);
-        let process_env = super::config::env_from_process();
-        let env = move |key: &str| {
-            if key == super::state::STATE_ENV {
-                return state_root.clone();
-            }
-            process_env(key)
-        };
-        let successor = Pane::spawn_native(
+        let successor = super::rollover_runtime::launch_native_pane(
             self.cfg,
             &state,
-            &env,
             self.repo,
+            self.pane.cwd(),
             self.pane.verb(),
             self.pane.title().to_string(),
             self.size,
-            native_pane::NativeDashboardSpec {
-                repo: self.pane.cwd().to_path_buf(),
-                role: self.role.label().to_string(),
-                route: plan.target_route.clone(),
-                writing: self.native.writing,
-                provider: self.native.provider.clone(),
-                // The seat's stable address and the generation `seat::commit`
-                // promoted. This is what keeps mail, nudge and `zirv ctx
-                // status` pointed at the same logical seat across the swap.
-                seat: Some((plan.short.clone(), plan.generation)),
-                initial_input: Some(native_successor_input(plan, self.note, self.cfg)),
-            },
-        )
-        .map_err(|e| SuccessorRefusal::LaunchFailed(e.to_string()))?;
+            self.role,
+            plan,
+            self.note,
+            &self.native,
+        )?;
 
         Ok(self.retire_source_for(successor))
     }
@@ -4190,7 +4120,7 @@ fn handover_pane(
         role,
         repo,
         size: (size.1, size.0),
-        native: NativeSuccessorSpec::default(),
+        native: super::rollover_runtime::NativeSuccessorSpec::default(),
     };
     match super::rollover_runtime::launch_successor(
         state,
@@ -10851,6 +10781,54 @@ pub fn run_dashboard(
     first_native: Option<native_pane::NativeDashboardSpec>,
     force_pace: bool,
 ) -> CtxResult<i32> {
+    run_dashboard_inner(cfg, repo, env, state, first, first_native, force_pace, None)
+}
+
+/// Takes over an already-live successor pane after another terminal host has
+/// restored its own modes. The pane is not respawned: its native session,
+/// stable seat address and generation are the ones the successor seam opened.
+pub(crate) fn run_dashboard_with_first_pane(
+    cfg: &CtxConfig,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    state: &StateDir,
+    first_pane: Pane,
+    force_pace: bool,
+) -> CtxResult<i32> {
+    let first = PaneSpec {
+        agent_name: first_pane.agent().to_string(),
+        argv: Vec::new(),
+        role: first_pane.role(),
+        verb: first_pane.verb(),
+        // Dashboard-level request and facts paths are keyed by this field's
+        // short form. A rollover successor's logical conversation is fresh,
+        // but its stable seat address must remain the dashboard address.
+        session_id: first_pane.short().to_string(),
+        title: first_pane.title().to_string(),
+    };
+    run_dashboard_inner(
+        cfg,
+        repo,
+        env,
+        state,
+        first,
+        None,
+        force_pace,
+        Some(first_pane),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_dashboard_inner(
+    cfg: &CtxConfig,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    state: &StateDir,
+    first: PaneSpec,
+    first_native: Option<native_pane::NativeDashboardSpec>,
+    force_pace: bool,
+    first_prebuilt: Option<Pane>,
+) -> CtxResult<i32> {
     let mut errors = ErrorLog::default();
     // Issue #354 phase 5: what the dashboard-level inspector reports as
     // `uptime`. Taken before any setup so it measures the session, not the
@@ -10899,7 +10877,8 @@ pub fn run_dashboard(
     // error line. Everything below this that a native pane DOES need (the
     // spawn-request channel, the owner pid, the restore roster) is built the
     // same way either way.
-    let (mut turn_env, turn_env_err) = if first_native.is_some() {
+    let prebuilt_native = first_prebuilt.as_ref().is_some_and(Pane::is_native);
+    let (mut turn_env, turn_env_err) = if first_native.is_some() || prebuilt_native {
         (Vec::new(), None)
     } else {
         build_turn_env(
@@ -11016,7 +10995,7 @@ pub fn run_dashboard(
     // keypress read to collide with. `fulfill_spawn_request` (worker panes
     // spawned *during* the live loop) cannot reuse this same blocking
     // treatment and uses the advisory spawn gate instead.
-    {
+    if first_prebuilt.is_none() {
         // The `SEAT_MODEL_ENV` `seat_model_env` just pushed onto `turn_env`
         // above -- this pane's own resolved model, for the same reason
         // `wrap::run_with`'s matching gate call resolves one.
@@ -11042,7 +11021,9 @@ pub fn run_dashboard(
     // to prevent. The link is dropped straight away here: it is the ownership
     // question that matters at this point, and painting a runtime-owned
     // session inside the dashboard is step N11 (#480).
-    if let Some(mut link) = link::RuntimeLink::connect(state, cfg.session.persistent) {
+    if first_prebuilt.is_none()
+        && let Some(mut link) = link::RuntimeLink::connect(state, cfg.session.persistent)
+    {
         let slug = super::state::repo_slug(repo);
         match link.seat_for(&slug, &agent_name) {
             Ok(Some(seat)) => {
@@ -11067,27 +11048,30 @@ pub fn run_dashboard(
     // a loop of its own, so the header, the sidebar, the roster, the mail
     // sweep, the spawn channel and every other dashboard surface apply to it
     // unchanged -- and a second, wrapped pane can be spawned beside it.
-    let first_spawn = match first_native {
-        Some(spec) => Pane::spawn_native(
-            cfg,
-            state,
-            env,
-            repo,
-            first.verb,
-            first.title.clone(),
-            size,
-            spec,
-        ),
-        None => Pane::spawn(
-            first,
-            state,
-            repo,
-            repo,
-            size,
-            &turn_env,
-            turn_signal_capable_for(cfg, &agent_name),
-            Duration::from_millis(cfg.dash.idle_quiet_ms),
-        ),
+    let first_spawn = match first_prebuilt {
+        Some(pane) => Ok(pane),
+        None => match first_native {
+            Some(spec) => Pane::spawn_native(
+                cfg,
+                state,
+                env,
+                repo,
+                first.verb,
+                first.title.clone(),
+                size,
+                spec,
+            ),
+            None => Pane::spawn(
+                first,
+                state,
+                repo,
+                repo,
+                size,
+                &turn_env,
+                turn_signal_capable_for(cfg, &agent_name),
+                Duration::from_millis(cfg.dash.idle_quiet_ms),
+            ),
+        },
     };
     let first_pane = match first_spawn {
         Ok(mut pane) => {
@@ -22781,7 +22765,7 @@ mod tests {
                     role: prompt::PromptRole::Orchestrator,
                     repo: repo.path(),
                     size: (24, 80),
-                    native: NativeSuccessorSpec {
+                    native: super::super::rollover_runtime::NativeSuccessorSpec {
                         // A bare temp repo cannot take a writer lease, and
                         // this test is about the successor existing at all.
                         writing: false,
@@ -22960,7 +22944,7 @@ mod tests {
                 role: prompt::PromptRole::Orchestrator,
                 repo: repo.path(),
                 size: (24, 80),
-                native: NativeSuccessorSpec::default(),
+                native: super::super::rollover_runtime::NativeSuccessorSpec::default(),
             };
             launcher
                 .launch(&plan)

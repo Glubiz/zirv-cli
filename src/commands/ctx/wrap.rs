@@ -57,6 +57,27 @@ const DEFAULT_SIZE: (u16, u16) = (80, 24);
 // ask-then-escalate shape.
 const QUIT_GRACE: Duration = Duration::from_secs(5);
 
+/// Gives the Unix stdin pump a bounded wake-up so ownership of the real
+/// terminal can move to a native successor. `read` remains the byte-preserving
+/// path; `poll` only says whether it would block.
+#[cfg(unix)]
+fn stdin_ready() -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: STDIN_FD,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` points to one initialized `pollfd` for the duration
+    // of this call, and `STDIN_FD` is borrowed rather than closed or replaced.
+    let result = unsafe { libc::poll(&mut descriptor, 1, PUMP_POLL.as_millis() as i32) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(result > 0
+        && descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+            != 0)
+}
+
 /// A Cursor Position Report for row 1, column 1 -- the reply a terminal sends
 /// when something asks it where the cursor is with `ESC[6n`.
 ///
@@ -2399,7 +2420,9 @@ pub fn run_with(
     let input_tx = tx.clone();
     let input_writer = std::sync::Arc::clone(&writer);
     let input_filter = std::sync::Arc::clone(&cpr_filter);
-    std::thread::spawn(move || {
+    let input_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let input_stop_for_thread = std::sync::Arc::clone(&input_stop);
+    let input_thread = std::thread::spawn(move || {
         // Issue #330: the operator's own keystrokes travel on this thread and
         // nothing else does. Raised for the same reason (and with the same
         // per-thread caveat) as the output thread's own raise.
@@ -2412,6 +2435,18 @@ pub fn run_with(
         // whole, to the new pty.
         let mut paste = PasteGuard::default();
         loop {
+            if input_stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            #[cfg(unix)]
+            match stdin_ready() {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => return,
+            }
+            if input_stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
@@ -2524,6 +2559,7 @@ pub fn run_with(
     // Issue #249: this session's own supervising session, if any -- resolved
     // once, from `env` alone, and passed straight through to every poll.
     let parent_short = super::agent::parent_identity(env);
+    let mut native_successor = None;
     let exit = pump(
         &mut child,
         &mut child_guard,
@@ -2555,14 +2591,24 @@ pub fn run_with(
         &mut bar,
         role,
         parent_short.as_deref(),
+        &mut native_successor,
     );
+    input_stop.store(true, std::sync::atomic::Ordering::Release);
+    #[cfg(unix)]
+    let _ = input_thread.join();
+    #[cfg(not(unix))]
+    drop(input_thread);
     // P2/P3: `pump` only ever returns once the child has exited (every arm
     // waits on it), so the pid leaves the console-close registry and the job
     // handle closes here, explicitly -- `panic = "abort"` means `Drop` is no
     // safety net. Before `session_guard.release()` purely for symmetry with
     // the order they were taken in.
     child_guard.release();
-    session_guard.release();
+    if native_successor.is_some() {
+        session_guard.disown();
+    } else {
+        session_guard.release();
+    }
     // Paired with `publish_socket_path` above, at the same single point every
     // other per-session artifact is released: a dead supervisor's file must
     // not linger to be picked as "the newest" by a later `read_socket_path`
@@ -2571,13 +2617,23 @@ pub fn run_with(
     // Issue #358: the seat is an address for a live session, and this one is
     // over. Released at the same single point as every other per-session
     // artifact so a dead seat record can never be read as a live one.
-    if role == PromptRole::Orchestrator {
+    if role == PromptRole::Orchestrator && native_successor.is_none() {
         super::rollover::forget(&state_dir, &super::sessions::short_id(session.as_str()));
     }
 
     reset_bar(&bar);
     if let Some(guard) = raw.as_mut() {
         let _ = guard.restore();
+    }
+
+    if let Some(successor) = native_successor {
+        let dashboard = super::dash::run_dashboard_with_first_pane(
+            &cfg, repo, env, &state_dir, successor, false,
+        );
+        if let Some(guard) = vt_guard.as_mut() {
+            let _ = guard.restore();
+        }
+        return dashboard;
     }
     if let Some(guard) = vt_guard.as_mut() {
         let _ = guard.restore();
@@ -2935,31 +2991,26 @@ struct HandoverOutcome {
     to_model: String,
     stored: CtxResult<PathBuf>,
     source: &'static str,
+    native: Option<super::dash::Pane>,
 }
 
-/// `zirv ctx wrap`'s own successor backend (issue #552, review round 1).
+/// `zirv ctx wrap`'s successor backend.
 ///
-/// A wrap seat supervises ONE harness child through a pty. Swapping that
-/// child for another harness is the whole of what this seam can do, so a
-/// rollover whose successor resolves to the NATIVE runtime is refused here
-/// rather than attempted: before this gate existed,
-/// `perform_handover_swap` called `handover::resolve_swap_launch`
-/// unconditionally and a native successor became a harness swap onto
-/// `req.target_agent` -- a route the rollover never chose, spending an
-/// account it never authorised.
-///
-/// A refusal PARKS the seat: it is returned before the old child is touched,
-/// so the harness keeps running with its handoff already stored, which is
-/// `rollover_runtime`'s own item 7 ("otherwise park honestly with all
-/// durable state intact").
-///
-/// `launch` itself never starts anything: the in-place swap below it is what
-/// starts the successor, and duplicating it inside a closure over twenty
-/// borrowed pty handles would be a second copy of the one thing this seam
-/// already does correctly. So this is an admission gate with a launch arm
-/// that only confirms the seat it is returning to.
+/// Harness successors still swap onto the existing pty below. A native
+/// successor is instead opened completely through the shared runtime seam,
+/// retained here, and handed to the dashboard only after the old child has
+/// exited and wrap has restored the real terminal. Admission checks the
+/// release gate first, so a gated build keeps the source untouched and parks
+/// exactly as it did before issue #632.
 struct WrapSwapLauncher<'a> {
     session: &'a str,
+    native_available: bool,
+    native: Option<super::dash::Pane>,
+    launch_native:
+        &'a mut dyn FnMut(
+            &super::rollover_runtime::SuccessorPlan,
+        )
+            -> Result<super::dash::Pane, super::rollover_runtime::SuccessorRefusal>,
 }
 
 impl super::rollover_runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
@@ -2967,22 +3018,36 @@ impl super::rollover_runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
         &self,
         plan: &super::rollover_runtime::SuccessorPlan,
     ) -> Result<(), super::rollover_runtime::SuccessorRefusal> {
-        if plan.to == super::runtime::RuntimeKind::Harness {
-            return Ok(());
-        }
-        Err(super::rollover_runtime::SuccessorRefusal::LaunchFailed(
-            format!(
-                "`zirv ctx wrap` supervises a harness child and has no {} backend; the seat                  is parked on its current harness with its handoff stored, rather than swapped                  onto a harness this rollover never chose",
-                plan.to.as_str()
+        match plan.to {
+            super::runtime::RuntimeKind::Harness => Ok(()),
+            super::runtime::RuntimeKind::Native if self.native_available && cfg!(unix) => Ok(()),
+            super::runtime::RuntimeKind::Native => Err(
+                super::rollover_runtime::SuccessorRefusal::LaunchFailed(format!(
+                    "{}; the seat is parked on its current harness with its handoff stored",
+                    super::runtime::NATIVE_COMING_SOON
+                )),
             ),
-        ))
+            super::runtime::RuntimeKind::Unknown => {
+                Err(super::rollover_runtime::SuccessorRefusal::LaunchFailed(
+                    "`zirv ctx wrap` cannot launch an unknown successor runtime; the seat is \
+                     parked on its current harness with its handoff stored"
+                        .to_string(),
+                ))
+            }
+        }
     }
 
     fn launch(
         &mut self,
-        _plan: &super::rollover_runtime::SuccessorPlan,
+        plan: &super::rollover_runtime::SuccessorPlan,
     ) -> Result<String, super::rollover_runtime::SuccessorRefusal> {
-        Ok(self.session.to_string())
+        if plan.to == super::runtime::RuntimeKind::Harness {
+            return Ok(self.session.to_string());
+        }
+        let successor = (self.launch_native)(plan)?;
+        let session = successor.session_id().to_string();
+        self.native = Some(successor);
+        Ok(session)
     }
 }
 
@@ -3114,12 +3179,32 @@ fn perform_handover_swap(
             .and_then(|record| record.boundary)
             .as_ref(),
     );
+    let successor_verb = session_guard.record().verb;
+    let mut launch_native = |plan: &super::rollover_runtime::SuccessorPlan| {
+        super::rollover_runtime::launch_native_pane(
+            cfg,
+            state_dir,
+            repo,
+            repo,
+            successor_verb,
+            "orch".to_string(),
+            last_size,
+            role,
+            plan,
+            &note,
+            &super::rollover_runtime::NativeSuccessorSpec::default(),
+        )
+    };
+    let mut launcher = WrapSwapLauncher {
+        session: session.as_str(),
+        native_available: super::runtime::native_available(),
+        native: None,
+        launch_native: &mut launch_native,
+    };
     super::rollover_runtime::launch_successor(
         state_dir,
         repo,
-        &mut WrapSwapLauncher {
-            session: session.as_str(),
-        },
+        &mut launcher,
         &plan,
         Some(session.as_str()),
         if req.structural_only {
@@ -3130,6 +3215,31 @@ fn perform_handover_swap(
         super::state::now_secs(),
     )
     .map_err(|refusal| refusal.to_string())?;
+
+    if let Some(mut native) = launcher.native.take() {
+        let quit = match writer.lock() {
+            Ok(mut sink) => quit_child(&mut *sink, child, adapter.quit_sequence(), grace),
+            Err(_) => Err("pty writer poisoned".into()),
+        };
+        if let Err(error) = quit {
+            let _ = native.shutdown("");
+            return Err(error);
+        }
+        generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        transcript.forget();
+        return Ok(HandoverOutcome {
+            from_agent,
+            from_model,
+            to_agent: super::runtime::RuntimeKind::Native.as_str().to_string(),
+            to_model: req
+                .target_model
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            stored,
+            source,
+            native: Some(native),
+        });
+    }
 
     // Everything from here on names the *new* harness. Resolved before the
     // old child is touched, so an unknown target agent (a race against the
@@ -3244,6 +3354,7 @@ fn perform_handover_swap(
         to_model,
         stored,
         source,
+        native: None,
     })
 }
 
@@ -3303,6 +3414,7 @@ fn pump(
     // once by `run_with` from `env` (`agent::parent_identity`) and passed
     // straight through, never re-derived per poll.
     parent_short: Option<&str>,
+    native_successor: &mut Option<super::dash::Pane>,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
     // T13: the live mail wake-up. See `mail_polling_enabled` for the gates: a
@@ -3597,7 +3709,7 @@ fn pump(
                     announcer,
                     &req,
                 ) {
-                    Ok(outcome) => {
+                    Ok(mut outcome) => {
                         let stored_text = match &outcome.stored {
                             Ok(path) => path.display().to_string(),
                             Err(e) => format!("not stored: {e}"),
@@ -3663,6 +3775,10 @@ fn pump(
                                 observed_at: None,
                             },
                         );
+                        if outcome.native.is_some() {
+                            *native_successor = outcome.native.take();
+                            return Ok(0);
+                        }
                     }
                     Err(e) => {
                         let reason = e.to_string();
@@ -4335,53 +4451,142 @@ mod tests {
     #[cfg(unix)]
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-    /// Issue #552 (review round 1): a wrap seat whose rollover resolves to a
-    /// NATIVE successor is parked, never swapped onto a harness.
-    ///
-    /// Platform-neutral by construction: the decision is
-    /// `WrapSwapLauncher::admits`, which reads the plan's runtime and nothing
-    /// else, so it runs here and on every CI platform. Everything the real
-    /// `perform_handover_swap` does after this gate needs a live pty and is
-    /// unix-only; the gate itself is what stops a mis-swap, and it sits
-    /// before the old child is touched -- so a refusal leaves the harness
-    /// running with its handoff already stored.
+    /// Issue #632: once the native runtime is available, wrap uses the same
+    /// pane launch backend as the dashboard instead of parking or silently
+    /// selecting a harness swap.
+    #[cfg(unix)]
     #[test]
-    fn wrap_rollover_to_native_never_selects_a_harness_swap() {
-        use super::super::rollover_runtime::SuccessorLauncher;
+    fn wrap_launches_a_native_successor_when_eligible_and_ungated() {
         use super::super::runtime::RuntimeKind;
 
-        let plan_for = |to: RuntimeKind| {
-            super::super::rollover_runtime::plan_successor(
-                RuntimeKind::Harness,
-                to,
-                "aaaa1111",
-                4,
-                Some("claude"),
-                None,
-                Some("opus"),
-                None,
-                None,
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = super::super::state::StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let note = Handoff {
+            task: "carry the wrap seat forward".to_string(),
+            ..Handoff::default()
+        };
+        let plan = super::super::rollover_runtime::plan_successor(
+            RuntimeKind::Harness,
+            RuntimeKind::Native,
+            "aaaa1111",
+            4,
+            Some("claude"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let native = super::super::rollover_runtime::NativeSuccessorSpec {
+            writing: false,
+            provider: Some(format!(
+                "fixture:{}",
+                super::super::runtime::fixture::fixture_root()
+                    .join("helper-answer.json")
+                    .display()
+            )),
+        };
+        let mut open_native = |plan: &super::super::rollover_runtime::SuccessorPlan| {
+            super::super::rollover_runtime::launch_native_pane(
+                &cfg,
+                &state,
+                repo.path(),
+                repo.path(),
+                super::super::sessions::Verb::Chat,
+                "orch".to_string(),
+                (80, 24),
+                PromptRole::Orchestrator,
+                plan,
+                &note,
+                &native,
             )
         };
-        let launcher = WrapSwapLauncher {
+        let mut launcher = WrapSwapLauncher {
             session: "11111111-2222-4333-8444-555555555555",
+            native_available: true,
+            native: None,
+            launch_native: &mut open_native,
         };
+        let successor_session = super::super::rollover_runtime::launch_successor(
+            &state,
+            repo.path(),
+            &mut launcher,
+            &plan,
+            Some("11111111-2222-4333-8444-555555555555"),
+            super::super::rollover_runtime::Drain::Quiesced,
+            1,
+        )
+        .expect("an ungated wrap seat launches its native successor");
+        let mut successor = launcher.native.take().expect("a live native pane");
+        assert!(successor.is_native());
+        assert_eq!(successor.session_id(), successor_session);
+        assert_eq!(successor.short(), plan.short);
+        assert_eq!(
+            super::super::seat::load(&state, &plan.short)
+                .expect("successor seat")
+                .generation,
+            plan.generation
+        );
+        let _ = successor.shutdown("");
+    }
 
-        // The one direction this seam can actually perform.
-        assert!(launcher.admits(&plan_for(RuntimeKind::Harness)).is_ok());
+    /// The release gate is checked at admission, before subagents are settled
+    /// or the source pty is touched, so current builds retain park behaviour.
+    #[test]
+    fn wrap_parks_a_native_successor_while_the_release_gate_is_closed() {
+        use super::super::runtime::RuntimeKind;
 
-        let refusal = launcher
-            .admits(&plan_for(RuntimeKind::Native))
-            .expect_err("a native successor must never become a harness swap");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = super::super::state::StateDir::from_root(tmp.path().join("state"));
+        let plan = super::super::rollover_runtime::plan_successor(
+            RuntimeKind::Harness,
+            RuntimeKind::Native,
+            "aaaa1111",
+            4,
+            Some("claude"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let launched = std::cell::Cell::new(false);
+        let mut open_native = |_: &super::super::rollover_runtime::SuccessorPlan| {
+            launched.set(true);
+            Err(
+                super::super::rollover_runtime::SuccessorRefusal::LaunchFailed(
+                    "must not launch".to_string(),
+                ),
+            )
+        };
+        let mut launcher = WrapSwapLauncher {
+            session: "11111111-2222-4333-8444-555555555555",
+            native_available: false,
+            native: None,
+            launch_native: &mut open_native,
+        };
+        let refusal = super::super::rollover_runtime::launch_successor(
+            &state,
+            repo.path(),
+            &mut launcher,
+            &plan,
+            Some("11111111-2222-4333-8444-555555555555"),
+            super::super::rollover_runtime::Drain::Quiesced,
+            1,
+        )
+        .expect_err("the gated native successor stays parked");
         let reason = refusal.to_string();
         assert!(
-            reason.contains("no native backend"),
-            "the refusal names the missing backend: {reason}"
+            reason.contains(super::super::runtime::NATIVE_COMING_SOON),
+            "the refusal preserves the release gate: {reason}"
         );
         assert!(
             reason.contains("parked"),
-            "and says the seat is parked rather than swapped: {reason}"
+            "the source remains parked rather than swapped: {reason}"
         );
+        assert!(!launched.get(), "admission must refuse before launch");
+        assert!(launcher.native.is_none());
     }
     #[cfg(unix)]
     use std::io::Read;
