@@ -3250,6 +3250,108 @@ pub(crate) fn unwrap_launcher_prefix(segment: &str) -> Option<String> {
     (i < tokens.len()).then(|| tokens[i..].join(" "))
 }
 
+/// `docker exec`/`kubectl exec`'s own flags: which ones are bare booleans
+/// and which ones consume a separate value token. Unlike [`LauncherPrefix`],
+/// there is also a REQUIRED positional (the container/pod name) between the
+/// flags and the optional `--` separator -- see [`unwrap_exec_prefix`].
+struct ExecWrapper {
+    program: &'static str,
+    boolean_flags: &'static [&'static str],
+    value_flags: &'static [&'static str],
+}
+
+const EXEC_WRAPPERS: &[ExecWrapper] = &[
+    ExecWrapper {
+        program: "docker",
+        boolean_flags: &[
+            "-d",
+            "--detach",
+            "-i",
+            "--interactive",
+            "-t",
+            "--tty",
+            "-it",
+            "--privileged",
+        ],
+        value_flags: &[
+            "-e",
+            "--env",
+            "--env-file",
+            "-u",
+            "--user",
+            "-w",
+            "--workdir",
+        ],
+    },
+    ExecWrapper {
+        program: "kubectl",
+        boolean_flags: &["-i", "--stdin", "-t", "--tty", "-it"],
+        value_flags: &["-n", "--namespace", "-c", "--container", "--context"],
+    },
+];
+
+/// One layer of `docker exec`/`kubectl exec` unwrapping: both run some
+/// OTHER, container-local command -- the same "goes on to run a wrapped
+/// command" shape [`unwrap_launcher_prefix`] already knows, plus a
+/// REQUIRED positional (the container/pod name) between the flags and an
+/// optional `--` separator marking where the inner command starts.
+///
+/// `docker exec [flags] <container> <cmd...>` and `kubectl exec [flags]
+/// <pod> [-n ns] [-c container] [--] <cmd...>` are peeled the same way:
+/// skip the wrapper's own flags (a boolean one alone, a value one plus its
+/// next token), then the first remaining token is the container/pod, then
+/// an optional `--`, then the remainder is the inner command.
+///
+/// `None` whenever the shape does not hold cleanly: no `exec` subcommand,
+/// an unrecognized flag before the positional (this function does not know
+/// whether it takes a value, and guessing risks eating the container/pod
+/// name itself), or nothing left after the positional/separator. Failing to
+/// decode is always the safer answer than mis-identifying where the inner
+/// command starts.
+pub(crate) fn unwrap_exec_prefix(segment: &str) -> Option<String> {
+    let bare = strip_program_dir(segment);
+    let collapsed = collapse_whitespace(&bare);
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let program = sql_program_name(tokens.first()?);
+    let wrapper = EXEC_WRAPPERS.iter().find(|w| w.program == program)?;
+    if !tokens
+        .get(1)
+        .is_some_and(|t| t.eq_ignore_ascii_case("exec"))
+    {
+        return None;
+    }
+    let mut i = 2usize;
+    while let Some(token) = tokens.get(i) {
+        if !token.starts_with('-') {
+            break;
+        }
+        if wrapper
+            .boolean_flags
+            .iter()
+            .any(|flag| token.eq_ignore_ascii_case(flag))
+        {
+            i += 1;
+            continue;
+        }
+        if wrapper
+            .value_flags
+            .iter()
+            .any(|flag| token.eq_ignore_ascii_case(flag))
+        {
+            i += 2;
+            continue;
+        }
+        return None;
+    }
+    // The container/pod name itself -- a required positional, not a flag.
+    tokens.get(i)?;
+    i += 1;
+    if tokens.get(i) == Some(&"--") {
+        i += 1;
+    }
+    (i < tokens.len()).then(|| tokens[i..].join(" "))
+}
+
 /// Issue #326: `zirv ctx run --compact -- <argv...>` is a TRANSPARENT
 /// launcher -- it stores the child's output and prints a summary, and is
 /// otherwise exactly the child. Returns the inner argv, or `None` when
@@ -3359,12 +3461,74 @@ fn push_executable_candidate(candidates: &mut Vec<String>, text: String) {
     push_candidate(candidates, strip_program_dir(&text));
 }
 
+/// Shell reserved words that open, continue, or close a compound-command
+/// structure, plus brace-group punctuation. None of these is ever a
+/// program name, so a segment or whole command starting with one must not
+/// be matched against policy as if it were (the "keyword-aware segment
+/// tokenization" fix in the built-in safe-command policy spec).
+const SHELL_STRUCTURAL_KEYWORDS: &[&str] = &[
+    "for", "while", "until", "if", "then", "elif", "else", "fi", "do", "done", "case", "esac",
+    "in", "{", "}",
+];
+
+/// Whether `text`'s own first token is a [`SHELL_STRUCTURAL_KEYWORDS`]
+/// entry -- i.e. `text` is a compound-command fragment, not a flat single
+/// command. Guards the TOP-LEVEL "whole command" candidate: unlike a
+/// [`split_segments`] segment, the whole string still has every top-level
+/// separator (`;`, `&&`, ...) uncut, so stripping just its first keyword
+/// would leave the remainder glued to later segments' own text instead of
+/// cleanly exposing one command. Suppressing it outright loses nothing: no
+/// built-in rule is shaped like `"for * do ... done"`, and every real
+/// command underneath is still reached through the per-segment candidates
+/// [`derive_segment_candidate`] produces below.
+fn is_shell_control_structure(text: &str) -> bool {
+    text.split(' ')
+        .find(|token| !token.is_empty())
+        .is_some_and(|first| SHELL_STRUCTURAL_KEYWORDS.contains(&first))
+}
+
+/// Strips a [`split_segments`] segment's reserved-word header so the body
+/// command underneath -- not the keyword -- is what
+/// [`push_executable_candidate`] matches against policy. Segments are
+/// already cut at every top-level separator, so stripping-and-keeping is
+/// safe here (unlike [`is_shell_control_structure`]'s whole-string case).
+///
+/// `None` means the segment carries no executable candidate at all: either
+/// it is pure structure with no payload (`done`, `fi`, `}`), or everything
+/// after the keyword is DATA rather than a command. A `for VAR [in
+/// WORD...]` header's variable and word list are never executed (the loop
+/// body is the separate segment after `do`), and `case WORD in` is the same
+/// shape for the word being matched -- treating either as a bogus candidate
+/// (`for f in a b` -> `a b`) would be exactly the wrong direction.
+///
+/// `Some(segment.to_string())` -- unchanged -- when the first token is not
+/// a recognized keyword at all: every ordinary command keeps exactly its
+/// current candidate.
+fn derive_segment_candidate(segment: &str) -> Option<String> {
+    let tokens: Vec<&str> = segment.split(' ').filter(|t| !t.is_empty()).collect();
+    let first = *tokens.first()?;
+    if !SHELL_STRUCTURAL_KEYWORDS.contains(&first) {
+        return Some(segment.to_string());
+    }
+    if matches!(first, "for" | "case") {
+        return None;
+    }
+    let mut i = 0;
+    while tokens
+        .get(i)
+        .is_some_and(|t| SHELL_STRUCTURAL_KEYWORDS.contains(t))
+    {
+        i += 1;
+    }
+    (i < tokens.len()).then(|| tokens[i..].join(" "))
+}
+
 fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<String>) {
     if depth > MAX_STRUCTURAL_DEPTH || candidates.len() >= MAX_STRUCTURAL_CANDIDATES {
         return;
     }
     let whole = collapse_whitespace(command);
-    if !whole.is_empty() {
+    if !whole.is_empty() && !is_shell_control_structure(&whole) {
         push_executable_candidate(candidates, whole);
     }
     let segments: Vec<(String, String)> = split_segments(command)
@@ -3378,8 +3542,14 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
     // dangerous sibling segment (`...; rm -rf /`) is always classified even
     // when an earlier segment's substitution-splice recursion in pass 2 would
     // otherwise exhaust MAX_STRUCTURAL_CANDIDATES before this segment.
+    // `derive_segment_candidate` skips a leading shell keyword (`for`, `{`,
+    // `do`, ...) so the BODY command is what gets matched, not the keyword
+    // itself -- see its own doc comment for why `for`/`case` headers are
+    // suppressed entirely instead.
     for (_, collapsed) in &segments {
-        push_executable_candidate(candidates, collapsed.clone());
+        if let Some(candidate) = derive_segment_candidate(collapsed) {
+            push_executable_candidate(candidates, candidate);
+        }
     }
     if depth >= MAX_STRUCTURAL_DEPTH {
         return;
@@ -3396,6 +3566,13 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
         if let Some(inner) = unwrap_launcher_prefix(collapsed) {
+            visit_executable_nodes(&inner, depth + 1, candidates);
+        }
+        // `docker exec`/`kubectl exec` go on to run a container-local
+        // command, exactly like any other launcher prefix -- see
+        // `unwrap_exec_prefix`'s own doc comment for the extra positional/
+        // separator handling neither `docker` nor `kubectl` needed before.
+        if let Some(inner) = unwrap_exec_prefix(collapsed) {
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
         // Issue #326: `zirv ctx run --compact -- <argv>` is a transparent
@@ -3471,10 +3648,23 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
 /// is_heavy` reuses, so a heavy command hidden behind `sh -c` or a `&&`
 /// chain is classified by the same matcher this module's own policy checks
 /// use, rather than a second, independently-drifting copy.
+///
+/// The raw candidate is skipped entirely (not seeded at all) when it is a
+/// keyword-led compound ([`is_shell_control_structure`]) -- the same guard
+/// [`visit_executable_nodes`]'s own top-level "whole command" push applies,
+/// for the same reason: this text still has every top-level separator
+/// uncut, so it can never usefully match a program-shaped rule, and an
+/// unmatched compound would otherwise fold to the launch mode's unmatched-
+/// command default regardless of how cleanly every real command underneath
+/// classifies (the exact headless false-positive "change 1" fixes).
 pub(crate) fn normalize_segments(command: &str) -> Vec<String> {
     let sanitized = redact_single_quoted_heredocs(command);
     let raw_candidate = redact_opaque_message(&sanitized).unwrap_or_else(|| sanitized.clone());
-    let mut candidates = vec![raw_candidate];
+    let mut candidates = if is_shell_control_structure(&raw_candidate) {
+        Vec::new()
+    } else {
+        vec![raw_candidate]
+    };
     visit_executable_nodes(&sanitized, 0, &mut candidates);
     candidates
 }
@@ -6095,7 +6285,7 @@ fn segment_write_targets(segment: &str) -> Option<Vec<String>> {
 /// no write target at all (no redirection, no `tee`). That last case matters
 /// because this function's caller only ever widens a verdict when it
 /// returns `Some(true)`: without this guard, ANY command with zero writes
-/// (an ordinary `kubectl exec -it pod -- sh`, a bare `2>&1` with nothing
+/// (an ordinary `ssh host uptime`, a bare `2>&1` with nothing
 /// else) would vacuously satisfy "every target is confined" and get widened
 /// to `Allow` just for not writing anywhere at all -- which is not what this
 /// design decision is for (a compound that DOES write, confined to the
@@ -10216,12 +10406,24 @@ mod tests {
     /// no redirection, or one that resolves to descriptor duplication only
     /// (`2>&1`, no path) -- must never vacuously satisfy "every target is
     /// confined". Without this, an arbitrary unmatched command with zero
-    /// writes (`kubectl exec -it pod -- sh`) would be silently widened to
-    /// `Allow` by the caller just for not writing anywhere at all.
+    /// writes (`ssh host uptime`) would be silently widened to `Allow` by
+    /// the caller just for not writing anywhere at all.
+    ///
+    /// `kubectl exec -it pod -- sh` was this test's example until the
+    /// `docker exec`/`kubectl exec` decoder (`unwrap_exec_prefix`) started
+    /// analysing the inner command instead of treating the whole invocation
+    /// as opaque -- it is no longer a stable "unanalyzable" example (its
+    /// analyzability is exactly what changed), so `ssh host uptime` (a
+    /// different program this module still never looks inside) takes its
+    /// place. `write_targets_confined` itself is unaffected either way: it
+    /// scans `split_segments` directly and has no exec-decoding of its own,
+    /// so its answer for the old example did not actually change -- this
+    /// swap is about keeping the test's chosen example honest, not about a
+    /// behavior change here.
     #[test]
     fn write_targets_confined_has_no_opinion_when_there_is_no_write_target_at_all() {
         let roots = vec!["/tmp/claude".to_string()];
-        for command in ["kubectl exec -it pod -- sh", "some-tool 2>&1", "git log"] {
+        for command in ["ssh host uptime", "some-tool 2>&1", "git log"] {
             assert_eq!(write_targets_confined(command, &roots), None, "{command}");
         }
     }
@@ -11233,10 +11435,22 @@ mod tests {
             }
         }
 
-        // `kubectl exec` remains mode-default: the interactive base verdict
-        // is Allow and can retry; the headless base verdict is Ask and the
-        // retry boundary converts that to Deny.
-        for (permission_mode, expected) in [("default", "allow"), ("dontAsk", "deny")] {
+        // `kubectl exec` used to remain mode-default on an unsandboxed
+        // retry: the interactive base verdict is Allow, and
+        // `allow_verdict_retry_clears_escape_screen` cleared the retry
+        // because the only candidate it could see was the whole `kubectl
+        // exec ...` invocation, whose own program name (`kubectl`) is
+        // neither `sh`/`bash`/`zsh`/`dash` nor `curl`/`wget`/`zirv`. Now that
+        // `unwrap_exec_prefix` (built-in safe-command policy, change 3)
+        // decodes the inner command, that screen also sees a bare `sh` --
+        // a shell with no `-c`/script payload it could clear --
+        // `shell_interpreter_payload_clears` fails closed on it, so the
+        // interactive retry no longer clears and correctly asks instead.
+        // The headless side is unaffected: its base verdict was already
+        // `Ask` (the whole-command candidate is still unmatched either
+        // way), so it still falls through to the same `<sandbox:
+        // unsandboxed retry>` `Deny`.
+        for (permission_mode, expected) in [("default", "ask"), ("dontAsk", "deny")] {
             let stdin = format!(
                 r#"{{"tool_name":"Bash","tool_input":{{"command":"kubectl exec -it pod -- sh","dangerouslyDisableSandbox":true}},"permission_mode":"{permission_mode}"}}"#
             );
@@ -12628,6 +12842,173 @@ mod tests {
                 "{command} is ordinary paced development work"
             );
         }
+    }
+
+    // -- Keyword-aware segment tokenization (built-in safe-command policy,
+    // change 1) -------------------------------------------------------------
+
+    /// Deny-evasion regression: wrapping a denied command in a brace group,
+    /// a `for`/`do`/`done` loop, or an `if`/`then`/`fi` conditional must not
+    /// change its verdict. Before `derive_segment_candidate` stripped the
+    /// leading keyword, `push_executable_candidate` matched the keyword
+    /// itself (`{`, `do`, `then`) against policy instead of the `sudo`
+    /// underneath, so none of these matched the built-in `sudo *` deny rule
+    /// and fell through to `interactive_default` (`Allow`).
+    #[test]
+    fn keyword_wrapped_commands_reach_the_same_verdict_as_the_bare_command() {
+        let policy = SafetyPolicy::default();
+        let bare = evaluate(&policy, "sudo id", LaunchMode::Interactive).verdict;
+        assert_eq!(bare, Verdict::Deny, "sudo id must deny to begin with");
+        for wrapped in [
+            "{ sudo id; }",
+            "for f in a; do sudo id; done",
+            "if true; then sudo id; fi",
+        ] {
+            assert_eq!(
+                evaluate(&policy, wrapped, LaunchMode::Interactive).verdict,
+                Verdict::Deny,
+                "{wrapped} must deny exactly like the bare command"
+            );
+        }
+    }
+
+    /// The same wrapping must not change a semantically-classified `Ask`
+    /// (recursive delete outside a generated directory) either -- neither
+    /// widening it to `Allow` (the pre-fix deny-evasion bug) nor narrowing
+    /// the bare command's own `Ask` into a `Deny` the wrapper never earned.
+    /// Checked in both launch modes: interactive's `Ask` comes from
+    /// upgrading the unmatched-command `Allow` default, headless's `Ask` IS
+    /// that default already -- the wrapper must not disturb either path.
+    #[test]
+    fn keyword_wrapped_recursive_deletes_stay_ask_in_both_launch_modes() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            assert_eq!(
+                evaluate(&policy, "rm -rf /tmp/x", mode).verdict,
+                Verdict::Ask,
+                "rm -rf /tmp/x must ask ({mode:?})"
+            );
+            assert_eq!(
+                evaluate(&policy, "{ rm -rf /tmp/x; }", mode).verdict,
+                Verdict::Ask,
+                "the brace-wrapped form must ask exactly like the bare command ({mode:?})"
+            );
+        }
+    }
+
+    /// The other direction of the same bug: a benign loop must not fold to
+    /// the headless unmatched-command default (`Ask`) just because its
+    /// `for ...`/`do ...`/`done` segments never matched any rule as literal
+    /// text. `cat` is on the shipped allow list, so once the loop body's own
+    /// leading `do` is stripped, `cat $f` is the only candidate that
+    /// resolves to anything other than "no opinion" here -- and that
+    /// resolution must be `Allow`, in EITHER launch mode.
+    #[test]
+    fn a_benign_control_flow_loop_is_allow_in_both_launch_modes() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            assert_eq!(
+                evaluate(&policy, "for f in a b; do cat $f; done", mode).verdict,
+                Verdict::Allow,
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// Unit-level pin on [`derive_segment_candidate`] itself: a keyword
+    /// stripped from the front must never swallow a real payload, a
+    /// `for`/`case` header's variable/word-list must never become a bogus
+    /// candidate of its own (`for f in a b` must not yield `a b`, or even
+    /// `f in a b`), and a segment that is pure structure with no payload at
+    /// all (`done`, `fi`, `}`) must yield no candidate rather than an
+    /// empty-string one.
+    #[test]
+    fn derive_segment_candidate_strips_keywords_without_losing_or_inventing_a_payload() {
+        for (segment, expected) in [
+            ("sudo id", Some("sudo id")),
+            ("do sudo id", Some("sudo id")),
+            ("{ sudo id", Some("sudo id")),
+            ("then sudo id", Some("sudo id")),
+            ("while read f", Some("read f")),
+            ("for f in a b", None),
+            ("for f", None),
+            ("case $x in", None),
+            ("done", None),
+            ("fi", None),
+            ("}", None),
+        ] {
+            assert_eq!(
+                derive_segment_candidate(segment),
+                expected.map(str::to_string),
+                "{segment}"
+            );
+        }
+    }
+
+    // -- docker exec / kubectl exec decoding (built-in safe-command policy,
+    // change 3) --------------------------------------------------------------
+
+    /// Unit-level pin on [`unwrap_exec_prefix`], mirroring
+    /// `a_launcher_prefix_never_hides_the_program_it_launches`'s own shape
+    /// for the ordinary launchers: every recognized flag spelling is peeled
+    /// away and the container/pod-local command underneath is what is
+    /// returned, including the `--` separator kubectl uses and the combined
+    /// `-it` boolean cluster both tools accept. The second loop pins the
+    /// CONSERVATIVE failure side: an unrecognized flag, a missing `exec`
+    /// subcommand, or nothing left after the positional/separator must all
+    /// leave the segment undecoded rather than guess.
+    #[test]
+    fn unwrap_exec_prefix_reveals_the_container_local_command() {
+        for (wrapped, inner) in [
+            ("docker exec db rm -rf /tmp/data", "rm -rf /tmp/data"),
+            ("docker exec db ls /app", "ls /app"),
+            ("docker exec -it db sh", "sh"),
+            ("docker exec -u root -w /app db ls", "ls"),
+            ("kubectl exec pod -- rm -rf /tmp/data", "rm -rf /tmp/data"),
+            ("kubectl exec -it pod -- sh", "sh"),
+            ("kubectl exec -n prod -c app pod -- ls /app", "ls /app"),
+        ] {
+            assert_eq!(
+                unwrap_exec_prefix(wrapped).as_deref(),
+                Some(inner),
+                "{wrapped}"
+            );
+        }
+        for command in [
+            "docker exec",
+            "docker exec db",
+            "docker exec --unknown-flag db ls",
+            "kubectl exec",
+            "kubectl get pods",
+            "docker run db ls",
+        ] {
+            assert_eq!(unwrap_exec_prefix(command), None, "{command}");
+        }
+    }
+
+    /// Regression lock, per the built-in safe-command policy's change 3:
+    /// `docker exec`/`kubectl exec` must reach the INNER command's verdict
+    /// -- a destructive `rm -rf` inside the container asks exactly like it
+    /// would bare, and a read-only `ls` stays allowed rather than folding
+    /// to the whole invocation's unmatched-command default.
+    #[test]
+    fn docker_and_kubectl_exec_reach_the_inner_commands_verdict() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "docker exec db rm -rf /tmp/data",
+            "kubectl exec pod -- rm -rf /tmp/data",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            evaluate(&policy, "docker exec db ls /app", LaunchMode::Interactive).verdict,
+            Verdict::Allow,
+            "a read-only inner command must stay allowed"
+        );
     }
 
     // -- Issue #326: `zirv ctx run --compact` is a transparent launcher -----
