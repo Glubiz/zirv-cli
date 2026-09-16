@@ -626,7 +626,8 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// entries' own comments and the spec's Change 3); and the everyday-tool
 /// gap (`sed`, `awk`, `jq`, `mkdir`, `touch`, `cp`, `mv`, `stat`, `df`, `du`,
 /// `ps`, `printf`, `date`, `basename`, `dirname`, `xargs`, `tee`, `mktemp`,
-/// `realpath`).
+/// `realpath`), plus the fixed macOS SSH-agent environment lookup
+/// (`launchctl getenv` and `export SSH_AUTH_SOCK=...`).
 pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Read(./**)", "read anything inside the workspace"),
     (
@@ -702,6 +703,14 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     (
         "Bash(where *)",
         "locate a command on PATH, read-only (Windows spelling)",
+    ),
+    (
+        "Bash(launchctl getenv *)",
+        "read one value from launchd's environment, including SSH_AUTH_SOCK",
+    ),
+    (
+        "Bash(export SSH_AUTH_SOCK=*)",
+        "point this shell at the SSH agent socket; command substitutions are analysed separately",
     ),
     ("Bash(diff *)", "compare files, read-only"),
     ("Bash(sort *)", "sort input lines, read-only"),

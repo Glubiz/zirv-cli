@@ -4852,6 +4852,15 @@ escalation, download-to-shell pipelines, and attacks on zirv itself are denied.
 Local reads or copies of project secret files (`.env`, `.env.*`, `*.pem`, `*.key`)
 ask; `.env.example`, `.env.sample`, `.env.template`, `.env.dist`, and `.env.test`
 templates stay silent.
+
+The shipped allow set also covers `zirv report bug|feature`, absolute-path
+`find`, ordinary `git merge`/`pull`/`push`/`branch`, and the macOS SSH-agent
+setup `export SSH_AUTH_SOCK=$(launchctl getenv SSH_AUTH_SOCK)`. The matching
+unsandboxed-retry rules keep those commands silent when the OS sandbox cannot
+reach the required repository, remote, user path, or agent socket. Destructive
+variants such as force/delete pushes, hard resets, and forced branch deletion
+still use the ask rules above.
+
 The structural/semantic result is identical for Unix, `cmd.exe`, and
 PowerShell spellings (including `.exe`/`.cmd` wrappers). This classifier is a
 tripwire layered with the harness sandbox, not a claim that finite command
@@ -4927,9 +4936,10 @@ beneath it.
 
 Each supervised Claude decision appends a privacy-preserving audit record under
 the platform state directory's `logs/safety-decisions/` UTC-day bucket. Records
-contain the verdict, matched rule/origin, launch/current policy fingerprints,
-attestation status and SHA-256 of the command—never the raw command, source,
-paths, tokens, or shell secrets.
+contain the verdict, a bounded command family (program plus a subcommand only
+for known dispatcher CLIs), matched rule/origin, launch/current policy
+fingerprints, attestation status and SHA-256 of the command—never the raw
+command, remaining arguments, source, paths, tokens, or shell secrets.
 
 `deny`/`ask` may be extended by a repo checkout (narrowing is always safe—both
 are checked before `allow`); `allow`, both defaults, and `sql` may not. A

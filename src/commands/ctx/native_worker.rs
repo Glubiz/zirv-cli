@@ -610,6 +610,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             mail_delivered: publication.mailed,
             errors: contract_errors,
             capability_warnings: Vec::new(),
+            blocked_families: Vec::new(),
             reason: None,
             note: receipt_note(delegation_state),
         };
@@ -656,6 +657,7 @@ fn refuse<W: Write>(
             mail_delivered: false,
             errors: Vec::new(),
             capability_warnings: Vec::new(),
+            blocked_families: Vec::new(),
             reason: Some(reason),
             note: receipt_note(DelegationState::LaunchFailed),
         };

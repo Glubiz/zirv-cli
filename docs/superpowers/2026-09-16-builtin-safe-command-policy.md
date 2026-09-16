@@ -127,6 +127,9 @@ Add to `SHIPPED_POSTURE_ALLOW`:
   `touch *`, `cp *`, `mv *`, `stat *`, `df *`, `du *`, `ps *`, `printf *`,
   `date *`, `basename *`, `dirname *`, `xargs *`, `tee *`, `mktemp *`,
   `realpath *`.
+- The fixed macOS SSH-agent lookup: `launchctl getenv *` and
+  `export SSH_AUTH_SOCK=*`. Command substitutions remain separate executable
+  candidates, so this does not hide a dangerous command used as the value.
 
 Separately, add `"kill"` to `ZIRV_CTX_ESCAPE_SAFE_VERBS`
 (`safety.rs:7037-7053`). That list feeds `ctx_base_allow_verbs()`
@@ -191,7 +194,9 @@ read-only tools only, which is why the 200 unsandboxed-retry asks — the
 single largest dialog class — are all build/dev tooling.
 
 Add `cargo`, `gh`, `glab`, `gitlab-ci-local`, `npm`, `npx`, `git`, `python3`,
-`mkdir`, `zirv`.
+`mkdir`, and the two narrowly allowed SSH-agent lookup programs (`launchctl`,
+`export`). `zirv` uses its existing subcommand-aware retry acceptor instead of
+a broad leading-program entry.
 
 Safety argument: the escape branch is gated on the base verdict already
 being `Allow` (`safety.rs:8573`), so deny and ask rules still win; an entry
@@ -297,7 +302,10 @@ iii. Whether `kubectl exec` follows `docker exec` or stays off.
 The over-broad `Bash(*find /*)` and Windows-registry deny globs in the
 operator's `~/.claude/settings.json` (85 silent denials in 7 days, and a
 `*regedit*` glob that blocked a read-only probe because the word appeared
-inside a `grep -v` argument); `~/.claude/hooks/enforce-rules.sh` using
-GNU-only `grep -oP`, which BSD/macOS grep rejects, so its repo resolution
+inside a `grep -v` argument) remain machine-local configuration defects. The
+commands themselves are safe in zirv's shipped policy; a harness-native deny
+still outranks zirv's allow. Also out of scope:
+`~/.claude/hooks/enforce-rules.sh` using GNU-only `grep -oP`, which BSD/macOS
+grep rejects, so its repo resolution
 silently fails, plus its substring matching firing on command text inside
 quoted arguments. Neither belongs to this repo's policy layer.
