@@ -69,7 +69,7 @@ fn build(
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
-            let dir = state.root().join("mcp-launch");
+            let dir = state_path.join("mcp-launch");
             super::super::state::create_private_dir_all(&dir)?;
             let path = dir.join(format!("{digest}.json"));
             super::super::state::write_private(&path, &json)?;
