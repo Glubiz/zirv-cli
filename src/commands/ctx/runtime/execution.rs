@@ -1903,12 +1903,13 @@ printf '{"type":"result","session_id":"%s","subtype":"success","is_error":false,
             trigger.cancel();
         });
         let started = Instant::now();
+        let error = adapter
+            .run(&request(&cancel), &mut |_| Ok(Value::Null))
+            .unwrap_err()
+            .to_string();
         assert!(
-            adapter
-                .run(&request(&cancel), &mut |_| Ok(Value::Null))
-                .unwrap_err()
-                .to_string()
-                .contains("cancelled")
+            error.contains("cancelled"),
+            "unexpected cancellation error: {error}"
         );
         assert!(started.elapsed() < Duration::from_secs(3));
     }
