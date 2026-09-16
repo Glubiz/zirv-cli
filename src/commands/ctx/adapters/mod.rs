@@ -612,6 +612,21 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// `WebFetch`/`WebSearch` (bare tool rules, no `Bash(...)` wrapper); and two
 /// scratchpad rules computed at launch from the real `std::env::temp_dir()`
 /// rather than baked into this `&'static` list -- see [`scratchpad_rules`].
+///
+/// **Fix round 6 (2026-09-16, docs/superpowers/2026-09-16-builtin-safe-
+/// command-policy.md, Change 2): the worker capability list.** This list is
+/// also what a headless `zirv ctx agent`/`exec`/`loop` worker can do
+/// unattended -- unlike an interactive session, it has no unmatched-command
+/// fallback to lean on (`headless_default = ask`, unanswerable), so a
+/// command absent here silently blocks a worker even though the identical
+/// command is already `Allow` interactively. `glab *`, `gitlab-ci-local *`,
+/// `php *`; read-only `kubectl get/logs/describe/config *` (never a bare
+/// `kubectl *` -- `apply`/`delete` stay off); `docker exec *`/`kubectl exec
+/// *` (safe only because the inner command is now analysed -- see the two
+/// entries' own comments and the spec's Change 3); and the everyday-tool
+/// gap (`sed`, `awk`, `jq`, `mkdir`, `touch`, `cp`, `mv`, `stat`, `df`, `du`,
+/// `ps`, `printf`, `date`, `basename`, `dirname`, `xargs`, `tee`, `mktemp`,
+/// `realpath`).
 pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Read(./**)", "read anything inside the workspace"),
     (
@@ -706,6 +721,77 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
         "Bash(wget *)",
         "fetch a URL; piping into a shell is denied below",
     ),
+    // Fix round 6 (2026-09-16, issue tracked in docs/superpowers/2026-09-16-
+    // builtin-safe-command-policy.md, Change 2) -- see this constant's own
+    // doc comment for the "worker capability list" framing.
+    (
+        "Bash(glab *)",
+        "the GitLab CLI; resolves a real asymmetry with `Bash(gh *)` above -- \
+         glab was absent from this internal policy while the Claude-adapter- \
+         native PROMPT_FREE_COMMAND_FAMILIES (adapters/claude.rs, issue #329) \
+         already grants `glab *` prompt-free treatment, so the two layers \
+         disagreed on the same command; destructive glab forms are still \
+         denied by the semantic classifier ahead of this family",
+    ),
+    (
+        "Bash(gitlab-ci-local *)",
+        "run this project's CI jobs locally against the GitLab CI config",
+    ),
+    ("Bash(php *)", "the PHP toolchain"),
+    // kubectl READ verbs only -- deliberately not a bare `Bash(kubectl *)`:
+    // `apply`/`delete`/`exec` must not inherit this blanket allow.
+    (
+        "Bash(kubectl get *)",
+        "inspect cluster resources, read-only",
+    ),
+    ("Bash(kubectl logs *)", "read a pod's logs, read-only"),
+    (
+        "Bash(kubectl describe *)",
+        "inspect a resource in detail, read-only",
+    ),
+    (
+        "Bash(kubectl config *)",
+        "inspect or switch kubeconfig context, read-only",
+    ),
+    // Container exec, per an explicit operator decision (spec Change 3):
+    // safe to allow ONLY because the inner command run inside the container/
+    // pod is decoded and analysed like any other nested command, not treated
+    // as one opaque string -- see the wrapper-decoding work tracked
+    // alongside this change. Without that analysis these two entries would
+    // let `docker exec db rm -rf /tmp/data` through unexamined.
+    (
+        "Bash(docker exec *)",
+        "exec into a running container; the inner command is analysed, not opaque",
+    ),
+    (
+        "Bash(kubectl exec *)",
+        "exec into a running pod; the inner command is analysed, not opaque",
+    ),
+    // Everyday tools absent today -- the same "worker capability list" gap
+    // as `glab`/`kubectl` above, just for common shell utilities rather than
+    // a named toolchain.
+    ("Bash(sed *)", "stream-edit text, including in-place edits"),
+    ("Bash(awk *)", "pattern-scan and process text"),
+    ("Bash(jq *)", "query and transform JSON"),
+    ("Bash(mkdir *)", "create a directory"),
+    ("Bash(touch *)", "create a file or update its timestamp"),
+    ("Bash(cp *)", "copy files"),
+    ("Bash(mv *)", "move or rename files"),
+    ("Bash(stat *)", "read file metadata, read-only"),
+    ("Bash(df *)", "report filesystem disk usage, read-only"),
+    ("Bash(du *)", "report directory disk usage, read-only"),
+    ("Bash(ps *)", "list running processes, read-only"),
+    ("Bash(printf *)", "print formatted text, read-only"),
+    ("Bash(date *)", "print or compute a date, read-only"),
+    ("Bash(basename *)", "strip a path down to its filename"),
+    ("Bash(dirname *)", "strip a path down to its directory"),
+    (
+        "Bash(xargs *)",
+        "build and run commands from input; the launched command is analysed on its own",
+    ),
+    ("Bash(tee *)", "write standard input to a file and stdout"),
+    ("Bash(mktemp *)", "create a temporary file or directory"),
+    ("Bash(realpath *)", "resolve a path, read-only"),
 ];
 
 /// Projects the operator's scratchpad temp directory into the two claude
