@@ -2745,6 +2745,7 @@ mod tests {
     fn delegation_fixture(id: &str, phase: delegation::Phase) -> delegation::Record {
         delegation::Record {
             schema_version: 1,
+            repository: None,
             handle: delegation::WorkerHandle {
                 delegation: id.to_string(),
                 attempt: 1,

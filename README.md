@@ -576,7 +576,8 @@ to the section that documents it in depth.
 ### Harness supervision (`zirv ctx`)
 
 - **MCP bridge** — `mcp` (`zirv ctx mcp serve`) exposes repository-scoped session, memory,
-  workflow, and artifact reads to wrapped MCP hosts. See [MCP bridge](#mcp-bridge).
+  workflow, artifact, worker-result, and inbox reads to wrapped MCP hosts.
+  `zirv ctx mcp doctor` checks a real stdio connection. See [MCP bridge](#mcp-bridge).
 - **Harness adapters** — one adapter per supported harness: `claude`,
   `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, and `qwen`, each
   enabled or disabled per repo in `.zirv/.settings.toml`. See
@@ -1822,7 +1823,8 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
 | `zirv ctx status [--json] [--agents]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through |
-| `zirv ctx mcp serve [--stdio] [--repo <path>]` | Serves four read-only MCP tools for one repository/worktree; see [MCP bridge](#mcp-bridge) |
+| `zirv ctx mcp serve [--stdio] [--repo <path>] [--session <id>]` | Serves seven read-only MCP tools for one repository/worktree; optionally binds inbox reads to a registered session. See [MCP bridge](#mcp-bridge) |
+| `zirv ctx mcp doctor [--repo <path>] [--session <id>] [--timeout-seconds <1..60>]` | Launches this executable as a stdio server, checks tool discovery and a snapshot call, and prints JSON; default deadline 10 seconds |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
@@ -2861,6 +2863,9 @@ configuration so a host's working directory cannot select the wrong project.
 | `memory_search` | `query`, optional `limit` and `max_bytes` | Ranked private/global/shared facts with provenance and verification dates. Uses the existing retrieval engine and trusted-key precedence. |
 | `workflow_status` | `{}` | Active workflow, current step/skill, approval state, and up to 64 registered artifact IDs, newest first. An absent workflow stays absent. |
 | `artifact_read` | `id`, optional `offset` and `max_bytes` | A UTF-8 text page from an artifact registered with `zirv artifact render`. Returns `next_offset` for subsequent pages. |
+| `worker_status` | Optional `id`, `cursor`, `limit` | Repository-scoped delegation/report records with recorded phase, attempt, exit code where available, report outcome and truncation. Worker IDs sort lexicographically; follow `next_cursor`. |
+| `result_read` | `id`, optional `offset`, `revision`, `max_bytes` | A page of the persisted worker result JSON, including report text, structured result, validation errors and undeclared changes. Use an ID from `worker_status`. |
+| `inbox_read` | Optional `cursor`, `limit`, `max_bytes` | Unread message previews for the launch-bound recipient, with sender labels, truncation and `next_cursor`. Never consumes, acknowledges, claims, expires or retries delivery. |
 
 All successful responses contain `captured_at` (Unix seconds), `repository`,
 and `data`, with both an output schema and structured JSON. Tool failures
@@ -2872,6 +2877,40 @@ operator's configured retrieval budgets. Artifact pages default to 8192 bytes
 (range 4..8192); files must be regular UTF-8 text no larger than 1 MiB.
 Offsets are byte positions on UTF-8 boundaries. Registered files remain live
 files, so callers should restart pagination if they change between reads.
+
+Worker listings default to 16 records (maximum 64). `id` selects one exact
+worker and cannot be combined with `cursor`. Ordinary harness reports have no
+delegation phase or exit code unless a corresponding durable delegation exists;
+those fields remain null. Report outcomes such as `reported`, `validated` and
+`contract_failed` describe stored evidence, not process liveness or task correctness.
+Unreadable, oversized or unscoped reports are omitted from listings; an explicit
+`result_read` returns an error. Reports written before repository provenance was
+recorded require a matching scoped delegation reference, never just a filename.
+
+Result pages default to 8192 bytes (range 4..8192). The first page returns a
+SHA-256 `revision`; pass it with every nonzero `offset`. A changed report refuses
+continuation, so restart at offset zero. Pages reconstruct the stored JSON,
+including escaped report text. Stored files must be regular UTF-8 JSON at most
+8 MiB (allowing JSON escaping of the existing 1 MiB report-body limit).
+
+Inbox pages default to six messages (maximum 32), oldest first. `max_bytes`
+controls each body preview, default 1024, range 4..4096. Current
+`mail.max_message_bytes` and the aggregate `mail.max_delivered_bytes` also apply;
+`body_truncated` and `body_bytes` describe omitted text. Use the existing inbox
+CLI/full-body references when a preview is insufficient. Cursors are exclusive
+and remain usable when earlier messages are consumed; concurrent arrivals can
+require another scan from the beginning. `mail.enabled = false` returns an
+explicitly disabled, empty inbox.
+
+Bind directed inbox reads using `serve --session <full-session-id-or-exact-short>`
+or by forwarding the supervisor's `ZIRV_CTX_SESSION` to the MCP subprocess.
+The server resolves that identity once against the session registry, requires
+its canonical repository to match `--repo`, and derives the agent and mailbox
+from the record. Unknown, ambiguous or foreign bindings refuse startup. Tool
+arguments cannot supply or change the recipient. Without a binding, only
+undirected mail addressed to `any` in this repository is visible. With a binding,
+existing directed delivery envelopes can locate that recipient's mail across
+mailbox directories; unrelated broadcast mail stays repository-scoped.
 
 For Codex, add a server entry to the operator's `~/.codex/config.toml`, using
 the real absolute paths:
@@ -2905,12 +2944,26 @@ See the official [Codex MCP](https://developers.openai.com/codex/mcp) and
 [Claude Code MCP](https://code.claude.com/docs/en/mcp) configuration references.
 
 The server does not register itself automatically or change host settings.
-Its four tools neither consume mail nor write memory, run commands, launch
+Its seven tools neither consume mail nor write memory, run commands, launch
 workers, or advance workflows. Existing hooks, CLI checkpoints and supervisor
 recovery continue independently. Reading a registered report does not certify
-that its claims are correct. Worker result storage, mail mutations, dispatch,
+that its claims are correct. Mail mutations, dispatch,
 and incoming event delivery are follow-on work tracked in
 [issue #658](https://github.com/Glubiz/zirv-cli/issues/658).
+
+Check the server before configuring a host:
+
+```bash
+zirv ctx mcp doctor --repo /absolute/path/to/project
+```
+
+The diagnostic launches the current executable, negotiates MCP, validates all
+seven tool definitions and invokes `session_snapshot`. It prints JSON on success
+and exits nonzero on a denied call, protocol error or timeout. It inherits the
+same state/configuration environment and optional session binding as `serve`,
+and terminates and reaps its subprocess on all paths. This verifies the local
+server connection; it does not inspect or certify host registration. No host
+settings, workflows, mail or memory are changed.
 
 MCP reads use the current repository state buckets and never migrate legacy
 buckets. If an older installation's state has not been adopted yet, run the
@@ -2924,7 +2977,10 @@ ordinary zirv CLI for that repository before starting the host.
 | `policy.tool_access` | Re-read for every call. `deny` and `ask` refuse calls; this server has no approval-granting channel. A malformed configuration also refuses reads. |
 | Memory | Existing `memory.enabled`, `memory.shared_enabled`, and retrieval budgets apply. A shared key cannot shadow an enabled private/global key, even if that trusted fact misses the query budget. |
 | Artifact IDs | Resolved in this repository's existing artifact registry. Payload access uses a directory capability to reject traversal and symlink escapes; arbitrary file paths are not tool arguments. |
-| Returned text | Memory provenance is retained; repository artifacts and shared facts are labeled untrusted information, never operator instructions. |
+| Worker results | IDs resolve inside the operator-owned result store. Canonical repository provenance or a matching scoped delegation authorizes each read; unscoped legacy filenames grant nothing. Directory capabilities reject report traversal and symlink escapes. |
+| Inbox recipient | Operator launch configuration/inherited supervisor identity selects a registered session in this repository. Agent and mailbox come from that record, never tool arguments. The binding is not an OS authentication boundary. |
+| Mail policy and receipts | Current `mail.enabled` and delivery budgets apply to every read. Existing expiry and fan-out visibility rules are reused without receipt or mailbox mutations. Sender labels remain claims. |
+| Returned text | Memory provenance is retained; artifacts, worker reports, mail and shared facts are labeled untrusted information, never operator instructions. |
 | OS account and local state | Operator-owned state is trusted as with the CLI. This local service does not isolate mutually hostile processes that already share filesystem access under the same account. |
 
 ### Signals and verdicts

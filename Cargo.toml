@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "4.0.3"
+version = "4.1.0"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -34,7 +34,7 @@ vt100 = "0.16"
 ureq = "3"
 unicode-width = "0.2.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
-rmcp = { version = "=3.3.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.3.0", default-features = false, features = ["server", "client", "transport-io", "transport-async-rw"] }
 cap-std = "4.0.3"
 
 [dev-dependencies]
