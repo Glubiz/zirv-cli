@@ -250,8 +250,26 @@ impl CompiledContext {
                 // Always first when present -- `prompt::compose`'s own first
                 // line is `String::from(DEFAULT_PROMPT)`.
                 PromptSource::Default => Some((0, Some(prompt::DEFAULT_PROMPT.len()), None)),
-                PromptSource::Harness => find_after(text, cursor, prompt::HARNESS_PROMPT)
-                    .map(|start| (start, Some(start + prompt::HARNESS_PROMPT.len()), None)),
+                // Issue #427: exactly one of the three tiered constants is
+                // ever actually spliced in by `prompt::compose` (selected by
+                // `cfg.prompt.verbosity`, not available here -- this method
+                // only ever touches `composed.text`/`sources`, already in
+                // memory, per its own doc comment). Trying all three and
+                // taking whichever literal search actually matches needs no
+                // verbosity threaded through `CompiledContext`: their
+                // distinct headers ("zirv meta-harness (v18)" vs.
+                // "(standard)"/"(minimal)") mean at most one can ever be a
+                // substring of `text`.
+                PromptSource::Harness => [
+                    prompt::HARNESS_PROMPT,
+                    prompt::HARNESS_PROMPT_STANDARD,
+                    prompt::HARNESS_PROMPT_MINIMAL,
+                ]
+                .iter()
+                .find_map(|candidate| {
+                    find_after(text, cursor, candidate)
+                        .map(|start| (start, Some(start + candidate.len()), None))
+                }),
                 PromptSource::Harnesses => {
                     find_after(text, cursor, prompt::HARNESS_ROSTER_LAYER_HEADER).and_then(
                         |header_at| {
@@ -1248,9 +1266,11 @@ fn measure_row(layer: &str, bytes: usize, note: &str) -> String {
 /// Builds the `--measure` table from a [`CompiledContext`] this repo/role/
 /// harness would actually get at launch, without re-deriving any layer's own
 /// byte count a second way: every number here comes straight off `compiled`
-/// (`composed.text.len()` for the ground-truth total) or off one of the two
-/// deterministic shipped-prompt constants (`DEFAULT_PROMPT`/`HARNESS_PROMPT`,
-/// which `compose` always copies verbatim -- see their own doc comments).
+/// (`composed.text.len()` for the ground-truth total) or off one of the
+/// deterministic shipped-prompt constants (`DEFAULT_PROMPT`, or whichever
+/// `PromptVerbosity` tier of `HARNESS_PROMPT` `cfg.prompt.verbosity`
+/// selects via `harness_prompt_for` -- issue #427), which `compose` always
+/// copies verbatim -- see their own doc comments).
 /// Rows are pushed in composition order, not sorted by size, and a truncated
 /// layer is annotated with the exact config key/cap an operator would raise.
 fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: PromptRole) -> String {
@@ -1270,7 +1290,7 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
     if role == PromptRole::Orchestrator && sources.contains(&PromptSource::Harness) {
         rows.push(measure_row(
             "harness prompt",
-            prompt::HARNESS_PROMPT.len(),
+            prompt::harness_prompt_for(cfg.prompt.verbosity).len(),
             "orchestrator only",
         ));
     }

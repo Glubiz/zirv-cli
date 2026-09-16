@@ -3176,7 +3176,7 @@ A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
-`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `chat.claude_permission_mode`, `mail.enabled`,
+`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
@@ -3274,6 +3274,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
 | `prompt.codex_orchestrator` | `ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR` |
+| `prompt.verbosity` | `ZIRV_CTX_PROMPT_VERBOSITY` |
 | `chat.claude_permission_mode` | `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
 | `context.max_harness_bytes` | `ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES` |
@@ -3413,6 +3414,10 @@ able to force that layer back on for an operator who turned it off.
 `prompt.codex_orchestrator` closes the same loop once more for codex's own
 orchestrator-conventions layer (issue #167): a repo checkout must not be
 able to re-enable it for an operator who turned it off.
+`prompt.verbosity` (issue #427) closes the same loop for the
+Orchestrator-only meta-harness orientation layer's own named tier: a repo
+checkout must not be able to raise the tier back up for an operator who
+chose a lower one.
 `session.*` closes a sharper version of the same hole: `session.persistent`
 decides whether cloning a repository is enough to make sessions started from
 it outlive the operator's terminal, and `session.history` decides whether
@@ -4731,6 +4736,29 @@ its own layer on or raise its own cap: `prompt.enabled`, `prompt.repo_layer` and
 enabled = true
 repo_layer = true
 max_repo_bytes = 4096
+```
+
+`prompt.verbosity` (issue #427; `"minimal"` | `"standard"` | `"verbose"`,
+default `"verbose"`) picks how much of the Orchestrator-only meta-harness
+orientation layer (zirv's own explanation of itself, the checkpoint/mail
+habit, delegation mechanics, lifecycle sizing, the design-approval gate,
+the review policy) is injected. `"verbose"` is today's full text, byte for
+byte -- the default changes nothing for an operator who never touches this
+key. `"standard"` drops only the purely descriptive framing and
+self-discovery bullets; every bullet that changes what the session does is
+kept verbatim. `"minimal"` drops those two plus the roster pointer (the
+harness roster itself, if enabled, is still appended regardless of tier),
+and compresses everything else to its shortest behaviour-changing form: it
+still teaches delegation mechanics, that an undirected `zirv ctx send` is
+claimed by exactly one session while `--all` fans out, that durable facts
+persist via `zirv ctx remember`/`recall`, that substantial work starts a
+`zirv workflow`, the design-approval gate, and the review policy's hard
+stop after 2 fix rounds. It is `REPO_FORBIDDEN`: set it in
+`~/.zirv/ctx.toml` or with `ZIRV_CTX_PROMPT_VERBOSITY`.
+
+```toml
+[prompt]
+verbosity = "verbose"
 ```
 
 Pass `--simple` to any of the four verbs to start the agent with no zirv text at

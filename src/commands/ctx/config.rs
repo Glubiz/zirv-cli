@@ -631,12 +631,40 @@ impl Default for DiagnosticsConfig {
     }
 }
 
+/// Issue #427: named tiers for the Orchestrator-only meta-harness
+/// orientation layer (`prompt::HARNESS_PROMPT`), each with its own pinned
+/// byte budget (`prompt::harness_prompt_for`'s bloat-guard tests).
+/// `Minimal` is the narrow end (fewest bytes, functional lines only),
+/// `Verbose` is today's full text. `REPO_FORBIDDEN` outright (see that
+/// entry's own comment) rather than a narrow-only fold like
+/// `OrchestratorWrites`, so no `PartialOrd`/`Ord` is needed here: a repo
+/// layer may never set this key at all, in either direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptVerbosity {
+    Minimal,
+    Standard,
+    #[default]
+    Verbose,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptConfig {
     pub enabled: bool,
     /// Whether `<repo>/.zirv/system-prompt.md` is read at all.
     pub repo_layer: bool,
+    /// Issue #427: how much of the Orchestrator-only meta-harness
+    /// orientation layer (`prompt::HARNESS_PROMPT` and its tiered variants,
+    /// selected by `prompt::harness_prompt_for`) is injected. `Minimal` is
+    /// the narrow end (fewest bytes). `Verbose` reproduces today's
+    /// `HARNESS_PROMPT` text byte for byte -- see that constant's own doc
+    /// comment and `harness_prompt_for`'s bloat-guard tests for the pinned
+    /// budget each tier stays under. `REPO_FORBIDDEN`, same trust asymmetry
+    /// as `harnesses`/`codex_orchestrator` above: a repo checkout must not
+    /// be able to raise the tier back up for an operator who chose a lower
+    /// one.
+    pub verbosity: PromptVerbosity,
     /// Cap on the repo layer only: untrusted text does not get to be long.
     pub max_repo_bytes: usize,
     /// Whether an Orchestrator session's composed prompt gets the derived
@@ -679,6 +707,7 @@ impl Default for PromptConfig {
         Self {
             enabled: true,
             repo_layer: true,
+            verbosity: PromptVerbosity::Verbose,
             max_repo_bytes: 4096,
             harnesses: true,
             codex_orchestrator: true,
@@ -2990,6 +3019,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_PROMPT_VERBOSITY",
+        &["prompt", "verbosity"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES",
         &["context", "max_common_bytes"],
         EnvKind::Int,
@@ -3877,6 +3911,11 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["prompt", "codex_orchestrator"],
         "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
     ),
+    // Issue #427: without this a repo checkout could simply raise its own
+    // tier, making an operator's chosen `"minimal"`/`"standard"` decorative
+    // -- the same reasoning as `prompt.max_repo_bytes` above, applied to a
+    // named tier instead of a byte count.
+    (&["prompt", "verbosity"], "ZIRV_CTX_PROMPT_VERBOSITY"),
     // The canonical `.zirv/context/{common,claude,codex}.md` layer (issue
     // #44's compiler) is repo-owned, untrusted content injected into the
     // composed prompt the same way the repo `system-prompt.md` layer is --
@@ -8641,13 +8680,16 @@ mod tests {
         // `harnesses` is here for the same reason: a repo must not be able to
         // force the derived roster back on for an operator who turned it off.
         // `codex_orchestrator` (issue #167): same asymmetry, for codex's own
-        // orchestrator-conventions layer.
+        // orchestrator-conventions layer. `verbosity` (issue #427): a repo
+        // must not be able to raise its own meta-harness orientation tier
+        // back up for an operator who chose a lower one.
         for (key, value) in [
             ("enabled", "true"),
             ("repo_layer", "true"),
             ("max_repo_bytes", "1000000"),
             ("harnesses", "false"),
             ("codex_orchestrator", "false"),
+            ("verbosity", "\"minimal\""),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -11358,6 +11400,7 @@ mod tests {
         ("prompt", "max_repo_bytes"),
         ("prompt", "harnesses"),
         ("prompt", "codex_orchestrator"),
+        ("prompt", "verbosity"),
         ("context", "max_common_bytes"),
         ("context", "max_harness_bytes"),
         ("context", "max_harness_roster_bytes"),
