@@ -163,6 +163,18 @@ separate work. See `docs/benchmarks/build-cost.md` §5 for the full numbers.
 
 - #610 scenario 2 (frontend run-inspect-capture-review): no configured
   browser capability in this environment; reported UNMET rather than faked.
+  **Update 2026-09-16:** a named, present test now exists --
+  `frontend_render::tests::a_frontend_run_inspect_capture_review_scenario_runs_live_or_names_exactly_what_is_missing`
+  -- which prints why it did no work and returns, rather than being
+  silently absent, whenever `capabilities.browser` resolves to nothing on
+  the machine running it (still this machine, as of this update). When a
+  browser IS present it drives the real `render()`/`frontend_detector::
+  detect()` entry points against a real git fixture and asserts a genuine
+  capture passed; the review half is still reported live rather than
+  faked, since #609's documented gap means a native reviewer's model call
+  cannot be fixture-injected and a real one needs credentials this
+  environment does not have (see #592). See
+  `docs/design/2026-09-14-native-release-evidence.md` §3.5.
 - A REAL delegated native worker's transport still cannot be fixture-driven
   (see #609's "left as a documented gap" above) -- the coordinator's own
   worker-launch seam is still `RecordingLauncher` for that reason, unchanged
