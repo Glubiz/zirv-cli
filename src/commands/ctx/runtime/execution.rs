@@ -992,6 +992,12 @@ impl Bridge {
                     }
                     Err(_) => break,
                 };
+                // BSD/macOS accepted sockets can inherit the listener's
+                // nonblocking flag. Framed reads below must wait for the rest
+                // of a record (within the timeout), not drop a partial write.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
                 let Ok(value) = read_record(&mut BufReader::new(&mut stream)) else {
@@ -1697,7 +1703,15 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            writeln!(stream,"{}",json!({"secret":secret,"request":{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"not-advertised","arguments":{}}}})).unwrap();
+            let record = format!(
+                "{}\n",
+                json!({"secret":secret,"request":{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"not-advertised","arguments":{}}}})
+            );
+            stream.write_all(&record.as_bytes()[..1]).unwrap();
+            // TCP may split even one write. Deliberately leave a partial frame
+            // across several listener polls to exercise the real stream mode.
+            std::thread::sleep(Duration::from_millis(100));
+            stream.write_all(&record.as_bytes()[1..]).unwrap();
             read_record(&mut BufReader::new(stream)).unwrap()
         });
         let deadline = Instant::now() + Duration::from_secs(3);
