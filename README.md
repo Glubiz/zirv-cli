@@ -5114,7 +5114,8 @@ Commands can target specific operating systems using the `operating_system` opti
 Contributions are welcome! Please fork the repository and submit a pull request with your changes. For major changes, please open an issue first to discuss what you would like to change.
 
 ## License
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE). See [DISCLAIMER.md](DISCLAIMER.md)
+for autonomous supervision, binary integrity, and third-party harness notes.
 
 ## Contact
 Tweet [@Glubiz](https://twitter.com/Glubiz)

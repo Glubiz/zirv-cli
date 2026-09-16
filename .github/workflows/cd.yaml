@@ -144,18 +144,76 @@ jobs:
       - name: Fetch version
         run: echo "Version is ${{ needs.build.outputs.version }}"
 
-      - name: Create Tag
+      # Issue #433: a light script (not release-please -- that stages its own
+      # release PR and drops the per-PR version bump this repo's linear
+      # rebase-merge model relies on). Generates the one section for this
+      # release from conventional commits since the previous tag and, on a
+      # first run for this tag, inserts it into CHANGELOG.md (regenerated
+      # only, per scripts/generate-changelog.sh's own header -- never hand-
+      # edited) and commits that ahead of the tag, so the tag itself points
+      # at a commit that already carries its own changelog entry.
+      # `[skip ci]` stops the push below from re-triggering this same
+      # workflow (native GitHub Actions support, no extra config needed).
+      # The tag is pushed BEFORE the changelog commit: the tag (and the
+      # release built from it) is the load-bearing artifact, the changelog
+      # commit on main is cosmetic and regenerable. A failed tag push fails
+      # the job cleanly with nothing touched, same as before reordering; a
+      # failed changelog push is caught and logged as a warning instead,
+      # since the release is already correct by that point and the next
+      # release's nearest_tag lookup folds in whatever section got missed.
+      # This still adds no concurrency guard against a second concurrent
+      # push to main racing the changelog push -- accepted for a light
+      # script, and it can no longer strand a tagless commit on main the
+      # way the old order could.
+      - name: Update CHANGELOG.md And Create Tag
         id: tag
         shell: bash
         run: |
+          set -euo pipefail
           TAG="v${{ needs.build.outputs.version }}"
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
+
+          # No --from: the script's own nearest-tag lookup excludes HEAD
+          # itself (looks at HEAD^), which matters on a re-run after a
+          # previous attempt already created $TAG on HEAD -- resolving the
+          # previous tag here manually would otherwise find $TAG itself and
+          # produce an empty range.
+          DATE=$(date -u +%Y-%m-%d)
+          bash scripts/generate-changelog.sh --section --to HEAD \
+            --header "## ${TAG} (${DATE})" > changelog-section.md
+
           if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists"
+            echo "Tag $TAG already exists -- CHANGELOG.md not touched again"
           else
+            if [ ! -f CHANGELOG.md ]; then
+              bash scripts/generate-changelog.sh --print-header > CHANGELOG.md
+            fi
+            # Insert just before the first existing "## v..." section (or at
+            # end of file when this is the very first entry after the header).
+            first=$(grep -n '^## v' CHANGELOG.md | head -1 | cut -d: -f1 || true)
+            first=${first:-$(($(wc -l < CHANGELOG.md) + 1))}
+            {
+              head -n "$((first - 1))" CHANGELOG.md
+              cat changelog-section.md
+              tail -n "+${first}" CHANGELOG.md
+            } > changelog-new.md
+            mv changelog-new.md CHANGELOG.md
+
+            git add CHANGELOG.md
+            git commit -m "docs: CHANGELOG.md for ${TAG} [skip ci]"
             git tag "$TAG"
+
+            # Load-bearing push first: if this fails, nothing is tagged and
+            # nothing has touched main -- the run fails cleanly and can be
+            # re-run. Only once the tag is safely on origin do we push the
+            # cosmetic changelog commit, and that push must not fail the job
+            # after a successful release.
             git push origin "$TAG"
+
+            if ! git push origin HEAD:main; then
+              echo "::warning::Tag ${TAG} was pushed and the release will proceed, but pushing the CHANGELOG.md commit to main failed (transient network issue or a race with another push to main). No manual fix is required -- the next release's changelog section automatically folds in whatever this one missed. To backfill immediately instead, run: bash scripts/generate-changelog.sh --section --to ${TAG} --header \"## ${TAG} (${DATE})\" and commit the result to main by hand."
+            fi
           fi
 
       - name: Download Windows artifact
@@ -199,7 +257,7 @@ jobs:
               exit 0
             fi
           else
-            gh release create "$TAG" --draft --title "Release $TAG" --notes "Release of zirv $TAG"
+            gh release create "$TAG" --draft --title "Release $TAG" --notes-file changelog-section.md
           fi
 
           gh release upload "$TAG" \

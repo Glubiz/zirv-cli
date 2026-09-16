@@ -392,6 +392,21 @@ jobs:
             exit 1
           fi
 
+      # Issue #433: an ADVISORY hint only, from the same conventional-commit
+      # reading `scripts/generate-changelog.sh` uses for CHANGELOG.md itself
+      # -- it never decides the actual bump size (the gate above still
+      # requires SOME increase whenever shipped code changed) or fails the
+      # PR. `if: always()` so the hint prints even when the gate above
+      # already failed. `continue-on-error: true` so a bug in the script
+      # can never turn an advisory step into a gate.
+      - name: Suggest bump size from conventional commits (advisory)
+        if: always()
+        continue-on-error: true
+        run: |
+          BASE="origin/${{ github.base_ref }}"
+          SUGGESTION=$(bash scripts/generate-changelog.sh --suggest-bump --from "$BASE" --to HEAD)
+          echo "::notice::conventional-commit suggested bump size: $SUGGESTION"
+
   # Issue #429: an ADVISORY nudge, never a gate -- `continue-on-error: true`
   # on top of the script's own always-0 exit means this job can never fail
   # the PR no matter what it finds. PR-only (a push has no base commit to
