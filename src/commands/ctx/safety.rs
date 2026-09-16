@@ -8099,7 +8099,9 @@ struct HookOutputExtras {
 /// The reason text for one hook decision: `extras.reason_override` when
 /// present (the identical-command guard's own full text), otherwise the
 /// ordinary `explain_text` narrative -- with `extras.breaker_note`, when
-/// present, prefixed onto whichever of those two won, joined by ` -- `.
+/// present, prefixed onto whichever of those two won, joined by ` -- `, and
+/// (Change 5b) `blocked_instruction_suffix`, when the verdict is a real
+/// block, appended at the very end.
 fn hook_reason_text(
     command: &str,
     outcome: &Outcome,
@@ -8112,9 +8114,47 @@ fn hook_reason_text(
         .reason_override
         .clone()
         .unwrap_or_else(|| explain_text(command, outcome, mode, divergence, status, None));
-    match &extras.breaker_note {
+    let text = match &extras.breaker_note {
         Some(note) => format!("{note} -- {base}"),
         None => base,
+    };
+    match blocked_instruction_suffix(command, outcome.verdict) {
+        Some(suffix) => format!("{text} {suffix}"),
+        None => text,
+    }
+}
+
+/// Change 5b: the instruction a worker must follow when this decision is a
+/// block it will actually see. `hook_reason_text` above only ever runs on a
+/// path that emits `hookSpecificOutput` at all -- the deliberately silent
+/// `Verdict::Ask` under `permission_mode == "dontAsk"` returns from
+/// `hook_output_with_extras` before ever calling `hook_reason_text` (see
+/// that function's own doc comment on why that silence must be preserved).
+/// So a `Deny` or `Ask` reaching this function always means either an
+/// explicit denial or an `Ask` that becomes a real prompt, never the
+/// unsatisfiable-prompt-turned-silent-denial case. `Allow` gets no suffix:
+/// nothing was blocked, so there is nothing to report.
+///
+/// Uses `hook::command_family` directly, not the stricter `safety_family`
+/// the persisted log needs (Change 5a): `explain_text`'s own narrative,
+/// just above this text in the same reason string, already names the full
+/// raw `command` verbatim, so a family word drawn from that SAME command
+/// adds no new exposure here the way it would in a persisted log file.
+fn blocked_instruction_suffix(command: &str, verdict: Verdict) -> Option<String> {
+    match verdict {
+        Verdict::Deny | Verdict::Ask => {
+            let family = super::hook::command_family(command);
+            let family = if family.is_empty() {
+                "unknown".to_string()
+            } else {
+                family
+            };
+            Some(format!(
+                "BLOCKED: {family}. Do not retry this command or work around it -- report \
+                 `BLOCKED: {family}` to your caller and move on to other work."
+            ))
+        }
+        Verdict::Allow => None,
     }
 }
 
@@ -8975,6 +9015,49 @@ fn run_check_hook_mode_with_env<W: Write>(
     Ok(0)
 }
 
+/// Change 5a: programs whose first non-flag argument is a genuine
+/// dispatcher SUBCOMMAND from a small, well-known vocabulary (`exec`,
+/// `push`, `mr`, `get`, ...) rather than caller-controlled data -- safe to
+/// name in `safety_family`'s plaintext `family` field. `hook::
+/// command_family`'s own rule ("not a flag, not `:`/`@`/`=`-shaped") is
+/// right for `PermissionPromptRow` but not strict enough for THIS log's
+/// tested "never the raw command" contract: `echo <secret>` or `rm -rf
+/// <path>` have a bare, dash-free, colon-free first argument too, and
+/// `hook::command_family` would report it as if it were a subcommand
+/// (`the_hook_audits_a_policy_fingerprint_without_storing_the_raw_command`
+/// pins exactly this). For any program NOT on this list, `safety_family`
+/// reports the program name alone -- e.g. `sudo` never gets the wrapped
+/// command's own program appended, matching the Change 5 spec's own
+/// worked example (`sudo`, not `sudo <whatever it wraps>`).
+const SAFETY_FAMILY_DISPATCHER_PROGRAMS: &[&str] = &[
+    "git",
+    "gh",
+    "glab",
+    "docker",
+    "kubectl",
+    "cargo",
+    "npm",
+    "npx",
+    "gitlab-ci-local",
+    "zirv",
+    "codex",
+    "terraform",
+    "aws",
+];
+
+/// The safety-decision log's own family derivation: `hook::command_family`'s
+/// candidate, narrowed to its first word alone unless `argv[0]` is one of
+/// `SAFETY_FAMILY_DISPATCHER_PROGRAMS` -- see that constant's own doc
+/// comment for why a plain narrower rule is not safe enough here.
+fn safety_family(command: &str) -> String {
+    let full = super::hook::command_family(command);
+    let program = full.split(' ').next().unwrap_or("");
+    if program.is_empty() || !SAFETY_FAMILY_DISPATCHER_PROGRAMS.contains(&program) {
+        return program.to_string();
+    }
+    full
+}
+
 fn audit_hook_decision(
     payload: &HookToolPayload,
     command: &str,
@@ -8992,11 +9075,14 @@ fn audit_hook_decision(
     let command_fingerprint = sha256_hex(command.as_bytes());
     let matched_pattern = outcome.matched.as_ref().map(|rule| rule.pattern.as_str());
     let origin = outcome.matched.as_ref().map(|rule| rule.origin.label());
+    // Change 5a: plaintext by design, unlike `command_fingerprint` above.
+    let family = safety_family(command);
     let decision = super::log::SafetyDecision {
         ts: super::state::now_secs(),
         session: &payload.session_id,
         mode: mode.label(),
         verdict: outcome.verdict.label(),
+        family: &family,
         command_sha256: &command_fingerprint,
         policy_sha256: &evidence.current_fingerprint,
         launch_policy_sha256: evidence.launch_fingerprint.as_deref(),
@@ -16397,6 +16483,57 @@ mod tests {
         assert!(output.contains("\"permissionDecision\":\"deny\""));
     }
 
+    /// Change 5b: a `Deny` must carry the family and the `BLOCKED:`
+    /// instruction so a worker knows to report the block rather than retry
+    /// or work around it -- but the deliberately silent `Ask`-under-
+    /// `dontAsk` path (issue #102's own finding) must still emit nothing at
+    /// all, never leak the instruction through some other channel.
+    #[test]
+    fn deny_reason_carries_the_blocked_instruction_but_the_silent_ask_path_stays_silent() {
+        let deny = Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: "rm -rf *".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let output = hook_output(
+            "rm -rf",
+            &deny,
+            "default",
+            SnapshotDivergence::Unchanged,
+            "not-present",
+        )
+        .expect("deny produces output");
+        assert!(
+            output.contains("BLOCKED: rm"),
+            "the family must be named in the reason: {output}"
+        );
+        assert!(
+            output.contains("report") && output.contains("BLOCKED:"),
+            "the reason must instruct the worker to report the block: {output}"
+        );
+
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*--force*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        assert!(
+            hook_output(
+                "git push --force x",
+                &ask,
+                "dontAsk",
+                SnapshotDivergence::Unchanged,
+                "not-present",
+            )
+            .is_none(),
+            "the unsatisfiable-prompt-under-dontAsk case must stay silent, BLOCKED text or not"
+        );
+    }
+
     #[test]
     fn hook_output_ask_with_no_permission_mode_still_asks() {
         // Backward compatible: an older claude CLI (or any payload that
@@ -17856,6 +17993,30 @@ mod tests {
         assert!(text.contains("\"policy_sha256\":"), "got {text}");
         assert!(text.contains("\"command_sha256\":"), "got {text}");
         assert!(!text.contains("secret-value-from-command"), "got {text}");
+    }
+
+    /// Change 5a: `safety_family` names a known dispatcher's subcommand
+    /// (matching the Change 5 spec's own worked examples: `docker exec`,
+    /// `glab mr`), but a program NOT on `SAFETY_FAMILY_DISPATCHER_PROGRAMS`
+    /// -- `sudo`, and every plain Unix tool -- gets the program name alone,
+    /// even when its first bare argument would otherwise look like a
+    /// subcommand to `hook::command_family`.
+    #[test]
+    fn safety_family_only_names_a_subcommand_for_known_dispatchers() {
+        assert_eq!(
+            safety_family("docker exec db psql -c \"select 1\""),
+            "docker exec"
+        );
+        assert_eq!(safety_family("glab mr merge 5"), "glab mr");
+        assert_eq!(safety_family("git push origin main"), "git push");
+        assert_eq!(safety_family("sudo rm -rf /"), "sudo");
+        assert_eq!(
+            safety_family("echo secret-value-from-command"),
+            "echo",
+            "a bare positional argument must never be reported as a subcommand"
+        );
+        assert_eq!(safety_family("rm -rf /tmp/data"), "rm");
+        assert_eq!(safety_family(""), "");
     }
 
     #[test]

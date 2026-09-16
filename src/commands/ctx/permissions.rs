@@ -3480,6 +3480,7 @@ mod tests {
             session: session.to_string(),
             mode: "interactive".to_string(),
             verdict: verdict.to_string(),
+            family: super::super::hook::command_family(command.trim()),
             command_sha256: sha256_hex(command.trim().as_bytes()),
             matched_pattern: matched_pattern.map(str::to_string),
             attestation: String::new(),
@@ -4787,6 +4788,7 @@ mod tests {
         let state_dir =
             super::super::state::StateDir::resolve(&super::super::config::env_from_process())
                 .expect("resolve test state dir");
+        let family = super::super::hook::command_family(command.trim());
         log::append_safety(
             &state_dir,
             &log::SafetyDecision {
@@ -4794,6 +4796,7 @@ mod tests {
                 session,
                 mode: "interactive",
                 verdict: "ask",
+                family: &family,
                 command_sha256: &sha256_hex(command.trim().as_bytes()),
                 policy_sha256: "p",
                 launch_policy_sha256: None,
@@ -5308,6 +5311,7 @@ mod tests {
             session: session.to_string(),
             mode: "default".to_string(),
             verdict: verdict.to_string(),
+            family: super::super::hook::command_family(command.trim()),
             command_sha256: sha256_hex(command.trim().as_bytes()),
             matched_pattern: None,
             attestation: String::new(),

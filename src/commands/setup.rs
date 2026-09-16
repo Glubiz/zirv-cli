@@ -64,12 +64,34 @@ pub(crate) const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
 pub(crate) const CLAUDE_COMPACT_OUTPUT_HOOK: (&str, Option<&str>, &str) =
     ("PostToolUse", Some("Bash"), "zirv ctx hook posttool");
 
+/// Change 5d: `PermissionRequest`/`PermissionDenied` -> `zirv ctx hook
+/// permission`, mirroring `ClaudeAdapter`'s own launch-time settings shape
+/// (`adapters/claude.rs`'s session-launch JSON) byte-for-byte -- today only
+/// zirv-launched sessions get these two wired into claude's `settings.json`
+/// at all, which is why a 7-day audit captured just 9 of ~120 denials.
+/// Claude-only, same reasoning as `CLAUDE_SAFETY_HOOK`: codex has no
+/// verified equivalent event. Both entries share the IDENTICAL command
+/// string on purpose (claude tells the two events apart via its own
+/// `hook_event_name` payload field, not via argv -- see `hook::
+/// PermissionHookPayload`), which is exactly why `install_claude_
+/// integration` inserts every `CLAUDE_ONLY_HOOKS` entry by its own (event,
+/// matcher) SLOT rather than by whole-tree `contains_command`: with the
+/// whole-tree check, installing the first would make the second look
+/// "already there" and it would never be written.
+pub(crate) const CLAUDE_PERMISSION_REQUEST_HOOK: (&str, Option<&str>, &str) =
+    ("PermissionRequest", None, "zirv ctx hook permission");
+/// Sibling of `CLAUDE_PERMISSION_REQUEST_HOOK` above; see its doc comment.
+pub(crate) const CLAUDE_PERMISSION_DENIED_HOOK: (&str, Option<&str>, &str) =
+    ("PermissionDenied", None, "zirv ctx hook permission");
+
 /// Every claude-only hook (`install_claude_integration`), never wired into
 /// `install_codex_hooks`.
-pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 3] = [
+pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 5] = [
     CLAUDE_SAFETY_HOOK,
     CLAUDE_SESSION_START_HOOK,
     CLAUDE_COMPACT_OUTPUT_HOOK,
+    CLAUDE_PERMISSION_REQUEST_HOOK,
+    CLAUDE_PERMISSION_DENIED_HOOK,
 ];
 
 /// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`
@@ -656,6 +678,45 @@ fn ensure_harness_hook(
     if contains_command(settings, command) {
         return Ok(false);
     }
+    push_harness_hook_entry(settings, event, matcher, command)?;
+    Ok(true)
+}
+
+/// Slot-scoped sibling of `ensure_harness_hook`: checks presence via
+/// `command_live_at_slot` (this exact (event, matcher) pair) rather than
+/// `contains_command`'s whole-tree search. `install_claude_integration`
+/// uses this for every `CLAUDE_ONLY_HOOKS` entry, because
+/// `CLAUDE_PERMISSION_REQUEST_HOOK`/`CLAUDE_PERMISSION_DENIED_HOOK` (Change
+/// 5d) intentionally install the identical command string under two
+/// different events -- with the whole-tree check, installing the first
+/// would make the second look "already there" and it would never be
+/// written. Behaviourally identical to `ensure_harness_hook` for every
+/// command string that is unique tree-wide (every `CLAUDE_ONLY_HOOKS` entry
+/// before this task), so switching the loop to this function changes
+/// nothing for them.
+fn ensure_harness_hook_at_slot(
+    settings: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> SetupResult<bool> {
+    if command_live_at_slot(settings, event, matcher, command) {
+        return Ok(false);
+    }
+    push_harness_hook_entry(settings, event, matcher, command)?;
+    Ok(true)
+}
+
+/// Shared insertion body for `ensure_harness_hook`/`ensure_harness_hook_at_slot`
+/// -- the two differ only in how they decide whether `command` is already
+/// present; once that decides "insert", both push the identical entry
+/// shape.
+fn push_harness_hook_entry(
+    settings: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> SetupResult<()> {
     let root = settings
         .as_object_mut()
         .ok_or("Claude settings root is not an object")?;
@@ -674,7 +735,7 @@ fn ensure_harness_hook(
         entry["matcher"] = Value::String(matcher.to_string());
     }
     entries.push(entry);
-    Ok(true)
+    Ok(())
 }
 
 /// Issue #93: how a Claude `statusLine.command` string relates to zirv's own
@@ -832,7 +893,9 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
         }
     }
     for (event, matcher, command) in CLAUDE_ONLY_HOOKS {
-        if ensure_harness_hook(&mut settings, event, matcher, command)? {
+        // Slot-scoped, not `ensure_harness_hook`'s whole-tree check -- see
+        // `ensure_harness_hook_at_slot`'s own doc comment (Change 5d).
+        if ensure_harness_hook_at_slot(&mut settings, event, matcher, command)? {
             hooks_added += 1;
         }
     }
@@ -2565,9 +2628,16 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         .iter()
         .filter(|(_, _, command)| contains_command(&claude_settings, command))
         .count()
+        // Slot-scoped, not `contains_command`'s whole-tree search: Change
+        // 5d's two permission hooks share one command string across two
+        // events, so a whole-tree search would count both as installed the
+        // moment either slot is live. `command_live_at_slot` judges each
+        // entry by its own (event, matcher) slot instead.
         + CLAUDE_ONLY_HOOKS
             .iter()
-            .filter(|(_, _, command)| contains_command(&claude_settings, command))
+            .filter(|(event, matcher, command)| {
+                command_live_at_slot(&claude_settings, event, *matcher, command)
+            })
             .count();
     let codex_hooks = load_json_object(&codex_dir.join("hooks.json")).unwrap_or_else(|_| json!({}));
     let codex_hooks_installed = HARNESS_HOOKS
@@ -4343,6 +4413,52 @@ mod tests {
         let (hooks_added_again, _) =
             install_claude_integration(home.path(), false).expect("re-apply");
         assert_eq!(hooks_added_again, 0, "a second apply must add nothing more");
+    }
+
+    /// Change 5d: `zirv setup apply` wires `zirv ctx hook permission` into
+    /// BOTH `PermissionRequest` and `PermissionDenied` -- the two events
+    /// intentionally share one command string, the exact case
+    /// `ensure_harness_hook_at_slot` exists for. A whole-tree
+    /// `contains_command` check would have installed only the first of the
+    /// two and reported "already there" for the second forever; this pins
+    /// that both slots are genuinely live, and idempotently so.
+    #[test]
+    fn install_claude_integration_wires_both_permission_hooks_at_their_own_slots() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        let (hooks_added, _statusline) =
+            install_claude_integration(home.path(), false).expect("apply");
+        assert_eq!(hooks_added, CLAUDE_HOOKS_TOTAL);
+
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        let settings = load_json_object(&settings_path).expect("settings");
+        assert!(
+            command_live_at_slot(
+                &settings,
+                "PermissionRequest",
+                None,
+                "zirv ctx hook permission"
+            ),
+            "PermissionRequest must carry the permission hook: {settings}"
+        );
+        assert!(
+            command_live_at_slot(
+                &settings,
+                "PermissionDenied",
+                None,
+                "zirv ctx hook permission"
+            ),
+            "PermissionDenied must carry the permission hook too, independently of \
+             PermissionRequest: {settings}"
+        );
+
+        let (hooks_added_again, _) =
+            install_claude_integration(home.path(), false).expect("re-apply");
+        assert_eq!(
+            hooks_added_again, 0,
+            "a second apply must report both permission hooks already there and add nothing"
+        );
     }
 
     /// Review follow-up to issue #420: an operator with an already-installed
