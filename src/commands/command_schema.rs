@@ -120,6 +120,7 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx ask",
     "zirv ctx config show",
     "zirv ctx status",
+    "zirv ctx mcp serve",
     "zirv ctx usage",
     "zirv ctx optimize",
     "zirv ctx inbox",
@@ -499,30 +500,17 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
         });
     }
 
-    // Issue #540: `zirv native` is a thin, case-insensitive top-level alias
-    // for `zirv chat --runtime native` (see `main.rs`'s
-    // `rewrite_native_alias_args`) -- cloned from the `zirv chat` entry
-    // above, which the loop just pushed, so its args/flags/mutating/
-    // availability can never drift from the command it actually rewrites
-    // into. Only `about`, `stability` and `runtime` are overridden: this is
-    // the one entry `zirv help` places in its separate "Experimental / work
-    // in progress" section rather than beside the stable commands, and the
-    // one JSON consumers can identify by `stability`/`runtime` without
-    // parsing prose.
-    let chat_entry = entries
-        .iter()
-        .find(|entry| entry.path == "zirv chat")
-        .unwrap_or_else(|| panic!("zirv chat must exist for the zirv native alias to clone"))
-        .clone();
+    // The reserved command is informational until the native release is enabled
+    // in source. Do not advertise chat flags or mutation for this placeholder.
     entries.push(CommandEntry {
         path: "zirv native".to_string(),
-        about: "EXPERIMENTAL / WORK IN PROGRESS: thin alias for `zirv chat --runtime native` \
-                (opens the native conversation pane -- no coding harness installed, no PTY); \
-                not part of the stable command surface yet."
-            .to_string(),
+        about: super::ctx::runtime::NATIVE_COMING_SOON.to_string(),
+        args: Vec::new(),
+        flags: Vec::new(),
+        mutating: false,
+        availability: Availability::Always,
         stability: Stability::Experimental,
         runtime: Some("native".to_string()),
-        ..chat_entry
     });
 
     entries.push(synthetic(
@@ -759,10 +747,11 @@ mod tests {
             .iter()
             .find(|entry| entry.path == "zirv chat")
             .expect("zirv chat must be discovered");
-        assert_eq!(native.mutating, chat.mutating);
+        assert!(!native.mutating);
         assert_eq!(native.availability, chat.availability);
-        assert_eq!(native.args, chat.args);
-        assert_eq!(native.flags, chat.flags);
+        assert!(native.args.is_empty());
+        assert!(native.flags.is_empty());
+        assert!(native.about.contains("coming soon"));
         assert_ne!(
             native.about, chat.about,
             "the experimental notice must not be silently identical to chat's own about text"

@@ -82,6 +82,9 @@ fn recorded_schema(ctx_toml: &std::path::Path) -> u32 {
 /// Pure: the schema-2 document for `text`, or `None` when it already is one.
 /// Comment-preserving, like every other edit in this module.
 pub fn migrate_document(text: &str, to: &str) -> CtxResult<Option<String>> {
+    if to.eq_ignore_ascii_case("native") {
+        super::runtime::require_native_available()?;
+    }
     if !matches!(to, "harness" | "native") {
         return Err(format!("--to '{to}': expected `harness` or `native`").into());
     }
@@ -216,8 +219,26 @@ fn semantic_value(value: &Value) -> CtxResult<toml::Value> {
     Ok(table["value"].clone())
 }
 
+fn contains_native_runtime(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(value) => value.eq_ignore_ascii_case("native"),
+        toml::Value::Table(table) => table.values().any(contains_native_runtime),
+        toml::Value::Array(values) => values.iter().any(contains_native_runtime),
+        _ => false,
+    }
+}
+
 fn edit(doc: &mut DocumentMut, key: &str, raw: &str, append: bool) -> CtxResult<bool> {
     let mut value = raw.parse::<Value>().unwrap_or_else(|_| Value::from(raw));
+    if key_parts(key)?
+        .first()
+        .is_some_and(|part| part.get() == "runtime")
+    {
+        let parsed = semantic_value(&value)?;
+        if contains_native_runtime(&parsed) {
+            super::runtime::require_native_available()?;
+        }
+    }
     let target = slot(doc.as_item_mut(), &key_parts(key)?)?;
     if append {
         if target.is_none() {

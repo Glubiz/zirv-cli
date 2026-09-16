@@ -537,6 +537,22 @@ pub fn render_json(report: &DoctorReport, w: &mut dyn Write) -> CtxResult<()> {
 }
 
 pub fn run(args: &DoctorArgs, w: &mut dyn Write) -> CtxResult<i32> {
+    if !super::runtime::native_available() {
+        if args.json {
+            serde_json::to_writer(
+                &mut *w,
+                &serde_json::json!({
+                    "native_available": false,
+                    "status": "coming-soon",
+                    "message": super::runtime::NATIVE_COMING_SOON,
+                }),
+            )?;
+            writeln!(w)?;
+        } else {
+            writeln!(w, "{}", super::runtime::NATIVE_COMING_SOON)?;
+        }
+        return Ok(0);
+    }
     let repo = match &args.repo {
         Some(repo) => repo.clone(),
         None => std::env::current_dir()?,

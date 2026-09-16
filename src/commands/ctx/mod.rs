@@ -48,6 +48,7 @@ pub mod ledger;
 pub mod lifecycle;
 pub mod log;
 pub mod mail;
+pub mod mcp;
 pub mod measure;
 pub mod memory;
 pub mod memory_cli;
@@ -515,9 +516,11 @@ pub struct CtxCli {
 
 #[derive(Debug, Subcommand)]
 pub enum CtxVerb {
+    /// Serve read-only, repository-scoped tools over MCP stdio.
+    Mcp(mcp::McpArgs),
     /// Show or edit operator ~/.zirv/ctx.toml; set/add ask for approval in wrapped sessions.
     Config(config_cmd::ConfigArgs),
-    /// Configure and inspect opt-in native provider routes.
+    /// Native provider routes are coming soon and cannot be enabled in this release.
     Provider(provider_cmd::ProviderArgs),
     /// Rot-score a session transcript and print JSON.
     Score(score::ScoreArgs),
@@ -693,6 +696,10 @@ fn read_stdin() -> String {
 pub fn dispatch(args: &[String]) -> i32 {
     // The private MCP relay must not probe harness readiness, load repository
     // configuration, or construct the ordinary CLI before authenticating.
+    if args.get(1).is_some_and(|verb| verb == "provider") && !runtime::native_available() {
+        eprintln!("{}", runtime::NATIVE_COMING_SOON);
+        return 1;
+    }
     if args.len() == 3 && args[1] == "provider" && args[2] == "bridge" {
         return runtime::execution::bridge_stdio().unwrap_or(1);
     }
@@ -746,6 +753,7 @@ pub fn dispatch(args: &[String]) -> i32 {
 
     let mut out = std::io::stdout();
     let result = match &cli.verb {
+        CtxVerb::Mcp(a) => mcp::run(a),
         CtxVerb::Config(a) => config_cmd::run(a, &mut out),
         CtxVerb::Provider(a) => provider_cmd::run(a, &mut out),
         CtxVerb::Score(a) => score::run(a, &mut out),

@@ -367,9 +367,8 @@ fn write_builtins<W: Write>(
         &[Row {
             name: "native",
             desc: &[
-                "EXPERIMENTAL: thin alias for `zirv chat --runtime native` (the native",
-                "conversation pane, no coding harness installed, no PTY). Not part of the",
-                "stable command surface yet -- see `zirv native --help`.",
+                "Coming soon. The native harness cannot be enabled in this release.",
+                "Use `zirv chat` to continue with the existing harness.",
             ],
         }],
         colour,
@@ -950,11 +949,11 @@ shortcuts:
             "the stable Commands: section must not mention native: {before}"
         );
         assert!(
-            after.contains("native") && after.contains("EXPERIMENTAL"),
+            after.contains("native") && after.contains("Coming soon"),
             "the experimental section must list native with its warning: {after}"
         );
         assert!(
-            after.contains("zirv chat --runtime native"),
+            after.contains("cannot be enabled"),
             "the experimental section must name the stable equivalent: {after}"
         );
         Ok(())

@@ -34,6 +34,8 @@ vt100 = "0.16"
 ureq = "3"
 unicode-width = "0.2.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
+rmcp = { version = "=3.3.0", default-features = false, features = ["server", "transport-io"] }
+cap-std = "4.0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"

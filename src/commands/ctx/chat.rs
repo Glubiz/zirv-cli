@@ -352,42 +352,7 @@ pub const NATIVE_TTY_REFUSAL: &str =
 /// [`NATIVE_TTY_REFUSAL`] verbatim rather than restating them, so this text
 /// and `run_native_chat`'s own refusals can never drift apart.
 pub fn native_help_text() -> String {
-    let lines = [
-        "zirv native -- EXPERIMENTAL / WORK IN PROGRESS".to_string(),
-        String::new(),
-        "A thin, case-insensitive top-level alias for `zirv chat --runtime native`: opens"
-            .to_string(),
-        "the structured native conversation pane (no coding harness installed, no PTY)".to_string(),
-        "instead of a wrapped-harness session. `zirv chat` remains the stable, recommended"
-            .to_string(),
-        "harness while this command is under development.".to_string(),
-        String::new(),
-        "Usage:".to_string(),
-        "  zirv native [--force-pace]".to_string(),
-        String::new(),
-        "Prerequisites:".to_string(),
-        "  - Native provider configuration in ~/.zirv/native.toml (see `zirv ctx provider"
-            .to_string(),
-        "    init`).".to_string(),
-        "  - A configured provider route for the orchestrator role.".to_string(),
-        "  - An interactive terminal (TTY) on both stdin and stdout.".to_string(),
-        String::new(),
-        "Limitations:".to_string(),
-        format!("  - {NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL}."),
-        format!("  - {NATIVE_TTY_REFUSAL}."),
-        "  - Never changes the operator's default runtime, migrates configuration, or".to_string(),
-        "    falls back to a wrapped harness.".to_string(),
-        String::new(),
-        "State and journal:".to_string(),
-        "  Session and journal state live under the same state directory `zirv ctx status`"
-            .to_string(),
-        "  reports, in <state>/native-journal.sqlite.".to_string(),
-        String::new(),
-        "Missing prerequisites are diagnosed by `zirv ctx doctor`.".to_string(),
-    ];
-    let mut text = lines.join("\n");
-    text.push('\n');
-    text
+    format!("{}\n", runtime_kind::NATIVE_COMING_SOON)
 }
 
 /// `zirv chat --runtime native`'s own refusal/dispatch, split out of
@@ -408,6 +373,7 @@ fn run_native_chat<E: Write>(
     stdin_is_tty: bool,
     vt_ok: bool,
 ) -> CtxResult<i32> {
+    runtime_kind::require_native_available()?;
     // Issue #540: printed exactly once -- this function runs once per
     // process invocation -- and only for the `zirv native` alias spelling,
     // never for a direct `zirv chat --runtime native` (which never sets
@@ -515,6 +481,13 @@ pub fn run_with<W: Write, E: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    if args
+        .runtime
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("native"))
+    {
+        runtime_kind::require_native_available()?;
+    }
     // F2, first of all: before any config load, adapter resolution, terminal
     // probe or VT mode change. A `chat` started inside an existing agent
     // session can take that outer session down (see
@@ -558,6 +531,9 @@ pub fn run_with<W: Write, E: Write>(
         &cfg.runtime,
         "orchestrator",
     );
+    if !runtime_kind::native_available() {
+        configured.as_ref().map_err(|error| error.to_string())?;
+    }
     if let Ok(choice) = &configured
         && let Some(note) = &choice.note
     {
@@ -2365,19 +2341,12 @@ mod tests {
         assert!(std::env::var(NATIVE_ALIAS_ENV).is_err());
     }
 
-    /// `zirv native --help`'s prose (`main.rs` prints `native_help_text()`
-    /// verbatim) must name the experimental notice, the stable equivalent,
-    /// and reuse -- not restate -- the same refusal text `run_native_chat`
-    /// itself prints, so the two can never drift apart.
     #[test]
-    fn native_help_text_names_the_experimental_notice_and_reuses_refusal_text() {
+    fn native_help_text_reports_coming_soon_without_setup_instructions() {
         let text = native_help_text();
-        assert!(text.contains("EXPERIMENTAL / WORK IN PROGRESS"), "{text}");
-        assert!(text.contains("zirv chat --runtime native"), "{text}");
-        assert!(text.contains(NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL), "{text}");
-        assert!(text.contains(NATIVE_TTY_REFUSAL), "{text}");
-        assert!(text.contains("native-journal.sqlite"), "{text}");
-        assert!(text.contains("~/.zirv/native.toml"), "{text}");
+        assert!(text.contains("coming soon"), "{text}");
+        assert!(text.contains("cannot be enabled"), "{text}");
+        assert!(!text.contains("provider init"), "{text}");
     }
 
     #[test]

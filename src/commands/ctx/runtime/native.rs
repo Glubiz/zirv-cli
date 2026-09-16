@@ -1611,6 +1611,7 @@ impl<'a> NativeLoop<'a> {
     /// for any driver: a caller stepping turns itself (an interactive surface,
     /// a test) is bounded exactly as the headless loop is.
     pub fn run_turn(&mut self) -> CtxResult<TurnOutcome> {
+        super::require_native_available()?;
         if self.turns >= self.config.limits.max_turns {
             let turn = TurnId::new(self.mint("turn"))?;
             return Ok(TurnOutcome {
@@ -2872,6 +2873,7 @@ pub fn resume_journal(
     session: &JournalSessionId,
     at_ms: u64,
 ) -> CtxResult<ResumeOutcome> {
+    super::require_native_available()?;
     let now = at_ms / 1000;
     let identity = journal.session(session)?;
     let previous_generation = identity.generation;
@@ -3093,6 +3095,7 @@ impl NativeBackend {
         spec: &SessionSpec,
         seat: Option<(&str, u64)>,
     ) -> CtxResult<SessionHandle> {
+        super::require_native_available()?;
         if spec.runtime != RuntimeKind::Native {
             return Err(RuntimeError::Unsupported(format!(
                 "native backend cannot start a `{}` session",
@@ -3152,6 +3155,7 @@ impl NativeBackend {
         session: &SessionHandle,
         journal_session: JournalSessionId,
     ) -> CtxResult<()> {
+        super::require_native_available()?;
         match self.sessions.get_mut(&session.logical_id) {
             Some(entry) => {
                 entry.generation = session.generation;
@@ -3795,6 +3799,7 @@ pub fn run_session<W: std::io::Write>(
     w: &mut W,
     env: EnvLookup<'_>,
 ) -> CtxResult<NativeFinalStatus> {
+    super::require_native_available()?;
     use super::super::state::{StateDir, now_secs};
     use super::journal::{SeatId, SessionIdentity, TaskId};
 
@@ -4733,6 +4738,7 @@ pub fn spawn_interactive(
     request: InteractiveRequest,
     env: EnvLookup<'_>,
 ) -> CtxResult<InteractiveSession> {
+    super::require_native_available()?;
     use super::super::state::{StateDir, now_secs};
     use super::journal::{SeatId, SessionIdentity, TaskId};
 
@@ -5185,6 +5191,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
     w: &mut W,
     env: EnvLookup<'_>,
 ) -> CtxResult<NativeFinalStatus> {
+    super::require_native_available()?;
     use super::super::state::StateDir;
 
     let _ = w;
@@ -5368,6 +5375,7 @@ fn build_transport(
     cfg: &super::super::config::CtxConfig,
     env: EnvLookup<'_>,
 ) -> CtxResult<(TurnDriver, Box<dyn ToolExecutor>, RouteIdentity, bool)> {
+    super::require_native_available()?;
     use std::time::Duration;
 
     use super::super::provider::anthropic::AnthropicMessagesAdapter;

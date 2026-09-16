@@ -88,6 +88,7 @@ const TEMPLATE: &str = r#"schema = 1
 "#;
 
 pub fn run(args: &ProviderArgs, w: &mut dyn Write) -> CtxResult<i32> {
+    super::runtime::require_native_available()?;
     if matches!(args.command, ProviderVerb::Bridge) {
         return super::runtime::execution::bridge_stdio();
     }

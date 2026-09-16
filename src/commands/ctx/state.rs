@@ -33,6 +33,33 @@ pub fn now_secs() -> u64 {
 /// path that cannot be canonicalized (it does not exist yet, or is not
 /// readable) falls back to its own text, which is the pre-existing behavior.
 pub fn repo_slug(path: &Path) -> String {
+    let (path, legacy, current) = slug_parts(path);
+
+    static ADOPTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let mut adopted = ADOPTED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !adopted.contains(&path)
+        && path.is_dir()
+        && path.ancestors().any(|parent| parent.join(".git").exists())
+    {
+        adopted.insert(path);
+        match StateDir::resolve(&|key| std::env::var(key).ok()) {
+            Ok(state) => adopt_legacy_slug_state(state.root(), &legacy, &current),
+            Err(error) => eprintln!("zirv: could not migrate repository state: {error}"),
+        }
+    }
+    current
+}
+
+/// Resolve the current bucket without adopting or renaming legacy state.
+/// Read-only services must use this path, including through their callees.
+pub(crate) fn repo_slug_read_only(path: &Path) -> String {
+    slug_parts(path).2
+}
+
+fn slug_parts(path: &Path) -> (PathBuf, String, String) {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let rendered = display_path(&path);
     let legacy: String = rendered
@@ -51,22 +78,7 @@ pub fn repo_slug(path: &Path) -> String {
         .collect();
     let current = format!("{legacy}-{hash}");
 
-    static ADOPTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    let mut adopted = ADOPTED
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !adopted.contains(&path)
-        && path.is_dir()
-        && path.ancestors().any(|parent| parent.join(".git").exists())
-    {
-        adopted.insert(path);
-        match StateDir::resolve(&|key| std::env::var(key).ok()) {
-            Ok(state) => adopt_legacy_slug_state(state.root(), &legacy, &current),
-            Err(error) => eprintln!("zirv: could not migrate repository state: {error}"),
-        }
-    }
-    current
+    (path, legacy, current)
 }
 
 #[derive(Clone, Copy)]

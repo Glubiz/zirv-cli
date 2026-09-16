@@ -1703,10 +1703,14 @@ fn repo_dir(state: &StateDir, repo: &Path) -> PathBuf {
 }
 
 fn state_path(state: &StateDir, repo: &Path, id: &str) -> CtxResult<PathBuf> {
+    state_path_in(&repo_dir(state, repo), id)
+}
+
+fn state_path_in(dir: &Path, id: &str) -> CtxResult<PathBuf> {
     if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!("invalid workflow id '{id}'").into());
     }
-    Ok(repo_dir(state, repo).join(format!("{id}.json")))
+    Ok(dir.join(format!("{id}.json")))
 }
 
 fn active_path(state: &StateDir, repo: &Path) -> PathBuf {
@@ -1790,6 +1794,13 @@ fn resolve_state_path_for_id(state: &StateDir, repo: &Path, id: &str) -> CtxResu
 
 pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState> {
     let path = resolve_state_path_for_id(state, repo, id)?;
+    let mut value = load_from_path(&path, id)?;
+    // Checks must measure the checkout through which the workflow was requested.
+    value.repo = repo.to_path_buf();
+    Ok(value)
+}
+
+fn load_from_path(path: &Path, id: &str) -> CtxResult<WorkflowState> {
     // Every verb that resolves a workflow by id (`status`, `resume`,
     // `context`, `artifacts`, `approve`, `advance`, ...) goes through this
     // one function, so checking here once is enough to keep a bogus id from
@@ -1798,7 +1809,7 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
     if !path.exists() {
         return Err(format!("unknown workflow '{id}'").into());
     }
-    let mut value: WorkflowState = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let mut value: WorkflowState = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     match value.schema_version {
         version if version == WORKFLOW_SCHEMA_VERSION => {}
         WORKFLOW_SCHEMA_VERSION_V4 => {
@@ -1816,16 +1827,6 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
             .into());
         }
     }
-    // Issue #467: retarget to the literal `repo` this lookup was actually
-    // reached through, regardless of which checkout `resolve_state_path_
-    // for_id` above actually found `id`'s state file in. Every downstream
-    // check that reads `state.repo` (`advance`'s Test/Verify/Review gates,
-    // `review package`'s diff and fingerprint, frontend detection, ...) must
-    // measure wherever the caller actually is, not wherever the workflow
-    // happened to be started -- that mismatch (main checkout clean, worktree
-    // dirty) was the whole bug. A no-op in the ordinary single-checkout
-    // case, where `repo` already equals `value.repo`.
-    value.repo = repo.to_path_buf();
     Ok(value)
 }
 
@@ -1859,6 +1860,23 @@ pub fn load_active(state: &StateDir, repo: &Path) -> CtxResult<Option<WorkflowSt
         Some(id) => load(state, repo, &id).map(Some),
         None => Ok(None),
     }
+}
+
+/// Read the requested checkout without migrating state or consulting siblings.
+pub(crate) fn load_active_read_only(
+    state: &StateDir,
+    repo: &Path,
+) -> CtxResult<Option<WorkflowState>> {
+    let dir = state
+        .workflows()
+        .join(crate::commands::ctx::state::repo_slug_read_only(repo));
+    let pointer = dir.join("active");
+    if !pointer.exists() {
+        return Ok(None);
+    }
+    let id = std::fs::read_to_string(pointer)?;
+    let id = id.trim();
+    load_from_path(&state_path_in(&dir, id)?, id).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

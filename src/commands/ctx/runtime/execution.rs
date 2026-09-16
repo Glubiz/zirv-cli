@@ -1098,6 +1098,7 @@ fn read_record(reader: &mut impl BufRead) -> CtxResult<Value> {
 /// reaches a per-turn loopback listener with an unguessable ephemeral secret.
 /// The parent, never this relay, owns tool execution and approval state.
 pub fn bridge_stdio() -> CtxResult<i32> {
+    super::require_native_available()?;
     let address: std::net::SocketAddr = std::env::var(BRIDGE_ADDRESS)
         .map_err(|_| "bridge address missing")?
         .parse()?;

@@ -1,5 +1,11 @@
 # Native feature parity: the release-blocking matrix
 
+> Release status: **coming soon, unavailable**. Native execution is blocked in
+> every ordinary build, with no runtime or Cargo-feature opt-in. The native
+> implementation evidence below applies to deterministic unit-test executables,
+> not to activation in the shipped CLI. `CI: Native Harness Coming Soon Release
+> Gate` verifies the installed binary refuses activation on all three platforms.
+
 **Issues:** #484 (roadmap N15), #485 (N16), #491 (N22), #492 (N23) ·
 **Roadmap:** #469 · **Last updated:** 2026-09-14
 
@@ -49,9 +55,8 @@ document may claim a rung it has not earned:
 | `live-validated` | a recorded run against a real provider endpoint, with the recording committed under `docs/benchmarks/`. **No row in this document claims this rung.** |
 | `legacy-only` | there is no native path, and the `Requires` cell says why. Every one of these is an entitlement limitation, not an unfinished feature -- see the two tables at the end. |
 
-Current distribution, counted by the check itself: 99 `unit`, 35
-`integration`, 18 `ci-matrix`, 8 `legacy-only`, 0 `live-validated`, across
-160 capabilities (122 command verbs, 38 model-calling call sites).
+The current distribution is counted by the check itself. No capability claims
+live-provider validation.
 
 ## Release blockers
 
@@ -65,7 +70,7 @@ One, and it is a blocker for the *rollout decision*, not for the code:
    runner has neither. What must happen to close it is written down in
    [`2026-09-14-native-release-evidence.md`](2026-09-14-native-release-evidence.md)
    ("What an operator must do"), and until it happens the native runtime
-   stays opt-in and the default stays the harness.
+   remains unavailable and the default stays the existing harness.
 
 No capability row is missing evidence. If one ever is, it must be added to
 this list by name or the build fails.
@@ -98,10 +103,10 @@ means it runs on any supported OS with no provider configured at all.
 | `ctx agent` | `ctx::native_worker::run` | `ctx::agent::run_with` + vendor CLI | any configured native route | `native_worker::tests::the_positional_name_selects_the_route_and_native_defers_to_the_role`, `native_worker::tests::harness_only_arguments_are_refused_rather_than_silently_dropped` | `integration` |
 | `ctx api` | `ctx::api::server` over protocol v1 | same zirv code on both runtimes | none | `api::tests::schema_prints_the_human_contract_by_default` | `unit` |
 | `ctx ask` | `handoff::helper_answer` at role `ask` -> `ctx::helper` | `ask::run_model` + `distiller_cmd` | a route for the `ask` role | `helper::tests::every_helper_role_answers_with_every_coding_harness_removed_from_path`, `ask::tests::a_live_session_is_asked_and_answers_from_its_own_transcript` | `ci-matrix` |
-| `ctx capabilities` | `runtime::capabilities::discover` | same zirv code on both runtimes | none | `capabilities_cmd::tests::an_unconfigured_machine_reports_every_integration_without_failing`, `CI: Native Setup And Doctor With No Harness Installed` | `ci-matrix` |
+| `ctx capabilities` | `runtime::capabilities::discover` | same zirv code on both runtimes | none | `capabilities_cmd::tests::an_unconfigured_machine_reports_every_integration_without_failing` | `unit` |
 | `ctx chat` | `native::spawn_interactive` under `--runtime native`, admitted through the shared allocator and accounting every turn into the breaker and the pool ledger | `chat::build_launch` + vendor TUI | a real terminal | `chat::tests::chat_builds_the_launch_from_the_adapter_rather_than_a_user_argv`, `runtime::native::tests::interactive_native_turns_record_health_and_settle_pool_spend` | `unit` |
 | `ctx compile` | `runtime::context::compile` | `ctx::compile` | none | `compile::tests::identical_slices_have_no_prefix_diff` | `unit` |
-| `ctx config` | `ctx::config` + `ctx::config_cmd` schema 2 | same zirv code | none | `config_cmd::tests::invalid_edits_leave_file_untouched_including_separate_policy_sections`, `CI: Config Migration Round Trip` | `ci-matrix` |
+| `ctx config` | native configuration and migration refused until release | same zirv code | native execution unavailable | `config_cmd::tests::invalid_edits_leave_file_untouched_including_separate_policy_sections`, `CI: Native Harness Coming Soon Release Gate` | `ci-matrix` |
 | `ctx discover` | `ctx::discover` over the compaction ledger | same zirv code | none | `discover::tests::measured_vs_estimated_classification_matches_the_ledger_join_exactly` | `unit` |
 | `ctx doctor` | `ctx::doctor::diagnose` | same zirv code on both runtimes | none | `doctor::tests::a_doctor_names_each_failure_class_from_a_real_inventory`, `CI: Verify Native Diagnosis Contracts` | `ci-matrix` |
 | `ctx exec` | `native::run_headless`, admitted through the shared allocator (`native_account::native_placement`) and accounted into the persistent breaker and the pool ledger | `exec::run_with_clock_inner` + vendor CLI | any configured native route | `runtime::native::tests::headless_native_exec_records_health_and_settles_pool_spend`, `runtime::native::tests::a_whole_native_session_runs_with_an_empty_path_and_no_harness_binary`, `exec::tests::exec_resolves_the_configured_default_against_its_own_role`, `tools::tests::a_real_native_worker_and_every_helper_role_complete_with_every_registered_harness_canaried_and_uninvoked`, `CI: Verify The Harness-Free Install Proof` | `ci-matrix` |
@@ -115,13 +120,14 @@ means it runs on any supported OS with no provider configured at all.
 | `ctx kill` | -- | `ctx::sessions::run_kill` terminates a supervised OS process | a native session is interrupted over the runtime protocol; there is no supervised vendor process to signal | -- | `legacy-only` |
 | `ctx learn` | `ctx::learn` | same zirv code | none | `learn::tests::classify_error_detects_each_class` | `unit` |
 | `ctx loop` | each cycle is a native `ctx exec` | each cycle is a harness `ctx exec` | any configured native route | `run_loop::tests::a_compact_tier_loop_cycle_compacts_and_continues_the_same_session` | `unit` |
+| `ctx mcp` | scoped read-only MCP bridge, independent of native execution | same zirv code | none | `ctx::mcp::tests::tool_contracts_are_read_only_and_reject_claimed_authority`, `ctx::mcp::tests::stdio_reads_never_migrate_legacy_state_in_a_git_repository` | `integration` |
 | `ctx measure` | `ctx::measure` | same zirv code | none | `measure::tests::median_is_none_for_empty` | `unit` |
 | `ctx nudge` | `ctx::delegation::send` queues durably for a native worker | `ctx::sessions::run_nudge` types at an open pane | none | `sessions::tests::a_nudge_stores_a_session_addressed_message_and_a_wake_marker`, `tools::tests::a_message_to_a_worker_with_an_approval_open_is_queued_not_typed` | `unit` |
 | `ctx objective` | `ctx::objective` + native `objective_status` tool | same zirv code | none | `tools::tests::operator_steering_and_stopping_reach_the_coordinator`, `objective::tests::a_record_round_trips_through_state` | `integration` |
 | `ctx optimize` | `handoff::helper_answer` at role `optimize` | `optimize::run_with` + `distiller_cmd` | a route for the `optimize` role | `helper::tests::every_helper_role_answers_with_every_coding_harness_removed_from_path`, `optimize::tests::every_layer_is_collected_in_a_stable_order` | `ci-matrix` |
 | `ctx output` | `runtime::tools` streams into the same store | same zirv code | none | `ctx::output::tests::a_failing_command_is_captured_verbatim_and_summarized` | `unit` |
 | `ctx permissions` | `runtime::enforcement` consumes the same policy | same zirv code | none | `enforcement::tests::approval_is_bound_to_action_policy_generation_and_parent_identity`, `permissions::tests::classify_approval_categorizes_each_exclusion_reason` | `integration` |
-| `ctx provider` | `provider::inventory` + `provider::credential` | not applicable -- native-only surface | none | `provider_cmd::tests::credential_set_refuses_harness_login_stores_before_reading_or_writing`, `CI: Native Setup And Doctor With No Harness Installed` | `ci-matrix` |
+| `ctx provider` | coming-soon notice; no provider or credential access | not applicable -- native-only surface | native execution unavailable | `provider_cmd::tests::credential_set_refuses_harness_login_stores_before_reading_or_writing`, `CI: Native Harness Coming Soon Release Gate` | `ci-matrix` |
 | `ctx recall` | `ctx::memory` + native `memory_recall` tool | same zirv code | none | `memory::tests::ctx_recall_merges_both_banks_and_labels_each_entrys_provenance` | `unit` |
 | `ctx remember` | `ctx::memory` + native `memory_remember` tool | same zirv code | none | `memory::tests::remembering_an_existing_key_replaces_the_entry_rather_than_duplicating_it` | `unit` |
 | `ctx resume` | `native::resume_journal` | `resume::launch_command` + vendor CLI | any configured native route | `runtime::native::tests::a_resume_reconciles_a_started_execution_and_fences_the_old_generation`, `resume::tests::an_unknown_adapter_preserves_the_crash_witness`, `runtime::native::tests::a_resume_with_a_reconcile_notice_writes_exactly_one_json_object_to_stdout` | `integration` |
@@ -170,7 +176,7 @@ means it runs on any supported OS with no provider configured at all.
 | `session list` | `ctx::session::service` over protocol v1 | same zirv code on both runtimes | none | `session::service::tests::a_served_runtime_serves_the_attachment_surface_over_the_real_transport` | `integration` |
 | `session serve` | `ctx::session::service` | same zirv code on both runtimes | none | `session::service::tests::a_live_runtime_is_refused_and_a_recycled_pid_is_replaceable`, `session::service::tests::an_unverifiable_record_is_refused_rather_than_taken_over` | `integration` |
 | `session stop` | `ctx::session::native` ends the conversation | `ctx::session::host` ends the process | none | `session::native::tests::an_interrupt_cancels_the_turn_and_a_stop_ends_the_conversation`, `session::host::tests::stopping_ends_the_process_and_releases_its_registry_record` | `integration` |
-| `setup` | `commands::setup` (harness hook installer); the native path is `ctx provider init` + `ctx doctor` | same zirv code | none | `setup::tests::parses_status_apply_and_guarded_reset`, `CI: Native Setup And Doctor With No Harness Installed` | `ci-matrix` |
+| `setup` | `commands::setup` (harness hook installer); native setup is unavailable | same zirv code | none | `setup::tests::parses_status_apply_and_guarded_reset` | `unit` |
 | `setup apply` | `commands::setup` | same zirv code | none | `setup::tests::install_claude_integration_records_a_baseline_on_a_reapply_with_no_changes` | `unit` |
 | `setup profile` | `commands::setup` | same zirv code | none | `setup::tests::profile_dry_run_previews_then_wet_run_merges_backs_up_and_is_idempotent` | `unit` |
 | `setup reset` | `commands::setup` | same zirv code | none | `setup::tests::reset_refuses_a_symlink_anywhere_in_a_target_tree_before_deleting_anything` | `unit` |

@@ -56,6 +56,23 @@ use super::CtxResult;
 use super::adapters::AgentAdapter;
 use super::provider::RouteId;
 
+/// Release availability is fixed in the binary, never in user configuration.
+/// Unit-test executables retain the implementation for deterministic development
+/// tests; ordinary debug/release builds (including all-features builds) refuse it.
+pub const NATIVE_COMING_SOON: &str = "The native harness is coming soon. It cannot be enabled in this release. Use `zirv chat` to continue with the existing harness.";
+
+pub const fn native_available() -> bool {
+    cfg!(test)
+}
+
+pub fn require_native_available() -> CtxResult<()> {
+    if native_available() {
+        Ok(())
+    } else {
+        Err(NATIVE_COMING_SOON.into())
+    }
+}
+
 /// Which backend drives a session's own conversation. `Unknown` is the
 /// forward-compat fallback for a value a future build wrote that this one
 /// has never heard of -- never a guess at `Harness`, which would silently
@@ -90,7 +107,11 @@ impl RuntimeKind {
 /// back to a harness the operator did not ask for.
 pub fn selected(flag: &str) -> crate::commands::ctx::CtxResult<RuntimeKind> {
     match flag.parse::<RuntimeKind>() {
-        Ok(kind @ (RuntimeKind::Harness | RuntimeKind::Native)) => Ok(kind),
+        Ok(RuntimeKind::Native) => {
+            require_native_available()?;
+            Ok(RuntimeKind::Native)
+        }
+        Ok(RuntimeKind::Harness) => Ok(RuntimeKind::Harness),
         _ => Err(format!("--runtime '{flag}': expected `harness` or `native`").into()),
     }
 }
@@ -209,6 +230,7 @@ pub fn resolve(
         });
     };
     match value.parse::<RuntimeKind>() {
+        Ok(RuntimeKind::Native) if !native_available() => Err(NATIVE_COMING_SOON.into()),
         Ok(kind @ (RuntimeKind::Harness | RuntimeKind::Native)) => Ok(RuntimeChoice {
             kind,
             source,
@@ -440,7 +462,10 @@ pub fn select(
             })?;
             Ok(Box::new(harness::HarnessBackend::new(adapter)))
         }
-        RuntimeKind::Native => Ok(Box::new(native::NativeBackend::new())),
+        RuntimeKind::Native => {
+            require_native_available()?;
+            Ok(Box::new(native::NativeBackend::new()))
+        }
         RuntimeKind::Unknown => {
             Err(RuntimeError::Unsupported("unknown runtime kind".to_string()).into())
         }

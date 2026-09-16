@@ -85,6 +85,7 @@ criterion).
 | `ctx kill` | harness-backend | terminates a supervised OS process; a native session is interrupted via the runtime protocol instead |
 | `ctx learn` | N06 (#475) |  |
 | `ctx loop` | N09 (#478) |  |
+| `ctx mcp` | shared | scoped read-only MCP bridge for wrapped hosts; does not start a native session |
 | `ctx measure` | N18 (#487) | transcript-derived proportionality/health metrics with a committed baseline |
 | `ctx nudge` | N10 (#479) | pane-typing surface; the runtime-neutral equivalent for a native worker is `delegation::send`, which queues rather than types at an open dialog |
 | `ctx objective` | N09 (#478) |  |

@@ -239,41 +239,15 @@ jobs:
       - name: Build Binary
         run: cargo build --bin zirv
 
-      # The packaged runtime is one binary: no extra native component is
-      # downloaded, unpacked or installed on any platform. This walks the
-      # whole first-run path on that binary alone -- write the provider
-      # template, read the inventory back, and diagnose readiness -- so a
-      # packaging regression that left a component out would surface here as
-      # a failing command rather than as a broken install in the wild.
-      - name: Native Setup And Doctor With No Harness Installed
+      # Test the ordinary installed executable. Native internals remain covered
+      # by deterministic unit tests, but no shipped binary may activate them.
+      - name: Native Harness Coming Soon Release Gate
         shell: bash
         run: |
           set -euo pipefail
-          bin="./target/debug/zirv"
-          [ -x "$bin" ] || bin="./target/debug/zirv.exe"
-          "$bin" ctx provider init
-          "$bin" ctx provider init          # idempotent: create-only
-          "$bin" ctx provider list
-          "$bin" ctx doctor --json
-          "$bin" ctx capabilities --json
-
-      # Update/downgrade: the operator config is migrated forward, the second
-      # run is a no-op, and the downgrade restores the pre-migration document
-      # so an older binary can still read it.
-      - name: Config Migration Round Trip
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin="./target/debug/zirv"
-          [ -x "$bin" ] || bin="./target/debug/zirv.exe"
-          "$bin" ctx config migrate --to native
-          "$bin" ctx config migrate --to native | grep -q unchanged
-          "$bin" ctx config show runtime.default | grep -q native
-          "$bin" ctx config migrate --downgrade
-          if "$bin" ctx config show runtime.default >/dev/null 2>&1; then
-            echo "runtime.default survived the downgrade" >&2
-            exit 1
-          fi
+          cargo test --bin zirv native_release_ -- --test-threads=1 2>&1 | tee native-release.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' native-release.txt \
+            || { echo "release filter matched no tests" >&2; exit 1; }
 
       # The three filtered runs below each guard against the same failure a
       # substring filter always has: a rename makes it match zero tests, and

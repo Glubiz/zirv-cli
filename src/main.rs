@@ -460,6 +460,10 @@ async fn main() {
     }
 
     if is_top_level_native_alias(&argv) {
+        if !ctx::runtime::native_available() {
+            print!("{}", ctx::chat::native_help_text());
+            return;
+        }
         if is_top_level_native_help(&argv) {
             print!("{}", ctx::chat::native_help_text());
             return;
@@ -870,13 +874,13 @@ mod tests {
     /// purely in-process call to `main`'s own helpers cannot prove end to
     /// end, including the process exit code.
     #[test]
-    fn native_help_exits_0_and_prints_the_experimental_notice() {
+    fn native_help_exits_0_and_prints_coming_soon() {
         let exe = std::env::current_exe().expect("current_exe");
         let bin = exe
             .parent()
             .and_then(|p| p.parent())
             .expect("target/debug")
-            .join("zirv");
+            .join(format!("zirv{}", std::env::consts::EXE_SUFFIX));
 
         let out = std::process::Command::new(&bin)
             .args(["native", "--help"])
@@ -890,11 +894,187 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            text.contains("EXPERIMENTAL / WORK IN PROGRESS"),
-            "got: {text}"
+        assert!(text.contains("coming soon"), "got: {text}");
+        assert!(text.contains("cannot be enabled"), "got: {text}");
+    }
+
+    // Exercise the ordinary executable, not cfg(test), so internal native unit
+    // tests cannot accidentally stand in for the release availability contract.
+    fn release_command(
+        args: &[&str],
+        config: Option<&str>,
+    ) -> (std::process::Output, tempfile::TempDir) {
+        release_command_with_env(args, config, &[])
+    }
+
+    fn release_command_with_env(
+        args: &[&str],
+        config: Option<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> (std::process::Output, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("temporary home");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("repository");
+        if let Some(config) = config {
+            std::fs::create_dir_all(root.path().join(".zirv")).expect("operator directory");
+            std::fs::write(root.path().join(".zirv/ctx.toml"), config).expect("operator config");
+        }
+        let exe = std::env::current_exe().expect("test executable");
+        let bin = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("target directory")
+            .join(format!("zirv{}", std::env::consts::EXE_SUFFIX));
+        let mut command = std::process::Command::new(bin);
+        for (key, _) in std::env::vars() {
+            if key.starts_with("ZIRV_") || key.starts_with("CLAUDE") || key.starts_with("CODEX") {
+                command.env_remove(key);
+            }
+        }
+        let output = command
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env("ZIRV_CTX_STATE_DIR", root.path().join("state"))
+            .envs(extra_env.iter().copied())
+            .output()
+            .expect("run release binary");
+        (output, root)
+    }
+
+    #[test]
+    fn native_release_commands_are_coming_soon_without_side_effects() {
+        for args in [
+            vec!["native"],
+            vec!["NATIVE", "--help"],
+            vec!["native", "--runtime=harness"],
+            vec!["native", "--force-pace"],
+            vec!["chat", "--runtime", "native"],
+            vec!["ctx", "chat", "--runtime=NATIVE"],
+            vec!["ctx", "exec", "--runtime", "native", "--prompt", "hello"],
+            vec![
+                "ctx",
+                "exec",
+                "--runtime",
+                "native",
+                "--provider",
+                "fixture:basic",
+                "--prompt",
+                "hello",
+            ],
+            vec!["agent", "native", "hello", "--runtime", "native"],
+            vec!["ctx", "provider", "init"],
+            vec!["ctx", "provider", "bridge"],
+            vec!["ctx", "config", "migrate", "--to", "native"],
+            vec!["ctx", "config", "set", "runtime.default", "native"],
+            vec!["ctx", "config", "set", "runtime.roles.worker", "native"],
+            vec![
+                "ctx",
+                "config",
+                "set",
+                "runtime",
+                "{ default = \"native\" }",
+            ],
+        ] {
+            let (out, root) = release_command(&args, None);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(text.contains("coming soon"), "{args:?}: {text}");
+            assert_eq!(
+                out.status.success(),
+                args[0].eq_ignore_ascii_case("native"),
+                "{args:?}: {text}"
+            );
+            assert!(
+                !root.path().join(".zirv/native.toml").exists(),
+                "{args:?}: wrote provider config"
+            );
+            assert!(
+                !root.path().join(".zirv/ctx.toml").exists(),
+                "{args:?}: wrote runtime config"
+            );
+            assert!(
+                !root.path().join("state/native-journal.sqlite").exists(),
+                "{args:?}: opened native journal"
+            );
+        }
+    }
+
+    #[test]
+    fn native_release_config_cannot_activate_chat_or_workers() {
+        for config in [
+            "[runtime]\ndefault = \"native\"\n",
+            "[runtime.roles]\norchestrator = \"native\"\nworker = \"native\"\n",
+        ] {
+            for args in [
+                vec!["ctx", "chat"],
+                vec!["ctx", "exec", "--prompt", "hello"],
+                vec!["agent", "native", "hello"],
+            ] {
+                let (out, _) = release_command(&args, Some(config));
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(!out.status.success(), "{args:?}: unexpectedly started");
+                assert!(text.contains("coming soon"), "{args:?}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_release_environment_cannot_enable_execution() {
+        let (out, _) = release_command_with_env(
+            &["ctx", "exec", "--prompt", "hello"],
+            None,
+            &[
+                ("ZIRV_CTX_RUNTIME", "native"),
+                ("ZIRV_CTX_NATIVE_ALIAS", "true"),
+            ],
         );
-        assert!(text.contains("zirv chat --runtime native"), "got: {text}");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("coming soon"));
+    }
+
+    #[test]
+    fn native_release_doctor_reports_unavailable_and_legacy_commands_remain_available() {
+        let (out, _) = release_command(&["ctx", "doctor", "--json", "--live"], None);
+        assert!(out.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor JSON");
+        assert_eq!(report["native_available"], false);
+        assert_eq!(report["status"], "coming-soon");
+        let (out, _) = release_command(&["ctx", "status", "--json"], None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (out, _) = release_command(
+            &[
+                "ctx",
+                "chat",
+                "--runtime",
+                "harness",
+                "--agent",
+                "nonexistent-test-harness",
+            ],
+            Some("[runtime]\ndefault = \"native\"\n"),
+        );
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            !text.contains("coming soon"),
+            "explicit harness must override native config: {text}"
+        );
+        assert!(
+            text.contains("nonexistent-test-harness"),
+            "legacy adapter resolution was not reached: {text}"
+        );
     }
 
     #[test]

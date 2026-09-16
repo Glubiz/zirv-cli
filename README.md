@@ -1,4 +1,17 @@
 # Zirv CLI
+
+> **Native harness: coming soon.** This release ships the existing meta harness.
+> `zirv native` only displays this notice. Native CLI flags, configured defaults,
+> workers, helper calls, dashboard sessions, provider execution, recovery and
+> rollover cannot enable it. There is no environment variable, configuration
+> setting or Cargo feature that unlocks native execution in a normal build.
+> Use `zirv chat` (or bare `zirv`) for the existing harness. If you previously
+> tested native defaults, use `--runtime harness` or remove the native runtime
+> overrides from your operator configuration.
+>
+> Native implementation and design documentation below is retained for development
+> of a future release; its native launch and setup examples are unavailable here.
+
 [![Release](https://img.shields.io/github/v/release/Glubiz/zirv-cli)](https://github.com/Glubiz/zirv-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -44,6 +57,7 @@
   - [Maintain loop](#maintain-loop)
   - [Frontend quality](#frontend-quality)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
+  - [MCP bridge](#mcp-bridge)
   - [Cross-harness fallback and handover](#cross-harness-fallback-and-handover)
   - [Permission auditing and safe-list proposals](#permission-auditing-and-safe-list-proposals-issue-178)
 - [Supported harnesses and models](#supported-harnesses-and-models)
@@ -561,6 +575,8 @@ to the section that documents it in depth.
 
 ### Harness supervision (`zirv ctx`)
 
+- **MCP bridge** — `mcp` (`zirv ctx mcp serve`) exposes repository-scoped session, memory,
+  workflow, and artifact reads to wrapped MCP hosts. See [MCP bridge](#mcp-bridge).
 - **Harness adapters** — one adapter per supported harness: `claude`,
   `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, and `qwen`, each
   enabled or disabled per repo in `.zirv/.settings.toml`. See
@@ -1806,11 +1822,12 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
 | `zirv ctx status [--json] [--agents]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through |
+| `zirv ctx mcp serve [--stdio] [--repo <path>]` | Serves four read-only MCP tools for one repository/worktree; see [MCP bridge](#mcp-bridge) |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
-| `zirv ctx provider init\|list\|check\|credential set` | Initializes, inventories, validates, or stores credentials for opt-in native provider routes |
-| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--runtime native` opens a structured native conversation pane instead (no coding harness, no PTY) — see [The native conversation pane](#the-native-conversation-pane) |
-| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` delegates to a native worker instead, with the same task/ownership/receipt contracts (also `zirv agent`) |
+| `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
+| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
+| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` reports coming soon and refuses to start (also `zirv agent`) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
@@ -2001,6 +2018,8 @@ The contract, and how to add or retire a protocol profile, is in
 
 #### The native agent loop
 
+> Coming soon: native execution is unavailable in this release.
+
 `zirv ctx exec --runtime native` runs a whole session without a coding
 harness installed:
 
@@ -2095,34 +2114,16 @@ is in
 
 #### The native conversation pane
 
-`zirv chat --runtime native` opens a structured native conversation instead
-of a wrapped-harness session: a dedicated `ratatui` dashboard pane (no PTY,
-no `vt100` — the pane renders the journal's own structured events directly)
-driving an in-process, multi-turn native session on a background thread:
+> Coming soon: native execution is unavailable in this release.
 
-```
-zirv chat --runtime native
-```
+The native conversation pane is **coming soon**. `zirv native`, including
+`zirv native --help`, only prints the coming-soon notice and exits without
+loading configuration, opening a dashboard, or starting a session. Native
+flags such as `zirv chat --runtime native` fail with the same explanation.
+`zirv commands --json` lists `zirv native` as an informational, non-mutating
+placeholder with no activation flags. `zirv chat` remains the existing harness.
 
-**Experimental: `zirv native`.** `zirv native` (case-insensitive) is a thin
-top-level alias for `zirv chat --runtime native` above: `main.rs` rewrites
-the argv to the identical `ctx chat --runtime native` shape before
-`ctx::dispatch` ever runs, so there is exactly one native-chat launch path
-either spelling reaches — no second implementation to keep in sync. `zirv
-native --help` documents its own syntax, prerequisites, limitations, and
-where session/journal state lives, and exits 0. `zirv help` never lists it
-beside the stable commands; it appears only in a separately labelled
-"Experimental / work in progress" section, and `zirv commands --json`
-reports it with `"stability": "experimental"` and `"runtime": "native"` so
-automation and docs generation can tell "hidden help" from "does not exist".
-Launching it prints a one-time notice on stderr ("zirv native is
-experimental; `zirv chat` remains the stable harness."), never repeated per
-turn and never folded into the model's own context; `zirv chat --runtime
-native` itself never prints that notice, since it is keyed on the alias
-having been used, not on the runtime chosen. Like the flag it rewrites to,
-it never changes the operator's default runtime, migrates configuration, or
-falls back to a wrapped harness — reject-with-a-refusal is the only response
-to a missing prerequisite (see `zirv ctx doctor`).
+The following describes the implementation retained for a future release.
 
 `zirv chat` takes no `--route` or `--view` flag (those are `zirv ctx exec
 --runtime native`'s own) — the native pane always spends the `orchestrator`
@@ -2262,6 +2263,8 @@ and the mock in
 
 #### Native workers, shared ownership and delegation receipts
 
+> Coming soon: native execution is unavailable in this release.
+
 `zirv agent --runtime native` (equally `zirv ctx agent --runtime native`)
 delegates one task to a **native** worker -- no coding harness installed, no
 child process, no PTY:
@@ -2361,6 +2364,8 @@ recorded in
 
 ### Native workflows, verification and helper calls
 
+> Coming soon: native execution is unavailable in this release.
+
 Migrating the chat loop alone would leave hidden vendor-CLI dependencies in
 everything around it, so every zirv model call that is *not* the main
 conversation runs natively too: handoff distillation, `zirv ctx ask`, `zirv
@@ -2422,6 +2427,8 @@ behind this step are in
 
 #### Instructions in native sessions
 
+> Coming soon: native execution is unavailable in this release.
+
 A native session's instruction layer (`SourceKind::NativeInstructions`, data,
 never a provider instruction message) is built the same [`ZIRV.md`
 precedence](#zirvmd-instruction-files) the wrapped harness reports, in a fixed
@@ -2448,6 +2455,8 @@ per-source path/scope/trust/decision), and the native `/context` (alias
 `/instructions`) pane command surfaces the same facts live.
 
 ### Native teams and the coordinating seat
+
+> Coming soon: native execution is unavailable in this release.
 
 Zirv can run the coordinator itself. A native session seated as
 `--role coordinator` (or `sub-orchestrator`) plans the work, staffs it and
@@ -2540,6 +2549,8 @@ The decisions behind this step are in
 [`docs/design/2026-09-13-native-orchestrator.md`](docs/design/2026-09-13-native-orchestrator.md).
 
 ### Native configured capabilities
+
+> Coming soon: native execution is unavailable in this release.
 
 A native session inherits nothing from a coding harness, so the non-shell
 capabilities a workflow needs — MCP servers, a browser, web search, language
@@ -2834,6 +2845,88 @@ See
 [`docs/design/2026-09-13-persistent-runtime.md`](docs/design/2026-09-13-persistent-runtime.md)
 for the design, the measurements and what is deferred.
 
+### MCP bridge
+
+`zirv ctx mcp serve` lets an MCP host such as Codex or Claude Code read zirv
+state through structured tools. The host launches it as a local subprocess;
+stdin/stdout carry MCP JSON-RPC and diagnostics go to stderr. Stdio is the
+only transport (`--stdio` is optional). `--repo` fixes the authorized directory
+at startup; without it, the server uses its launch directory. Use an absolute
+path to the installed zirv executable and an explicit repository path in host
+configuration so a host's working directory cannot select the wrong project.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `session_snapshot` | `{}` | Up to 64 session registry records for this directory, requested policy, and memory gates. Liveness and host enforcement are explicitly unverified; stale records are preserved. |
+| `memory_search` | `query`, optional `limit` and `max_bytes` | Ranked private/global/shared facts with provenance and verification dates. Uses the existing retrieval engine and trusted-key precedence. |
+| `workflow_status` | `{}` | Active workflow, current step/skill, approval state, and up to 64 registered artifact IDs, newest first. An absent workflow stays absent. |
+| `artifact_read` | `id`, optional `offset` and `max_bytes` | A UTF-8 text page from an artifact registered with `zirv artifact render`. Returns `next_offset` for subsequent pages. |
+
+All successful responses contain `captured_at` (Unix seconds), `repository`,
+and `data`, with both an output schema and structured JSON. Tool failures
+return `isError: true` with an explanation. Each serialized structured result
+is capped at 32 KiB (the MCP text fallback repeats that JSON). Memory queries
+must be nonblank and at most 2048 bytes. Memory limits default to 6 entries /
+2048 bytes, may be lowered, and cannot exceed 32 entries / 16384 bytes or the
+operator's configured retrieval budgets. Artifact pages default to 8192 bytes
+(range 4..8192); files must be regular UTF-8 text no larger than 1 MiB.
+Offsets are byte positions on UTF-8 boundaries. Registered files remain live
+files, so callers should restart pagination if they change between reads.
+
+For Codex, add a server entry to the operator's `~/.codex/config.toml`, using
+the real absolute paths:
+
+```toml
+[mcp_servers.zirv]
+command = "/absolute/path/to/zirv"
+args = ["ctx", "mcp", "serve", "--repo", "/absolute/path/to/project"]
+```
+
+For Claude Code, save this as an operator-owned `zirv-mcp.json` and pass it
+for a single wrapped launch with
+`zirv ctx wrap -- claude --mcp-config /absolute/path/to/zirv-mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "zirv": {
+      "command": "/absolute/path/to/zirv",
+      "args": ["ctx", "mcp", "serve", "--repo", "/absolute/path/to/project"]
+    }
+  }
+}
+```
+
+On Windows, use the installed `zirv.exe` path; forward slashes work in JSON
+and TOML paths. Preserve the host's existing server entries. If the host
+must use a custom zirv state directory or operator environment override,
+forward that setting through its MCP server environment configuration.
+See the official [Codex MCP](https://developers.openai.com/codex/mcp) and
+[Claude Code MCP](https://code.claude.com/docs/en/mcp) configuration references.
+
+The server does not register itself automatically or change host settings.
+Its four tools neither consume mail nor write memory, run commands, launch
+workers, or advance workflows. Existing hooks, CLI checkpoints and supervisor
+recovery continue independently. Reading a registered report does not certify
+that its claims are correct. Worker result storage, mail mutations, dispatch,
+and incoming event delivery are follow-on work tracked in
+[issue #658](https://github.com/Glubiz/zirv-cli/issues/658).
+
+MCP reads use the current repository state buckets and never migrate legacy
+buckets. If an older installation's state has not been adopted yet, run the
+ordinary zirv CLI for that repository before starting the host.
+
+#### MCP trust boundary
+
+| Surface | Authority and enforcement |
+|---|---|
+| Executable and `--repo` | Chosen by the operator's host configuration at launch; tool arguments cannot change either. The repository directory is opened once for artifact access. |
+| `policy.tool_access` | Re-read for every call. `deny` and `ask` refuse calls; this server has no approval-granting channel. A malformed configuration also refuses reads. |
+| Memory | Existing `memory.enabled`, `memory.shared_enabled`, and retrieval budgets apply. A shared key cannot shadow an enabled private/global key, even if that trusted fact misses the query budget. |
+| Artifact IDs | Resolved in this repository's existing artifact registry. Payload access uses a directory capability to reject traversal and symlink escapes; arbitrary file paths are not tool arguments. |
+| Returned text | Memory provenance is retained; repository artifacts and shared facts are labeled untrusted information, never operator instructions. |
+| OS account and local state | Operator-owned state is trusted as with the CLI. This local service does not isolate mutually hostile processes that already share filesystem access under the same account. |
+
 ### Signals and verdicts
 
 Four signals over the trailing window (default 10 turns):
@@ -2984,6 +3077,7 @@ keep only your own.
 
 | Surface | Trust | Narrowing? |
 |---|---|---|
+| Native release availability | fixed in the binary | no flag, configuration, environment variable or Cargo feature can enable native execution |
 | `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
 | `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
 
@@ -3311,6 +3405,8 @@ actually reach for.
 
 ### Native provider routes
 
+> Coming soon: native execution is unavailable in this release.
+
 Native routing is opt-in through a separate `~/.zirv/native.toml`; older
 zirv binaries ignore this file and continue reading the unchanged
 `ctx.toml`. Start with `zirv ctx provider init`, inspect the offline inventory
@@ -3384,6 +3480,8 @@ cannot add accounts, endpoints, routes, role bindings, credentials, or
 permissions.
 
 #### Provider-owned execution in the native UI
+
+> Coming soon: native execution is unavailable in this release.
 
 A route may use an official provider harness while retaining Zirv's native
 conversation UI, tasks, approvals and tool broker. This is distinct from direct
@@ -3514,8 +3612,11 @@ reported separately.
 
 #### Native setup, diagnosis and rollback
 
-A fresh machine needs no coding harness installed to run native sessions. The
-whole path is four commands:
+> Coming soon: native execution is unavailable in this release.
+
+Native setup is **coming soon**. Provider commands and migration to native are
+blocked in this release; `zirv ctx doctor` reports `coming-soon` without probing
+providers or credentials. The commands below document the future setup flow:
 
 ```bash
 zirv ctx provider init                       # write ~/.zirv/native.toml
@@ -3643,6 +3744,8 @@ Implementation gaps (zirv's own work, each tracked):
   until the N19 validation pass records a real one.
 
 #### Native compaction
+
+> Coming soon: native execution is unavailable in this release.
 
 A native session compacts itself rather than calling a harness `/compact`.
 Committed journal events and the provider's own measured input footprint

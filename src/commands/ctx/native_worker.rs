@@ -124,6 +124,7 @@ fn phase_of(status: NativeStatus) -> delegation::Phase {
 
 /// Runs one delegated native worker end to end.
 pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
+    super::runtime::require_native_available()?;
     let args = request.args;
     let state = request.state;
     let repo = request.repo;
