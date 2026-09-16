@@ -86,12 +86,23 @@ pub struct Decision<'a> {
 /// represented only by their SHA-256 identity: an operator can correlate a
 /// known command during an incident without turning the state directory into
 /// a second transcript full of source, paths, tokens, or shell secrets.
+///
+/// Change 5a (blocked-command observability): `family` is the one
+/// deliberate exception -- `argv[0]`, plus the first non-flag,
+/// non-credential-shaped token ONLY for a small curated set of known
+/// dispatcher programs (`safety::safety_family`, a narrower sibling of
+/// `hook::command_family`/`PermissionPromptRow::family` -- see its own doc
+/// comment for why this log's stricter "never the raw command" contract
+/// needs a narrower rule). Never a path, flag, URL, or secret. It exists so
+/// `zirv ctx hook audit` can finally name WHAT was blocked, not just how
+/// many times.
 #[derive(Debug, Serialize)]
 pub struct SafetyDecision<'a> {
     pub ts: u64,
     pub session: &'a str,
     pub mode: &'a str,
     pub verdict: &'a str,
+    pub family: &'a str,
     pub command_sha256: &'a str,
     pub policy_sha256: &'a str,
     pub launch_policy_sha256: Option<&'a str>,
@@ -539,6 +550,11 @@ pub struct SafetyDecisionRecord {
     #[allow(dead_code)]
     pub mode: String,
     pub verdict: String,
+    /// Change 5a. `#[serde(default)]` so a row written before this field
+    /// existed still parses -- an empty string reads as "unknown", the
+    /// only honest reading for a record that predates it.
+    #[serde(default)]
+    pub family: String,
     pub command_sha256: String,
     #[serde(default)]
     pub matched_pattern: Option<String>,
@@ -734,6 +750,7 @@ mod tests {
                 session: "s1",
                 mode: "interactive",
                 verdict: "ask",
+                family: "rm -rf",
                 command_sha256: "aaa",
                 policy_sha256: "p",
                 launch_policy_sha256: None,
@@ -751,6 +768,7 @@ mod tests {
                 session: "s1",
                 mode: "headless",
                 verdict: "allow",
+                family: "cargo build",
                 command_sha256: "bbb",
                 policy_sha256: "p",
                 launch_policy_sha256: None,
@@ -810,6 +828,7 @@ mod tests {
                 session: "s1",
                 mode: "interactive",
                 verdict: "ask",
+                family: "rm -rf",
                 command_sha256: "aaa",
                 policy_sha256: "p",
                 launch_policy_sha256: None,
@@ -871,6 +890,7 @@ mod tests {
                 session,
                 mode: "headless",
                 verdict: "deny",
+                family: "git push",
                 command_sha256,
                 policy_sha256: "p",
                 launch_policy_sha256: None,
@@ -1317,6 +1337,12 @@ mod tests {
     fn safety_audit_records_structured_evidence_without_the_raw_command() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
+        // The real command behind this decision would be something like
+        // `curl --data secret-value-from-command ...` -- `family` is
+        // computed by the caller (`safety::safety_family`), and for a
+        // program not on its curated dispatcher list, collapses to just
+        // the program name. Even so, the raw command must never reach this
+        // log; only the family and the two hashes may.
         append_safety(
             &state,
             &SafetyDecision {
@@ -1324,6 +1350,7 @@ mod tests {
                 session: "abc",
                 mode: "interactive",
                 verdict: "ask",
+                family: "curl",
                 command_sha256: "0123456789abcdef",
                 policy_sha256: "fedcba9876543210",
                 launch_policy_sha256: Some("aabbccdd"),
@@ -1345,6 +1372,10 @@ mod tests {
         let text = std::fs::read_to_string(file).expect("audit");
         assert!(text.contains("\"command_sha256\":\"0123456789abcdef\""));
         assert!(text.contains("\"policy_sha256\":\"fedcba9876543210\""));
+        assert!(
+            text.contains("\"family\":\"curl\""),
+            "the family names only the program: {text}"
+        );
         assert!(!text.contains("secret-value-from-command"));
     }
 

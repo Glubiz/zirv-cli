@@ -212,21 +212,37 @@ fn web_url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// Program-family for a shell command string: `argv[0]` plus the first
+/// non-flag argument that cannot itself carry a credential (a token
+/// starting with `-` such as `-pSECRET`, or one containing `:`/`@`/`=` such
+/// as `user:pass@host` or `KEY=val`). Empty input yields an empty string --
+/// callers with a more specific fallback (e.g. the tool name) apply it
+/// themselves. Shared by [`permission_family`]'s `Bash`/`PowerShell` branch
+/// and `safety::audit_hook_decision`'s own `family` field on the
+/// safety-decision record (Change 5a) -- both need the identical
+/// "never leak an argument" rule, so it exists exactly once.
+pub(crate) fn command_family(command: &str) -> String {
+    let mut tokens = command.split_whitespace();
+    let program = tokens.next().unwrap_or("");
+    let subcommand =
+        tokens.find(|token| !token.starts_with('-') && !token.contains([':', '@', '=']));
+    match (program, subcommand) {
+        ("", _) => String::new(),
+        (program, Some(subcommand)) => format!("{program} {subcommand}"),
+        (program, None) => program.to_string(),
+    }
+}
+
 fn permission_family(payload: &PermissionHookPayload) -> (String, Option<String>) {
     match payload.tool_name.as_str() {
         "Bash" | "PowerShell" => {
-            // Program name plus the first non-flag argument, but never a token
-            // that could itself carry a credential (`-pSECRET` starts with
-            // `-`; `user:pass@host` and `KEY=val` carry `:`/`@`/`=`). The full
-            // command is captured only as an opaque sha256, never in clear.
-            let mut tokens = payload.tool_input.command.split_whitespace();
-            let program = tokens.next().unwrap_or("");
-            let subcommand =
-                tokens.find(|token| !token.starts_with('-') && !token.contains([':', '@', '=']));
-            let family = match (program, subcommand) {
-                ("", _) => payload.tool_name.clone(),
-                (program, Some(subcommand)) => format!("{program} {subcommand}"),
-                (program, None) => program.to_string(),
+            // The full command is captured only as an opaque sha256, never
+            // in clear -- `command_family` above gives the plaintext family.
+            let family = command_family(&payload.tool_input.command);
+            let family = if family.is_empty() {
+                payload.tool_name.clone()
+            } else {
+                family
             };
             (
                 family,
@@ -3263,12 +3279,13 @@ fn run_hook_install<W: Write>(
 /// over the main decision log, reuse-probe skip reasons, top denied
 /// programs from the orchestrator-write guard's own `Bash`/`PowerShell`
 /// rows (every other tool names a file path, not a program, so those are
-/// counted but never named), a bare denial count from the command-safety
-/// log (commands there are SHA-only -- see `SafetyDecision`'s own doc
-/// comment -- so no program name can ever be recovered from it), and the
-/// compaction ledger's own outcome counts. One report tying every
-/// hook-observable signal together for an operator asking "is the hook
-/// actually doing anything." Read-only throughout.
+/// counted but never named), the top BLOCKED FAMILIES from the
+/// command-safety log (Change 5a: `SafetyDecision::family`, computed by
+/// `safety::safety_family` -- the command itself is still SHA-only, but
+/// the family is plaintext by design), and the compaction ledger's own
+/// outcome counts. One report tying every hook-observable signal together
+/// for an operator asking "is the hook actually doing anything." Read-only
+/// throughout.
 fn run_audit<W: Write>(w: &mut W, since: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let state = StateDir::resolve(env)?;
     let since_secs = super::spend::parse_since(since).ok_or_else(|| {
@@ -3346,15 +3363,30 @@ fn run_audit<W: Write>(w: &mut W, since: &str, env: EnvLookup<'_>) -> CtxResult<
         "other denied tool calls (file path, not a program): {other_denials}"
     )?;
 
-    let safety_denials = log::read_safety_decisions(&state)
+    let safety_denials: Vec<_> = log::read_safety_decisions(&state)
         .into_iter()
         .filter(|d| d.ts >= since_ts && d.verdict == "deny")
-        .count();
-    writeln!(
-        w,
-        "safety-policy denials: {safety_denials} (commands are hashed -- no program names \
-         available)"
-    )?;
+        .collect();
+    writeln!(w, "\nsafety-policy denials: {}", safety_denials.len())?;
+    writeln!(w, "blocked families (commands themselves stay hashed):")?;
+    let mut blocked_families: std::collections::BTreeMap<&str, u64> = Default::default();
+    for d in &safety_denials {
+        let family = if d.family.is_empty() {
+            "unknown"
+        } else {
+            d.family.as_str()
+        };
+        *blocked_families.entry(family).or_insert(0) += 1;
+    }
+    if blocked_families.is_empty() {
+        writeln!(w, "  none")?;
+    } else {
+        let mut sorted: Vec<_> = blocked_families.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        for (family, n) in sorted.into_iter().take(10) {
+            writeln!(w, "  {family:<30} {n}")?;
+        }
+    }
 
     let ledger_outcomes = super::ledger::outcome_counts_since(&state, since_ts);
     writeln!(w, "\nledger outcomes:")?;
@@ -6103,6 +6135,23 @@ mod tests {
                 "family leaked `{secret}` for `{command}`"
             );
         }
+    }
+
+    /// Change 5a: `safety::audit_hook_decision` calls `command_family`
+    /// directly (not through `PermissionHookPayload`) for the
+    /// safety-decision log's own `family` field -- same underlying function
+    /// as `permission_family_never_captures_a_credential_bearing_token`
+    /// above, pinned here at the function itself so the "never leak an
+    /// argument" guarantee holds independent of that wrapper.
+    #[test]
+    fn command_family_never_leaks_a_secret_shaped_argument() {
+        assert_eq!(command_family("mysql -pSECRET -h host"), "mysql host");
+        assert_eq!(command_family("curl https://user:pass@host/api"), "curl");
+        assert_eq!(
+            command_family("printf KEY=secret-value-from-command"),
+            "printf"
+        );
+        assert_eq!(command_family(""), "");
     }
 
     #[test]
@@ -9395,8 +9444,8 @@ mod tests {
 
     /// A fixture log with mixed outcomes (issue #424) aggregates correctly:
     /// verb/verdict counts, a skip reason, a denied Bash program, a
-    /// safety-log denial count with no program name, and the ledger's own
-    /// outcome counts.
+    /// safety-log denial count with its blocked family named (Change 5a),
+    /// and the ledger's own outcome counts.
     #[test]
     fn hook_audit_aggregates_a_mixed_fixture_correctly() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -9479,6 +9528,7 @@ mod tests {
                 session: "sess-1",
                 mode: "interactive",
                 verdict: "deny",
+                family: "rm -rf",
                 command_sha256: "aaa",
                 policy_sha256: "p",
                 launch_policy_sha256: None,
@@ -9522,9 +9572,10 @@ mod tests {
             text.contains("other denied tool calls (file path, not a program): 1"),
             "{text}"
         );
+        assert!(text.contains("safety-policy denials: 1"), "{text}");
         assert!(
-            text.contains("safety-policy denials: 1 (commands are hashed"),
-            "{text}"
+            text.contains("rm -rf"),
+            "blocked family must be named: {text}"
         );
         assert!(text.contains("compacted"), "{text}");
     }

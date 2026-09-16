@@ -1082,6 +1082,61 @@ fn orchestrator_blocks_status_line(
     ))
 }
 
+/// Change 5c (blocked-command observability): one line naming how many
+/// commands zirv's own command-safety hook has refused (`Verdict::Deny`)
+/// in the CURRENT session, and the top blocked families -- so a worker
+/// that got no visible trace at the time (the deliberately silent `Ask`-
+/// under-`dontAsk` path, or simply a caller that never reads
+/// `hookSpecificOutput`) can still find out from `zirv ctx status`. Reads
+/// the log the same bounded way the denial breaker already does
+/// (`log::read_recent_safety_decisions`, issue #313's day-window/limit),
+/// not the unbounded `log::read_safety_decisions` `zirv ctx hook audit`
+/// uses for a full-history report -- this line renders on every
+/// checkpoint. `None` (no line at all, byte-identical report) when this
+/// session has no denial in that window, the same allowance every other
+/// single-line health signal here already gets.
+fn blocked_commands_status_line(
+    state: &StateDir,
+    env: EnvLookup<'_>,
+    colour: bool,
+) -> Option<String> {
+    let session_ident = mail::session_identity(env)?;
+    let recent = log::read_recent_safety_decisions(state, &session_ident, 50, now_secs() / 86_400);
+    let denials: Vec<_> = recent
+        .iter()
+        .filter(|record| record.verdict == "deny")
+        .collect();
+    if denials.is_empty() {
+        return None;
+    }
+    let mut by_family: std::collections::BTreeMap<&str, u64> = Default::default();
+    for record in &denials {
+        let family = if record.family.is_empty() {
+            "unknown"
+        } else {
+            record.family.as_str()
+        };
+        *by_family.entry(family).or_insert(0) += 1;
+    }
+    let mut top: Vec<_> = by_family.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let families = top
+        .into_iter()
+        .take(3)
+        .map(|(family, n)| format!("{family} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "{} {}",
+        label(colour, "blocked:"),
+        style::paint(
+            &format!("{} this session \u{b7} top: {families}", denials.len()),
+            Tone::Warn,
+            colour,
+        )
+    ))
+}
+
 /// How many of the most recent sessions with a large ledger row [`hook_
 /// health_warning`] may scan before giving up -- `zirv ctx status` runs on
 /// every checkpoint, so this may not rescan every session the ledger has
@@ -1386,6 +1441,13 @@ fn render_report<W: Write>(
             // `spend:` gets, and silent (no line at all) when nothing has
             // ever been blocked -- see `orchestrator_blocks_status_line`.
             if let Some(line) = orchestrator_blocks_status_line(&state, env, colour) {
+                writeln!(w, "{line}")?;
+            }
+            // Change 5c: present in `--brief` too, the same allowance
+            // `spend:`/`orchestrator writes:` both get, and silent (no line
+            // at all) when this session has refused nothing -- see
+            // `blocked_commands_status_line`.
+            if let Some(line) = blocked_commands_status_line(&state, env, colour) {
                 writeln!(w, "{line}")?;
             }
             // Issue #422: present in `--brief` too, the same allowance
@@ -5178,6 +5240,106 @@ mod tests {
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(!text.contains("orchestrator writes:"), "got {text}");
+    }
+
+    /// Change 5c: `blocked:` names how many commands zirv's own
+    /// command-safety hook refused (`verdict == "deny"`) in the CURRENT
+    /// session (filtered by `SESSION_ENV`, same identity `orchestrator
+    /// writes:` uses), and the top blocked families by count -- an `ask`
+    /// row and a different session's `deny` row must both be excluded.
+    #[test]
+    fn status_reports_blocked_commands_this_session_and_top_families() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let now = crate::commands::ctx::state::now_secs();
+
+        for (session, verdict, family, sha) in [
+            ("aaaa1111", "deny", "rm -rf", "s1"),
+            ("aaaa1111", "deny", "rm -rf", "s2"),
+            ("aaaa1111", "deny", "sudo", "s3"),
+            // Excluded: not a deny.
+            ("aaaa1111", "ask", "git push", "s4"),
+            // Excluded: a different session.
+            ("bbbb2222", "deny", "curl", "s5"),
+        ] {
+            log::append_safety(
+                &state,
+                &log::SafetyDecision {
+                    ts: now,
+                    session,
+                    mode: "headless",
+                    verdict,
+                    family,
+                    command_sha256: sha,
+                    policy_sha256: "p",
+                    launch_policy_sha256: None,
+                    attestation: "not-present",
+                    matched_pattern: None,
+                    origin: Some("built-in"),
+                    platform: "linux",
+                },
+            )
+            .expect("append");
+        }
+
+        let mut env = env_for(state.root());
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaa1111".to_string(),
+        );
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("blocked: 3 this session \u{b7} top: rm -rf (2), sudo (1)"),
+            "got {text}"
+        );
+    }
+
+    /// Nothing logged yet, and nothing to logged with `verdict == "deny"`
+    /// for this session, must render byte-identical to before this line
+    /// existed -- no `blocked:` text at all.
+    #[test]
+    fn status_omits_the_blocked_line_with_no_denials() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("blocked:"), "got {text}");
     }
 
     /// The fourth surface change: a window whose `resets_at` has provably
