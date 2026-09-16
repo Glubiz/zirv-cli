@@ -2912,8 +2912,30 @@ undirected mail addressed to `any` in this repository is visible. With a binding
 existing directed delivery envelopes can locate that recipient's mail across
 mailbox directories; unrelated broadcast mail stays repository-scoped.
 
-For Codex, add a server entry to the operator's `~/.codex/config.toml`, using
-the real absolute paths:
+**New Claude Code and Codex sessions launched through Zirv register this bridge
+automatically.** This includes chat/wrap, dashboard panes, headless workers,
+loop cycles and their supervised restarts. No `.mcp.json` or manual server
+entry is needed. The launch pins the current Zirv executable, canonical repository,
+operator state directory and stable inbox address. Install the updated Zirv
+binary and start a new session to discover its tools; an already-running host
+keeps its existing server process until restarted.
+
+Zirv supplies a launch-only `zirv` server entry using Claude's `--mcp-config`
+or Codex's `-c` overrides. Other named servers remain configured. The `zirv`
+name is reserved for this automatic entry during the launch. No project or
+user host settings are edited. On Windows, Zirv writes Claude's generated JSON
+under the private state directory's `mcp-launch/` to keep JSON off shell-shim
+command lines; users do not create or maintain that file.
+
+Set `ZIRV_CTX_MCP_AUTOREGISTER=0` (also `false` or `off`) to opt out.
+Claude's explicit `--strict-mcp-config` is respected and suppresses automatic
+registration. `wrap --no-supervise` remains passthrough. Unsupported hosts and
+sessions launched directly outside Zirv retain their own registration setup.
+An unavailable automatic configuration prints a warning and leaves the host
+launch available.
+
+For a **direct Codex launch outside Zirv**, add a server entry to the operator's
+`~/.codex/config.toml`, using the real absolute paths:
 
 ```toml
 [mcp_servers.zirv]
@@ -2921,9 +2943,8 @@ command = "/absolute/path/to/zirv"
 args = ["ctx", "mcp", "serve", "--repo", "/absolute/path/to/project"]
 ```
 
-For Claude Code, save this as an operator-owned `zirv-mcp.json` and pass it
-for a single wrapped launch with
-`zirv ctx wrap -- claude --mcp-config /absolute/path/to/zirv-mcp.json`:
+For a **direct Claude Code launch outside Zirv**, pass this JSON through
+`--mcp-config` (an inline JSON string or an operator-owned file):
 
 ```json
 {
@@ -2943,15 +2964,14 @@ forward that setting through its MCP server environment configuration.
 See the official [Codex MCP](https://developers.openai.com/codex/mcp) and
 [Claude Code MCP](https://code.claude.com/docs/en/mcp) configuration references.
 
-The server does not register itself automatically or change host settings.
-Its seven tools neither consume mail nor write memory, run commands, launch
+The server's seven tools neither consume mail nor write memory, run commands, launch
 workers, or advance workflows. Existing hooks, CLI checkpoints and supervisor
 recovery continue independently. Reading a registered report does not certify
 that its claims are correct. Mail mutations, dispatch,
 and incoming event delivery are follow-on work tracked in
 [issue #658](https://github.com/Glubiz/zirv-cli/issues/658).
 
-Check the server before configuring a host:
+Check the local server connection:
 
 ```bash
 zirv ctx mcp doctor --repo /absolute/path/to/project
@@ -2973,7 +2993,8 @@ ordinary zirv CLI for that repository before starting the host.
 
 | Surface | Authority and enforcement |
 |---|---|
-| Executable and `--repo` | Chosen by the operator's host configuration at launch; tool arguments cannot change either. The repository directory is opened once for artifact access. |
+| Executable and `--repo` | Pinned by the Zirv supervisor for automatic registration, or chosen by explicit operator host configuration; tool arguments cannot change either. The repository directory is opened once for artifact access. |
+| Automatic registration | A launch-only `zirv` entry for Claude Code/Codex. No project/user host config writes or changes to other named servers; operator opt-out and Claude's strict MCP selection are respected. Codex receives operator environment override names, never credential values on argv. |
 | `policy.tool_access` | Re-read for every call. `deny` and `ask` refuse calls; this server has no approval-granting channel. A malformed configuration also refuses reads. |
 | Memory | Existing `memory.enabled`, `memory.shared_enabled`, and retrieval budgets apply. A shared key cannot shadow an enabled private/global key, even if that trusted fact misses the query budget. |
 | Artifact IDs | Resolved in this repository's existing artifact registry. Payload access uses a directory capability to reject traversal and symlink escapes; arbitrary file paths are not tool arguments. |

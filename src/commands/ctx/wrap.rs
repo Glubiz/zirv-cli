@@ -1711,7 +1711,16 @@ fn relaunch(
         pixel_height: 0,
     })?;
 
-    let command = relaunch_command(adapter, handoff, extra, screen_thresholds, state, session);
+    let mut extra = extra.to_vec();
+    let mcp_args = super::mcp::launch::arguments(
+        adapter.name(),
+        repo,
+        state,
+        &super::sessions::short_id(session),
+        &extra,
+    );
+    super::mcp::launch::append(&mut extra, mcp_args);
+    let command = relaunch_command(adapter, handoff, &extra, screen_thresholds, state, session);
     // FIX 2a (command-injection defense): the relaunch rebuilds its own
     // CommandBuilder from the adapter's Command, so -- like the first launch
     // below and the dashboard pane -- it must clear the cmd.exe argv-reparse
@@ -2191,20 +2200,28 @@ pub fn run_with(
     // same cmd.exe argv-reparse policy over the full downstream argv -- the
     // wrapped command's own args plus zirv's injected prompt args, which carry
     // repo-sourced text. A no-op off Windows and for any non-shim program.
-    {
-        let mut guarded: Vec<String> = rest.to_vec();
-        guarded.extend(policy_extra.iter().cloned());
-        guarded.extend(prompt_args.iter().cloned());
-        adapters::guard_cmd_shim_reparse(program, &guarded)?;
+    let mut child_args: Vec<String> = rest.to_vec();
+    super::mcp::launch::append(
+        &mut child_args,
+        policy_extra
+            .iter()
+            .chain(prompt_args.iter())
+            .cloned()
+            .collect(),
+    );
+    if !policy_skip {
+        let mcp_args = super::mcp::launch::arguments(
+            adapter.name(),
+            repo,
+            &state_dir,
+            session_guard.short(),
+            &child_args,
+        );
+        super::mcp::launch::append(&mut child_args, mcp_args);
     }
+    adapters::guard_cmd_shim_reparse(program, &child_args)?;
     let mut command = CommandBuilder::new(program);
-    for arg in rest {
-        command.arg(arg);
-    }
-    for arg in &policy_extra {
-        command.arg(arg);
-    }
-    for arg in &prompt_args {
+    for arg in &child_args {
         command.arg(arg);
     }
     command.cwd(repo);

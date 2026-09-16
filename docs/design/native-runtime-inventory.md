@@ -202,6 +202,7 @@ installed binary during self-update; never spawns it).
 | Entry point | Path | Symbol | Owner | Notes |
 |---|---|---|---|---|
 | MCP connection diagnostic | `src/commands/ctx/mcp/doctor.rs` | `run` | shared | self-executes only the read-only MCP server to verify discovery and a snapshot call; no model is invoked |
+| Wrapped-host MCP registration | `src/commands/ctx/mcp/launch.rs` | `arguments` | harness-backend | names the current Zirv executable in launch-only Claude Code/Codex MCP settings; no model is invoked here |
 | Official provider execution | `src/commands/ctx/runtime/execution.rs` | `run` | N24 (#650) | official unmodified Claude Code owns model/agent loop; native UI and Zirv MCP broker own presentation/effects; no subscription token transport |
 | Native Anthropic Messages request | `src/commands/ctx/provider/anthropic.rs` | `perform_blocking` | N07 (#476) | direct HTTPS/SSE transport behind `ProviderAdapter`; no vendor CLI or SDK agent loop |
 | Native OpenAI Responses request | `src/commands/ctx/provider/openai.rs` | `perform_blocking` | N08 (#477) | direct HTTPS/SSE transport behind `ProviderAdapter`; no Codex binary, SDK, or App Server |

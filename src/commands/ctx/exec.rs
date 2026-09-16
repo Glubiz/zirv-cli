@@ -1346,7 +1346,7 @@ fn run_with_clock_inner<W: Write>(
             agent_name.is_some(),
             &args.command,
         );
-    let policy_extra = if policy_skip {
+    let mut policy_extra = if policy_skip {
         Vec::new()
     } else {
         adapters::policy_launch_args(
@@ -1369,6 +1369,15 @@ fn run_with_clock_inner<W: Write>(
             policy_extra.join(" ")
         },
     });
+    if !policy_skip {
+        policy_extra.extend(super::mcp::launch::arguments(
+            adapter.name(),
+            repo,
+            &state,
+            &registry_short,
+            &user_extra,
+        ));
+    }
     // Issue #420: heal any self-healable (`Outdated`) hook entry, then warn
     // at most once per 24h if something still drifted. Best-effort: no home
     // directory is not a reason to fail the launch.
@@ -1683,10 +1692,16 @@ fn run_with_clock_inner<W: Write>(
         // comment for why `flags_pin_policy` still consulted the launch's
         // own trailing flags (folded into `user_extra` above) rather than
         // this branch's fixed command.
-        let mut command = build_command(&launch_command, repo)?;
-        for arg in policy_extra.iter().chain(prompt_args.iter()) {
-            command.arg(arg);
-        }
+        let mut argv = launch_command.clone();
+        super::mcp::launch::append(
+            &mut argv,
+            policy_extra
+                .iter()
+                .chain(prompt_args.iter())
+                .cloned()
+                .collect(),
+        );
+        let command = build_command(&argv, repo)?;
         (command, None)
     };
     apply_session_env(&mut command, &session);
@@ -7387,6 +7402,10 @@ mod tests {
         assert!(
             argv.contains("--allowedTools=") && argv.contains("Edit(./**)"),
             "the generated permission set must reach it too: {argv}"
+        );
+        assert!(
+            argv.contains("--mcp-config=") && argv.contains("cccccccc"),
+            "the supervised launch must register the bridge with its stable inbox: {argv}"
         );
     }
 

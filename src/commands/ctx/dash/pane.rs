@@ -1385,12 +1385,21 @@ impl Pane {
     ) -> CtxResult<Pane> {
         let PaneSpec {
             agent_name,
-            argv,
+            mut argv,
             role,
             verb,
             session_id,
             title,
         } = spec;
+
+        let mcp_args = super::super::mcp::launch::arguments(
+            &agent_name,
+            repo,
+            state,
+            seat_short.unwrap_or(&sessions::short_id(&session_id)),
+            &argv,
+        );
+        super::super::mcp::launch::append(&mut argv, mcp_args);
 
         let (cols, rows) = size;
         let pair = native_pty_system().openpty(PtySize {
@@ -1440,6 +1449,29 @@ impl Pane {
         wrap::answer_inherit_cursor_probe(&mut *first_writer);
         let writer = Arc::new(Mutex::new(first_writer));
 
+        // Publish the inbox identity before the child can start its MCP server.
+        let server = SignalServer::bind(&state.socket_for(&session_id)).ok();
+        if let Some(server) = &server {
+            wrap::publish_socket_path(state, &session_id, server.path());
+        }
+
+        let mut record = Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
+        // Issue #552: a rollover successor answers to the seat's own address.
+        if let Some(seat_short) = seat_short {
+            record = record.with_stable_short(seat_short);
+        }
+        // `owner_pid` is left unset here: `SessionGuard::register` below
+        // stamps it with this process's own pid -- the dashboard's -- for
+        // every pane, orchestrator and worker alike, the same seam every
+        // other registration path shares (`sessions::Record::owner_pid`,
+        // `dash::assemble_sidebar`).
+        let record = if server.is_some() {
+            record
+        } else {
+            record.unreachable()
+        };
+        let mut guard = SessionGuard::register(state, record);
+
         let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
         // P2/P3: adopted on the very next statement after the spawn, ahead of
@@ -1453,6 +1485,9 @@ impl Pane {
         // report one; there the guard is inert and behaviour is exactly
         // today's.
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
+        if let Some(pid) = child.process_id() {
+            guard.adopt_child_pid(pid);
+        }
         // Issue #330: a pane's child is spawned BY the dashboard, so it would
         // otherwise inherit the operator UI's own priority class and hand it
         // straight on to every cargo process it runs. The posture is stamped
@@ -1491,44 +1526,6 @@ impl Pane {
             }
         });
 
-        let server = SignalServer::bind(&state.socket_for(&session_id)).ok();
-        if let Some(server) = &server {
-            wrap::publish_socket_path(state, &session_id, server.path());
-        }
-
-        let mut record = Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
-        // Issue #552: a rollover successor answers to the seat's own address.
-        if let Some(seat_short) = seat_short {
-            record = record.with_stable_short(seat_short);
-        }
-        // `Record::new` stamps `std::process::id()` -- the dashboard's own pid,
-        // identical for every pane, so liveness could not tell one pane's child
-        // from another's. Stamp the child's real pid instead. `process_id`
-        // returns `None` on a platform that cannot report it; there we leave
-        // the dashboard's pid rather than a bogus one.
-        //
-        // Review round 2 finding 1 (issue #152): `start_time` must move with
-        // `pid` in the same breath, via the same `sessions::process_start_secs`
-        // reader `Record::new` itself used -- see `SessionGuard::
-        // adopt_child_pid`'s doc comment for why leaving the dashboard's own
-        // start time in place here is a guaranteed false "dead" the moment
-        // this pane's very first liveness probe hits `EPERM` (the everyday
-        // sandboxed case issue #146 exists for).
-        if let Some(child_pid) = child.process_id() {
-            record.pid = child_pid;
-            record.start_time = sessions::process_start_secs(child_pid);
-        }
-        // `owner_pid` is left unset here: `SessionGuard::register` below
-        // stamps it with this process's own pid -- the dashboard's -- for
-        // every pane, orchestrator and worker alike, the same seam every
-        // other registration path shares (`sessions::Record::owner_pid`,
-        // `dash::assemble_sidebar`).
-        let record = if server.is_some() {
-            record
-        } else {
-            record.unreachable()
-        };
-        let guard = SessionGuard::register(state, record);
         // Issue #358 (task 5): the logical orchestrator seat this pane sits
         // in -- only ever an orchestrator pane's, since nothing rolls a
         // worker over. The model comes from `turn_env`, the single source of
@@ -3079,7 +3076,7 @@ impl Pane {
             spec:
                 PaneSpec {
                     agent_name: new_agent_name,
-                    argv: new_argv,
+                    argv: mut new_argv,
                     ..
                 },
             turn_env,
@@ -3088,6 +3085,14 @@ impl Pane {
             turn_signal_capable,
             idle_quiet,
         } = launch;
+        let mcp_args = super::super::mcp::launch::arguments(
+            &new_agent_name,
+            repo,
+            &self.state_dir,
+            self.short(),
+            &new_argv,
+        );
+        super::super::mcp::launch::append(&mut new_argv, mcp_args);
 
         // Finding #2: every fallible step for the *successor* runs first,
         // before the old child is touched at all. Previously the old child

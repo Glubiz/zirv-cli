@@ -113,7 +113,7 @@ async fn check(
             "tools": names,
             "inbox_session": snapshot["data"]["inbox_session"],
             "checks": ["initialize", "tools/list", "session_snapshot"],
-            "host_registration": "not inspected; configure this executable and repository in your MCP host"
+            "host_registration": "not inspected; Zirv-managed Claude Code/Codex launches register automatically; other hosts need explicit configuration"
         }))
     };
     let result = match tokio::time::timeout(timeout, operation).await {
