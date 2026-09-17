@@ -337,6 +337,89 @@ mouse = true                  # ZIRV_CTX_DASH_MOUSE
 idle_quiet_ms = 10000          # ZIRV_CTX_DASH_IDLE_QUIET_MS -- repo-settable
 ```
 
+### Harness proxy
+
+The harness proxy is an opt-in intake decision made once, before a session
+launches: from the request text alone it decides intent, complexity, risk,
+execution mode (Direct/Bounded/Orchestrated), a workflow to start (or none),
+the orchestrator harness+model, and the worker tier, then hands that decision
+to `zirv chat`. It implements part of the execution-profile seam tracked in
+[issue #537](https://github.com/Glubiz/zirv-cli/issues/537); the deterministic
+classifier, team compiler, workflow definitions and gates it sits in front of
+are unchanged.
+
+**Decider chain.** `decide()` always computes the deterministic baseline
+first, then runs at most one model decider, starting at `cfg.proxy.decider`:
+TypeSafe Jev over HTTP (skipped with a recorded fallback when
+`TYPESAFE_API_KEY` is unset, or on any transport/HTTP error) → the existing
+helper-model chokepoint (skipped when no adapter is ready or the call fails)
+→ the deterministic baseline as is. A field whose model confidence is below
+`min_confidence` keeps the baseline value instead, with a recorded reason.
+`complexity`, `risk` and `execution` are always merged with `max(model,
+baseline)` — a monotonic floor, so a model decision can raise them but never
+lower them — and `validation` is recomputed from the merged complexity and
+risk, so a raise always propagates. The winning decision is then validated
+against the live roster (an unready harness, an unknown model alias, or an
+unknown workflow id falls back to the baseline with a reason) before it is
+applied.
+
+**When it takes over.** Bare `zirv` and `zirv chat` open the proxy's intake
+view first only when `[proxy] enabled = true` and the configured decider has a
+usable model: `typesafe` needs a non-empty `model` and the environment variable
+named by `credential_env` set; `helper` needs a resolvable default adapter;
+`deterministic` never takes over. Otherwise the launch proceeds exactly as it
+does today — the full orchestrator harness — after one `zirv ▸` advisory line
+carrying the reason, for example `proxy: enabled but TYPESAFE_API_KEY is
+unset; starting the orchestrator harness`.
+
+**What `zirv chat` does with it.** When the proxy is active, the decided
+harness and `--model` replace the resolved adapter and `cfg.chat.model`
+before launch; the decision's workflow starts with the request text as the
+first prompt when the repo has no workflow already active; and one `zirv ▸`
+line announces the outcome, e.g.:
+
+```
+zirv ▸ proxy: orchestrated · claude/fable · workers standard · workflow feature (substantial/medium) · typesafe 0.81
+```
+
+**`zirv ctx proxy [--json] [REQUEST]`** decides and prints without launching
+anything. `REQUEST` is read from stdin when omitted and stdin is not a tty;
+human output is the announce line plus one line per field with its source
+and confidence, then reasons and fallbacks; `--json` prints the full
+decision. `zirv ctx chat --proxy` / `--no-proxy` overrides `cfg.proxy.enabled`
+for one launch; `--resume` and `--simple` always skip the proxy.
+
+Disabled by default:
+
+```toml
+# ~/.zirv/ctx.toml
+[proxy]
+enabled = false              # ZIRV_CTX_PROXY_ENABLED
+decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY_DECIDER
+min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
+request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
+
+[proxy.typesafe]
+base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
+credential_env = "TYPESAFE_API_KEY"       # ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV
+model = "jev-latest"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL
+timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
+```
+
+**Privacy.** The state sent to a model decider carries the request text
+(truncated to `request_max_bytes`) plus names and counts only — repository
+name, changed-file/line counts, active workflow, primary extensions, harness
+readiness/headroom, and workflow ids/descriptions — never file contents or
+secrets. The TypeSafe credential is read only from the environment variable
+named by `credential_env`.
+
+**Price.** TypeSafe Jev is priced through the catalogue's `typesafe` vendor
+at $0.042 per MTok input, output free — see [Model
+catalogue](#model-catalogue) — and costs at most one bounded call per launch.
+
+The native runtime applies the same decision behind its existing gate; this
+feature does not change that gate.
+
 ### `zirv memory`
 
 `zirv memory` manages this repository's memory bank without starting an AI
@@ -1829,8 +1912,9 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
-| `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
+| `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
 | `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` reports coming soon and refuses to start (also `zirv agent`) |
+| `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
@@ -3094,6 +3178,18 @@ retrieval_max_entries = 6      # max number of recalled entries, independent of 
 banner = true   # the one-time launch banner
 bar = true      # the reserved one-row status bar
 events = true   # the `zirv ▸` announcement channel on stderr
+
+[proxy]
+enabled = false              # ZIRV_CTX_PROXY_ENABLED
+decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY_DECIDER
+min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
+request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
+
+[proxy.typesafe]
+base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
+credential_env = "TYPESAFE_API_KEY"       # ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV
+model = "jev-latest"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL
+timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 ```
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
@@ -3179,7 +3275,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, any `price.*` key, `review`, `worker.claude`,
+`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
 `handover`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
@@ -3388,6 +3484,14 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `session.history` | `ZIRV_CTX_SESSION_HISTORY` |
 | `session.scrollback_rows` | `ZIRV_CTX_SESSION_SCROLLBACK_ROWS` |
 | `session.stale_after_secs` | `ZIRV_CTX_SESSION_STALE_AFTER_SECS` |
+| `proxy.enabled` | `ZIRV_CTX_PROXY_ENABLED` |
+| `proxy.decider` | `ZIRV_CTX_PROXY_DECIDER` |
+| `proxy.min_confidence` | `ZIRV_CTX_PROXY_MIN_CONFIDENCE` |
+| `proxy.request_max_bytes` | `ZIRV_CTX_PROXY_REQUEST_MAX_BYTES` |
+| `proxy.typesafe.base_url` | `ZIRV_CTX_PROXY_TYPESAFE_BASE_URL` |
+| `proxy.typesafe.credential_env` | `ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV` |
+| `proxy.typesafe.model` | `ZIRV_CTX_PROXY_TYPESAFE_MODEL` |
+| `proxy.typesafe.timeout_secs` | `ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS` |
 | `capabilities` | `ZIRV_CTX_CAPABILITIES` |
 | `runtime` | `ZIRV_CTX_RUNTIME` |
 
@@ -5095,9 +5199,13 @@ same string, so the id is shown only where it differs.
 | amazon | `nova-premier` | Deep |
 | amazon | `nova-pro` | Standard |
 | amazon | `nova-lite` | Cheap |
+| typesafe | `jev` (`jev-latest`) | Cheap |
 
 `deepseek` has no `Standard` rung, `minimax` has only its one `Standard`
 rung, and `meta` has no `Deep` rung — not every vendor fills all three tiers.
+`typesafe` is not a harness vendor: it is used only by the [harness
+proxy](#harness-proxy)'s TypeSafe Jev decider, priced at $0.042 per MTok
+input and $0 output.
 Beyond the ladder, zirv also recognises `claude-fable-5` and the `[1m]`
 long-context variants `claude-fable-5[1m]`, `claude-fable-5-1[1m]`,
 `claude-mythos-5[1m]` and `claude-opus-5[1m]` on Anthropic, and

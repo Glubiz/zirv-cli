@@ -865,6 +865,33 @@ fn describe_chat(cfg: &CtxConfig, colour: bool) -> String {
     }
 }
 
+/// The `proxy:` status line (issue #537 seam): `off` when `[proxy] enabled`
+/// is false, `enabled (<reason>)` when enabled but `proxy::activation`
+/// finds no usable decider for this launch (the same predicate `zirv ctx
+/// chat` itself consults before opening the intake view), otherwise the
+/// most recently persisted decision for this repo rendered the same way a
+/// launch would announce it (`proxy::announce_line`), or a note that none
+/// has been recorded yet.
+fn describe_proxy(cfg: &CtxConfig, state_dir: &Path, repo: &Path, colour: bool) -> String {
+    if !cfg.proxy.enabled {
+        return format!(
+            "{} {}",
+            label(colour, "proxy:"),
+            style::paint("off", Tone::Muted, colour)
+        );
+    }
+    if let Err(reason) = super::proxy::activation(cfg) {
+        return format!("{} enabled ({reason})", label(colour, "proxy:"));
+    }
+    match super::proxy::latest_for_repo(state_dir, repo) {
+        Some(decision) => super::proxy::announce_line(&decision),
+        None => format!(
+            "{} enabled, no decision recorded yet",
+            label(colour, "proxy:")
+        ),
+    }
+}
+
 /// Issue #85: on a launch shape that cannot safely carry an adapter's own
 /// system-prompt injection argv (the Windows `cmd.exe /c <shim>` form an
 /// npm-installed `codex.cmd` resolves to -- `CodexAdapter::system_prompt_
@@ -1330,6 +1357,7 @@ fn render_report<W: Write>(
     match &cfg_result {
         Ok(cfg) => {
             writeln!(w, "\n{}", describe_chat(cfg, colour))?;
+            writeln!(w, "{}", describe_proxy(cfg, state.root(), repo, colour))?;
             for layer in &cfg.unparsable_layers {
                 writeln!(
                     w,
@@ -3962,6 +3990,99 @@ mod tests {
             describe_chat(&configured_cfg, false),
             "chat: claude (configured)"
         );
+    }
+
+    /// `describe_proxy` is `off` while `[proxy] enabled` is false, regardless
+    /// of any other configuration.
+    #[test]
+    fn status_proxy_line_is_off_when_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            describe_proxy(&CtxConfig::default(), state.root(), repo.path(), false),
+            "proxy: off"
+        );
+    }
+
+    /// Once enabled, a decider `proxy::activation` finds unusable (here: the
+    /// deterministic decider, which never takes over a launch per the spec)
+    /// is named inline as `enabled (<reason>)` -- the same predicate `zirv
+    /// ctx chat` itself consults before opening the intake view.
+    #[test]
+    fn status_proxy_line_names_the_activation_reason_when_not_usable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.decider = crate::commands::ctx::config::ProxyDecider::Deterministic;
+        let reason = crate::commands::ctx::proxy::activation(&cfg).expect_err("must be err");
+        assert_eq!(
+            describe_proxy(&cfg, state.root(), repo.path(), false),
+            format!("proxy: enabled ({reason})")
+        );
+    }
+
+    /// Enabled with a usable decider: no decision persisted yet degrades to
+    /// a plain note, and once one is persisted for this repo, the line is
+    /// exactly that decision's own `announce_line` -- the same rendering a
+    /// launch prints.
+    #[test]
+    fn status_proxy_line_reports_the_latest_decision_or_lack_thereof() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.typesafe.credential_env = "STATUS_TEST_PROXY_KEY_637".to_string();
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var("STATUS_TEST_PROXY_KEY_637", "secret");
+        }
+        assert!(crate::commands::ctx::proxy::activation(&cfg).is_ok());
+
+        assert_eq!(
+            describe_proxy(&cfg, state.root(), repo.path(), false),
+            "proxy: enabled, no decision recorded yet"
+        );
+
+        let decision = crate::commands::ctx::proxy::decision::ProxyDecision {
+            request_sha256: "x".repeat(64),
+            repo: repo.path().to_path_buf(),
+            intent: crate::commands::workflow::classify::Intent::Feature,
+            complexity: crate::commands::workflow::classify::Complexity::Substantial,
+            risk: crate::commands::workflow::classify::RiskBand::Medium,
+            execution: crate::commands::workflow::profile::ExecutionMode::Orchestrated,
+            validation: crate::commands::workflow::profile::ValidationProfile::default(),
+            workflow: Some("feature".to_string()),
+            orchestrator: crate::commands::ctx::proxy::decision::Seat {
+                harness: "claude".to_string(),
+                model: "fable".to_string(),
+            },
+            worker_tier: crate::commands::ctx::catalogue::Tier::Standard,
+            needs_clarification: 0.0,
+            decider: crate::commands::ctx::proxy::decision::Decider::Typesafe,
+            confidence: std::collections::BTreeMap::from([("seat".to_string(), 0.81_f32)]),
+            reasons: Vec::new(),
+            fallbacks: Vec::new(),
+            elapsed_ms: 12,
+            usage: None,
+            created_at: 0,
+        };
+        crate::commands::ctx::proxy::persist(state.root(), &decision).expect("persist");
+
+        assert_eq!(
+            describe_proxy(&cfg, state.root(), repo.path(), false),
+            crate::commands::ctx::proxy::announce_line(&decision)
+        );
+
+        // SAFETY (test-only): cleans up the var this test set above --
+        // after every assertion, since `describe_proxy` itself re-checks
+        // `activation` (and therefore this var) on every call.
+        unsafe {
+            std::env::remove_var("STATUS_TEST_PROXY_KEY_637");
+        }
     }
 
     /// When nothing is both enabled and ready, `describe_chat` degrades to

@@ -4991,8 +4991,32 @@ pub fn spawn_interactive(
         let _retained_writer = retained_writer;
         let mut backend = backend;
         let mut tools = tools;
+        let mut config = config;
+        let mut first_turn = true;
         let env_fn = super::super::config::env_from_process();
         for text in submit_rx.iter() {
+            // Issue #537 (T2b): the harness proxy's decision applies once,
+            // on this session's very first submitted text -- a native pane
+            // always mints a FRESH journal session (see this function's own
+            // doc comment above), so the first turn through this loop IS the
+            // session's first turn, and a local flag is the honest signal
+            // rather than an inferred one. A no-op whenever `proxy::
+            // activation` finds no usable decider (disabled, or the
+            // deterministic decider, which never takes over a launch), so a
+            // disabled or unusable proxy leaves this session byte-identical
+            // to today.
+            if first_turn {
+                first_turn = false;
+                apply_proxy_first_turn(
+                    &worker_cfg,
+                    &worker_state,
+                    &worker_repo,
+                    &text,
+                    &worker_home,
+                    &mut config.route,
+                    &progress_tx,
+                );
+            }
             // A new turn re-arms the dialog: an interrupt cancels the turn
             // that was running, never the session's ability to be asked again.
             worker_approvals.resume();
@@ -5103,6 +5127,71 @@ pub fn spawn_interactive(
         worker: Some(worker),
         writer_permit_held,
     })
+}
+
+/// Issue #537 (T2b): applies the harness proxy's decision to a native
+/// session's first submitted turn -- starts the decided workflow (if any;
+/// a skip is logged through `progress_tx`'s own notice channel, the pane's
+/// existing "tell the operator, don't fail the turn" mechanism) and, when
+/// the decision names a route on this harness's configured route table,
+/// records that [`super::super::provider::RouteId`] onto `route` -- the
+/// journal/accounting identity only. The transport this session already
+/// opened (`provider`/`tools`, built once in `build_transport` before the
+/// worker thread starts) is NOT rebuilt: doing so would mean re-deriving a
+/// writer lease already consumed into `retained_writer`, re-running the
+/// brokered-tools wrap and the native-account placement check, all from
+/// inside the first-turn hot path. Both branches say so explicitly through
+/// a notice, so the pane never claims a provider switch that did not
+/// happen. `route` is left exactly as the caller's role configured it when
+/// no native route matches or none is configured.
+///
+/// A no-op in every other respect: `proxy::activation` gates the whole
+/// thing, so a disabled proxy, or one enabled with the deterministic
+/// decider (which never takes over a launch), touches nothing here.
+fn apply_proxy_first_turn(
+    cfg: &super::super::config::CtxConfig,
+    state: &super::super::state::StateDir,
+    repo: &std::path::Path,
+    request: &str,
+    home: &std::path::Path,
+    route: &mut RouteIdentity,
+    progress_tx: &mpsc::Sender<InteractiveProgress>,
+) {
+    if super::super::proxy::activation(cfg).is_err() {
+        return;
+    }
+    let decision = super::super::proxy::decide(cfg, state.root(), repo, request);
+    match super::super::proxy::launch::start_workflow_for(&decision, state.root(), repo, request) {
+        Ok(super::super::proxy::launch::WorkflowStart::Skipped { reason }) => {
+            let _ = progress_tx.send(InteractiveProgress::Notice(format!("proxy: {reason}")));
+        }
+        Ok(super::super::proxy::launch::WorkflowStart::Started { .. }) => {}
+        Err(error) => {
+            let _ = progress_tx.send(InteractiveProgress::Notice(format!(
+                "proxy: workflow not started ({error})"
+            )));
+        }
+    }
+
+    let native_config = super::super::provider::config::NativeConfig::load(home, repo)
+        .ok()
+        .flatten();
+    match native_config
+        .as_ref()
+        .and_then(|native| super::super::proxy::native::route_for_decision(&decision, native))
+    {
+        Some(route_id) => {
+            let _ = progress_tx.send(InteractiveProgress::Notice(format!(
+                "proxy: route {route_id} recorded; transport unchanged this session"
+            )));
+            route.route = route_id;
+        }
+        None => {
+            let _ = progress_tx.send(InteractiveProgress::Notice(
+                "proxy: no matching native route; keeping the configured role route".to_string(),
+            ));
+        }
+    }
 }
 
 /// `NativeSessionConfig::task` needs a validated `journal::TaskId`, but by
@@ -8137,6 +8226,88 @@ mod tests {
                 .iter()
                 .any(|row| row.key == "native" && row.runs > 0),
             "`zirv ctx spend --by harness` reports the seat's own native spend"
+        );
+    }
+
+    /// Issue #537 (T2b): the harness proxy's decision applies on a native
+    /// session's FIRST submitted turn only. Enabled against a typesafe
+    /// endpoint that refuses the connection immediately (a local TCP
+    /// listener bound then dropped before use, so nothing is ever
+    /// listening) -- `proxy::decide` never fails even so, it falls through
+    /// to the deterministic baseline and still persists a decision.
+    /// `ZIRV_CTX_AGENT` names an adapter that does not exist, so the
+    /// in-process helper fallback fails on a plain lookup rather than
+    /// touching any real adapter or subprocess. Two turns are submitted;
+    /// only ONE decision is ever appended to `proxy-decisions.jsonl`.
+    #[test]
+    fn proxy_decision_applies_once_on_the_first_submitted_turn_only() {
+        let (repo, state, _tree, mut env) = interactive_shutdown_fixture();
+
+        let closed_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+            // The listener is dropped here: nothing answers on this port
+            // from this point on, so a connection attempt refuses fast.
+        };
+        let credential_env = "NATIVE_TEST_PROXY_KEY_537";
+        env.insert("ZIRV_CTX_PROXY_ENABLED".to_string(), "true".to_string());
+        env.insert(
+            "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL".to_string(),
+            format!("http://127.0.0.1:{closed_port}"),
+        );
+        env.insert(
+            "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV".to_string(),
+            credential_env.to_string(),
+        );
+        env.insert(
+            "ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS".to_string(),
+            "1".to_string(),
+        );
+        env.insert(
+            "ZIRV_CTX_AGENT".to_string(),
+            "zirv-test-no-such-adapter-537".to_string(),
+        );
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+
+        let session = spawn_fixture_interactive_session(repo.path(), &env);
+        session.submit("first request".to_string()).expect("submit");
+        wait_for_idle(&session);
+        session
+            .submit("second request".to_string())
+            .expect("submit");
+        wait_for_idle(&session);
+        session.shutdown();
+
+        // SAFETY (test-only): cleans up the var this test set above.
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+
+        let decisions_path = state.root().join("proxy-decisions.jsonl");
+        let text = std::fs::read_to_string(&decisions_path).unwrap_or_default();
+        let count = text.lines().filter(|line| !line.trim().is_empty()).count();
+        assert_eq!(count, 1, "decide must run on the first turn only: {text}");
+    }
+
+    /// Issue #537 (T2b): `[proxy] enabled = false` (the default) leaves a
+    /// native session's first turn exactly as before -- no decision is ever
+    /// computed or persisted, so `proxy-decisions.jsonl` never appears.
+    #[test]
+    fn proxy_disabled_leaves_the_native_session_unaffected() {
+        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+
+        let session = spawn_fixture_interactive_session(repo.path(), &env);
+        session.submit("do the thing".to_string()).expect("submit");
+        wait_for_idle(&session);
+        session.shutdown();
+
+        let decisions_path = state.root().join("proxy-decisions.jsonl");
+        assert!(
+            !decisions_path.exists(),
+            "a disabled proxy must never persist a decision"
         );
     }
 

@@ -27,6 +27,8 @@
 
 use std::borrow::Cow;
 
+use serde::{Deserialize, Serialize};
+
 use super::price::ModelPrice;
 
 /// The survey date behind every vendor in this module other than
@@ -43,7 +45,12 @@ pub const CATALOGUE_AS_OF: &str = "2026-09-07";
 /// against. Not every vendor fills all three -- a two-rung vendor like
 /// `deepseek` has no `Standard` entry, and a one-rung vendor like `minimax`
 /// fills only one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` added for the harness proxy (issue #537 seam):
+/// `proxy::ProxyDecision::worker_tier` persists this value to
+/// `proxy-decisions.jsonl` and round-trips it through `--json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Tier {
     Cheap,
     Standard,
@@ -562,6 +569,28 @@ const META_RUNGS: &[Rung] = &[
     },
 ];
 
+/// The harness proxy's own decider vendor (issue #537 seam), not a coding
+/// harness at all: `jev-latest` answers `proxy::decide`'s intake questions
+/// over HTTP (see `proxy::typesafe`). One rung, priced from the docs
+/// (`$0.042/MTok input, output free`) -- `cache_write_micros`/`cache_read_
+/// micros`/`output_micros` are all `0` rather than following this module's
+/// usual cache-rate shortcut: Jev's `/systemone` endpoint is a single bounded
+/// Q&A call with no conversational cache and no billed output tokens, so
+/// there is no cache rate to approximate at all.
+const TYPESAFE_RUNGS: &[Rung] = &[Rung {
+    alias: "jev",
+    id: "jev-latest",
+    strength: 1,
+    context_window: None,
+    price: Some(ModelPrice {
+        input_micros: 42_000,
+        cache_write_micros: 0,
+        cache_read_micros: 0,
+        output_micros: 0,
+    }),
+    tier: Some(Tier::Cheap),
+}];
+
 const AMAZON_RUNGS: &[Rung] = &[
     Rung {
         alias: "nova-premier",
@@ -686,6 +715,13 @@ const VENDORS: &[Vendor] = &[
     Vendor {
         slug: "amazon",
         rungs: AMAZON_RUNGS,
+        default_context_window: None,
+        extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
+    },
+    Vendor {
+        slug: "typesafe",
+        rungs: TYPESAFE_RUNGS,
         default_context_window: None,
         extra_prices: &[],
         as_of: Some(CATALOGUE_AS_OF),
@@ -893,6 +929,39 @@ mod tests {
         assert!(vendor("anthropic").is_some());
         assert!(vendor("openai").is_some());
         assert!(vendor("no-such-vendor").is_none());
+    }
+
+    /// Issue #537 seam: the harness proxy's own decider vendor prices
+    /// `jev-latest` at the documented $0.042/MTok input, output free.
+    #[test]
+    fn typesafe_vendor_resolves_and_prices_jev_latest() {
+        let typesafe = vendor("typesafe").expect("typesafe is a built-in vendor");
+        let rung = rung_of(typesafe, "jev-latest").expect("jev-latest resolves on the ladder");
+        assert_eq!(rung.tier, Some(Tier::Cheap));
+        let table = super::super::price::built_in_table();
+        let usage = crate::commands::ctx::event::TranscriptUsage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::super::price::price("jev-latest", &usage, &table),
+            Some(42_000)
+        );
+    }
+
+    /// The proxy's `worker_tier` field round-trips `Tier` through
+    /// `serde_json` -- required now that `ProxyDecision` derives
+    /// `Serialize + Deserialize` and embeds this enum directly.
+    #[test]
+    fn tier_serializes_as_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&Tier::Standard).unwrap(),
+            "\"standard\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Tier>("\"deep\"").unwrap(),
+            Tier::Deep
+        );
     }
 
     #[test]
@@ -1126,7 +1195,13 @@ mod tests {
     #[test]
     fn every_new_vendor_rung_reuses_the_documented_cache_shortcut() {
         for v in vendors() {
-            if v.slug == "anthropic" || v.slug == "openai" {
+            // `anthropic`/`openai` are hand-verified, not survey data (see
+            // this module's own doc comment). `typesafe` is neither a
+            // coding-model vendor nor a conversational one: `jev-latest` is
+            // a single bounded Q&A call with no cache concept at all, so it
+            // deliberately does NOT follow the survey-vendor cache shortcut
+            // (see `TYPESAFE_RUNGS`'s own doc comment).
+            if v.slug == "anthropic" || v.slug == "openai" || v.slug == "typesafe" {
                 continue;
             }
             for r in v.rungs {

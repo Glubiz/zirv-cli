@@ -1,0 +1,115 @@
+{
+  "cases": [
+    {
+      "name": "typo fix",
+      "request": "Fix the typo in the README's installation heading.",
+      "files": [{"path": "README.md", "lines": 1}],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    },
+    {
+      "name": "README wording",
+      "request": "Improve the wording in the README's quick-start section for clarity.",
+      "files": [{"path": "README.md", "lines": 10}],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    },
+    {
+      "name": "bug with a stack trace",
+      "request": "Fix a bug causing a crash on startup: thread 'main' panicked at src/main.rs:42: called `Option::unwrap()` on a `None` value.",
+      "files": [
+        {"path": "src/main.rs", "lines": 20},
+        {"path": "tests/main_test.rs", "lines": 15}
+      ],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    },
+    {
+      "name": "a feature",
+      "request": "Add a feature: let users export their reports as CSV from the dashboard.",
+      "files": [
+        {"path": "src/reports/csv.rs", "lines": 60},
+        {"path": "src/reports/mod.rs", "lines": 60},
+        {"path": "src/dashboard/export_button.rs", "lines": 60},
+        {"path": "src/api/reports.rs", "lines": 60},
+        {"path": "tests/reports_csv.rs", "lines": 60},
+        {"path": "docs/reports.md", "lines": 60}
+      ],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    },
+    {
+      "name": "architecture redesign",
+      "request": "Redesign the plugin system architecture and migrate every workflow pack onto it.",
+      "files": [
+        {"path": "src/architecture/plugin_system.rs", "lines": 50},
+        {"path": "src/architecture/migration.rs", "lines": 50},
+        {"path": "src/plugins/mod.rs", "lines": 50}
+      ],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    },
+    {
+      "name": "one-line auth change",
+      "request": "One-line change: rotate the shared credential constant used by session auth.",
+      "files": [{"path": "src/auth/session.rs", "lines": 1}],
+      "execution": "bounded",
+      "min_complexity": "trivial",
+      "min_risk": "high",
+      "workflow": null
+    },
+    {
+      "name": "a plain question",
+      "request": "What does the retry logic in src/pace.rs do when the account is rate-limited?",
+      "files": [],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    },
+    {
+      "name": "mixed Danish/English prompt",
+      "request": "Ret venligst denne bug i betalingsmodulet - it crashes on refund with a stack trace.",
+      "files": [
+        {"path": "src/payments/refund.rs", "lines": 20},
+        {"path": "tests/refund_test.rs", "lines": 20}
+      ],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    },
+    {
+      "name": "large-unrelated-branch-diff",
+      "request": "Fix the typo in the README.",
+      "files": [
+        {"path": "src/unrelated-0.rs", "lines": 400},
+        {"path": "src/unrelated-1.rs", "lines": 400},
+        {"path": "src/unrelated-2.rs", "lines": 400},
+        {"path": "src/unrelated-3.rs", "lines": 400},
+        {"path": "src/unrelated-4.rs", "lines": 400},
+        {"path": "src/unrelated-5.rs", "lines": 400},
+        {"path": "src/unrelated-6.rs", "lines": 400},
+        {"path": "src/unrelated-7.rs", "lines": 400},
+        {"path": "src/unrelated-8.rs", "lines": 400},
+        {"path": "src/unrelated-9.rs", "lines": 400},
+        {"path": "src/unrelated-10.rs", "lines": 400},
+        {"path": "src/unrelated-11.rs", "lines": 400},
+        {"path": "src/unrelated-12.rs", "lines": 400},
+        {"path": "src/unrelated-13.rs", "lines": 400},
+        {"path": "src/unrelated-14.rs", "lines": 400},
+        {"path": "src/unrelated-15.rs", "lines": 400},
+        {"path": "src/unrelated-16.rs", "lines": 400},
+        {"path": "src/unrelated-17.rs", "lines": 400},
+        {"path": "src/unrelated-18.rs", "lines": 400},
+        {"path": "src/unrelated-19.rs", "lines": 400}
+      ],
+      "execution": "direct",
+      "min_complexity": "trivial",
+      "workflow": null
+    }
+  ]
+}

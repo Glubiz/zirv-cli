@@ -1,0 +1,941 @@
+//! The harness proxy (issue #537 seam): one inspectable decision --
+//! intent, complexity, risk, execution mode, workflow, orchestrator seat,
+//! worker tier -- computed before any provider turn, printed by `zirv ctx
+//! proxy` and (T2) applied to a `zirv chat` launch.
+//!
+//! [`decide`] always succeeds: it computes a pure, deterministic
+//! [`decision::baseline`] first, then tries at most one model decider
+//! (`typesafe` -> `helper`, per `[proxy] decider`), merges a confident
+//! answer over the baseline (never lowering complexity/risk/execution),
+//! validates the result against the live harness/workflow roster, and
+//! persists it. Disabled by default (`[proxy] enabled = false`); every
+//! launch path is unaffected until an operator opts in.
+
+pub mod decision;
+pub mod launch;
+pub mod llm;
+pub mod native;
+pub mod typesafe;
+
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use clap::Args;
+
+use self::decision::{Answers, Decider, ProxyDecision, Question};
+use super::config::{self, CtxConfig, ProxyDecider};
+use super::{CtxResult, adapters, helper, log, state};
+use crate::commands::workflow::profile::ExecutionMode;
+
+const PROXY_DECISIONS_FILE: &str = "proxy-decisions.jsonl";
+/// The catalogue id `log::Delegation`/`price::price` key the proxy's own
+/// spend row on -- see `catalogue.rs`'s `typesafe` vendor.
+const TYPESAFE_MODEL_ID: &str = "jev-latest";
+
+#[derive(Debug, Args)]
+pub struct ProxyArgs {
+    /// Print the full `ProxyDecision` as JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// The request to decide on. Read from stdin (multi-line, until a blank
+    /// line or EOF) when omitted and stdin is not a terminal.
+    pub request: Option<String>,
+}
+
+fn tier_str(tier: super::catalogue::Tier) -> &'static str {
+    match tier {
+        super::catalogue::Tier::Cheap => "cheap",
+        super::catalogue::Tier::Standard => "standard",
+        super::catalogue::Tier::Deep => "deep",
+    }
+}
+
+fn decider_label(decider: Decider) -> &'static str {
+    match decider {
+        Decider::Typesafe => "typesafe",
+        Decider::Helper => "helper",
+        Decider::Deterministic => "deterministic",
+    }
+}
+
+fn lower_debug<T: std::fmt::Debug>(value: T) -> String {
+    format!("{value:?}").to_lowercase()
+}
+
+/// Whether the harness proxy should take over a `zirv chat` launch (open the
+/// intake view before starting the orchestrator harness). Distinct from
+/// `decide()`'s own fallback chain: this predicate only decides whether the
+/// proxy is even worth trying for THIS launch, so a chat session backed by
+/// a `deterministic` decider does not silently insert an intake step that
+/// can only ever answer from the baseline. `Ok(())` when a usable model
+/// exists for the configured decider; `Err(reason)` (one line, in the same
+/// tone as other `zirv \u{25b8}` advisories) otherwise.
+pub fn activation(cfg: &CtxConfig) -> Result<(), String> {
+    if !cfg.proxy.enabled {
+        return Err("proxy: disabled; starting the orchestrator harness".to_string());
+    }
+    match cfg.proxy.decider {
+        ProxyDecider::Typesafe => {
+            if cfg.proxy.typesafe.model.is_empty() {
+                return Err(
+                    "proxy: enabled but proxy.typesafe.model is empty; starting the orchestrator \
+                     harness"
+                        .to_string(),
+                );
+            }
+            let credential_set = std::env::var(&cfg.proxy.typesafe.credential_env)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if !credential_set {
+                return Err(format!(
+                    "proxy: enabled but {} is unset; starting the orchestrator harness",
+                    cfg.proxy.typesafe.credential_env
+                ));
+            }
+            Ok(())
+        }
+        ProxyDecider::Helper => adapters::resolve_default(cfg).map(|_| ()).map_err(|error| {
+            format!(
+                "proxy: enabled but no helper adapter is ready ({error}); starting the \
+                 orchestrator harness"
+            )
+        }),
+        ProxyDecider::Deterministic => {
+            Err("proxy: decider is deterministic; starting the orchestrator harness".to_string())
+        }
+    }
+}
+
+fn try_helper(cfg: &CtxConfig, questions: &[Question]) -> Result<Answers, String> {
+    let (adapter, _origin) = adapters::resolve_default(cfg)
+        .map_err(|error| format!("helper: no adapter ready ({error})"))?;
+    let model = super::handoff::resolve_distiller_model(None, adapter.as_ref());
+    // `config.rs::CtxConfig::load` already floors `timeout_secs` to at
+    // least 1 at load time (see `ProxyConfig`'s own doc comment); no ad-hoc
+    // `.max(1)` needed here.
+    let timeout = Duration::from_secs(cfg.proxy.typesafe.timeout_secs);
+    llm::decide(
+        helper::ROLE_PROXY,
+        adapter.as_ref(),
+        &model,
+        questions,
+        timeout,
+    )
+    .map_err(|error| format!("helper: {error}"))
+}
+
+/// Computes one [`ProxyDecision`] for `request`, in `repo`, under `cfg`.
+/// Never fails: every I/O-touching step inside is best-effort, and the
+/// deterministic baseline is always a valid answer on its own. Persists the
+/// decision (and a spend row, when a model call reported usage) to
+/// `<state_dir>/proxy-decisions.jsonl` before returning.
+pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> ProxyDecision {
+    let started = Instant::now();
+    let classification = decision::classify_request(request);
+    let roster = decision::Roster::gather(cfg, repo);
+    let baseline = decision::baseline(cfg, repo, request, &classification, &roster);
+    let intake = decision::build_intake(cfg, repo, state_dir, request, &roster);
+    let questions = decision::questions(&intake);
+
+    let mut fallbacks = Vec::new();
+    let mut winner = Decider::Deterministic;
+    let mut usage = None;
+    let mut result = baseline.clone();
+    let mut ran_model = false;
+
+    if matches!(cfg.proxy.decider, ProxyDecider::Typesafe) {
+        match typesafe::decide(&cfg.proxy.typesafe, &intake, &questions) {
+            Ok((answers, model_usage)) => {
+                result = decision::merge(&baseline, request, &answers, cfg.proxy.min_confidence);
+                winner = Decider::Typesafe;
+                usage = Some(model_usage);
+                ran_model = true;
+            }
+            Err(error) => fallbacks.push(format!("typesafe: {error}")),
+        }
+    }
+
+    if !ran_model
+        && matches!(
+            cfg.proxy.decider,
+            ProxyDecider::Typesafe | ProxyDecider::Helper
+        )
+    {
+        match try_helper(cfg, &questions) {
+            Ok(answers) => {
+                result = decision::merge(&baseline, request, &answers, cfg.proxy.min_confidence);
+                winner = Decider::Helper;
+            }
+            Err(reason) => fallbacks.push(reason),
+        }
+    }
+
+    decision::validate(&mut result, &baseline, &roster);
+    result.decider = winner;
+    result.fallbacks = fallbacks;
+    result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    result.usage = usage;
+    result.created_at = state::now_secs();
+
+    let _ = persist(state_dir, &result);
+    result
+}
+
+/// One line: `proxy: <execution> \u{b7} <harness>/<model> \u{b7} workers <tier> \u{b7} workflow
+/// <id-or-none> (<complexity>/<risk>) \u{b7} <decider> [<mean-confidence>]`.
+pub fn announce_line(decision: &ProxyDecision) -> String {
+    let execution = lower_debug(decision.execution);
+    let seat = format!(
+        "{}/{}",
+        decision.orchestrator.harness, decision.orchestrator.model
+    );
+    let worker_tier = tier_str(decision.worker_tier);
+    let workflow = decision.workflow.as_deref().unwrap_or("none");
+    let complexity = lower_debug(decision.complexity);
+    let risk = lower_debug(decision.risk);
+    let decider = decider_label(decision.decider);
+    let mut line = format!(
+        "proxy: {execution} \u{b7} {seat} \u{b7} workers {worker_tier} \u{b7} workflow {workflow} \
+         ({complexity}/{risk}) \u{b7} {decider}"
+    );
+    if let Some(confidence) = mean_confidence(decision) {
+        line.push_str(&format!(" {confidence:.2}"));
+    }
+    line
+}
+
+fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
+    if decision.confidence.is_empty() {
+        return None;
+    }
+    let total: f32 = decision.confidence.values().sum();
+    Some(total / decision.confidence.len() as f32)
+}
+
+/// The bounded `[zirv proxy]` context layer (T2 folds this into the compiled
+/// prompt): at most 6 lines -- a header, execution/complexity/risk, the
+/// seats, the workflow, and (Direct/Bounded only) one line steering the
+/// session to do the work itself rather than delegate reflexively.
+// T2 is the first caller (folds this into `compile.rs`'s composed context);
+// exercised here only by this module's own tests in the meantime.
+#[allow(dead_code)]
+pub fn prompt_layer(decision: &ProxyDecision) -> String {
+    let mut lines = vec!["[zirv proxy]".to_string()];
+    lines.push(format!(
+        "execution: {} (complexity {}, risk {})",
+        lower_debug(decision.execution),
+        lower_debug(decision.complexity),
+        lower_debug(decision.risk),
+    ));
+    lines.push(format!(
+        "seats: orchestrator {}/{} \u{b7} workers {}",
+        decision.orchestrator.harness,
+        decision.orchestrator.model,
+        tier_str(decision.worker_tier),
+    ));
+    lines.push(format!(
+        "workflow: {}",
+        decision.workflow.as_deref().unwrap_or("none")
+    ));
+    if matches!(
+        decision.execution,
+        ExecutionMode::Direct | ExecutionMode::Bounded
+    ) {
+        lines.push("do this work in this seat; delegate only for a distinct need".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Appends `d` to `<state_dir>/proxy-decisions.jsonl`, and (when `d.usage`
+/// is `Some`) a `log::Delegation` spend row -- agent `"typesafe"`, model
+/// `"jev-latest"`, input/output tokens from `usage`, outcome `"ok"` -- so
+/// `zirv ctx spend` prices the call through `catalogue`'s `typesafe` vendor.
+/// `session` is this process's own `ZIRV_CTX_SESSION` (the same identity
+/// `mail::session_identity`/`hook.rs` read), falling back to `"proxy"` only
+/// when this process carries none at all; `principal` is this process's own
+/// `ZIRV_PRINCIPAL` (`agent::PRINCIPAL_ENV`), falling back to `"root"` only
+/// when unset -- the same "root session, no inherited envelope" convention
+/// `agent::root_envelope` establishes, rather than hardcoding either value.
+/// Best-effort like every other append in this crate's flat logs: the
+/// caller (`decide`) never propagates a write failure.
+pub fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
+    state::create_private_dir_all(state_dir)?;
+    let mut file = state::open_private_append(&state_dir.join(PROXY_DECISIONS_FILE))?;
+    writeln!(file, "{}", serde_json::to_string(d)?)?;
+
+    if let Some(usage) = &d.usage {
+        let wrapped = state::StateDir::from_path(state_dir.to_path_buf());
+        let session = std::env::var(adapters::SESSION_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "proxy".to_string());
+        let principal = std::env::var(super::agent::PRINCIPAL_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "root".to_string());
+        let _ = log::append_delegation(
+            &wrapped,
+            &log::Delegation {
+                ts: d.created_at,
+                session: &session,
+                parent_session: "",
+                work_group_id: None,
+                agent: "typesafe",
+                model: Some(TYPESAFE_MODEL_ID),
+                input_tokens: usage.input_tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: usage.output_tokens,
+                wall_ms: d.elapsed_ms,
+                exit_code: 0,
+                outcome: "ok",
+                mode: None,
+                task_class: None,
+                principal: &principal,
+                envelope_sha256: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// The most recent persisted decision for `repo`, or `None` when nothing is
+/// stored yet or the log cannot be read. Best-effort: a corrupt line is
+/// skipped, never fatal.
+pub fn latest_for_repo(state_dir: &Path, repo: &Path) -> Option<ProxyDecision> {
+    let text = std::fs::read_to_string(state_dir.join(PROXY_DECISIONS_FILE)).ok()?;
+    let canonical_repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<ProxyDecision>(line).ok())
+        .rfind(|decision| {
+            let candidate = decision
+                .repo
+                .canonicalize()
+                .unwrap_or_else(|_| decision.repo.clone());
+            candidate == canonical_repo
+        })
+}
+
+/// Reads a request from `reader`: every line up to (not including) the
+/// first blank line or EOF. `None` when nothing but whitespace was read.
+pub fn read_request(reader: &mut impl BufRead) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            break;
+        }
+        lines.push(trimmed.to_string());
+    }
+    let joined = lines.join("\n");
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+fn human_fields(decision: &ProxyDecision, min_confidence: f32) -> Vec<(&'static str, String)> {
+    let source = |field: &str| -> &'static str {
+        if decision.decider == Decider::Deterministic {
+            return "baseline";
+        }
+        match decision.confidence.get(field) {
+            Some(confidence) if *confidence >= min_confidence => decider_label(decision.decider),
+            _ => "baseline",
+        }
+    };
+    let confidence_text = |field: &str| -> String {
+        decision
+            .confidence
+            .get(field)
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    let row = |field: &'static str, value: String| -> (&'static str, String) {
+        (
+            field,
+            format!("{value} ({}, {})", source(field), confidence_text(field)),
+        )
+    };
+    vec![
+        row("intent", lower_debug(decision.intent)),
+        row("complexity", lower_debug(decision.complexity)),
+        row("risk", lower_debug(decision.risk)),
+        row("execution", lower_debug(decision.execution)),
+        row(
+            "workflow",
+            decision
+                .workflow
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        row(
+            "seat",
+            format!(
+                "{}/{}",
+                decision.orchestrator.harness, decision.orchestrator.model
+            ),
+        ),
+        row("worker_tier", tier_str(decision.worker_tier).to_string()),
+        row(
+            "needs_clarification",
+            format!("{:.2}", decision.needs_clarification),
+        ),
+    ]
+}
+
+/// `zirv ctx proxy [--json] [REQUEST]`: decides and prints, never launches.
+pub fn run<W: Write>(args: &ProxyArgs, w: &mut W) -> CtxResult<i32> {
+    let env = config::env_from_process();
+    let repo = std::env::current_dir()?;
+    let cfg = CtxConfig::load(&repo, &env)?;
+    let state = state::StateDir::resolve(&env)?;
+    run_with(&cfg, state.root(), &repo, args, w)
+}
+
+pub fn run_with<W: Write>(
+    cfg: &CtxConfig,
+    state_dir: &Path,
+    repo: &Path,
+    args: &ProxyArgs,
+    w: &mut W,
+) -> CtxResult<i32> {
+    let request = match &args.request {
+        Some(request) => request.clone(),
+        None => {
+            if std::io::stdin().is_terminal() {
+                return Err(
+                    "zirv ctx proxy: no REQUEST given and stdin is a terminal; pass a request or \
+                     pipe one in"
+                        .into(),
+                );
+            }
+            let stdin = std::io::stdin();
+            let mut locked = stdin.lock();
+            match read_request(&mut locked) {
+                Some(request) => request,
+                None => return Err("zirv ctx proxy: no request given on stdin".into()),
+            }
+        }
+    };
+
+    let decision = decide(cfg, state_dir, repo, &request);
+
+    if args.json {
+        writeln!(w, "{}", serde_json::to_string_pretty(&decision)?)?;
+        return Ok(0);
+    }
+
+    writeln!(w, "{}", announce_line(&decision))?;
+    for (field, rendered) in human_fields(&decision, cfg.proxy.min_confidence) {
+        writeln!(w, "{field}: {rendered}")?;
+    }
+    for reason in &decision.reasons {
+        writeln!(w, "reason: {reason}")?;
+    }
+    for fallback in &decision.fallbacks {
+        writeln!(w, "fallback: {fallback}")?;
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::ctx::catalogue::Tier;
+    use crate::commands::workflow::classify::{Complexity, Intent, RiskBand};
+    use crate::commands::workflow::profile::{ExecutionMode, ValidationProfile};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn sample_decision() -> ProxyDecision {
+        ProxyDecision {
+            request_sha256: "x".repeat(64),
+            repo: PathBuf::from("/tmp/repo"),
+            intent: Intent::Feature,
+            complexity: Complexity::Substantial,
+            risk: RiskBand::Medium,
+            execution: ExecutionMode::Orchestrated,
+            validation: ValidationProfile::default(),
+            workflow: Some("feature".to_string()),
+            orchestrator: decision::Seat {
+                harness: "claude".to_string(),
+                model: "fable".to_string(),
+            },
+            worker_tier: Tier::Standard,
+            needs_clarification: 0.0,
+            decider: Decider::Typesafe,
+            confidence: BTreeMap::from([("seat".to_string(), 0.81_f32)]),
+            reasons: Vec::new(),
+            fallbacks: Vec::new(),
+            elapsed_ms: 12,
+            usage: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn announce_line_matches_the_documented_shape() {
+        let line = announce_line(&sample_decision());
+        assert_eq!(
+            line,
+            "proxy: orchestrated \u{b7} claude/fable \u{b7} workers standard \u{b7} workflow \
+             feature (substantial/medium) \u{b7} typesafe 0.81"
+        );
+    }
+
+    #[test]
+    fn prompt_layer_is_bounded_and_starts_with_the_header() {
+        let layer = prompt_layer(&sample_decision());
+        let lines: Vec<&str> = layer.lines().collect();
+        assert!(lines.len() <= 6, "{lines:?}");
+        assert_eq!(lines[0], "[zirv proxy]");
+    }
+
+    #[test]
+    fn prompt_layer_advises_direct_work_only_for_direct_and_bounded() {
+        let mut decision = sample_decision();
+        decision.execution = ExecutionMode::Direct;
+        assert!(prompt_layer(&decision).contains("do this work in this seat"));
+
+        decision.execution = ExecutionMode::Orchestrated;
+        assert!(!prompt_layer(&decision).contains("do this work in this seat"));
+    }
+
+    #[test]
+    fn read_request_reads_until_a_blank_line() {
+        let mut input = std::io::Cursor::new(b"line one\nline two\n\nnever read\n".to_vec());
+        let request = read_request(&mut input).expect("some request");
+        assert_eq!(request, "line one\nline two");
+    }
+
+    #[test]
+    fn read_request_reads_until_eof_with_no_blank_line() {
+        let mut input = std::io::Cursor::new(b"only line".to_vec());
+        assert_eq!(read_request(&mut input), Some("only line".to_string()));
+    }
+
+    #[test]
+    fn read_request_is_none_for_whitespace_only_input() {
+        let mut input = std::io::Cursor::new(b"   \n\n".to_vec());
+        assert_eq!(read_request(&mut input), None);
+    }
+
+    #[test]
+    fn persist_and_latest_for_repo_round_trip() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut decision = sample_decision();
+        decision.repo = repo.path().to_path_buf();
+        persist(state_dir.path(), &decision).expect("persist");
+        let found = latest_for_repo(state_dir.path(), repo.path()).expect("found");
+        assert_eq!(found.request_sha256, decision.request_sha256);
+    }
+
+    #[test]
+    fn persist_appends_a_delegation_row_only_when_usage_is_present() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let mut decision = sample_decision();
+        decision.usage = Some(decision::Usage {
+            input_tokens: 100,
+            output_tokens: 5,
+        });
+        persist(state_dir.path(), &decision).expect("persist");
+        let delegations = log::read_delegations(
+            &state::StateDir::from_path(state_dir.path().to_path_buf()),
+            10,
+        );
+        assert_eq!(delegations.len(), 1);
+        assert_eq!(delegations[0].agent, "typesafe");
+        assert_eq!(delegations[0].model.as_deref(), Some(TYPESAFE_MODEL_ID));
+        assert_eq!(delegations[0].input_tokens, 100);
+    }
+
+    #[test]
+    fn persist_uses_this_processs_session_and_principal_when_set_else_the_documented_fallbacks() {
+        use crate::commands::ctx::adapters::SESSION_ENV;
+        use crate::commands::ctx::agent::PRINCIPAL_ENV;
+
+        let had_session = std::env::var(SESSION_ENV).ok();
+        let had_principal = std::env::var(PRINCIPAL_ENV).ok();
+        // SAFETY (test-only): restored at the end of this test regardless
+        // of outcome.
+        unsafe {
+            std::env::remove_var(SESSION_ENV);
+            std::env::remove_var(PRINCIPAL_ENV);
+        }
+
+        let mut decision = sample_decision();
+        decision.usage = Some(decision::Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+        });
+
+        let unset_dir = tempfile::tempdir().expect("tempdir");
+        persist(unset_dir.path(), &decision).expect("persist");
+        let rows = log::read_delegations(
+            &state::StateDir::from_path(unset_dir.path().to_path_buf()),
+            10,
+        );
+        assert_eq!(rows[0].session, "proxy");
+        assert_eq!(rows[0].principal, "root");
+
+        unsafe {
+            std::env::set_var(SESSION_ENV, "sess-537");
+            std::env::set_var(PRINCIPAL_ENV, "root/child-537");
+        }
+        let set_dir = tempfile::tempdir().expect("tempdir");
+        persist(set_dir.path(), &decision).expect("persist");
+        let rows = log::read_delegations(
+            &state::StateDir::from_path(set_dir.path().to_path_buf()),
+            10,
+        );
+        assert_eq!(rows[0].session, "sess-537");
+        assert_eq!(rows[0].principal, "root/child-537");
+
+        unsafe {
+            match had_session {
+                Some(value) => std::env::set_var(SESSION_ENV, value),
+                None => std::env::remove_var(SESSION_ENV),
+            }
+            match had_principal {
+                Some(value) => std::env::set_var(PRINCIPAL_ENV, value),
+                None => std::env::remove_var(PRINCIPAL_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn activation_is_err_when_disabled() {
+        let cfg = CtxConfig::default();
+        assert!(activation(&cfg).is_err());
+    }
+
+    #[test]
+    fn activation_is_err_for_the_deterministic_decider() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.decider = ProxyDecider::Deterministic;
+        let error = activation(&cfg).expect_err("must be err");
+        assert!(error.contains("deterministic"), "{error}");
+    }
+
+    #[test]
+    fn activation_names_the_unset_credential_env() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "PROXY_TEST_NEVER_SET_537".to_string();
+        let error = activation(&cfg).expect_err("must be err");
+        assert!(error.contains("PROXY_TEST_NEVER_SET_537"), "{error}");
+    }
+
+    #[test]
+    fn activation_is_ok_for_typesafe_with_the_credential_set() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "PROXY_TEST_KEY_SET_537".to_string();
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var("PROXY_TEST_KEY_SET_537", "secret");
+        }
+        let result = activation(&cfg);
+        unsafe {
+            std::env::remove_var("PROXY_TEST_KEY_SET_537");
+        }
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn decide_never_panics_and_falls_back_to_deterministic_without_a_credential() {
+        // SAFETY (test-only): ensures this well-known var is unset for the
+        // duration of this test, regardless of the outer environment.
+        let had = std::env::var("TYPESAFE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("TYPESAFE_API_KEY");
+        }
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        // No credential AND no adapter to fall back to (an unknown agent
+        // name fails `resolve_default` immediately, without spawning or
+        // probing anything real) -- otherwise this test would reach for
+        // whatever coding harness happens to be installed on the machine
+        // running it.
+        let cfg = CtxConfig {
+            agent: Some("no-such-adapter-537".to_string()),
+            ..CtxConfig::default()
+        };
+        let decision = decide(
+            &cfg,
+            state_dir.path(),
+            repo.path(),
+            "fix the typo in README",
+        );
+        assert_eq!(decision.decider, Decider::Deterministic);
+        assert!(
+            decision
+                .fallbacks
+                .iter()
+                .any(|line| line.contains("credential env")),
+            "{:?}",
+            decision.fallbacks
+        );
+        if let Some(value) = had {
+            unsafe {
+                std::env::set_var("TYPESAFE_API_KEY", value);
+            }
+        }
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct BatteryFile {
+        path: String,
+        lines: usize,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct BatteryCase {
+        name: String,
+        request: String,
+        #[serde(default)]
+        files: Vec<BatteryFile>,
+        execution: String,
+        min_complexity: String,
+        #[serde(default = "default_min_risk")]
+        min_risk: String,
+        workflow: Option<String>,
+    }
+
+    fn default_min_risk() -> String {
+        "low".to_string()
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Battery {
+        cases: Vec<BatteryCase>,
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn parse_execution_label(label: &str) -> ExecutionMode {
+        match label {
+            "direct" => ExecutionMode::Direct,
+            "bounded" => ExecutionMode::Bounded,
+            "orchestrated" => ExecutionMode::Orchestrated,
+            other => panic!("unknown execution label '{other}' in battery fixture"),
+        }
+    }
+
+    fn parse_complexity_label(label: &str) -> Complexity {
+        match label {
+            "trivial" => Complexity::Trivial,
+            "bounded" => Complexity::Bounded,
+            "substantial" => Complexity::Substantial,
+            "architectural" => Complexity::Architectural,
+            other => panic!("unknown complexity label '{other}' in battery fixture"),
+        }
+    }
+
+    fn parse_risk_label(label: &str) -> RiskBand {
+        match label {
+            "low" => RiskBand::Low,
+            "medium" => RiskBand::Medium,
+            "high" => RiskBand::High,
+            "critical" => RiskBand::Critical,
+            other => panic!("unknown risk label '{other}' in battery fixture"),
+        }
+    }
+
+    /// A throwaway git repo with one committed baseline file plus the
+    /// battery case's own UNTRACKED shape (`files`): this is exactly what
+    /// `classify::git_change_input` measures via `git diff --numstat` (the
+    /// committed baseline) and `git ls-files --others` (the untracked
+    /// shape).
+    ///
+    /// Issue #537 fix: the baseline classification (`decision::
+    /// classify_request`) no longer measures the repository at all -- a
+    /// case's `files` shape therefore no longer drives its own `execution`/
+    /// `min_complexity`/`workflow` expectation (every case's deterministic
+    /// baseline is `direct`/`trivial`/`none` now, regardless of shape; see
+    /// the `"large-unrelated-branch-diff"` case, whose entire point is a
+    /// large shape that must NOT move the outcome). `shaped_repo` is kept
+    /// for that regression case and because `build_intake` still measures
+    /// the real repository for `IntakeState`'s own informational
+    /// `uncommitted_or_branch_changes` field (never the decision fields).
+    fn shaped_repo(files: &[BatteryFile]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "base\n").expect("write base");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        for file in files {
+            let full = repo.path().join(&file.path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            let content: String = (0..file.lines).map(|n| format!("line {n}\n")).collect();
+            std::fs::write(&full, content).expect("write case file");
+        }
+        repo
+    }
+
+    /// Issue #537 seam: the deterministic decider's own floor, exercised
+    /// against a small battery of realistic requests (`tests/fixtures/
+    /// proxy/battery.json`) rather than one hand-picked example. Every
+    /// expectation here is what `decide()` with `[proxy] decider =
+    /// "deterministic"` ACTUALLY returns (verified by running this test,
+    /// not guessed) -- see this task's own report for the human-expectation
+    /// gaps this surfaced, which is exactly what the model deciders exist
+    /// to close.
+    ///
+    /// Issue #537 fix: the baseline classifies from request TEXT ONLY now
+    /// (never the repository's own diff, which used to inflate every
+    /// request's complexity/risk on a feature branch carrying unrelated
+    /// changes, and the monotonic floor then forbade a model decider from
+    /// ever lowering it back down). Every case's deterministic `execution`/
+    /// `min_complexity`/`workflow` is therefore `direct`/`trivial`/`none`
+    /// regardless of its `files` shape; the `"large-unrelated-branch-diff"`
+    /// case exists specifically to pin that a large on-disk diff cannot
+    /// move it.
+    #[test]
+    fn deterministic_battery_matches_recorded_expectations() {
+        let text = std::fs::read_to_string(fixture("proxy/battery.json")).expect("battery fixture");
+        let battery: Battery = serde_json::from_str(&text).expect("parse battery fixture");
+        assert!(
+            battery.cases.len() >= 8,
+            "battery must carry at least 8 cases, got {}",
+            battery.cases.len()
+        );
+
+        let cfg = CtxConfig {
+            proxy: crate::commands::ctx::config::ProxyConfig {
+                decider: ProxyDecider::Deterministic,
+                ..crate::commands::ctx::config::ProxyConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        for case in &battery.cases {
+            let repo = shaped_repo(&case.files);
+            let decision = decide(&cfg, state_dir.path(), repo.path(), &case.request);
+            assert_eq!(
+                decision.decider,
+                Decider::Deterministic,
+                "{}: decider",
+                case.name
+            );
+            assert_eq!(
+                decision.execution,
+                parse_execution_label(&case.execution),
+                "{}: execution was {:?}",
+                case.name,
+                decision.execution
+            );
+            let min_complexity = parse_complexity_label(&case.min_complexity);
+            assert!(
+                decision.complexity >= min_complexity,
+                "{}: complexity {:?} is below the recorded minimum {:?}",
+                case.name,
+                decision.complexity,
+                min_complexity
+            );
+            let min_risk = parse_risk_label(&case.min_risk);
+            assert!(
+                decision.risk >= min_risk,
+                "{}: risk {:?} is below the recorded minimum {:?}",
+                case.name,
+                decision.risk,
+                min_risk
+            );
+            assert_eq!(decision.workflow, case.workflow, "{}: workflow", case.name);
+        }
+    }
+
+    /// Review finding: exercises `decide()` end-to-end with `decider =
+    /// helper` against the real `fake-model.sh` `proxy` fixture (not just
+    /// `decision::merge` in isolation), on a sensitive-surface request --
+    /// the fake model's own `proxy` answers never touch `risk`, so the only
+    /// way `security_review`/`independent_review` stay `true` on the merged
+    /// decision is if the baseline's own text-driven flags survive the
+    /// merge, which is exactly what this task's fix restores.
+    #[test]
+    fn decide_with_the_helper_decider_keeps_baseline_validation_flags() {
+        // SAFETY (test-only): restored at the end of this test regardless
+        // of outcome.
+        let had_mode = std::env::var("FAKE_MODEL_MODE").ok();
+        unsafe {
+            std::env::set_var("FAKE_MODEL_MODE", "proxy");
+        }
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig {
+            agent: Some("claude".to_string()),
+            agent_bin: Some(format!("sh {}", fixture("fake-model.sh").display())),
+            proxy: crate::commands::ctx::config::ProxyConfig {
+                decider: ProxyDecider::Helper,
+                ..crate::commands::ctx::config::ProxyConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        let request = "rotate the shared credential constant used by session auth";
+
+        let decision = decide(&cfg, state_dir.path(), repo.path(), request);
+
+        unsafe {
+            match had_mode {
+                Some(value) => std::env::set_var("FAKE_MODEL_MODE", value),
+                None => std::env::remove_var("FAKE_MODEL_MODE"),
+            }
+        }
+
+        assert_eq!(
+            decision.decider,
+            Decider::Helper,
+            "expected the helper decider to win: {:?}",
+            decision.fallbacks
+        );
+        assert!(
+            decision.validation.security_review,
+            "{:?}",
+            decision.validation
+        );
+        assert!(
+            decision.validation.independent_review,
+            "{:?}",
+            decision.validation
+        );
+    }
+}

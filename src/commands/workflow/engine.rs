@@ -2875,7 +2875,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
 /// different, currently-running one for the same repo.
 pub fn close(
     state_dir: &StateDir,
-    mut state: WorkflowState,
+    state: WorkflowState,
     reason: Option<String>,
 ) -> CtxResult<WorkflowState> {
     if matches!(
@@ -2908,6 +2908,69 @@ pub fn close(
                 .into(),
         );
     }
+    finish_close(state_dir, state, reason)
+}
+
+/// Issue #537 review: a workflow the proxy started immediately before a
+/// spawn that then failed is `AwaitingApproval` the instant `packs/feature.
+/// toml`/`packs/bugfix.toml` gate the first step behind `approval = true`
+/// (any bounded-or-riskier classification does) -- `close`'s own approval
+/// refusal above exists because approval is a pending human decision on the
+/// CURRENT step, but nobody has made or seen that decision yet here. This
+/// path is deliberately narrower than `close`: it only ever closes a
+/// workflow sitting at its very first gate, before a human has advanced OR
+/// approved anything at all -- zero `completed_steps` and zero accepted
+/// artifacts. The moment either is non-empty, this refuses and the caller
+/// must go through `close` instead, the same fail-closed shape `close`
+/// itself already uses for every other state it will not touch.
+pub fn close_unstarted(
+    state_dir: &StateDir,
+    state: WorkflowState,
+    reason: Option<String>,
+) -> CtxResult<WorkflowState> {
+    if matches!(
+        state.status,
+        WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Closed
+    ) {
+        return Err(format!(
+            "cannot close workflow: already {:?}; close only applies to a workflow that will \
+             not reach Completed on its own",
+            state.status
+        )
+        .into());
+    }
+    if state.status != WorkflowStatus::AwaitingApproval {
+        return Err(
+            "close_unstarted only applies to a workflow awaiting approval at its first gate; \
+             use `close`"
+                .into(),
+        );
+    }
+    if !state.completed_steps.is_empty() {
+        return Err(
+            "cannot close_unstarted: at least one step has already completed; use `close`".into(),
+        );
+    }
+    if state.artifacts.values().any(|a| a.accepted_hash.is_some()) {
+        return Err(
+            "cannot close_unstarted: at least one artifact has already been accepted; use \
+             `close`"
+                .into(),
+        );
+    }
+    finish_close(state_dir, state, reason)
+}
+
+/// The actual close: sets `status: Closed`, records `closed_reason`/
+/// `closed_at`, persists via `save_inactive_if_active` (clears this
+/// repository's active pointer only when it currently names THIS
+/// workflow), and records the same `TelemetryKind::Closed` event either of
+/// [`close`]/[`close_unstarted`] always did inline before this split.
+fn finish_close(
+    state_dir: &StateDir,
+    mut state: WorkflowState,
+    reason: Option<String>,
+) -> CtxResult<WorkflowState> {
     let now = now_secs();
     state.status = WorkflowStatus::Closed;
     state.closed_reason = reason;
@@ -9437,6 +9500,77 @@ mod tests {
 
         let error = close(&state_dir, state, None).unwrap_err();
         assert!(error.to_string().contains("awaiting approval"), "{error}");
+    }
+
+    /// Issue #537 review: the COMMON case a proxy-started workflow hits, not
+    /// an edge one -- `bugfix`'s own pack gates its `intent` step behind
+    /// `approval = true` for anything Bounded-or-riskier, so a freshly
+    /// started workflow at that classification is `AwaitingApproval` before
+    /// anyone has seen or acted on the prompt. `close_unstarted` must still
+    /// close it (nothing has completed, nothing is accepted); the same
+    /// workflow, after a human actually approves that first gate, must
+    /// refuse via this path exactly like `close` already refuses -- a human
+    /// has now acted on it, so only `close` applies from here on.
+    #[test]
+    fn close_unstarted_closes_a_fresh_gate_but_refuses_once_a_human_has_approved_it() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Bounded;
+        classification.risk = RiskBand::Medium;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "bounded bugfix".into(),
+            WorkflowKind::Bugfix,
+            None,
+            true,
+            classification,
+        );
+        assert_eq!(state.status, WorkflowStatus::AwaitingApproval);
+        assert_eq!(state.current().unwrap().id, "intent");
+        assert!(state.completed_steps.is_empty());
+
+        // A clone taken before anything else happens: exactly the shape a
+        // proxy-started workflow whose spawn immediately failed is in.
+        let closed = close_unstarted(
+            &state_dir,
+            state.clone(),
+            Some("proxy launch failed".to_string()),
+        )
+        .expect("closes a workflow that never progressed past its first gate");
+        assert_eq!(closed.status, WorkflowStatus::Closed);
+        assert_eq!(closed.closed_reason.as_deref(), Some("proxy launch failed"));
+
+        // The same workflow, but a human has since approved the first gate:
+        // `close_unstarted` must now refuse, the same as `close` already
+        // does for every workflow it will not touch.
+        ensure_current_artifact_template(&state).unwrap();
+        std::fs::write(
+            workflow_artifact_path(&state, ArtifactStage::Intent).unwrap(),
+            "# Intent\n\n## Problem\nConcrete problem\n\n## Desired outcome\nConcrete result\n",
+        )
+        .unwrap();
+        let approved = approve(&state_dir, state).expect("approve intent");
+        assert!(
+            !approved.completed_steps.is_empty(),
+            "approving the first gate must record a completed step"
+        );
+        // Approving `intent` advances past it (the next step, `debug`, is
+        // unconditional), so this no longer even reads as "awaiting
+        // approval at the first gate" -- refused either way, but naming
+        // which guard actually catches it keeps this test honest about why.
+        assert_ne!(
+            approved.status,
+            WorkflowStatus::AwaitingApproval,
+            "approving the only gated step must advance past it"
+        );
+        let error =
+            close_unstarted(&state_dir, approved, Some("too late".to_string())).unwrap_err();
+        assert!(
+            error.to_string().contains("first gate"),
+            "must refuse once a human has advanced the workflow: {error}"
+        );
     }
 
     #[test]

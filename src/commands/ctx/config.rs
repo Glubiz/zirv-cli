@@ -1738,6 +1738,98 @@ pub struct ChatConfig {
     pub claude_permission_mode: Option<String>,
 }
 
+/// Which model decider `proxy::decide` runs first, per `[proxy] decider`.
+/// The chain always falls through toward `Deterministic` on failure (see
+/// `proxy::mod::decide`'s own doc comment); this only picks where the chain
+/// STARTS -- `Helper` skips `Typesafe` outright, and `Deterministic` skips
+/// every model call and returns the baseline classification as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyDecider {
+    #[default]
+    Typesafe,
+    Helper,
+    Deterministic,
+}
+
+/// The floor `load`'s own range check holds `proxy.request_max_bytes` to --
+/// small enough that a request could still be truncated to something
+/// legible for a model decider (never literally 0, which would give a
+/// decider an empty request every time), far below the `16_384` default.
+pub const MIN_PROXY_REQUEST_MAX_BYTES: usize = 1024;
+
+/// Issue #537 seam: the harness proxy's own decision core (`proxy::decide`),
+/// disabled by default so every launch path stays byte-identical to today
+/// until an operator opts in. `REPO_FORBIDDEN` as a whole -- every key here
+/// paired with its own `ZIRV_CTX_PROXY_*` env var (see `REPO_FORBIDDEN`'s own
+/// table below): a repository checkout must not be able to turn the proxy on
+/// for itself, choose which decider spends the operator's Jev/helper-model
+/// budget, or loosen the confidence floor/request cap that bounds it -- the
+/// same trust asymmetry `agent`/`handoff.model`/`endpoint` already hold.
+///
+/// `min_confidence`, `typesafe.timeout_secs` and `request_max_bytes` are
+/// range-checked once, in `CtxConfig::load` (see that function's own
+/// `proxy.*` block, alongside the `fallback.*`/`chat.model` range and
+/// charset checks it already makes), the same "loud rather than silent,
+/// load-time error naming the key" convention this crate holds to for every
+/// other bounded numeric config value -- never a silent clamp. Reading
+/// `cfg.proxy.typesafe.timeout_secs`/`request_max_bytes` anywhere past that
+/// point can therefore trust the bound without re-checking or re-flooring.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyConfig {
+    pub enabled: bool,
+    pub decider: ProxyDecider,
+    /// A model answer below this per-field confidence is discarded in favor
+    /// of the deterministic baseline (`proxy::decision::merge`). Must be in
+    /// `0.0..=1.0`.
+    pub min_confidence: f32,
+    /// The intake `request` text is truncated to this many bytes before it
+    /// ever reaches a model decider (`proxy::decision::IntakeState`). Must be
+    /// at least [`MIN_PROXY_REQUEST_MAX_BYTES`].
+    pub request_max_bytes: usize,
+    pub typesafe: ProxyTypesafeConfig,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            decider: ProxyDecider::default(),
+            min_confidence: 0.5,
+            request_max_bytes: 16_384,
+            typesafe: ProxyTypesafeConfig::default(),
+        }
+    }
+}
+
+/// TypeSafe's Jev endpoint (`docs.typesafe.ai`), the proxy's primary decider.
+/// `credential_env` NAMES the environment variable holding the API key --
+/// never the secret itself, the same `EndpointTarget::credential_env`
+/// contract this mirrors.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyTypesafeConfig {
+    pub base_url: String,
+    pub credential_env: String,
+    pub model: String,
+    /// Connect and receive timeout for the `/systemone` call. Must be at
+    /// least 1 (see `ProxyConfig`'s own doc comment on where this is
+    /// checked).
+    pub timeout_secs: u64,
+}
+
+impl Default for ProxyTypesafeConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.typesafe.ai/v1".to_string(),
+            credential_env: "TYPESAFE_API_KEY".to_string(),
+            model: "jev-latest".to_string(),
+            timeout_secs: 10,
+        }
+    }
+}
+
 /// Per-agent override for which model runs code review, keyed the same way
 /// as `UseCreditsConfig` (operator thinks in agent names). `None` -- the
 /// default for both -- defers to that adapter's own `AgentAdapter::
@@ -2585,6 +2677,10 @@ pub struct CtxConfig {
     pub objective: ObjectiveConfig,
     pub screen: ScreenConfig,
     pub task: TaskConfig,
+    /// Issue #537 seam: the harness proxy's decision core (`zirv ctx proxy`,
+    /// `proxy::decide`). The whole table is `REPO_FORBIDDEN`; see
+    /// [`ProxyConfig`].
+    pub proxy: ProxyConfig,
     /// Issue #352's experimental persistent-runtime gate. Every key is
     /// `REPO_FORBIDDEN`; see [`SessionConfig`].
     pub session: SessionConfig,
@@ -3406,6 +3502,49 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     // Issue #491: the operator's opt-in native default, and the spelling
     // `REPO_FORBIDDEN` names when it rejects a repo layer's `[runtime]` table.
     ("ZIRV_CTX_RUNTIME", &["runtime", "default"], EnvKind::Str),
+    // Issue #537 seam: the harness proxy's own `[proxy]`/`[proxy.typesafe]`
+    // tables, every key `REPO_FORBIDDEN` -- see that const's own entries for
+    // this same set.
+    (
+        "ZIRV_CTX_PROXY_ENABLED",
+        &["proxy", "enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PROXY_DECIDER",
+        &["proxy", "decider"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_PROXY_MIN_CONFIDENCE",
+        &["proxy", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_PROXY_REQUEST_MAX_BYTES",
+        &["proxy", "request_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL",
+        &["proxy", "typesafe", "base_url"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+        &["proxy", "typesafe", "credential_env"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_PROXY_TYPESAFE_MODEL",
+        &["proxy", "typesafe", "model"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS",
+        &["proxy", "typesafe", "timeout_secs"],
+        EnvKind::Int,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -4599,6 +4738,38 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // direction. `~/.zirv/ctx.toml`, `ZIRV_CTX_RUNTIME` and the `--runtime`
     // flag remain the only ways to set it.
     (&["runtime"], "ZIRV_CTX_RUNTIME"),
+    // Issue #537 seam: the harness proxy decides which harness/model/
+    // workflow a launch spends the operator's own account on -- a repo
+    // checkout must not be able to turn it on, choose its decider, or loosen
+    // its confidence floor/request cap, the same trust asymmetry as
+    // `agent`/`handoff.model`/`endpoint` above. One leaf entry per key so the
+    // refusal names the exact one a checkout tried to set.
+    (&["proxy", "enabled"], "ZIRV_CTX_PROXY_ENABLED"),
+    (&["proxy", "decider"], "ZIRV_CTX_PROXY_DECIDER"),
+    (
+        &["proxy", "min_confidence"],
+        "ZIRV_CTX_PROXY_MIN_CONFIDENCE",
+    ),
+    (
+        &["proxy", "request_max_bytes"],
+        "ZIRV_CTX_PROXY_REQUEST_MAX_BYTES",
+    ),
+    (
+        &["proxy", "typesafe", "base_url"],
+        "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL",
+    ),
+    (
+        &["proxy", "typesafe", "credential_env"],
+        "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+    ),
+    (
+        &["proxy", "typesafe", "model"],
+        "ZIRV_CTX_PROXY_TYPESAFE_MODEL",
+    ),
+    (
+        &["proxy", "typesafe", "timeout_secs"],
+        "ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS",
+    ),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -5936,6 +6107,32 @@ impl CtxConfig {
             validate_endpoint_target("endpoint.codex", target)?;
         }
 
+        // Issue #537 seam: `[proxy]` bounds, checked once here rather than
+        // re-clamped or re-floored at every read site -- see `ProxyConfig`'s
+        // own doc comment for why this is a load-time error, not a silent
+        // clamp, matching the `fallback.*` percentage checks above.
+        if !(0.0..=1.0).contains(&cfg.proxy.min_confidence) {
+            return Err(format!(
+                "proxy.min_confidence must be between 0.0 and 1.0, got {}",
+                cfg.proxy.min_confidence
+            )
+            .into());
+        }
+        if cfg.proxy.typesafe.timeout_secs < 1 {
+            return Err(format!(
+                "proxy.typesafe.timeout_secs must be at least 1, got {}",
+                cfg.proxy.typesafe.timeout_secs
+            )
+            .into());
+        }
+        if cfg.proxy.request_max_bytes < MIN_PROXY_REQUEST_MAX_BYTES {
+            return Err(format!(
+                "proxy.request_max_bytes must be at least {MIN_PROXY_REQUEST_MAX_BYTES}, got {}",
+                cfg.proxy.request_max_bytes
+            )
+            .into());
+        }
+
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         cfg.policy = super::policy::resolve(home_policy, repo_policy, env)?;
         cfg.safety = super::safety::resolve(home_safety, repo_safety, env)?;
@@ -7247,6 +7444,153 @@ mod tests {
             .expect("the operator's own environment may set these keys");
         assert!(!cfg.memory.session_enabled);
         assert_eq!(cfg.memory.journal_max_entries, 42);
+    }
+
+    /// Issue #537 seam: `[proxy]` defaults match the spec's table exactly --
+    /// disabled, `typesafe` first, floor 0.5, 16 KiB request cap, the
+    /// documented Jev endpoint/credential-env/model/timeout.
+    #[test]
+    fn proxy_config_defaults_match_the_spec() {
+        let cfg = ProxyConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.decider, ProxyDecider::Typesafe);
+        assert_eq!(cfg.min_confidence, 0.5);
+        assert_eq!(cfg.request_max_bytes, 16_384);
+        assert_eq!(cfg.typesafe.base_url, "https://api.typesafe.ai/v1");
+        assert_eq!(cfg.typesafe.credential_env, "TYPESAFE_API_KEY");
+        assert_eq!(cfg.typesafe.model, "jev-latest");
+        assert_eq!(cfg.typesafe.timeout_secs, 10);
+    }
+
+    /// Every `[proxy]`/`[proxy.typesafe]` key is `REPO_FORBIDDEN`: a repo
+    /// checkout must not be able to turn the proxy on for itself, redirect
+    /// its decider, or loosen its confidence floor/request cap.
+    #[test]
+    fn proxy_keys_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            ("[proxy]\nenabled = true\n", "enabled"),
+            ("[proxy]\ndecider = \"helper\"\n", "decider"),
+            ("[proxy]\nmin_confidence = 0.9\n", "min_confidence"),
+            ("[proxy]\nrequest_max_bytes = 1\n", "request_max_bytes"),
+            (
+                "[proxy.typesafe]\nbase_url = \"https://evil.example\"\n",
+                "typesafe.base_url",
+            ),
+            (
+                "[proxy.typesafe]\ncredential_env = \"EVIL\"\n",
+                "typesafe.credential_env",
+            ),
+            ("[proxy.typesafe]\nmodel = \"evil\"\n", "typesafe.model"),
+            (
+                "[proxy.typesafe]\ntimeout_secs = 1\n",
+                "typesafe.timeout_secs",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set proxy.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "proxy.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
+    /// `ZIRV_CTX_PROXY_*` env var may still set these keys.
+    #[test]
+    fn the_operator_can_still_set_proxy_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PROXY_ENABLED", "true"),
+            ("ZIRV_CTX_PROXY_DECIDER", "helper"),
+            ("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "0.75"),
+            ("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "4096"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL", "http://localhost:9999"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV", "MY_KEY"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_MODEL", "jev-next"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "3"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert!(cfg.proxy.enabled);
+        assert_eq!(cfg.proxy.decider, ProxyDecider::Helper);
+        assert_eq!(cfg.proxy.min_confidence, 0.75);
+        assert_eq!(cfg.proxy.request_max_bytes, 4096);
+        assert_eq!(cfg.proxy.typesafe.base_url, "http://localhost:9999");
+        assert_eq!(cfg.proxy.typesafe.credential_env, "MY_KEY");
+        assert_eq!(cfg.proxy.typesafe.model, "jev-next");
+        assert_eq!(cfg.proxy.typesafe.timeout_secs, 3);
+    }
+
+    /// Issue #537 seam, review finding: `[proxy]`'s three bounded numeric
+    /// keys are validated once at load, as a hard error naming the key --
+    /// never a silent clamp -- matching every other range check `load`
+    /// makes (`fallback.*`'s percentage bounds, `chat.claude_permission_
+    /// mode`'s fixed set).
+    #[test]
+    fn proxy_bounds_are_validated_at_load() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (env_pairs, expected_key) in [
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "1.5")],
+                "proxy.min_confidence",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "-0.1")],
+                "proxy.min_confidence",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "0")],
+                "proxy.typesafe.timeout_secs",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "10")],
+                "proxy.request_max_bytes",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            let env = env_map(&env_pairs);
+            let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err(&format!(
+                "{expected_key} out of range must be a load-time error"
+            ));
+            assert!(
+                err.to_string().contains(expected_key),
+                "expected error naming {expected_key}: {err}"
+            );
+        }
+    }
+
+    /// The documented lower bounds (`0.0`, `1`, `MIN_PROXY_REQUEST_MAX_
+    /// BYTES`) are themselves valid, not just narrowly excluded.
+    #[test]
+    fn proxy_bounds_accept_their_own_edges() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "0"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "1"),
+            ("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "1024"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the documented lower bounds must be accepted");
+        assert_eq!(cfg.proxy.min_confidence, 0.0);
+        assert_eq!(cfg.proxy.typesafe.timeout_secs, 1);
+        assert_eq!(cfg.proxy.request_max_bytes, 1024);
     }
 
     #[test]

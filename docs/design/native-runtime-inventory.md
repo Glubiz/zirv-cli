@@ -93,6 +93,7 @@ criterion).
 | `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
 | `ctx permissions` | N04 (#473) | canonical policy and approval audit remain shared; native effects consume them through `runtime::enforcement` |
 | `ctx provider` | N02 (#471) | `init`, `list`, `check`, official execution `login`/`status`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
+| `ctx proxy` | shared | decide-and-print CRUD (`--json` prints the `ProxyDecision`, never launches) is runtime-neutral; its two model-calling deciders (TypeSafe HTTP, the helper-model chokepoint) are tracked as entry points below |
 | `ctx recall` | N06 (#475) | native `memory_recall` preserves session/private/global/shared precedence |
 | `ctx remember` | N06 (#475) | native `memory_remember` defaults to session scope; shared writes retain policy/writer enforcement |
 | `ctx resume` | N17 (#486) |  |
@@ -239,6 +240,8 @@ installed binary during self-update; never spawns it).
 | Auto-spawn on workflow gate transition | `src/commands/workflow/engine.rs` | `spawn_auto_worker` | N15 (#484) | issue #242: detached self-recursion into `zirv workflow review run` / `test` / `verify` |
 | `ctx ask` helper-model call | `src/commands/ctx/ask.rs` | `run_model` | N15 (#484) |  |
 | `ctx optimize` judgment call | `src/commands/ctx/optimize.rs` | `run_with` | N15 (#484) |  |
+| Harness proxy TypeSafe Jev intake | `src/commands/ctx/proxy/typesafe.rs` | `decide` | shared | direct `ureq` HTTP POST to TypeSafe's own `/systemone` endpoint; no harness CLI or `ProviderAdapter` involved, so it is already runtime-independent and needs no native-runtime migration step |
+| Harness proxy helper-model intake | `src/commands/ctx/proxy/llm.rs` | `decide` | N15 (#484) | second decider in the proxy's chain: calls `handoff::helper_answer(helper::ROLE_PROXY, ..)`, the same native-first (`helper.rs`) / harness-second (`handoff::run_model`) chokepoint `ctx ask`/`ctx optimize` already reuse |
 | Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from exec.rs/wrap.rs restart and session-end seams |
 | Memory optimize consolidation | `src/commands/ctx/memory_optimize.rs` | `apply_consolidation` | N06 (#475) | `zirv memory optimize`'s model-assisted merge |
 | Builtin argv-shape checks | `src/commands/workflow/checks/argv.rs` | `headless_cmd` | shared | Notes: probe/check only -- `ZCHK-ARGV-CODEX-EXEC` / `ZCHK-ARGV-CLAUDE-HEADLESS` build argv to inspect it, never spawn |
