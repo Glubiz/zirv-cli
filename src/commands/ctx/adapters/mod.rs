@@ -260,13 +260,16 @@ pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
 
 /// Tells a spawned session which **role** launched it -- orchestrator,
-/// sub-orchestrator, or worker -- so a hook process (`zirv ctx hook
-/// pretool`, `zirv ctx safety check`) and `zirv ctx agent` can learn which
-/// seat role is running without re-deriving it. Only the value
-/// `"orchestrator"` ever gates any behaviour: an orchestrator seat must be
-/// technically unable to edit repository files, and delegation inside the
-/// same harness must use the harness's own native subagent tool rather than
-/// a nested `zirv ctx` launch (issues #328/#334).
+/// sub-orchestrator, worker, or (issue #537 T3) the harness proxy's own
+/// single seat -- so a hook process (`zirv ctx hook pretool`, `zirv ctx
+/// safety check`) and `zirv ctx agent` can learn which seat role is running
+/// without re-deriving it. Only the value `"orchestrator"` ever gates any
+/// behaviour: an orchestrator seat must be technically unable to edit
+/// repository files, and delegation inside the same harness must use the
+/// harness's own native subagent tool rather than a nested `zirv ctx` launch
+/// (issues #328/#334). `"single"` is therefore treated exactly like
+/// `"worker"`/`"sub-orchestrator"` by every guard keyed on this value: none
+/// of them ever compare against anything but the literal `"orchestrator"`.
 ///
 /// Set for every role, unlike `SEAT_MODEL_ENV` (orchestrator-only) -- a
 /// worker or sub-orchestrator seat needs to be told apart from an
@@ -1283,10 +1286,15 @@ pub(crate) fn model_only_flags(flags: &[String]) -> Option<&str> {
 /// The `SEAT_MODEL_ENV` pair a launch exports, or nothing. Pure, so which
 /// launches disclose a seat is testable without a pty.
 ///
-/// Only an `Orchestrator` launch with a non-blank resolved model discloses
-/// one: a `Worker` is not a seat that dispatches subagents, and with no
-/// resolved model the harness picks its own default, which zirv cannot name
-/// and therefore must not claim to.
+/// Only an `Orchestrator` or (issue #537 T3) `Single` launch with a
+/// non-blank resolved model discloses one: a `Worker`/`SubOrchestrator` is
+/// not a seat that dispatches subagents, and with no resolved model the
+/// harness picks its own default, which zirv cannot name and therefore must
+/// not claim to. A `Single` seat is included alongside `Orchestrator`
+/// because it is just as interactive and just as able to fork a native
+/// subagent through its own harness's mechanism -- `hook::pretool_decision`
+/// (the expensive-seat subagent guard) and `zirv ctx status` both need to
+/// see its model exactly as reliably as an Orchestrator's.
 ///
 /// The resolved model prefers an operator-passed `--model`/`--model=` in
 /// `flags` (the last occurrence, CLI last-wins) over `cfg_model`
@@ -1303,7 +1311,8 @@ pub fn seat_model_env(
     flags: &[String],
     cfg_model: Option<&str>,
 ) -> Vec<(String, String)> {
-    if role != super::prompt::PromptRole::Orchestrator {
+    use super::prompt::PromptRole;
+    if !matches!(role, PromptRole::Orchestrator | PromptRole::Single) {
         return Vec::new();
     }
     let resolved = last_model_flag(flags).or(cfg_model);
@@ -7338,6 +7347,13 @@ mod tests {
         assert_eq!(
             seat_role_env(PromptRole::Worker),
             vec![(SEAT_ROLE_ENV.to_string(), "worker".to_string())]
+        );
+        // Issue #537 (T3): the proxy's own single seat labels identically to
+        // every other non-orchestrator role -- only the literal
+        // `"orchestrator"` ever gates a guard keyed on this env var.
+        assert_eq!(
+            seat_role_env(PromptRole::Single),
+            vec![(SEAT_ROLE_ENV.to_string(), "single".to_string())]
         );
     }
 }

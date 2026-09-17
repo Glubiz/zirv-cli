@@ -4054,6 +4054,8 @@ mod tests {
             complexity: crate::commands::workflow::classify::Complexity::Substantial,
             risk: crate::commands::workflow::classify::RiskBand::Medium,
             execution: crate::commands::workflow::profile::ExecutionMode::Orchestrated,
+            seat_role: crate::commands::ctx::proxy::decision::SeatRole::Orchestrator,
+            seat_tier: crate::commands::ctx::proxy::decision::SeatTier::Frontier,
             validation: crate::commands::workflow::profile::ValidationProfile::default(),
             workflow: Some("feature".to_string()),
             orchestrator: crate::commands::ctx::proxy::decision::Seat {

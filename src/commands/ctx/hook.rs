@@ -8166,6 +8166,34 @@ mod tests {
         assert!(out.is_empty(), "a worker must be free to edit: {out:?}");
     }
 
+    /// Issue #537 (T3): mirrors `run_pretool_stays_silent_for_a_worker_
+    /// editing_a_repo_file` for the proxy's own `PromptRole::Single` seat --
+    /// `lifecycle::orchestrator_write_target`'s `role != Some("orchestrator")`
+    /// gate already excludes any role but that exact string, so `"single"`
+    /// falls outside the guard's scope the same way `"worker"` does, with no
+    /// production code change required; this test just pins that a Single
+    /// seat is never technically unable to edit files the way the operator's
+    /// bug report showed it was when a direct/bounded decision was launched
+    /// as a full orchestrator.
+    #[test]
+    fn run_pretool_stays_silent_for_a_single_seat_editing_a_repo_file() {
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::SEAT_ROLE_ENV.to_string(), "single".to_string())].into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a single seat must be free to edit: {out:?}"
+        );
+    }
+
     fn edit_payload_stdin(repo: &Path, relative_target: &str) -> String {
         orchestrator_pretool_stdin(
             &repo.display().to_string(),
@@ -8756,7 +8784,7 @@ mod tests {
     // -- the seat env the orchestrator exports ------------------------------
 
     #[test]
-    fn only_an_orchestrator_launch_with_a_configured_model_exports_the_seat() {
+    fn only_an_orchestrator_or_single_seat_with_a_configured_model_exports_the_seat() {
         use crate::commands::ctx::adapters::{SEAT_MODEL_ENV, seat_model_env};
         use crate::commands::ctx::prompt::PromptRole;
 
@@ -8764,9 +8792,20 @@ mod tests {
             seat_model_env(PromptRole::Orchestrator, &[], Some("fable")),
             vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
         );
+        // Issue #537 (T3): a Single seat is just as able to fork a native
+        // subagent through its own harness as an Orchestrator, so it
+        // discloses its own model through the identical path.
+        assert_eq!(
+            seat_model_env(PromptRole::Single, &[], Some("fable")),
+            vec![(SEAT_MODEL_ENV.to_string(), "fable".to_string())]
+        );
         assert!(
             seat_model_env(PromptRole::Worker, &[], Some("fable")).is_empty(),
             "a worker is not a seat that spawns subagents"
+        );
+        assert!(
+            seat_model_env(PromptRole::SubOrchestrator, &[], Some("fable")).is_empty(),
+            "a sub-orchestrator is not a seat that spawns subagents either"
         );
         assert!(
             seat_model_env(PromptRole::Orchestrator, &[], None).is_empty(),

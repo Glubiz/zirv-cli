@@ -109,7 +109,7 @@ mod tests {
 
     use super::*;
     use crate::commands::ctx::catalogue::Tier;
-    use crate::commands::ctx::proxy::decision::{Decider, Seat};
+    use crate::commands::ctx::proxy::decision::{Decider, Seat, SeatRole, SeatTier};
     use crate::commands::ctx::state::StateDir as CtxStateDir;
     use crate::commands::workflow::classify::{Complexity, Intent, RiskBand};
     use crate::commands::workflow::profile::{ExecutionMode, ValidationProfile};
@@ -150,12 +150,14 @@ mod tests {
             complexity,
             risk,
             execution: ExecutionMode::Bounded,
+            seat_role: SeatRole::Single,
             validation: ValidationProfile::default(),
             workflow: workflow.map(str::to_string),
             orchestrator: Seat {
                 harness: "claude".to_string(),
                 model: "fable".to_string(),
             },
+            seat_tier: SeatTier::Standard,
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
             decider: Decider::Deterministic,

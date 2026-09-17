@@ -583,6 +583,7 @@ pub fn chat_via_runtime<W: Write>(
     extra: &[String],
     repo: &std::path::Path,
     w: &mut W,
+    role: super::prompt::PromptRole,
 ) -> CtxResult<i32> {
     let endpoint = endpoint_for(state);
     if !super::api::transport::probe(&endpoint) {
@@ -609,7 +610,7 @@ pub fn chat_via_runtime<W: Write>(
                 Method::SessionStart,
                 json!({
                     "runtime": "harness",
-                    "role": "orchestrator",
+                    "role": role.label(),
                     "agent": agent,
                     "cwd": repo.to_string_lossy(),
                     "prompt": prompt.unwrap_or_default(),

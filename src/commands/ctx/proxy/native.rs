@@ -35,7 +35,7 @@ pub fn route_for_decision(decision: &ProxyDecision, cfg: &NativeConfig) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::ctx::proxy::decision::{Decider, Seat};
+    use crate::commands::ctx::proxy::decision::{Decider, Seat, SeatRole, SeatTier};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -47,12 +47,14 @@ mod tests {
             complexity: crate::commands::workflow::classify::Complexity::Bounded,
             risk: crate::commands::workflow::classify::RiskBand::Low,
             execution: crate::commands::workflow::profile::ExecutionMode::Bounded,
+            seat_role: SeatRole::Single,
             validation: crate::commands::workflow::profile::ValidationProfile::default(),
             workflow: None,
             orchestrator: Seat {
                 harness: harness.to_string(),
                 model: model.to_string(),
             },
+            seat_tier: SeatTier::Standard,
             worker_tier: catalogue::Tier::Standard,
             needs_clarification: 0.0,
             decider: Decider::Deterministic,

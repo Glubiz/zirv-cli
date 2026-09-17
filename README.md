@@ -353,15 +353,28 @@ first, then runs at most one model decider, starting at `cfg.proxy.decider`:
 TypeSafe Jev over HTTP (skipped with a recorded fallback when
 `TYPESAFE_API_KEY` is unset, or on any transport/HTTP error) → the existing
 helper-model chokepoint (skipped when no adapter is ready or the call fails)
-→ the deterministic baseline as is. A field whose model confidence is below
-`min_confidence` keeps the baseline value instead, with a recorded reason.
-`complexity`, `risk` and `execution` are always merged with `max(model,
-baseline)` — a monotonic floor, so a model decision can raise them but never
-lower them — and `validation` is recomputed from the merged complexity and
-risk, so a raise always propagates. The winning decision is then validated
-against the live roster (an unready harness, an unknown model alias, or an
-unknown workflow id falls back to the baseline with a reason) before it is
-applied.
+→ the deterministic baseline as is. Jev/the helper model answer exactly five
+questions — `intent`, `complexity`, `risk`, `workflow`, `needs_clarification`
+— never `execution`, seat tier or worker tier directly: a live battery found
+those unreliable, and any many-option seat/tier question never cleared the
+confidence floor. A field whose model confidence is below `min_confidence`
+keeps the baseline value instead, with a recorded reason; `complexity` and
+`risk` are always merged with `max(model, baseline)` — a monotonic floor, so
+a model decision can raise them but never lower them — and `validation` is
+recomputed from the merged complexity and risk, so a raise always
+propagates. `execution`, seat tier, worker tier and seat role then derive
+entirely from that merged `complexity`: Trivial → direct/cheap/single seat,
+Bounded → bounded/standard/single seat, Substantial or Architectural →
+orchestrated/frontier/orchestrator seat — floored upward when risk reaches
+High (at least Bounded) or the request names a security surface, and a
+Direct execution always clears any chosen workflow back to none. The
+winning decision is then validated against the live roster (an unready
+harness falls back to the baseline harness, its model re-derived for the
+decision's own seat tier; an unknown workflow id falls back to the baseline)
+before it is applied. The committed `tests/fixtures/proxy/jev-battery.json`
+documents the expected ruling (execution, complexity, workflow, seat tier)
+per request class, verified against the real API; `TYPESAFE_API_KEY=...
+cargo nextest run jev_live_battery` replays it against Jev directly.
 
 **When it takes over.** Bare `zirv` and `zirv chat` open the proxy's intake
 view first only when `[proxy] enabled = true` and the configured decider has a
@@ -379,8 +392,24 @@ first prompt when the repo has no workflow already active; and one `zirv ▸`
 line announces the outcome, e.g.:
 
 ```
-zirv ▸ proxy: orchestrated · claude/fable · workers standard · workflow feature (substantial/medium) · typesafe 0.81
+zirv ▸ proxy: orchestrated · orchestrator claude/fable (frontier) · workers standard · workflow feature (substantial/medium) · typesafe 0.81
+zirv ▸ proxy: direct · single seat · claude/sonnet (cheap) · no workflow · typesafe 0.75
 ```
+
+Before either decider call runs, one `zirv ▸ proxy: asking …` line tells the
+operator the request has gone out, e.g. `proxy: asking typesafe
+(jev-latest)…` or `proxy: asking helper model…`.
+
+**Single seat vs. orchestrator seat.** A Direct or Bounded decision launches
+the harness as a `single` seat (`PromptRole::Single`): it gets none of the
+orchestrator's own conventions — no `HARNESS_PROMPT`, no derived harness
+roster, no "delegate everything" coaching — and never reads the operator's
+orchestrator `system-prompt.md`; editing repository files directly is
+allowed (only an orchestrator seat is technically blocked from that), and
+the seat gets its own optional `~/.zirv/system-prompt.single.md`
+(`SINGLE_PROMPT_FILE`) layer instead, if one exists. An Orchestrated decision
+keeps today's orchestrator seat and every one of its existing conventions
+unchanged.
 
 **`zirv ctx proxy [--json] [REQUEST]`** decides and prints without launching
 anything. `REQUEST` is read from stdin when omitted and stdin is not a tty;
@@ -704,8 +733,10 @@ to the section that documents it in depth.
   session per cycle); `chat` starts an interactive orchestrator session
   (also the top-level `zirv chat` alias, and bare `zirv`), and `agent`
   delegates one task to a supervised worker on another enabled harness
-  (also `zirv agent`). See [Verbs](#verbs) and [Just Run
-  `zirv`](#just-run-zirv).
+  (also `zirv agent`); `proxy` decides a request's intent, complexity, risk
+  and workflow before a launch, so the seat, model and workflow fit the task
+  (opt-in, see [Harness proxy](#harness-proxy)). See [Verbs](#verbs) and
+  [Just Run `zirv`](#just-run-zirv).
 - **Experimental: `native`** — a thin, case-insensitive top-level alias
   (`zirv native`) for `zirv chat --runtime native`, reserved so a script or
   shortcut can never shadow it. Shown only in `zirv help`'s separately

@@ -70,7 +70,11 @@ const WORKER_NICE: libc::c_int = 5;
 /// one level down.
 pub fn posture_for(role: PromptRole) -> Posture {
     match role {
-        PromptRole::Orchestrator => Posture::Interactive,
+        // Issue #537 (T3): a Single seat is the other shape of "a human is
+        // typing into this session" -- the proxy's direct/bounded decision,
+        // as interactive as an Orchestrator, just working alone rather than
+        // delegating.
+        PromptRole::Orchestrator | PromptRole::Single => Posture::Interactive,
         PromptRole::SubOrchestrator | PromptRole::Worker => Posture::Worker,
     }
 }
