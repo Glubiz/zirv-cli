@@ -17,7 +17,10 @@ use super::dash;
 use super::dash::pane::PaneSpec;
 use super::event::SessionId;
 use super::prompt::PromptRole;
-use super::proxy::{self, decision::ProxyDecision};
+use super::proxy::{
+    self,
+    decision::{ProxyDecision, SeatRole},
+};
 use super::runtime::{self as runtime_kind, RuntimeKind};
 use super::state::StateDir;
 use super::term;
@@ -160,6 +163,12 @@ pub fn build_launch(
 /// compose`'s own gate), and `task_prompt_with_composed_fallback` is a no-op
 /// when handed `None`, so both degrade to returning `initial_prompt`
 /// unchanged -- the correct answer either way.
+///
+/// `role` (issue #537 T3) is the seat this launch actually runs as --
+/// `PromptRole::Single` for the proxy's own direct/bounded decision,
+/// `Orchestrator` for everything else (see `proxy_prompt_role`) -- so this
+/// fallback composes the SAME layers the launch's own env/hook plumbing
+/// assumes, rather than always hardcoding `Orchestrator`.
 #[allow(clippy::too_many_arguments)]
 fn orchestrator_initial_prompt(
     adapter: &dyn AgentAdapter,
@@ -170,6 +179,7 @@ fn orchestrator_initial_prompt(
     simple: bool,
     state: &StateDir,
     proxy_layer: Option<&str>,
+    role: PromptRole,
 ) -> Option<String> {
     if adapter.system_prompt_supported(&[]) {
         return initial_prompt;
@@ -180,7 +190,7 @@ fn orchestrator_initial_prompt(
         simple,
         cfg,
         adapter,
-        PromptRole::Orchestrator,
+        role,
         state,
         super::state::now_secs(),
         super::adapters::LaunchMode::Interactive,
@@ -387,6 +397,21 @@ fn proxy_intake<E: Write>(
             ),
         });
     };
+    // Issue #537 review (operator field report): nothing on screen showed
+    // that the request was actually sent to the configured decider, so a
+    // slow or falling-back `decide()` looked identical to a hung session.
+    // Same `zirv \u{25b8}` channel and `--quiet` gate every other proxy
+    // advisory uses, printed immediately before the call it describes.
+    super::announce::Announcer::new(
+        cfg.chrome.events && !args.quiet,
+        console::colors_enabled_stderr(),
+    )
+    .emit_to(
+        stderr,
+        &super::announce::Event::ProxyAdvisory {
+            text: proxy::asking_line(cfg),
+        },
+    );
     let decision = proxy::decide(cfg, state.root(), repo, &request);
     Ok(ProxyIntakeOutcome::Decided {
         decision: Box::new(decision),
@@ -406,6 +431,23 @@ fn proxy_intake<E: Write>(
 fn apply_proxy_decision(cfg: &mut CtxConfig, decision: &ProxyDecision) -> String {
     cfg.chat.model = Some(decision.orchestrator.model.clone());
     decision.orchestrator.harness.clone()
+}
+
+/// Issue #537 (T3, operator field report): the `PromptRole` this launch's own
+/// prompt/env/hook plumbing runs as. `SeatRole::Single` (a `direct`/`bounded`
+/// decision -- one seat working alone) launches as `PromptRole::Single`
+/// rather than today's hardcoded `Orchestrator`, so it never receives the
+/// harness's orchestrator conventions, the operator's orchestrator `system-
+/// prompt.md`, or the write-guard denial those imply (see `PromptRole::
+/// Single`'s own doc comment). `SeatRole::Orchestrator` and every outcome
+/// that never decided (today's launch, unchanged) keep `Orchestrator`.
+fn proxy_prompt_role(intake: &ProxyIntakeOutcome) -> PromptRole {
+    match intake {
+        ProxyIntakeOutcome::Decided { decision, .. } if decision.seat_role == SeatRole::Single => {
+            PromptRole::Single
+        }
+        _ => PromptRole::Orchestrator,
+    }
 }
 
 /// The harness proxy's own bounded `[zirv proxy]` layer text
@@ -883,6 +925,11 @@ pub fn run_with<W: Write, E: Write>(
     // just below, `dash_orchestrator_pane` and `wrap_args_for` -- so all
     // three launch shapes carry exactly the same layer or none at all.
     let proxy_layer = proxy_layer_text(&intake);
+    // Issue #537 (T3): the seat this launch actually runs as -- `Single` for
+    // the proxy's own direct/bounded decision, `Orchestrator` for everything
+    // else -- resolved once and threaded to every place a role currently
+    // hardcodes `Orchestrator`, exactly like `proxy_layer` just above.
+    let seat_role = proxy_prompt_role(&intake);
     let initial_prompt = orchestrator_initial_prompt(
         adapter.as_ref(),
         initial_prompt,
@@ -892,6 +939,7 @@ pub fn run_with<W: Write, E: Write>(
         args.simple,
         &state,
         proxy_layer.as_deref(),
+        seat_role,
     );
 
     // Applies to both branches below (the dashboard's orchestrator pane and
@@ -899,7 +947,13 @@ pub fn run_with<W: Write, E: Write>(
     // the dashboard, so the model flags are folded into the launch's own
     // extra arguments once, here, before either path reads `launch.argv`.
     let extra = extra_with_model(&cfg, adapter.as_ref(), &args.extra);
-    let launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &extra);
+    let mut launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &extra);
+    // Issue #537 (T3): overrides `build_launch`'s own hardcoded `Orchestrator`
+    // default when the proxy decided a Single seat -- every downstream
+    // consumer of `launch.role` (the banner, `dash_orchestrator_pane`,
+    // `wrap::run_with`, `chat_via_runtime`) already threads it through
+    // generically, so this is the one place that has to change.
+    launch.role = seat_role;
 
     if chrome.banner {
         let facts = BannerFacts {
@@ -971,6 +1025,7 @@ pub fn run_with<W: Write, E: Write>(
                     &extra,
                     repo,
                     w,
+                    launch.role,
                 )
             },
         ) {
@@ -1354,7 +1409,7 @@ mod tests {
     use crate::commands::ctx::adapters::codex::CodexAdapter;
     use crate::commands::ctx::catalogue::Tier;
     use crate::commands::ctx::handoff::Handoff;
-    use crate::commands::ctx::proxy::decision::{Decider, Seat};
+    use crate::commands::ctx::proxy::decision::{Decider, Seat, SeatTier};
     use crate::commands::ctx::state::StateDir;
     use crate::commands::workflow::classify::{Complexity, Intent, RiskBand};
     use crate::commands::workflow::profile::{ExecutionMode, ValidationProfile};
@@ -1450,6 +1505,7 @@ mod tests {
                 false,
                 &state,
                 None,
+                PromptRole::Orchestrator,
             ),
             None
         );
@@ -1463,6 +1519,7 @@ mod tests {
                 false,
                 &state,
                 None,
+                PromptRole::Orchestrator,
             ),
             Some("resume this".to_string())
         );
@@ -1503,6 +1560,7 @@ mod tests {
             false,
             &state,
             None,
+            PromptRole::Orchestrator,
         )
         .expect("an unsupported adapter still gets a fallback prompt");
         assert!(
@@ -1527,6 +1585,7 @@ mod tests {
             false,
             &state,
             None,
+            PromptRole::Orchestrator,
         )
         .expect("still folds a fallback in on top of a real prompt");
         assert!(
@@ -1564,6 +1623,7 @@ mod tests {
             false,
             &state,
             Some("[zirv proxy]\nexecution: bounded"),
+            PromptRole::Orchestrator,
         )
         .expect("an unsupported adapter still gets a fallback prompt");
         assert!(
@@ -1599,6 +1659,7 @@ mod tests {
                 true,
                 &state,
                 None,
+                PromptRole::Orchestrator,
             ),
             None,
             "--simple must still suppress every zirv-injected layer, fallback included"
@@ -3312,6 +3373,11 @@ mod tests {
             complexity: Complexity::Bounded,
             risk: RiskBand::Medium,
             execution: ExecutionMode::Bounded,
+            // `Bounded` -> `SeatRole::Single`/`SeatTier::Standard`, mirroring
+            // `decision::SeatRole::from_execution`/`SeatTier::from_execution`
+            // (both private to that module) rather than re-deriving them.
+            seat_role: SeatRole::Single,
+            seat_tier: SeatTier::Standard,
             validation: ValidationProfile::default(),
             workflow: workflow.map(str::to_string),
             orchestrator: Seat {
@@ -3520,6 +3586,55 @@ mod tests {
         }
     }
 
+    /// Issue #537 review (operator field report): nothing on screen showed
+    /// that a request was actually sent to the decider, so a slow or
+    /// falling-back `decide()` looked identical to a hung session.
+    /// `proxy_intake` must print `proxy::asking_line` on stderr immediately
+    /// before calling `decide()`, even when every model decider falls
+    /// through to the deterministic floor. A connection-refused loopback
+    /// address keeps `decide()`'s own Typesafe attempt instant rather than
+    /// waiting out `timeout_secs`, so this stays fast and network-free; the
+    /// "never when inactive" half is already proven by the disabled/resume/
+    /// simple/non-tty tests above, all of which assert `stderr` is empty or
+    /// carries only their own named reason.
+    #[test]
+    fn the_asking_line_is_announced_before_decide_runs() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
+        cfg.proxy.typesafe.timeout_secs = 1;
+        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
+            cfg.proxy.typesafe.credential_env.as_str(),
+            Some("a-test-key"),
+        )]);
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            true,
+            &mut &b"fix the flaky retry test\n"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        assert!(
+            matches!(outcome, ProxyIntakeOutcome::Decided { .. }),
+            "the deterministic floor never fails: {outcome:?}"
+        );
+        let printed = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            printed.contains(&proxy::asking_line(&cfg)),
+            "the asking line must reach the operator before decide() runs: {printed}"
+        );
+    }
+
     /// The wiring `run_with` applies once the proxy actually decided this
     /// launch: the decided model replaces `cfg.chat.model` and the decided
     /// harness is returned for `resolve_adapter`, so `extra_with_model`/
@@ -3571,6 +3686,105 @@ mod tests {
 
         assert_eq!(requested_agent, "codex");
         assert_eq!(cfg.chat.model.as_deref(), Some("o-fast"));
+    }
+
+    /// Issue #537 (T3): `run_with` reads the seat this launch runs as
+    /// straight off `proxy_prompt_role` -- `SeatRole::Single` maps to
+    /// `PromptRole::Single`, `SeatRole::Orchestrator` keeps today's
+    /// `Orchestrator`, and an intake that never decided this launch at all
+    /// (the disabled default, or every other `Inactive`/`Refuse` outcome)
+    /// also keeps `Orchestrator`, unchanged.
+    #[test]
+    fn proxy_prompt_role_maps_seat_role_and_leaves_an_undecided_launch_alone() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
+        assert_eq!(
+            decision.seat_role,
+            SeatRole::Single,
+            "sample_decision's Bounded execution is a Single seat"
+        );
+
+        let single = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision.clone()),
+            request: "fix a typo".to_string(),
+        };
+        assert_eq!(proxy_prompt_role(&single), PromptRole::Single);
+
+        decision.seat_role = SeatRole::Orchestrator;
+        let orchestrated = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "redesign the billing pipeline".to_string(),
+        };
+        assert_eq!(proxy_prompt_role(&orchestrated), PromptRole::Orchestrator);
+
+        assert_eq!(
+            proxy_prompt_role(&ProxyIntakeOutcome::Inactive { advisory: None }),
+            PromptRole::Orchestrator
+        );
+    }
+
+    /// Issue #537 (T3, operator field report): the actual bug -- a direct/
+    /// bounded decision started "the full orchestrator setup" -- reproduced
+    /// and fixed at the launch level. A `SeatRole::Single` decision must
+    /// launch with no harness meta-teaching (`HARNESS_PROMPT`, "zirv meta-
+    /// harness"), no adapter orchestrator-conventions layer (`ORCHESTRATOR_
+    /// PROMPT`, "it does not implement"), and its role must reach
+    /// `adapters::seat_role_env` as `"single"` -- the same env pair the
+    /// write guard and the subagent guard key off (see `hook.rs`'s `run_
+    /// pretool_stays_silent_for_a_single_seat_editing_a_repo_file`). Same
+    /// recipe `the_dash_orchestrator_pane_carries_the_composed_prompt`
+    /// already proves for an `Orchestrator` decision, which this test's
+    /// companion assertions confirm is still unaffected.
+    #[test]
+    fn a_decided_single_seat_launches_with_no_orchestrator_conventions() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+
+        let decision = sample_decision(tmp.path(), "claude", "fable", None);
+        let outcome = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "fix a typo in README".to_string(),
+        };
+        let role = proxy_prompt_role(&outcome);
+        assert_eq!(role, PromptRole::Single);
+
+        let mut launch = build_launch(&adapter, None, &[]);
+        launch.role = role;
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+            None,
+        )
+        .expect("pane");
+
+        let argv = pane.argv.join(" ");
+        assert!(
+            argv.contains("zirv engineering standard"),
+            "the shipped default layer must still apply to a single seat: {argv}"
+        );
+        assert!(
+            !argv.contains("zirv meta-harness"),
+            "a single seat must not get the harness delegation layer: {argv}"
+        );
+        assert!(
+            !argv.contains("it does not implement"),
+            "a single seat must not get the orchestrator's own conventions layer: {argv}"
+        );
+        assert_eq!(pane.role, PromptRole::Single);
+        assert_eq!(
+            adapters::seat_role_env(pane.role),
+            vec![(adapters::SEAT_ROLE_ENV.to_string(), "single".to_string())],
+            "the hook write guard and the subagent guard both key off this env pair"
+        );
     }
 
     fn git_init_with_commit(repo: &Path) {

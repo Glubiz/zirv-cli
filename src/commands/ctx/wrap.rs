@@ -2305,12 +2305,12 @@ pub fn run_with(
         turn_env.push((key, value));
     }
     // The seat this session sits in, for the `zirv ctx hook pretool` guard
-    // running inside it. Orchestrator-only, and preferring an operator's own
-    // `--model`/`--model=` passthrough in `rest` (the same flag vector this
-    // launch actually spawns with) over `cfg.chat.model`; see
-    // `adapters::seat_model_env`. Kept in `turn_env` for the same reason
-    // `AGENT_ENV` is: a relaunch reuses this exact vector, and the fresh
-    // session sits in the same seat.
+    // running inside it. Orchestrator or (issue #537 T3) Single only, and
+    // preferring an operator's own `--model`/`--model=` passthrough in `rest`
+    // (the same flag vector this launch actually spawns with) over
+    // `cfg.chat.model`; see `adapters::seat_model_env`. Kept in `turn_env`
+    // for the same reason `AGENT_ENV` is: a relaunch reuses this exact
+    // vector, and the fresh session sits in the same seat.
     //
     // Only a `chat` launch may fall back to `cfg.chat.model`: that is `chat`'s
     // own knob, spliced into the argv it hands us (`chat::extra_with_model`),

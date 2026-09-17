@@ -92,6 +92,14 @@ pub const WORKER_PROMPT_FILE: &str = "system-prompt.worker.md";
 /// no such file a SubOrchestrator session gets no user layer at all, same as
 /// the other two roles.
 pub const SUB_ORCHESTRATOR_PROMPT_FILE: &str = "system-prompt.sub-orchestrator.md";
+/// The user layer's own Single-role file, mirroring [`WORKER_PROMPT_FILE`]/
+/// [`SUB_ORCHESTRATOR_PROMPT_FILE`] for `PromptRole::Single` (issue #537 T3):
+/// an operator's standing Orchestrator instructions ("this seat does not
+/// edit files; delegate everything") are exactly wrong for a seat working
+/// alone, so a Single seat never reads [`PROMPT_FILE`] and gets its own
+/// optional file instead. With no such file a Single session gets no user
+/// layer at all, same as the other two non-Orchestrator roles.
+pub const SINGLE_PROMPT_FILE: &str = "system-prompt.single.md";
 
 /// The floor every zirv-started session gets. Deliberately few rules: enough
 /// to make sessions behave the same way twice, short enough that it never
@@ -577,6 +585,23 @@ pub enum PromptRole {
     /// is not the one deciding which harnesses run, and teaching it to
     /// delegate invites recursion.
     Worker,
+    /// Issue #537 (T3, harness proxy): an interactive human seat that works
+    /// ALONE -- the proxy's `execution: direct`/`bounded` decision, as
+    /// opposed to `orchestrated`. Gets neither `HARNESS_PROMPT` nor the
+    /// derived roster (same reason `SubOrchestrator` does not: which
+    /// harnesses run is not this seat's decision -- the proxy already made
+    /// it), no adapter role layer at all (`adapter_layer_for` -- it is
+    /// neither the orchestrator's `ORCHESTRATOR_PROMPT` "delegate
+    /// everything" coaching, nor a dispatched `WORKER_PROMPT`/
+    /// `SUB_ORCHESTRATOR_PROMPT`, since this seat is not delegated and does
+    /// not delegate), and never reads the operator's orchestrator
+    /// `system-prompt.md` (its own optional file is [`SINGLE_PROMPT_FILE`]
+    /// instead, mirroring the Worker/SubOrchestrator split). Otherwise an
+    /// ordinary interactive launch: the shipped default, the operator's own
+    /// repo/context/memory/mail/objective layers, and the proxy's own
+    /// `[zirv proxy]` layer (`with_proxy_layer`, unconditional on role) all
+    /// still apply.
+    Single,
 }
 
 impl PromptRole {
@@ -587,7 +612,7 @@ impl PromptRole {
     // above -- Task 5.3 is the first real consumer.
     #[allow(dead_code)]
     pub fn may_spawn_workers(self) -> bool {
-        !matches!(self, PromptRole::Worker)
+        !matches!(self, PromptRole::Worker | PromptRole::Single)
     }
 
     /// A short, stable, human-readable name for this role, used in logs and
@@ -599,6 +624,7 @@ impl PromptRole {
             PromptRole::Orchestrator => "orchestrator",
             PromptRole::SubOrchestrator => "sub-orchestrator",
             PromptRole::Worker => "worker",
+            PromptRole::Single => "single",
         }
     }
 
@@ -612,6 +638,7 @@ impl PromptRole {
             "orchestrator" => Some(PromptRole::Orchestrator),
             "sub-orchestrator" => Some(PromptRole::SubOrchestrator),
             "worker" => Some(PromptRole::Worker),
+            "single" => Some(PromptRole::Single),
             _ => None,
         }
     }
@@ -1344,6 +1371,7 @@ pub fn compose(
         PromptRole::Orchestrator => PROMPT_FILE,
         PromptRole::SubOrchestrator => SUB_ORCHESTRATOR_PROMPT_FILE,
         PromptRole::Worker => WORKER_PROMPT_FILE,
+        PromptRole::Single => SINGLE_PROMPT_FILE,
     };
     let user_path = home.map(|home| home.join(crate::utils::SCRIPT_DIR_NAME).join(user_file));
     if let Some(path) = user_path
@@ -1413,14 +1441,19 @@ controls capabilities.\n\n";
 
 /// Issue #253's gate, extracted into its own named, independently-tested
 /// function so a future caller can resolve it without going through
-/// `compose`: only `PromptRole::Orchestrator` ever hears about the active
-/// workflow step in `repo` -- a `zirv agent`-dispatched Worker or
-/// SubOrchestrator must never hear about whatever step happens to be active
-/// at launch time, only the Orchestrator session driving that workflow does.
-/// Without this gate a step's guidance (written for the session that will
-/// read `zirv workflow ...` output and decide what to do next) hijacked
-/// every dispatched worker's own, self-contained brief regardless of what it
-/// was actually asked to do.
+/// `compose`: only `PromptRole::Orchestrator` -- and, since issue #537 T3,
+/// `PromptRole::Single` -- ever hears about the active workflow step in
+/// `repo`. A `zirv agent`-dispatched Worker or SubOrchestrator must never
+/// hear about whatever step happens to be active at launch time, only the
+/// session actually driving that workflow does. Without this gate a step's
+/// guidance (written for the session that will read `zirv workflow ...`
+/// output and decide what to do next) hijacked every dispatched worker's
+/// own, self-contained brief regardless of what it was actually asked to do.
+/// A `Single` seat is not dispatched -- it is the proxy's own direct/bounded
+/// decision, the one seat actually doing the work a `Bounded` decision's
+/// workflow (e.g. `bugfix`) was started for -- so it needs the same step
+/// guidance an Orchestrator would use to drive that workflow, unlike a
+/// Worker/SubOrchestrator which never drives one.
 ///
 /// `compose` used to call this inline, right after `Harness`/`Harnesses`,
 /// ahead of `User`/`Repo` -- a real prompt-cache problem, since the workflow
@@ -1436,7 +1469,7 @@ controls capabilities.\n\n";
 /// Returns the raw step text (if any is active and the role allows it), for
 /// the caller to pass straight into `with_workflow_layer`.
 pub fn workflow_context_for_role(repo: &Path, role: PromptRole) -> Option<String> {
-    if role != PromptRole::Orchestrator {
+    if !matches!(role, PromptRole::Orchestrator | PromptRole::Single) {
         return None;
     }
     crate::commands::workflow::engine::active_skill_context(repo)
@@ -2057,6 +2090,12 @@ fn adapter_layer_for(
         PromptRole::Orchestrator => adapter.base_system_prompt(cfg.orchestrator_writes),
         PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt().map(str::to_string),
         PromptRole::Worker => adapter.worker_system_prompt().map(str::to_string),
+        // Issue #537 (T3): a Single seat gets none of the three -- not the
+        // Orchestrator's "delegate everything" coaching, and not a dispatched
+        // role's own layer either, since this seat was never dispatched and
+        // must not delegate onward. See `PromptRole::Single`'s own doc
+        // comment.
+        PromptRole::Single => None,
     }
     .filter(|layer| !layer.trim().is_empty())
 }
@@ -3498,6 +3537,84 @@ mod tests {
 
         assert!(!composed.text.contains("worker-only user text"));
         assert!(!composed.sources.contains(&PromptSource::User));
+    }
+
+    /// Issue #537 (T3, operator field report): a `PromptRole::Single` seat
+    /// (the proxy's own direct/bounded decision) must compose like an
+    /// ordinary interactive session MINUS the orchestrator's own conventions
+    /// -- no `Harness`/`Harnesses` layer (that block is exactly what teaches
+    /// "implementation ... is a worker's, whatever the task size"), and no
+    /// `User` layer from the operator's orchestrator `system-prompt.md` (an
+    /// operator's "this seat does not edit files; delegate everything"
+    /// instructions are wrong for a seat working alone). `with_proxy_layer`
+    /// is unconditional on role (see its own doc comment) and so is not
+    /// exercised by `compose` itself; it is proven separately in this
+    /// module's `with_proxy_layer` tests.
+    #[test]
+    fn the_single_role_excludes_the_orchestrator_layers_and_the_orchestrators_user_file() {
+        let (_tmp, home, repo) = tree();
+        std::fs::write(
+            home.join(".zirv/system-prompt.md"),
+            "orchestrator-only user text\n",
+        )
+        .expect("write");
+
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Single,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+
+        assert_eq!(
+            composed.sources,
+            vec![PromptSource::Default],
+            "no Harness/Harnesses and no User layer from the orchestrator's own file: {:?}",
+            composed.sources
+        );
+        assert!(!composed.text.contains("orchestrator-only user text"));
+        assert!(
+            !composed.text.contains("zirv meta-harness"),
+            "a single seat must not get the harness delegation layer: {}",
+            composed.text
+        );
+    }
+
+    /// The mirror of [`the_single_role_excludes_the_orchestrator_layers_and_
+    /// the_orchestrators_user_file`]: a `Single` seat still gets an ordinary
+    /// user layer, just from its own file ([`SINGLE_PROMPT_FILE`]) rather
+    /// than the orchestrator's.
+    #[test]
+    fn the_single_role_reads_its_own_user_layer_file() {
+        let (_tmp, home, repo) = tree();
+        std::fs::write(
+            home.join(".zirv").join(SINGLE_PROMPT_FILE),
+            "single-seat user text\n",
+        )
+        .expect("write");
+
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Single,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+
+        assert_eq!(
+            composed.sources,
+            vec![PromptSource::Default, PromptSource::User]
+        );
+        assert!(composed.text.contains("single-seat user text"));
     }
 
     /// `repo == home_dir()` (`zirv chat` run from `~`) must not read the
@@ -7299,9 +7416,12 @@ mod tests {
     /// returns). Exercises the same three-role gate `the_workflow_step_
     /// layer_reaches_only_the_orchestrator_role` exercises through `compose`
     /// together with `with_workflow_layer`, directly against the extracted
-    /// function instead.
+    /// function instead. Issue #537 (T3) widened the gate to also admit
+    /// `PromptRole::Single`: it is the seat actually doing the work a
+    /// `Bounded` decision's own workflow was started for, unlike a
+    /// dispatched Worker/SubOrchestrator.
     #[test]
-    fn workflow_context_for_role_reaches_only_the_orchestrator_role() {
+    fn workflow_context_for_role_reaches_the_orchestrator_and_single_roles_only() {
         let (_tmp, _home, repo) = tree();
 
         let orchestrator_context = with_active_workflow(&repo, || {
@@ -7309,6 +7429,12 @@ mod tests {
         })
         .expect("orchestrator gets the active step");
         assert!(orchestrator_context.contains("run the database migration"));
+
+        let single_context = with_active_workflow(&repo, || {
+            workflow_context_for_role(&repo, PromptRole::Single)
+        })
+        .expect("a single seat gets the active step too -- it is the one doing the work");
+        assert!(single_context.contains("run the database migration"));
 
         let worker_context = with_active_workflow(&repo, || {
             workflow_context_for_role(&repo, PromptRole::Worker)

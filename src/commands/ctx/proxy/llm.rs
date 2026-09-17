@@ -29,8 +29,8 @@ struct Contract {
 fn render_prompt(questions: &[Question]) -> String {
     let mut prompt = String::from(
         "You are answering intake questions for a coding-task router. For EACH question below, \
-         give a probability distribution over its listed options (choice/worker-tier questions), \
-         over its ordered levels by index (score questions), or over {\"true\", \"false\"} (noul \
+         give a probability distribution over its listed options (choice questions), over its \
+         ordered levels by index (score questions), or over {\"true\", \"false\"} (noul \
          questions). Answer with EXACTLY one JSON object and nothing else, no prose, no markdown \
          fences, in this shape:\n\n\
          {\"answers\": {\"<id>\": {\"probabilities\": {\"<option-or-index-or-true/false>\": \

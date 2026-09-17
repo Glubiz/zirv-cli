@@ -23,10 +23,9 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 
-use self::decision::{Answers, Decider, ProxyDecision, Question};
+use self::decision::{Answers, Decider, ProxyDecision, Question, SeatRole};
 use super::config::{self, CtxConfig, ProxyDecider};
 use super::{CtxResult, adapters, helper, log, state};
-use crate::commands::workflow::profile::ExecutionMode;
 
 const PROXY_DECISIONS_FILE: &str = "proxy-decisions.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` key the proxy's own
@@ -147,7 +146,8 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     if matches!(cfg.proxy.decider, ProxyDecider::Typesafe) {
         match typesafe::decide(&cfg.proxy.typesafe, &intake, &questions) {
             Ok((answers, model_usage)) => {
-                result = decision::merge(&baseline, request, &answers, cfg.proxy.min_confidence);
+                result =
+                    decision::merge(cfg, &baseline, request, &answers, cfg.proxy.min_confidence);
                 winner = Decider::Typesafe;
                 usage = Some(model_usage);
                 ran_model = true;
@@ -164,14 +164,15 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     {
         match try_helper(cfg, &questions) {
             Ok(answers) => {
-                result = decision::merge(&baseline, request, &answers, cfg.proxy.min_confidence);
+                result =
+                    decision::merge(cfg, &baseline, request, &answers, cfg.proxy.min_confidence);
                 winner = Decider::Helper;
             }
             Err(reason) => fallbacks.push(reason),
         }
     }
 
-    decision::validate(&mut result, &baseline, &roster);
+    decision::validate(&mut result, &baseline, &roster, cfg);
     result.decider = winner;
     result.fallbacks = fallbacks;
     result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -182,27 +183,72 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     result
 }
 
-/// One line: `proxy: <execution> \u{b7} <harness>/<model> \u{b7} workers <tier> \u{b7} workflow
-/// <id-or-none> (<complexity>/<risk>) \u{b7} <decider> [<mean-confidence>]`.
+/// One line, shaped by `decision.seat_role` -- issue #537 field evidence
+/// problem (c): the operator experienced both a single-seat and a full team
+/// launch as "the full orchestrator setup", so this now says which one it
+/// actually is, and names the resolved seat tier alongside the model:
+///
+/// - `Single`: `proxy: <execution> \u{b7} single seat \u{b7} <harness>/<model> (<seat-tier>) \u{b7}
+///   <workflow-or-none> \u{b7} <decider> [<mean-confidence>]`
+/// - `Orchestrator`: `proxy: <execution> \u{b7} orchestrator <harness>/<model> (<seat-tier>) \u{b7}
+///   workers <worker-tier> \u{b7} <workflow-or-none> \u{b7} <decider> [<mean-confidence>]`
+///
+/// `<workflow-or-none>` is `no workflow` when `decision.workflow` is `None`
+/// (the common case now that a `Direct` execution always clears it, see
+/// `decision::apply_direct_execution_workflow_rule`), else `workflow <id>
+/// (<complexity>/<risk>)`.
 pub fn announce_line(decision: &ProxyDecision) -> String {
     let execution = lower_debug(decision.execution);
     let seat = format!(
         "{}/{}",
         decision.orchestrator.harness, decision.orchestrator.model
     );
-    let worker_tier = tier_str(decision.worker_tier);
-    let workflow = decision.workflow.as_deref().unwrap_or("none");
-    let complexity = lower_debug(decision.complexity);
-    let risk = lower_debug(decision.risk);
+    let seat_tier = decision.seat_tier.label();
     let decider = decider_label(decision.decider);
-    let mut line = format!(
-        "proxy: {execution} \u{b7} {seat} \u{b7} workers {worker_tier} \u{b7} workflow {workflow} \
-         ({complexity}/{risk}) \u{b7} {decider}"
-    );
+    let workflow_segment = match &decision.workflow {
+        Some(id) => format!(
+            "workflow {id} ({}/{})",
+            lower_debug(decision.complexity),
+            lower_debug(decision.risk)
+        ),
+        None => "no workflow".to_string(),
+    };
+
+    let mut line = match decision.seat_role {
+        SeatRole::Single => format!(
+            "proxy: {execution} \u{b7} single seat \u{b7} {seat} ({seat_tier}) \u{b7} \
+             {workflow_segment} \u{b7} {decider}"
+        ),
+        SeatRole::Orchestrator => format!(
+            "proxy: {execution} \u{b7} orchestrator {seat} ({seat_tier}) \u{b7} workers {} \u{b7} \
+             {workflow_segment} \u{b7} {decider}",
+            tier_str(decision.worker_tier)
+        ),
+    };
     if let Some(confidence) = mean_confidence(decision) {
         line.push_str(&format!(" {confidence:.2}"));
     }
     line
+}
+
+/// Prints before `decide()` runs, naming the decider that will run first for
+/// `cfg.proxy.decider` -- so an operator watching `zirv ctx proxy` (or a
+/// `zirv chat` launch the proxy took over) sees the request go out rather
+/// than a silent pause. `Deterministic` asks nothing at all: the baseline is
+/// the whole answer, so there is no model to announce.
+pub fn asking_line(cfg: &CtxConfig) -> String {
+    match cfg.proxy.decider {
+        ProxyDecider::Typesafe => {
+            format!(
+                "proxy: asking typesafe ({})\u{2026}",
+                cfg.proxy.typesafe.model
+            )
+        }
+        ProxyDecider::Helper => "proxy: asking helper model\u{2026}".to_string(),
+        ProxyDecider::Deterministic => {
+            "proxy: using the deterministic baseline\u{2026}".to_string()
+        }
+    }
 }
 
 fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
@@ -215,8 +261,8 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
 
 /// The bounded `[zirv proxy]` context layer (T2 folds this into the compiled
 /// prompt): at most 6 lines -- a header, execution/complexity/risk, the
-/// seats, the workflow, and (Direct/Bounded only) one line steering the
-/// session to do the work itself rather than delegate reflexively.
+/// seat(s), the workflow, and (`Single` only) one line telling the session
+/// plainly that it is the one doing the work, not an orchestrator.
 // T2 is the first caller (folds this into `compile.rs`'s composed context);
 // exercised here only by this module's own tests in the meantime.
 #[allow(dead_code)]
@@ -228,21 +274,31 @@ pub fn prompt_layer(decision: &ProxyDecision) -> String {
         lower_debug(decision.complexity),
         lower_debug(decision.risk),
     ));
-    lines.push(format!(
-        "seats: orchestrator {}/{} \u{b7} workers {}",
-        decision.orchestrator.harness,
-        decision.orchestrator.model,
-        tier_str(decision.worker_tier),
-    ));
+    lines.push(match decision.seat_role {
+        SeatRole::Single => format!(
+            "seat: {}/{} ({})",
+            decision.orchestrator.harness,
+            decision.orchestrator.model,
+            decision.seat_tier.label(),
+        ),
+        SeatRole::Orchestrator => format!(
+            "seats: orchestrator {}/{} ({}) \u{b7} workers {}",
+            decision.orchestrator.harness,
+            decision.orchestrator.model,
+            decision.seat_tier.label(),
+            tier_str(decision.worker_tier),
+        ),
+    });
     lines.push(format!(
         "workflow: {}",
         decision.workflow.as_deref().unwrap_or("none")
     ));
-    if matches!(
-        decision.execution,
-        ExecutionMode::Direct | ExecutionMode::Bounded
-    ) {
-        lines.push("do this work in this seat; delegate only for a distinct need".to_string());
+    if decision.seat_role == SeatRole::Single {
+        lines.push(
+            "You are the single seat for this request: do the work here yourself; do not \
+             delegate."
+                .to_string(),
+        );
     }
     lines.join("\n")
 }
@@ -370,6 +426,7 @@ fn human_fields(decision: &ProxyDecision, min_confidence: f32) -> Vec<(&'static 
         row("complexity", lower_debug(decision.complexity)),
         row("risk", lower_debug(decision.risk)),
         row("execution", lower_debug(decision.execution)),
+        row("seat_role", lower_debug(decision.seat_role)),
         row(
             "workflow",
             decision
@@ -384,6 +441,7 @@ fn human_fields(decision: &ProxyDecision, min_confidence: f32) -> Vec<(&'static 
                 decision.orchestrator.harness, decision.orchestrator.model
             ),
         ),
+        row("seat_tier", decision.seat_tier.label().to_string()),
         row("worker_tier", tier_str(decision.worker_tier).to_string()),
         row(
             "needs_clarification",
@@ -427,6 +485,9 @@ pub fn run_with<W: Write>(
         }
     };
 
+    if !args.json {
+        eprintln!("{}", asking_line(cfg));
+    }
     let decision = decide(cfg, state_dir, repo, &request);
 
     if args.json {
@@ -464,16 +525,18 @@ mod tests {
             complexity: Complexity::Substantial,
             risk: RiskBand::Medium,
             execution: ExecutionMode::Orchestrated,
+            seat_role: SeatRole::Orchestrator,
             validation: ValidationProfile::default(),
             workflow: Some("feature".to_string()),
             orchestrator: decision::Seat {
                 harness: "claude".to_string(),
                 model: "fable".to_string(),
             },
+            seat_tier: decision::SeatTier::Frontier,
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
             decider: Decider::Typesafe,
-            confidence: BTreeMap::from([("seat".to_string(), 0.81_f32)]),
+            confidence: BTreeMap::from([("seat_tier".to_string(), 0.81_f32)]),
             reasons: Vec::new(),
             fallbacks: Vec::new(),
             elapsed_ms: 12,
@@ -483,12 +546,34 @@ mod tests {
     }
 
     #[test]
-    fn announce_line_matches_the_documented_shape() {
+    fn announce_line_matches_the_documented_shape_for_an_orchestrator_seat() {
         let line = announce_line(&sample_decision());
         assert_eq!(
             line,
-            "proxy: orchestrated \u{b7} claude/fable \u{b7} workers standard \u{b7} workflow \
-             feature (substantial/medium) \u{b7} typesafe 0.81"
+            "proxy: orchestrated \u{b7} orchestrator claude/fable (frontier) \u{b7} workers \
+             standard \u{b7} workflow feature (substantial/medium) \u{b7} typesafe 0.81"
+        );
+    }
+
+    #[test]
+    fn announce_line_matches_the_documented_shape_for_a_single_seat() {
+        let mut decision = sample_decision();
+        decision.execution = ExecutionMode::Direct;
+        decision.seat_role = SeatRole::Single;
+        decision.seat_tier = decision::SeatTier::Cheap;
+        decision.orchestrator = decision::Seat {
+            harness: "claude".to_string(),
+            model: "sonnet".to_string(),
+        };
+        decision.workflow = None;
+        decision.confidence = BTreeMap::new();
+        decision.decider = Decider::Typesafe;
+        decision.confidence.insert("execution".to_string(), 0.75);
+        let line = announce_line(&decision);
+        assert_eq!(
+            line,
+            "proxy: direct \u{b7} single seat \u{b7} claude/sonnet (cheap) \u{b7} no workflow \u{b7} \
+             typesafe 0.75"
         );
     }
 
@@ -501,13 +586,46 @@ mod tests {
     }
 
     #[test]
-    fn prompt_layer_advises_direct_work_only_for_direct_and_bounded() {
+    fn prompt_layer_tells_a_single_seat_not_to_delegate() {
         let mut decision = sample_decision();
         decision.execution = ExecutionMode::Direct;
-        assert!(prompt_layer(&decision).contains("do this work in this seat"));
+        decision.seat_role = SeatRole::Single;
+        assert!(
+            prompt_layer(&decision)
+                .contains("You are the single seat for this request: do the work here yourself")
+        );
 
         decision.execution = ExecutionMode::Orchestrated;
-        assert!(!prompt_layer(&decision).contains("do this work in this seat"));
+        decision.seat_role = SeatRole::Orchestrator;
+        assert!(!prompt_layer(&decision).contains("You are the single seat"));
+    }
+
+    #[test]
+    fn asking_line_names_typesafe_and_its_model() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.model = "jev-latest".to_string();
+        assert_eq!(
+            asking_line(&cfg),
+            "proxy: asking typesafe (jev-latest)\u{2026}"
+        );
+    }
+
+    #[test]
+    fn asking_line_names_the_helper_decider() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.decider = ProxyDecider::Helper;
+        assert_eq!(asking_line(&cfg), "proxy: asking helper model\u{2026}");
+    }
+
+    #[test]
+    fn asking_line_names_no_decider_for_the_deterministic_baseline() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.decider = ProxyDecider::Deterministic;
+        assert_eq!(
+            asking_line(&cfg),
+            "proxy: using the deterministic baseline\u{2026}"
+        );
     }
 
     #[test]
@@ -880,6 +998,35 @@ mod tests {
                 min_risk
             );
             assert_eq!(decision.workflow, case.workflow, "{}: workflow", case.name);
+            // Issue #537: every battery case is `direct` or `bounded`, never
+            // `orchestrated`, so `seat_role` must always be `Single` -- and
+            // `seat_tier` must follow `execution` exactly
+            // (`SeatTier::from_execution`).
+            assert_eq!(
+                decision.seat_role,
+                decision::SeatRole::Single,
+                "{}: seat_role",
+                case.name
+            );
+            let expected_seat_tier = match decision.execution {
+                ExecutionMode::Direct => decision::SeatTier::Cheap,
+                ExecutionMode::Bounded => decision::SeatTier::Standard,
+                ExecutionMode::Orchestrated => decision::SeatTier::Frontier,
+            };
+            assert_eq!(
+                decision.seat_tier, expected_seat_tier,
+                "{}: seat_tier",
+                case.name
+            );
+            let expected_worker_tier = match decision.execution {
+                ExecutionMode::Orchestrated => Tier::Standard,
+                ExecutionMode::Direct | ExecutionMode::Bounded => Tier::Cheap,
+            };
+            assert_eq!(
+                decision.worker_tier, expected_worker_tier,
+                "{}: worker_tier",
+                case.name
+            );
         }
     }
 
@@ -936,6 +1083,122 @@ mod tests {
             decision.validation.independent_review,
             "{:?}",
             decision.validation
+        );
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct JevBatteryExpect {
+        execution: String,
+        complexity: String,
+        workflow: String,
+        seat_tier: String,
+        // Jev's `intent` answer is advisory only -- this battery asserts
+        // execution/complexity/workflow/seat_tier, never intent -- but the
+        // field stays on the fixture (and this type) for a human reading
+        // `jev-battery.json` to see what Jev actually said.
+        #[allow(dead_code)]
+        intent: String,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct JevBatteryCase {
+        id: String,
+        request: String,
+        expect: JevBatteryExpect,
+    }
+
+    /// Replays the committed `tests/fixtures/proxy/jev-battery.json` against
+    /// the REAL TypeSafe Jev API -- issue #537's own recorded rulings, from
+    /// two live runs against this build that matched on 23/24 cases both
+    /// times, every case ruling identically across both runs (the one
+    /// intentional divergence, `perf-investigation`, is committed as
+    /// `substantial`, which is what Jev consistently rules and what the
+    /// `complexity` criteria actually call for).
+    ///
+    /// Skips (passes, printing one line) when `TYPESAFE_API_KEY` is unset:
+    /// this test never touches the Keychain and never fails just because a
+    /// key is absent, so it stays green in CI and on a machine with no
+    /// TypeSafe credential. Run it with a key: `TYPESAFE_API_KEY=... cargo
+    /// nextest run jev_live_battery`. Costs roughly 25 calls at about 6k
+    /// input tokens each (TypeSafe's own published $0.042/MTok input rate --
+    /// about a cent total). `state_dir` points at a temp dir, never the real
+    /// `<state>/proxy-decisions.jsonl`, so a real run's own persisted
+    /// decisions and spend rows are untouched -- it persists exactly like
+    /// any other `decide()` call, just into a throwaway directory.
+    #[test]
+    fn jev_live_battery_matches_recorded_rulings() {
+        let key = std::env::var("TYPESAFE_API_KEY").unwrap_or_default();
+        if key.trim().is_empty() {
+            println!("skipped: TYPESAFE_API_KEY unset");
+            return;
+        }
+
+        let text = std::fs::read_to_string(fixture("proxy/jev-battery.json"))
+            .expect("jev-battery fixture");
+        let cases: Vec<JevBatteryCase> =
+            serde_json::from_str(&text).expect("parse jev-battery fixture");
+        assert!(!cases.is_empty(), "jev-battery fixture must not be empty");
+
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        let mut mismatches = Vec::new();
+        for case in &cases {
+            let decision = decide(&cfg, state_dir.path(), repo, &case.request);
+            if decision.decider != Decider::Typesafe {
+                mismatches.push(format!(
+                    "{}: decider fell back to {:?} ({:?})",
+                    case.id, decision.decider, decision.fallbacks
+                ));
+                continue;
+            }
+
+            let actual_execution = lower_debug(decision.execution);
+            if actual_execution != case.expect.execution {
+                mismatches.push(format!(
+                    "{}: execution expected {} got {actual_execution}",
+                    case.id, case.expect.execution
+                ));
+            }
+
+            let actual_complexity = lower_debug(decision.complexity);
+            if actual_complexity != case.expect.complexity {
+                mismatches.push(format!(
+                    "{}: complexity expected {} got {actual_complexity}",
+                    case.id, case.expect.complexity
+                ));
+            }
+
+            let actual_workflow = decision
+                .workflow
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
+            if actual_workflow != case.expect.workflow {
+                mismatches.push(format!(
+                    "{}: workflow expected {} got {actual_workflow}",
+                    case.id, case.expect.workflow
+                ));
+            }
+
+            let actual_seat_tier = decision.seat_tier.label().to_string();
+            if actual_seat_tier != case.expect.seat_tier {
+                mismatches.push(format!(
+                    "{}: seat_tier expected {} got {actual_seat_tier}",
+                    case.id, case.expect.seat_tier
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatch(es) out of {} cases:\n{}",
+            mismatches.len(),
+            cases.len(),
+            mismatches.join("\n")
         );
     }
 }

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::ctx::adapters;
 use crate::commands::ctx::catalogue::{self, Tier};
 use crate::commands::ctx::config::CtxConfig;
+use crate::commands::ctx::handover;
 use crate::commands::workflow::classify::{self, Classification, Complexity, Intent, RiskBand};
 use crate::commands::workflow::engine;
 use crate::commands::workflow::profile::{ExecutionMode, ExecutionProfile, ValidationProfile};
@@ -66,6 +67,78 @@ pub enum Decider {
     Deterministic,
 }
 
+/// Whether this decision routes to one seat doing the work directly, or a
+/// full orchestrator setup (an orchestrator seat plus delegated workers).
+/// Issue #537 field evidence: an operator experienced both a trivial,
+/// one-place color change AND a bounded bugfix investigation as "the full
+/// orchestrator setup", because nothing named the difference plainly. This
+/// is that name -- derived once, in [`finalize_derived_fields`], from
+/// `execution` alone (never asked as its own question): `Orchestrated` is
+/// the only mode that actually compiles a team, so it alone maps to
+/// `Orchestrator`; `Direct` and `Bounded` both stay on one seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeatRole {
+    Single,
+    Orchestrator,
+}
+
+impl SeatRole {
+    fn from_execution(execution: ExecutionMode) -> Self {
+        match execution {
+            ExecutionMode::Direct | ExecutionMode::Bounded => SeatRole::Single,
+            ExecutionMode::Orchestrated => SeatRole::Orchestrator,
+        }
+    }
+}
+
+/// The generic tier the orchestrator SEAT ITSELF runs at -- issue #537 field
+/// evidence problem (a): asking a `seat` question over every enabled
+/// `harness/alias` pair spread probability across too many similar-looking
+/// options for any answer to ever clear the confidence floor, so the launch
+/// always fell back to the configured orchestrator model regardless of how
+/// small the request was. A live 24-case Jev battery then showed that even a
+/// four-option `seat_tier` question fared no better (any many-option seat/
+/// tier question never cleared the floor, while its `execution` answers were
+/// themselves unreliable, 17-74 confidence, calling architectural work
+/// "direct") -- so `seat_tier` (like `execution`) is now derived, never
+/// asked, from [`SeatTier::from_execution`]. `Frontier` is the top-of-fleet
+/// tier `worker_tier`/[`super::catalogue::Tier`] deliberately has no
+/// equivalent of: a delegated worker is never the orchestrator seat
+/// compiling the team, so it never needs the top rung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeatTier {
+    Cheap,
+    Standard,
+    Deep,
+    Frontier,
+}
+
+impl SeatTier {
+    /// Issue #537: the baseline maps directly from `execution` -- `Direct`
+    /// needs no more than a cheap seat, `Bounded` a standard one, and only
+    /// `Orchestrated` (a real compiled team) earns the frontier rung.
+    fn from_execution(execution: ExecutionMode) -> Self {
+        match execution {
+            ExecutionMode::Direct => SeatTier::Cheap,
+            ExecutionMode::Bounded => SeatTier::Standard,
+            ExecutionMode::Orchestrated => SeatTier::Frontier,
+        }
+    }
+
+    /// A short, stable, human-readable label -- used in `announce_line`/
+    /// `prompt_layer` and matched against a Jev/helper choice answer.
+    pub fn label(self) -> &'static str {
+        match self {
+            SeatTier::Cheap => "cheap",
+            SeatTier::Standard => "standard",
+            SeatTier::Deep => "deep",
+            SeatTier::Frontier => "frontier",
+        }
+    }
+}
+
 /// One inspectable decision, printed by `zirv ctx proxy` and (T2) applied to
 /// a `zirv chat` launch. Every field traces to a reason; `fallbacks` names
 /// every decider that was tried and skipped before `decider` won.
@@ -77,9 +150,11 @@ pub struct ProxyDecision {
     pub complexity: Complexity,
     pub risk: RiskBand,
     pub execution: ExecutionMode,
+    pub seat_role: SeatRole,
     pub validation: ValidationProfile,
     pub workflow: Option<String>,
     pub orchestrator: Seat,
+    pub seat_tier: SeatTier,
     pub worker_tier: Tier,
     pub needs_clarification: f32,
     pub decider: Decider,
@@ -359,16 +434,39 @@ fn measured_branch_changes(repo: &Path) -> (Vec<PathBuf>, usize) {
         .unwrap_or_default()
 }
 
-fn baseline_seat(cfg: &CtxConfig) -> Seat {
+/// Issue #537 field evidence problem (a): the orchestrator seat's model is
+/// resolved from `seat_tier` alone, never asked or chosen as its own
+/// harness/model question -- `harness` is always the baseline default
+/// (unchanged by any decider); only the tier varies. `cheap`/`standard`/
+/// `deep` go through `handover::resolve_model` (the same tier ladder,
+/// operator overrides included, `zirv ctx handover` itself uses); `frontier`
+/// is the operator's own configured `chat.model` when set, else the vendor's
+/// own top rung -- there is no "frontier" tier in `handover`'s own
+/// cheap/standard/deep ladder because that ladder is for delegated workers,
+/// which never need the orchestrator's own top-of-fleet rung.
+/// `handover::resolve_model` failing (an adapter with no tier ladder at all)
+/// degrades to the same top-rung alias `frontier` itself falls back to,
+/// rather than propagating -- `proxy::decide` must never fail.
+fn model_for_tier(cfg: &CtxConfig, harness: &str, tier: SeatTier) -> String {
+    match tier {
+        SeatTier::Frontier => cfg
+            .chat
+            .model
+            .clone()
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| top_rung_alias(harness)),
+        SeatTier::Cheap | SeatTier::Standard | SeatTier::Deep => {
+            handover::resolve_model(harness, tier.label(), cfg)
+                .unwrap_or_else(|_| top_rung_alias(harness))
+        }
+    }
+}
+
+fn baseline_seat(cfg: &CtxConfig, seat_tier: SeatTier) -> Seat {
     match adapters::resolve_default(cfg) {
         Ok((adapter, _origin)) => {
             let harness = adapter.name().to_string();
-            let model = cfg
-                .chat
-                .model
-                .clone()
-                .filter(|model| !model.is_empty())
-                .unwrap_or_else(|| top_rung_alias(&harness));
+            let model = model_for_tier(cfg, &harness, seat_tier);
             Seat { harness, model }
         }
         Err(_) => Seat {
@@ -404,22 +502,24 @@ pub fn baseline(
             selection::select_definition(classification, registry, request).definition_id
         }),
     };
-    let worker_tier = match profile.model_tier {
-        crate::commands::workflow::agents::ModelTier::Fast => Tier::Cheap,
-        crate::commands::workflow::agents::ModelTier::Standard => Tier::Standard,
-        crate::commands::workflow::agents::ModelTier::Deep => Tier::Deep,
-    };
     let mut decision = ProxyDecision {
         request_sha256: sha256_hex(request),
         repo: repo.to_path_buf(),
         intent: classification.intent,
         complexity: classification.complexity,
         risk: classification.risk,
-        execution: profile.execution,
+        // Placeholders: `finalize_derived_fields` overwrites every one of
+        // execution/seat_role/seat_tier/worker_tier/orchestrator.model at
+        // this function's own tail, from `complexity` alone -- see that
+        // function's own doc comment for why derivation lives there and
+        // nowhere else.
+        execution: ExecutionMode::Direct,
+        seat_role: SeatRole::Single,
         validation: profile.validation,
         workflow,
-        orchestrator: baseline_seat(cfg),
-        worker_tier,
+        orchestrator: baseline_seat(cfg, SeatTier::Cheap),
+        seat_tier: SeatTier::Cheap,
+        worker_tier: Tier::Cheap,
         needs_clarification: 0.0,
         decider: Decider::Deterministic,
         confidence: BTreeMap::new(),
@@ -435,7 +535,7 @@ pub fn baseline(
         created_at: 0,
     };
     apply_security_risk_floor(&mut decision);
-    apply_risk_execution_floor(&mut decision);
+    finalize_derived_fields(&mut decision, cfg);
     decision
 }
 
@@ -466,10 +566,9 @@ fn apply_security_risk_floor(decision: &mut ProxyDecision) {
 /// diff size alone -- `risk >= High` alone already forces independent/
 /// security review in `validation`, but until this rule existed nothing
 /// stopped `execution` from staying `Direct` regardless. The one place this
-/// rule lives: called from the tail of both [`baseline`] (the undecorated
-/// floor) and [`merge`] (in case a model raised `risk` to `High` without
-/// separately raising `execution`), so it holds no matter which decider
-/// produced the fields it reads.
+/// rule lives: called from [`finalize_derived_fields`] right after
+/// `execution` is (re)derived from `complexity`, so it holds no matter which
+/// decider produced `risk`/`complexity`.
 fn apply_risk_execution_floor(decision: &mut ProxyDecision) {
     if decision.risk >= RiskBand::High
         && execution_rank(decision.execution) < execution_rank(ExecutionMode::Bounded)
@@ -479,6 +578,77 @@ fn apply_risk_execution_floor(decision: &mut ProxyDecision) {
             "execution: raised to bounded because risk is high (sensitive paths)".to_string(),
         );
     }
+}
+
+/// Issue #537 field evidence problem (b): a `direct` execution answer must
+/// never coexist with a gated `workflow` -- both of the operator's own live
+/// complaints were exactly this pairing (a one-place color change and a
+/// bounded bugfix investigation, each landing a `workflow` a `Direct`
+/// execution has no business gating). One function, applied at the tail of
+/// both [`baseline`] and [`merge`] (after every floor above it, so it reads
+/// the FINAL `execution`): `Direct` clears `workflow` to `None` with a
+/// recorded reason; `Bounded`/`Orchestrated` keep whatever the model or
+/// baseline already chose.
+fn apply_direct_execution_workflow_rule(decision: &mut ProxyDecision) {
+    if decision.execution == ExecutionMode::Direct && decision.workflow.is_some() {
+        decision.workflow = None;
+        decision
+            .reasons
+            .push("workflow: none because execution is direct".to_string());
+    }
+}
+
+/// Issue #537 design revision, from a live 24-case Jev battery run against
+/// this decider: Jev's own `complexity`/`workflow` answers were reliable,
+/// but its `execution` answers were not (17-74 confidence, calling
+/// architectural work "direct"), and neither `execution` nor any many-option
+/// seat/tier question ever cleared the confidence floor. `execution` is
+/// therefore never asked at all -- it is this one deterministic mapping from
+/// the (already merged/floored) `complexity`, the same mapping
+/// `ExecutionProfile::derive` itself already used to compute its own
+/// `execution` field.
+fn execution_from_complexity(complexity: Complexity) -> ExecutionMode {
+    match complexity {
+        Complexity::Trivial => ExecutionMode::Direct,
+        Complexity::Bounded => ExecutionMode::Bounded,
+        Complexity::Substantial | Complexity::Architectural => ExecutionMode::Orchestrated,
+    }
+}
+
+/// Issue #537 design revision: delegated workers only ever need a step up
+/// from cheap when there is a real compiled team coordinating them
+/// (`Orchestrated`) -- `Direct`/`Bounded` both stay on the cheap tier, since
+/// a single seat handling its own bounded work has no delegated workers to
+/// tier up in the first place.
+fn worker_tier_from_execution(execution: ExecutionMode) -> Tier {
+    match execution {
+        ExecutionMode::Orchestrated => Tier::Standard,
+        ExecutionMode::Direct | ExecutionMode::Bounded => Tier::Cheap,
+    }
+}
+
+/// Derives every field that follows deterministically from the merged,
+/// floor-raised `complexity`/`risk` alone: `execution` (from `complexity`,
+/// then floored by `risk` via [`apply_risk_execution_floor`]), the
+/// direct-execution/workflow rule, `seat_tier`/`worker_tier`/`seat_role`
+/// (from the final `execution`), and the orchestrator's own resolved
+/// `model` (from `seat_tier` via `handover::resolve_model`, see
+/// [`model_for_tier`]). The ONE place all of this is computed, called at
+/// the tail of both [`baseline`] and [`merge`], after
+/// [`apply_security_risk_floor`] has already had its say on `risk`.
+fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
+    decision.execution = execution_from_complexity(decision.complexity);
+    let complexity_label = format!("{:?}", decision.complexity).to_lowercase();
+    decision.reasons.push(format!(
+        "execution: derived from complexity {complexity_label}"
+    ));
+    apply_risk_execution_floor(decision);
+    apply_direct_execution_workflow_rule(decision);
+    decision.seat_tier = SeatTier::from_execution(decision.execution);
+    decision.worker_tier = worker_tier_from_execution(decision.execution);
+    decision.seat_role = SeatRole::from_execution(decision.execution);
+    decision.orchestrator.model =
+        model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
 }
 
 /// Top file extensions by count among `paths` -- shared by the (now always
@@ -631,6 +801,26 @@ fn choice(id: &str, instructions: &str, options: Vec<(String, Option<String>)>) 
     }
 }
 
+/// Builds one option/level description from a structured `what`/`not_for`/
+/// `examples` triple -- TypeSafe's own guidance for separating options a
+/// model could otherwise confuse (see the spec's "Decision fields" table).
+/// The Jev wire format's own `criteria` shape is a single description string
+/// per option (`typesafe.rs`'s own module doc has the shape), so this is a
+/// Rust-side structuring aid rather than a wire-level change: it renders to
+/// exactly the string that lands in that map. `not_for`/`examples` are
+/// skipped when empty, so a level that has nothing to add (most `Score`
+/// levels) stays a single sentence.
+fn describe(what: &str, not_for: &str, examples: &[&str]) -> String {
+    let mut text = what.to_string();
+    if !not_for.is_empty() {
+        text.push_str(&format!(" Not for: {not_for}."));
+    }
+    if !examples.is_empty() {
+        text.push_str(&format!(" Examples: {}.", examples.join("; ")));
+    }
+    text
+}
+
 /// The neutral question set both model deciders answer -- self-contained
 /// from `intake` alone, so neither `typesafe.rs` nor `llm.rs` needs the
 /// `Roster`/`CtxConfig` this was built from.
@@ -642,23 +832,47 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
             vec![
                 (
                     "feature".to_string(),
-                    Some("Adds new capability or behavior.".to_string()),
+                    Some(describe(
+                        "Adds new capability or behavior that did not exist before.",
+                        "fixing something broken, or restructuring without changing behavior",
+                        &["a new export button", "a new API endpoint"],
+                    )),
                 ),
                 (
                     "bugfix".to_string(),
-                    Some("Fixes a defect or regression.".to_string()),
+                    Some(describe(
+                        "Fixes a defect or regression -- something that should work but does not.",
+                        "adding new capability",
+                        &["a crash on startup", "a wrong calculation"],
+                    )),
                 ),
                 (
                     "refactor".to_string(),
-                    Some("Restructures existing code without changing behavior.".to_string()),
+                    Some(describe(
+                        "Restructures existing code without changing its observable behavior.",
+                        "adding features or fixing bugs",
+                        &["renaming", "extracting a function", "simplifying logic"],
+                    )),
                 ),
                 (
                     "spike".to_string(),
-                    Some("Explores, prototypes, or researches an approach.".to_string()),
+                    Some(describe(
+                        "Explores, prototypes, or researches an approach before committing to \
+                         it.",
+                        "shipping a final implementation",
+                        &[
+                            "try an approach and see if it works",
+                            "a throwaway experiment",
+                        ],
+                    )),
                 ),
                 (
                     "review".to_string(),
-                    Some("Reviews or audits existing work.".to_string()),
+                    Some(describe(
+                        "Reviews or audits existing work rather than changing it outright.",
+                        "implementing a fix or feature",
+                        &["review this PR", "audit for security issues"],
+                    )),
                 ),
                 (
                     "other".to_string(),
@@ -676,10 +890,48 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
                        facts given?"
             .to_string(),
         criteria: Criteria::Score(vec![
-            "Trivial: a small, isolated change.".to_string(),
-            "Bounded: a modest, contained change.".to_string(),
-            "Substantial: a significant change touching multiple areas.".to_string(),
-            "Architectural: a structural or cross-cutting change.".to_string(),
+            describe(
+                "Trivial: one obvious change in one place, or no code change at all.",
+                "anything that needs investigation",
+                &[
+                    "a typo",
+                    "a colour or constant",
+                    "a default value",
+                    "answering a question",
+                    "explaining a command",
+                ],
+            ),
+            describe(
+                "Bounded: one area with a clear goal that needs some reading or investigation.",
+                "cross-module work",
+                &[
+                    "fixing one reported bug (with or without a backtrace)",
+                    "adding a flag or a small verb",
+                    "a refactor within one module",
+                    "a spike or research report",
+                    "reviewing one change",
+                    "writing one runbook",
+                    "one CI job",
+                ],
+            ),
+            describe(
+                "Substantial: several areas, a real design choice, or a wide mechanical change.",
+                "one bug",
+                &[
+                    "a major dependency upgrade across many call sites",
+                    "a new subsystem in one crate area",
+                    "a performance investigation spanning modules",
+                ],
+            ),
+            describe(
+                "Architectural: a cross-cutting redesign, or a migration of a store or protocol.",
+                "",
+                &[
+                    "a plugin system",
+                    "a new adapter with full parity",
+                    "a TUI redesign",
+                ],
+            ),
         ]),
     });
 
@@ -699,98 +951,45 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
         ]),
     });
 
-    out.push(choice(
-        "execution",
-        "How much coordination does this request need?",
-        cap_choice_options(
-            vec![
-                (
-                    "direct".to_string(),
-                    Some("Small enough for one seat to do the work directly.".to_string()),
-                ),
-                (
-                    "bounded".to_string(),
-                    Some("Needs one or two seats, tightly scoped.".to_string()),
-                ),
-                (
-                    "orchestrated".to_string(),
-                    Some("Needs a compiled team of several seats.".to_string()),
-                ),
-                ("other".to_string(), None),
-            ],
-            ("other", "Uncertain; keep the deterministic default."),
-        ),
-    ));
-
+    // Issue #537 design revision: `execution`/`seat_tier`/`worker_tier` are
+    // no longer asked at all -- a live 24-case Jev battery showed
+    // `execution` answers were unreliable (17-74 confidence, calling
+    // architectural work "direct") and any many-option seat/tier question
+    // never cleared the confidence floor. All three are now derived from
+    // `complexity` alone (see `execution_from_complexity`,
+    // `finalize_derived_fields`); the model's influence on them flows
+    // entirely through its `complexity` answer.
+    const NONE_WORKFLOW_DESCRIPTION: &str = "Direct work that needs no gated workflow: \
+                                              one-place changes, tiny fixes, questions.";
+    // Issue #537 (this design revision): the registry's own `refactor` pack
+    // description does not spell out that it covers a pure deletion/removal
+    // (no new behavior) -- sharpened here, at the one place this question is
+    // built, rather than in the pack's own definition this module does not
+    // own.
+    const REFACTOR_COVERS_DELETIONS: &str = " Explicitly covers deletions or removals of code \
+                                              and docs with no new behavior.";
     let mut workflow_options: Vec<(String, Option<String>)> = intake
         .workflows
         .iter()
-        .map(|workflow| (workflow.id.clone(), Some(workflow.description.clone())))
+        .map(|workflow| {
+            let mut description = workflow.description.clone();
+            if workflow.id == "refactor" {
+                description.push_str(REFACTOR_COVERS_DELETIONS);
+            }
+            (workflow.id.clone(), Some(description))
+        })
         .collect();
     workflow_options.push((
         "none".to_string(),
-        Some("No workflow needed; direct work.".to_string()),
+        Some(NONE_WORKFLOW_DESCRIPTION.to_string()),
     ));
     out.push(choice(
         "workflow",
-        "Which registered workflow, if any, should gate this request?",
-        cap_choice_options(
-            workflow_options,
-            ("none", "No workflow needed; direct work."),
+        &format!(
+            "Which registered workflow, if any, should gate this request? \"none\" is {}",
+            NONE_WORKFLOW_DESCRIPTION.to_lowercase()
         ),
-    ));
-
-    let mut seat_options: Vec<(String, Option<String>)> = Vec::new();
-    for harness in &intake.harnesses {
-        if !harness.ready {
-            continue;
-        }
-        for model in &harness.models {
-            let headroom = harness
-                .headroom_pct
-                .map(|pct| format!("{pct:.0}%"))
-                .unwrap_or_else(|| "unknown".to_string());
-            let tier = model.tier.as_deref().unwrap_or("untiered");
-            let description = format!(
-                "strength {} \u{b7} tier {tier} \u{b7} ${:.3} per MTok input \u{b7} headroom {headroom}",
-                model.strength, model.input_usd_per_mtok
-            );
-            seat_options.push((
-                format!("{}/{}", harness.name, model.alias),
-                Some(description),
-            ));
-        }
-    }
-    out.push(choice(
-        "seat",
-        "Which harness/model should run as the orchestrator seat?",
-        cap_choice_options(
-            seat_options,
-            ("none", "No preference; keep zirv's own default seat."),
-        ),
-    ));
-
-    out.push(choice(
-        "worker_tier",
-        "What model tier should delegated workers run at?",
-        cap_choice_options(
-            vec![
-                (
-                    "cheap".to_string(),
-                    Some("Fast, low-cost model for small tasks.".to_string()),
-                ),
-                (
-                    "standard".to_string(),
-                    Some("Balanced model for ordinary work.".to_string()),
-                ),
-                (
-                    "deep".to_string(),
-                    Some("Strongest available model for hard work.".to_string()),
-                ),
-                ("other".to_string(), None),
-            ],
-            ("other", "No preference; keep the deterministic default."),
-        ),
+        cap_choice_options(workflow_options, ("none", NONE_WORKFLOW_DESCRIPTION)),
     ));
 
     out.push(Question {
@@ -816,24 +1015,6 @@ fn parse_intent(value: &str) -> Option<Intent> {
         "spike" => Some(Intent::Spike),
         "review" => Some(Intent::Review),
         "other" => Some(Intent::Other),
-        _ => None,
-    }
-}
-
-fn parse_execution(value: &str) -> Option<ExecutionMode> {
-    match value {
-        "direct" => Some(ExecutionMode::Direct),
-        "bounded" => Some(ExecutionMode::Bounded),
-        "orchestrated" => Some(ExecutionMode::Orchestrated),
-        _ => None,
-    }
-}
-
-fn parse_tier(value: &str) -> Option<Tier> {
-    match value {
-        "cheap" => Some(Tier::Cheap),
-        "standard" => Some(Tier::Standard),
-        "deep" => Some(Tier::Deep),
         _ => None,
     }
 }
@@ -870,11 +1051,17 @@ fn risk_from_index(index: f64) -> RiskBand {
 
 /// Merges `answers` onto `baseline`'s own fields, applying the per-field
 /// rules the spec's "Decision fields" table sets: a low-confidence answer is
-/// discarded (with a reason recorded); complexity/risk/execution only ever
-/// rise (`max(model, baseline)`); every other field is replaced outright
-/// when confident. Existence checks against the live roster (a workflow id,
-/// a harness/model pair) are deferred to [`validate`], which runs right
-/// after this and has the `Roster` this function does not need.
+/// discarded (with a reason recorded); complexity/risk only ever rise
+/// (`max(model, baseline)`); every other ASKED field (`intent`, `workflow`)
+/// is replaced outright when confident. Existence checks against the live
+/// roster (a workflow id, a harness/model pair) are deferred to [`validate`],
+/// which runs right after this and has the `Roster` this function does not
+/// need.
+///
+/// Issue #537 design revision, from a live 24-case Jev battery: `execution`,
+/// `seat_tier` and `worker_tier` are no longer questions at all (see
+/// [`finalize_derived_fields`]'s own doc comment for why) -- a model's only
+/// influence on them is indirect, through however it moved `complexity`.
 ///
 /// `request` is the same text `baseline` was itself derived from -- passed
 /// through (never re-truncated or substituted with `""`) so the validation
@@ -882,7 +1069,11 @@ fn risk_from_index(index: f64) -> RiskBand {
 /// (`ExecutionProfile::derive`'s own security-domain detection from words
 /// like "credential"/"auth"/"secret") instead of silently losing them the
 /// moment a model answers.
+///
+/// `cfg` is needed only for [`finalize_derived_fields`]'s own resolution of
+/// the orchestrator's model via `handover::resolve_model`.
 pub fn merge(
+    cfg: &CtxConfig,
     baseline: &ProxyDecision,
     request: &str,
     answers: &Answers,
@@ -927,17 +1118,6 @@ pub fn merge(
         }
     }
 
-    if let Some(answer) = answers.get("execution") {
-        if answer.confidence < min_confidence {
-            record_low("execution", answer);
-        } else if let AnswerValue::Choice(value) = &answer.value
-            && let Some(mode) = parse_execution(value)
-            && execution_rank(mode) > execution_rank(decision.execution)
-        {
-            decision.execution = mode;
-        }
-    }
-
     if let Some(answer) = answers.get("workflow") {
         if answer.confidence < min_confidence {
             record_low("workflow", answer);
@@ -947,30 +1127,6 @@ pub fn merge(
             } else {
                 Some(value.clone())
             };
-        }
-    }
-
-    if let Some(answer) = answers.get("seat") {
-        if answer.confidence < min_confidence {
-            record_low("seat", answer);
-        } else if let AnswerValue::Choice(value) = &answer.value
-            && value != "none"
-            && let Some((harness, model)) = value.split_once('/')
-        {
-            decision.orchestrator = Seat {
-                harness: harness.to_string(),
-                model: model.to_string(),
-            };
-        }
-    }
-
-    if let Some(answer) = answers.get("worker_tier") {
-        if answer.confidence < min_confidence {
-            record_low("worker_tier", answer);
-        } else if let AnswerValue::Choice(value) = &answer.value
-            && let Some(tier) = parse_tier(value)
-        {
-            decision.worker_tier = tier;
         }
     }
 
@@ -1002,7 +1158,7 @@ pub fn merge(
     decision.validation.independent_test |= recomputed_validation.independent_test;
     decision.validation.security_review |= recomputed_validation.security_review;
     apply_security_risk_floor(&mut decision);
-    apply_risk_execution_floor(&mut decision);
+    finalize_derived_fields(&mut decision, cfg);
 
     decision
 }
@@ -1034,22 +1190,40 @@ impl ProxyDecision {
 }
 
 /// Reverts `decision`'s `orchestrator`/`workflow` fields to `baseline`'s own
-/// when the roster proves them invalid: a harness that is not enabled+ready,
-/// a model alias/id absent from that harness's vendor catalogue, or a
-/// workflow id absent from the registry. Every revert records a reason.
-pub fn validate(decision: &mut ProxyDecision, baseline: &ProxyDecision, roster: &Roster) {
-    if !seat_is_valid(&decision.orchestrator, roster) {
-        if decision.orchestrator != baseline.orchestrator {
+/// when the roster proves them invalid.
+///
+/// Review finding (round 3): the orchestrator's `model` is NEVER policed
+/// against the catalogue here -- only `harness` readiness is. `model` is
+/// always the tier-derived result of `model_for_tier` (`handover::
+/// resolve_model`, see that function's own doc comment), the same trusted
+/// resolver `zirv ctx handover` itself uses, and it already honors an
+/// operator's own free-form override (`[handover.claude] standard =
+/// "my-team/internal-model"`, a documented value with no catalogue rung of
+/// its own at all). Policing it here used to silently revert exactly that
+/// kind of decision to the BASELINE's own model -- which, whenever a merge
+/// had raised `seat_tier` above the baseline's own (a confident `complexity`
+/// answer, say), was a DIFFERENT tier's model: the decision then announced
+/// one seat tier while quietly launching another. When the harness itself is
+/// not enabled+ready, `orchestrator` still reverts -- but to the baseline's
+/// harness with the model RE-DERIVED for it at `decision`'s own (unreverted)
+/// `seat_tier`, so the decision stays internally consistent rather than
+/// falling back to whatever tier the baseline itself happened to be at.
+pub fn validate(
+    decision: &mut ProxyDecision,
+    baseline: &ProxyDecision,
+    roster: &Roster,
+    cfg: &CtxConfig,
+) {
+    if !harness_is_ready(&decision.orchestrator.harness, roster) {
+        if decision.orchestrator.harness != baseline.orchestrator.harness {
             decision.reasons.push(format!(
-                "seat: '{}/{}' is not an enabled+ready harness with that model on its catalogue; \
-                 kept baseline '{}/{}'",
-                decision.orchestrator.harness,
-                decision.orchestrator.model,
-                baseline.orchestrator.harness,
-                baseline.orchestrator.model,
+                "seat: harness '{}' is not an enabled+ready harness; kept baseline harness '{}'",
+                decision.orchestrator.harness, baseline.orchestrator.harness,
             ));
         }
-        decision.orchestrator = baseline.orchestrator.clone();
+        decision.orchestrator.harness = baseline.orchestrator.harness.clone();
+        decision.orchestrator.model =
+            model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
     }
 
     if let Some(id) = decision.workflow.clone()
@@ -1062,15 +1236,8 @@ pub fn validate(decision: &mut ProxyDecision, baseline: &ProxyDecision, roster: 
     }
 }
 
-fn seat_is_valid(seat: &Seat, roster: &Roster) -> bool {
-    let Some(harness) = roster.harness(&seat.harness) else {
-        return false;
-    };
-    if !harness.ready {
-        return false;
-    }
-    catalogue::vendor(harness.vendor)
-        .is_some_and(|vendor| catalogue::rung_of(vendor, &seat.model).is_some())
+fn harness_is_ready(harness: &str, roster: &Roster) -> bool {
+    roster.harness(harness).is_some_and(|h| h.ready)
 }
 
 #[cfg(test)]
@@ -1085,13 +1252,15 @@ mod tests {
             complexity: Complexity::Bounded,
             risk: RiskBand::Low,
             execution: ExecutionMode::Bounded,
+            seat_role: SeatRole::Single,
             validation: ValidationProfile::default(),
             workflow: Some("feature".to_string()),
             orchestrator: Seat {
                 harness: "claude".to_string(),
                 model: "sonnet".to_string(),
             },
-            worker_tier: Tier::Standard,
+            seat_tier: SeatTier::Standard,
+            worker_tier: Tier::Cheap,
             needs_clarification: 0.0,
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),
@@ -1136,18 +1305,20 @@ mod tests {
 
     #[test]
     fn a_confident_higher_complexity_raises_the_baseline() {
+        let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let ans = answers(&[("complexity", AnswerValue::Score(3.0), 0.9)]);
-        let merged = merge(&baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
         assert_eq!(merged.complexity, Complexity::Architectural);
     }
 
     #[test]
     fn a_confident_lower_complexity_never_lowers_the_baseline() {
+        let cfg = CtxConfig::default();
         let mut baseline = sample_decision();
         baseline.complexity = Complexity::Substantial;
         let ans = answers(&[("complexity", AnswerValue::Score(0.0), 0.95)]);
-        let merged = merge(&baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
         assert_eq!(
             merged.complexity,
             Complexity::Substantial,
@@ -1157,9 +1328,10 @@ mod tests {
 
     #[test]
     fn a_low_confidence_answer_keeps_the_baseline_and_records_a_reason() {
+        let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let ans = answers(&[("risk", AnswerValue::Score(3.0), 0.2)]);
-        let merged = merge(&baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
         assert_eq!(merged.risk, baseline.risk);
         assert!(
             merged
@@ -1171,26 +1343,187 @@ mod tests {
         );
     }
 
+    /// Issue #537 design revision (a live 24-case Jev battery showed its own
+    /// `execution` answers were unreliable, 17-74 confidence, calling
+    /// architectural work "direct"): `execution` is no longer a question at
+    /// all -- an answer under that id, however confident, must be ignored
+    /// entirely, and `execution` must rise ONLY as a side effect of a raised
+    /// `complexity` (`execution_from_complexity`).
     #[test]
-    fn execution_only_ever_rises_toward_orchestrated() {
+    fn execution_is_derived_from_complexity_and_an_execution_answer_is_ignored() {
+        let cfg = CtxConfig::default();
         let mut baseline = sample_decision();
-        baseline.execution = ExecutionMode::Direct;
+        baseline.complexity = Complexity::Trivial;
         let ans = answers(&[(
             "execution",
             AnswerValue::Choice("orchestrated".to_string()),
-            0.9,
+            0.99,
         )]);
-        let merged = merge(&baseline, "implement the feature", &ans, 0.5);
-        assert_eq!(merged.execution, ExecutionMode::Orchestrated);
+        let merged = merge(&cfg, &baseline, "fix the typo", &ans, 0.5);
+        assert_eq!(
+            merged.execution,
+            ExecutionMode::Direct,
+            "an 'execution' answer must never move execution on its own"
+        );
 
-        let mut baseline = sample_decision();
-        baseline.execution = ExecutionMode::Orchestrated;
-        let ans = answers(&[("execution", AnswerValue::Choice("direct".to_string()), 0.99)]);
-        let merged = merge(&baseline, "implement the feature", &ans, 0.5);
+        let ans = answers(&[("complexity", AnswerValue::Score(3.0), 0.9)]);
+        let merged = merge(&cfg, &baseline, "fix the typo", &ans, 0.5);
+        assert_eq!(merged.complexity, Complexity::Architectural);
         assert_eq!(
             merged.execution,
             ExecutionMode::Orchestrated,
-            "a confident lower execution reading must never lower the baseline"
+            "execution rises when a confident complexity answer raises it"
+        );
+    }
+
+    /// Issue #537 design revision: `execution`/`seat_tier`/`worker_tier`/
+    /// `seat_role` follow `complexity` alone, exercised across the whole
+    /// ladder -- `Trivial` a single cheap seat, `Bounded` a single standard
+    /// seat, `Substantial`/`Architectural` a frontier orchestrator with
+    /// standard-tier workers.
+    #[test]
+    fn the_whole_seat_ladder_follows_the_merged_complexity() {
+        let cfg = CtxConfig::default();
+        for (complexity, execution, seat_tier, worker_tier, seat_role) in [
+            (
+                Complexity::Trivial,
+                ExecutionMode::Direct,
+                SeatTier::Cheap,
+                Tier::Cheap,
+                SeatRole::Single,
+            ),
+            (
+                Complexity::Bounded,
+                ExecutionMode::Bounded,
+                SeatTier::Standard,
+                Tier::Cheap,
+                SeatRole::Single,
+            ),
+            (
+                Complexity::Substantial,
+                ExecutionMode::Orchestrated,
+                SeatTier::Frontier,
+                Tier::Standard,
+                SeatRole::Orchestrator,
+            ),
+            (
+                Complexity::Architectural,
+                ExecutionMode::Orchestrated,
+                SeatTier::Frontier,
+                Tier::Standard,
+                SeatRole::Orchestrator,
+            ),
+        ] {
+            let mut baseline = sample_decision();
+            baseline.complexity = Complexity::Trivial;
+            let index = match complexity {
+                Complexity::Trivial => 0.0,
+                Complexity::Bounded => 1.0,
+                Complexity::Substantial => 2.0,
+                Complexity::Architectural => 3.0,
+            };
+            let ans = answers(&[("complexity", AnswerValue::Score(index), 0.9)]);
+            let merged = merge(&cfg, &baseline, "a request", &ans, 0.5);
+            assert_eq!(merged.complexity, complexity, "{complexity:?}: complexity");
+            assert_eq!(merged.execution, execution, "{complexity:?}: execution");
+            assert_eq!(merged.seat_tier, seat_tier, "{complexity:?}: seat_tier");
+            assert_eq!(
+                merged.worker_tier, worker_tier,
+                "{complexity:?}: worker_tier"
+            );
+            assert_eq!(merged.seat_role, seat_role, "{complexity:?}: seat_role");
+        }
+    }
+
+    /// Issue #537: `SeatRole` is a name for what `execution` already
+    /// decided, derived once at the tail of `baseline`/`merge` -- `Direct`
+    /// and `Bounded` both stay on one seat; only `Orchestrated` compiles a
+    /// team.
+    #[test]
+    fn seat_role_follows_execution() {
+        assert_eq!(
+            SeatRole::from_execution(ExecutionMode::Direct),
+            SeatRole::Single
+        );
+        assert_eq!(
+            SeatRole::from_execution(ExecutionMode::Bounded),
+            SeatRole::Single
+        );
+        assert_eq!(
+            SeatRole::from_execution(ExecutionMode::Orchestrated),
+            SeatRole::Orchestrator
+        );
+    }
+
+    /// Issue #537: a `direct` execution answer must never coexist with a
+    /// gated workflow, even when the model was confident about both --
+    /// exactly the operator's own two live-decision complaints (a trivial
+    /// colour change and a bounded bugfix investigation, each landing a
+    /// gated `workflow` a `Direct` execution has no business gating).
+    #[test]
+    fn direct_execution_clears_a_confident_workflow_answer() {
+        let cfg = CtxConfig::default();
+        let mut baseline = sample_decision();
+        // `execution` is derived from `complexity` alone (issue #537 design
+        // revision) -- `Trivial` is what actually makes this `Direct`.
+        baseline.complexity = Complexity::Trivial;
+        baseline.execution = ExecutionMode::Direct;
+        baseline.workflow = None;
+        let ans = answers(&[("workflow", AnswerValue::Choice("feature".to_string()), 0.79)]);
+        let merged = merge(&cfg, &baseline, "change the background color", &ans, 0.5);
+        assert_eq!(merged.complexity, Complexity::Trivial);
+        assert_eq!(merged.execution, ExecutionMode::Direct);
+        assert_eq!(merged.workflow, None, "{:?}", merged);
+        assert_eq!(merged.seat_role, SeatRole::Single);
+        assert!(
+            merged
+                .reasons
+                .iter()
+                .any(|reason| reason == "workflow: none because execution is direct"),
+            "{:?}",
+            merged.reasons
+        );
+    }
+
+    /// Issue #537: `seat_tier`/`worker_tier` resolve to concrete models
+    /// through `handover::resolve_model` -- never guessed in this module --
+    /// so the merged decision's `orchestrator.model` always matches what
+    /// `zirv ctx handover` itself would resolve for that harness/tier.
+    #[test]
+    fn seat_tier_resolves_to_a_concrete_model_via_handover_for_claude() {
+        let cfg = CtxConfig::default();
+        for (tier, expected) in [
+            (SeatTier::Cheap, "haiku"),
+            (SeatTier::Standard, "sonnet"),
+            (SeatTier::Deep, "opus"),
+        ] {
+            assert_eq!(model_for_tier(&cfg, "claude", tier), expected);
+        }
+        // Frontier: the operator's own configured `chat.model` when set,
+        // else the vendor's own top rung.
+        assert_eq!(model_for_tier(&cfg, "claude", SeatTier::Frontier), "fable");
+        let mut with_chat_model = cfg.clone();
+        with_chat_model.chat.model = Some("mythos".to_string());
+        assert_eq!(
+            model_for_tier(&with_chat_model, "claude", SeatTier::Frontier),
+            "mythos"
+        );
+    }
+
+    /// Issue #537: the baseline maps `seat_tier` from `execution` alone.
+    #[test]
+    fn baseline_seat_tier_follows_execution() {
+        assert_eq!(
+            SeatTier::from_execution(ExecutionMode::Direct),
+            SeatTier::Cheap
+        );
+        assert_eq!(
+            SeatTier::from_execution(ExecutionMode::Bounded),
+            SeatTier::Standard
+        );
+        assert_eq!(
+            SeatTier::from_execution(ExecutionMode::Orchestrated),
+            SeatTier::Frontier
         );
     }
 
@@ -1235,7 +1568,13 @@ mod tests {
         // what the baseline already (correctly) floored, and must keep the
         // text-driven validation flags.
         let low_risk_answer = answers(&[("risk", AnswerValue::Score(0.0), 0.9)]);
-        let merged = merge(&baseline_decision, sensitive_request, &low_risk_answer, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline_decision,
+            sensitive_request,
+            &low_risk_answer,
+            0.5,
+        );
         assert_eq!(merged.risk, RiskBand::High);
         assert!(merged.validation.security_review);
         assert!(merged.validation.independent_review);
@@ -1254,7 +1593,7 @@ mod tests {
         assert!(!plain_baseline.validation.security_review);
         assert!(!plain_baseline.validation.independent_review);
         let high_risk_answer = answers(&[("risk", AnswerValue::Score(2.0), 0.9)]);
-        let raised = merge(&plain_baseline, plain_request, &high_risk_answer, 0.5);
+        let raised = merge(&cfg, &plain_baseline, plain_request, &high_risk_answer, 0.5);
         assert_eq!(raised.risk, RiskBand::High);
         assert!(raised.validation.security_review);
         assert!(raised.validation.independent_review);
@@ -1413,14 +1752,24 @@ mod tests {
         );
     }
 
+    /// Review finding (round 3): when the harness itself is not enabled+
+    /// ready, `orchestrator` still reverts -- but to the baseline's harness
+    /// with the model RE-DERIVED for it at `decision`'s OWN (unreverted)
+    /// `seat_tier`, never copied verbatim from the baseline (which may sit
+    /// at a different tier entirely).
     #[test]
-    fn validate_rejects_a_disabled_or_not_ready_harness() {
+    fn validate_reverts_an_unready_harness_and_rederives_the_model_at_the_decisions_own_seat_tier()
+    {
+        let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let mut decision = baseline.clone();
         decision.orchestrator = Seat {
             harness: "codex".to_string(),
-            model: "sonnet".to_string(),
+            model: "gpt-5.6-sol".to_string(),
         };
+        // A merge raised `seat_tier` above the baseline's own `standard` --
+        // the reverted harness's model must reflect THIS tier.
+        decision.seat_tier = SeatTier::Deep;
         let roster = Roster {
             harnesses: vec![
                 RosterHarness {
@@ -1436,8 +1785,16 @@ mod tests {
             ],
             registry: None,
         };
-        validate(&mut decision, &baseline, &roster);
-        assert_eq!(decision.orchestrator, baseline.orchestrator);
+        validate(&mut decision, &baseline, &roster, &cfg);
+        assert_eq!(decision.orchestrator.harness, "claude");
+        assert_eq!(
+            decision.orchestrator.model,
+            model_for_tier(&cfg, "claude", SeatTier::Deep)
+        );
+        assert_ne!(
+            decision.orchestrator.model, baseline.orchestrator.model,
+            "must not silently copy a different tier's model from the baseline"
+        );
         assert!(
             decision
                 .reasons
@@ -1446,14 +1803,21 @@ mod tests {
         );
     }
 
+    /// Review finding (round 3): a tier-derived model absent from the
+    /// catalogue must never be reverted -- `handover::resolve_model` is
+    /// already the trusted resolver for it, operator free-form overrides
+    /// (`[handover.claude] standard = "my-team/internal-model"`, a
+    /// documented value with no catalogue rung of its own) included.
+    /// Reproduces the exact bug: a merge raises `seat_tier` from the
+    /// baseline's own `cheap` to `standard`, where the operator has
+    /// overridden claude's `standard` tier to such a model -- the old
+    /// catalogue check silently reverted this to the baseline's `cheap`
+    /// model while leaving `seat_tier` at `standard`, announcing one tier
+    /// and launching another.
     #[test]
-    fn validate_rejects_an_unknown_model_alias_on_an_otherwise_ready_harness() {
-        let baseline = sample_decision();
-        let mut decision = baseline.clone();
-        decision.orchestrator = Seat {
-            harness: "claude".to_string(),
-            model: "no-such-rung".to_string(),
-        };
+    fn validate_never_reverts_a_trusted_tier_derived_model_absent_from_the_catalogue() {
+        let mut cfg = CtxConfig::default();
+        cfg.handover.claude.standard = Some("my-team/internal-model".to_string());
         let roster = Roster {
             harnesses: vec![RosterHarness {
                 name: "claude".to_string(),
@@ -1462,12 +1826,37 @@ mod tests {
             }],
             registry: None,
         };
-        validate(&mut decision, &baseline, &roster);
-        assert_eq!(decision.orchestrator, baseline.orchestrator);
+
+        let mut baseline = sample_decision();
+        baseline.complexity = Complexity::Trivial;
+        baseline.execution = ExecutionMode::Direct;
+        baseline.seat_tier = SeatTier::Cheap;
+        baseline.orchestrator.model = model_for_tier(&cfg, "claude", SeatTier::Cheap);
+
+        let mut decision = baseline.clone();
+        decision.complexity = Complexity::Bounded;
+        decision.execution = ExecutionMode::Bounded;
+        decision.seat_tier = SeatTier::Standard;
+        decision.orchestrator.model = model_for_tier(&cfg, "claude", SeatTier::Standard);
+        assert_eq!(decision.orchestrator.model, "my-team/internal-model");
+
+        validate(&mut decision, &baseline, &roster, &cfg);
+
+        assert_eq!(decision.seat_tier, SeatTier::Standard);
+        assert_eq!(decision.orchestrator.model, "my-team/internal-model");
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .all(|reason| !reason.starts_with("seat:")),
+            "no revert reason expected: {:?}",
+            decision.reasons
+        );
     }
 
     #[test]
     fn validate_rejects_an_unknown_workflow_id() {
+        let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let mut decision = baseline.clone();
         decision.workflow = Some("no-such-workflow".to_string());
@@ -1479,7 +1868,7 @@ mod tests {
             }],
             registry: None,
         };
-        validate(&mut decision, &baseline, &roster);
+        validate(&mut decision, &baseline, &roster, &cfg);
         assert_eq!(decision.workflow, baseline.workflow);
         assert!(
             decision
