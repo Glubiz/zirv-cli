@@ -57,6 +57,11 @@ pub const ROLE_OPTIMIZE: &str = "optimize";
 /// delegated worker through `zirv agent --runtime native`, so its route comes
 /// from that command's own positional or the `worker` role.
 pub const ROLE_SEAT: &str = "seat";
+/// The harness proxy's own helper-model decider (issue #537 seam): `proxy::
+/// llm` renders the intake questions as a JSON contract prompt and answers
+/// through this role when `[proxy] decider` falls through from `typesafe`
+/// (or is configured as `helper` directly).
+pub const ROLE_PROXY: &str = "proxy";
 
 /// How much of a session a helper may spend. Deliberately far below
 /// [`NativeLimits::default`]: a helper answers one question, and a helper that

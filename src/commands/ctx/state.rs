@@ -830,6 +830,18 @@ impl StateDir {
         Self(root)
     }
 
+    /// Wraps an already-resolved state directory root without going through
+    /// `resolve`'s own env/platform lookup (issue #537 seam). The harness
+    /// proxy's public surface (`proxy::decide`/`persist`/`latest_for_repo`)
+    /// takes its state directory as a plain `&Path` -- the same value a
+    /// caller obtained from its own `StateDir::resolve` earlier -- so it can
+    /// rebuild a `StateDir` locally to reuse `pace`/`log`/`window` helpers
+    /// that require one, without threading a `StateDir` through the whole
+    /// proxy module boundary.
+    pub(crate) fn from_path(root: PathBuf) -> Self {
+        Self(root)
+    }
+
     /// `ZIRV_CTX_STATE_DIR`, else the platform state dir, else the platform
     /// local data dir (macOS and Windows have no state dir), plus `zirv/ctx`.
     pub fn resolve(env: EnvLookup<'_>) -> CtxResult<Self> {

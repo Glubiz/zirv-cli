@@ -716,6 +716,33 @@ pub static PROFILES: &[RouteProfile] = &[
         ),
         doc: "Factory Droid (harness backend only)",
     },
+    // -- decision-only vendors (never a coding-session route) -------------
+    RouteProfile {
+        id: "typesafe-jev-decider",
+        version: 1,
+        provider: "openai-compatible",
+        vendor: Some("typesafe"),
+        protocol: Protocol::OpenAiChatCompatible,
+        base_url: BaseUrl::Operator,
+        path: OPENAI_CHAT_PATH,
+        credential: CredentialClass::BrokerSubscription,
+        credential_env: &[],
+        caveats: Caveats {
+            tools: false,
+            streamed_tool_args: false,
+            structured_output: false,
+            parallel_tool_calls: false,
+            ..PLAIN_CHAT
+        },
+        extensions: &[],
+        support: Support::LegacyOnly(
+            "TypeSafe Jev is a decision-only vendor for the harness proxy's \
+             intake call; `proxy::typesafe` speaks its systemone endpoint \
+             directly over its own HTTP client, never through a coding-session \
+             provider route, so no native route is bound here",
+        ),
+        doc: "TypeSafe Jev (harness proxy decision endpoint only)",
+    },
     // -- the generic fallback ---------------------------------------------
     RouteProfile {
         id: "openai-chat-generic",
@@ -742,7 +769,9 @@ pub static PROFILES: &[RouteProfile] = &[
 /// Every catalogue vendor's own direct route, named explicitly so that a new
 /// family cannot be added to the catalogue and quietly inherit the generic
 /// compatible fallback. `amazon` resolves through Bedrock Converse because
-/// the Nova family has no separate direct API.
+/// the Nova family has no separate direct API. `typesafe` binds to a
+/// legacy-only profile because it is a decision-only vendor for the harness
+/// proxy, never a coding-session route.
 const VENDOR_ROUTES: &[(&str, &str)] = &[
     ("anthropic", "anthropic-messages"),
     ("openai", "openai-responses"),
@@ -759,6 +788,7 @@ const VENDOR_ROUTES: &[(&str, &str)] = &[
     ("ollama", "ollama-openai"),
     ("lmstudio", "lmstudio-openai"),
     ("vllm", "vllm-openai"),
+    ("typesafe", "typesafe-jev-decider"),
 ];
 
 /// The documented direct route for a catalogue vendor.

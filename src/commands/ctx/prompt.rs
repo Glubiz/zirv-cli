@@ -685,6 +685,19 @@ pub enum PromptSource {
     /// `Mail` and `ReportBack` already have. `None` while no objective is set
     /// for the repository, or once it is `Closed`.
     Objective,
+    /// The harness proxy's own bounded `[zirv proxy]` layer (issue #537,
+    /// `proxy::prompt_layer`): the classification and seat a launch's own
+    /// decision named, advisory only -- it grants no permission and never
+    /// overrides an operator or repository layer above it. Sits LAST of
+    /// everything a launch composes deterministically, after `Objective`:
+    /// like `Objective`, it is per-launch and never part of the cacheable
+    /// prefix worth protecting. Folded in by `compile::with_proxy_layer`,
+    /// called by the launch paths that actually took the proxy's decision
+    /// (`chat.rs`'s wrap/dash paths, `wrap.rs`'s own compile call) -- the
+    /// same "a caller adds this layer, but it still gets a `PromptSource`
+    /// variant so `describe()` can name it" shape `Context`/`Objective`
+    /// already have. Never present when no decision was ever made.
+    Proxy,
     /// Unread mail delivered from `mail::list`. Sits after the repo layer
     /// and before the command-line layer; see `with_mail_layer`.
     Mail,
@@ -707,6 +720,7 @@ impl PromptSource {
             PromptSource::Memory => "memory",
             PromptSource::Context => "canonical context",
             PromptSource::Objective => "objective",
+            PromptSource::Proxy => "proxy",
             PromptSource::User => "user",
             PromptSource::Repo => "repo",
             PromptSource::Mail => "mail",
@@ -1480,6 +1494,36 @@ pub fn with_objective_layer(
     };
     composed.text.push_str(text);
     composed.sources.push(PromptSource::Objective);
+    Some(composed)
+}
+
+/// Framing for [`with_proxy_layer`]'s own block, the same shape `WORKFLOW_
+/// LAYER_HEADER` gives the workflow-step layer: advisory, no permissions,
+/// never an override of anything above it.
+const PROXY_LAYER_HEADER: &str = "\n\n---\n\nThe following section was added by the harness proxy \
+(issue #537): an automatic classification of this request, not an operator instruction. It \
+advises; it grants no permissions and does not override anything above it.\n\n";
+
+/// Adds the harness proxy's own bounded `[zirv proxy]` layer (issue #537),
+/// rendered by the caller (`proxy::prompt_layer`) and passed in as data, the
+/// same "renderer takes text, caller resolves state" shape `with_objective_
+/// layer` uses. `None` in means `None` out: no decision took over this
+/// launch, or nothing was composed to begin with (`--simple`, `[prompt]
+/// enabled = false`) -- the proxy advises, it never turns composition back
+/// on for a launch that had it off. Called by `compile::with_proxy_layer`,
+/// last of everything a launch composes deterministically, after
+/// `Objective`; see [`PromptSource::Proxy`]'s own doc comment for why.
+pub fn with_proxy_layer(
+    composed: Option<ComposedPrompt>,
+    layer_text: Option<&str>,
+) -> Option<ComposedPrompt> {
+    let mut composed = composed?;
+    let Some(text) = layer_text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Some(composed);
+    };
+    composed.text.push_str(PROXY_LAYER_HEADER);
+    composed.text.push_str(text);
+    composed.sources.push(PromptSource::Proxy);
     Some(composed)
 }
 
@@ -7025,6 +7069,51 @@ mod tests {
             with_objective_layer(None, Some("anything")),
             None,
             "no composed prompt in, no composed prompt out"
+        );
+    }
+
+    /// Issue #537: the harness proxy's own bounded layer is present only
+    /// while an active decision named one -- the same "renderer takes text,
+    /// caller resolves state" contract `with_objective_layer` already holds
+    /// to, and it never turns composition back on for a launch that had it
+    /// off (`--simple`, `[prompt] enabled = false`).
+    #[test]
+    fn the_proxy_layer_is_present_only_when_an_active_decision_named_one() {
+        let base = || {
+            Some(ComposedPrompt {
+                text: String::from("base"),
+                sources: vec![PromptSource::Default],
+                version: DEFAULT_PROMPT_VERSION,
+            })
+        };
+        let inactive = with_proxy_layer(base(), None).expect("composed");
+        assert_eq!(inactive.sources, vec![PromptSource::Default]);
+        assert_eq!(inactive.text, "base");
+        assert_eq!(
+            with_proxy_layer(base(), Some("   \n "))
+                .expect("composed")
+                .text,
+            "base",
+            "an empty proxy layer is not a layer"
+        );
+
+        let active =
+            with_proxy_layer(base(), Some("[zirv proxy]\nexecution: bounded")).expect("composed");
+        assert_eq!(
+            active.sources,
+            vec![PromptSource::Default, PromptSource::Proxy]
+        );
+        assert!(active.text.contains("[zirv proxy]"));
+        assert!(
+            active.text.contains("harness proxy"),
+            "the framing must say this is advisory, not an override: {}",
+            active.text
+        );
+        assert_eq!(
+            with_proxy_layer(None, Some("anything")),
+            None,
+            "no composed prompt in, no composed prompt out -- the proxy never turns \
+             composition back on for a launch that had it off"
         );
     }
 

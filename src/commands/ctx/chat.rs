@@ -7,7 +7,7 @@
 //! allowed to hear about delegating to other harnesses (`zirv ctx send`,
 //! `zirv ctx inbox`, `zirv ctx agent`).
 
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use super::adapters::{self, AgentAdapter, DefaultOrigin};
@@ -17,6 +17,7 @@ use super::dash;
 use super::dash::pane::PaneSpec;
 use super::event::SessionId;
 use super::prompt::PromptRole;
+use super::proxy::{self, decision::ProxyDecision};
 use super::runtime::{self as runtime_kind, RuntimeKind};
 use super::state::StateDir;
 use super::term;
@@ -74,6 +75,16 @@ pub struct ChatArgs {
     /// of those.
     #[arg(long)]
     pub runtime: Option<String>,
+    /// Issue #537: force this launch through the harness proxy's intake
+    /// view, overriding `[proxy] enabled` for this one launch. Mutually
+    /// exclusive with `--no-proxy`; still skipped outright under `--simple`
+    /// or `--resume` (see `run_with`'s own intake step).
+    #[arg(long, conflicts_with = "no_proxy")]
+    pub proxy: bool,
+    /// The inverse of `--proxy`: never take over this launch through the
+    /// intake view, even when `[proxy] enabled = true`.
+    #[arg(long, default_value_t = false)]
+    pub no_proxy: bool,
     /// Extra arguments passed through to the agent, after `--`.
     //
     // `allow_hyphen_values`, because what gets passed through here is the
@@ -149,6 +160,7 @@ pub fn build_launch(
 /// compose`'s own gate), and `task_prompt_with_composed_fallback` is a no-op
 /// when handed `None`, so both degrade to returning `initial_prompt`
 /// unchanged -- the correct answer either way.
+#[allow(clippy::too_many_arguments)]
 fn orchestrator_initial_prompt(
     adapter: &dyn AgentAdapter,
     initial_prompt: Option<String>,
@@ -157,6 +169,7 @@ fn orchestrator_initial_prompt(
     repo: &Path,
     simple: bool,
     state: &StateDir,
+    proxy_layer: Option<&str>,
 ) -> Option<String> {
     if adapter.system_prompt_supported(&[]) {
         return initial_prompt;
@@ -173,6 +186,13 @@ fn orchestrator_initial_prompt(
         super::adapters::LaunchMode::Interactive,
         false,
     );
+    // Issue #537 (T2a): the harness proxy's own bounded layer, when an
+    // active decision took over this launch -- a no-op for every other
+    // launch (`proxy_layer` is `None`). Only reachable for an adapter with
+    // no verified system-prompt injection mechanism (the early return
+    // above); every other adapter gets this same layer through `wrap.rs`'s
+    // or `dash_orchestrator_pane`'s own `compile::with_proxy_layer` call.
+    let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
     let base = initial_prompt.unwrap_or_default();
     let text =
         super::prompt::task_prompt_with_composed_fallback(&base, false, compiled.composed.as_ref());
@@ -280,6 +300,176 @@ pub fn resolve_initial_prompt<W: Write>(
             Ok(None)
         }
     }
+}
+
+/// Issue #537 (T2): what the harness proxy's intake step decided for this
+/// launch, evaluated once, before `resolve_adapter`.
+#[derive(Debug, PartialEq)]
+enum ProxyIntakeOutcome {
+    /// The proxy took no part in this launch; `advisory`, when present, is
+    /// the one line `run_with` prints on the same `zirv \u{25b8}` channel as
+    /// every other announcement (so it still honors `--quiet`).
+    Inactive { advisory: Option<String> },
+    /// Activation succeeded but stdin is not a terminal, so there is
+    /// nowhere to read the task description from: `run_with` refuses the
+    /// whole launch with this message rather than silently skipping the
+    /// proxy (unlike every other `Inactive` case, this one was never given
+    /// a chance to say anything at all).
+    Refuse { message: String },
+    /// The proxy decided this launch: `request` is the raw text `decide`
+    /// classified, carried alongside so it can also become the launch's own
+    /// initial prompt. Boxed: `ProxyDecision` is far larger than every other
+    /// variant here (clippy's `large_enum_variant`), and this variant is
+    /// matched far less often than it is passed around.
+    Decided {
+        decision: Box<ProxyDecision>,
+        request: String,
+    },
+}
+
+/// The harness proxy's intake step (issue #537 T2), evaluated before any
+/// dashboard/TUI or `wrap` launch and before `resolve_adapter`. Pure of the
+/// real terminal/stdin: `stdin_is_tty` and `reader` are both passed in
+/// (`run_with` supplies `std::io::stdin()`'s own tty probe and a locked
+/// handle onto it), so the decision logic here is testable without one.
+///
+/// `--simple`/`--resume` always skip the proxy outright -- a resumed
+/// session's first prompt is the stored handoff, and `--simple` promises no
+/// zirv-injected step at all -- recording why only when `--proxy` was
+/// explicitly requested (an operator asking for the proxy and silently not
+/// getting it would otherwise look like a bug). Otherwise `proxy::activation`
+/// decides (`--proxy`/`--no-proxy` already folded into `cfg.proxy.enabled`
+/// by the caller): `Err` skips with that reason as the advisory; `Ok` opens
+/// the intake view, refusing outright on a non-tty stdin (there is nowhere
+/// to read a request from) and falling back to `Inactive` on an empty
+/// request, exactly like every other skip.
+fn proxy_intake<E: Write>(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    args: &ChatArgs,
+    stdin_is_tty: bool,
+    reader: &mut impl BufRead,
+    stderr: &mut E,
+) -> CtxResult<ProxyIntakeOutcome> {
+    if args.simple || args.resume {
+        let advisory = args.proxy.then(|| {
+            let flag = if args.simple { "--simple" } else { "--resume" };
+            format!("proxy: skipped ({flag}); starting the orchestrator harness")
+        });
+        return Ok(ProxyIntakeOutcome::Inactive { advisory });
+    }
+    if let Err(reason) = proxy::activation(cfg) {
+        // Issue #537 review: the plain `[proxy] enabled = false` default --
+        // no flag either way -- must stay byte-identical to today,
+        // announcements included. `cfg.proxy.enabled` here already has
+        // `--proxy`/`--no-proxy` folded in by the caller, so this is exactly
+        // "enabled (by config or --proxy) but not usable"; the disabled
+        // default (or an explicit `--no-proxy`) prints nothing.
+        let advisory = cfg.proxy.enabled.then_some(reason);
+        return Ok(ProxyIntakeOutcome::Inactive { advisory });
+    }
+    if !stdin_is_tty {
+        return Ok(ProxyIntakeOutcome::Refuse {
+            message: "zirv ctx chat: the harness proxy needs an interactive terminal on stdin to \
+                      read the task description; pass --no-proxy (or disable [proxy]) to skip it"
+                .to_string(),
+        });
+    }
+    writeln!(
+        stderr,
+        "zirv \u{25b8} proxy: describe the task (empty line to send)"
+    )?;
+    let Some(request) = proxy::read_request(reader) else {
+        return Ok(ProxyIntakeOutcome::Inactive {
+            advisory: Some(
+                "proxy: no request given; starting the orchestrator harness".to_string(),
+            ),
+        });
+    };
+    let decision = proxy::decide(cfg, state.root(), repo, &request);
+    Ok(ProxyIntakeOutcome::Decided {
+        decision: Box::new(decision),
+        request,
+    })
+}
+
+/// The chat-launch overrides an active harness-proxy decision applies:
+/// `cfg.chat.model` (so `extra_with_model`/`SEAT_MODEL_ENV`/the banner all
+/// disclose the SAME model the proxy chose, through the exact seams that
+/// already carry an operator-configured `chat.model` today) and the
+/// requested adapter name, returned for the caller to fold into
+/// `resolve_adapter` in place of `--agent`. Pure and given an already-
+/// computed [`ProxyDecision`] (not `decide` itself), so the effect on a
+/// launch's argv is testable without a pty, a real decider, or a live
+/// `proxy::decide` call.
+fn apply_proxy_decision(cfg: &mut CtxConfig, decision: &ProxyDecision) -> String {
+    cfg.chat.model = Some(decision.orchestrator.model.clone());
+    decision.orchestrator.harness.clone()
+}
+
+/// The harness proxy's own bounded `[zirv proxy]` layer text
+/// (`proxy::prompt_layer`), when [`proxy_intake`] decided this launch;
+/// `None` for every other outcome. Computed once and threaded to every
+/// place that needs it (`orchestrator_initial_prompt`'s fallback,
+/// `dash_orchestrator_pane`, `wrap_args_for`), so the launch shape actually
+/// taken can never disagree with the others about it.
+fn proxy_layer_text(intake: &ProxyIntakeOutcome) -> Option<String> {
+    match intake {
+        ProxyIntakeOutcome::Decided { decision, .. } => Some(proxy::prompt_layer(decision)),
+        _ => None,
+    }
+}
+
+/// Starts the proxy's chosen workflow (when [`proxy_intake`] decided one)
+/// immediately before `spawn`, closing it again with `"proxy launch
+/// failed"` if `spawn` itself returns `Err` -- so a failed launch never
+/// leaves an orphaned workflow reported as this repository's active one
+/// forever. A plain pass-through to `spawn` when the intake never took over
+/// this launch. Shared by all three launch shapes below (the dashboard
+/// pane, the `wrap` fallback, and the persistent-runtime spawn), so the
+/// decision reaches whichever one this terminal actually takes.
+///
+/// Issue #537 review: never silently discards an outcome the operator has
+/// no other way to learn about. `announce` is called through the exact
+/// same `zirv \u{25b8}` channel every other proxy line uses (a `Skipped`
+/// start, a `start_workflow_for` error, or a `close_started` error after a
+/// failed spawn); a `Started` workflow followed by a successful spawn stays
+/// silent, same as today.
+fn with_proxy_workflow<T>(
+    outcome: &ProxyIntakeOutcome,
+    state: &StateDir,
+    repo: &Path,
+    mut announce: impl FnMut(String),
+    spawn: impl FnOnce() -> CtxResult<T>,
+) -> CtxResult<T> {
+    let ProxyIntakeOutcome::Decided { decision, request } = outcome else {
+        return spawn();
+    };
+    let started_id = match proxy::launch::start_workflow_for(decision, state.root(), repo, request)
+    {
+        Ok(proxy::launch::WorkflowStart::Started { id }) => Some(id),
+        Ok(proxy::launch::WorkflowStart::Skipped { reason }) => {
+            announce(format!("proxy: workflow not started; {reason}"));
+            None
+        }
+        Err(err) => {
+            announce(format!("proxy: workflow start failed; {err}"));
+            None
+        }
+    };
+    let result = spawn();
+    if result.is_err()
+        && let Some(id) = &started_id
+        && let Err(close_error) =
+            proxy::launch::close_started(state.root(), repo, id, "proxy launch failed")
+    {
+        announce(format!(
+            "proxy: could not close workflow {id} after the failed launch; {close_error} -- \
+             run `zirv workflow close {id}` yourself"
+        ));
+    }
+    result
 }
 
 /// Probes stdout for the launch banner: whether it is a terminal at all, its
@@ -506,7 +696,16 @@ pub fn run_with<W: Write, E: Write>(
         return Ok(1);
     }
 
-    let cfg = CtxConfig::load_for_launch(repo, env)?;
+    let mut cfg = CtxConfig::load_for_launch(repo, env)?;
+    // Issue #537 (T2): `--proxy`/`--no-proxy` override `[proxy] enabled` for
+    // this one launch only -- the rest of the activation predicate (the
+    // configured decider, its own credential/model checks) is untouched, so
+    // an operator cannot use the flag to bypass those.
+    if args.proxy {
+        cfg.proxy.enabled = true;
+    } else if args.no_proxy {
+        cfg.proxy.enabled = false;
+    }
     // Held for the rest of this function: dropping it early would restore
     // the console's original VT mode before `wrap`'s own raw-mode session
     // (which relies on VT already being on) even opens.
@@ -568,8 +767,58 @@ pub fn run_with<W: Write, E: Write>(
     }
 
     let chrome = ChromeCaps::probe(stdout_is_tty, vt_ok, size, &cfg.chrome, args.simple, false);
+    let state = StateDir::resolve(env)?;
 
-    let (adapter, rule) = match resolve_adapter(&cfg, args.agent.as_deref()) {
+    // Issue #537 (T2): the harness proxy's own intake, before any adapter
+    // resolution or dashboard/wrap launch -- see `proxy_intake`'s own doc
+    // comment for the full skip/refuse/decide sequence.
+    let intake = proxy_intake(
+        &cfg,
+        &state,
+        repo,
+        args,
+        stdin_is_tty,
+        &mut std::io::stdin().lock(),
+        stderr,
+    )?;
+    if let ProxyIntakeOutcome::Refuse { message } = &intake {
+        writeln!(stderr, "{message}")?;
+        return Ok(1);
+    }
+    let proxy_announcer = super::announce::Announcer::new(
+        cfg.chrome.events && !args.quiet,
+        console::colors_enabled_stderr(),
+    );
+    // Issue #537: the decided orchestrator harness overrides `--agent`
+    // outright when the proxy took over this launch (via `apply_proxy_
+    // decision`, which also folds the decided model into `cfg.chat.model`);
+    // every other case keeps today's `--agent`/configured/first-ready
+    // resolution untouched.
+    let mut requested_agent = args.agent.clone();
+    match &intake {
+        ProxyIntakeOutcome::Inactive {
+            advisory: Some(reason),
+        } => {
+            proxy_announcer.emit_to(
+                stderr,
+                &super::announce::Event::ProxyAdvisory {
+                    text: reason.clone(),
+                },
+            );
+        }
+        ProxyIntakeOutcome::Decided { decision, .. } => {
+            requested_agent = Some(apply_proxy_decision(&mut cfg, decision));
+            proxy_announcer.emit_to(
+                stderr,
+                &super::announce::Event::ProxyAdvisory {
+                    text: proxy::announce_line(decision),
+                },
+            );
+        }
+        ProxyIntakeOutcome::Inactive { advisory: None } | ProxyIntakeOutcome::Refuse { .. } => {}
+    }
+
+    let (adapter, rule) = match resolve_adapter(&cfg, requested_agent.as_deref()) {
         Ok(found) => found,
         Err(err) => {
             // Printed once, here, rather than propagated as `Err`: `zirv
@@ -598,9 +847,15 @@ pub fn run_with<W: Write, E: Write>(
             return Ok(1);
         }
     };
-    let state = StateDir::resolve(env)?;
-    let initial_prompt =
-        resolve_initial_prompt(args.resume, &state, repo, w, &cfg.screen.thresholds())?;
+    // Issue #537: the decided request stands in for `--resume`'s own
+    // initial-prompt resolution -- both name what the first prompt should
+    // be, and the two never coexist (`proxy_intake` always skips under
+    // `--resume`, so `ProxyIntakeOutcome::Decided` and a real `--resume`
+    // request never race for this slot).
+    let initial_prompt = match &intake {
+        ProxyIntakeOutcome::Decided { request, .. } => Some(request.clone()),
+        _ => resolve_initial_prompt(args.resume, &state, repo, w, &cfg.screen.thresholds())?,
+    };
     let resuming = args.resume && initial_prompt.is_some();
     let session = SessionId::new_v4();
 
@@ -623,6 +878,11 @@ pub fn run_with<W: Write, E: Write>(
     // orchestrator always gets one. Folded in here, once, before `build_
     // launch` bakes the positional prompt slot: both branches below reuse
     // this same `launch`.
+    // Issue #537 (T2a): the harness proxy's own bounded layer text, computed
+    // once here and threaded to every place that needs it -- the fallback
+    // just below, `dash_orchestrator_pane` and `wrap_args_for` -- so all
+    // three launch shapes carry exactly the same layer or none at all.
+    let proxy_layer = proxy_layer_text(&intake);
     let initial_prompt = orchestrator_initial_prompt(
         adapter.as_ref(),
         initial_prompt,
@@ -631,6 +891,7 @@ pub fn run_with<W: Write, E: Write>(
         repo,
         args.simple,
         &state,
+        proxy_layer.as_deref(),
     );
 
     // Applies to both branches below (the dashboard's orchestrator pane and
@@ -685,13 +946,33 @@ pub fn run_with<W: Write, E: Write>(
         stdout_is_tty,
     ) == super::session::ChatRoute::Runtime
     {
-        match super::session::chat_via_runtime(
+        // Issue #537 (T2a): the third spawn shape -- wrapped identically to
+        // the dashboard pane and the `wrap` fallback below, so a decision
+        // this launch made starts (and, on failure, closes) the same
+        // workflow regardless of which of the three shapes actually spawns.
+        // An `Err` here just means the runtime path itself did not pan out
+        // (this process falls through to the in-process launch below,
+        // which gets its own `with_proxy_workflow` around it) -- treating
+        // it as a failed spawn closes the workflow this attempt started
+        // rather than leaving it orphaned, and the fallback path below
+        // starts a fresh one for the launch that actually proceeds.
+        match with_proxy_workflow(
+            &intake,
             &state,
-            adapter.name(),
-            initial_prompt.as_deref(),
-            &extra,
             repo,
-            w,
+            |text| {
+                proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
+            },
+            || {
+                super::session::chat_via_runtime(
+                    &state,
+                    adapter.name(),
+                    initial_prompt.as_deref(),
+                    &extra,
+                    repo,
+                    w,
+                )
+            },
         ) {
             Ok(code) => return Ok(code),
             Err(error) => writeln!(
@@ -718,8 +999,17 @@ pub fn run_with<W: Write, E: Write>(
             repo,
             session.as_str(),
             args.simple,
+            proxy_layer.as_deref(),
         )?;
-        return dash::run_dashboard(&cfg, repo, &env, &state, pane, None, args.force_pace);
+        return with_proxy_workflow(
+            &intake,
+            &state,
+            repo,
+            |text| {
+                proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
+            },
+            || dash::run_dashboard(&cfg, repo, &env, &state, pane, None, args.force_pace),
+        );
     }
 
     // Ineligible because the dashboard is on but the terminal is too small
@@ -748,14 +1038,24 @@ pub fn run_with<W: Write, E: Write>(
         ));
     }
 
-    let wrap_args = wrap_args_for(args, launch.clone());
-    wrap::run_with(
-        &wrap_args,
+    let wrap_args = wrap_args_for(args, launch.clone(), proxy_layer.clone());
+    with_proxy_workflow(
+        &intake,
+        &state,
         repo,
-        &env,
-        launch.role,
-        Some(session),
-        launch.verb,
+        |text| {
+            proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
+        },
+        || {
+            wrap::run_with(
+                &wrap_args,
+                repo,
+                &env,
+                launch.role,
+                Some(session),
+                launch.verb,
+            )
+        },
     )
 }
 
@@ -829,6 +1129,7 @@ pub(crate) fn dash_orchestrator_pane(
     repo: &Path,
     session: &str,
     simple: bool,
+    proxy_layer: Option<&str>,
 ) -> CtxResult<PaneSpec> {
     // Issue #44: gathers memory, the derived harness roster and the
     // canonical `.zirv/context/` layer, and attaches the policy report --
@@ -845,6 +1146,9 @@ pub(crate) fn dash_orchestrator_pane(
         super::adapters::LaunchMode::Interactive,
         true,
     );
+    // Issue #537 (T2a): the harness proxy's own bounded layer, when an
+    // active decision took over this launch -- a no-op otherwise.
+    let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
     let (mut argv, composed) = super::prompt::merge_command_line_prompt(
         adapter,
         &launch.argv,
@@ -982,7 +1286,7 @@ fn extra_with_model(cfg: &CtxConfig, adapter: &dyn AgentAdapter, extra: &[String
 /// runs the same nesting guard again against the same environment, so an
 /// override honored here but dropped here would simply be refused one layer
 /// down.
-pub fn wrap_args_for(args: &ChatArgs, launch: ChatLaunch) -> WrapArgs {
+pub fn wrap_args_for(args: &ChatArgs, launch: ChatLaunch, proxy_layer: Option<String>) -> WrapArgs {
     WrapArgs {
         agent: Some(launch.agent_name),
         no_supervise: false,
@@ -990,6 +1294,7 @@ pub fn wrap_args_for(args: &ChatArgs, launch: ChatLaunch) -> WrapArgs {
         simple: args.simple,
         allow_nested: args.allow_nested,
         force_pace: args.force_pace,
+        proxy_layer,
     }
 }
 
@@ -1047,8 +1352,13 @@ mod tests {
     use super::*;
     use crate::commands::ctx::adapters::claude::ClaudeAdapter;
     use crate::commands::ctx::adapters::codex::CodexAdapter;
+    use crate::commands::ctx::catalogue::Tier;
     use crate::commands::ctx::handoff::Handoff;
+    use crate::commands::ctx::proxy::decision::{Decider, Seat};
     use crate::commands::ctx::state::StateDir;
+    use crate::commands::workflow::classify::{Complexity, Intent, RiskBand};
+    use crate::commands::workflow::profile::{ExecutionMode, ValidationProfile};
+    use std::collections::BTreeMap;
 
     fn handoff() -> Handoff {
         Handoff {
@@ -1139,6 +1449,7 @@ mod tests {
                 tmp.path(),
                 false,
                 &state,
+                None,
             ),
             None
         );
@@ -1151,6 +1462,7 @@ mod tests {
                 tmp.path(),
                 false,
                 &state,
+                None,
             ),
             Some("resume this".to_string())
         );
@@ -1190,6 +1502,7 @@ mod tests {
             tmp.path(),
             false,
             &state,
+            None,
         )
         .expect("an unsupported adapter still gets a fallback prompt");
         assert!(
@@ -1213,6 +1526,7 @@ mod tests {
             tmp.path(),
             false,
             &state,
+            None,
         )
         .expect("still folds a fallback in on top of a real prompt");
         assert!(
@@ -1222,6 +1536,39 @@ mod tests {
         assert!(
             with_resume.contains("zirv engineering standard"),
             "and the composed context must still follow it: {with_resume}"
+        );
+    }
+
+    /// Issue #537 (T2a): the same unsupported-adapter fallback carries the
+    /// harness proxy's own bounded layer when one is given, on top of the
+    /// composed context this launch shape already folds in.
+    #[cfg(windows)]
+    #[test]
+    fn orchestrator_initial_prompt_folds_the_proxy_layer_for_an_unsupported_codex_shim() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let shim_dir = tempfile::tempdir().expect("tempdir");
+        let shim = shim_dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("write shim");
+        let adapter = CodexAdapter::new(Some(&shim.display().to_string()));
+
+        let text = orchestrator_initial_prompt(
+            &adapter,
+            None,
+            &cfg,
+            Some(&home),
+            tmp.path(),
+            false,
+            &state,
+            Some("[zirv proxy]\nexecution: bounded"),
+        )
+        .expect("an unsupported adapter still gets a fallback prompt");
+        assert!(
+            text.contains("[zirv proxy]"),
+            "a given decision must reach the fallback prompt: {text}"
         );
     }
 
@@ -1250,7 +1597,8 @@ mod tests {
                 Some(&home),
                 tmp.path(),
                 true,
-                &state
+                &state,
+                None,
             ),
             None,
             "--simple must still suppress every zirv-injected layer, fallback included"
@@ -1323,6 +1671,7 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
+            None,
         )
         .expect("pane");
 
@@ -1342,6 +1691,54 @@ mod tests {
             pane.argv.first().map(String::as_str),
             Some("/nonexistent/fake-claude"),
             "the launch program is still the adapter's own binary: {argv}"
+        );
+    }
+
+    /// Issue #537 (T2a): the dashboard orchestrator pane folds the harness
+    /// proxy's own bounded layer onto its compiled context when it is given
+    /// one, and (the companion assertion) never does when it is not --
+    /// same shape as the test above, but with `proxy_layer` set.
+    #[test]
+    fn the_dash_orchestrator_pane_carries_the_proxy_layer_only_when_given_one() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+
+        let without = dash_orchestrator_pane(
+            &adapter,
+            build_launch(&adapter, None, &[]),
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+            None,
+        )
+        .expect("pane");
+        assert!(
+            !without.argv.join(" ").contains("[zirv proxy]"),
+            "no decision given, no proxy layer: {:?}",
+            without.argv
+        );
+
+        let with = dash_orchestrator_pane(
+            &adapter,
+            build_launch(&adapter, None, &[]),
+            &cfg,
+            &state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+            Some("[zirv proxy]\nexecution: bounded"),
+        )
+        .expect("pane");
+        assert!(
+            with.argv.join(" ").contains("[zirv proxy]"),
+            "a given decision must reach the pane's own argv: {:?}",
+            with.argv
         );
     }
 
@@ -1368,6 +1765,7 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
+            None,
         )
         .expect("pane");
         assert!(
@@ -1409,6 +1807,7 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
+            None,
         )
         .expect("pane");
         assert_eq!(
@@ -1449,6 +1848,7 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
+            None,
         )
         .expect("pane");
         assert!(
@@ -1509,6 +1909,7 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
+            None,
         )
         .expect("pane");
 
@@ -1564,6 +1965,7 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             false,
+            None,
         )
         .expect("pane");
 
@@ -1613,6 +2015,7 @@ mod tests {
             tmp.path(),
             "11111111-2222-4333-8444-555555555555",
             true,
+            None,
         )
         .expect("pane");
         // R1: the session pin is launch plumbing, not injected instruction --
@@ -1647,9 +2050,17 @@ mod tests {
         let session = "11111111-2222-4333-8444-555555555555";
         let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
         let launch = build_launch(&adapter, None, &[]);
-        let pane =
-            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false)
-                .expect("pane");
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            session,
+            false,
+            None,
+        )
+        .expect("pane");
 
         let pin = pane
             .argv
@@ -1690,9 +2101,17 @@ mod tests {
         ] {
             let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
             let launch = build_launch(&adapter, None, &extra);
-            let pane =
-                dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false)
-                    .expect("pane");
+            let pane = dash_orchestrator_pane(
+                &adapter,
+                launch,
+                &cfg,
+                &state,
+                tmp.path(),
+                session,
+                false,
+                None,
+            )
+            .expect("pane");
 
             assert!(
                 !pane.argv.iter().any(|a| a == session),
@@ -1733,9 +2152,17 @@ mod tests {
             None,
             &["--resume".to_string(), existing.to_string()],
         );
-        let pane =
-            dash_orchestrator_pane(&adapter, launch, &cfg, &state, tmp.path(), session, false)
-                .expect("pane");
+        let pane = dash_orchestrator_pane(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            tmp.path(),
+            session,
+            false,
+            None,
+        )
+        .expect("pane");
 
         assert_eq!(
             pane.session_id, session,
@@ -2033,6 +2460,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: None,
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2080,6 +2509,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: None,
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2116,6 +2547,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: Some("bogus".to_string()),
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2173,6 +2606,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: Some("harness".to_string()),
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2219,6 +2654,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: Some("native".to_string()),
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let mut err_out = Vec::new();
@@ -2260,6 +2697,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: Some("native".to_string()),
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let mut err_out = Vec::new();
@@ -2311,6 +2750,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: Some("native".to_string()),
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let real_env = env_from_process();
@@ -2395,6 +2836,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: None,
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2450,6 +2893,8 @@ mod tests {
             pin_harness: false,
             no_session: false,
             runtime: None,
+            proxy: false,
+            no_proxy: false,
             extra: Vec::new(),
         }
     }
@@ -2555,7 +3000,7 @@ mod tests {
         let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
         let launch = build_launch(&adapter, None, &[]);
         for allow_nested in [false, true] {
-            let wrap_args = wrap_args_for(&chat_args(allow_nested), launch.clone());
+            let wrap_args = wrap_args_for(&chat_args(allow_nested), launch.clone(), None);
             assert_eq!(
                 wrap_args.allow_nested, allow_nested,
                 "chat's own override has to reach wrap's identical guard"
@@ -2849,6 +3294,478 @@ mod tests {
         assert!(
             harnesses.contains(&("claude".to_string(), true)),
             "claude is enabled and present, so it must still be listed as live: {harnesses:?}"
+        );
+    }
+
+    // Issue #537 (T2a): the harness proxy's launch wiring.
+
+    fn sample_decision(
+        repo: &Path,
+        harness: &str,
+        model: &str,
+        workflow: Option<&str>,
+    ) -> ProxyDecision {
+        ProxyDecision {
+            request_sha256: "deadbeef".to_string(),
+            repo: repo.to_path_buf(),
+            intent: Intent::Feature,
+            complexity: Complexity::Bounded,
+            risk: RiskBand::Medium,
+            execution: ExecutionMode::Bounded,
+            validation: ValidationProfile::default(),
+            workflow: workflow.map(str::to_string),
+            orchestrator: Seat {
+                harness: harness.to_string(),
+                model: model.to_string(),
+            },
+            worker_tier: Tier::Standard,
+            needs_clarification: 0.0,
+            decider: Decider::Deterministic,
+            confidence: BTreeMap::new(),
+            reasons: Vec::new(),
+            fallbacks: Vec::new(),
+            elapsed_ms: 0,
+            usage: None,
+            created_at: 0,
+        }
+    }
+
+    /// The overwhelmingly common case (the proxy never configured at all):
+    /// `activation` refuses on `[proxy] enabled = false`, and `proxy_intake`
+    /// folds that reason into `Inactive` rather than reading stdin at all.
+    #[test]
+    fn proxy_disabled_by_default_is_silently_inactive() {
+        let cfg = CtxConfig::default();
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            false,
+            &mut &b""[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        assert_eq!(
+            outcome,
+            ProxyIntakeOutcome::Inactive { advisory: None },
+            "the disabled default must be byte-identical to today, announcements included"
+        );
+        assert!(
+            stderr.is_empty(),
+            "proxy_intake itself never prints the advisory -- that is the caller's job \
+             (through the announce channel), so it must not touch stderr here"
+        );
+    }
+
+    /// The mirror of the test above: `[proxy] enabled = true` (config or
+    /// `--proxy`) but not actually usable (here, the deterministic decider,
+    /// which `activation` always refuses) still gets the advisory -- an
+    /// operator who turned the proxy on deserves to know why it never took
+    /// over, unlike the silent, never-asked-for default.
+    #[test]
+    fn proxy_enabled_but_unusable_still_names_why() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.decider = crate::commands::ctx::config::ProxyDecider::Deterministic;
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            false,
+            &mut &b""[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        match outcome {
+            ProxyIntakeOutcome::Inactive {
+                advisory: Some(reason),
+            } => assert!(reason.contains("deterministic"), "got {reason}"),
+            other => panic!("expected Inactive with a reason, got {other:?}"),
+        }
+    }
+
+    /// `--resume`'s own first prompt is the stored handoff; the proxy must
+    /// never insert its own intake step ahead of it. Naming the reason is
+    /// conditional on `--proxy` -- proven by the companion test below.
+    #[test]
+    fn resume_with_an_explicit_proxy_request_is_skipped_with_a_named_reason() {
+        let cfg = CtxConfig::default();
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let mut args = chat_args(false);
+        args.resume = true;
+        args.proxy = true;
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            false,
+            &mut &b""[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        match outcome {
+            ProxyIntakeOutcome::Inactive {
+                advisory: Some(reason),
+            } => assert!(reason.contains("--resume"), "got {reason}"),
+            other => panic!("expected Inactive naming --resume, got {other:?}"),
+        }
+    }
+
+    /// The mirror of the test above: `--simple` alone (no explicit
+    /// `--proxy`) must skip silently -- an operator who never asked for the
+    /// proxy should not see it mentioned at all.
+    #[test]
+    fn simple_alone_skips_silently_with_no_explicit_proxy_request() {
+        let cfg = CtxConfig::default();
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let mut args = chat_args(false);
+        args.simple = true;
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            false,
+            &mut &b""[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        assert_eq!(
+            outcome,
+            ProxyIntakeOutcome::Inactive { advisory: None },
+            "no explicit --proxy means no advisory at all"
+        );
+    }
+
+    /// `--proxy` and `--no-proxy` name the same underlying `enabled`
+    /// override in opposite directions; clap must refuse both together
+    /// rather than silently letting one win.
+    #[test]
+    fn proxy_and_no_proxy_together_is_a_clap_conflict() {
+        use clap::Parser;
+        let result = crate::commands::ctx::CtxCli::try_parse_from([
+            "zirv ctx",
+            "chat",
+            "--proxy",
+            "--no-proxy",
+        ]);
+        assert!(
+            result.is_err(),
+            "clap must refuse --proxy together with --no-proxy"
+        );
+    }
+
+    /// Activation succeeding (a usable Typesafe model configured, credential
+    /// present) but stdin not a terminal leaves nowhere to read the task
+    /// description from: `run_with` must refuse the whole launch rather than
+    /// silently falling back, which would look like the proxy was never
+    /// asked for at all.
+    #[test]
+    fn activation_ok_but_non_tty_stdin_refuses_the_launch() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
+            cfg.proxy.typesafe.credential_env.as_str(),
+            Some("a-test-key"),
+        )]);
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            false,
+            &mut &b""[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        match outcome {
+            ProxyIntakeOutcome::Refuse { message } => {
+                assert!(message.contains("interactive terminal"), "got {message}");
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
+    /// The wiring `run_with` applies once the proxy actually decided this
+    /// launch: the decided model replaces `cfg.chat.model` and the decided
+    /// harness is returned for `resolve_adapter`, so `extra_with_model`/
+    /// `build_launch` (already covered by their own tests) put the decided
+    /// `--model` in argv and the request text becomes the initial prompt.
+    #[test]
+    fn an_injected_proxy_decision_lands_the_decided_model_and_request_in_the_built_launch() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let decision = sample_decision(repo.path(), "claude", "fable", Some("bugfix"));
+        let mut cfg = CtxConfig::default();
+
+        let requested_agent = apply_proxy_decision(&mut cfg, &decision);
+
+        assert_eq!(requested_agent, "claude");
+        assert_eq!(cfg.chat.model.as_deref(), Some("fable"));
+
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        let extra = extra_with_model(&cfg, &adapter, &[]);
+        let launch = build_launch(&adapter, Some("fix the flaky retry test"), &extra);
+
+        assert!(
+            launch
+                .argv
+                .windows(2)
+                .any(|pair| pair == ["--model", "fable"]),
+            "the decided model must land in argv: {:?}",
+            launch.argv
+        );
+        assert!(
+            launch
+                .argv
+                .contains(&"fix the flaky retry test".to_string()),
+            "the request text must become the initial prompt: {:?}",
+            launch.argv
+        );
+    }
+
+    /// `apply_proxy_decision` is a no-op on `cfg.chat.model` for any field
+    /// it does not touch: the proxy only ever replaces the model, never
+    /// anything else on `cfg`.
+    #[test]
+    fn apply_proxy_decision_only_touches_the_chat_model() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let decision = sample_decision(repo.path(), "codex", "o-fast", None);
+        let mut cfg = CtxConfig::default();
+        cfg.chat.model = Some("stale".to_string());
+
+        let requested_agent = apply_proxy_decision(&mut cfg, &decision);
+
+        assert_eq!(requested_agent, "codex");
+        assert_eq!(cfg.chat.model.as_deref(), Some("o-fast"));
+    }
+
+    fn git_init_with_commit(repo: &Path) {
+        let git = |cmd_args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(cmd_args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {cmd_args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+    }
+
+    /// `with_proxy_workflow` is a plain pass-through to `spawn` when the
+    /// intake never decided this launch: no workflow is ever touched.
+    #[test]
+    fn with_proxy_workflow_passes_through_when_inactive() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let outcome = ProxyIntakeOutcome::Inactive { advisory: None };
+        let mut announced: Vec<String> = Vec::new();
+
+        let result = with_proxy_workflow(
+            &outcome,
+            &state,
+            repo.path(),
+            |text| announced.push(text),
+            || Ok(42),
+        );
+
+        assert_eq!(result.expect("passthrough"), 42);
+        assert!(
+            announced.is_empty(),
+            "inactive never announces anything: {announced:?}"
+        );
+    }
+
+    /// A failed spawn must close the workflow this launch started -- an
+    /// orphaned "active" workflow left behind by a launch that never
+    /// actually started would otherwise block every later `zirv chat`
+    /// (proxy or not) that reaches the same repo, since `engine::
+    /// start_workflow` never overwrites an existing active pointer.
+    #[test]
+    fn with_proxy_workflow_closes_a_workflow_it_started_when_the_spawn_fails() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_init_with_commit(repo.path());
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        // Trivial/Low keeps the built-in `bugfix` pack's conditional,
+        // approval-gated `intent` step out of the materialized plan, so
+        // this starts `Running` -- `engine::close` refuses to close a
+        // workflow still `AwaitingApproval`.
+        let mut decision = sample_decision(repo.path(), "claude", "fable", Some("bugfix"));
+        decision.complexity = Complexity::Trivial;
+        decision.risk = RiskBand::Low;
+        let outcome = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "fix a database retry bug".to_string(),
+        };
+
+        let mut announced: Vec<String> = Vec::new();
+        let result: CtxResult<i32> = with_proxy_workflow(
+            &outcome,
+            &state,
+            repo.path(),
+            |text| announced.push(text),
+            || Err("spawn failed".into()),
+        );
+        assert!(result.is_err());
+
+        let active =
+            crate::commands::workflow::engine::load_active(&state, repo.path()).expect("readable");
+        assert!(
+            active.is_none(),
+            "a failed spawn must clear the active pointer via close_started"
+        );
+        assert!(
+            announced.is_empty(),
+            "close_started succeeded, so nothing needs announcing: {announced:?}"
+        );
+    }
+
+    /// The mirror of the test above: a successful spawn leaves the started
+    /// workflow running -- `with_proxy_workflow` must never close a launch
+    /// that actually succeeded.
+    #[test]
+    fn with_proxy_workflow_leaves_a_successful_launch_s_workflow_running() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_init_with_commit(repo.path());
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let mut decision = sample_decision(repo.path(), "claude", "fable", Some("bugfix"));
+        decision.complexity = Complexity::Trivial;
+        decision.risk = RiskBand::Low;
+        let outcome = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "fix a database retry bug".to_string(),
+        };
+
+        let mut announced: Vec<String> = Vec::new();
+        let result: CtxResult<i32> = with_proxy_workflow(
+            &outcome,
+            &state,
+            repo.path(),
+            |text| announced.push(text),
+            || Ok(0),
+        );
+        assert_eq!(result.expect("spawn succeeded"), 0);
+
+        let active = crate::commands::workflow::engine::load_active(&state, repo.path())
+            .expect("readable")
+            .expect("the started workflow is still active");
+        assert_eq!(
+            active.status,
+            crate::commands::workflow::engine::WorkflowStatus::Running
+        );
+        assert!(
+            announced.is_empty(),
+            "started + successful spawn must stay silent: {announced:?}"
+        );
+    }
+
+    /// Issue #537 review: a `Skipped` workflow start (an active workflow
+    /// already on the repo) must not vanish silently -- the operator has no
+    /// other way to learn the proxy's own decision never actually started a
+    /// workflow, unlike `runtime/native.rs`, which already announces this
+    /// case.
+    #[test]
+    fn with_proxy_workflow_announces_a_skipped_start() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_init_with_commit(repo.path());
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+
+        // Seed an existing active workflow so `start_workflow_for` skips.
+        let existing = crate::commands::workflow::engine::start_workflow(
+            &state,
+            &crate::commands::workflow::engine::StartArgs {
+                id: Some("bugfix".to_string()),
+                task: "an earlier launch's workflow".to_string(),
+                agent: None,
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+                paths: vec![std::path::PathBuf::from("README.md")],
+                changed_lines: Some(1),
+                tests_changed: false,
+                complexity: None,
+                risk: None,
+                branch: None,
+                frontend_root: None,
+                brainstorm: false,
+                no_brainstorm: false,
+                profile: None,
+                json: false,
+            },
+        )
+        .expect("seed an active workflow");
+
+        let mut decision = sample_decision(repo.path(), "claude", "fable", Some("feature"));
+        decision.complexity = Complexity::Trivial;
+        decision.risk = RiskBand::Low;
+        let outcome = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "do more work".to_string(),
+        };
+        let mut announced: Vec<String> = Vec::new();
+
+        let result: CtxResult<i32> = with_proxy_workflow(
+            &outcome,
+            &state,
+            repo.path(),
+            |text| announced.push(text),
+            || Ok(0),
+        );
+        assert_eq!(result.expect("spawn still runs"), 0);
+
+        assert_eq!(announced.len(), 1, "got {announced:?}");
+        assert!(
+            announced[0].contains("proxy: workflow not started")
+                && announced[0].contains(&existing.state.id),
+            "must name why and which workflow is already active: {}",
+            announced[0]
         );
     }
 }

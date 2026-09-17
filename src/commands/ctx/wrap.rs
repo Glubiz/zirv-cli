@@ -447,6 +447,15 @@ pub struct WrapArgs {
     /// interactive-gate call site.
     #[arg(long, default_value_t = false)]
     pub force_pace: bool,
+    /// Issue #537 (T2a): the harness proxy's own bounded `[zirv proxy]`
+    /// layer text, already rendered (`proxy::prompt_layer`), when an active
+    /// decision took over this launch. Never a CLI flag (`#[arg(skip)]`) --
+    /// there is no sane way for an operator to type this; only `chat::
+    /// wrap_args_for` ever sets it to `Some`. Folded onto this launch's own
+    /// compiled context via `compile::with_proxy_layer`, right after the
+    /// `compile::compile` call below.
+    #[arg(skip)]
+    pub proxy_layer: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1815,6 +1824,40 @@ fn launch_mode_from_interactive(interactive: bool) -> super::adapters::LaunchMod
     }
 }
 
+/// The compiled context this launch actually uses: `compile::compile`'s own
+/// gathered memory/harness-roster/canonical-context layers, with the
+/// harness proxy's own bounded `[zirv proxy]` layer folded on top when
+/// `proxy_layer` is `Some` (issue #537, T2a) -- a no-op when it is `None`,
+/// which is every launch the proxy never took over. Split out of `run_with`
+/// so this wiring is testable without a pty: `run_with` itself is a hot,
+/// hard-to-unit-test path (a real supervised session), while this seam is a
+/// pure function of its inputs.
+#[allow(clippy::too_many_arguments)]
+fn compiled_context_for_launch(
+    repo: &Path,
+    skip_injection: bool,
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    role: PromptRole,
+    state_dir: &StateDir,
+    mode: super::adapters::LaunchMode,
+    proxy_layer: Option<&str>,
+) -> super::compile::CompiledContext {
+    let compiled = super::compile::compile(
+        crate::utils::home_dir().ok().as_deref(),
+        repo,
+        skip_injection,
+        cfg,
+        adapter,
+        role,
+        state_dir,
+        super::state::now_secs(),
+        mode,
+        true,
+    );
+    super::compile::with_proxy_layer(compiled, proxy_layer)
+}
+
 pub fn run_with(
     args: &WrapArgs,
     repo: &Path,
@@ -1964,19 +2007,19 @@ pub fn run_with(
     // now owns) reads this same slug.
     let memory_slug = super::state::repo_slug(repo);
     // Issue #44: gathers memory, the derived harness roster and the
-    // canonical `.zirv/context/` layer, and attaches the policy report --
-    // see `compile::compile`'s own doc comment.
-    let compiled = super::compile::compile(
-        crate::utils::home_dir().ok().as_deref(),
+    // canonical `.zirv/context/` layer, and attaches the policy report;
+    // issue #537 (T2a) folds the harness proxy's own bounded layer on top
+    // when `chat::wrap_args_for` set one -- see `compiled_context_for_
+    // launch`'s own doc comment.
+    let compiled = compiled_context_for_launch(
         repo,
         skip_injection,
         &cfg,
         adapter.as_ref(),
         role,
         &state_dir,
-        super::state::now_secs(),
         launch_mode_from_interactive(interactive_launch),
-        true,
+        args.proxy_layer.as_deref(),
     );
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
@@ -5320,6 +5363,7 @@ mod tests {
             simple: false,
             allow_nested,
             force_pace: false,
+            proxy_layer: None,
         }
     }
 
@@ -5726,6 +5770,7 @@ mod tests {
             simple: false,
             allow_nested: false,
             force_pace: false,
+            proxy_layer: None,
         };
         let err = run_with(
             &args,
@@ -5756,6 +5801,7 @@ mod tests {
             simple: false,
             allow_nested: false,
             force_pace: false,
+            proxy_layer: None,
         };
         let err = run_with(
             &args,
@@ -5798,6 +5844,7 @@ mod tests {
             simple: false,
             allow_nested: false,
             force_pace: false,
+            proxy_layer: None,
         };
         let err = run_with(
             &args,
@@ -8528,6 +8575,57 @@ mod tests {
             composed.text.contains("[memory truncated:"),
             "the truncation must be visible, not silent: {}",
             composed.text
+        );
+    }
+
+    /// Issue #537 (T2a): `run_with`'s own compiled-context seam folds the
+    /// harness proxy's bounded layer on top when `WrapArgs::proxy_layer`
+    /// carries one, and is a no-op (today's compiled context, unchanged)
+    /// when it does not -- proven here without a pty, since this is a pure
+    /// function of its inputs.
+    #[test]
+    fn compiled_context_for_launch_carries_the_proxy_layer_only_when_set() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = repo.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+
+        let without = compiled_context_for_launch(
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            crate::commands::ctx::adapters::LaunchMode::Interactive,
+            None,
+        );
+        let without_text = without.composed.as_ref().expect("composed").text.clone();
+        assert!(
+            !without_text.contains("[zirv proxy]"),
+            "no decision carried, no proxy layer: {without_text}"
+        );
+
+        let with = compiled_context_for_launch(
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            crate::commands::ctx::adapters::LaunchMode::Interactive,
+            Some("[zirv proxy]\nexecution: bounded"),
+        );
+        let with_text = with.composed.expect("composed").text;
+        assert!(
+            with_text.contains("[zirv proxy]"),
+            "a carried decision must reach the compiled context: {with_text}"
+        );
+        assert!(
+            with_text.starts_with(&without_text),
+            "the proxy layer must only ever APPEND, never change what came before it"
         );
     }
 

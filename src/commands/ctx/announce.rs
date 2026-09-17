@@ -256,6 +256,12 @@ pub enum Event {
     /// that prompts on ordinary commands (`codex::codex_approval_advisory`).
     /// `advisory` is pre-rendered by the caller.
     CodexApprovalAdvisory { advisory: String },
+    /// Issue #537: the harness proxy's own line -- the activation refusal
+    /// reason, the `--simple`/`--resume` skip reason, or `proxy::
+    /// announce_line`'s summary of a decision that took over the launch.
+    /// `text` is pre-rendered by the caller, the same plain-passthrough
+    /// shape `CodexApprovalAdvisory` uses.
+    ProxyAdvisory { text: String },
     /// Issue #243 (review round, F3/F4): a live supervision loop's own
     /// scoring cycle flagged something in the transcript bytes it just
     /// ingested (`sessions::record_screening`, de-duplicated there so an
@@ -330,6 +336,7 @@ impl Event {
             ),
             Event::SandboxResidual { note } => format!("sandbox residual: {note}"),
             Event::CodexApprovalAdvisory { advisory } => advisory.clone(),
+            Event::ProxyAdvisory { text } => text.clone(),
             Event::Screening { summary } => format!("screening: {summary}"),
             Event::VerdictChanged { from, to, score } => {
                 format!(

@@ -76,6 +76,7 @@ pub mod priority;
 pub mod prompt;
 pub mod provider;
 pub mod provider_cmd;
+pub mod proxy;
 pub mod reservation;
 pub mod result_schema;
 pub mod resume;
@@ -604,6 +605,9 @@ pub enum CtxVerb {
     Objective(objective::ObjectiveArgs),
     /// Aggregate delegation spend from the cost ledger (issue #264).
     Spend(spend::SpendArgs),
+    /// Decide the harness proxy's routing for a request and print it --
+    /// never launches (issue #537 seam).
+    Proxy(proxy::ProxyArgs),
     /// Report how much `zirv ctx run`'s compact-output hook has actually
     /// saved: rows, bytes in/out, saved bytes/percent, an outcome breakdown
     /// and a dollar estimate (issue #422).
@@ -787,6 +791,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Compile(a) => compile::run(a, &mut out),
         CtxVerb::Objective(a) => objective::run(a, &mut out),
         CtxVerb::Spend(a) => spend::run(a, &mut out),
+        CtxVerb::Proxy(a) => proxy::run(a, &mut out),
         CtxVerb::Savings(a) => ledger::run(a, &mut out),
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
         CtxVerb::Search(a) => search::run(a, &mut out),

@@ -1156,6 +1156,11 @@ pub fn launch_spec(spec: &SessionSpec, session_id: &str, state: &StateDir) -> Ct
         (!prompt.is_empty()).then_some(prompt),
         &spec.extra_args,
     );
+    // Issue #537: the persistent runtime's own launch path has no protocol
+    // field yet for the harness proxy's bounded layer (`SessionSpec` carries
+    // a plain prompt string only) -- `None` here until that wire format is
+    // extended; see the T2a report for why that is out of this round's
+    // scope.
     let pane = super::super::chat::dash_orchestrator_pane(
         adapter.as_ref(),
         launch,
@@ -1164,6 +1169,7 @@ pub fn launch_spec(spec: &SessionSpec, session_id: &str, state: &StateDir) -> Ct
         &repo,
         session_id,
         false,
+        None,
     )?;
     let (env, _turn_env_error) = super::super::dash::build_turn_env(
         &cfg,

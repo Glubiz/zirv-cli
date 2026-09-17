@@ -136,6 +136,12 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx group status",
     "zirv ctx compile",
     "zirv ctx spend",
+    // Issue #537 seam: decides and prints a harness-proxy routing decision,
+    // never launches. Writes only its own bookkeeping (`proxy-decisions.
+    // jsonl`, a spend ledger row when a model call reported usage) --the
+    // same "internal record, not a repo/process mutation" class `zirv ctx
+    // optimize`'s own report above already sits in.
+    "zirv ctx proxy",
     "zirv ctx savings",
     "zirv ctx snapshot",
     "zirv ctx search",

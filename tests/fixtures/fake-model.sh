@@ -24,6 +24,10 @@
 #   consolidate  echoes back exactly one `key: body` line, using the
 #           survivor key named in the prompt's "(KEEP THIS KEY)" marker,
 #           for memory_optimize::apply_consolidation tests (issue #38)
+#   proxy   a well-formed `{"answers": {...}}` JSON contract, for
+#           proxy::llm tests (issue #537 seam)
+#   proxy_garbage  prose that never parses as the JSON contract, on both
+#           the first answer and the one repair attempt
 set -eu
 
 head_bin=head
@@ -71,6 +75,14 @@ case "${FAKE_MODEL_MODE:-good}" in
   consolidate)
     key=$(printf '%s\n' "$prompt" | sed -n 's/^- \(.*\) (KEEP THIS KEY):.*/\1/p' | "$head_bin" -n1)
     printf '%s: merged body from the fake consolidation model\n' "$key"
+    ;;
+  proxy)
+    printf '{"answers": {"intent": {"probabilities": {"feature": 0.86, "bugfix": 0.14}}, '
+    printf '"complexity": {"probabilities": {"0": 0.1, "1": 0.9}}, '
+    printf '"needs_clarification": {"probabilities": {"true": 0.05, "false": 0.95}}}}\n'
+    ;;
+  proxy_garbage)
+    printf 'I had a look and things seem mostly fine.\n'
     ;;
   partial)
     printf '## Task\nShip the webhook\n\n## Done\n- wrote the route\n'

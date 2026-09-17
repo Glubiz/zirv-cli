@@ -1222,6 +1222,23 @@ pub fn compile_with_harness_roster(
     }
 }
 
+/// Issue #537 (T2a): folds the harness proxy's own bounded `[zirv proxy]`
+/// layer onto an already-`compile`d context, for the launch paths that took
+/// the proxy's decision (`chat.rs`'s wrap/dash paths, `wrap.rs`'s own
+/// compile call). A thin wrapper over `prompt::with_proxy_layer` rather
+/// than a new parameter on `compile`/`compile_with_harness_roster`: both
+/// have six existing call sites, and this layer only two (soon three) of
+/// them ever produce -- adding a required knob to either would touch every
+/// other caller for a layer they never use. `layer_text: None` (no active
+/// decision) is a no-op: `compiled` is returned unchanged.
+pub fn with_proxy_layer(
+    mut compiled: CompiledContext,
+    layer_text: Option<&str>,
+) -> CompiledContext {
+    compiled.composed = prompt::with_proxy_layer(compiled.composed, layer_text);
+    compiled
+}
+
 /// Issue #225 ("Reduce steady-state token usage of running sessions"): `zirv
 /// ctx compile` is the measurement surface for what a session's own prompt
 /// prefix actually costs. It composes exactly as an orchestrator launch
@@ -1691,6 +1708,26 @@ mod tests {
             false,
         );
         assert_eq!(first, second);
+    }
+
+    /// Issue #537 (T2a): `compile::with_proxy_layer` only ever appends the
+    /// harness proxy's own bounded layer onto whatever `compile` already
+    /// produced, and is a byte-identical no-op with `None` -- the launch
+    /// paths that never took the proxy's decision must see this call as
+    /// though it were never made.
+    #[test]
+    fn with_proxy_layer_appends_only_when_a_decision_is_present() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let compiled = compile_for(repo.path(), &cfg, &adapter, PromptRole::Orchestrator);
+
+        let unchanged = with_proxy_layer(compiled.clone(), None);
+        assert_eq!(unchanged, compiled, "None must be a byte-identical no-op");
+
+        let decided = with_proxy_layer(compiled, Some("[zirv proxy]\nexecution: bounded"));
+        let text = decided.composed.expect("still composed").text;
+        assert!(text.contains("[zirv proxy]"), "got {text}");
     }
 
     /// Issue #355: the pointer at `zirv --skill`/`zirv commands --json`
