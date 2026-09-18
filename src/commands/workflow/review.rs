@@ -253,7 +253,7 @@ fn advise_dispositions(
             let AnswerValue::Choice(choice) = &answer.value else {
                 continue;
             };
-            if answer.confidence >= JEV_DISPOSITION_CONFIDENCE
+            if answer.decisive(JEV_DISPOSITION_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
                 && matches!(choice.as_str(), "fix_now" | "verify" | "defer" | "reject")
             {
                 finding.advisory_disposition = Some(choice.clone());
@@ -337,11 +337,23 @@ fn advise_duplicates(
             .iter()
             .enumerate()
             .filter_map(|(index, candidate)| {
-                let probability = answers.get(&format!("p{index}"))?.as_noul()?;
-                Some((*candidate, probability))
+                let answer = answers.get(&format!("p{index}"))?;
+                let probability = answer.as_noul()?;
+                Some((*candidate, probability, answer))
             })
             .max_by(|left, right| left.1.total_cmp(&right.1));
-        if let Some((candidate, probability)) = best {
+        // Jev determinism fix: the winning answer must also be `decisive`
+        // (margin at or above `jev::DEFAULT_MIN_MARGIN`; a noul has no
+        // separate confidence to check, so this is a margin-only gate) --
+        // a thin-margin verdict falls through, same as no answer at all. No
+        // dedicated thin-margin test exists for this site: `JEV_DEDUP_
+        // PROBABILITY` (0.9) sits far enough from 0.5 that every accepted
+        // value already has margin `>= 0.8`, well clear of the default --
+        // structurally a no-op at this floor, same reasoning `memory.rs`'s
+        // harvest gate documents for its own floor.
+        if let Some((candidate, probability, answer)) = best
+            && answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+        {
             apply_duplicate_answer(finding, candidate, probability);
         }
     }
@@ -5227,7 +5239,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
 
     #[test]
     fn jev_disposition_annotates_and_sorts_without_changing_stored_dispositions() {
-        let body = r#"{"model":"jev-latest","answers":{"f0":{"type":"choice","choice":"reject","probabilities":{"reject":0.95},"confidence":0.95},"f1":{"type":"choice","choice":"fix_now","probabilities":{"fix_now":0.95},"confidence":0.95},"f2":{"type":"choice","choice":"verify","probabilities":{"verify":0.95},"confidence":0.95},"f3":{"type":"choice","choice":"defer","probabilities":{"defer":0.95},"confidence":0.95}},"usage":{"input_tokens":20,"output_tokens":4}}"#;
+        let body = r#"{"model":"jev-latest","answers":{"f0":{"type":"choice","choice":"reject","probabilities":{"reject":0.95,"other":0.05},"confidence":0.95},"f1":{"type":"choice","choice":"fix_now","probabilities":{"fix_now":0.95,"other":0.05},"confidence":0.95},"f2":{"type":"choice","choice":"verify","probabilities":{"verify":0.95,"other":0.05},"confidence":0.95},"f3":{"type":"choice","choice":"defer","probabilities":{"defer":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":20,"output_tokens":4}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -5268,6 +5280,37 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             findings
                 .iter()
                 .all(|finding| finding.advisory_confidence == Some(0.95))
+        );
+    }
+
+    /// Jev determinism fix: a disposition answer with the right label and a
+    /// confidence (0.95) above `JEV_DISPOSITION_CONFIDENCE`, but a thin
+    /// margin (0.51/0.49) between its own top and runner-up probability,
+    /// must never annotate the finding -- it falls through exactly like a
+    /// low-confidence answer.
+    #[test]
+    fn jev_disposition_leaves_a_thin_margin_answer_unannotated() {
+        let body = r#"{"model":"jev-latest","answers":{"f0":{"type":"choice","choice":"reject","probabilities":{"reject":0.51,"fix_now":0.49},"confidence":0.95}},"usage":{"input_tokens":5,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_review_config(url, "JEV_TEST_REVIEW_DISPOSITION_THIN_MARGIN");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_REVIEW_DISPOSITION_THIN_MARGIN",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut findings = vec![finding_at("src/reject.rs", 1, "reject")];
+
+        advise_dispositions(&cfg, &state_dir, "review the repository", &mut findings);
+        request.recv().unwrap();
+
+        assert_eq!(
+            findings[0].advisory_disposition, None,
+            "a thin-margin answer must never annotate the finding"
         );
     }
 

@@ -484,10 +484,21 @@ fn rerank_memory_candidates<'a>(
     let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = Vec::new();
     let mut unanswered: Vec<retrieval::Ranked<'a>> = Vec::new();
     for (ranked, id) in sent.into_iter().zip(ids.iter()) {
-        match answers.get(id).and_then(|answer| answer.as_noul()) {
-            Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => scored.push((noul, ranked)),
-            Some(_) => {} // an explicit low-relevance verdict prunes the candidate.
-            None => unanswered.push(ranked), // missing/unparseable: kept, original position.
+        // Jev determinism fix: a noul answer that is not `decisive` (margin
+        // below `jev::DEFAULT_MIN_MARGIN`; a noul has no separate confidence
+        // to check, so this is a margin-only gate) is treated the same as a
+        // missing one -- kept, original position -- rather than trusted to
+        // score or prune the candidate.
+        match answers.get(id) {
+            Some(answer) if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) => {
+                unanswered.push(ranked);
+            }
+            Some(answer) => match answer.as_noul() {
+                Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => scored.push((noul, ranked)),
+                Some(_) => {} // a decisive low-relevance verdict prunes the candidate.
+                None => unanswered.push(ranked), // unparseable: kept, original position.
+            },
+            None => unanswered.push(ranked), // missing: kept, original position.
         }
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1885,7 +1896,11 @@ mod tests {
     /// Issue #537 (A3): on a canned 200 response, candidates below
     /// `MEMORY_RELEVANCE_FLOOR` are dropped and survivors are reordered by
     /// `noul` descending -- never a candidate `retrieval::select` did not
-    /// already choose.
+    /// already choose. Jev determinism fix: charlie's own `0.5` noul has
+    /// margin `0.0` (maximally uncertain), so it is not decisive and falls
+    /// to the "kept, original position" bucket rather than being scored --
+    /// it still lands after alpha here only because it was already last
+    /// among the sent candidates once bravo was pruned.
     #[test]
     fn rerank_memory_candidates_prunes_and_reorders_on_a_200_response() {
         let candidates = [
@@ -2072,7 +2087,12 @@ mod tests {
 
     /// Review finding (#537 A3): a candidate whose id is missing from the
     /// answers must keep its original relative position after the ranked
-    /// ones, never dropped by the filter.
+    /// ones, never dropped by the filter. Jev determinism fix: charlie's own
+    /// `0.5` noul now ALSO lands in that same "kept, original position"
+    /// bucket -- exact `0.5` is the maximally uncertain reading (margin
+    /// `0.0`), so it is no longer decisive enough to outrank bravo's
+    /// complete non-answer; the two are ordered exactly as `selected` gave
+    /// them (bravo before charlie).
     #[test]
     fn rerank_memory_candidates_keeps_a_candidate_missing_from_the_answers() {
         let candidates = [
@@ -2107,15 +2127,63 @@ mod tests {
         }
         handle.join().expect("server thread must not panic");
 
-        // alpha (0.9) ranks first, then charlie (0.5), then bravo (no
-        // answer) kept at the end rather than dropped.
+        // alpha (0.9, decisive) ranks first; bravo (no answer) and charlie
+        // (0.5, margin 0.0 -- not decisive) both fall to the deterministic
+        // "kept, original position" bucket, in their original relative
+        // order.
         assert_eq!(
             keys(&result),
             vec![
                 "alpha".to_string(),
-                "charlie".to_string(),
-                "bravo".to_string()
+                "bravo".to_string(),
+                "charlie".to_string()
             ]
+        );
+    }
+
+    /// Jev determinism fix: an answer with the "right" (above-floor) raw
+    /// value but a thin margin (0.55, margin 0.1 -- below `jev::
+    /// DEFAULT_MIN_MARGIN`) must fall to the deterministic path (kept,
+    /// original position) exactly like a missing answer, never trusted to
+    /// outrank one.
+    #[test]
+    fn rerank_memory_candidates_treats_a_thin_margin_noul_as_not_decisive() {
+        let candidates = [
+            retrieval_candidate("bravo", "bravo body"),
+            retrieval_candidate("alpha", "alpha body"),
+        ];
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+
+        // "0" (bravo) has no answer at all; "1" (alpha) has an above-floor
+        // but thin-margin noul (0.55, margin 0.1).
+        let body = r#"{"model": "jev-latest", "answers": {
+            "1": {"type": "noul", "noul": 0.55}
+        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "COMPILE_TEST_MEMORY_THIN_MARGIN";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            keys(&result),
+            vec!["bravo".to_string(), "alpha".to_string()],
+            "a thin-margin answer must never outrank a missing one: {:?}",
+            keys(&result)
         );
     }
 

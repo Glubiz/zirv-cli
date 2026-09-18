@@ -577,17 +577,19 @@ const META_RUNGS: &[Rung] = &[
 /// usual cache-rate shortcut: Jev's `/systemone` endpoint is a single bounded
 /// Q&A call with no conversational cache and no billed output tokens, so
 /// there is no cache rate to approximate at all.
+const TYPESAFE_JEV_PRICE: ModelPrice = ModelPrice {
+    input_micros: 42_000,
+    cache_write_micros: 0,
+    cache_read_micros: 0,
+    output_micros: 0,
+};
+
 const TYPESAFE_RUNGS: &[Rung] = &[Rung {
     alias: "jev",
     id: "jev-latest",
     strength: 1,
     context_window: None,
-    price: Some(ModelPrice {
-        input_micros: 42_000,
-        cache_write_micros: 0,
-        cache_read_micros: 0,
-        output_micros: 0,
-    }),
+    price: Some(TYPESAFE_JEV_PRICE),
     tier: Some(Tier::Cheap),
 }];
 
@@ -723,7 +725,11 @@ const VENDORS: &[Vendor] = &[
         slug: "typesafe",
         rungs: TYPESAFE_RUNGS,
         default_context_window: None,
-        extra_prices: &[],
+        // Jev determinism fix: `[proxy.typesafe] model` now defaults to this
+        // pinned release rather than the `jev-latest` alias the rung above
+        // still carries as its own `id` -- priced identically here so a
+        // Delegation row recorded under either string still resolves.
+        extra_prices: &[("jev-1.13.0", TYPESAFE_JEV_PRICE)],
         as_of: Some(CATALOGUE_AS_OF),
     },
     // Issue #395: local-runtime "vendors" an operator's own endpoint override
@@ -945,6 +951,24 @@ mod tests {
         };
         assert_eq!(
             super::super::price::price("jev-latest", &usage, &table),
+            Some(42_000)
+        );
+    }
+
+    /// Jev determinism fix: the harness proxy's pinned default model
+    /// (`jev-1.13.0`, `config::ProxyTypesafeConfig::default`) must price
+    /// identically to `jev-latest` -- a `jev::record` spend row for any
+    /// other `[jev]`-gated site records `cfg.proxy.typesafe.model` verbatim,
+    /// so the pin must not silently turn those rows unpriced.
+    #[test]
+    fn typesafe_vendor_also_prices_the_pinned_default_model() {
+        let table = super::super::price::built_in_table();
+        let usage = crate::commands::ctx::event::TranscriptUsage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::super::price::price("jev-1.13.0", &usage, &table),
             Some(42_000)
         );
     }
@@ -1183,6 +1207,9 @@ mod tests {
             "gpt-5.4-mini",
             "gpt-5-codex",
             "gpt-6-astra",
+            "jev",
+            "jev-latest",
+            "jev-1.13.0",
         ] {
             assert!(table.contains_key(key), "missing priced key {key}");
         }

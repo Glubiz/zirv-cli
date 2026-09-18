@@ -164,6 +164,17 @@ pub struct ProxyDecision {
     pub seat_tier: SeatTier,
     pub worker_tier: Tier,
     pub needs_clarification: f32,
+    /// Whether the `needs_clarification` answer above was itself
+    /// [`Answer::decisive`] (margin-gated -- see that method's own doc
+    /// comment) at merge time. `needs_clarification` always keeps the raw
+    /// value regardless; a consumer that would act on it (`chat.rs::
+    /// maybe_clarify`'s interactive round, `prompt_layer`'s `clarify:` line)
+    /// checks THIS flag too, so a confident-looking but unstable "ambiguous"
+    /// reading never interrupts a launch on its own. `#[serde(default)]` so
+    /// a decision persisted before this field existed still deserializes, as
+    /// `false` (never fires a clarify round retroactively).
+    #[serde(default)]
+    pub needs_clarification_decisive: bool,
     /// Additive domain tags a confident Jev/helper `Noul` answer added
     /// (issue #537 A2) -- `security`, `data`, `docs_only`, `devops`,
     /// `architecture`, `frontend`. Never removed once added; `#[serde(
@@ -192,23 +203,17 @@ pub struct IntakeWorkflow {
     pub description: String,
 }
 
+/// Issue #537 determinism fix (2026-09-18 replay): this used to also carry
+/// `uncommitted_or_branch_changes`, `active_workflow` and `primary_
+/// extensions` -- live-measured repository facts that differ between runs
+/// and worktrees. Stripping every one of them changed no answer's accuracy
+/// in that replay, so the request body (state + `questions()`) now depends
+/// only on the request text, the workflow registry ([`IntakeState::
+/// workflows`]) and the policy -- nothing that can silently drift the
+/// intake between two calls for the same request.
 #[derive(Debug, Clone, Serialize)]
 pub struct IntakeRepository {
     pub name: String,
-    /// The repository's own measured diff (uncommitted working-tree changes,
-    /// or committed changes on this branch since its base) -- informational
-    /// context for a model decider only, named so it is never mistaken for
-    /// "how big is the request": the baseline classification never measures
-    /// this (see `classify_request`'s own doc comment for why).
-    pub uncommitted_or_branch_changes: BranchChanges,
-    pub active_workflow: Option<String>,
-    pub primary_extensions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BranchChanges {
-    pub files: usize,
-    pub lines: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -367,19 +372,6 @@ pub fn classify_request(request: &str) -> Classification {
     classification
 }
 
-/// The repository's own measured change surface (paths + total lines), for
-/// [`IntakeState`]'s informational `uncommitted_or_branch_changes` field
-/// ONLY -- never fed into [`classify_request`]'s baseline classification
-/// (see that function's own doc comment for why). Best-effort: empty/`0`
-/// outside a repository, on an unborn/no-commit repo, or on any other git
-/// failure, the same fail-soft posture every other measurement in this
-/// module holds to.
-fn measured_branch_changes(repo: &Path) -> (Vec<PathBuf>, usize) {
-    classify::git_change_input(repo, String::new())
-        .map(|input| (input.paths, input.changed_lines))
-        .unwrap_or_default()
-}
-
 /// Issue #537 field evidence problem (a): the orchestrator seat's model is
 /// resolved from `seat_tier` alone, never asked or chosen as its own
 /// harness/model question -- `harness` is always the baseline default
@@ -467,6 +459,7 @@ pub fn baseline(
         seat_tier: SeatTier::Cheap,
         worker_tier: Tier::Cheap,
         needs_clarification: 0.0,
+        needs_clarification_decisive: false,
         domains: Vec::new(),
         decider: Decider::Deterministic,
         confidence: BTreeMap::new(),
@@ -598,68 +591,29 @@ fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
         model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
 }
 
-/// Top file extensions by count among `paths` -- shared by the (now always
-/// empty, per `classify_request`'s own text-only baseline) classification
-/// path list and the real measured branch diff `build_intake` reads for
-/// `IntakeState`'s informational `uncommitted_or_branch_changes` context.
-fn primary_extensions<P: AsRef<Path>>(paths: &[P]) -> Vec<String> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for path in paths {
-        if let Some(ext) = path.as_ref().extension().and_then(|value| value.to_str()) {
-            *counts.entry(ext.to_ascii_lowercase()).or_default() += 1;
-        }
-    }
-    let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    pairs.into_iter().map(|(ext, _)| ext).take(8).collect()
-}
-
-fn active_workflow_id(
-    state: &crate::commands::ctx::state::StateDir,
-    repo: &Path,
-) -> Option<String> {
-    let workflow = engine::load_active(state, repo).ok().flatten()?;
-    Some(
-        workflow
-            .definition
-            .map(|definition| definition.id)
-            .unwrap_or_else(|| workflow.kind.as_str().to_string()),
-    )
-}
-
 /// Builds the Jev `state`/`questions()` input: the request (truncated to
-/// `cfg.proxy.request_max_bytes`), the repository's own measured branch/
-/// uncommitted change counts and extensions (labeled
-/// `uncommitted_or_branch_changes` -- informational context about the
-/// repository, never a stand-in for the request's own size; see
-/// `classify_request`'s doc comment for why the baseline never measures
-/// this), the registered workflow ids/descriptions, and whether the native
-/// runtime is available. Issue #537 (A2): no longer carries the harness/
-/// model catalogue -- see [`IntakeState`]'s own doc comment for why.
+/// `cfg.proxy.request_max_bytes`), the repository's own name, the registered
+/// workflow ids/descriptions, and whether the native runtime is available.
+/// Issue #537 determinism fix (2026-09-18 replay): no longer measures the
+/// repository at all -- see [`IntakeRepository`]'s own doc comment for why;
+/// `state_dir` is accepted only for call-site parity with every other
+/// `build_*`-shaped seam in this crate and is not read. Issue #537 (A2):
+/// also no longer carries the harness/model catalogue -- see [`IntakeState`]'s
+/// own doc comment for why.
 pub fn build_intake(
     cfg: &CtxConfig,
     repo: &Path,
-    state_dir: &Path,
+    _state_dir: &Path,
     request: &str,
     roster: &Roster,
 ) -> IntakeState {
-    let state = crate::commands::ctx::state::StateDir::from_path(state_dir.to_path_buf());
     let repo_name = repo
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo.display().to_string());
-    let (branch_paths, branch_lines) = measured_branch_changes(repo);
     IntakeState {
         request: truncate_bytes(request, cfg.proxy.request_max_bytes.max(1)),
-        repository: IntakeRepository {
-            name: repo_name,
-            uncommitted_or_branch_changes: BranchChanges {
-                files: branch_paths.len(),
-                lines: branch_lines,
-            },
-            active_workflow: active_workflow_id(&state, repo),
-            primary_extensions: primary_extensions(&branch_paths),
-        },
+        repository: IntakeRepository { name: repo_name },
         workflows: roster.workflow_summaries(),
         policy: IntakePolicy {
             native_available: crate::commands::ctx::runtime::native_available(),
@@ -986,13 +940,16 @@ fn risk_from_index(index: f64) -> RiskBand {
 }
 
 /// Merges `answers` onto `baseline`'s own fields, applying the per-field
-/// rules the spec's "Decision fields" table sets: a low-confidence answer is
-/// discarded (with a reason recorded); complexity/risk only ever rise
-/// (`max(model, baseline)`); every other ASKED field (`intent`, `workflow`)
-/// is replaced outright when confident. Existence checks against the live
-/// roster (a workflow id, a harness/model pair) are deferred to [`validate`],
-/// which runs right after this and has the `Roster` this function does not
-/// need.
+/// rules the spec's "Decision fields" table sets: an answer that is not
+/// [`Answer::decisive`] (either its confidence is below `min_confidence`, or
+/// its margin is below `cfg.proxy.min_margin` -- see that method's own doc
+/// comment for why margin, not confidence alone, is what catches the
+/// 2026-09-18 replay's instability) is discarded, with a reason recorded;
+/// complexity/risk only ever rise (`max(model, baseline)`); every other
+/// ASKED field (`intent`, `workflow`, a domain tag) is replaced/added outright
+/// when decisive. Existence checks against the live roster (a workflow id, a
+/// harness/model pair) are deferred to [`validate`], which runs right after
+/// this and has the `Roster` this function does not need.
 ///
 /// Issue #537 design revision, from a live 24-case Jev battery: `execution`,
 /// `seat_tier` and `worker_tier` are no longer questions at all (see
@@ -1006,8 +963,9 @@ fn risk_from_index(index: f64) -> RiskBand {
 /// like "credential"/"auth"/"secret") instead of silently losing them the
 /// moment a model answers.
 ///
-/// `cfg` is needed only for [`finalize_derived_fields`]'s own resolution of
-/// the orchestrator's model via `handover::resolve_model`.
+/// `cfg` is needed for [`finalize_derived_fields`]'s own resolution of the
+/// orchestrator's model via `handover::resolve_model`, and for
+/// `cfg.proxy.min_margin`.
 pub fn merge(
     cfg: &CtxConfig,
     baseline: &ProxyDecision,
@@ -1015,22 +973,37 @@ pub fn merge(
     answers: &Answers,
     min_confidence: f32,
 ) -> ProxyDecision {
+    let min_margin = cfg.proxy.min_margin;
     let mut decision = baseline.clone();
     decision.confidence = answers
         .iter()
         .map(|(id, answer)| (id.clone(), answer.confidence))
         .collect();
 
-    let mut record_low = |id: &str, answer: &Answer| {
-        decision.reasons.push(format!(
-            "{id}: confidence {:.2} < {:.2}, kept baseline",
-            answer.confidence, min_confidence
-        ));
+    // Mirrors the pre-existing low-confidence reason for that failure mode
+    // exactly (`"{id}: confidence {:.2} < {:.2}, kept baseline"`), and adds a
+    // matching one for a confident-but-thin-margin answer -- the case
+    // `Answer::decisive`'s own doc comment cites, an answer whose label the
+    // model would likely flip on an identical re-ask.
+    let mut record_not_decisive = |id: &str, answer: &Answer| {
+        let reason = if answer.confidence < min_confidence {
+            format!(
+                "{id}: confidence {:.2} < {:.2}, kept baseline",
+                answer.confidence, min_confidence
+            )
+        } else {
+            format!(
+                "{id}: margin {:.2} < {:.2}, kept baseline",
+                answer.margin(),
+                min_margin
+            )
+        };
+        decision.reasons.push(reason);
     };
 
     if let Some(answer) = answers.get("intent") {
-        if answer.confidence < min_confidence {
-            record_low("intent", answer);
+        if !answer.decisive(min_confidence, min_margin) {
+            record_not_decisive("intent", answer);
         } else if let AnswerValue::Choice(value) = &answer.value
             && let Some(intent) = parse_intent(value)
         {
@@ -1039,24 +1012,24 @@ pub fn merge(
     }
 
     if let Some(answer) = answers.get("complexity") {
-        if answer.confidence < min_confidence {
-            record_low("complexity", answer);
+        if !answer.decisive(min_confidence, min_margin) {
+            record_not_decisive("complexity", answer);
         } else if let AnswerValue::Score(value) = answer.value {
             decision.complexity = decision.complexity.max(complexity_from_index(value));
         }
     }
 
     if let Some(answer) = answers.get("risk") {
-        if answer.confidence < min_confidence {
-            record_low("risk", answer);
+        if !answer.decisive(min_confidence, min_margin) {
+            record_not_decisive("risk", answer);
         } else if let AnswerValue::Score(value) = answer.value {
             decision.risk = decision.risk.max(risk_from_index(value));
         }
     }
 
     if let Some(answer) = answers.get("workflow") {
-        if answer.confidence < min_confidence {
-            record_low("workflow", answer);
+        if !answer.decisive(min_confidence, min_margin) {
+            record_not_decisive("workflow", answer);
         } else if let AnswerValue::Choice(value) = &answer.value {
             decision.workflow = if value == "none" {
                 None
@@ -1066,31 +1039,39 @@ pub fn merge(
         }
     }
 
-    // Advisory only: never gated on confidence, since the value itself IS
-    // the model's own confidence in "this is ambiguous" (see the noul
-    // conversions in `typesafe.rs`/`llm.rs`).
+    // Advisory only: the raw value is always kept (never gated), since the
+    // value itself IS the model's own confidence in "this is ambiguous" (see
+    // the noul conversions in `typesafe.rs`/`llm.rs`). Whether a CONSUMER
+    // (`chat.rs::maybe_clarify`, `prompt_layer`) actually acts on it -- fires
+    // the interactive clarify round, or adds the `clarify:` context line --
+    // is gated separately, on `needs_clarification_decisive`: `Answer::
+    // decisive` ignores `min_confidence` for a `Noul` (see its own doc
+    // comment), so this is a margin-only check.
     if let Some(answer) = answers.get("needs_clarification")
         && let AnswerValue::Noul(value) = answer.value
     {
         decision.needs_clarification = value as f32;
+        decision.needs_clarification_decisive = answer.decisive(min_confidence, min_margin);
     }
 
-    // Issue #537 (A2): additive domain tags -- a confident `true` noul
-    // answer adds that domain; nothing ever removes one. Never gated on
-    // `min_confidence`, same reasoning as `needs_clarification` right above
-    // (the noul value itself already is the model's own confidence, and
-    // there is no baseline domain a "kept baseline" reason could refer to
-    // here). `security`'s own tag sets the same validation flags the
-    // keyword-based `ExecutionProfile::derive` detection sets below, so
-    // `apply_security_risk_floor` floors risk/execution the same way
-    // regardless of which detector caught it.
+    // Issue #537 (A2): additive domain tags -- a decisive `true` noul answer
+    // adds that domain; nothing ever removes one. A confident-but-thin-margin
+    // `true` answer now falls back to "not added" (the deterministic
+    // baseline never has a domain tag of its own), recorded the same way a
+    // discarded intent/complexity/risk/workflow answer is. `security`'s own
+    // tag sets the same validation flags the keyword-based `ExecutionProfile
+    // ::derive` detection sets below, so `apply_security_risk_floor` floors
+    // risk/execution the same way regardless of which detector caught it.
     for id in DOMAIN_QUESTION_IDS {
         if let Some(answer) = answers.get(id)
             && let AnswerValue::Noul(value) = answer.value
             && value >= 0.5
-            && !decision.domains.iter().any(|domain| domain == id)
         {
-            decision.domains.push(id.to_string());
+            if !answer.decisive(min_confidence, min_margin) {
+                record_not_decisive(id, answer);
+            } else if !decision.domains.iter().any(|domain| domain == id) {
+                decision.domains.push(id.to_string());
+            }
         }
     }
     if decision.domains.iter().any(|domain| domain == "security") {
@@ -1221,6 +1202,7 @@ mod tests {
             seat_tier: SeatTier::Standard,
             worker_tier: Tier::Cheap,
             needs_clarification: 0.0,
+            needs_clarification_decisive: false,
             domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),
@@ -1248,16 +1230,32 @@ mod tests {
         }
     }
 
+    /// A `Choice`/`Score` answer's `probabilities` gets a synthetic
+    /// two-entry distribution whose margin tracks `confidence` (`top -
+    /// runner_up = 2 * top.max(0.5) - 1`, always non-negative): high
+    /// confidence gives a wide margin, so every EXISTING test below that
+    /// means "a confident answer" stays decisive under `Answer::decisive`'s
+    /// margin gate without hand-building a full distribution of its own. A
+    /// test that means to exercise a THIN margin specifically constructs its
+    /// own `Answer` instead (see the merge tests below this helper). `Noul`
+    /// needs no probabilities at all -- its margin comes from the raw value.
     fn answers(pairs: &[(&str, AnswerValue, f32)]) -> Answers {
         pairs
             .iter()
             .map(|(id, value, confidence)| {
+                let probabilities = match value {
+                    AnswerValue::Choice(_) | AnswerValue::Score(_) => {
+                        let top = confidence.max(0.5);
+                        BTreeMap::from([("top".to_string(), top), ("rest".to_string(), 1.0 - top)])
+                    }
+                    AnswerValue::Noul(_) => BTreeMap::new(),
+                };
                 (
                     (*id).to_string(),
                     Answer {
                         value: value.clone(),
                         confidence: *confidence,
-                        probabilities: BTreeMap::new(),
+                        probabilities,
                     },
                 )
             })
@@ -1304,6 +1302,42 @@ mod tests {
         );
     }
 
+    /// Jev determinism fix: a `risk` answer with a confidence at or above the
+    /// floor, but a thin margin (0.51/0.49) between its own top and
+    /// runner-up probability, must ALSO keep the baseline -- confidence
+    /// alone is not enough, and the recorded reason names the margin, not
+    /// the confidence, since confidence itself cleared its own floor.
+    #[test]
+    fn a_thin_margin_answer_keeps_the_baseline_and_records_a_margin_reason() {
+        let cfg = CtxConfig::default();
+        let baseline = sample_decision();
+        let mut ans = Answers::new();
+        ans.insert(
+            "risk".to_string(),
+            Answer {
+                value: AnswerValue::Score(3.0),
+                confidence: 0.9,
+                probabilities: BTreeMap::from([
+                    ("2".to_string(), 0.51_f32),
+                    ("3".to_string(), 0.49_f32),
+                ]),
+            },
+        );
+        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        assert_eq!(
+            merged.risk, baseline.risk,
+            "a thin margin must keep the baseline despite high confidence"
+        );
+        assert!(
+            merged
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("risk: margin 0.02 < ")),
+            "{:?}",
+            merged.reasons
+        );
+    }
+
     /// Issue #537 (A2): a confident `true` noul answer for a domain question
     /// adds that tag to `domains`; an unconfident/`false` one does not, and
     /// tags accumulate rather than replace each other.
@@ -1342,6 +1376,60 @@ mod tests {
         assert!(merged.validation.independent_review);
         assert_eq!(merged.risk, RiskBand::High);
         assert_eq!(merged.execution, ExecutionMode::Bounded);
+    }
+
+    /// Jev determinism fix: a `true`-labeled `security` domain answer (0.55,
+    /// margin 0.1 -- below `jev::DEFAULT_MIN_MARGIN`) must not add the tag or
+    /// floor risk/execution -- a noul has no separate confidence to check
+    /// (`Answer::decisive` ignores `min_confidence` for it), so margin alone
+    /// governs, and a barely-over-half reading is exactly the kind of
+    /// unstable answer the floor exists to catch.
+    #[test]
+    fn a_thin_margin_security_domain_answer_is_not_added_and_never_floors_anything() {
+        let cfg = CtxConfig::default();
+        let mut baseline = sample_decision();
+        baseline.complexity = Complexity::Trivial;
+        baseline.risk = RiskBand::Low;
+        baseline.execution = ExecutionMode::Direct;
+        let ans = answers(&[("security", AnswerValue::Noul(0.55), 0.95)]);
+        let merged = merge(&cfg, &baseline, "rotate the shared token", &ans, 0.5);
+        assert!(merged.domains.is_empty(), "{:?}", merged.domains);
+        assert!(!merged.validation.security_review);
+        assert!(!merged.validation.independent_review);
+        assert_eq!(merged.risk, RiskBand::Low);
+        assert_eq!(merged.execution, ExecutionMode::Direct);
+        assert!(
+            merged
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("security: margin 0.10 < ")),
+            "{:?}",
+            merged.reasons
+        );
+    }
+
+    /// Issue #537 (A2)/Jev determinism fix: `needs_clarification` always
+    /// keeps the model's raw value regardless of margin, but `needs_
+    /// clarification_decisive` reflects `Answer::decisive` (margin-only for
+    /// a noul) -- a wide-margin answer (0.9) is decisive, a thin-margin one
+    /// (0.52, margin 0.04) is not, even though both keep the same raw value
+    /// semantics a consumer would otherwise read as "confidently ambiguous".
+    #[test]
+    fn needs_clarification_keeps_the_raw_value_but_decisive_follows_margin_only() {
+        let cfg = CtxConfig::default();
+        let baseline = sample_decision();
+        let wide = answers(&[("needs_clarification", AnswerValue::Noul(0.9), 0.9)]);
+        let merged = merge(&cfg, &baseline, "a request", &wide, 0.5);
+        assert_eq!(merged.needs_clarification, 0.9);
+        assert!(merged.needs_clarification_decisive);
+
+        let thin = answers(&[("needs_clarification", AnswerValue::Noul(0.52), 0.52)]);
+        let merged = merge(&cfg, &baseline, "a request", &thin, 0.5);
+        assert_eq!(
+            merged.needs_clarification, 0.52,
+            "the raw value is kept regardless of decisiveness"
+        );
+        assert!(!merged.needs_clarification_decisive);
     }
 
     /// Issue #537 design revision (a live 24-case Jev battery showed its own
@@ -1881,9 +1969,6 @@ mod tests {
             request: "x".to_string(),
             repository: IntakeRepository {
                 name: "repo".to_string(),
-                uncommitted_or_branch_changes: BranchChanges { files: 0, lines: 0 },
-                active_workflow: None,
-                primary_extensions: Vec::new(),
             },
             workflows: (0..300)
                 .map(|n| IntakeWorkflow {

@@ -1213,7 +1213,8 @@ fn jev_judge_continue(
         return false;
     };
     answers.get("verdict").is_some_and(|answer| {
-        answer.as_choice() == Some("continue") && answer.confidence >= JUDGE_CONTINUE_FLOOR
+        answer.as_choice() == Some("continue")
+            && answer.decisive(JUDGE_CONTINUE_FLOOR, jev::DEFAULT_MIN_MARGIN)
     })
 }
 
@@ -3943,7 +3944,7 @@ mod tests {
         fn jev_judge_continue_skips_the_helper_on_a_confident_continue_answer() {
             let body = r#"{"model": "jev-latest", "answers": {
                 "verdict": {"type": "choice", "choice": "continue",
-                            "probabilities": {"continue": 0.9}, "confidence": 0.9}
+                            "probabilities": {"continue": 0.9, "other": 0.1}, "confidence": 0.9}
             }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
             let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
             let credential_env = "RUN_LOOP_TEST_JUDGE_CONTINUE";
@@ -3969,6 +3970,46 @@ mod tests {
             }
             handle.join().expect("server thread must not panic");
             assert!(skip, "a confident continue must skip the helper call");
+        }
+
+        /// Jev determinism fix: a `continue` answer with the right label and
+        /// a confidence above `JUDGE_CONTINUE_FLOOR`, but a thin margin
+        /// (0.51/0.49) between its own top and runner-up probability, must
+        /// fall through to the helper call exactly like a low-confidence
+        /// answer -- the 2026-09-18 replay's instability signature.
+        #[test]
+        fn jev_judge_continue_falls_through_on_a_thin_margin_answer() {
+            let body = r#"{"model": "jev-latest", "answers": {
+                "verdict": {"type": "choice", "choice": "continue",
+                            "probabilities": {"continue": 0.51, "done": 0.49}, "confidence": 0.9}
+            }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+            let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+            let credential_env = "RUN_LOOP_TEST_JUDGE_THIN_MARGIN";
+            // SAFETY (test-only): a unique env var name this test owns.
+            unsafe {
+                std::env::set_var(credential_env, "secret");
+            }
+            let cfg = jev_test_cfg(url, credential_env);
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+            let skip = jev_judge_continue(
+                &cfg,
+                &state,
+                &sample_objective(),
+                "assistant: done",
+                3,
+                true,
+            );
+
+            unsafe {
+                std::env::remove_var(credential_env);
+            }
+            handle.join().expect("server thread must not panic");
+            assert!(
+                !skip,
+                "a thin-margin continue must fall through despite high confidence"
+            );
         }
 
         #[test]

@@ -2242,7 +2242,7 @@ fn dispatch_tier_advise(
         &questions,
     )?;
     let answer = answers.get("tier")?;
-    if answer.confidence < DISPATCH_TIER_FLOOR {
+    if !answer.decisive(DISPATCH_TIER_FLOOR, super::jev::DEFAULT_MIN_MARGIN) {
         return None;
     }
     let (tier, tier_label) = match answer.as_score()? as i64 {
@@ -6819,6 +6819,37 @@ mod tests {
         }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
         let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
         let credential_env = "HOOK_TEST_JEV_DISPATCH_LOW_CONF";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(output.is_none());
+    }
+
+    /// Jev determinism fix: the identical `standard` tier at a confidence
+    /// (0.8) above `DISPATCH_TIER_FLOOR`, but a thin margin (0.42/0.40)
+    /// between its own top and runner-up level probability, must fall
+    /// through so the caller denies exactly as today.
+    #[test]
+    fn dispatch_tier_advise_falls_through_on_a_thin_margin_answer() {
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "score", "score": 1.0,
+                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
+                     "probabilities": {"0": 0.18, "1": 0.42, "2": 0.40}, "confidence": 0.8}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_THIN_MARGIN";
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
             std::env::set_var(credential_env, "secret");

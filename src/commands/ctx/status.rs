@@ -4064,6 +4064,7 @@ mod tests {
             },
             worker_tier: crate::commands::ctx::catalogue::Tier::Standard,
             needs_clarification: 0.0,
+            needs_clarification_decisive: false,
             domains: Vec::new(),
             decider: crate::commands::ctx::proxy::decision::Decider::Typesafe,
             confidence: std::collections::BTreeMap::from([("seat".to_string(), 0.81_f32)]),

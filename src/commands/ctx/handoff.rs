@@ -1460,7 +1460,8 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
         return false;
     };
     answers.get("quality").is_some_and(|answer| {
-        answer.as_choice() == Some("thin") && answer.confidence >= HANDOFF_THIN_FLOOR
+        answer.as_choice() == Some("thin")
+            && answer.decisive(HANDOFF_THIN_FLOOR, jev::DEFAULT_MIN_MARGIN)
     })
 }
 
@@ -2090,7 +2091,7 @@ mod tests {
         let adapter = fake_model_adapter();
         let body = r#"{"model": "jev-latest", "answers": {
             "quality": {"type": "choice", "choice": "thin",
-                        "probabilities": {"thin": 0.95}, "confidence": 0.95}
+                        "probabilities": {"thin": 0.95, "other": 0.05}, "confidence": 0.95}
         }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
         let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
         let credential_env = "HANDOFF_TEST_JEV_THIN_095";
@@ -2122,6 +2123,50 @@ mod tests {
         assert_eq!(
             handoff.task, "ship the webhook",
             "demoted to the mechanical fallback: from the last user prompt"
+        );
+    }
+
+    /// Jev determinism fix: a `thin` verdict with a confidence (0.95) above
+    /// `HANDOFF_THIN_FLOOR`, but a thin margin (0.51/0.49) between its own
+    /// top and runner-up probability, must NOT demote a genuinely
+    /// `"distilled"` handoff -- it falls through exactly like a low-
+    /// confidence answer.
+    #[test]
+    fn distill_or_structural_with_jev_keeps_a_thin_margin_thin_verdict() {
+        let adapter = fake_model_adapter();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "quality": {"type": "choice", "choice": "thin",
+                        "probabilities": {"thin": 0.51, "adequate": 0.49}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_THIN_MARGIN";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let (_handoff, source) = distill_or_structural_with_jev(
+            &cfg,
+            &state,
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+            false,
+            None,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            source, "distilled",
+            "a thin-margin verdict must not demote a genuinely distilled handoff"
         );
     }
 

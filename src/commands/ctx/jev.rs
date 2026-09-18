@@ -3,7 +3,11 @@
 //! request/response, no retries, no streaming), used today by the harness
 //! proxy (`proxy::typesafe`, now a thin wrapper over [`ask`]) and available
 //! to any future advisory site gated by its own `[jev]` key (see
-//! `config::JevConfig`).
+//! `config::JevConfig`). [`ask`] also caches: an identical request body
+//! (hashed with SHA-256) gives an identical answer by construction, up to
+//! `[jev] cache_ttl_secs` old, so the same question asked twice for the same
+//! state never depends on Jev's own answer-to-answer variance at all -- see
+//! [`ask`]'s own doc comment for the cache contract.
 //!
 //! Request body:
 //!
@@ -40,6 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +59,31 @@ use crate::commands::ctx::state::{self, StateDir};
 /// (a caller-provided `("none"|"other", ...)` entry) -- the Jev API's own
 /// documented limit.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
+
+/// The default margin floor [`Answer::decisive`] checks alongside a caller's
+/// own confidence floor. From the completed 2026-09-18 measurement (497 live
+/// calls across the intake battery): flipped `intent`/`workflow`/
+/// `architecture` answers had a margin of at most 0.14, while their own
+/// stable answers sat at 0.17 or higher -- `0.2` clears every flip with a
+/// little room to spare. `complexity` is the exception this floor does NOT
+/// fix: one stable (non-flipping) but factually wrong answer
+/// (`perf-investigation`, see `proxy::jev_live_battery_matches_recorded_
+/// rulings`'s own doc comment) sits at margin 0.18-0.24, and one genuinely
+/// ambiguous prompt flipped at margin 0.54. So this floor is a DETERMINISM
+/// tool -- the same request body keeps giving the same answer, backed
+/// further by [`ask`]'s own cache -- never an ACCURACY tool: a decisive
+/// answer can still be wrong, and a truly ambiguous prompt can still flip at
+/// any margin.
+pub(crate) const DEFAULT_MIN_MARGIN: f32 = 0.2;
+// A compile-time check (clippy flags a runtime `assert!` on a `const` as
+// always-true) so the build itself fails if this constant ever drops below
+// the highest flip margin the 2026-09-18 measurement found for intent/
+// workflow/architecture (0.14) -- complexity's own flip/stable bands
+// overlap and are not a clean bound, see this constant's own doc comment.
+const _: () = assert!(
+    DEFAULT_MIN_MARGIN > 0.14,
+    "must clear every general-field flip margin (<= 0.14)"
+);
 
 /// The three question shapes the Jev API speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +168,10 @@ impl Question {
 /// One decider's answer to one question, already reduced to a single value
 /// plus a confidence in `[0, 1]`. `Score`'s value is a continuous level
 /// index (not necessarily an integer -- see [`to_answer`]'s own rounding
-/// rule); `Noul`'s value is the raw `true`-probability.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// rule); `Noul`'s value is the raw `true`-probability. `Deserialize` is for
+/// [`ask`]'s own decision cache, which round-trips a whole [`Answers`]
+/// through JSON on disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnswerValue {
     Choice(String),
     Score(f64),
@@ -151,7 +183,9 @@ pub enum AnswerValue {
 /// confidence; `Noul`'s raw value doubles as its own confidence, since the
 /// wire format carries no separate `confidence` field for it), plus the raw
 /// probability distribution -- empty for `Noul`, which has none on the wire.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// `Deserialize` is for [`ask`]'s own decision cache (see [`AnswerValue`]'s
+/// own doc comment).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Answer {
     pub value: AnswerValue,
     pub confidence: f32,
@@ -184,6 +218,46 @@ impl Answer {
             AnswerValue::Noul(value) => Some(value),
             AnswerValue::Choice(_) | AnswerValue::Score(_) => None,
         }
+    }
+
+    /// The gap between this answer's most likely value and its runner-up, in
+    /// `[0, 1]` -- large when the model was decisively between one option and
+    /// the rest, near `0` when two (or more) options were nearly tied. A
+    /// `Choice`/`Score` answer with fewer than two entries in `probabilities`
+    /// (an empty distribution, or a caller-composed answer with none) has no
+    /// runner-up to compare against, so its margin is `0.0`. `Noul` carries
+    /// no probability distribution on the wire at all; its margin is instead
+    /// how far its own raw value sits from the maximally uncertain `0.5`,
+    /// doubled into the same `[0, 1]` range every other margin uses (`p =
+    /// 0.52` gives `0.04`, `p = 0.95` gives `0.9`).
+    pub(crate) fn margin(&self) -> f32 {
+        match &self.value {
+            AnswerValue::Choice(_) | AnswerValue::Score(_) => {
+                let mut probabilities: Vec<f32> = self.probabilities.values().copied().collect();
+                if probabilities.len() < 2 {
+                    return 0.0;
+                }
+                probabilities.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                probabilities[0] - probabilities[1]
+            }
+            AnswerValue::Noul(value) => (*value as f32 - 0.5).abs() * 2.0,
+        }
+    }
+
+    /// Whether this answer clears BOTH floors a caller wants before acting on
+    /// it, rather than falling back to its own deterministic path: the
+    /// reported `confidence` at or above `min_confidence`, AND `margin` at or
+    /// above `min_margin` (see [`DEFAULT_MIN_MARGIN`]'s own doc comment for
+    /// why confidence alone is not enough). `Noul` carries no independently
+    /// reported confidence on the wire at all -- its own `confidence` field
+    /// IS the raw value (see this struct's own doc comment) -- so
+    /// `min_confidence` is ignored for it, and only `margin` governs.
+    pub(crate) fn decisive(&self, min_confidence: f32, min_margin: f32) -> bool {
+        let confidence_ok = match self.value {
+            AnswerValue::Noul(_) => true,
+            AnswerValue::Choice(_) | AnswerValue::Score(_) => self.confidence >= min_confidence,
+        };
+        confidence_ok && self.margin() >= min_margin
     }
 }
 
@@ -409,26 +483,118 @@ fn status_error(status: u16) -> JevError {
     }
 }
 
+/// The decision cache's own subdirectory under a state dir:
+/// `<state_dir>/jev-cache/<sha256-of-the-request-body>.json`. See [`ask`]'s
+/// own doc comment for the cache contract.
+const JEV_CACHE_DIR: &str = "jev-cache";
+
+/// One cached call, exactly what a cache HIT restores and a cache MISS (on a
+/// 200) writes.
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheEntry {
+    answers: Answers,
+    usage: Usage,
+    stored_at: u64,
+    model: String,
+}
+
+fn hash_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// `Some(entry)` for a cache file that parses and is younger than
+/// `ttl_secs`; `None` for anything else -- missing, corrupt/unparseable
+/// (treated as a miss, never a hard error), or expired. Never deletes an
+/// expired file: the next successful call overwrites it via the same
+/// atomic `state::write_private` every other cache write uses.
+fn read_cache_entry(path: &Path, ttl_secs: u64) -> Option<CacheEntry> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let entry: CacheEntry = serde_json::from_str(&text).ok()?;
+    (state::now_secs().saturating_sub(entry.stored_at) < ttl_secs).then_some(entry)
+}
+
+/// Best-effort, like every other cache/log write in this crate: a failure to
+/// create the directory or write the file never fails the caller's own
+/// (already-computed) answer.
+fn write_cache_entry(
+    state_dir: &Path,
+    cache_key: &str,
+    answers: &Answers,
+    usage: &Usage,
+    model: &str,
+) {
+    let dir = state_dir.join(JEV_CACHE_DIR);
+    if state::create_private_dir_all(&dir).is_err() {
+        return;
+    }
+    let entry = CacheEntry {
+        answers: answers.clone(),
+        usage: *usage,
+        stored_at: state::now_secs(),
+        model: model.to_string(),
+    };
+    if let Ok(text) = serde_json::to_string(&entry) {
+        let _ = state::write_private(&dir.join(format!("{cache_key}.json")), &text);
+    }
+}
+
 /// Runs one bounded `/systemone` call and converts its answers into the
-/// neutral [`Answers`] shape. `credential_env` is read fresh every call and
+/// neutral [`Answers`] shape, or serves an identical prior call from the
+/// on-disk decision cache. `credential_env` is read fresh every call and
 /// never logged; an unset or empty value refuses before any connection is
 /// opened, matching every other credential-by-env-name seam in this crate
 /// (`EndpointTarget`, `AgentAdapter::ready`). `state` is any bounded,
 /// repository-neutral value a caller wants Jev's opinion on -- the harness
 /// proxy passes its own `IntakeState`; a future site passes its own shape.
+///
+/// Cache: the request body (`{state, model, questions}`, the exact bytes
+/// this function would otherwise send) is hashed with SHA-256 and looked up
+/// at `<state_dir>/jev-cache/<hash>.json` BEFORE the credential check or any
+/// network attempt -- an identical request gives an identical answer by
+/// construction, with zero `Usage` and no credential needed at all, up to
+/// `cache_ttl_secs` old. A miss (including an expired entry, or a corrupt/
+/// unreadable file) falls through to the real call exactly as before; only
+/// a genuine `200` response is stored, never an error. `cache_ttl_secs ==
+/// 0` disables the cache entirely: no lookup, no write, every call reaches
+/// the network. The returned `bool` is whether this answer was served from
+/// the cache -- callers that record a decision line (`record`, below) pass
+/// it through as `cached`.
 pub(crate) fn ask(
     cfg: &ProxyTypesafeConfig,
+    state_dir: &Path,
+    cache_ttl_secs: u64,
     state: &impl Serialize,
     questions: &[Question],
-) -> Result<(Answers, Usage), JevError> {
+) -> Result<(Answers, Usage, bool), JevError> {
+    let request = build_request(state, questions, &cfg.model);
+    let payload = serde_json::to_string(&request)
+        .map_err(|error| JevError::Transport(format!("failed to encode request: {error}")))?;
+    let cache_key = hash_hex(payload.as_bytes());
+    let cache_path = state_dir
+        .join(JEV_CACHE_DIR)
+        .join(format!("{cache_key}.json"));
+
+    if cache_ttl_secs > 0
+        && let Some(entry) = read_cache_entry(&cache_path, cache_ttl_secs)
+    {
+        return Ok((
+            entry.answers,
+            Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            true,
+        ));
+    }
+
     let credential = match std::env::var(&cfg.credential_env) {
         Ok(value) if !value.is_empty() => value,
         _ => return Err(JevError::NoCredential(cfg.credential_env.clone())),
     };
-
-    let request = build_request(state, questions, &cfg.model);
-    let payload = serde_json::to_string(&request)
-        .map_err(|error| JevError::Transport(format!("failed to encode request: {error}")))?;
 
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .max_redirects(0)
@@ -465,13 +631,14 @@ pub(crate) fn ask(
         serde_json::from_str(&body).map_err(|error| JevError::Malformed(error.to_string()))?;
 
     let answers = to_answers(questions, &parsed.answers);
-    Ok((
-        answers,
-        Usage {
-            input_tokens: parsed.usage.input_tokens,
-            output_tokens: parsed.usage.output_tokens,
-        },
-    ))
+    let usage = Usage {
+        input_tokens: parsed.usage.input_tokens,
+        output_tokens: parsed.usage.output_tokens,
+    };
+    if cache_ttl_secs > 0 {
+        write_cache_entry(state_dir, &cache_key, &answers, &usage, &cfg.model);
+    }
+    Ok((answers, usage, false))
 }
 
 /// Whether `cfg`'s credential env is set and non-empty -- the cheap half of
@@ -513,32 +680,49 @@ pub(crate) fn session_and_principal() -> (String, String) {
     (session, principal)
 }
 
+/// One answer plus its own [`Answer::margin`] -- `#[serde(flatten)]` so the
+/// JSONL shape stays exactly what it was before margin recording (`value`/
+/// `confidence`/`probabilities` at the top level of each answer object),
+/// with `margin` simply joining them, rather than nesting the original
+/// answer under its own key.
+#[derive(Debug, Serialize)]
+struct AnswerRecord<'a> {
+    #[serde(flatten)]
+    answer: &'a Answer,
+    margin: f32,
+}
+
 #[derive(Debug, Serialize)]
 struct DecisionRecord<'a> {
     site: &'a str,
     ts: u64,
-    answers: &'a Answers,
+    answers: BTreeMap<&'a str, AnswerRecord<'a>>,
     usage: &'a Usage,
     wall_ms: u64,
     fallbacks: &'a [String],
+    /// Whether these answers were served from [`ask`]'s own decision cache
+    /// rather than a real call -- `usage` is `0`/`0` whenever this is `true`.
+    cached: bool,
 }
 
 /// Appends one JSON line -- `site`, a timestamp, every answer's value/
-/// confidence/probabilities, `usage`, `wall_ms` and `fallbacks` -- to
-/// `<state_dir>/jev-decisions.jsonl`, and records a `log::Delegation` spend
-/// row (agent `"typesafe"`, model from `cfg.proxy.typesafe.model`, `usage`'s
-/// input/output tokens, `wall_ms`) so `zirv ctx spend` prices the call
-/// through the same catalogue vendor the harness proxy already does. The
-/// harness proxy keeps recording its own `proxy-decisions.jsonl` and spend
-/// row via `proxy::persist` -- this is for every OTHER `[jev]`-gated site,
-/// never a second record for the proxy's own call. Appends via
-/// `state::open_private_append`, the same `O_APPEND`-backed write
-/// `proxy::persist` itself uses for its own decisions file -- a prior
+/// confidence/probabilities/margin, `usage`, `wall_ms`, `fallbacks` and
+/// `cached` -- to `<state_dir>/jev-decisions.jsonl`, and records a
+/// `log::Delegation` spend row (agent `"typesafe"`, model from `cfg.proxy.
+/// typesafe.model`, `usage`'s input/output tokens, `wall_ms`) so `zirv ctx
+/// spend` prices the call through the same catalogue vendor the harness
+/// proxy already does -- a cache hit's own `0`/`0` `usage` naturally prices
+/// as free. The harness proxy keeps recording its own `proxy-decisions.jsonl`
+/// and spend row via `proxy::persist` -- this is for every OTHER
+/// `[jev]`-gated site, never a second record for the proxy's own call.
+/// Appends via `state::open_private_append`, the same `O_APPEND`-backed
+/// write `proxy::persist` itself uses for its own decisions file -- a prior
 /// version read the whole file, appended in memory, and rewrote it with
 /// `state::write_private`, which lost a line whenever two zirv processes
 /// recorded at the same time (review finding). Best-effort like every other
 /// append in this crate's flat logs: a write failure here must never break
 /// the caller's own (already-computed) decision.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -547,15 +731,29 @@ pub(crate) fn record(
     usage: &Usage,
     wall_ms: u64,
     fallbacks: &[String],
+    cached: bool,
 ) {
     let ts = state::now_secs();
+    let answer_records: BTreeMap<&str, AnswerRecord> = answers
+        .iter()
+        .map(|(id, answer)| {
+            (
+                id.as_str(),
+                AnswerRecord {
+                    answer,
+                    margin: answer.margin(),
+                },
+            )
+        })
+        .collect();
     let record = DecisionRecord {
         site,
         ts,
-        answers,
+        answers: answer_records,
         usage,
         wall_ms,
         fallbacks,
+        cached,
     };
     if let Ok(line) = serde_json::to_string(&record)
         && state::create_private_dir_all(state.root()).is_ok()
@@ -614,8 +812,14 @@ pub(crate) fn advise(
     let wall_ms = |started: std::time::Instant| -> u64 {
         started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     };
-    match ask(&cfg.proxy.typesafe, state, questions) {
-        Ok((answers, usage)) => {
+    match ask(
+        &cfg.proxy.typesafe,
+        state_dir.root(),
+        cfg.jev.cache_ttl_secs,
+        state,
+        questions,
+    ) {
+        Ok((answers, usage, cached)) => {
             record(
                 state_dir,
                 cfg,
@@ -624,6 +828,7 @@ pub(crate) fn advise(
                 &usage,
                 wall_ms(started),
                 &[],
+                cached,
             );
             Some(answers)
         }
@@ -639,6 +844,7 @@ pub(crate) fn advise(
                 },
                 wall_ms(started),
                 &[error.to_string()],
+                false,
             );
             None
         }
@@ -799,6 +1005,7 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
         let body: &'static str = Box::leak(text.into_boxed_str());
         let (url, handle) = one_shot_server(200, body);
+        let state_dir = tempfile::tempdir().expect("tempdir");
         with_credential("JEV_TEST_KEY_PROBABILITIES", "secret", || {
             let cfg = config(url, "JEV_TEST_KEY_PROBABILITIES", 5);
             let questions = vec![
@@ -824,7 +1031,9 @@ pub(crate) mod tests {
                     },
                 },
             ];
-            let (answers, _usage) = ask(&cfg, &sample_state(), &questions).expect("ask");
+            let (answers, _usage, cached) =
+                ask(&cfg, state_dir.path(), 0, &sample_state(), &questions).expect("ask");
+            assert!(!cached);
             assert_eq!(answers["category"].probabilities["technical"], 0.84);
             assert_eq!(answers["urgency"].probabilities["1"], 0.8);
             assert!(
@@ -887,7 +1096,7 @@ pub(crate) mod tests {
             output_tokens: 2,
         };
 
-        record(&state, &cfg, "memory", &answers, &usage, 42, &[]);
+        record(&state, &cfg, "memory", &answers, &usage, 42, &[], false);
 
         let text = std::fs::read_to_string(state_dir.path().join(JEV_DECISIONS_FILE))
             .expect("jev-decisions.jsonl");
@@ -895,8 +1104,13 @@ pub(crate) mod tests {
         let value: serde_json::Value = serde_json::from_str(line).expect("parse json");
         assert_eq!(value["site"], "memory");
         assert_eq!(value["answers"]["intent"]["probabilities"]["feature"], 0.9);
+        assert!(
+            (value["answers"]["intent"]["margin"].as_f64().unwrap() - 0.8).abs() < 1e-6,
+            "{value}"
+        );
         assert_eq!(value["usage"]["input_tokens"], 10);
         assert_eq!(value["wall_ms"], 42);
+        assert_eq!(value["cached"], false);
 
         let delegations = log::read_delegations(&state, 10);
         assert_eq!(delegations.len(), 1);
@@ -926,12 +1140,30 @@ pub(crate) mod tests {
             output_tokens: 0,
         };
 
-        record(&state, &cfg, "memory", &Answers::new(), &usage, 5, &[]);
+        record(
+            &state,
+            &cfg,
+            "memory",
+            &Answers::new(),
+            &usage,
+            5,
+            &[],
+            false,
+        );
         let path = state_dir.path().join(JEV_DECISIONS_FILE);
         let after_first = std::fs::read_to_string(&path).expect("jev-decisions.jsonl");
         let first_line = after_first.lines().next().expect("one line").to_string();
 
-        record(&state, &cfg, "supervisor", &Answers::new(), &usage, 7, &[]);
+        record(
+            &state,
+            &cfg,
+            "supervisor",
+            &Answers::new(),
+            &usage,
+            7,
+            &[],
+            true,
+        );
         let after_second = std::fs::read_to_string(&path).expect("jev-decisions.jsonl");
         let lines: Vec<&str> = after_second.lines().collect();
 
@@ -947,7 +1179,9 @@ pub(crate) mod tests {
         let first: serde_json::Value = serde_json::from_str(lines[0]).expect("parse first line");
         let second: serde_json::Value = serde_json::from_str(lines[1]).expect("parse second line");
         assert_eq!(first["site"], "memory");
+        assert_eq!(first["cached"], false);
         assert_eq!(second["site"], "supervisor");
+        assert_eq!(second["cached"], true);
     }
 
     #[test]
@@ -1158,6 +1392,7 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
         let body: &'static str = Box::leak(text.into_boxed_str());
         let (url, handle) = one_shot_server(200, body);
+        let state_dir = tempfile::tempdir().expect("tempdir");
         with_credential("JEV_TEST_KEY_OK", "secret", || {
             let cfg = config(url, "JEV_TEST_KEY_OK", 5);
             let questions = vec![Question {
@@ -1166,7 +1401,9 @@ pub(crate) mod tests {
                 instructions: String::new(),
                 criteria: Criteria::Choice(Vec::new()),
             }];
-            let (answers, usage) = ask(&cfg, &sample_state(), &questions).expect("ask");
+            let (answers, usage, cached) =
+                ask(&cfg, state_dir.path(), 0, &sample_state(), &questions).expect("ask");
+            assert!(!cached);
             assert_eq!(usage.input_tokens, 312);
             assert!(answers.contains_key("category"));
         });
@@ -1175,6 +1412,7 @@ pub(crate) mod tests {
 
     #[test]
     fn error_statuses_map_to_the_matching_variant() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
         for (status, expect_variant) in [
             (401, "auth"),
             (422, "invalid"),
@@ -1186,7 +1424,8 @@ pub(crate) mod tests {
             let env_name = format!("JEV_TEST_KEY_{status}");
             with_credential(&env_name, "secret", || {
                 let cfg = config(url, &env_name, 5);
-                let error = ask(&cfg, &sample_state(), &[]).expect_err("must fail");
+                let error =
+                    ask(&cfg, state_dir.path(), 0, &sample_state(), &[]).expect_err("must fail");
                 let matched = matches!(
                     (&error, expect_variant),
                     (JevError::Auth, "auth")
@@ -1214,10 +1453,12 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_secs(10));
             }
         });
+        let state_dir = tempfile::tempdir().expect("tempdir");
         with_credential("JEV_TEST_KEY_TIMEOUT", "secret", || {
             let cfg = config(format!("http://{address}"), "JEV_TEST_KEY_TIMEOUT", 1);
             let started = std::time::Instant::now();
-            let error = ask(&cfg, &sample_state(), &[]).expect_err("must time out");
+            let error =
+                ask(&cfg, state_dir.path(), 0, &sample_state(), &[]).expect_err("must time out");
             assert!(matches!(error, JevError::Timeout), "{error:?}");
             assert!(
                 started.elapsed() < Duration::from_secs(5),
@@ -1238,11 +1479,269 @@ pub(crate) mod tests {
         });
         // Deliberately never set: a unique name this process never exports.
         let cfg = config(format!("http://{address}"), "JEV_TEST_KEY_NEVER_SET_537", 1);
-        let error = ask(&cfg, &sample_state(), &[]).expect_err("must refuse");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let error = ask(&cfg, state_dir.path(), 0, &sample_state(), &[]).expect_err("must refuse");
         assert!(matches!(error, JevError::NoCredential(_)), "{error:?}");
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
             "no connection should have been attempted"
+        );
+    }
+
+    /// A second call with the identical request body is served from the
+    /// cache: the one-shot server only ever accepts ONE connection, so a
+    /// second real attempt would fail with a transport error rather than
+    /// this test's own `expect("second ask")` succeeding.
+    #[test]
+    fn a_second_identical_call_is_served_from_the_cache_with_no_network() {
+        let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
+        let body: &'static str = Box::leak(text.into_boxed_str());
+        let (url, handle) = one_shot_server(200, body);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        with_credential("JEV_TEST_KEY_CACHE_HIT", "secret", || {
+            let cfg = config(url, "JEV_TEST_KEY_CACHE_HIT", 5);
+            let questions = sample_questions();
+
+            let (first_answers, first_usage, first_cached) =
+                ask(&cfg, state_dir.path(), 86_400, &sample_state(), &questions)
+                    .expect("first ask");
+            assert!(!first_cached, "the first call must hit the network");
+            assert!(first_usage.input_tokens > 0);
+
+            let (second_answers, second_usage, second_cached) =
+                ask(&cfg, state_dir.path(), 86_400, &sample_state(), &questions)
+                    .expect("second ask");
+            assert!(
+                second_cached,
+                "an identical second call must be served from the cache"
+            );
+            assert_eq!(second_usage.input_tokens, 0);
+            assert_eq!(second_usage.output_tokens, 0);
+            assert_eq!(second_answers, first_answers);
+        });
+        handle.join().expect("server thread must not panic");
+    }
+
+    /// `cache_ttl_secs == 0` disables the cache entirely: each of two
+    /// otherwise-identical calls must reach its OWN one-shot server (a
+    /// cache hit would mean the second one is never even attempted).
+    #[test]
+    fn ttl_zero_disables_the_cache_and_always_calls() {
+        let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        with_credential("JEV_TEST_KEY_CACHE_TTL_ZERO", "secret", || {
+            for _ in 0..2 {
+                let body: &'static str = Box::leak(text.clone().into_boxed_str());
+                let (url, handle) = one_shot_server(200, body);
+                let cfg = config(url, "JEV_TEST_KEY_CACHE_TTL_ZERO", 5);
+                let (_, usage, cached) = ask(
+                    &cfg,
+                    state_dir.path(),
+                    0,
+                    &sample_state(),
+                    &sample_questions(),
+                )
+                .expect("ask");
+                assert!(!cached, "ttl 0 must never serve from the cache");
+                assert!(usage.input_tokens > 0);
+                handle.join().expect("server thread must not panic");
+            }
+        });
+    }
+
+    /// An entry older than `ttl_secs` is a miss: pre-populating one that is
+    /// already expired must still reach the network below, exactly like no
+    /// cache file existing at all.
+    #[test]
+    fn an_expired_cache_entry_calls_again() {
+        let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
+        let body: &'static str = Box::leak(text.into_boxed_str());
+        let (url, handle) = one_shot_server(200, body);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        with_credential("JEV_TEST_KEY_CACHE_EXPIRED", "secret", || {
+            let cfg = config(url, "JEV_TEST_KEY_CACHE_EXPIRED", 5);
+            let questions = sample_questions();
+            let request = build_request(&sample_state(), &questions, &cfg.model);
+            let payload = serde_json::to_string(&request).expect("serialize");
+            let cache_key = hash_hex(payload.as_bytes());
+            let cache_dir = state_dir.path().join(JEV_CACHE_DIR);
+            std::fs::create_dir_all(&cache_dir).expect("mkdir cache dir");
+            let stale_entry = serde_json::json!({
+                "answers": {},
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+                "stored_at": 1,
+                "model": cfg.model,
+            });
+            std::fs::write(
+                cache_dir.join(format!("{cache_key}.json")),
+                stale_entry.to_string(),
+            )
+            .expect("write stale cache entry");
+
+            let (_, usage, cached) =
+                ask(&cfg, state_dir.path(), 5, &sample_state(), &questions).expect("ask");
+            assert!(!cached, "an expired entry must not be served");
+            assert!(
+                usage.input_tokens > 0,
+                "an expired entry must reach the network"
+            );
+        });
+        handle.join().expect("server thread must not panic");
+    }
+
+    /// An error response is never cached: the directory it would have lived
+    /// in must not even exist afterward.
+    #[test]
+    fn a_500_response_leaves_no_cache_file() {
+        let (url, handle) = one_shot_server(500, "{}");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        with_credential("JEV_TEST_KEY_CACHE_500", "secret", || {
+            let cfg = config(url, "JEV_TEST_KEY_CACHE_500", 5);
+            let error = ask(
+                &cfg,
+                state_dir.path(),
+                86_400,
+                &sample_state(),
+                &sample_questions(),
+            )
+            .expect_err("must fail");
+            assert!(matches!(error, JevError::Status(500)), "{error:?}");
+        });
+        handle.join().expect("server thread must not panic");
+        assert!(
+            !state_dir.path().join(JEV_CACHE_DIR).exists(),
+            "an error response must never create a cache file"
+        );
+    }
+
+    #[test]
+    fn margin_is_the_gap_between_top_and_runner_up_for_choice_and_score() {
+        let choice = Answer {
+            value: AnswerValue::Choice("technical".to_string()),
+            confidence: 0.6,
+            probabilities: BTreeMap::from([
+                ("technical".to_string(), 0.6_f32),
+                ("billing".to_string(), 0.3_f32),
+                ("sales".to_string(), 0.1_f32),
+            ]),
+        };
+        assert!((choice.margin() - 0.3).abs() < 1e-6, "{}", choice.margin());
+
+        let score = Answer {
+            value: AnswerValue::Score(1.0),
+            confidence: 0.7,
+            probabilities: BTreeMap::from([
+                ("0".to_string(), 0.1_f32),
+                ("1".to_string(), 0.7_f32),
+                ("2".to_string(), 0.2_f32),
+            ]),
+        };
+        assert!((score.margin() - 0.5).abs() < 1e-6, "{}", score.margin());
+    }
+
+    #[test]
+    fn margin_for_noul_is_distance_from_maximal_uncertainty_doubled() {
+        let barely_over_half = Answer {
+            value: AnswerValue::Noul(0.52),
+            confidence: 0.52,
+            probabilities: BTreeMap::new(),
+        };
+        assert!(
+            (barely_over_half.margin() - 0.04).abs() < 1e-4,
+            "{}",
+            barely_over_half.margin()
+        );
+
+        let near_certain = Answer {
+            value: AnswerValue::Noul(0.95),
+            confidence: 0.95,
+            probabilities: BTreeMap::new(),
+        };
+        assert!(
+            (near_certain.margin() - 0.9).abs() < 1e-4,
+            "{}",
+            near_certain.margin()
+        );
+    }
+
+    #[test]
+    fn margin_is_zero_with_fewer_than_two_reported_probabilities() {
+        let single = Answer {
+            value: AnswerValue::Choice("only".to_string()),
+            confidence: 0.9,
+            probabilities: BTreeMap::from([("only".to_string(), 1.0_f32)]),
+        };
+        assert_eq!(single.margin(), 0.0);
+
+        let none = Answer {
+            value: AnswerValue::Score(0.0),
+            confidence: 0.9,
+            probabilities: BTreeMap::new(),
+        };
+        assert_eq!(none.margin(), 0.0);
+    }
+
+    #[test]
+    fn decisive_requires_both_confidence_and_margin_for_choice_and_score() {
+        let decisive = Answer {
+            value: AnswerValue::Choice("technical".to_string()),
+            confidence: 0.8,
+            probabilities: BTreeMap::from([
+                ("technical".to_string(), 0.8_f32),
+                ("billing".to_string(), 0.2_f32),
+            ]),
+        };
+        assert!(decisive.decisive(0.5, 0.2));
+
+        let thin_margin = Answer {
+            value: AnswerValue::Choice("technical".to_string()),
+            confidence: 0.8,
+            probabilities: BTreeMap::from([
+                ("technical".to_string(), 0.51_f32),
+                ("billing".to_string(), 0.49_f32),
+            ]),
+        };
+        assert!(
+            !thin_margin.decisive(0.5, 0.2),
+            "margin 0.02 must fail the floor even at high confidence"
+        );
+
+        let low_confidence = Answer {
+            value: AnswerValue::Choice("technical".to_string()),
+            confidence: 0.3,
+            probabilities: BTreeMap::from([
+                ("technical".to_string(), 0.9_f32),
+                ("billing".to_string(), 0.1_f32),
+            ]),
+        };
+        assert!(
+            !low_confidence.decisive(0.5, 0.2),
+            "confidence 0.3 must fail the floor even at a wide margin"
+        );
+    }
+
+    #[test]
+    fn decisive_for_noul_ignores_confidence_and_checks_margin_only() {
+        let thin = Answer {
+            value: AnswerValue::Noul(0.52),
+            confidence: 0.52,
+            probabilities: BTreeMap::new(),
+        };
+        assert!(!thin.decisive(0.0, 0.2), "margin 0.04 must fail the floor");
+        assert!(
+            !thin.decisive(1.0, 0.2),
+            "min_confidence must be ignored for noul"
+        );
+
+        let decisive = Answer {
+            value: AnswerValue::Noul(0.95),
+            confidence: 0.95,
+            probabilities: BTreeMap::new(),
+        };
+        assert!(decisive.decisive(0.0, 0.2));
+        assert!(
+            decisive.decisive(1.0, 0.2),
+            "min_confidence must be ignored for noul"
         );
     }
 }

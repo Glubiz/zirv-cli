@@ -421,10 +421,13 @@ fn proxy_intake<E: Write>(
 }
 
 /// Issue #537 (A2): one round of interactive follow-up when `decision.
-/// needs_clarification` is at or above `proxy::CLARIFY_THRESHOLD` -- prints
-/// one prompt (unconditional, same as `proxy_intake`'s own "describe the
-/// task" prompt right above: this blocks on stdin, so it must stay visible
-/// regardless of `--quiet`) and reads one line. An empty line (or EOF)
+/// needs_clarification` is at or above `proxy::CLARIFY_THRESHOLD` AND
+/// `decision.needs_clarification_decisive` (the margin gate `proxy::decision
+/// ::merge` applied -- a confident-looking but thin-margin "ambiguous"
+/// reading must not interrupt a launch on its own) -- prints one prompt
+/// (unconditional, same as `proxy_intake`'s own "describe the task" prompt
+/// right above: this blocks on stdin, so it must stay visible regardless of
+/// `--quiet`) and reads one line. An empty line (or EOF)
 /// leaves `decision`/`request` untouched -- an operator who has nothing to
 /// add is not forced to add anything. A non-empty line is appended to
 /// `request` (separated by a blank line, so the harness's own first prompt
@@ -440,7 +443,9 @@ fn maybe_clarify<E: Write>(
     reader: &mut impl BufRead,
     stderr: &mut E,
 ) -> CtxResult<(ProxyDecision, String)> {
-    if decision.needs_clarification < proxy::CLARIFY_THRESHOLD {
+    if decision.needs_clarification < proxy::CLARIFY_THRESHOLD
+        || !decision.needs_clarification_decisive
+    {
         return Ok((decision, request));
     }
     writeln!(
@@ -3427,6 +3432,7 @@ mod tests {
             },
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
+            needs_clarification_decisive: false,
             domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),
@@ -3709,6 +3715,7 @@ mod tests {
 
         let mut ambiguous = decision;
         ambiguous.needs_clarification = 0.9;
+        ambiguous.needs_clarification_decisive = true;
         let mut stderr = Vec::new();
         let (unchanged, request) = maybe_clarify(
             &cfg,
@@ -3728,6 +3735,40 @@ mod tests {
         );
     }
 
+    /// Jev determinism fix: at or above `proxy::CLARIFY_THRESHOLD`, a
+    /// `needs_clarification` answer that was NOT decisive at merge time
+    /// (thin margin between "ambiguous" and "clear enough") must never fire
+    /// the interactive round -- the raw value alone is not enough once
+    /// `needs_clarification_decisive` is `false`.
+    #[test]
+    fn maybe_clarify_is_a_no_op_above_the_threshold_when_not_decisive() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let cfg = CtxConfig::default();
+
+        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
+        decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = false;
+        let mut stderr = Vec::new();
+        let (unchanged, request) = maybe_clarify(
+            &cfg,
+            &state,
+            repo.path(),
+            decision.clone(),
+            "original request".to_string(),
+            &mut &b"ignored, never read when not decisive\n"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+        assert_eq!(unchanged, decision);
+        assert_eq!(request, "original request");
+        assert!(
+            stderr.is_empty(),
+            "a non-decisive answer must never prompt, however high its raw value"
+        );
+    }
+
     /// Issue #537 (A2): at or above the threshold, a non-empty answer is
     /// appended to the request (separated by a blank line) and `decide` runs
     /// exactly once more against the combined text -- never a second
@@ -3744,6 +3785,7 @@ mod tests {
 
         let mut decision = sample_decision(repo.path(), "claude", "fable", None);
         decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = true;
         let mut stderr = Vec::new();
 
         let (new_decision, new_request) = maybe_clarify(

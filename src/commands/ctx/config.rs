@@ -1784,6 +1784,13 @@ pub struct ProxyConfig {
     /// of the deterministic baseline (`proxy::decision::merge`). Must be in
     /// `0.0..=1.0`.
     pub min_confidence: f32,
+    /// A model answer whose margin (`jev::Answer::margin` -- the gap between
+    /// its top and runner-up probability) falls below this floor is ALSO
+    /// discarded in favor of the deterministic baseline, alongside (never
+    /// instead of) `min_confidence` above -- see `jev::Answer::decisive`'s
+    /// own doc comment for why confidence alone misses an unstable answer.
+    /// Must be in `0.0..=1.0`.
+    pub min_margin: f32,
     /// The intake `request` text is truncated to this many bytes before it
     /// ever reaches a model decider (`proxy::decision::IntakeState`). Must be
     /// at least [`MIN_PROXY_REQUEST_MAX_BYTES`].
@@ -1797,6 +1804,7 @@ impl Default for ProxyConfig {
             enabled: false,
             decider: ProxyDecider::default(),
             min_confidence: 0.5,
+            min_margin: crate::commands::ctx::jev::DEFAULT_MIN_MARGIN,
             request_max_bytes: 16_384,
             typesafe: ProxyTypesafeConfig::default(),
         }
@@ -1812,6 +1820,16 @@ impl Default for ProxyConfig {
 pub struct ProxyTypesafeConfig {
     pub base_url: String,
     pub credential_env: String,
+    /// Pinned to a specific Jev release by default (`jev-1.13.0`, what
+    /// `jev-latest` itself resolves to as of 2026-09-18) rather than the
+    /// `jev-latest` moving alias -- reproducibility across FUTURE alias
+    /// moves is the point, not that today's alias is wrong: a 2026-09-18
+    /// measurement found the model itself flips a thin-margin answer between
+    /// otherwise-identical calls, and an alias that can change underneath a
+    /// deployed config would confound that instability with an actual model
+    /// upgrade. Set this to `jev-latest` explicitly to opt back into
+    /// automatic upgrades, or to a newer pinned version once one is
+    /// verified.
     pub model: String,
     /// Connect and receive timeout for the `/systemone` call. Must be at
     /// least 1 (see `ProxyConfig`'s own doc comment on where this is
@@ -1824,7 +1842,7 @@ impl Default for ProxyTypesafeConfig {
         Self {
             base_url: "https://api.typesafe.ai/v1".to_string(),
             credential_env: "TYPESAFE_API_KEY".to_string(),
-            model: "jev-latest".to_string(),
+            model: "jev-1.13.0".to_string(),
             timeout_secs: 10,
         }
     }
@@ -1842,7 +1860,7 @@ impl Default for ProxyTypesafeConfig {
 /// entry per key, same trust asymmetry as `[proxy]` above: a repository
 /// checkout must not be able to turn on a Jev-backed decision path for
 /// itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JevConfig {
     pub memory: bool,
@@ -1850,6 +1868,26 @@ pub struct JevConfig {
     pub dispatch: bool,
     pub review: bool,
     pub gates: bool,
+    /// How long a cached answer (`<state_dir>/jev-cache/<hash>.json`, keyed
+    /// by the exact request body -- see `jev::ask`'s own doc comment) stays
+    /// usable, in seconds. `0` disables the cache entirely: every call
+    /// reaches the network, and none is ever written. Shared by every
+    /// `[jev]`-gated site and the harness proxy's own `typesafe` decider,
+    /// since both go through the same `jev::ask`.
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            memory: false,
+            supervisor: false,
+            dispatch: false,
+            review: false,
+            gates: false,
+            cache_ttl_secs: 86_400,
+        }
+    }
 }
 
 /// Per-agent override for which model runs code review, keyed the same way
@@ -3547,6 +3585,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Float,
     ),
     (
+        "ZIRV_CTX_PROXY_MIN_MARGIN",
+        &["proxy", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
         "ZIRV_CTX_PROXY_REQUEST_MAX_BYTES",
         &["proxy", "request_max_bytes"],
         EnvKind::Int,
@@ -3583,6 +3626,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ("ZIRV_CTX_JEV_DISPATCH", &["jev", "dispatch"], EnvKind::Bool),
     ("ZIRV_CTX_JEV_REVIEW", &["jev", "review"], EnvKind::Bool),
     ("ZIRV_CTX_JEV_GATES", &["jev", "gates"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_JEV_CACHE_TTL_SECS",
+        &["jev", "cache_ttl_secs"],
+        EnvKind::Int,
+    ),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -4788,6 +4836,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["proxy", "min_confidence"],
         "ZIRV_CTX_PROXY_MIN_CONFIDENCE",
     ),
+    (&["proxy", "min_margin"], "ZIRV_CTX_PROXY_MIN_MARGIN"),
     (
         &["proxy", "request_max_bytes"],
         "ZIRV_CTX_PROXY_REQUEST_MAX_BYTES",
@@ -4817,6 +4866,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "dispatch"], "ZIRV_CTX_JEV_DISPATCH"),
     (&["jev", "review"], "ZIRV_CTX_JEV_REVIEW"),
     (&["jev", "gates"], "ZIRV_CTX_JEV_GATES"),
+    (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -6165,6 +6215,13 @@ impl CtxConfig {
             )
             .into());
         }
+        if !(0.0..=1.0).contains(&cfg.proxy.min_margin) {
+            return Err(format!(
+                "proxy.min_margin must be between 0.0 and 1.0, got {}",
+                cfg.proxy.min_margin
+            )
+            .into());
+        }
         if cfg.proxy.typesafe.timeout_secs < 1 {
             return Err(format!(
                 "proxy.typesafe.timeout_secs must be at least 1, got {}",
@@ -7502,10 +7559,14 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.decider, ProxyDecider::Typesafe);
         assert_eq!(cfg.min_confidence, 0.5);
+        assert_eq!(
+            cfg.min_margin,
+            crate::commands::ctx::jev::DEFAULT_MIN_MARGIN
+        );
         assert_eq!(cfg.request_max_bytes, 16_384);
         assert_eq!(cfg.typesafe.base_url, "https://api.typesafe.ai/v1");
         assert_eq!(cfg.typesafe.credential_env, "TYPESAFE_API_KEY");
-        assert_eq!(cfg.typesafe.model, "jev-latest");
+        assert_eq!(cfg.typesafe.model, "jev-1.13.0");
         assert_eq!(cfg.typesafe.timeout_secs, 10);
     }
 
@@ -7522,6 +7583,7 @@ mod tests {
             ("[proxy]\nenabled = true\n", "enabled"),
             ("[proxy]\ndecider = \"helper\"\n", "decider"),
             ("[proxy]\nmin_confidence = 0.9\n", "min_confidence"),
+            ("[proxy]\nmin_margin = 0.9\n", "min_margin"),
             ("[proxy]\nrequest_max_bytes = 1\n", "request_max_bytes"),
             (
                 "[proxy.typesafe]\nbase_url = \"https://evil.example\"\n",
@@ -7560,6 +7622,7 @@ mod tests {
             ("ZIRV_CTX_PROXY_ENABLED", "true"),
             ("ZIRV_CTX_PROXY_DECIDER", "helper"),
             ("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "0.75"),
+            ("ZIRV_CTX_PROXY_MIN_MARGIN", "0.35"),
             ("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "4096"),
             ("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL", "http://localhost:9999"),
             ("ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV", "MY_KEY"),
@@ -7574,6 +7637,7 @@ mod tests {
         assert!(cfg.proxy.enabled);
         assert_eq!(cfg.proxy.decider, ProxyDecider::Helper);
         assert_eq!(cfg.proxy.min_confidence, 0.75);
+        assert_eq!(cfg.proxy.min_margin, 0.35);
         assert_eq!(cfg.proxy.request_max_bytes, 4096);
         assert_eq!(cfg.proxy.typesafe.base_url, "http://localhost:9999");
         assert_eq!(cfg.proxy.typesafe.credential_env, "MY_KEY");
@@ -7599,6 +7663,14 @@ mod tests {
             (
                 vec![("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "-0.1")],
                 "proxy.min_confidence",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_MARGIN", "1.5")],
+                "proxy.min_margin",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_MARGIN", "-0.1")],
+                "proxy.min_margin",
             ),
             (
                 vec![("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "0")],
@@ -7630,12 +7702,14 @@ mod tests {
         let repo = tempfile::tempdir().expect("tempdir");
         let env = env_map(&[
             ("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "0"),
+            ("ZIRV_CTX_PROXY_MIN_MARGIN", "0"),
             ("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "1"),
             ("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "1024"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
             .expect("the documented lower bounds must be accepted");
         assert_eq!(cfg.proxy.min_confidence, 0.0);
+        assert_eq!(cfg.proxy.min_margin, 0.0);
         assert_eq!(cfg.proxy.typesafe.timeout_secs, 1);
         assert_eq!(cfg.proxy.request_max_bytes, 1024);
     }
@@ -7651,6 +7725,7 @@ mod tests {
         assert!(!cfg.dispatch);
         assert!(!cfg.review);
         assert!(!cfg.gates);
+        assert_eq!(cfg.cache_ttl_secs, 86_400);
     }
 
     /// The operator's own home layer may still set `[jev]` keys directly in
@@ -7690,6 +7765,7 @@ mod tests {
             ("[jev]\ndispatch = true\n", "dispatch"),
             ("[jev]\nreview = true\n", "review"),
             ("[jev]\ngates = true\n", "gates"),
+            ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -7716,6 +7792,7 @@ mod tests {
             ("ZIRV_CTX_JEV_DISPATCH", "true"),
             ("ZIRV_CTX_JEV_REVIEW", "true"),
             ("ZIRV_CTX_JEV_GATES", "true"),
+            ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -7727,6 +7804,7 @@ mod tests {
         assert!(cfg.jev.dispatch);
         assert!(cfg.jev.review);
         assert!(cfg.jev.gates);
+        assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 
     #[test]

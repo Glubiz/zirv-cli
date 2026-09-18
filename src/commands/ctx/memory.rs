@@ -3022,9 +3022,19 @@ fn apply_jev_harvest_gate(
         .into_iter()
         .zip(ids)
         .filter(|((key, _), id)| {
-            let noul = answers.get(id).and_then(|answer| answer.as_noul());
-            match noul {
-                Some(value) if value < MEMORY_RELEVANCE_FLOOR => {
+            let answer = answers.get(id);
+            let noul = answer.and_then(|answer| answer.as_noul());
+            match (answer, noul) {
+                // Jev determinism fix: an explicit rejection only prunes the
+                // candidate when it is also `decisive` (margin at or above
+                // `jev::DEFAULT_MIN_MARGIN` -- a noul has no separate
+                // confidence to check, so this is a margin-only gate). A
+                // below-floor but thin-margin verdict is treated the same as
+                // a missing answer: kept.
+                (Some(answer), Some(value))
+                    if value < MEMORY_RELEVANCE_FLOOR
+                        && answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) =>
+                {
                     let detail =
                         format!("'{key}' scored {value:.2} below the Jev durability floor");
                     let _ = super::log::append(
@@ -3042,8 +3052,9 @@ fn apply_jev_harvest_gate(
                     );
                     false
                 }
-                // An accepting score, or a missing/unparseable answer: keep
-                // the keyword filter's own verdict (accepted).
+                // An accepting score, a thin-margin verdict, or a missing/
+                // unparseable answer: keep the keyword filter's own verdict
+                // (accepted).
                 _ => true,
             }
         })
@@ -6843,6 +6854,19 @@ This is part of the body too.\n";
             "a missing per-id answer must keep the keyword filter's own accept: {gated:?}"
         );
     }
+
+    // Jev determinism fix: no "below floor but thin margin" test lives here
+    // by design -- `MEMORY_RELEVANCE_FLOOR` (0.3) sits far enough from 0.5
+    // that every value below it already has margin `>= |0.3 - 0.5| * 2 =
+    // 0.4`, well clear of `jev::DEFAULT_MIN_MARGIN` (0.2) this site checks
+    // against (hardcoded, not `cfg.proxy.min_margin` -- see `apply_jev_
+    // harvest_gate`'s own call). A below-floor verdict is therefore ALWAYS
+    // decisive here; the margin gate is real (see `jev::Answer::decisive`'s
+    // own tests for the mechanism) but structurally a no-op at this
+    // particular site's floor. `rerank_memory_candidates_treats_a_thin_
+    // margin_noul_as_not_decisive` in `compile.rs` exercises the same
+    // mechanism at a floor (0.3, checked as `>=`) whose PASSING side does
+    // reach into the thin-margin band.
 
     /// Issue #37: shared writes must remain ordinary visible working-tree
     /// changes -- Zirv must never auto-commit them. No model involved: this

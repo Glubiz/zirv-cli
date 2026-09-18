@@ -12,20 +12,26 @@ use crate::commands::ctx::config::ProxyTypesafeConfig;
 use crate::commands::ctx::jev;
 
 /// Runs one bounded `/systemone` call via [`jev::ask`] and converts its
-/// answers into the neutral [`Answers`] shape.
+/// answers into the neutral [`Answers`] shape. The `cached` half of `ask`'s
+/// own result is dropped here: the harness proxy's own persistence
+/// (`proxy::persist`, a different file from `jev::record`'s) does not yet
+/// carry that flag, so a caller wanting it should call `jev::ask` directly.
 pub fn decide(
     cfg: &ProxyTypesafeConfig,
+    state_dir: &std::path::Path,
+    cache_ttl_secs: u64,
     intake: &IntakeState,
     questions: &[Question],
 ) -> Result<(Answers, Usage), TypesafeError> {
-    jev::ask(cfg, intake, questions)
+    jev::ask(cfg, state_dir, cache_ttl_secs, intake, questions)
+        .map(|(answers, usage, _cached)| (answers, usage))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::ctx::proxy::decision::{
-        AnswerValue, BranchChanges, Criteria, IntakePolicy, IntakeRepository, QuestionKind,
+        AnswerValue, Criteria, IntakePolicy, IntakeRepository, QuestionKind,
     };
 
     fn fixture(name: &str) -> std::path::PathBuf {
@@ -40,9 +46,6 @@ mod tests {
             request: "fix the typo".to_string(),
             repository: IntakeRepository {
                 name: "repo".to_string(),
-                uncommitted_or_branch_changes: BranchChanges { files: 0, lines: 0 },
-                active_workflow: None,
-                primary_extensions: Vec::new(),
             },
             workflows: Vec::new(),
             policy: IntakePolicy {
@@ -96,8 +99,15 @@ mod tests {
             model: "jev-latest".to_string(),
             timeout_secs: 5,
         };
+        let state_dir = tempfile::tempdir().expect("tempdir");
 
-        let result = decide(&cfg, &sample_intake(), &sample_questions());
+        let result = decide(
+            &cfg,
+            state_dir.path(),
+            0,
+            &sample_intake(),
+            &sample_questions(),
+        );
 
         // SAFETY (test-only): removing the same unique env var set above.
         unsafe {
