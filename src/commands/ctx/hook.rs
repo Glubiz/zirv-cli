@@ -2086,6 +2086,23 @@ fn pretool_intent(payload: &PreToolPayload) -> super::lifecycle::ToolIntent {
     }
 }
 
+/// The original `tool_input` object exactly as claude sent it -- every field
+/// it carried, known or unknown -- re-read from the raw payload rather than
+/// the typed [`PreToolInput`] (issue #537 A5 review finding): claude's
+/// `updatedInput` REPLACES the whole `tool_input` object rather than merging
+/// into it, so a rewrite built only from the fields `PreToolInput` models
+/// would silently drop anything else the real call carried (e.g.
+/// `isolation`). `stdin` has already parsed successfully once by the time
+/// this runs (`run_pretool`'s own `PreToolPayload::parse` at the top), so
+/// this reparse cannot fail in practice; a defensive empty object covers it
+/// regardless.
+fn raw_tool_input(stdin: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(stdin)
+        .ok()
+        .and_then(|value| value.get("tool_input").cloned())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 /// `payload.cwd` when it names one, else the process's own current
 /// directory -- the one cwd-resolution rule every PreToolUse guard that
 /// needs a repository root applies, shared so the file-modification guard
@@ -2141,12 +2158,36 @@ fn omitted_model_on_generic_type(seat: &str, tool_name: &str, input: &PreToolInp
 /// `updatedInput` -- mirroring [`pretool_rewrite_output`]'s own shape for the
 /// `Bash` rewrite, the one other place this hook rewrites a tool call rather
 /// than merely allowing or denying it outright.
-fn pretool_dispatch_tier_output(model: &str, note: &str) -> String {
+///
+/// Review finding: claude's `updatedInput` REPLACES the tool's whole input
+/// object rather than merging into it, so `updatedInput` here must be the
+/// ORIGINAL `tool_input` (`original_tool_input`, [`raw_tool_input`]) with
+/// `model` inserted or overwritten -- never a bare `{"model": ...}`, which
+/// would launch the dispatch with no `prompt`, no `subagent_type` and no
+/// `description` at all.
+fn pretool_dispatch_tier_output(
+    original_tool_input: &serde_json::Value,
+    model: &str,
+    note: &str,
+) -> String {
+    let mut updated_input = original_tool_input.clone();
+    match updated_input.as_object_mut() {
+        Some(object) => {
+            object.insert(
+                "model".to_string(),
+                serde_json::Value::String(model.to_string()),
+            );
+        }
+        // The original was not a JSON object at all (malformed payload) --
+        // never reachable in practice, but a bare model object is still a
+        // safer fallback than propagating a non-object `updatedInput`.
+        None => updated_input = serde_json::json!({ "model": model }),
+    }
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "updatedInput": { "model": model },
+            "updatedInput": updated_input,
             "additionalContext": note
         }
     })
@@ -2164,12 +2205,16 @@ fn pretool_dispatch_tier_output(model: &str, note: &str) -> String {
 /// `subagent_type`: both are excluded before this is even reached. Takes
 /// `cfg`/`state` directly (rather than resolving them itself from `env`) so
 /// it is directly unit-testable against a canned Jev response, the same
-/// split every other `[jev]`-gated site in this codebase uses.
+/// split every other `[jev]`-gated site in this codebase uses. `tool_input`
+/// is the ORIGINAL raw `tool_input` object ([`raw_tool_input`]), threaded
+/// through unchanged to [`pretool_dispatch_tier_output`] -- see its own doc
+/// comment for why a rebuild from typed fields alone would be wrong.
 fn dispatch_tier_advise(
     cfg: &CtxConfig,
     state: &StateDir,
     seat: &str,
     payload: &PreToolPayload,
+    tool_input: &serde_json::Value,
 ) -> Option<String> {
     if !omitted_model_on_generic_type(seat, &payload.tool_name, &payload.tool_input) {
         return None;
@@ -2209,6 +2254,7 @@ fn dispatch_tier_advise(
     let vendor = super::catalogue::vendor(vendor_slug)?;
     let alias = super::catalogue::tier_model(vendor, tier)?;
     Some(pretool_dispatch_tier_output(
+        tool_input,
         alias,
         &format!(
             "zirv: model {alias} chosen for this dispatch (tier {tier_label}, {:.2})",
@@ -2220,17 +2266,20 @@ fn dispatch_tier_advise(
 /// The production wrapper around [`dispatch_tier_advise`]: resolves `cfg`/
 /// `state` from `env` exactly as the file-modification guard below resolves
 /// its own `cfg` (same [`resolved_cwd`]/[`cfg_or_operator_only_gate`]
-/// pair), then delegates. `None` on an unresolvable cwd or state directory,
-/// same fail-open posture as every other best-effort lookup on this path.
+/// pair) and the original `tool_input` from `stdin` ([`raw_tool_input`]),
+/// then delegates. `None` on an unresolvable cwd or state directory, same
+/// fail-open posture as every other best-effort lookup on this path.
 fn dispatch_tier_override(
     seat: &str,
     payload: &PreToolPayload,
+    stdin: &str,
     env: EnvLookup<'_>,
 ) -> Option<String> {
     let cwd = resolved_cwd(payload)?;
     let cfg = cfg_or_operator_only_gate(&cwd, env);
     let state = StateDir::resolve(env).ok()?;
-    dispatch_tier_advise(&cfg, &state, seat, payload)
+    let tool_input = raw_tool_input(stdin);
+    dispatch_tier_advise(&cfg, &state, seat, payload, &tool_input)
 }
 
 // -- PreToolUse: the orchestrator-write guard (issues #328/#334) -----------
@@ -2670,7 +2719,7 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     if let Some(seat) = env(adapters::SEAT_MODEL_ENV)
         && let Some(reason) = pretool_decision(Some(&seat), &payload)
     {
-        if let Some(output) = dispatch_tier_override(&seat, &payload, env) {
+        if let Some(output) = dispatch_tier_override(&seat, &payload, stdin, env) {
             let _ = writeln!(w, "{output}");
             return Ok(0);
         }
@@ -6691,12 +6740,20 @@ mod tests {
 
     // -- dispatch_tier_advise (issue #537 A5) ---------------------------------
 
-    fn agent_payload(subagent_type: &str, model: &str, prompt: &str) -> PreToolPayload {
-        PreToolPayload::parse(&pretool_stdin(
-            "Agent",
-            serde_json::json!({"subagent_type": subagent_type, "model": model, "prompt": prompt}),
-        ))
-        .expect("the documented payload must parse")
+    /// Returns the parsed payload alongside the exact raw `tool_input` JSON
+    /// it was built from -- `dispatch_tier_advise` needs both: the typed
+    /// payload for its own gate checks, the raw value for what it must hand
+    /// back unchanged via `updatedInput` (review finding).
+    fn agent_payload(
+        subagent_type: &str,
+        model: &str,
+        prompt: &str,
+    ) -> (PreToolPayload, serde_json::Value) {
+        let tool_input =
+            serde_json::json!({"subagent_type": subagent_type, "model": model, "prompt": prompt});
+        let payload = PreToolPayload::parse(&pretool_stdin("Agent", tool_input.clone()))
+            .expect("the documented payload must parse");
+        (payload, tool_input)
     }
 
     fn jev_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
@@ -6713,7 +6770,7 @@ mod tests {
     /// `Tier::Standard` to `sonnet`.
     #[test]
     fn dispatch_tier_advise_allows_a_standard_tier_dispatch_with_a_right_sized_model() {
-        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
         let body = r#"{"model": "jev-latest", "answers": {
             "tier": {"type": "score", "score": 1.0,
                      "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
@@ -6729,7 +6786,7 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
 
         unsafe {
             std::env::remove_var(credential_env);
@@ -6754,7 +6811,7 @@ mod tests {
     /// (0.6) -- must fall through so the caller denies exactly as today.
     #[test]
     fn dispatch_tier_advise_falls_through_below_the_confidence_floor() {
-        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
         let body = r#"{"model": "jev-latest", "answers": {
             "tier": {"type": "score", "score": 1.0,
                      "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
@@ -6770,7 +6827,7 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
 
         unsafe {
             std::env::remove_var(credential_env);
@@ -6782,7 +6839,7 @@ mod tests {
     /// A 500 must fall through so the caller denies exactly as today.
     #[test]
     fn dispatch_tier_advise_falls_through_on_a_500() {
-        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
         let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
         let credential_env = "HOOK_TEST_JEV_DISPATCH_500";
         // SAFETY (test-only): a unique env var name this test owns.
@@ -6793,7 +6850,7 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
 
         unsafe {
             std::env::remove_var(credential_env);
@@ -6806,7 +6863,7 @@ mod tests {
     /// credential that looks available.
     #[test]
     fn dispatch_tier_advise_is_none_when_the_gate_is_off() {
-        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
         let credential_env = "HOOK_TEST_JEV_DISPATCH_GATE_OFF";
         // The credential looks available, so a bug that ignored the gate
         // would still attempt a call rather than short-circuiting on it.
@@ -6819,7 +6876,7 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
 
         unsafe {
             std::env::remove_var(credential_env);
@@ -6832,7 +6889,8 @@ mod tests {
     /// merely a `None` a network failure could also produce.
     #[test]
     fn dispatch_tier_advise_never_calls_out_for_an_explicit_model() {
-        let payload = agent_payload("general-purpose", "opus", "implement the feature");
+        let (payload, tool_input) =
+            agent_payload("general-purpose", "opus", "implement the feature");
         let credential_env = "HOOK_TEST_JEV_DISPATCH_EXPLICIT_MODEL";
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
@@ -6842,7 +6900,7 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
 
         unsafe {
             std::env::remove_var(credential_env);
@@ -6858,7 +6916,7 @@ mod tests {
     /// pins its own model) must never even attempt a call either.
     #[test]
     fn dispatch_tier_advise_never_calls_out_for_a_named_custom_subagent_type() {
-        let payload = agent_payload("vault-keeper", "", "implement the feature");
+        let (payload, tool_input) = agent_payload("vault-keeper", "", "implement the feature");
         let credential_env = "HOOK_TEST_JEV_DISPATCH_CUSTOM_TYPE";
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
@@ -6868,13 +6926,78 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
 
         unsafe {
             std::env::remove_var(credential_env);
         }
         assert!(output.is_none());
         assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+    }
+
+    /// Review finding (issue #537 A5): claude's `updatedInput` REPLACES the
+    /// tool's whole input object rather than merging into it, so a rewrite
+    /// built only from the fields the inserted `model` needed would
+    /// silently drop `prompt`/`subagent_type`/`description` -- and anything
+    /// the payload carried that `PreToolInput` does not even model, such as
+    /// the Agent tool's own `isolation` parameter. Every one of those must
+    /// survive, unchanged, alongside the inserted `model`.
+    #[test]
+    fn dispatch_tier_advise_preserves_every_original_field_alongside_the_inserted_model() {
+        let tool_input = serde_json::json!({
+            "subagent_type": "general-purpose",
+            "model": "",
+            "prompt": "implement the feature",
+            "description": "implement thing",
+            "isolation": "worktree"
+        });
+        let payload = PreToolPayload::parse(&pretool_stdin("Agent", tool_input.clone()))
+            .expect("the documented payload must parse");
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "score", "score": 1.0,
+                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
+                     "probabilities": {"0": 0.1, "1": 0.8, "2": 0.1}, "confidence": 0.8}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_PRESERVE_FIELDS";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        let output = output.expect("a confident answer must allow");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(
+            updated["model"], "sonnet",
+            "the model must be inserted/overwritten: {updated}"
+        );
+        assert_eq!(
+            updated["prompt"], "implement the feature",
+            "the prompt must survive: {updated}"
+        );
+        assert_eq!(
+            updated["subagent_type"], "general-purpose",
+            "subagent_type must survive: {updated}"
+        );
+        assert_eq!(
+            updated["description"], "implement thing",
+            "description must survive: {updated}"
+        );
+        assert_eq!(
+            updated["isolation"], "worktree",
+            "an unmodeled field must survive too: {updated}"
+        );
     }
 
     /// A named `.claude/agents/<name>.md` definition carries its own `model`
