@@ -122,7 +122,6 @@ impl Question {
     }
 
     /// A yes/no question naming what `true`/`false` each mean.
-    #[allow(dead_code)]
     pub(crate) fn noul(id: &str, instructions: &str, when_true: &str, when_false: &str) -> Self {
         Question {
             id: id.to_string(),
