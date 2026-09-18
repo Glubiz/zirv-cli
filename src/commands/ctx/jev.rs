@@ -39,6 +39,7 @@
 //! empty -> `NoCredential`, checked BEFORE opening any connection.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -121,7 +122,6 @@ impl Question {
     }
 
     /// A yes/no question naming what `true`/`false` each mean.
-    #[allow(dead_code)]
     pub(crate) fn noul(id: &str, instructions: &str, when_true: &str, when_false: &str) -> Self {
         Question {
             id: id.to_string(),
@@ -477,11 +477,9 @@ pub(crate) fn ask(
 /// Whether `cfg`'s credential env is set and non-empty -- the cheap half of
 /// deciding whether a `[jev]`-gated site should bother calling [`ask`] at
 /// all (the other half is that site's own `[jev]` key; see
-/// `config::JevConfig`'s own doc comment). Not yet called from any non-test
-/// code -- the first `[jev]`-gated site is this task's own first consumer,
-/// the same dormant-until-wired posture `mod.rs::prompt_layer` already
-/// holds to.
-#[allow(dead_code)]
+/// `config::JevConfig`'s own doc comment). Also what `proxy::activation`
+/// checks for the harness proxy's own `typesafe` decider, so the two never
+/// drift on what "usable" means.
 pub(crate) fn available(cfg: &ProxyTypesafeConfig) -> bool {
     std::env::var(&cfg.credential_env)
         .map(|value| !value.is_empty())
@@ -496,6 +494,24 @@ const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
 /// site asked.
 #[allow(dead_code)]
 const JEV_SPEND_AGENT: &str = "typesafe";
+
+/// This process's own `(session, principal)` -- `ZIRV_CTX_SESSION`/
+/// `ZIRV_PRINCIPAL`, falling back to `"proxy"`/`"root"` only when unset, the
+/// same "root session, no inherited envelope" convention `agent::
+/// root_envelope` establishes. Shared by [`record`] and `proxy::persist` so
+/// the two spend-adjacent recorders never drift on what an absent value
+/// means.
+pub(crate) fn session_and_principal() -> (String, String) {
+    let session = std::env::var(adapters::SESSION_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "proxy".to_string());
+    let principal = std::env::var(agent::PRINCIPAL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "root".to_string());
+    (session, principal)
+}
 
 #[derive(Debug, Serialize)]
 struct DecisionRecord<'a> {
@@ -515,9 +531,14 @@ struct DecisionRecord<'a> {
 /// through the same catalogue vendor the harness proxy already does. The
 /// harness proxy keeps recording its own `proxy-decisions.jsonl` and spend
 /// row via `proxy::persist` -- this is for every OTHER `[jev]`-gated site,
-/// never a second record for the proxy's own call. Best-effort like every
-/// other append in this crate's flat logs: a write failure here must never
-/// break the caller's own (already-computed) decision.
+/// never a second record for the proxy's own call. Appends via
+/// `state::open_private_append`, the same `O_APPEND`-backed write
+/// `proxy::persist` itself uses for its own decisions file -- a prior
+/// version read the whole file, appended in memory, and rewrote it with
+/// `state::write_private`, which lost a line whenever two zirv processes
+/// recorded at the same time (review finding). Best-effort like every other
+/// append in this crate's flat logs: a write failure here must never break
+/// the caller's own (already-computed) decision.
 pub(crate) fn record(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -538,25 +559,12 @@ pub(crate) fn record(
     };
     if let Ok(line) = serde_json::to_string(&record)
         && state::create_private_dir_all(state.root()).is_ok()
+        && let Ok(mut file) = state::open_private_append(&state.root().join(JEV_DECISIONS_FILE))
     {
-        let path = state.root().join(JEV_DECISIONS_FILE);
-        let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        contents.push_str(&line);
-        contents.push('\n');
-        let _ = state::write_private(&path, &contents);
+        let _ = writeln!(file, "{line}");
     }
 
-    let session = std::env::var(adapters::SESSION_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "proxy".to_string());
-    let principal = std::env::var(agent::PRINCIPAL_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "root".to_string());
+    let (session, principal) = session_and_principal();
     let _ = log::append_delegation(
         state,
         &log::Delegation {
@@ -638,7 +646,7 @@ pub(crate) fn advise(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -898,6 +906,48 @@ mod tests {
             Some(cfg.proxy.typesafe.model.as_str())
         );
         assert_eq!(delegations[0].input_tokens, 10);
+    }
+
+    /// Review finding: `record` used to read the whole file, append in
+    /// memory, and rewrite it with `state::write_private` -- a lost-update
+    /// race between two concurrent zirv processes recording at once. Now an
+    /// `O_APPEND` write (`state::open_private_append`), the same primitive
+    /// `proxy::persist` already uses for its own decisions file: two
+    /// sequential calls must leave exactly two lines, in call order, with
+    /// the first line byte-identical to what it was before the second call
+    /// ever ran (never truncated, never rewritten).
+    #[test]
+    fn record_called_twice_appends_two_lines_and_never_truncates() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: 0,
+        };
+
+        record(&state, &cfg, "memory", &Answers::new(), &usage, 5, &[]);
+        let path = state_dir.path().join(JEV_DECISIONS_FILE);
+        let after_first = std::fs::read_to_string(&path).expect("jev-decisions.jsonl");
+        let first_line = after_first.lines().next().expect("one line").to_string();
+
+        record(&state, &cfg, "supervisor", &Answers::new(), &usage, 7, &[]);
+        let after_second = std::fs::read_to_string(&path).expect("jev-decisions.jsonl");
+        let lines: Vec<&str> = after_second.lines().collect();
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "two record() calls must leave two lines, never truncate: {after_second:?}"
+        );
+        assert_eq!(
+            lines[0], first_line,
+            "the first call's own line must survive byte-identical"
+        );
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("parse first line");
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("parse second line");
+        assert_eq!(first["site"], "memory");
+        assert_eq!(second["site"], "supervisor");
     }
 
     #[test]
