@@ -3263,11 +3263,11 @@ timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 # the shared Jev client; each is also gated on the `[proxy.typesafe]`
 # credential actually being set (see "Harness proxy" above)
 [jev]
-memory = false      # ZIRV_CTX_JEV_MEMORY
-supervisor = false  # ZIRV_CTX_JEV_SUPERVISOR
-dispatch = false    # ZIRV_CTX_JEV_DISPATCH
-review = false      # ZIRV_CTX_JEV_REVIEW
-gates = false       # ZIRV_CTX_JEV_GATES
+memory = false      # reranks retrieval, gates harvest; ZIRV_CTX_JEV_MEMORY
+supervisor = false  # judge pre-filter, crash triage, handoff quality; ZIRV_CTX_JEV_SUPERVISOR
+dispatch = false    # model tier for an omitted Agent model; ZIRV_CTX_JEV_DISPATCH
+review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
+gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 ```
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state

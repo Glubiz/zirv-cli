@@ -23,6 +23,10 @@
 //! liveness question is involved, a caller-supplied `bool` -- the same
 //! "caller supplies liveness" testability seam `group::is_abandoned` already
 //! uses) -- never a clock read or a process probe of its own.
+//! `respawn_decision_with_jev` (issue #537 A4) is the one exception: a
+//! gated, best-effort wrapper that may call out to Jev, but only ever to
+//! NARROW `respawn_decision`'s own pure verdict, never to override a
+//! `Refuse` or to soften an `AutoBlock`/`Respawn` the other way.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -31,7 +35,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
-use super::config::EnvLookup;
+use super::config::{CtxConfig, EnvLookup};
+use super::jev;
 use super::state::{StateDir, create_private_dir_all, write_private};
 
 pub const EVENTS_FILE: &str = "events.jsonl";
@@ -744,6 +749,121 @@ pub fn respawn_decision(card: &Card, exit: ExitKind, max_attempts: u32) -> Respa
                 RespawnVerdict::Respawn
             }
         }
+    }
+}
+
+fn exit_kind_label(exit: ExitKind) -> &'static str {
+    match exit {
+        ExitKind::Crash => "crash",
+        ExitKind::SilentZero => "silent_zero",
+        ExitKind::Reported => "reported",
+    }
+}
+
+/// Issue #537 (A4): from a live 2026-09-18 probe -- 10/12 correct, the
+/// highest-scoring wrong answer at 0.88.
+const CRASH_TRIAGE_FLOOR: f32 = 0.9;
+
+#[derive(Debug, Serialize)]
+struct CrashAdviseState<'a> {
+    block_reason: String,
+    exit_kind: &'a str,
+    attempt: u32,
+    max_attempts: u32,
+}
+
+/// Issue #537 (A4): when [`respawn_decision`]'s own keyword check on
+/// `block_reason` did not match, asks Jev (site `"crash"`) to semantically
+/// triage it: `access` (an authentication/authorization/credential/login/
+/// quota/permission problem a retry cannot fix) or `deterministic` (a bug,
+/// compile error or missing file that will recur identically) at or above
+/// [`CRASH_TRIAGE_FLOOR`] takes the same [`RespawnVerdict::AutoBlock`] path
+/// the keyword match already takes, with its own reason text. `transient`, a
+/// low-confidence answer, or no answer at all (gate off, no credential, any
+/// transport/parse error -- `jev::advise`'s own contract) returns `None`, so
+/// the caller falls through to today's attempt-count logic unchanged.
+fn jev_crash_cause(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    block_reason: &str,
+    exit: ExitKind,
+    attempt: u32,
+    max_attempts: u32,
+) -> Option<RespawnVerdict> {
+    let advise_state = CrashAdviseState {
+        block_reason: crate::utils::truncate_bytes(block_reason.to_string(), Some(1024)),
+        exit_kind: exit_kind_label(exit),
+        attempt,
+        max_attempts,
+    };
+    let questions = [jev::Question::choice(
+        "cause",
+        "Why did this worker fail, from its block reason?",
+        &[
+            (
+                "transient",
+                "network, timeout, out of memory, crash or rate limit that a fresh attempt may pass",
+            ),
+            (
+                "access",
+                "authentication, authorization, credential, login, quota or permission problem a \
+                 retry cannot fix",
+            ),
+            (
+                "deterministic",
+                "a bug, compile error or missing file that will recur identically",
+            ),
+        ],
+    )];
+    let answers = jev::advise(
+        cfg,
+        state,
+        "crash",
+        cfg.jev.supervisor,
+        &advise_state,
+        &questions,
+    )?;
+    let answer = answers.get("cause")?;
+    if answer.confidence < CRASH_TRIAGE_FLOOR {
+        return None;
+    }
+    match answer.as_choice()? {
+        "access" => Some(RespawnVerdict::AutoBlock(format!(
+            "blocked on '{block_reason}': an access/credential problem a retry cannot fix"
+        ))),
+        "deterministic" => Some(RespawnVerdict::AutoBlock(format!(
+            "blocked on '{block_reason}': a deterministic failure that will recur identically"
+        ))),
+        _ => None, // "transient", or any other value: fall through.
+    }
+}
+
+/// Issue #537 (A4): the gated wrapper around [`respawn_decision`] --
+/// [`respawn_decision`] itself stays pure and its keyword check stays first
+/// and unchanged. When it already returns [`RespawnVerdict::Refuse`] (the
+/// card already succeeded, or the keyword check itself matched), that
+/// verdict is returned as-is -- Jev is never even asked, let alone allowed
+/// to override a refusal. Otherwise, when `card.block` carries a reason the
+/// keyword check did not match, one confident [`jev_crash_cause`] triage may
+/// additionally narrow a `Respawn`/attempt-ceiling `AutoBlock` verdict to an
+/// earlier `AutoBlock` -- never the reverse.
+pub(crate) fn respawn_decision_with_jev(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    card: &Card,
+    exit: ExitKind,
+    max_attempts: u32,
+) -> RespawnVerdict {
+    let base = respawn_decision(card, exit, max_attempts);
+    if matches!(base, RespawnVerdict::Refuse(_)) {
+        return base;
+    }
+    let Some(block) = &card.block else {
+        return base;
+    };
+    match jev_crash_cause(cfg, state, &block.reason, exit, card.attempts, max_attempts) {
+        Some(verdict) => verdict,
+        None => base,
     }
 }
 
@@ -2239,6 +2359,190 @@ mod tests {
             respawn_decision(&card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS),
             RespawnVerdict::Refuse(_)
         ));
+    }
+
+    // -- respawn_decision_with_jev (issue #537 A4) ----------------------------
+
+    fn jev_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.supervisor = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// The keyword check on `card.block.reason` (`"missing AUTH token"`)
+    /// matches and refuses -- with the gate ON and a credential set, so a
+    /// bug that called Jev before checking keywords would still attempt a
+    /// call. No `jev-decisions.jsonl` file must exist afterward: proof no
+    /// call was ever even attempted, not merely that one failed silently.
+    #[test]
+    fn respawn_decision_with_jev_never_calls_out_when_the_keyword_check_already_matched() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.block = Some(Block {
+            reason: "missing AUTH token".to_string(),
+            by: "sess-1".to_string(),
+        });
+        let credential_env = "TASK_TEST_JEV_KEYWORD_MATCH";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let verdict =
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert!(matches!(verdict, RespawnVerdict::Refuse(_)));
+        assert!(
+            !state_dir.path().join("jev-decisions.jsonl").exists(),
+            "the keyword match must short-circuit before any Jev call is attempted"
+        );
+    }
+
+    /// A block reason with no keyword hit ("token expired, run login
+    /// again") and a confident `access` answer (0.95, at or above
+    /// `CRASH_TRIAGE_FLOOR`) auto-blocks -- the same path the keyword match
+    /// takes, reached here through Jev instead. `attempts` is well below the
+    /// ceiling, so a bare `Respawn` would otherwise result: the `AutoBlock`
+    /// is attributable only to Jev.
+    #[test]
+    fn respawn_decision_with_jev_auto_blocks_on_a_confident_access_answer() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.attempts = 1;
+        card.block = Some(Block {
+            reason: "token expired, run login again".to_string(),
+            by: "sess-1".to_string(),
+        });
+        let body = r#"{"model": "jev-latest", "answers": {
+            "cause": {"type": "choice", "choice": "access",
+                      "probabilities": {"access": 0.95}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "TASK_TEST_JEV_ACCESS_095";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let verdict =
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(
+            matches!(verdict, RespawnVerdict::AutoBlock(_)),
+            "{verdict:?}"
+        );
+    }
+
+    /// The identical `access` answer at 0.85 -- below `CRASH_TRIAGE_FLOOR`
+    /// (0.9) -- must fall through to today's attempt-count logic
+    /// unchanged: `Respawn`, since `attempts` is below the ceiling.
+    #[test]
+    fn respawn_decision_with_jev_falls_through_below_the_confidence_floor() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.attempts = 1;
+        card.block = Some(Block {
+            reason: "token expired, run login again".to_string(),
+            by: "sess-1".to_string(),
+        });
+        let body = r#"{"model": "jev-latest", "answers": {
+            "cause": {"type": "choice", "choice": "access",
+                      "probabilities": {"access": 0.85}, "confidence": 0.85}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "TASK_TEST_JEV_ACCESS_085";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let verdict =
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert_eq!(verdict, RespawnVerdict::Respawn);
+    }
+
+    /// A transport/HTTP error (a 500) must fall through to today's
+    /// attempt-count logic unchanged.
+    #[test]
+    fn respawn_decision_with_jev_falls_through_on_a_500() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.attempts = 1;
+        card.block = Some(Block {
+            reason: "token expired, run login again".to_string(),
+            by: "sess-1".to_string(),
+        });
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let credential_env = "TASK_TEST_JEV_500";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let verdict =
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert_eq!(verdict, RespawnVerdict::Respawn);
+    }
+
+    /// The gate off must be byte-identical to calling `respawn_decision`
+    /// directly -- no call even attempted, despite a block reason with no
+    /// keyword hit and a credential that looks available.
+    #[test]
+    fn respawn_decision_with_jev_is_identical_to_the_pure_function_when_the_gate_is_off() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.attempts = 1;
+        card.block = Some(Block {
+            reason: "token expired, run login again".to_string(),
+            by: "sess-1".to_string(),
+        });
+        let credential_env = "TASK_TEST_JEV_GATE_OFF";
+        // The credential looks available, so a bug that ignored the gate
+        // would still attempt a call rather than short-circuiting on it.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.supervisor, "the gate defaults off");
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let baseline = respawn_decision(&card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+        let verdict =
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert_eq!(verdict, baseline);
     }
 
     // -- CLI verbs, end to end ------------------------------------------------

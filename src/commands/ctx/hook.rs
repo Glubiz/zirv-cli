@@ -1997,6 +1997,10 @@ pub struct PreToolInput {
     /// and fails open on it instead of denying on the zero values `#[serde(
     /// default)]` invented for fields the payload never carried at all.
     pub prompt: String,
+    /// The Agent tool's own short (3-5 word) task description (issue #537
+    /// A5): purely descriptive context for the dispatch-tier advisory, never
+    /// consulted by the deterministic guard above.
+    pub description: String,
     /// `Edit`/`Write`/`MultiEdit`'s own target path (issue #334).
     pub file_path: String,
     /// `NotebookEdit`'s own target path (issue #334).
@@ -2080,6 +2084,153 @@ fn pretool_intent(payload: &PreToolPayload) -> super::lifecycle::ToolIntent {
         }),
         delegated: !payload.agent_id.is_empty(),
     }
+}
+
+/// `payload.cwd` when it names one, else the process's own current
+/// directory -- the one cwd-resolution rule every PreToolUse guard that
+/// needs a repository root applies, shared so the file-modification guard
+/// below and the dispatch-tier advisory never resolve it two different ways.
+fn resolved_cwd(payload: &PreToolPayload) -> Option<PathBuf> {
+    if !payload.cwd.is_empty() {
+        return Some(PathBuf::from(&payload.cwd));
+    }
+    std::env::current_dir().ok()
+}
+
+// -- PreToolUse: the dispatch model-tier advisory (issue #537 A5) ----------
+
+/// Issue #537 (A5): from a live 2026-09-18 probe -- 9/10 correct at 0.6.
+const DISPATCH_TIER_FLOOR: f32 = 0.6;
+
+#[derive(Debug, Serialize)]
+struct DispatchAdviseState<'a> {
+    brief: String,
+    subagent_type: &'a str,
+    description: &'a str,
+}
+
+/// True only for the one [`super::lifecycle::subagent_admission`] deny
+/// reachable by an OMITTED `model` -- a fork (which denies regardless of
+/// `model`, ignoring it outright) and an explicit model that merely re-asks
+/// for the seat tier by name (denied BECAUSE a model was given) are both
+/// excluded, mirroring that function's own three-way split so the two never
+/// drift. `subagent_admission` itself is not called here: it collapses all
+/// three sub-cases into one reason string, which cannot be told apart after
+/// the fact, so this stays a small, deliberate duplicate of its guard
+/// conditions for the one sub-case Jev may narrow.
+fn omitted_model_on_generic_type(seat: &str, tool_name: &str, input: &PreToolInput) -> bool {
+    if !super::lifecycle::names_expensive_tier(seat) {
+        return false;
+    }
+    if !super::lifecycle::SUBAGENT_TOOLS.contains(&tool_name) {
+        return false;
+    }
+    if input.prompt.trim().is_empty() {
+        return false;
+    }
+    let subagent_type = input.subagent_type.trim();
+    let model = input.model.trim();
+    model.is_empty()
+        && subagent_type != "fork"
+        && (subagent_type.is_empty()
+            || super::lifecycle::GENERIC_SUBAGENT_TYPES.contains(&subagent_type))
+}
+
+/// The `updatedInput`/`additionalContext` envelope for a dispatch Jev has
+/// right-sized: the same `allow` shape [`pretool_advise_output`] prints, plus
+/// `updatedInput` -- mirroring [`pretool_rewrite_output`]'s own shape for the
+/// `Bash` rewrite, the one other place this hook rewrites a tool call rather
+/// than merely allowing or denying it outright.
+fn pretool_dispatch_tier_output(model: &str, note: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": { "model": model },
+            "additionalContext": note
+        }
+    })
+    .to_string()
+}
+
+/// Issue #537 (A5): when [`pretool_decision`]'s deny is reachable ONLY by an
+/// omitted `model` on a generic (or empty) `subagent_type`
+/// ([`omitted_model_on_generic_type`]) and `cfg.jev.dispatch` is on, asks Jev
+/// to right-size the model instead of denying outright. At or above
+/// [`DISPATCH_TIER_FLOOR`], returns the allow-with-rewrite envelope; below
+/// it, no answer, or any error (`jev::advise`'s own contract -- gate off, no
+/// credential, transport/parse failure) returns `None` so the caller denies
+/// exactly as today. Never touches an explicit `model` or a named custom
+/// `subagent_type`: both are excluded before this is even reached. Takes
+/// `cfg`/`state` directly (rather than resolving them itself from `env`) so
+/// it is directly unit-testable against a canned Jev response, the same
+/// split every other `[jev]`-gated site in this codebase uses.
+fn dispatch_tier_advise(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    seat: &str,
+    payload: &PreToolPayload,
+) -> Option<String> {
+    if !omitted_model_on_generic_type(seat, &payload.tool_name, &payload.tool_input) {
+        return None;
+    }
+    let advise_state = DispatchAdviseState {
+        brief: crate::utils::truncate_bytes(payload.tool_input.prompt.clone(), Some(4 * 1024)),
+        subagent_type: payload.tool_input.subagent_type.as_str(),
+        description: payload.tool_input.description.as_str(),
+    };
+    let questions = [super::jev::Question::score(
+        "tier",
+        "How capable a model does this dispatch actually need?",
+        &[
+            "cheap: mechanical or bulk edits, formatting, simple lookups",
+            "standard: ordinary implementation, tests, focused review",
+            "frontier: hard debugging, concurrency, architecture, security design",
+        ],
+    )];
+    let answers = super::jev::advise(
+        cfg,
+        state,
+        "dispatch",
+        cfg.jev.dispatch,
+        &advise_state,
+        &questions,
+    )?;
+    let answer = answers.get("tier")?;
+    if answer.confidence < DISPATCH_TIER_FLOOR {
+        return None;
+    }
+    let (tier, tier_label) = match answer.as_score()? as i64 {
+        0 => (super::catalogue::Tier::Cheap, "cheap"),
+        1 => (super::catalogue::Tier::Standard, "standard"),
+        _ => (super::catalogue::Tier::Deep, "frontier"),
+    };
+    let vendor_slug = super::catalogue::vendor_of(seat)?;
+    let vendor = super::catalogue::vendor(vendor_slug)?;
+    let alias = super::catalogue::tier_model(vendor, tier)?;
+    Some(pretool_dispatch_tier_output(
+        alias,
+        &format!(
+            "zirv: model {alias} chosen for this dispatch (tier {tier_label}, {:.2})",
+            answer.confidence
+        ),
+    ))
+}
+
+/// The production wrapper around [`dispatch_tier_advise`]: resolves `cfg`/
+/// `state` from `env` exactly as the file-modification guard below resolves
+/// its own `cfg` (same [`resolved_cwd`]/[`cfg_or_operator_only_gate`]
+/// pair), then delegates. `None` on an unresolvable cwd or state directory,
+/// same fail-open posture as every other best-effort lookup on this path.
+fn dispatch_tier_override(
+    seat: &str,
+    payload: &PreToolPayload,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    let cwd = resolved_cwd(payload)?;
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    let state = StateDir::resolve(env).ok()?;
+    dispatch_tier_advise(&cfg, &state, seat, payload)
 }
 
 // -- PreToolUse: the orchestrator-write guard (issues #328/#334) -----------
@@ -2519,6 +2670,10 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     if let Some(seat) = env(adapters::SEAT_MODEL_ENV)
         && let Some(reason) = pretool_decision(Some(&seat), &payload)
     {
+        if let Some(output) = dispatch_tier_override(&seat, &payload, env) {
+            let _ = writeln!(w, "{output}");
+            return Ok(0);
+        }
         let _ = writeln!(w, "{}", pretool_output(&reason));
         return Ok(0);
     }
@@ -2534,13 +2689,8 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     if !FILE_MODIFICATION_TOOLS.contains(&payload.tool_name.as_str()) {
         return Ok(0);
     }
-    let cwd = if !payload.cwd.is_empty() {
-        PathBuf::from(&payload.cwd)
-    } else {
-        let Ok(cwd) = std::env::current_dir() else {
-            return Ok(0);
-        };
-        cwd
+    let Some(cwd) = resolved_cwd(&payload) else {
+        return Ok(0);
     };
     let role = env(adapters::SEAT_ROLE_ENV);
     let cfg = cfg_or_operator_only_gate(&cwd, env);
@@ -6537,6 +6687,194 @@ mod tests {
             .is_some(),
             "empty is the same as absent"
         );
+    }
+
+    // -- dispatch_tier_advise (issue #537 A5) ---------------------------------
+
+    fn agent_payload(subagent_type: &str, model: &str, prompt: &str) -> PreToolPayload {
+        PreToolPayload::parse(&pretool_stdin(
+            "Agent",
+            serde_json::json!({"subagent_type": subagent_type, "model": model, "prompt": prompt}),
+        ))
+        .expect("the documented payload must parse")
+    }
+
+    fn jev_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.dispatch = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// A confident (0.8) `standard` tier answer allows the dispatch with a
+    /// right-sized model instead of denying it -- claude's own ladder maps
+    /// `Tier::Standard` to `sonnet`.
+    #[test]
+    fn dispatch_tier_advise_allows_a_standard_tier_dispatch_with_a_right_sized_model() {
+        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "score", "score": 1.0,
+                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
+                     "probabilities": {"0": 0.1, "1": 0.8, "2": 0.1}, "confidence": 0.8}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_STANDARD";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        let output = output.expect("a confident standard answer must allow");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedInput"]["model"],
+            "sonnet"
+        );
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        assert!(context.contains("sonnet"), "{context}");
+        assert!(context.contains("standard"), "{context}");
+    }
+
+    /// The identical `standard` answer at 0.5 -- below `DISPATCH_TIER_FLOOR`
+    /// (0.6) -- must fall through so the caller denies exactly as today.
+    #[test]
+    fn dispatch_tier_advise_falls_through_below_the_confidence_floor() {
+        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "score", "score": 1.0,
+                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
+                     "probabilities": {"0": 0.2, "1": 0.5, "2": 0.3}, "confidence": 0.5}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_LOW_CONF";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(output.is_none());
+    }
+
+    /// A 500 must fall through so the caller denies exactly as today.
+    #[test]
+    fn dispatch_tier_advise_falls_through_on_a_500() {
+        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_500";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(output.is_none());
+    }
+
+    /// The gate off must be `None` -- no call even attempted, despite a
+    /// credential that looks available.
+    #[test]
+    fn dispatch_tier_advise_is_none_when_the_gate_is_off() {
+        let payload = agent_payload("general-purpose", "", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_GATE_OFF";
+        // The credential looks available, so a bug that ignored the gate
+        // would still attempt a call rather than short-circuiting on it.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.dispatch, "the gate defaults off");
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert!(output.is_none());
+    }
+
+    /// An explicit `model` must never even attempt a call, whatever the
+    /// gate or credential -- proof is the absence of a decisions file, not
+    /// merely a `None` a network failure could also produce.
+    #[test]
+    fn dispatch_tier_advise_never_calls_out_for_an_explicit_model() {
+        let payload = agent_payload("general-purpose", "opus", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_EXPLICIT_MODEL";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert!(output.is_none());
+        assert!(
+            !state_dir.path().join("jev-decisions.jsonl").exists(),
+            "an explicit model must never even attempt a call"
+        );
+    }
+
+    /// A named custom `subagent_type` (its own `.claude/agents/<name>.md`
+    /// pins its own model) must never even attempt a call either.
+    #[test]
+    fn dispatch_tier_advise_never_calls_out_for_a_named_custom_subagent_type() {
+        let payload = agent_payload("vault-keeper", "", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_CUSTOM_TYPE";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert!(output.is_none());
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
     }
 
     /// A named `.claude/agents/<name>.md` definition carries its own `model`

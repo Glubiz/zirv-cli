@@ -4116,7 +4116,9 @@ fn pump(
                     .ok()
                     .flatten()
                     .map(|(_, h)| h);
-                let (note, source) = handoff::distill_or_structural(
+                let (note, source) = handoff::distill_or_structural_with_jev(
+                    cfg,
+                    state_dir,
                     adapter.as_ref(),
                     distiller_model.as_str(),
                     &ctx,
