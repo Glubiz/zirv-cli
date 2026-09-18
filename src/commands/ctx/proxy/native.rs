@@ -57,6 +57,7 @@ mod tests {
             seat_tier: SeatTier::Standard,
             worker_tier: catalogue::Tier::Standard,
             needs_clarification: 0.0,
+            domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),
             reasons: Vec::new(),

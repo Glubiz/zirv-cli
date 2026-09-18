@@ -353,11 +353,13 @@ first, then runs at most one model decider, starting at `cfg.proxy.decider`:
 TypeSafe Jev over HTTP (skipped with a recorded fallback when
 `TYPESAFE_API_KEY` is unset, or on any transport/HTTP error) → the existing
 helper-model chokepoint (skipped when no adapter is ready or the call fails)
-→ the deterministic baseline as is. Jev/the helper model answer exactly five
-questions — `intent`, `complexity`, `risk`, `workflow`, `needs_clarification`
-— never `execution`, seat tier or worker tier directly: a live battery found
-those unreliable, and any many-option seat/tier question never cleared the
-confidence floor. A field whose model confidence is below `min_confidence`
+→ the deterministic baseline as is. Jev/the helper model answer eleven
+questions — `intent`, `complexity`, `risk`, `workflow`, `needs_clarification`,
+and six additive domain tags (`security`, `data`, `docs_only`, `devops`,
+`architecture`, `frontend`) — never `execution`, seat tier or worker tier
+directly: a live battery found those unreliable, and any many-option seat/
+tier question never cleared the confidence floor. A field whose model
+confidence is below `min_confidence`
 keeps the baseline value instead, with a recorded reason; `complexity` and
 `risk` are always merged with `max(model, baseline)` — a monotonic floor, so
 a model decision can raise them but never lower them — and `validation` is
@@ -375,6 +377,31 @@ before it is applied. The committed `tests/fixtures/proxy/jev-battery.json`
 documents the expected ruling (execution, complexity, workflow, seat tier)
 per request class, verified against the real API; `TYPESAFE_API_KEY=...
 cargo nextest run jev_live_battery` replays it against Jev directly.
+
+**Domain tags.** A substring keyword match (the deterministic classifier's
+own security-domain detection) misses phrasing that never uses one of its
+fixed keywords — "rotate the shared token" names none of `security`/`auth`/
+`permission`/`credential`/`secret` — so a model decider is also asked
+directly, one yes/no question per tag. A confident (`>= 0.5`) `true` answer
+adds that tag to `decision.domains`; tags only ever accumulate, and a
+confident `security` tag applies the same risk/execution floor the keyword
+trigger already does (risk at least High, execution at least Bounded). Shown
+in `zirv ctx proxy`'s human/`--json` output, the `proxy:` announce line, and
+the `[zirv proxy]` prompt layer as `domains: security, data` — omitted
+everywhere when empty.
+
+**Clarification.** When the winning decision's `needs_clarification` is at
+or above `0.5`, an interactive `zirv chat`/bare `zirv` launch prints one
+prompt (`proxy: the request looks ambiguous (0.72). Add detail and press
+Enter, or press Enter to launch as is:`) and reads one line from stdin. An
+empty answer leaves the decision as is; a non-empty one is appended to the
+request (separated by a blank line) and `decide()` runs exactly once more —
+never a second round, however ambiguous the new decision still looks.
+`zirv ctx proxy` itself never prompts; it keeps printing
+`needs_clarification` as a plain field, same as every other value. A launch
+that never got the chance to ask (a dashboard pane, a resumed session) still
+carries a `clarify: ask the user one precise question before acting` line in
+its `[zirv proxy]` prompt layer at or above the same threshold.
 
 **When it takes over.** Bare `zirv` and `zirv chat` open the proxy's intake
 view first only when `[proxy] enabled = true` and the configured decider has a
@@ -437,10 +464,14 @@ timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 
 **Privacy.** The state sent to a model decider carries the request text
 (truncated to `request_max_bytes`) plus names and counts only — repository
-name, changed-file/line counts, active workflow, primary extensions, harness
-readiness/headroom, and workflow ids/descriptions — never file contents or
-secrets. The TypeSafe credential is read only from the environment variable
-named by `credential_env`.
+name, changed-file/line counts, active workflow, primary extensions, and
+workflow ids/descriptions — never file contents or secrets. The harness/
+model catalogue (names, readiness, headroom, prices) used to ride along too;
+it was dropped (no question ever read it, and TypeSafe's own guidance is
+that irrelevant state degrades answer accuracy) — the harness roster is
+still policed against the live roster directly when the decision is applied,
+never through this state. The TypeSafe credential is read only from the
+environment variable named by `credential_env`.
 
 **Price.** TypeSafe Jev is priced through the catalogue's `typesafe` vendor
 at $0.042 per MTok input, output free — see [Model

@@ -43,6 +43,19 @@ use crate::commands::workflow::selection;
 /// construction outright.
 const CLASSIFY_TASK_MAX_BYTES: usize = 4000;
 
+/// Issue #537 (A2): the additive domain tags a confident `Noul` answer may
+/// add to [`ProxyDecision::domains`] -- also the exact question ids
+/// [`questions`] asks and [`merge`] reads back, so the two can never drift
+/// out of sync with each other.
+const DOMAIN_QUESTION_IDS: [&str; 6] = [
+    "security",
+    "data",
+    "docs_only",
+    "devops",
+    "architecture",
+    "frontend",
+];
+
 /// The orchestrator seat a decision names: a harness registry name
 /// (`"claude"`, `"codex"`, ...) plus a model alias or id on that harness's
 /// own vendor ladder.
@@ -151,6 +164,13 @@ pub struct ProxyDecision {
     pub seat_tier: SeatTier,
     pub worker_tier: Tier,
     pub needs_clarification: f32,
+    /// Additive domain tags a confident Jev/helper `Noul` answer added
+    /// (issue #537 A2) -- `security`, `data`, `docs_only`, `devops`,
+    /// `architecture`, `frontend`. Never removed once added; `#[serde(
+    /// default)]` so a decision persisted before this field existed still
+    /// deserializes, as an empty list.
+    #[serde(default)]
+    pub domains: Vec<String>,
     pub decider: Decider,
     pub confidence: BTreeMap<String, f32>,
     pub reasons: Vec<String>,
@@ -165,22 +185,6 @@ pub struct ProxyDecision {
 // `llm.rs` consume/produce, so [`merge`] never needs to know which decider
 // answered -- now live in the shared `jev` module; re-exported at the top
 // of this file.
-
-#[derive(Debug, Clone, Serialize)]
-pub struct IntakeModel {
-    pub alias: String,
-    pub tier: Option<String>,
-    pub strength: u8,
-    pub input_usd_per_mtok: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct IntakeHarness {
-    pub name: String,
-    pub ready: bool,
-    pub headroom_pct: Option<f64>,
-    pub models: Vec<IntakeModel>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntakeWorkflow {
@@ -217,11 +221,18 @@ pub struct IntakePolicy {
 /// `request_max_bytes`, `repository` carries counts and extensions rather
 /// than paths or diffs, and neither this type nor anything that builds it
 /// ever touches file contents or environment values.
+///
+/// Issue #537 (A2): the harness/model catalogue (names, readiness, headroom,
+/// prices) used to ride along here too, even though no question ever reads
+/// it -- TypeSafe's own guidance is that irrelevant state degrades answer
+/// accuracy, so it was dropped. The harness roster stays exactly where it
+/// already lived for its one real job: [`validate`] polices the winning
+/// decision's `orchestrator.harness` against the live [`Roster`] directly,
+/// never against anything carried in this state.
 #[derive(Debug, Clone, Serialize)]
 pub struct IntakeState {
     pub request: String,
     pub repository: IntakeRepository,
-    pub harnesses: Vec<IntakeHarness>,
     pub workflows: Vec<IntakeWorkflow>,
     pub policy: IntakePolicy,
 }
@@ -229,12 +240,11 @@ pub struct IntakeState {
 /// One harness's proxy-relevant roster facts: whether it is currently
 /// enabled+ready (`settings::AgentGate::is_enabled` plus `AgentAdapter::
 /// ready`, the same `chat.rs::harness_list` shape without needing that
-/// private function), and the vendor slug its catalogue rungs live under.
+/// private function).
 #[derive(Debug, Clone)]
 pub struct RosterHarness {
     pub name: String,
     pub ready: bool,
-    pub vendor: &'static str,
 }
 
 /// The enabled/ready harness roster and the loaded workflow registry, both
@@ -259,7 +269,6 @@ impl Roster {
                 name: (*name).to_string(),
                 ready: cfg.agents.is_enabled(name)
                     && ctor(cfg.agent_bin.as_deref()).ready().is_ok(),
-                vendor: adapters::provider_for_agent_name(Some(name)),
             })
             .collect();
         // `built_in_only: false`, matching `zirv workflow start`'s own
@@ -323,14 +332,6 @@ fn truncate_bytes(text: &str, max: usize) -> String {
         end -= 1;
     }
     text[..end].to_string()
-}
-
-fn tier_str(tier: Tier) -> &'static str {
-    match tier {
-        Tier::Cheap => "cheap",
-        Tier::Standard => "standard",
-        Tier::Deep => "deep",
-    }
 }
 
 /// The deterministic classification behind a decision's baseline --
@@ -466,6 +467,7 @@ pub fn baseline(
         seat_tier: SeatTier::Cheap,
         worker_tier: Tier::Cheap,
         needs_clarification: 0.0,
+        domains: Vec::new(),
         decider: Decider::Deterministic,
         confidence: BTreeMap::new(),
         // Carries `classification.reasons` (including `classify_request`'s
@@ -625,73 +627,15 @@ fn active_workflow_id(
     )
 }
 
-/// Best-effort spawn headroom for `harness`, from the exact source `zirv ctx
-/// status`'s own `fallback:` line reads (`pace::current_windows` +
-/// `pace::spawn_headroom`, see `status.rs`). `None` on any missing signal --
-/// an absent reading is honest uncertainty, never a guess.
-fn headroom_for_harness(
-    cfg: &CtxConfig,
-    state: &crate::commands::ctx::state::StateDir,
-    harness: &str,
-) -> Option<f64> {
-    let provider = adapters::provider_for_agent_name(Some(harness));
-    let now = crate::commands::ctx::state::now_secs();
-    let (collector, estimator) =
-        crate::commands::ctx::pace::current_windows(state, &cfg.pace, now, provider);
-    crate::commands::ctx::pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
-        .map(|reading| reading.headroom_pct)
-}
-
-fn intake_harnesses(
-    roster: &Roster,
-    cfg: &CtxConfig,
-    state: &crate::commands::ctx::state::StateDir,
-) -> Vec<IntakeHarness> {
-    roster
-        .harnesses
-        .iter()
-        .map(|harness| {
-            let models = catalogue::vendor(harness.vendor)
-                .map(|vendor| {
-                    vendor
-                        .rungs
-                        .iter()
-                        .map(|rung| IntakeModel {
-                            alias: rung.alias.to_string(),
-                            tier: rung.tier.map(tier_str).map(str::to_string),
-                            strength: rung.strength,
-                            input_usd_per_mtok: rung
-                                .price
-                                .map(|price| price.input_micros as f64 / 1_000_000.0)
-                                .unwrap_or(0.0),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let headroom_pct = if harness.ready {
-                headroom_for_harness(cfg, state, &harness.name)
-            } else {
-                None
-            };
-            IntakeHarness {
-                name: harness.name.clone(),
-                ready: harness.ready,
-                headroom_pct,
-                models,
-            }
-        })
-        .collect()
-}
-
 /// Builds the Jev `state`/`questions()` input: the request (truncated to
 /// `cfg.proxy.request_max_bytes`), the repository's own measured branch/
 /// uncommitted change counts and extensions (labeled
 /// `uncommitted_or_branch_changes` -- informational context about the
 /// repository, never a stand-in for the request's own size; see
 /// `classify_request`'s doc comment for why the baseline never measures
-/// this), the enabled+ready harness roster with catalogue pricing and
-/// best-effort headroom, the registered workflow ids/descriptions, and
-/// whether the native runtime is available.
+/// this), the registered workflow ids/descriptions, and whether the native
+/// runtime is available. Issue #537 (A2): no longer carries the harness/
+/// model catalogue -- see [`IntakeState`]'s own doc comment for why.
 pub fn build_intake(
     cfg: &CtxConfig,
     repo: &Path,
@@ -716,7 +660,6 @@ pub fn build_intake(
             active_workflow: active_workflow_id(&state, repo),
             primary_extensions: primary_extensions(&branch_paths),
         },
-        harnesses: intake_harnesses(roster, cfg, &state),
         workflows: roster.workflow_summaries(),
         policy: IntakePolicy {
             native_available: crate::commands::ctx::runtime::native_available(),
@@ -949,6 +892,54 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
         },
     });
 
+    // Issue #537 (A2): additive domain tags, one Noul question per tag
+    // (`DOMAIN_QUESTION_IDS`, the single source of truth `merge` reads back
+    // by the same ids). A substring keyword match (`ExecutionProfile::
+    // derive`'s own domain detection) misses phrasing that never uses one of
+    // its fixed keywords -- "rotate the shared token" names no keyword in
+    // its `security` list at all -- so these ask the model directly instead.
+    // `security`'s own confident `true` answer floors risk/execution the
+    // same way the keyword trigger already does (see `merge`); the other
+    // five are informational only.
+    let domain_questions: [(&str, &str, &str); 6] = [
+        (
+            "Does this request touch authentication, credentials, permissions, or a trust \
+             boundary?",
+            "yes, a security-sensitive surface",
+            "no security-sensitive surface",
+        ),
+        (
+            "Does this request touch a data schema, a migration, or stored data?",
+            "yes, a data surface",
+            "no data surface",
+        ),
+        (
+            "Does this request change only documentation or comments, with no other code \
+             change?",
+            "yes, documentation/comments only",
+            "no, it changes other code too",
+        ),
+        (
+            "Does this request touch CI, deployment, packaging, or infrastructure?",
+            "yes, a deployment/operations surface",
+            "no deployment/operations surface",
+        ),
+        (
+            "Does this request involve cross-module design or a new subsystem?",
+            "yes, cross-module design or a new subsystem",
+            "no, contained to one place",
+        ),
+        (
+            "Does this request touch UI, rendering, or visual behavior?",
+            "yes, a UI/visual surface",
+            "no UI/visual surface",
+        ),
+    ];
+    for (id, (what, when_true, when_false)) in DOMAIN_QUESTION_IDS.into_iter().zip(domain_questions)
+    {
+        out.push(Question::noul(id, what, when_true, when_false));
+    }
+
     out
 }
 
@@ -1084,6 +1075,29 @@ pub fn merge(
         decision.needs_clarification = value as f32;
     }
 
+    // Issue #537 (A2): additive domain tags -- a confident `true` noul
+    // answer adds that domain; nothing ever removes one. Never gated on
+    // `min_confidence`, same reasoning as `needs_clarification` right above
+    // (the noul value itself already is the model's own confidence, and
+    // there is no baseline domain a "kept baseline" reason could refer to
+    // here). `security`'s own tag sets the same validation flags the
+    // keyword-based `ExecutionProfile::derive` detection sets below, so
+    // `apply_security_risk_floor` floors risk/execution the same way
+    // regardless of which detector caught it.
+    for id in DOMAIN_QUESTION_IDS {
+        if let Some(answer) = answers.get(id)
+            && let AnswerValue::Noul(value) = answer.value
+            && value >= 0.5
+            && !decision.domains.iter().any(|domain| domain == id)
+        {
+            decision.domains.push(id.to_string());
+        }
+    }
+    if decision.domains.iter().any(|domain| domain == "security") {
+        decision.validation.independent_review = true;
+        decision.validation.security_review = true;
+    }
+
     // Recomputed from the real request text (never `""` -- see this
     // function's own doc comment) and the (possibly raised) merged
     // complexity/risk. OR'd onto the baseline's own `validation` (already
@@ -1207,6 +1221,7 @@ mod tests {
             seat_tier: SeatTier::Standard,
             worker_tier: Tier::Cheap,
             needs_clarification: 0.0,
+            domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),
             reasons: Vec::new(),
@@ -1287,6 +1302,46 @@ mod tests {
             "{:?}",
             merged.reasons
         );
+    }
+
+    /// Issue #537 (A2): a confident `true` noul answer for a domain question
+    /// adds that tag to `domains`; an unconfident/`false` one does not, and
+    /// tags accumulate rather than replace each other.
+    #[test]
+    fn confident_domain_answers_accumulate_and_others_are_skipped() {
+        let cfg = CtxConfig::default();
+        let baseline = sample_decision();
+        let ans = answers(&[
+            ("security", AnswerValue::Noul(0.9), 0.9),
+            ("data", AnswerValue::Noul(0.8), 0.8),
+            ("docs_only", AnswerValue::Noul(0.1), 0.9),
+        ]);
+        let merged = merge(&cfg, &baseline, "rotate the shared token", &ans, 0.5);
+        assert_eq!(
+            merged.domains,
+            vec!["security".to_string(), "data".to_string()]
+        );
+    }
+
+    /// Issue #537 (A2): a confident `security` domain answer floors risk/
+    /// execution exactly like the keyword-based `ExecutionProfile::derive`
+    /// trigger already does -- the whole point of asking the model directly
+    /// is to catch phrasing the fixed keyword list misses ("token" names no
+    /// keyword in that list at all).
+    #[test]
+    fn a_confident_security_domain_answer_floors_risk_and_execution() {
+        let cfg = CtxConfig::default();
+        let mut baseline = sample_decision();
+        baseline.complexity = Complexity::Trivial;
+        baseline.risk = RiskBand::Low;
+        baseline.execution = ExecutionMode::Direct;
+        let ans = answers(&[("security", AnswerValue::Noul(0.95), 0.95)]);
+        let merged = merge(&cfg, &baseline, "rotate the shared token", &ans, 0.5);
+        assert_eq!(merged.domains, vec!["security".to_string()]);
+        assert!(merged.validation.security_review);
+        assert!(merged.validation.independent_review);
+        assert_eq!(merged.risk, RiskBand::High);
+        assert_eq!(merged.execution, ExecutionMode::Bounded);
     }
 
     /// Issue #537 design revision (a live 24-case Jev battery showed its own
@@ -1721,12 +1776,10 @@ mod tests {
                 RosterHarness {
                     name: "claude".to_string(),
                     ready: true,
-                    vendor: "anthropic",
                 },
                 RosterHarness {
                     name: "codex".to_string(),
                     ready: false,
-                    vendor: "openai",
                 },
             ],
             registry: None,
@@ -1768,7 +1821,6 @@ mod tests {
             harnesses: vec![RosterHarness {
                 name: "claude".to_string(),
                 ready: true,
-                vendor: "anthropic",
             }],
             registry: None,
         };
@@ -1810,7 +1862,6 @@ mod tests {
             harnesses: vec![RosterHarness {
                 name: "claude".to_string(),
                 ready: true,
-                vendor: "anthropic",
             }],
             registry: None,
         };
@@ -1834,21 +1885,6 @@ mod tests {
                 active_workflow: None,
                 primary_extensions: Vec::new(),
             },
-            harnesses: (0..40)
-                .map(|n| IntakeHarness {
-                    name: format!("harness-{n}"),
-                    ready: true,
-                    headroom_pct: Some(50.0),
-                    models: (0..8)
-                        .map(|m| IntakeModel {
-                            alias: format!("model-{m}"),
-                            tier: Some("standard".to_string()),
-                            strength: 1,
-                            input_usd_per_mtok: 1.0,
-                        })
-                        .collect(),
-                })
-                .collect(),
             workflows: (0..300)
                 .map(|n| IntakeWorkflow {
                     id: format!("workflow-{n}"),

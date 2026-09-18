@@ -626,6 +626,13 @@ pub fn run_remember_with<W: Write>(
     if body.is_empty() {
         return Err("zirv memory remember: no text given".into());
     }
+    if let Some(warning) = memory::truncation_warning(
+        "zirv memory remember",
+        body.len(),
+        cfg.memory.max_entry_bytes,
+    ) {
+        eprintln!("{warning}");
+    }
     let written_by = env(AGENT_ENV)
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_string());

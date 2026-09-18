@@ -413,10 +413,51 @@ fn proxy_intake<E: Write>(
         },
     );
     let decision = proxy::decide(cfg, state.root(), repo, &request);
+    let (decision, request) = maybe_clarify(cfg, state, repo, decision, request, reader, stderr)?;
     Ok(ProxyIntakeOutcome::Decided {
         decision: Box::new(decision),
         request,
     })
+}
+
+/// Issue #537 (A2): one round of interactive follow-up when `decision.
+/// needs_clarification` is at or above `proxy::CLARIFY_THRESHOLD` -- prints
+/// one prompt (unconditional, same as `proxy_intake`'s own "describe the
+/// task" prompt right above: this blocks on stdin, so it must stay visible
+/// regardless of `--quiet`) and reads one line. An empty line (or EOF)
+/// leaves `decision`/`request` untouched -- an operator who has nothing to
+/// add is not forced to add anything. A non-empty line is appended to
+/// `request` (separated by a blank line, so the harness's own first prompt
+/// still reads as one coherent task) and `decide` runs exactly once more --
+/// never a second clarification round, however ambiguous the new decision
+/// still looks.
+fn maybe_clarify<E: Write>(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    decision: ProxyDecision,
+    request: String,
+    reader: &mut impl BufRead,
+    stderr: &mut E,
+) -> CtxResult<(ProxyDecision, String)> {
+    if decision.needs_clarification < proxy::CLARIFY_THRESHOLD {
+        return Ok((decision, request));
+    }
+    writeln!(
+        stderr,
+        "zirv \u{25b8} proxy: the request looks ambiguous ({:.2}). Add detail and press Enter, or \
+         press Enter to launch as is:",
+        decision.needs_clarification
+    )?;
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).unwrap_or(0);
+    let addition = line.trim_end_matches(['\n', '\r']);
+    if read == 0 || addition.trim().is_empty() {
+        return Ok((decision, request));
+    }
+    let combined_request = format!("{request}\n\n{addition}");
+    let combined_decision = proxy::decide(cfg, state.root(), repo, &combined_request);
+    Ok((combined_decision, combined_request))
 }
 
 /// The chat-launch overrides an active harness-proxy decision applies:
@@ -3386,6 +3427,7 @@ mod tests {
             },
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
+            domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),
             reasons: Vec::new(),
@@ -3633,6 +3675,100 @@ mod tests {
             printed.contains(&proxy::asking_line(&cfg)),
             "the asking line must reach the operator before decide() runs: {printed}"
         );
+    }
+
+    /// Issue #537 (A2): below `proxy::CLARIFY_THRESHOLD`, `maybe_clarify` is
+    /// a complete no-op -- no prompt, `decision`/`request` unchanged --
+    /// regardless of what stdin holds; at or above it with an empty answer
+    /// (just Enter), the prompt still prints but the outcome is the same
+    /// no-op, since an operator with nothing to add must not be forced to
+    /// add something.
+    #[test]
+    fn maybe_clarify_is_a_no_op_below_the_threshold_or_on_an_empty_answer() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let cfg = CtxConfig::default();
+
+        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
+        decision.needs_clarification = 0.1;
+        let mut stderr = Vec::new();
+        let (unchanged, request) = maybe_clarify(
+            &cfg,
+            &state,
+            repo.path(),
+            decision.clone(),
+            "original request".to_string(),
+            &mut &b"ignored, never read below the threshold\n"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+        assert_eq!(unchanged, decision);
+        assert_eq!(request, "original request");
+        assert!(stderr.is_empty(), "below the threshold, no prompt at all");
+
+        let mut ambiguous = decision;
+        ambiguous.needs_clarification = 0.9;
+        let mut stderr = Vec::new();
+        let (unchanged, request) = maybe_clarify(
+            &cfg,
+            &state,
+            repo.path(),
+            ambiguous.clone(),
+            "original request".to_string(),
+            &mut &b"\n"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+        assert_eq!(unchanged, ambiguous);
+        assert_eq!(request, "original request");
+        assert!(
+            !stderr.is_empty(),
+            "the prompt itself must still print even when the answer is empty"
+        );
+    }
+
+    /// Issue #537 (A2): at or above the threshold, a non-empty answer is
+    /// appended to the request (separated by a blank line) and `decide` runs
+    /// exactly once more against the combined text -- never a second
+    /// clarification round, however ambiguous the new decision still looks.
+    #[test]
+    fn maybe_clarify_appends_a_non_empty_answer_and_redecides_once() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        // Deterministic only: this test must never depend on network access
+        // or an ambient credential, and must be reproducible.
+        cfg.proxy.decider = crate::commands::ctx::config::ProxyDecider::Deterministic;
+
+        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
+        decision.needs_clarification = 0.9;
+        let mut stderr = Vec::new();
+
+        let (new_decision, new_request) = maybe_clarify(
+            &cfg,
+            &state,
+            repo.path(),
+            decision,
+            "original request".to_string(),
+            &mut &b"more detail here\n"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        assert_eq!(new_request, "original request\n\nmore detail here");
+        // `elapsed_ms`/`created_at` legitimately differ between two separate
+        // `decide()` calls; every other field must match exactly.
+        let mut new_decision = new_decision;
+        let mut expected = proxy::decide(&cfg, state.root(), repo.path(), &new_request);
+        new_decision.elapsed_ms = 0;
+        expected.elapsed_ms = 0;
+        new_decision.created_at = 0;
+        expected.created_at = 0;
+        assert_eq!(new_decision, expected, "must redecide on the combined text");
+        let printed = String::from_utf8(stderr).expect("utf8");
+        assert!(printed.contains("ambiguous (0.90)"), "{printed}");
     }
 
     /// The wiring `run_with` applies once the proxy actually decided this

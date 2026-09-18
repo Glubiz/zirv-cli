@@ -16,6 +16,7 @@ use serde::Serialize;
 use super::CtxResult;
 use super::adapters::AGENT_ENV;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::jev;
 use super::state::{StateDir, now_secs, repo_slug};
 
 /// Reserved state-directory slug for the operator-owned machine-wide bank.
@@ -106,6 +107,23 @@ impl Entry {
 /// marker -- the per-entry cap every tier's writer applies just before
 /// storing, factored out so `rollback`'s multi-entry restore applies the
 /// identical rule rather than a fourth copy of it.
+/// Issue #537 (A3): the one-line stderr warning `zirv ctx remember`/`zirv
+/// memory remember` print when a body is about to be silently truncated by
+/// `cap_body` -- seven repo entries were cut at 512 bytes with no operator
+/// ever told. `None` when `body_len` is already within `cap`. Pure and
+/// directly testable, unlike the `eprintln!` at each of the two call sites;
+/// `pub(super)`, not private, the same cross-module-within-`ctx` reuse
+/// `is_temporary_or_generic` already gets, since `memory_cli.rs`'s own
+/// `--shared` handler needs the identical message.
+pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> Option<String> {
+    (body_len > cap).then(|| {
+        format!(
+            "{command}: body is {body_len} bytes, over the {cap}-byte cap \
+             (memory.max_entry_bytes); it will be truncated"
+        )
+    })
+}
+
 fn cap_body(entry: &Entry, cap: usize) -> Entry {
     let mut entry = entry.clone();
     if entry.body.len() > cap {
@@ -2918,6 +2936,120 @@ pub fn filter_durable_candidates(
     out
 }
 
+/// Issue #537 (A3): the floor a Jev durability/relevance `noul` must clear
+/// to keep a candidate, shared by the harvest gate below and `compile::
+/// rerank_memory_candidates`. From a live 2026-09-18 probe: 0.3 cleanly
+/// separated all 24 recorded candidates (true/false positives never crossed
+/// it either way); 0.5 dropped a true positive.
+pub(crate) const MEMORY_RELEVANCE_FLOOR: f64 = 0.3;
+
+const HARVEST_ADVISE_SUMMARY_MAX_BYTES: usize = 300;
+
+#[derive(Debug, Serialize)]
+struct HarvestAdviseCandidate<'a> {
+    id: &'a str,
+    key: &'a str,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HarvestAdviseState<'a> {
+    candidates: Vec<HarvestAdviseCandidate<'a>>,
+}
+
+/// Issue #537 (A3): re-examines candidates the keyword filter
+/// (`filter_durable_candidates`) already accepted, with one BATCHED Jev
+/// advisory call (site `"memory"`) when `[jev] memory` is on -- one Noul per
+/// candidate, asking whether it is a durable fact rather than transient
+/// narration. Jev never ACCEPTS a candidate the keyword filter itself
+/// rejected: this only ever narrows `accepted`, the same "propose, then
+/// dispose" relationship `filter_durable_candidates`'s own doc comment
+/// describes for the model/keyword-filter pair. A confident rejection (noul
+/// below [`MEMORY_RELEVANCE_FLOOR`]) -- or no parseable answer at all for
+/// that candidate -- drops it, logged the same observable `harvest-skipped`
+/// way every other rejection in this pipeline already is (`REJECT_PATTERNS`'s
+/// own "ties go to rejecting" bias, extended here to an ambiguous Jev
+/// response). Best-effort like every other `[jev]`-gated site: the gate
+/// being off, no credential, or any transport/parse error for the WHOLE call
+/// leaves `accepted` completely untouched (`jev::advise`'s own contract).
+fn apply_jev_harvest_gate(
+    accepted: Vec<(String, String)>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    now: u64,
+) -> Vec<(String, String)> {
+    if accepted.is_empty() {
+        return accepted;
+    }
+    let ids: Vec<String> = (0..accepted.len()).map(|i| i.to_string()).collect();
+    let candidates: Vec<HarvestAdviseCandidate> = accepted
+        .iter()
+        .zip(&ids)
+        .map(|((key, body), id)| HarvestAdviseCandidate {
+            id,
+            key: key.as_str(),
+            summary: crate::utils::truncate_bytes(
+                body.clone(),
+                Some(HARVEST_ADVISE_SUMMARY_MAX_BYTES),
+            ),
+        })
+        .collect();
+    let questions: Vec<jev::Question> = ids
+        .iter()
+        .map(|id| {
+            jev::Question::noul(
+                id,
+                "Is this a durable fact a future session cannot derive from the code or git \
+                 history, rather than transient narration or a status update?",
+                "yes, a durable fact",
+                "no, transient narration or a status update",
+            )
+        })
+        .collect();
+    let advise_state = HarvestAdviseState { candidates };
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "memory",
+        cfg.jev.memory,
+        &advise_state,
+        &questions,
+    ) else {
+        return accepted;
+    };
+    accepted
+        .into_iter()
+        .zip(ids)
+        .filter(|((key, _), id)| {
+            let noul = answers.get(id).and_then(|answer| answer.as_noul());
+            let keep = noul.is_some_and(|value| value >= MEMORY_RELEVANCE_FLOOR);
+            if !keep {
+                let detail = match noul {
+                    Some(value) => {
+                        format!("'{key}' scored {value:.2} below the Jev durability floor")
+                    }
+                    None => format!("'{key}' got no Jev durability answer"),
+                };
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: now,
+                        session: "n/a",
+                        verb: "memory",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "harvest-skipped",
+                        detail: &detail,
+                        observed_at: None,
+                    },
+                );
+            }
+            keep
+        })
+        .map(|((key, body), _)| (key, body))
+        .collect()
+}
+
 /// Writes an already-filtered batch to the SHARED bank, each entry through
 /// `upsert_scoped(Shared, ...)` -- an existing key (harvested before, or from
 /// `zirv memory init`) is updated in place rather than duplicated, exactly
@@ -3105,6 +3237,11 @@ fn harvest_durable_with_tool_errors(
         }
     }
     let accepted = filter_durable_candidates(&candidates, cfg);
+    // Issue #537 (A3): narrows (never widens) the keyword filter's own
+    // output with one batched Jev advisory call when `[jev] memory` is on;
+    // a byte-identical pass-through otherwise (`apply_jev_harvest_gate`'s
+    // own doc comment).
+    let accepted = apply_jev_harvest_gate(accepted, cfg, state, now_secs());
     let written = write_durable(repo, state, slug, &accepted, cfg, now_secs())?;
     // Issue #87: a one-line summary on the `zirv ▸` channel every time a
     // harvest actually ran (this function is the single choke point every
@@ -3878,6 +4015,11 @@ pub fn run_remember_with<W: Write>(
                         .into(),
                 );
             }
+            if let Some(warning) =
+                truncation_warning("zirv ctx remember", body.len(), cfg.memory.max_entry_bytes)
+            {
+                eprintln!("{warning}");
+            }
             let now = now_secs();
             let entry = Entry {
                 key: args.key.clone(),
@@ -4341,6 +4483,20 @@ pub fn cadence_for_shared(
 mod tests {
     use super::super::state;
     use super::*;
+
+    /// Issue #537 (A3): pure, so both `zirv ctx remember` and `zirv memory
+    /// remember --shared` can share one tested message rather than each
+    /// carrying its own untested `eprintln!` copy.
+    #[test]
+    fn truncation_warning_only_fires_over_the_cap_and_names_both_numbers() {
+        assert_eq!(truncation_warning("zirv ctx remember", 100, 512), None);
+        assert_eq!(truncation_warning("zirv ctx remember", 512, 512), None);
+        let warning =
+            truncation_warning("zirv ctx remember", 600, 512).expect("over the cap must warn");
+        assert!(warning.contains("zirv ctx remember"), "{warning}");
+        assert!(warning.contains("600"), "{warning}");
+        assert!(warning.contains("512"), "{warning}");
+    }
 
     // N2: the header block ends at the first blank line. Before this, a
     // blank line only `continue`d, so the parser stayed in header mode and
@@ -6552,6 +6708,95 @@ This is part of the body too.\n";
             vec![("fact-small".to_string(), "tiny".to_string())],
             "an oversized candidate is skipped, not a hard stop: {accepted:?}"
         );
+    }
+
+    // Issue #537 (A3): `apply_jev_harvest_gate` tests.
+
+    /// The keyword filter's own rejection (`"still need"`, a `REJECT_
+    /// PATTERNS` hit) drops `noisy-status` before Jev ever sees it -- it
+    /// gets no id and no question at all, so Jev has no way to resurrect it
+    /// regardless of how its own canned answers are shaped. Of the two
+    /// candidates the keyword filter DOES accept, Jev scores `borderline`
+    /// at 0.1 (below `MEMORY_RELEVANCE_FLOOR`) and `good-fact` at 0.9: only
+    /// `good-fact` survives.
+    #[test]
+    fn apply_jev_harvest_gate_never_resurrects_a_keyword_rejection_and_drops_a_low_scoring_one() {
+        let raw = vec![
+            (
+                "noisy-status".to_string(),
+                "still need to wire this up before merging".to_string(),
+            ),
+            ("borderline".to_string(), "a maybe-durable fact".to_string()),
+            (
+                "good-fact".to_string(),
+                "a genuinely durable fact".to_string(),
+            ),
+        ];
+        let cfg_filter = CtxConfig::default();
+        let accepted = filter_durable_candidates(&raw, &cfg_filter);
+        assert_eq!(
+            accepted,
+            vec![
+                ("borderline".to_string(), "a maybe-durable fact".to_string()),
+                (
+                    "good-fact".to_string(),
+                    "a genuinely durable fact".to_string()
+                ),
+            ],
+            "sanity: the keyword filter alone already dropped noisy-status"
+        );
+
+        let body = r#"{"model": "jev-latest", "answers": {
+            "0": {"type": "noul", "noul": 0.1},
+            "1": {"type": "noul", "noul": 0.9}
+        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "MEMORY_TEST_HARVEST_GATE_KEY_200";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let gated = apply_jev_harvest_gate(accepted, &cfg, &state, now_secs());
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            gated,
+            vec![(
+                "good-fact".to_string(),
+                "a genuinely durable fact".to_string()
+            )],
+            "noisy-status was never a candidate Jev could accept, and borderline scored below \
+             the floor: {gated:?}"
+        );
+    }
+
+    /// With the gate off, `apply_jev_harvest_gate` never even attempts a
+    /// call and returns the keyword filter's own output untouched.
+    #[test]
+    fn apply_jev_harvest_gate_is_a_pass_through_when_the_gate_is_off() {
+        let cfg = CtxConfig::default();
+        assert!(!cfg.jev.memory, "the gate defaults off");
+        let accepted = vec![(
+            "good-fact".to_string(),
+            "a genuinely durable fact".to_string(),
+        )];
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let gated = apply_jev_harvest_gate(accepted.clone(), &cfg, &state, now_secs());
+
+        assert_eq!(gated, accepted);
     }
 
     /// Issue #37: shared writes must remain ordinary visible working-tree

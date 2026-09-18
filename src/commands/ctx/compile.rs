@@ -45,6 +45,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use super::adapters::{self, AgentAdapter};
 use super::config::CtxConfig;
 use super::optimize::{self, Layer};
@@ -52,7 +54,7 @@ use super::policy::{self, PolicyReport};
 use super::prompt::{self, ComposedPrompt, PromptRole, PromptSource};
 use super::state::StateDir;
 use super::surface::{ContextSurface, Trust};
-use super::{CtxResult, context, memory, retrieval};
+use super::{CtxResult, context, jev, memory, retrieval};
 
 /// `log::Decision::action` for a canonical context layer cut by its budget.
 pub const TRUNCATED_ACTION: &str = "context-truncated";
@@ -374,6 +376,108 @@ impl CompiledContext {
 fn find_after(haystack: &str, from: usize, needle: &str) -> Option<usize> {
     haystack[from..].find(needle).map(|at| from + at)
 }
+/// At most this many deterministically-selected candidates are ever sent to
+/// Jev in one [`rerank_memory_candidates`] call -- state stays bounded
+/// regardless of how large `[memory] retrieval_max_entries` is configured.
+const MEMORY_ADVISE_MAX_CANDIDATES: usize = 32;
+const MEMORY_ADVISE_QUERY_MAX_BYTES: usize = 4096;
+const MEMORY_ADVISE_MAX_CHANGED_PATHS: usize = 100;
+const MEMORY_ADVISE_SUMMARY_MAX_BYTES: usize = 300;
+
+#[derive(Debug, Serialize)]
+struct MemoryAdviseCandidate<'a> {
+    id: &'a str,
+    key: &'a str,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryAdviseState<'a> {
+    query: String,
+    changed_paths: &'a [String],
+    candidates: Vec<MemoryAdviseCandidate<'a>>,
+}
+
+/// Issue #537 (A3): re-ranks and prunes `selected` -- already
+/// deterministically chosen and budgeted by `retrieval::select` -- with one
+/// Jev advisory call (site `"memory"`) when `cfg.jev.memory` is on. Never
+/// ADDS a candidate `retrieval::select` did not already choose: this only
+/// reorders (by relevance `noul`, descending, stable) and prunes (`noul`
+/// below [`memory::MEMORY_RELEVANCE_FLOOR`]) the same set. Best-effort like every
+/// other `[jev]`-gated site: the gate being off, no credential set, or any
+/// transport/parse error all surface as `jev::advise` returning `None`,
+/// which leaves `selected` in its original deterministic order and
+/// membership, completely untouched -- the common case, and the only case
+/// today's default config ever takes (`cfg.jev.memory` defaults `false`),
+/// so this never affects `compile`'s own documented determinism guarantee
+/// unless an operator has explicitly opted a Jev credential in.
+fn rerank_memory_candidates<'a>(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    query: &str,
+    changed_paths: &[String],
+    selected: Vec<retrieval::Ranked<'a>>,
+) -> Vec<retrieval::Ranked<'a>> {
+    if selected.is_empty() {
+        return selected;
+    }
+    let bounded: Vec<retrieval::Ranked<'a>> = selected
+        .into_iter()
+        .take(MEMORY_ADVISE_MAX_CANDIDATES)
+        .collect();
+    let ids: Vec<String> = (0..bounded.len()).map(|i| i.to_string()).collect();
+    let candidates: Vec<MemoryAdviseCandidate> = bounded
+        .iter()
+        .zip(&ids)
+        .map(|(ranked, id)| MemoryAdviseCandidate {
+            id,
+            key: ranked.candidate.entry.key.as_str(),
+            summary: crate::utils::truncate_bytes(
+                ranked.candidate.entry.body.clone(),
+                Some(MEMORY_ADVISE_SUMMARY_MAX_BYTES),
+            ),
+        })
+        .collect();
+    let questions: Vec<jev::Question> = ids
+        .iter()
+        .map(|id| {
+            jev::Question::noul(
+                id,
+                "Is this candidate directly useful for carrying out the request?",
+                "yes, directly useful for the request",
+                "no, not directly useful for the request",
+            )
+        })
+        .collect();
+    let changed_paths_bounded =
+        &changed_paths[..changed_paths.len().min(MEMORY_ADVISE_MAX_CHANGED_PATHS)];
+    let advise_state = MemoryAdviseState {
+        query: crate::utils::truncate_bytes(query.to_string(), Some(MEMORY_ADVISE_QUERY_MAX_BYTES)),
+        changed_paths: changed_paths_bounded,
+        candidates,
+    };
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "memory",
+        cfg.jev.memory,
+        &advise_state,
+        &questions,
+    ) else {
+        return bounded;
+    };
+    let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = bounded
+        .into_iter()
+        .zip(ids.iter())
+        .filter_map(|(ranked, id)| {
+            let noul = answers.get(id)?.as_noul()?;
+            (noul >= memory::MEMORY_RELEVANCE_FLOOR).then_some((noul, ranked))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().map(|(_, ranked)| ranked).collect()
+}
+
 /// Gathers the always-present core memory layer and the independent,
 /// context-ranked retrieval layer. Core selection remains private-first and
 /// capped by `core_max_bytes`; retrieval uses changed repository paths as its
@@ -466,8 +570,17 @@ pub(crate) fn gather_memory(
         cfg.memory.retrieval_max_bytes,
         cfg.memory.retrieval_max_entries,
     );
-    let retrieved = selection
-        .selected
+    // Issue #537 (A3): re-ranks/prunes the already-selected+budgeted list
+    // with one Jev advisory call when `[jev] memory` is on; a byte-identical
+    // pass-through otherwise (`rerank_memory_candidates`'s own doc comment).
+    let reranked = rerank_memory_candidates(
+        cfg,
+        state,
+        &retrieval_context.query,
+        &retrieval_context.changed_paths,
+        selection.selected,
+    );
+    let retrieved = reranked
         .into_iter()
         .filter(|ranked| {
             !core_keys.contains(&(
@@ -1708,6 +1821,155 @@ mod tests {
             false,
         );
         assert_eq!(first, second);
+    }
+
+    // Issue #537 (A3): `rerank_memory_candidates` tests.
+
+    fn retrieval_candidate(key: &str, body: &str) -> retrieval::RetrievalCandidate {
+        retrieval::RetrievalCandidate {
+            entry: memory::Entry {
+                key: key.to_string(),
+                written_by: "claude".to_string(),
+                written: 1_700_000_000,
+                verified: 1_700_000_000,
+                source: "explicit".to_string(),
+                body: body.to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            shared: false,
+            verified_age_days: 0,
+            lifecycle: retrieval::Lifecycle::Active,
+        }
+    }
+
+    fn ranked(candidate: &retrieval::RetrievalCandidate) -> retrieval::Ranked<'_> {
+        retrieval::Ranked {
+            candidate,
+            base_score: 5,
+            score: 5,
+            reasons: Vec::new(),
+        }
+    }
+
+    fn keys(ranked: &[retrieval::Ranked]) -> Vec<String> {
+        ranked
+            .iter()
+            .map(|r| r.candidate.entry.key.clone())
+            .collect()
+    }
+
+    /// Issue #537 (A3): on a canned 200 response, candidates below
+    /// `MEMORY_RELEVANCE_FLOOR` are dropped and survivors are reordered by
+    /// `noul` descending -- never a candidate `retrieval::select` did not
+    /// already choose.
+    #[test]
+    fn rerank_memory_candidates_prunes_and_reorders_on_a_200_response() {
+        let candidates = [
+            retrieval_candidate("alpha", "alpha body"),
+            retrieval_candidate("bravo", "bravo body"),
+            retrieval_candidate("charlie", "charlie body"),
+        ];
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+
+        let body = r#"{"model": "jev-latest", "answers": {
+            "0": {"type": "noul", "noul": 0.9},
+            "1": {"type": "noul", "noul": 0.1},
+            "2": {"type": "noul", "noul": 0.5}
+        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "COMPILE_TEST_MEMORY_KEY_200";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        // Candidates are ids "0"/"1"/"2" by position: "bravo" (id "1", 0.1)
+        // is pruned; "alpha" (id "0", 0.9) outranks "charlie" (id "2", 0.5).
+        assert_eq!(
+            keys(&result),
+            vec!["alpha".to_string(), "charlie".to_string()]
+        );
+    }
+
+    /// Issue #537 (A3): a transport/HTTP error (here, a 500) makes
+    /// `jev::advise` return `None`, which must leave the list in its
+    /// original deterministic order and membership -- identical to what the
+    /// gate-off path already does today.
+    #[test]
+    fn rerank_memory_candidates_falls_back_to_the_deterministic_list_on_a_500() {
+        let candidates = [
+            retrieval_candidate("alpha", "alpha body"),
+            retrieval_candidate("bravo", "bravo body"),
+        ];
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let deterministic_keys = keys(&selected);
+
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let credential_env = "COMPILE_TEST_MEMORY_KEY_500";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(keys(&result), deterministic_keys);
+    }
+
+    /// Issue #537 (A3): with the gate off, `rerank_memory_candidates` never
+    /// even attempts a call (no server listening at that address, so any
+    /// attempt would error) and returns the deterministic list untouched --
+    /// the same outcome the 500 fallback above produces, proven independent
+    /// ways.
+    #[test]
+    fn rerank_memory_candidates_is_a_pass_through_when_the_gate_is_off() {
+        let candidates = [
+            retrieval_candidate("alpha", "alpha body"),
+            retrieval_candidate("bravo", "bravo body"),
+            retrieval_candidate("charlie", "charlie body"),
+        ];
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let deterministic_keys = keys(&selected);
+        let cfg = CtxConfig::default();
+        assert!(!cfg.jev.memory, "the gate defaults off");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        assert_eq!(keys(&result), deterministic_keys);
+        assert_eq!(
+            result.len(),
+            3,
+            "the ranked list must never be longer than the deterministic one"
+        );
     }
 
     /// Issue #537 (T2a): `compile::with_proxy_layer` only ever appends the
