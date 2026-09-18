@@ -86,6 +86,55 @@ pub struct Question {
     pub criteria: Criteria,
 }
 
+impl Question {
+    /// A choice question from `(option, description)` pairs. For a
+    /// caller-composed catch-all or an optional description, build
+    /// [`Criteria::Choice`] directly instead -- this constructor is for the
+    /// common case where every option has one.
+    #[allow(dead_code)]
+    pub(crate) fn choice(id: &str, instructions: &str, options: &[(&str, &str)]) -> Self {
+        Question {
+            id: id.to_string(),
+            kind: QuestionKind::Choice,
+            instructions: instructions.to_string(),
+            criteria: Criteria::Choice(
+                options
+                    .iter()
+                    .map(|(option, description)| {
+                        (option.to_string(), Some(description.to_string()))
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// A score question from an ordered list of level descriptions (index 0
+    /// first).
+    #[allow(dead_code)]
+    pub(crate) fn score(id: &str, instructions: &str, levels: &[&str]) -> Self {
+        Question {
+            id: id.to_string(),
+            kind: QuestionKind::Score,
+            instructions: instructions.to_string(),
+            criteria: Criteria::Score(levels.iter().map(|level| level.to_string()).collect()),
+        }
+    }
+
+    /// A yes/no question naming what `true`/`false` each mean.
+    #[allow(dead_code)]
+    pub(crate) fn noul(id: &str, instructions: &str, when_true: &str, when_false: &str) -> Self {
+        Question {
+            id: id.to_string(),
+            kind: QuestionKind::Noul,
+            instructions: instructions.to_string(),
+            criteria: Criteria::Noul {
+                when_true: Some(when_true.to_string()),
+                when_false: Some(when_false.to_string()),
+            },
+        }
+    }
+}
+
 /// One decider's answer to one question, already reduced to a single value
 /// plus a confidence in `[0, 1]`. `Score`'s value is a continuous level
 /// index (not necessarily an integer -- see [`to_answer`]'s own rounding
@@ -107,6 +156,35 @@ pub struct Answer {
     pub value: AnswerValue,
     pub confidence: f32,
     pub probabilities: BTreeMap<String, f32>,
+}
+
+impl Answer {
+    /// `Some(choice)` for a `Choice` answer, `None` for any other kind.
+    #[allow(dead_code)]
+    pub(crate) fn as_choice(&self) -> Option<&str> {
+        match &self.value {
+            AnswerValue::Choice(value) => Some(value.as_str()),
+            AnswerValue::Score(_) | AnswerValue::Noul(_) => None,
+        }
+    }
+
+    /// `Some(index)` for a `Score` answer, `None` for any other kind.
+    #[allow(dead_code)]
+    pub(crate) fn as_score(&self) -> Option<f64> {
+        match self.value {
+            AnswerValue::Score(value) => Some(value),
+            AnswerValue::Choice(_) | AnswerValue::Noul(_) => None,
+        }
+    }
+
+    /// `Some(probability)` for a `Noul` answer, `None` for any other kind.
+    #[allow(dead_code)]
+    pub(crate) fn as_noul(&self) -> Option<f64> {
+        match self.value {
+            AnswerValue::Noul(value) => Some(value),
+            AnswerValue::Choice(_) | AnswerValue::Score(_) => None,
+        }
+    }
 }
 
 /// A full set of answers, keyed by [`Question::id`].
@@ -419,35 +497,34 @@ const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
 #[allow(dead_code)]
 const JEV_SPEND_AGENT: &str = "typesafe";
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct DecisionRecord<'a> {
     site: &'a str,
     ts: u64,
     answers: &'a Answers,
     usage: &'a Usage,
+    wall_ms: u64,
     fallbacks: &'a [String],
 }
 
 /// Appends one JSON line -- `site`, a timestamp, every answer's value/
-/// confidence/probabilities, `usage` and `fallbacks` -- to `<state_dir>/
-/// jev-decisions.jsonl`, and records a `log::Delegation` spend row (agent
-/// `"typesafe"`, model from `cfg.proxy.typesafe.model`, `usage`'s input/
-/// output tokens) so `zirv ctx spend` prices the call through the same
-/// catalogue vendor the harness proxy already does. The harness proxy keeps
-/// recording its own `proxy-decisions.jsonl` and spend row via `proxy::
-/// persist` -- this is for every OTHER `[jev]`-gated site, never a second
-/// record for the proxy's own call. Best-effort like every other append in
-/// this crate's flat logs: a write failure here must never break the
-/// caller's own (already-computed) decision. Not yet called from any
-/// non-test code -- see [`available`]'s own doc comment.
-#[allow(dead_code)]
+/// confidence/probabilities, `usage`, `wall_ms` and `fallbacks` -- to
+/// `<state_dir>/jev-decisions.jsonl`, and records a `log::Delegation` spend
+/// row (agent `"typesafe"`, model from `cfg.proxy.typesafe.model`, `usage`'s
+/// input/output tokens, `wall_ms`) so `zirv ctx spend` prices the call
+/// through the same catalogue vendor the harness proxy already does. The
+/// harness proxy keeps recording its own `proxy-decisions.jsonl` and spend
+/// row via `proxy::persist` -- this is for every OTHER `[jev]`-gated site,
+/// never a second record for the proxy's own call. Best-effort like every
+/// other append in this crate's flat logs: a write failure here must never
+/// break the caller's own (already-computed) decision.
 pub(crate) fn record(
     state: &StateDir,
     cfg: &CtxConfig,
     site: &str,
     answers: &Answers,
     usage: &Usage,
+    wall_ms: u64,
     fallbacks: &[String],
 ) {
     let ts = state::now_secs();
@@ -456,6 +533,7 @@ pub(crate) fn record(
         ts,
         answers,
         usage,
+        wall_ms,
         fallbacks,
     };
     if let Ok(line) = serde_json::to_string(&record)
@@ -492,7 +570,7 @@ pub(crate) fn record(
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             output_tokens: usage.output_tokens,
-            wall_ms: 0,
+            wall_ms,
             exit_code: 0,
             outcome: "ok",
             mode: None,
@@ -501,6 +579,62 @@ pub(crate) fn record(
             envelope_sha256: None,
         },
     );
+}
+
+/// The one advisory entry point a `[jev]`-gated site calls: short-circuits
+/// to `None`, with no network call and no log line at all, when `enabled`
+/// is false or the `[proxy.typesafe]` credential is not set ([`available`])
+/// -- either way the caller's own pre-existing deterministic path runs
+/// byte-identical to today. Otherwise runs one bounded [`ask`] call and
+/// [`record`]s the outcome either way: a successful call's own answers, or
+/// an empty answer set carrying the error's `Display` as the one fallback
+/// reason. Never panics, never propagates -- same posture as every other
+/// best-effort seam in this crate.
+#[allow(dead_code)]
+pub(crate) fn advise(
+    cfg: &CtxConfig,
+    state_dir: &StateDir,
+    site: &str,
+    enabled: bool,
+    state: &impl Serialize,
+    questions: &[Question],
+) -> Option<Answers> {
+    if !enabled || !available(&cfg.proxy.typesafe) {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let wall_ms = |started: std::time::Instant| -> u64 {
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    };
+    match ask(&cfg.proxy.typesafe, state, questions) {
+        Ok((answers, usage)) => {
+            record(
+                state_dir,
+                cfg,
+                site,
+                &answers,
+                &usage,
+                wall_ms(started),
+                &[],
+            );
+            Some(answers)
+        }
+        Err(error) => {
+            record(
+                state_dir,
+                cfg,
+                site,
+                &Answers::new(),
+                &Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
+                wall_ms(started),
+                &[error.to_string()],
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -745,7 +879,7 @@ mod tests {
             output_tokens: 2,
         };
 
-        record(&state, &cfg, "memory", &answers, &usage, &[]);
+        record(&state, &cfg, "memory", &answers, &usage, 42, &[]);
 
         let text = std::fs::read_to_string(state_dir.path().join(JEV_DECISIONS_FILE))
             .expect("jev-decisions.jsonl");
@@ -754,6 +888,7 @@ mod tests {
         assert_eq!(value["site"], "memory");
         assert_eq!(value["answers"]["intent"]["probabilities"]["feature"], 0.9);
         assert_eq!(value["usage"]["input_tokens"], 10);
+        assert_eq!(value["wall_ms"], 42);
 
         let delegations = log::read_delegations(&state, 10);
         assert_eq!(delegations.len(), 1);
@@ -763,6 +898,110 @@ mod tests {
             Some(cfg.proxy.typesafe.model.as_str())
         );
         assert_eq!(delegations[0].input_tokens, 10);
+    }
+
+    #[test]
+    fn advise_with_the_gate_off_makes_no_call_and_returns_none() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_GATE_OFF_537".to_string();
+        // The credential looks available, so a bug that ignored `enabled`
+        // would still attempt a call rather than short-circuiting on it.
+        with_credential(&cfg.proxy.typesafe.credential_env.clone(), "secret", || {
+            let result = advise(
+                &cfg,
+                &state,
+                "memory",
+                false,
+                &sample_state(),
+                &sample_questions(),
+            );
+            assert!(result.is_none());
+        });
+        assert!(
+            !state_dir.path().join(JEV_DECISIONS_FILE).exists(),
+            "advise must not write a record when the gate is off"
+        );
+    }
+
+    #[test]
+    fn advise_on_a_200_response_returns_some_and_records_wall_ms() {
+        let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
+        let body: &'static str = Box::leak(text.into_boxed_str());
+        let (url, handle) = one_shot_server(200, body);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        with_credential("JEV_TEST_KEY_ADVISE_OK", "secret", || {
+            let mut cfg = CtxConfig::default();
+            cfg.proxy.typesafe = config(url, "JEV_TEST_KEY_ADVISE_OK", 5);
+            let questions = vec![Question::choice(
+                "category",
+                "pick one",
+                &[("technical", "a technical question")],
+            )];
+            let result = advise(&cfg, &state, "memory", true, &sample_state(), &questions);
+            assert!(result.is_some());
+        });
+        handle.join().expect("server thread must not panic");
+
+        let text = std::fs::read_to_string(state_dir.path().join(JEV_DECISIONS_FILE))
+            .expect("jev-decisions.jsonl");
+        let line = text.lines().next().expect("one line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse json");
+        assert_eq!(value["site"], "memory");
+        assert!(
+            value["wall_ms"].as_u64().is_some(),
+            "wall_ms must be a recorded number: {value}"
+        );
+        assert!(
+            value["fallbacks"]
+                .as_array()
+                .expect("fallbacks array")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn advise_on_a_500_response_returns_none_and_records_the_fallback() {
+        let (url, handle) = one_shot_server(500, "{}");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        with_credential("JEV_TEST_KEY_ADVISE_ERR", "secret", || {
+            let mut cfg = CtxConfig::default();
+            cfg.proxy.typesafe = config(url, "JEV_TEST_KEY_ADVISE_ERR", 5);
+            let result = advise(
+                &cfg,
+                &state,
+                "memory",
+                true,
+                &sample_state(),
+                &sample_questions(),
+            );
+            assert!(result.is_none());
+        });
+        handle.join().expect("server thread must not panic");
+
+        let text = std::fs::read_to_string(state_dir.path().join(JEV_DECISIONS_FILE))
+            .expect("jev-decisions.jsonl");
+        let line = text.lines().next().expect("one line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse json");
+        assert_eq!(value["site"], "memory");
+        let fallbacks = value["fallbacks"].as_array().expect("fallbacks array");
+        assert_eq!(fallbacks.len(), 1);
+        assert!(
+            fallbacks[0]
+                .as_str()
+                .unwrap()
+                .contains("unexpected status 500"),
+            "{fallbacks:?}"
+        );
+        assert!(
+            value["answers"]
+                .as_object()
+                .expect("answers object")
+                .is_empty()
+        );
     }
 
     /// The byte offset right after the first `needle` in `haystack`, or
