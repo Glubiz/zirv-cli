@@ -42,6 +42,7 @@ pub mod helper;
 pub mod hook;
 pub(crate) mod hook_integrity;
 pub(crate) mod hook_project;
+pub mod jev;
 pub mod judge;
 pub mod learn;
 pub mod ledger;

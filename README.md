@@ -449,6 +449,12 @@ catalogue](#model-catalogue) — and costs at most one bounded call per launch.
 The native runtime applies the same decision behind its existing gate; this
 feature does not change that gate.
 
+The HTTP call to Jev is a shared client, not proxy-specific code; other
+advisory sites it may back (memory ranking, the supervisor judge, dispatch
+tiering, review triage, gate reclassification) are listed under their own
+[`[jev]`](#configuration) key, each still spending through this same
+`[proxy.typesafe]` connection.
+
 ### `zirv memory`
 
 `zirv memory` manages this repository's memory bank without starting an AI
@@ -3221,6 +3227,16 @@ base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
 credential_env = "TYPESAFE_API_KEY"       # ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV
 model = "jev-latest"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL
 timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
+
+# operator-only: which advisory sites besides the harness proxy may consult
+# the shared Jev client; each is also gated on the `[proxy.typesafe]`
+# credential actually being set (see "Harness proxy" above)
+[jev]
+memory = false      # ZIRV_CTX_JEV_MEMORY
+supervisor = false  # ZIRV_CTX_JEV_SUPERVISOR
+dispatch = false    # ZIRV_CTX_JEV_DISPATCH
+review = false      # ZIRV_CTX_JEV_REVIEW
+gates = false       # ZIRV_CTX_JEV_GATES
 ```
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
@@ -3306,7 +3322,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, `review`, `worker.claude`,
+`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
 `handover`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
@@ -3523,6 +3539,11 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `proxy.typesafe.credential_env` | `ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV` |
 | `proxy.typesafe.model` | `ZIRV_CTX_PROXY_TYPESAFE_MODEL` |
 | `proxy.typesafe.timeout_secs` | `ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS` |
+| `jev.memory` | `ZIRV_CTX_JEV_MEMORY` |
+| `jev.supervisor` | `ZIRV_CTX_JEV_SUPERVISOR` |
+| `jev.dispatch` | `ZIRV_CTX_JEV_DISPATCH` |
+| `jev.review` | `ZIRV_CTX_JEV_REVIEW` |
+| `jev.gates` | `ZIRV_CTX_JEV_GATES` |
 | `capabilities` | `ZIRV_CTX_CAPABILITIES` |
 | `runtime` | `ZIRV_CTX_RUNTIME` |
 

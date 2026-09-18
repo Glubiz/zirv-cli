@@ -1830,6 +1830,28 @@ impl Default for ProxyTypesafeConfig {
     }
 }
 
+/// Issue #537 seam extraction (task A1): which advisory sites, beyond the
+/// harness proxy itself, may consult the shared Jev client (`jev::ask`) in
+/// place of their own pre-existing deterministic path. A site is active
+/// only when BOTH its key here is `true` AND `jev::available` reports the
+/// `[proxy.typesafe]` credential set -- either being false means that
+/// site's deterministic path runs byte-identical to today. Connection
+/// settings (endpoint, credential, model, timeout) stay in
+/// `[proxy.typesafe]`, shared with the harness proxy; this table only ever
+/// gates WHICH sites may spend through them. `REPO_FORBIDDEN`, one leaf
+/// entry per key, same trust asymmetry as `[proxy]` above: a repository
+/// checkout must not be able to turn on a Jev-backed decision path for
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JevConfig {
+    pub memory: bool,
+    pub supervisor: bool,
+    pub dispatch: bool,
+    pub review: bool,
+    pub gates: bool,
+}
+
 /// Per-agent override for which model runs code review, keyed the same way
 /// as `UseCreditsConfig` (operator thinks in agent names). `None` -- the
 /// default for both -- defers to that adapter's own `AgentAdapter::
@@ -2681,6 +2703,10 @@ pub struct CtxConfig {
     /// `proxy::decide`). The whole table is `REPO_FORBIDDEN`; see
     /// [`ProxyConfig`].
     pub proxy: ProxyConfig,
+    /// Issue #537 seam extraction: which advisory sites besides the harness
+    /// proxy may consult the shared Jev client. Every key is
+    /// `REPO_FORBIDDEN`; see [`JevConfig`].
+    pub jev: JevConfig,
     /// Issue #352's experimental persistent-runtime gate. Every key is
     /// `REPO_FORBIDDEN`; see [`SessionConfig`].
     pub session: SessionConfig,
@@ -3545,6 +3571,18 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["proxy", "typesafe", "timeout_secs"],
         EnvKind::Int,
     ),
+    // Issue #537 seam extraction (task A1): the operator's own override for
+    // every `[jev]` advisory-site key -- see that same const's own entries
+    // in `REPO_FORBIDDEN`, below.
+    ("ZIRV_CTX_JEV_MEMORY", &["jev", "memory"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_JEV_SUPERVISOR",
+        &["jev", "supervisor"],
+        EnvKind::Bool,
+    ),
+    ("ZIRV_CTX_JEV_DISPATCH", &["jev", "dispatch"], EnvKind::Bool),
+    ("ZIRV_CTX_JEV_REVIEW", &["jev", "review"], EnvKind::Bool),
+    ("ZIRV_CTX_JEV_GATES", &["jev", "gates"], EnvKind::Bool),
 ];
 
 fn merge(base: &mut toml::Table, over: toml::Table) {
@@ -4770,6 +4808,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["proxy", "typesafe", "timeout_secs"],
         "ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS",
     ),
+    // Issue #537 seam extraction (task A1): the `[jev]` advisory-site gate --
+    // a repo checkout must not be able to turn on a Jev-backed decision path
+    // for any site, the same trust asymmetry as `[proxy]` right above. One
+    // leaf entry per key, same reasoning.
+    (&["jev", "memory"], "ZIRV_CTX_JEV_MEMORY"),
+    (&["jev", "supervisor"], "ZIRV_CTX_JEV_SUPERVISOR"),
+    (&["jev", "dispatch"], "ZIRV_CTX_JEV_DISPATCH"),
+    (&["jev", "review"], "ZIRV_CTX_JEV_REVIEW"),
+    (&["jev", "gates"], "ZIRV_CTX_JEV_GATES"),
 ];
 
 fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
@@ -7591,6 +7638,95 @@ mod tests {
         assert_eq!(cfg.proxy.min_confidence, 0.0);
         assert_eq!(cfg.proxy.typesafe.timeout_secs, 1);
         assert_eq!(cfg.proxy.request_max_bytes, 1024);
+    }
+
+    /// Issue #537 seam extraction: every `[jev]` advisory-site key defaults
+    /// to off, so a Jev-backed decision path never activates until an
+    /// operator opts a specific site in.
+    #[test]
+    fn jev_config_defaults_to_all_sites_off() {
+        let cfg = JevConfig::default();
+        assert!(!cfg.memory);
+        assert!(!cfg.supervisor);
+        assert!(!cfg.dispatch);
+        assert!(!cfg.review);
+        assert!(!cfg.gates);
+    }
+
+    /// The operator's own home layer may still set `[jev]` keys directly in
+    /// TOML, same as any other operator-only table.
+    #[test]
+    fn an_operator_layer_can_set_jev_keys_from_toml() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[jev]\nmemory = true\ngates = true\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(cfg.jev.memory);
+        assert!(cfg.jev.gates);
+        assert!(!cfg.jev.supervisor);
+        assert!(!cfg.jev.dispatch);
+        assert!(!cfg.jev.review);
+    }
+
+    /// Every `[jev]` key is `REPO_FORBIDDEN`: a repo checkout must not be
+    /// able to turn on a Jev-backed decision path for itself.
+    #[test]
+    fn jev_keys_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            ("[jev]\nmemory = true\n", "memory"),
+            ("[jev]\nsupervisor = true\n", "supervisor"),
+            ("[jev]\ndispatch = true\n", "dispatch"),
+            ("[jev]\nreview = true\n", "review"),
+            ("[jev]\ngates = true\n", "gates"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set jev.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "jev.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
+    /// `ZIRV_CTX_JEV_*` env var may still set these keys.
+    #[test]
+    fn the_operator_can_still_set_jev_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_JEV_MEMORY", "true"),
+            ("ZIRV_CTX_JEV_SUPERVISOR", "true"),
+            ("ZIRV_CTX_JEV_DISPATCH", "true"),
+            ("ZIRV_CTX_JEV_REVIEW", "true"),
+            ("ZIRV_CTX_JEV_GATES", "true"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert!(cfg.jev.memory);
+        assert!(cfg.jev.supervisor);
+        assert!(cfg.jev.dispatch);
+        assert!(cfg.jev.review);
+        assert!(cfg.jev.gates);
     }
 
     #[test]
