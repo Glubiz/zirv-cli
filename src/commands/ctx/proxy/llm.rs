@@ -94,7 +94,9 @@ fn parse_contract(text: &str) -> Option<Contract> {
 /// contract's own instruction. `Score` derives a continuous level index as
 /// the probability-weighted average of the numbered levels; `Noul` reads
 /// the `true` probability (falling back to the winning probability when the
-/// model answered with a different key shape).
+/// model answered with a different key shape). `probabilities` carries the
+/// model's own reported distribution through unchanged, same as `jev::
+/// to_answer` does for a Jev response.
 fn to_answer(question: &Question, probabilities: &BTreeMap<String, f64>) -> Option<Answer> {
     let (top_key, top_probability) = probabilities
         .iter()
@@ -119,7 +121,15 @@ fn to_answer(question: &Question, probabilities: &BTreeMap<String, f64>) -> Opti
             AnswerValue::Noul(true_probability)
         }
     };
-    Some(Answer { value, confidence })
+    let probabilities = probabilities
+        .iter()
+        .map(|(key, value)| (key.clone(), *value as f32))
+        .collect();
+    Some(Answer {
+        value,
+        confidence,
+        probabilities,
+    })
 }
 
 fn to_answers(questions: &[Question], contract: &Contract) -> Answers {

@@ -3,8 +3,8 @@
 //! This module holds the pure building blocks `proxy::decide` (in `mod.rs`)
 //! chains together: a deterministic [`baseline`] (reusing the existing
 //! classifier/profile/selection seams, never a model call), the neutral
-//! [`Question`]/[`Answer`] shapes both model deciders (`typesafe.rs`,
-//! `llm.rs`) answer into, [`merge`] (confidence-gated, monotonic on
+//! [`Question`]/[`Answer`] shapes (from the shared `jev` module) both model
+//! deciders (`typesafe.rs`, `llm.rs`) answer into, [`merge`] (confidence-gated, monotonic on
 //! complexity/risk/execution), and [`validate`] (the roster-backed defense
 //! that reverts an invalid harness/model/workflow choice to the baseline).
 //!
@@ -23,14 +23,18 @@ use crate::commands::ctx::adapters;
 use crate::commands::ctx::catalogue::{self, Tier};
 use crate::commands::ctx::config::CtxConfig;
 use crate::commands::ctx::handover;
+// Issue #537 seam extraction (A1): `Question`/`Criteria`/`QuestionKind`/
+// `AnswerValue`/`Answer`/`Answers`/`Usage`/`MAX_CHOICE_OPTIONS` now live in
+// the shared `jev` module (any future Jev-consuming site needs the same
+// neutral shapes); re-exported here so every existing `decision::<Name>`
+// path in this crate keeps compiling unchanged.
+pub use crate::commands::ctx::jev::{
+    Answer, AnswerValue, Answers, Criteria, MAX_CHOICE_OPTIONS, Question, QuestionKind, Usage,
+};
 use crate::commands::workflow::classify::{self, Classification, Complexity, Intent, RiskBand};
 use crate::commands::workflow::engine;
 use crate::commands::workflow::profile::{ExecutionMode, ExecutionProfile, ValidationProfile};
 use crate::commands::workflow::selection;
-
-/// Every choice-kind question is capped here, plus a reserved catch-all slot
-/// (see [`cap_choice_options`]) -- the Jev API's own documented limit.
-pub const MAX_CHOICE_OPTIONS: usize = 255;
 
 /// The deterministic classifier's own task-text bound is smaller than
 /// `[proxy] request_max_bytes`'s default; a request longer than this is
@@ -46,16 +50,6 @@ const CLASSIFY_TASK_MAX_BYTES: usize = 4000;
 pub struct Seat {
     pub harness: String,
     pub model: String,
-}
-
-/// Raw token counts from a model decider's own response, when it reported
-/// one (`typesafe.rs` always does; `llm.rs`/the deterministic path never
-/// do). Mirrors `event::TranscriptUsage`'s input/output split narrowly --
-/// Jev bills input only, so there is no cache class to carry.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
 }
 
 /// Which decider actually produced this decision's non-baseline fields.
@@ -166,60 +160,11 @@ pub struct ProxyDecision {
     pub created_at: u64,
 }
 
-/// The three question shapes the Jev API and the helper-model contract both
-/// speak, per the docs (`typesafe.rs`'s own module doc has the wire shape).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuestionKind {
-    Choice,
-    Score,
-    Noul,
-}
-
-/// A question's own criteria, one shape per [`QuestionKind`]. `Choice`
-/// pairs an option with an optional one-line description (`None` is a valid
-/// Jev value); `Score` is an ordered list of level descriptions (index 0
-/// first); `Noul` optionally names what `true`/`false` mean.
-#[derive(Debug, Clone)]
-pub enum Criteria {
-    Choice(Vec<(String, Option<String>)>),
-    Score(Vec<String>),
-    Noul {
-        when_true: Option<String>,
-        when_false: Option<String>,
-    },
-}
-
-/// A neutral, decider-agnostic question. Both `typesafe.rs` and `llm.rs`
-/// consume the same `Vec<Question>` (from [`questions`]) and produce the
-/// same [`Answers`] shape, so [`merge`] never needs to know which decider
-/// answered.
-#[derive(Debug, Clone)]
-pub struct Question {
-    pub id: String,
-    pub kind: QuestionKind,
-    pub instructions: String,
-    pub criteria: Criteria,
-}
-
-/// One decider's answer to one question, already reduced to a single value
-/// plus a confidence in `[0, 1]`. `Score`'s value is a continuous level
-/// index (not necessarily an integer -- see `typesafe::to_answers`'s own
-/// rounding rule); `Noul`'s value is the raw `true`-probability.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AnswerValue {
-    Choice(String),
-    Score(f64),
-    Noul(f64),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Answer {
-    pub value: AnswerValue,
-    pub confidence: f32,
-}
-
-/// A full set of answers, keyed by [`Question::id`].
-pub type Answers = BTreeMap<String, Answer>;
+// `QuestionKind`/`Criteria`/`Question`/`AnswerValue`/`Answer`/`Answers` --
+// the neutral question/answer shapes both `typesafe.rs` (via `jev::ask`) and
+// `llm.rs` consume/produce, so [`merge`] never needs to know which decider
+// answered -- now live in the shared `jev` module; re-exported at the top
+// of this file.
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntakeModel {
@@ -1297,6 +1242,7 @@ mod tests {
                     Answer {
                         value: value.clone(),
                         confidence: *confidence,
+                        probabilities: BTreeMap::new(),
                     },
                 )
             })
