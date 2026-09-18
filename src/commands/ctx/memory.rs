@@ -2964,12 +2964,13 @@ struct HarvestAdviseState<'a> {
 /// narration. Jev never ACCEPTS a candidate the keyword filter itself
 /// rejected: this only ever narrows `accepted`, the same "propose, then
 /// dispose" relationship `filter_durable_candidates`'s own doc comment
-/// describes for the model/keyword-filter pair. A confident rejection (noul
-/// below [`MEMORY_RELEVANCE_FLOOR`]) -- or no parseable answer at all for
-/// that candidate -- drops it, logged the same observable `harvest-skipped`
-/// way every other rejection in this pipeline already is (`REJECT_PATTERNS`'s
-/// own "ties go to rejecting" bias, extended here to an ambiguous Jev
-/// response). Best-effort like every other `[jev]`-gated site: the gate
+/// describes for the model/keyword-filter pair. Only an EXPLICIT rejection
+/// (a noul answer below [`MEMORY_RELEVANCE_FLOOR`]) drops a candidate,
+/// logged the same observable `harvest-skipped` way every other rejection in
+/// this pipeline already is. A missing or unparseable per-id answer is never
+/// grounds to drop a candidate the keyword filter already accepted -- it
+/// keeps the keyword filter's own verdict (accepted), same as the whole-call
+/// fallback below. Best-effort like every other `[jev]`-gated site: the gate
 /// being off, no credential, or any transport/parse error for the WHOLE call
 /// leaves `accepted` completely untouched (`jev::advise`'s own contract).
 fn apply_jev_harvest_gate(
@@ -3022,29 +3023,29 @@ fn apply_jev_harvest_gate(
         .zip(ids)
         .filter(|((key, _), id)| {
             let noul = answers.get(id).and_then(|answer| answer.as_noul());
-            let keep = noul.is_some_and(|value| value >= MEMORY_RELEVANCE_FLOOR);
-            if !keep {
-                let detail = match noul {
-                    Some(value) => {
-                        format!("'{key}' scored {value:.2} below the Jev durability floor")
-                    }
-                    None => format!("'{key}' got no Jev durability answer"),
-                };
-                let _ = super::log::append(
-                    state,
-                    &super::log::Decision {
-                        ts: now,
-                        session: "n/a",
-                        verb: "memory",
-                        verdict: "n/a",
-                        score: 0,
-                        action: "harvest-skipped",
-                        detail: &detail,
-                        observed_at: None,
-                    },
-                );
+            match noul {
+                Some(value) if value < MEMORY_RELEVANCE_FLOOR => {
+                    let detail =
+                        format!("'{key}' scored {value:.2} below the Jev durability floor");
+                    let _ = super::log::append(
+                        state,
+                        &super::log::Decision {
+                            ts: now,
+                            session: "n/a",
+                            verb: "memory",
+                            verdict: "n/a",
+                            score: 0,
+                            action: "harvest-skipped",
+                            detail: &detail,
+                            observed_at: None,
+                        },
+                    );
+                    false
+                }
+                // An accepting score, or a missing/unparseable answer: keep
+                // the keyword filter's own verdict (accepted).
+                _ => true,
             }
-            keep
         })
         .map(|((key, body), _)| (key, body))
         .collect()
@@ -6797,6 +6798,50 @@ This is part of the body too.\n";
         let gated = apply_jev_harvest_gate(accepted.clone(), &cfg, &state, now_secs());
 
         assert_eq!(gated, accepted);
+    }
+
+    /// Review finding (#537 A3): a missing per-id answer must never drop a
+    /// candidate the keyword filter already accepted -- only an explicit
+    /// noul below the floor does. The canned response answers id `"0"` and
+    /// omits `"1"` entirely; `"1"` must still survive.
+    #[test]
+    fn apply_jev_harvest_gate_keeps_a_candidate_with_no_answer_at_all() {
+        let accepted = vec![
+            ("answered".to_string(), "a durable fact".to_string()),
+            ("omitted".to_string(), "another durable fact".to_string()),
+        ];
+
+        let body = r#"{"model": "jev-latest", "answers": {
+            "0": {"type": "noul", "noul": 0.9}
+        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "MEMORY_TEST_HARVEST_GATE_KEY_OMITTED";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let gated = apply_jev_harvest_gate(accepted, &cfg, &state, now_secs());
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            gated,
+            vec![
+                ("answered".to_string(), "a durable fact".to_string()),
+                ("omitted".to_string(), "another durable fact".to_string()),
+            ],
+            "a missing per-id answer must keep the keyword filter's own accept: {gated:?}"
+        );
     }
 
     /// Issue #37: shared writes must remain ordinary visible working-tree

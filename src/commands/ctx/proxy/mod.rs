@@ -271,7 +271,7 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
 }
 
 /// The bounded `[zirv proxy]` context layer (T2 folds this into the compiled
-/// prompt): at most 8 lines -- a header, execution/complexity/risk, the
+/// prompt): at most 7 lines -- a header, execution/complexity/risk, the
 /// seat(s), the workflow, (issue #537 A2, both conditional) the domain tags
 /// and a clarify instruction, and (`Single` only) one line telling the
 /// session plainly that it is the one doing the work, not an orchestrator.

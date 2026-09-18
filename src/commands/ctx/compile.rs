@@ -406,11 +406,24 @@ struct MemoryAdviseState<'a> {
 /// below [`memory::MEMORY_RELEVANCE_FLOOR`]) the same set. Best-effort like every
 /// other `[jev]`-gated site: the gate being off, no credential set, or any
 /// transport/parse error all surface as `jev::advise` returning `None`,
-/// which leaves `selected` in its original deterministic order and
-/// membership, completely untouched -- the common case, and the only case
+/// which leaves `selected` in its original deterministic order, membership
+/// AND LENGTH, completely untouched -- the common case, and the only case
 /// today's default config ever takes (`cfg.jev.memory` defaults `false`),
 /// so this never affects `compile`'s own documented determinism guarantee
 /// unless an operator has explicitly opted a Jev credential in.
+///
+/// Review finding: only the first [`MEMORY_ADVISE_MAX_CANDIDATES`] of
+/// `selected` are ever SENT to Jev (state stays bounded regardless of how
+/// large `[memory] retrieval_max_entries` is configured), but that cap must
+/// never truncate the RETURNED list -- an operator whose `retrieval_max_
+/// entries` exceeds the cap must not silently lose candidates when the gate
+/// is off. Any candidate beyond the sent slice is appended unchanged, in
+/// its original order, after the ranked ones. Within the sent slice, a
+/// candidate whose id is missing from (or unparseable in) the answers is
+/// neither ranked nor pruned -- it keeps its original relative position
+/// after the ranked ones, ahead of the beyond-slice tail: an incomplete
+/// answer set is never grounds to drop a candidate `retrieval::select`
+/// already chose.
 fn rerank_memory_candidates<'a>(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -421,12 +434,9 @@ fn rerank_memory_candidates<'a>(
     if selected.is_empty() {
         return selected;
     }
-    let bounded: Vec<retrieval::Ranked<'a>> = selected
-        .into_iter()
-        .take(MEMORY_ADVISE_MAX_CANDIDATES)
-        .collect();
-    let ids: Vec<String> = (0..bounded.len()).map(|i| i.to_string()).collect();
-    let candidates: Vec<MemoryAdviseCandidate> = bounded
+    let sent_len = selected.len().min(MEMORY_ADVISE_MAX_CANDIDATES);
+    let ids: Vec<String> = (0..sent_len).map(|i| i.to_string()).collect();
+    let candidates: Vec<MemoryAdviseCandidate> = selected[..sent_len]
         .iter()
         .zip(&ids)
         .map(|(ranked, id)| MemoryAdviseCandidate {
@@ -464,18 +474,29 @@ fn rerank_memory_candidates<'a>(
         &advise_state,
         &questions,
     ) else {
-        return bounded;
+        return selected;
     };
-    let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = bounded
-        .into_iter()
-        .zip(ids.iter())
-        .filter_map(|(ranked, id)| {
-            let noul = answers.get(id)?.as_noul()?;
-            (noul >= memory::MEMORY_RELEVANCE_FLOOR).then_some((noul, ranked))
-        })
-        .collect();
+
+    let mut remaining = selected;
+    let tail = remaining.split_off(sent_len);
+    let sent = remaining;
+
+    let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = Vec::new();
+    let mut unanswered: Vec<retrieval::Ranked<'a>> = Vec::new();
+    for (ranked, id) in sent.into_iter().zip(ids.iter()) {
+        match answers.get(id).and_then(|answer| answer.as_noul()) {
+            Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => scored.push((noul, ranked)),
+            Some(_) => {} // an explicit low-relevance verdict prunes the candidate.
+            None => unanswered.push(ranked), // missing/unparseable: kept, original position.
+        }
+    }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.into_iter().map(|(_, ranked)| ranked).collect()
+
+    let mut result: Vec<retrieval::Ranked<'a>> =
+        scored.into_iter().map(|(_, ranked)| ranked).collect();
+    result.extend(unanswered);
+    result.extend(tail);
+    result
 }
 
 /// Gathers the always-present core memory layer and the independent,
@@ -1969,6 +1990,132 @@ mod tests {
             result.len(),
             3,
             "the ranked list must never be longer than the deterministic one"
+        );
+    }
+
+    /// Review finding (#537 A3): the per-call cap on candidates SENT to Jev
+    /// must never truncate the RETURNED list when the gate is off -- an
+    /// operator whose `retrieval_max_entries` exceeds
+    /// `MEMORY_ADVISE_MAX_CANDIDATES` must not silently lose candidates.
+    #[test]
+    fn rerank_memory_candidates_never_truncates_on_the_gate_off_path() {
+        let candidates: Vec<retrieval::RetrievalCandidate> = (0..40)
+            .map(|i| retrieval_candidate(&format!("key-{i}"), "body"))
+            .collect();
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let deterministic_keys = keys(&selected);
+        let cfg = CtxConfig::default();
+        assert!(!cfg.jev.memory, "the gate defaults off");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        assert_eq!(keys(&result), deterministic_keys);
+        assert_eq!(result.len(), 40, "all 40 candidates must survive untouched");
+    }
+
+    /// Review finding (#537 A3): only the first `MEMORY_ADVISE_MAX_CANDIDATES`
+    /// (32) candidates are sent to Jev; the remaining 8 must be appended
+    /// unchanged, in their original order, after the ranked slice.
+    #[test]
+    fn rerank_memory_candidates_appends_the_beyond_cap_tail_unchanged() {
+        let candidates: Vec<retrieval::RetrievalCandidate> = (0..40)
+            .map(|i| retrieval_candidate(&format!("key-{i}"), "body"))
+            .collect();
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let tail_keys: Vec<String> = keys(&selected)[32..].to_vec();
+
+        // Every sent candidate scores well above `MEMORY_RELEVANCE_FLOOR`
+        // (0.3), so none of the 32 sent candidates are pruned -- this test
+        // is only about the beyond-cap tail, asserted below.
+        let answers: Vec<String> = (0..32)
+            .map(|i| {
+                format!(
+                    r#""{i}": {{"type": "noul", "noul": {}}}"#,
+                    0.9 - (i as f64) * 0.01
+                )
+            })
+            .collect();
+        let body = format!(
+            r#"{{"model": "jev-latest", "answers": {{{}}}, "usage": {{"input_tokens": 10, "output_tokens": 0}}}}"#,
+            answers.join(",")
+        );
+        let body: &'static str = Box::leak(body.into_boxed_str());
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "COMPILE_TEST_MEMORY_KEY_TAIL";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(result.len(), 40, "no candidate lost: {}", result.len());
+        assert_eq!(
+            keys(&result)[32..],
+            tail_keys[..],
+            "the beyond-cap tail must survive unchanged, in original order"
+        );
+    }
+
+    /// Review finding (#537 A3): a candidate whose id is missing from the
+    /// answers must keep its original relative position after the ranked
+    /// ones, never dropped by the filter.
+    #[test]
+    fn rerank_memory_candidates_keeps_a_candidate_missing_from_the_answers() {
+        let candidates = [
+            retrieval_candidate("alpha", "alpha body"),
+            retrieval_candidate("bravo", "bravo body"),
+            retrieval_candidate("charlie", "charlie body"),
+        ];
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+
+        // "1" (bravo) is omitted entirely.
+        let body = r#"{"model": "jev-latest", "answers": {
+            "0": {"type": "noul", "noul": 0.9},
+            "2": {"type": "noul", "noul": 0.5}
+        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "COMPILE_TEST_MEMORY_KEY_OMITTED";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        // alpha (0.9) ranks first, then charlie (0.5), then bravo (no
+        // answer) kept at the end rather than dropped.
+        assert_eq!(
+            keys(&result),
+            vec![
+                "alpha".to_string(),
+                "charlie".to_string(),
+                "bravo".to_string()
+            ]
         );
     }
 
