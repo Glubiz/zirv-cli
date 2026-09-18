@@ -1283,23 +1283,58 @@ fn github_api_pages<T: for<'de> Deserialize<'de>>(
     parse_paginated(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn severity_from_github_comment(body: &str) -> FindingSeverity {
+fn is_github_approval(body: &str) -> bool {
+    const APPROVALS: &[&str] = &[
+        "looks good to me",
+        "ready to merge",
+        "good to go",
+        "great work",
+        "looks great",
+        "looks good",
+        "all good",
+        "approved",
+        "approve",
+        "ship it",
+        "lgtm",
+        "nice work",
+        "nice",
+        "thumbs up",
+        ":+1:",
+        "+1",
+        "👍",
+        "✅",
+    ];
+    let normalized = body.trim().to_lowercase();
+    APPROVALS.iter().any(|approval| {
+        normalized
+            .strip_prefix(approval)
+            .is_some_and(|suffix| suffix.chars().all(|character| !character.is_alphanumeric()))
+    })
+}
+
+fn github_comment_defaults(body: &str) -> Option<(FindingSeverity, FindingDisposition)> {
+    if is_github_approval(body) {
+        return None;
+    }
     let normalized = body.trim_start().to_ascii_lowercase();
-    if normalized.starts_with("[critical]")
+    let defaults = if normalized.starts_with("[critical]")
         || normalized.starts_with("critical:")
         || normalized.starts_with("blocker:")
     {
-        FindingSeverity::Critical
+        (FindingSeverity::Critical, FindingDisposition::Fixed)
+    } else if normalized.starts_with("[major]") || normalized.starts_with("major:") {
+        (FindingSeverity::Major, FindingDisposition::Fixed)
     } else if normalized.starts_with("[minor]")
         || normalized.starts_with("minor:")
         || normalized.starts_with("nit:")
     {
-        FindingSeverity::Minor
+        (FindingSeverity::Minor, FindingDisposition::Fixed)
     } else if normalized.starts_with("[note]") || normalized.starts_with("note:") {
-        FindingSeverity::Note
+        (FindingSeverity::Note, FindingDisposition::Fixed)
     } else {
-        FindingSeverity::Major
-    }
+        (FindingSeverity::Minor, FindingDisposition::Open)
+    };
+    Some(defaults)
 }
 
 fn github_summary(pr: u64, author: Option<&GhUser>, body: &str, url: Option<&str>) -> String {
@@ -1342,13 +1377,17 @@ fn ingest_pull_request_comments(
         if existing.contains(&id) || comment.body.trim().is_empty() {
             continue;
         }
+        let Some((severity, recommended_disposition)) = github_comment_defaults(&comment.body)
+        else {
+            continue;
+        };
         let path = comment.path.and_then(|path| {
             (path.len() <= MAX_FINDING_PATH_BYTES && !Path::new(&path).is_absolute())
                 .then(|| PathBuf::from(path))
         });
         incoming.push(ReviewFinding {
             id,
-            severity: severity_from_github_comment(&comment.body),
+            severity,
             summary: github_summary(
                 pr,
                 comment.user.as_ref(),
@@ -1358,7 +1397,7 @@ fn ingest_pull_request_comments(
             path,
             line: comment.line.or(comment.original_line),
             disposition: FindingDisposition::Open,
-            recommended_disposition: Some(FindingDisposition::Fixed),
+            recommended_disposition: Some(recommended_disposition),
             created_at: now_secs(),
         });
     }
@@ -1371,14 +1410,17 @@ fn ingest_pull_request_comments(
         if existing.contains(&id) {
             continue;
         }
+        let Some((severity, recommended_disposition)) = github_comment_defaults(&body) else {
+            continue;
+        };
         incoming.push(ReviewFinding {
             id,
-            severity: severity_from_github_comment(&body),
+            severity,
             summary: github_summary(pr, review.user.as_ref(), &body, review.html_url.as_deref()),
             path: None,
             line: None,
             disposition: FindingDisposition::Open,
-            recommended_disposition: Some(FindingDisposition::Fixed),
+            recommended_disposition: Some(recommended_disposition),
             created_at: now_secs(),
         });
     }
@@ -3286,12 +3328,20 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 // moved.
                 let (_, results) = engine::apply_recommended_dispositions(&state_dir, state)?;
                 for result in &results {
-                    match result.applied {
-                        Some(disposition) => {
-                            writeln!(writer, "{}: {:?}", result.finding_id, disposition)?
-                        }
-                        None => {
-                            writeln!(writer, "{}: open (no recommendation)", result.finding_id)?
+                    if result.requires_explicit_disposition {
+                        writeln!(
+                            writer,
+                            "{}: open (explicit disposition required)",
+                            result.finding_id
+                        )?;
+                    } else {
+                        match result.applied {
+                            Some(disposition) => {
+                                writeln!(writer, "{}: {:?}", result.finding_id, disposition)?
+                            }
+                            None => {
+                                writeln!(writer, "{}: open (no recommendation)", result.finding_id)?
+                            }
                         }
                     }
                 }
@@ -4357,20 +4407,51 @@ mod tests {
     #[test]
     fn github_review_severity_mapping_is_deterministic() {
         assert_eq!(
-            severity_from_github_comment("[critical] auth bypass"),
-            FindingSeverity::Critical
+            github_comment_defaults("[critical] auth bypass"),
+            Some((FindingSeverity::Critical, FindingDisposition::Fixed))
         );
         assert_eq!(
-            severity_from_github_comment("nit: rename this"),
-            FindingSeverity::Minor
+            github_comment_defaults("nit: rename this"),
+            Some((FindingSeverity::Minor, FindingDisposition::Fixed))
         );
         assert_eq!(
-            severity_from_github_comment("note: optional"),
-            FindingSeverity::Note
+            github_comment_defaults("note: optional"),
+            Some((FindingSeverity::Note, FindingDisposition::Fixed))
         );
         assert_eq!(
-            severity_from_github_comment("This changes semantics"),
-            FindingSeverity::Major
+            github_comment_defaults("This changes semantics"),
+            Some((FindingSeverity::Minor, FindingDisposition::Open))
+        );
+    }
+
+    #[test]
+    fn github_approval_comments_are_skipped() {
+        for body in [
+            "LGTM",
+            "looks good! 🚀",
+            "Approve.",
+            "APPROVED ✅",
+            "ship it!",
+            "Nice 👍",
+            "+1",
+        ] {
+            assert_eq!(github_comment_defaults(body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn github_unmarked_defect_defaults_to_minor_and_open() {
+        assert_eq!(
+            github_comment_defaults("This changes semantics"),
+            Some((FindingSeverity::Minor, FindingDisposition::Open))
+        );
+    }
+
+    #[test]
+    fn github_marked_major_comment_keeps_major_fixed_defaults() {
+        assert_eq!(
+            github_comment_defaults("[Major] This changes semantics"),
+            Some((FindingSeverity::Major, FindingDisposition::Fixed))
         );
     }
 
@@ -6221,6 +6302,26 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         let mut state = running_review_state(repo.path(), "HEAD");
         state.review_findings = vec![
             ReviewFinding {
+                id: "critical-dismissal".into(),
+                severity: FindingSeverity::Critical,
+                summary: "critical defect".into(),
+                path: None,
+                line: None,
+                disposition: FindingDisposition::Open,
+                recommended_disposition: Some(FindingDisposition::Dismissed),
+                created_at: now_secs(),
+            },
+            ReviewFinding {
+                id: "minor-dismissal".into(),
+                severity: FindingSeverity::Minor,
+                summary: "minor false positive".into(),
+                path: None,
+                line: None,
+                disposition: FindingDisposition::Open,
+                recommended_disposition: Some(FindingDisposition::Dismissed),
+                created_at: now_secs(),
+            },
+            ReviewFinding {
                 id: "has-recommendation".into(),
                 severity: FindingSeverity::Major,
                 summary: "real defect".into(),
@@ -6265,6 +6366,14 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             "applied finding should be named: {text}"
         );
         assert!(
+            text.contains("critical-dismissal: open (explicit disposition required)"),
+            "withheld major/critical dismissals must be named: {text}"
+        );
+        assert!(
+            text.contains("minor-dismissal: Dismissed"),
+            "minor dismissals should still be applied: {text}"
+        );
+        assert!(
             text.contains("no-recommendation: open (no recommendation)"),
             "an open finding with no recommendation must still be listed: {text}"
         );
@@ -6280,6 +6389,14 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         assert_eq!(
             finding("has-recommendation").disposition,
             FindingDisposition::Fixed
+        );
+        assert_eq!(
+            finding("critical-dismissal").disposition,
+            FindingDisposition::Open
+        );
+        assert_eq!(
+            finding("minor-dismissal").disposition,
+            FindingDisposition::Dismissed
         );
         assert_eq!(
             finding("no-recommendation").disposition,

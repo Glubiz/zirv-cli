@@ -3000,8 +3000,10 @@ fn finish_close(
 pub struct AppliedDisposition {
     pub finding_id: String,
     /// `Some` when the finding carried a recommendation and was moved to it;
-    /// `None` when it had none and was left `Open`.
+    /// `None` when it had none or requires an explicit disposition.
     pub applied: Option<super::review::FindingDisposition>,
+    /// A Critical or Major dismissal was withheld from bulk application.
+    pub requires_explicit_disposition: bool,
 }
 
 /// Applies every *open* review finding's own `recommended_disposition` in one
@@ -3014,7 +3016,8 @@ pub struct AppliedDisposition {
 /// additive over the single-finding dispose, never a way to revisit a
 /// decision already made. An open finding with no recommendation is left
 /// `Open` and still reported, so the caller can see it was considered and
-/// skipped rather than silently missed.
+/// skipped rather than silently missed. Critical and Major findings whose
+/// recommendation is `Dismissed` also remain `Open` for explicit disposition.
 ///
 /// Called directly by `zirv workflow review dispose --apply-recommended`
 /// (`review::ReviewCommand::Dispose`'s handler): the flag lives on the same
@@ -3034,11 +3037,21 @@ pub fn apply_recommended_dispositions(
         if finding.disposition != super::review::FindingDisposition::Open {
             continue;
         }
+        let requires_explicit_disposition = finding.recommended_disposition
+            == Some(super::review::FindingDisposition::Dismissed)
+            && matches!(
+                finding.severity,
+                super::review::FindingSeverity::Critical | super::review::FindingSeverity::Major
+            );
+        let applied = finding
+            .recommended_disposition
+            .filter(|_| !requires_explicit_disposition);
         results.push(AppliedDisposition {
             finding_id: finding.id.clone(),
-            applied: finding.recommended_disposition,
+            applied,
+            requires_explicit_disposition,
         });
-        if let Some(recommended) = finding.recommended_disposition {
+        if let Some(recommended) = applied {
             finding.disposition = recommended;
         }
     }
@@ -7623,9 +7636,12 @@ mod tests {
             true,
             low_classification(),
         );
+        let mut minor_dismissal =
+            review_finding("b", Disposition::Open, Some(Disposition::Dismissed));
+        minor_dismissal.severity = super::super::review::FindingSeverity::Minor;
         state.review_findings = vec![
             review_finding("a", Disposition::Open, Some(Disposition::Fixed)),
-            review_finding("b", Disposition::Open, Some(Disposition::Dismissed)),
+            minor_dismissal,
             review_finding("c", Disposition::Open, None),
             review_finding("d", Disposition::Accepted, Some(Disposition::Fixed)),
         ];
@@ -7681,6 +7697,51 @@ mod tests {
             Disposition::Fixed,
             "the applied disposition must persist"
         );
+    }
+
+    #[test]
+    fn apply_recommended_dispositions_requires_explicit_major_or_critical_dismissal() {
+        use super::super::review::{
+            FindingDisposition as Disposition, FindingSeverity as Severity,
+        };
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut critical =
+            review_finding("critical", Disposition::Open, Some(Disposition::Dismissed));
+        critical.severity = Severity::Critical;
+        let major = review_finding("major", Disposition::Open, Some(Disposition::Dismissed));
+        let mut minor = review_finding("minor", Disposition::Open, Some(Disposition::Dismissed));
+        minor.severity = Severity::Minor;
+        state.review_findings = vec![critical, major, minor];
+
+        let (state, results) = apply_recommended_dispositions(&state_dir, state).unwrap();
+        let finding = |needle: &str| {
+            state
+                .review_findings
+                .iter()
+                .find(|finding| finding.id == needle)
+                .unwrap()
+        };
+        assert_eq!(finding("critical").disposition, Disposition::Open);
+        assert_eq!(finding("major").disposition, Disposition::Open);
+        assert_eq!(finding("minor").disposition, Disposition::Dismissed);
+        for id in ["critical", "major"] {
+            let result = results
+                .iter()
+                .find(|result| result.finding_id == id)
+                .unwrap();
+            assert_eq!(result.applied, None);
+            assert!(result.requires_explicit_disposition);
+        }
     }
 
     #[test]

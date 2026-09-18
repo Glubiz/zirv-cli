@@ -700,21 +700,17 @@ pub enum InconclusiveReason {
     /// "command not found"/"not recognized" message) -- see
     /// `looks_like_tool_missing`.
     ToolMissing,
-    /// A `cargo test`/`cargo nextest run`-shaped `Unit` check exited
-    /// non-zero without printing a single parseable summary line -- the
-    /// STATUS_ACCESS_VIOLATION trap this issue exists to close: no
-    /// `test result:`/`Summary [...]` line means the runner never finished
-    /// reporting, not that nothing failed. See `classify_test_report`.
+    /// A recognized test runner exited abnormally without trustworthy result
+    /// output. Cargo uses its summary grammar; other runners fail closed on
+    /// any unsuccessful exit.
     RunnerCrashed,
     /// A `cargo test`/`cargo nextest run`-shaped `Unit` check's summary line
     /// declared zero tests run with a successful exit -- an empty filter or
     /// a selection that matched nothing, not evidence the change set is
     /// clean.
     NoTestsSelected,
-    /// A `cargo test`/`cargo nextest run`-shaped `Unit` check exited zero
-    /// but no summary line could be found at all -- reserved for a
-    /// well-formed-but-empty output that is neither a crash (exit succeeded)
-    /// nor a recognizable summary.
+    /// A recognized test runner exited zero without result output. Cargo
+    /// requires a parseable summary; other runners require non-empty output.
     ReportUnparseable,
     /// The check's own process-level timeout fired. Reserved for parity with
     /// the design's reason list; `CheckStatus::TimedOut` already carries
@@ -1003,15 +999,73 @@ fn failure_names_for(check: &CheckResult) -> std::collections::BTreeSet<String> 
         .unwrap_or_default()
 }
 
-/// Whether `command` invokes one of the two test runners
-/// [`classify_test_report`] knows how to read a well-formedness verdict out
-/// of. Scoped deliberately narrow (issue #268): an arbitrary `Unit` check
-/// (`npm run test`, say) does not print either runner's summary shape, and
-/// misclassifying its ordinary output as `report-unparseable` would turn a
-/// real pass into a false `Inconclusive`.
-fn is_cargo_test_runner(command: &str) -> bool {
-    let command = command.trim_start();
-    command.starts_with("cargo test") || command.starts_with("cargo nextest")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestRunnerKind {
+    Cargo,
+    Other,
+}
+
+fn is_environment_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn test_runner_kind(command: &str) -> Option<TestRunnerKind> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut index: usize = 0;
+    loop {
+        while tokens
+            .get(index)
+            .is_some_and(|token| is_environment_assignment(token))
+        {
+            index += 1;
+        }
+        match tokens.get(index).copied() {
+            Some("env" | "time") => index += 1,
+            Some("nice") => {
+                index += 1;
+                if tokens.get(index).is_some_and(|token| *token == "-n") {
+                    index = index.saturating_add(2);
+                } else if tokens.get(index).is_some_and(|token| {
+                    token
+                        .strip_prefix('-')
+                        .is_some_and(|value| value.parse::<u8>().is_ok())
+                }) {
+                    index += 1;
+                }
+            }
+            Some("timeout") => index = index.saturating_add(2),
+            _ => break,
+        }
+    }
+    match tokens.get(index..)? {
+        ["cargo", "test", ..] | ["cargo", "nextest", ..] => Some(TestRunnerKind::Cargo),
+        ["pytest", ..]
+        | ["python", "-m", "pytest", ..]
+        | ["python3", "-m", "pytest", ..]
+        | ["go", "test", ..]
+        | ["npm", "test", ..]
+        | ["npm", "run", "test", ..]
+        | ["pnpm", "test", ..]
+        | ["yarn", "test", ..]
+        | ["bun", "test", ..]
+        | ["vitest", ..]
+        | ["jest", ..]
+        | ["phpunit", ..]
+        | ["mix", "test", ..]
+        | ["dotnet", "test", ..]
+        | ["mvn", "test", ..]
+        | ["gradle", "test", ..]
+        | ["./gradlew", "test", ..]
+        | ["make", "test", ..] => Some(TestRunnerKind::Other),
+        _ => None,
+    }
 }
 
 /// A cheap, pure signal (issue #268's "degraded-gate ban") that a check's own
@@ -1159,14 +1213,10 @@ fn classify_test_outcome(total: Option<u64>, exit_success: bool) -> Option<Incon
 
 /// Applies both of `run_check`'s post-hoc `Inconclusive` reclassifications
 /// (issue #268) to an otherwise-final `(status, exit_code)`: a tool the
-/// shell could not find, then -- only for a `cargo test`/`cargo nextest
-/// run`-shaped `Unit` check -- [`classify_test_outcome`], fed
-/// `test_summary_total` from the check's complete, uncapped output (see that
-/// function's own doc comment for why the capped display text must never be
-/// used here). `output` itself is only ever consulted for the tool-missing
-/// heuristic, which is fine against the capped text: a "command not
-/// found"/exit-127 signal shows up early and reliably, unlike a summary line
-/// a large enough later flood can push out of a capped tail. Never touches
+/// shell could not find, then a recognized test runner whose result cannot
+/// be trusted. Cargo uses [`classify_test_outcome`] with `test_summary_total`
+/// from the complete stream; other runners require a successful exit and
+/// non-empty output. Never touches
 /// `CheckStatus::DryRun`/`Skipped`/`TimedOut`: a timeout already blocks every
 /// gate exactly as hard as `Inconclusive` does (see `CheckStatus::
 /// Inconclusive`'s own doc comment), and dry-run/skipped checks were never
@@ -1175,7 +1225,7 @@ fn classify_gate_status(
     status: CheckStatus,
     exit_code: Option<i32>,
     output: &str,
-    is_test_runner_check: bool,
+    test_runner_kind: Option<TestRunnerKind>,
     test_summary_total: Option<u64>,
 ) -> (CheckStatus, Option<InconclusiveReason>) {
     if status == CheckStatus::Failed && looks_like_tool_missing(exit_code, output) {
@@ -1184,12 +1234,22 @@ fn classify_gate_status(
             Some(InconclusiveReason::ToolMissing),
         );
     }
-    if is_test_runner_check
-        && matches!(status, CheckStatus::Passed | CheckStatus::Failed)
-        && let Some(reason) =
-            classify_test_outcome(test_summary_total, status == CheckStatus::Passed)
-    {
-        return (CheckStatus::Inconclusive, Some(reason));
+    if matches!(status, CheckStatus::Passed | CheckStatus::Failed) {
+        let reason = match test_runner_kind {
+            Some(TestRunnerKind::Cargo) => {
+                classify_test_outcome(test_summary_total, status == CheckStatus::Passed)
+            }
+            Some(TestRunnerKind::Other) if status == CheckStatus::Failed => {
+                Some(InconclusiveReason::RunnerCrashed)
+            }
+            Some(TestRunnerKind::Other) if output.trim().is_empty() => {
+                Some(InconclusiveReason::ReportUnparseable)
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return (CheckStatus::Inconclusive, Some(reason));
+        }
     }
     (status, None)
 }
@@ -2015,8 +2075,9 @@ fn run_check(
     }
     let check_source = check.source;
     let check = &check.spec;
-    let is_test_runner_check =
-        check.kind == CheckKind::Unit && is_cargo_test_runner(&check.command);
+    let test_runner_kind = (check.kind == CheckKind::Unit)
+        .then(|| test_runner_kind(&check.command))
+        .flatten();
     let started = Instant::now();
     let mut command = command_for_shell(&check.command);
     super::isolate_process_tree(&mut command);
@@ -2159,9 +2220,8 @@ fn run_check(
     // literal spawn failure (the shell binary itself missing -- vanishingly
     // rare) and a shell-reported "command not found" (the command inside it
     // missing -- the realistic case for a misconfigured `verify.toml`) both
-    // become `Inconclusive`, and so does a `cargo test`/`cargo nextest
-    // run`-shaped `Unit` check whose own output never reached a well-formed
-    // summary line.
+    // become `Inconclusive`, as does a recognized test runner whose result
+    // cannot be trusted.
     let (status, inconclusive_reason) = if spawn_tool_missing {
         (
             CheckStatus::Inconclusive,
@@ -2172,7 +2232,7 @@ fn run_check(
             status,
             exit_code,
             &String::from_utf8_lossy(&output),
-            is_test_runner_check,
+            test_runner_kind,
             test_summary_total,
         )
     };
@@ -5765,11 +5825,25 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     }
 
     #[test]
-    fn is_cargo_test_runner_matches_both_known_runners_and_nothing_else() {
-        assert!(is_cargo_test_runner("cargo test --verbose"));
-        assert!(is_cargo_test_runner("cargo nextest run --no-fail-fast"));
-        assert!(!is_cargo_test_runner("npm run test"));
-        assert!(!is_cargo_test_runner("cargo build"));
+    fn test_runner_recognizer_handles_wrappers_and_common_runners() {
+        assert_eq!(
+            test_runner_kind("FOO=bar env BAR=baz timeout 30 cargo test --verbose"),
+            Some(TestRunnerKind::Cargo)
+        );
+        assert_eq!(
+            test_runner_kind("nice time cargo nextest run --no-fail-fast"),
+            Some(TestRunnerKind::Cargo)
+        );
+        assert_eq!(test_runner_kind("pytest -q"), Some(TestRunnerKind::Other));
+        assert_eq!(
+            test_runner_kind("python3 -m pytest"),
+            Some(TestRunnerKind::Other)
+        );
+        assert_eq!(
+            test_runner_kind("go test ./..."),
+            Some(TestRunnerKind::Other)
+        );
+        assert_eq!(test_runner_kind("ls -la"), None);
     }
 
     #[test]
@@ -5787,17 +5861,16 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     }
 
     /// `classify_gate_status` is the seam `run_check` actually calls: a
-    /// non-runner `Unit` check (`npm run test`, say) must never be
+    /// non-runner `Unit` check must never be
     /// reclassified by `classify_test_report` at all, even if its output
-    /// happens to contain no cargo-shaped summary -- only `cargo test`/
-    /// `cargo nextest run` commands are in scope (`is_cargo_test_runner`).
+    /// happens to contain no cargo-shaped summary.
     #[test]
     fn classify_gate_status_never_touches_a_non_runner_unit_check() {
         let (status, reason) = classify_gate_status(
             CheckStatus::Passed,
             Some(0),
             "jest output, no cargo shape",
-            false,
+            None,
             None,
         );
         assert_eq!(status, CheckStatus::Passed);
@@ -5808,16 +5881,33 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     fn classify_gate_status_reclassifies_a_crashed_test_runner_check() {
         let output = include_str!("../../../tests/fixtures/test-reports/cargo-test-crash.txt");
         let total = extract_test_total(output);
-        let (status, reason) =
-            classify_gate_status(CheckStatus::Failed, Some(1), output, true, total);
+        let (status, reason) = classify_gate_status(
+            CheckStatus::Failed,
+            Some(1),
+            output,
+            Some(TestRunnerKind::Cargo),
+            total,
+        );
+        assert_eq!(status, CheckStatus::Inconclusive);
+        assert_eq!(reason, Some(InconclusiveReason::RunnerCrashed));
+    }
+
+    #[test]
+    fn a_non_cargo_runner_crash_is_inconclusive_not_a_silent_pass() {
+        let (status, reason) = classify_gate_status(
+            CheckStatus::Failed,
+            Some(1),
+            "Fatal Python error: Segmentation fault",
+            Some(TestRunnerKind::Other),
+            None,
+        );
         assert_eq!(status, CheckStatus::Inconclusive);
         assert_eq!(reason, Some(InconclusiveReason::RunnerCrashed));
     }
 
     #[test]
     fn classify_gate_status_reclassifies_exit_127_regardless_of_check_kind() {
-        let (status, reason) =
-            classify_gate_status(CheckStatus::Failed, Some(127), "", false, None);
+        let (status, reason) = classify_gate_status(CheckStatus::Failed, Some(127), "", None, None);
         assert_eq!(status, CheckStatus::Inconclusive);
         assert_eq!(reason, Some(InconclusiveReason::ToolMissing));
     }
@@ -5839,7 +5929,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             CheckStatus::Passed,
             Some(0),
             &output_with_no_summary,
-            true,
+            Some(TestRunnerKind::Cargo),
             Some(3),
         );
         assert_eq!(passed_status, CheckStatus::Passed, "{passed_reason:?}");
@@ -5849,7 +5939,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             CheckStatus::Failed,
             Some(101),
             &output_with_no_summary,
-            true,
+            Some(TestRunnerKind::Cargo),
             Some(2),
         );
         assert_eq!(failed_status, CheckStatus::Failed, "{failed_reason:?}");
