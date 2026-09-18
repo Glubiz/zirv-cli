@@ -12,6 +12,7 @@ use super::agents::AgentRegistry;
 use super::classify::{self, Classification, Complexity, Intent, RiskBand, WorkDomain};
 use super::deploy::DeployTier;
 use super::skill::{SkillRegistry, WorkflowPhase};
+use crate::commands::ctx::jev::{self, AnswerValue, Question};
 // Only `mod tests` below refers to this module by its bare name (as
 // `super::team::X`, where `super` from inside `tests` is `engine`, which has
 // no `team` submodule of its own); the non-test code above always spells the
@@ -34,6 +35,17 @@ pub const WORKFLOW_SCHEMA_VERSION: u32 = 5;
 const WORKFLOW_SCHEMA_VERSION_V4: u32 = 4;
 const MAX_STEP_ATTEMPTS: u8 = 3;
 const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
+const MAX_JEV_GATE_TASK_BYTES: usize = 4 * 1024;
+const MAX_JEV_GATE_PATHS: usize = 200;
+const MAX_JEV_ARTIFACT_BYTES: usize = 16 * 1024;
+/// Minimum sensitive-surface probability from the 2026-09-18 probe.
+const JEV_SENSITIVE_PROBABILITY: f64 = 0.7;
+/// Minimum frontend choice confidence from the 2026-09-18 probe.
+const JEV_FRONTEND_CONFIDENCE: f32 = 0.9;
+/// Minimum additive-tag probability from the 2026-09-18 probe.
+const JEV_TAG_PROBABILITY: f64 = 0.7;
+/// Minimum artifact-substance confidence from the 2026-09-18 probe.
+const JEV_ARTIFACT_CONFIDENCE: f32 = 0.9;
 
 /// Marks a `[skill ...]` provenance header this compiler itself emitted,
 /// placed right after the newline and before `[skill `. Repository skill
@@ -1188,6 +1200,8 @@ pub struct WorkflowState {
     /// state persisted before this field existed.
     #[serde(default)]
     pub selection: Option<super::selection::Selection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jev_tags: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -1352,6 +1366,7 @@ impl WorkflowState {
             closed_at: None,
             team_plan: None,
             selection: None,
+            jev_tags: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1525,7 +1540,17 @@ fn rfc3339_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-fn pin_current_artifact(state: &mut WorkflowState) -> CtxResult<ArtifactStage> {
+#[derive(Serialize)]
+struct JevArtifactState {
+    artifact_kind: ArtifactStage,
+    artifact_text: String,
+}
+
+fn pin_current_artifact_with_config(
+    state_dir: &StateDir,
+    state: &mut WorkflowState,
+    cfg: Option<&crate::commands::ctx::config::CtxConfig>,
+) -> CtxResult<(ArtifactStage, Option<String>)> {
     let stage = state
         .current()
         .and_then(|step| step.artifact)
@@ -1540,6 +1565,57 @@ fn pin_current_artifact(state: &mut WorkflowState) -> CtxResult<ArtifactStage> {
         )
         .into());
     }
+    let mut warning = None;
+    if let Some(cfg) = cfg {
+        let advice_state = JevArtifactState {
+            artifact_kind: stage,
+            artifact_text: crate::utils::truncate_bytes(body.clone(), Some(MAX_JEV_ARTIFACT_BYTES)),
+        };
+        let questions = [Question::choice(
+            "substance",
+            "Assess whether this artifact has substantive content for its section headings.",
+            &[
+                ("template_copy", "the template with only trivial edits"),
+                (
+                    "thin",
+                    "has content but no substance for its section headings",
+                ),
+                (
+                    "substantive",
+                    "substantive content for its section headings",
+                ),
+            ],
+        )];
+        if let Some(answers) = jev::advise(
+            cfg,
+            state_dir,
+            "workflow-artifact-substance",
+            cfg.jev.gates,
+            &advice_state,
+            &questions,
+        ) && let Some(answer) = answers.get("substance")
+            && answer.confidence >= JEV_ARTIFACT_CONFIDENCE
+            && let AnswerValue::Choice(choice) = &answer.value
+        {
+            match choice.as_str() {
+                "template_copy" => {
+                    return Err(format!(
+                        "{stage} artifact refused by the template_copy advisory at {:.2} confidence: {}",
+                        answer.confidence,
+                        path.display()
+                    )
+                    .into());
+                }
+                "thin" => {
+                    warning = Some(format!(
+                        "{stage} artifact substance advisory is thin at {:.2} confidence; pinning anyway",
+                        answer.confidence
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     let hash = hash_bytes(body.as_bytes());
     let record = state
         .artifacts
@@ -1547,7 +1623,17 @@ fn pin_current_artifact(state: &mut WorkflowState) -> CtxResult<ArtifactStage> {
         .ok_or("workflow artifact record disappeared")?;
     record.accepted_hash = Some(hash);
     record.accepted_at = Some(rfc3339_now());
-    Ok(stage)
+    Ok((stage, warning))
+}
+
+fn pin_current_artifact(
+    state_dir: &StateDir,
+    state: &mut WorkflowState,
+) -> CtxResult<(ArtifactStage, Option<String>)> {
+    let cfg =
+        crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| std::env::var(key).ok())
+            .ok();
+    pin_current_artifact_with_config(state_dir, state, cfg.as_ref())
 }
 
 fn artifact_drift(state: &WorkflowState) -> CtxResult<Option<ArtifactStage>> {
@@ -2201,6 +2287,121 @@ fn enrich_transition_evidence(
     evidence
 }
 
+#[derive(Serialize)]
+struct JevGateState {
+    task: String,
+    changed_paths: Vec<String>,
+    current_complexity: Complexity,
+    current_risk: RiskBand,
+    current_domain: WorkDomain,
+}
+
+fn apply_jev_gate_advice(
+    cfg: &crate::commands::ctx::config::CtxConfig,
+    state_dir: &StateDir,
+    state: &mut WorkflowState,
+    measured: &mut Classification,
+) {
+    measured.risk = measured.risk.max(state.classification.risk);
+    if state.classification.work_domain.domain == WorkDomain::Frontend {
+        measured.work_domain = state.classification.work_domain.clone();
+    }
+    let advice_state = JevGateState {
+        task: crate::utils::truncate_bytes(state.task.clone(), Some(MAX_JEV_GATE_TASK_BYTES)),
+        changed_paths: measured
+            .changed_paths
+            .iter()
+            .take(MAX_JEV_GATE_PATHS)
+            .cloned()
+            .collect(),
+        current_complexity: measured.complexity,
+        current_risk: measured.risk,
+        current_domain: measured.work_domain.domain,
+    };
+    let questions = vec![
+        Question::noul(
+            "sensitive_surface",
+            "Do these paths or this task touch authentication, credentials, permissions, schema or data migration, deployment, or a public API contract?",
+            "a sensitive surface is touched",
+            "no sensitive surface is touched",
+        ),
+        Question::choice(
+            "work_domain",
+            "Which work domain best describes this change?",
+            &[
+                ("frontend", "frontend user interface work"),
+                ("backend", "backend or service work"),
+                ("mixed", "both frontend and backend work"),
+                ("docs", "documentation-only work"),
+            ],
+        ),
+        Question::noul(
+            "security",
+            "Is this security work?",
+            "security",
+            "not security",
+        ),
+        Question::noul("data", "Is this data work?", "data", "not data"),
+        Question::noul(
+            "docs_only",
+            "Is this documentation-only work?",
+            "documentation only",
+            "not documentation only",
+        ),
+        Question::noul("devops", "Is this DevOps work?", "DevOps", "not DevOps"),
+        Question::noul(
+            "architecture",
+            "Is this architecture work?",
+            "architecture",
+            "not architecture",
+        ),
+    ];
+    let Some(answers) = jev::advise(
+        cfg,
+        state_dir,
+        "workflow-gate-reclassification",
+        cfg.jev.gates,
+        &advice_state,
+        &questions,
+    ) else {
+        return;
+    };
+    if answers
+        .get("sensitive_surface")
+        .and_then(|answer| answer.as_noul())
+        .is_some_and(|probability| probability >= JEV_SENSITIVE_PROBABILITY)
+    {
+        measured.risk = measured.risk.max(RiskBand::High);
+        measured.risk_score = measured.risk_score.max(45);
+    }
+    if measured.work_domain.domain == WorkDomain::General
+        && answers.get("work_domain").is_some_and(|answer| {
+            matches!(&answer.value, AnswerValue::Choice(choice) if choice == "frontend")
+                && answer.confidence >= JEV_FRONTEND_CONFIDENCE
+        })
+    {
+        measured.work_domain.domain = WorkDomain::Frontend;
+        measured.work_domain.score = measured.work_domain.score.max(90);
+    }
+    for (question, tag) in [
+        ("security", "security"),
+        ("data", "data"),
+        ("docs_only", "docs-only"),
+        ("devops", "devops"),
+        ("architecture", "architecture"),
+    ] {
+        if answers
+            .get(question)
+            .and_then(|answer| answer.as_noul())
+            .is_some_and(|probability| probability >= JEV_TAG_PROBABILITY)
+            && !state.jev_tags.iter().any(|existing| existing == tag)
+        {
+            state.jev_tags.push(tag.to_string());
+        }
+    }
+    state.jev_tags.sort();
+}
+
 /// Re-measure risk when a workflow reaches a gated step, and never lower it.
 ///
 /// Classification used to be frozen at `workflow start`, which for the common
@@ -2215,7 +2416,7 @@ fn enrich_transition_evidence(
 /// no commits): the band is escalated one step (`classify::mark_unavailable`)
 /// rather than left standing unchallenged -- see the Decision Log entry
 /// "Unmeasurable risk fails safe, not open".
-fn reclassify_at_gate(state: &mut WorkflowState) {
+fn reclassify_at_gate(state_dir: &StateDir, state: &mut WorkflowState) {
     let Some(step) = state.current().cloned() else {
         return;
     };
@@ -2229,7 +2430,7 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
             input
         })
         .and_then(|input| classify::classify(&input).ok());
-    let Some(measured) = measured else {
+    let Some(mut measured) = measured else {
         let raised = classify::mark_unavailable(
             &mut state.classification,
             format!(
@@ -2242,13 +2443,20 @@ fn reclassify_at_gate(state: &mut WorkflowState) {
         }
         return;
     };
-    if measured.work_domain.domain == WorkDomain::Frontend
-        && state.profile == WorkflowProfile::Standard
+    if let Ok(cfg) =
+        crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| std::env::var(key).ok())
     {
-        state.profile = WorkflowProfile::Frontend;
+        apply_jev_gate_advice(&cfg, state_dir, state, &mut measured);
+    }
+    if measured.work_domain.domain == WorkDomain::Frontend
+        && state.classification.work_domain.domain == WorkDomain::General
+    {
         state.classification.work_domain = measured.work_domain.clone();
-        let definition = resolve_definition_for_state(state);
-        apply_profile(&definition, state.profile, &mut state.steps);
+        if state.profile == WorkflowProfile::Standard {
+            state.profile = WorkflowProfile::Frontend;
+            let definition = resolve_definition_for_state(state);
+            apply_profile(&definition, state.profile, &mut state.steps);
+        }
         state.classification.reasons.push(format!(
             "frontend workflow profile selected at step '{}'",
             step.id
@@ -2604,7 +2812,7 @@ pub fn advance_with_evidence(
             record_step_duration_ms(&mut state, &current.id);
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
-            reclassify_at_gate(&mut state);
+            reclassify_at_gate(state_dir, &mut state);
             sync_artifact_records(&mut state);
             ensure_current_artifact_template(&state)?;
             state.status = match state.current() {
@@ -2757,13 +2965,16 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
             .into());
         }
         let completed = state.current().expect("artifact step exists").clone();
-        let accepted = pin_current_artifact(&mut state)?;
+        let (accepted, warning) = pin_current_artifact(state_dir, &mut state)?;
+        if let Some(warning) = warning {
+            crate::output::warn(warning);
+        }
         if !state.completed_steps.contains(&completed.id) {
             record_step_duration_ms(&mut state, &completed.id);
             state.completed_steps.push(completed.id);
         }
         state.current_step += 1;
-        reclassify_at_gate(&mut state);
+        reclassify_at_gate(state_dir, &mut state);
         sync_artifact_records(&mut state);
         ensure_current_artifact_template(&state)?;
         state.status = match state.current() {
@@ -4282,6 +4493,9 @@ pub(crate) fn write_state(
             )?;
         }
         writeln!(writer, "deploy tier: {}", state.deploy_tier)?;
+        if !state.jev_tags.is_empty() {
+            writeln!(writer, "jev tags: {}", state.jev_tags.join(", "))?;
+        }
         writeln!(writer, "status: {:?}", state.status)?;
         if let Some(reason) = &state.closed_reason {
             writeln!(writer, "closed reason: {reason}")?;
@@ -6883,6 +7097,9 @@ mod tests {
             line: None,
             disposition: FindingDisposition::Open,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: 0,
         });
         save(&state_dir, &with_finding, true).unwrap();
@@ -7613,6 +7830,9 @@ mod tests {
             line: None,
             disposition,
             recommended_disposition: recommended,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: 0,
         }
     }
@@ -8385,6 +8605,151 @@ mod tests {
         );
     }
 
+    fn artifact_gate_state(repo: &Path) -> WorkflowState {
+        WorkflowState::start(
+            repo.to_path_buf(),
+            "document the intent".into(),
+            WorkflowKind::Bugfix,
+            None,
+            true,
+            Classification {
+                complexity: Complexity::Bounded,
+                ..low_classification()
+            },
+        )
+    }
+
+    #[test]
+    fn jev_artifact_refuses_template_copy_at_high_confidence() {
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.95},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_COPY");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_ARTIFACT_COPY",
+            Some("secret"),
+        )]);
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = artifact_gate_state(repo.path());
+        ensure_current_artifact_template(&state).unwrap();
+        let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(&path, "# Intent\n\n## Problem\nChanged wording\n").unwrap();
+
+        let error = pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg))
+            .unwrap_err()
+            .to_string();
+        request.recv().unwrap();
+
+        assert!(
+            error.contains("template_copy") && error.contains("0.95"),
+            "{error}"
+        );
+        assert!(state.artifacts["intent"].accepted_hash.is_none());
+    }
+
+    #[test]
+    fn jev_artifact_warns_and_pins_thin_content_at_high_confidence() {
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"thin","probabilities":{"thin":0.95},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_THIN");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_ARTIFACT_THIN",
+            Some("secret"),
+        )]);
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = artifact_gate_state(repo.path());
+        ensure_current_artifact_template(&state).unwrap();
+        let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        std::fs::write(&path, "# Intent\n\nA sentence.\n").unwrap();
+
+        let (_, warning) =
+            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
+        request.recv().unwrap();
+
+        let warning = warning.expect("thin content warns");
+        assert!(
+            warning.contains("thin") && warning.contains("0.95"),
+            "{warning}"
+        );
+        assert!(state.artifacts["intent"].accepted_hash.is_some());
+    }
+
+    #[test]
+    fn deterministic_template_equality_refuses_before_substantive_advice() {
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"substantive","probabilities":{"substantive":0.99},"confidence":0.99}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_EQUALITY");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_ARTIFACT_EQUALITY",
+            Some("secret"),
+        )]);
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = artifact_gate_state(repo.path());
+        ensure_current_artifact_template(&state).unwrap();
+
+        let error = pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("untouched template"), "{error}");
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "deterministic equality must refuse before calling Jev"
+        );
+    }
+
+    #[test]
+    fn jev_artifact_500_pins_exactly_like_gate_off() {
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            500,
+            "{}",
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_500");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_ARTIFACT_500",
+            Some("secret"),
+        )]);
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = artifact_gate_state(repo.path());
+        ensure_current_artifact_template(&state).unwrap();
+        let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        let body = "# Intent\n\n## Problem\nConcrete problem\n";
+        std::fs::write(&path, body).unwrap();
+
+        let (stage, warning) =
+            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
+        request.recv().unwrap();
+
+        assert_eq!(stage, ArtifactStage::Intent);
+        assert!(warning.is_none());
+        assert_eq!(
+            state.artifacts["intent"].accepted_hash.as_deref(),
+            Some(hash_bytes(body.as_bytes()).as_str())
+        );
+    }
+
     /// Mirrors `skill::symlinked_manifests_are_refused` / `agents::load_dir`'s
     /// own symlink defense: a symlinked `.zirv/work/<id>` workflow directory
     /// must be refused before `ensure_current_artifact_template` ever creates
@@ -8889,6 +9254,8 @@ mod tests {
     #[test]
     fn reclassify_at_gate_fails_safe_when_git_is_unavailable_outside_a_repository() {
         let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(state_root.path().to_path_buf());
         let mut state = WorkflowState::start(
             repo.path().to_path_buf(),
             "small feature".into(),
@@ -8908,7 +9275,7 @@ mod tests {
             .position(|step| step.phase == WorkflowPhase::Verify)
             .unwrap();
 
-        reclassify_at_gate(&mut state);
+        reclassify_at_gate(&state_dir, &mut state);
 
         assert!(
             matches!(
@@ -8938,6 +9305,8 @@ mod tests {
     #[test]
     fn reclassify_at_gate_fails_safe_when_the_repository_has_no_commits() {
         let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(state_root.path().to_path_buf());
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(repo.path())
@@ -8958,7 +9327,7 @@ mod tests {
             .position(|step| step.phase == WorkflowPhase::Verify)
             .unwrap();
 
-        reclassify_at_gate(&mut state);
+        reclassify_at_gate(&state_dir, &mut state);
 
         assert!(
             matches!(
@@ -8976,6 +9345,8 @@ mod tests {
     #[test]
     fn reclassify_at_gate_stays_measured_when_git_succeeds() {
         let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(state_root.path().to_path_buf());
         let git = |args: &[&str]| {
             let status = std::process::Command::new("git")
                 .args([
@@ -9010,12 +9381,197 @@ mod tests {
             .position(|step| step.phase == WorkflowPhase::Verify)
             .unwrap();
 
-        reclassify_at_gate(&mut state);
+        reclassify_at_gate(&state_dir, &mut state);
 
         assert_eq!(
             state.classification.risk_measurement,
             classify::RiskMeasurement::Measured
         );
+    }
+
+    fn jev_gate_config(
+        base_url: String,
+        credential_env: &str,
+    ) -> crate::commands::ctx::config::CtxConfig {
+        let mut cfg = crate::commands::ctx::config::CtxConfig::default();
+        cfg.jev.gates = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg
+    }
+
+    #[test]
+    fn jev_gate_sensitive_surface_raises_medium_to_high() {
+        let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_GATE_SENSITIVE");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_GATE_SENSITIVE",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "change credentials".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.classification.risk = RiskBand::Medium;
+        let mut measured = state.classification.clone();
+
+        apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
+        request.recv().unwrap();
+
+        assert_eq!(measured.risk, RiskBand::High);
+    }
+
+    #[test]
+    fn jev_gate_frontend_choice_sets_an_unset_frontend_domain() {
+        let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.95},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_GATE_FRONTEND");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_GATE_FRONTEND",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "update the view".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut measured = state.classification.clone();
+
+        apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
+        request.recv().unwrap();
+
+        assert_eq!(measured.work_domain.domain, WorkDomain::Frontend);
+    }
+
+    #[test]
+    fn jev_gate_permissive_answers_never_lower_risk_or_unset_frontend() {
+        let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.05},"work_domain":{"type":"choice","choice":"backend","probabilities":{"backend":0.99},"confidence":0.99},"security":{"type":"noul","noul":0.05},"data":{"type":"noul","noul":0.05},"docs_only":{"type":"noul","noul":0.05},"devops":{"type":"noul","noul":0.05},"architecture":{"type":"noul","noul":0.05}},"usage":{"input_tokens":20,"output_tokens":7}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_GATE_NARROW");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_GATE_NARROW",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let repo = tempdir().unwrap();
+        let mut classification = low_classification();
+        classification.risk = RiskBand::High;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "existing frontend change".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification.clone(),
+        );
+        let mut measured = classification.clone();
+
+        apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
+        request.recv().unwrap();
+
+        assert_eq!(measured.risk, RiskBand::High);
+        assert_eq!(measured.work_domain.domain, WorkDomain::Frontend);
+        assert!(state.jev_tags.is_empty());
+    }
+
+    #[test]
+    fn jev_gate_tags_accumulate_and_render_in_status() {
+        let body = r#"{"model":"jev-latest","answers":{"security":{"type":"noul","noul":0.95},"data":{"type":"noul","noul":0.95},"docs_only":{"type":"noul","noul":0.95},"devops":{"type":"noul","noul":0.95},"architecture":{"type":"noul","noul":0.95}},"usage":{"input_tokens":20,"output_tokens":5}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_GATE_TAGS");
+        let _credential =
+            crate::commands::ctx::testenv::VarGuard::set(&[("JEV_TEST_GATE_TAGS", Some("secret"))]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "cross-cutting change".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut measured = state.classification.clone();
+
+        apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
+        request.recv().unwrap();
+
+        assert_eq!(
+            state.jev_tags,
+            vec!["architecture", "data", "devops", "docs-only", "security"]
+        );
+        let mut output = Vec::new();
+        write_state(&mut output, &state, false).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("jev tags: architecture, data, devops, docs-only, security"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn jev_gate_500_leaves_state_identical_to_gate_off() {
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            500,
+            "{}",
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_GATE_500");
+        let _credential =
+            crate::commands::ctx::testenv::VarGuard::set(&[("JEV_TEST_GATE_500", Some("secret"))]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small change".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut measured = state.classification.clone();
+        let expected_state = state.clone();
+        let expected_measured = measured.clone();
+
+        apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
+        request.recv().unwrap();
+
+        assert_eq!(state, expected_state);
+        assert_eq!(measured, expected_measured);
     }
 
     #[test]
@@ -9512,6 +10068,9 @@ mod tests {
                 line: None,
                 disposition: super::super::review::FindingDisposition::Open,
                 recommended_disposition: None,
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
                 created_at: now_secs(),
             });
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
