@@ -1482,7 +1482,8 @@ proportional design, approval, test, and review depth; sensitive auth/security
 and database/schema changes cannot be downgraded below High risk. Optional
 operator-owned `jev.gates` advice can only tighten gate-time classification,
 add displayed workflow tags, or refuse a high-confidence template-copy
-artifact; the exact untouched-template check always runs first.
+artifact; high-confidence thin artifacts warn and pin, and the exact
+untouched-template check always runs first.
 
 ### The full verb set
 

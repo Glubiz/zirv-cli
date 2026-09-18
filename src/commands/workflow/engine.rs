@@ -1626,14 +1626,8 @@ fn pin_current_artifact_with_config(
     Ok((stage, warning))
 }
 
-fn pin_current_artifact(
-    state_dir: &StateDir,
-    state: &mut WorkflowState,
-) -> CtxResult<(ArtifactStage, Option<String>)> {
-    let cfg =
-        crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| std::env::var(key).ok())
-            .ok();
-    pin_current_artifact_with_config(state_dir, state, cfg.as_ref())
+fn load_workflow_jev_config(repo: &Path) -> Option<crate::commands::ctx::config::CtxConfig> {
+    crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()).ok()
 }
 
 fn artifact_drift(state: &WorkflowState) -> CtxResult<Option<ArtifactStage>> {
@@ -2302,10 +2296,12 @@ fn apply_jev_gate_advice(
     state: &mut WorkflowState,
     measured: &mut Classification,
 ) {
-    measured.risk = measured.risk.max(state.classification.risk);
-    if state.classification.work_domain.domain == WorkDomain::Frontend {
-        measured.work_domain = state.classification.work_domain.clone();
-    }
+    let current_risk = measured.risk.max(state.classification.risk);
+    let current_domain = if state.classification.work_domain.domain == WorkDomain::Frontend {
+        WorkDomain::Frontend
+    } else {
+        measured.work_domain.domain
+    };
     let advice_state = JevGateState {
         task: crate::utils::truncate_bytes(state.task.clone(), Some(MAX_JEV_GATE_TASK_BYTES)),
         changed_paths: measured
@@ -2315,8 +2311,8 @@ fn apply_jev_gate_advice(
             .cloned()
             .collect(),
         current_complexity: measured.complexity,
-        current_risk: measured.risk,
-        current_domain: measured.work_domain.domain,
+        current_risk,
+        current_domain,
     };
     let questions = vec![
         Question::noul(
@@ -2366,6 +2362,10 @@ fn apply_jev_gate_advice(
     ) else {
         return;
     };
+    measured.risk = current_risk;
+    if state.classification.work_domain.domain == WorkDomain::Frontend {
+        measured.work_domain = state.classification.work_domain.clone();
+    }
     if answers
         .get("sensitive_surface")
         .and_then(|answer| answer.as_noul())
@@ -2416,7 +2416,11 @@ fn apply_jev_gate_advice(
 /// no commits): the band is escalated one step (`classify::mark_unavailable`)
 /// rather than left standing unchallenged -- see the Decision Log entry
 /// "Unmeasurable risk fails safe, not open".
-fn reclassify_at_gate(state_dir: &StateDir, state: &mut WorkflowState) {
+fn reclassify_at_gate(
+    state_dir: &StateDir,
+    state: &mut WorkflowState,
+    cfg: Option<&crate::commands::ctx::config::CtxConfig>,
+) {
     let Some(step) = state.current().cloned() else {
         return;
     };
@@ -2443,20 +2447,16 @@ fn reclassify_at_gate(state_dir: &StateDir, state: &mut WorkflowState) {
         }
         return;
     };
-    if let Ok(cfg) =
-        crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| std::env::var(key).ok())
-    {
-        apply_jev_gate_advice(&cfg, state_dir, state, &mut measured);
+    if let Some(cfg) = cfg {
+        apply_jev_gate_advice(cfg, state_dir, state, &mut measured);
     }
     if measured.work_domain.domain == WorkDomain::Frontend
-        && state.classification.work_domain.domain == WorkDomain::General
+        && state.profile == WorkflowProfile::Standard
     {
+        state.profile = WorkflowProfile::Frontend;
         state.classification.work_domain = measured.work_domain.clone();
-        if state.profile == WorkflowProfile::Standard {
-            state.profile = WorkflowProfile::Frontend;
-            let definition = resolve_definition_for_state(state);
-            apply_profile(&definition, state.profile, &mut state.steps);
-        }
+        let definition = resolve_definition_for_state(state);
+        apply_profile(&definition, state.profile, &mut state.steps);
         state.classification.reasons.push(format!(
             "frontend workflow profile selected at step '{}'",
             step.id
@@ -2812,7 +2812,14 @@ pub fn advance_with_evidence(
             record_step_duration_ms(&mut state, &current.id);
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
-            reclassify_at_gate(state_dir, &mut state);
+            let jev_cfg = if state.current().is_some_and(|step| {
+                matches!(step.phase, WorkflowPhase::Review | WorkflowPhase::Verify)
+            }) {
+                load_workflow_jev_config(&state.repo)
+            } else {
+                None
+            };
+            reclassify_at_gate(state_dir, &mut state, jev_cfg.as_ref());
             sync_artifact_records(&mut state);
             ensure_current_artifact_template(&state)?;
             state.status = match state.current() {
@@ -2965,7 +2972,9 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
             .into());
         }
         let completed = state.current().expect("artifact step exists").clone();
-        let (accepted, warning) = pin_current_artifact(state_dir, &mut state)?;
+        let jev_cfg = load_workflow_jev_config(&state.repo);
+        let (accepted, warning) =
+            pin_current_artifact_with_config(state_dir, &mut state, jev_cfg.as_ref())?;
         if let Some(warning) = warning {
             crate::output::warn(warning);
         }
@@ -2974,7 +2983,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
             state.completed_steps.push(completed.id);
         }
         state.current_step += 1;
-        reclassify_at_gate(state_dir, &mut state);
+        reclassify_at_gate(state_dir, &mut state, jev_cfg.as_ref());
         sync_artifact_records(&mut state);
         ensure_current_artifact_template(&state)?;
         state.status = match state.current() {
@@ -9275,7 +9284,7 @@ mod tests {
             .position(|step| step.phase == WorkflowPhase::Verify)
             .unwrap();
 
-        reclassify_at_gate(&state_dir, &mut state);
+        reclassify_at_gate(&state_dir, &mut state, None);
 
         assert!(
             matches!(
@@ -9327,7 +9336,7 @@ mod tests {
             .position(|step| step.phase == WorkflowPhase::Verify)
             .unwrap();
 
-        reclassify_at_gate(&state_dir, &mut state);
+        reclassify_at_gate(&state_dir, &mut state, None);
 
         assert!(
             matches!(
@@ -9381,12 +9390,63 @@ mod tests {
             .position(|step| step.phase == WorkflowPhase::Verify)
             .unwrap();
 
-        reclassify_at_gate(&state_dir, &mut state);
+        reclassify_at_gate(&state_dir, &mut state, None);
 
         assert_eq!(
             state.classification.risk_measurement,
             classify::RiskMeasurement::Measured
         );
+    }
+
+    #[test]
+    fn gate_off_preserves_general_classification_after_operator_frontend_profile_override() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(state_root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/App.tsx"), "export const App = 1;\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(repo.path().join("src/App.tsx"), "export const App = 2;\n").unwrap();
+
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small change".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        state.set_profile(WorkflowProfile::Frontend);
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.phase == WorkflowPhase::Verify)
+            .unwrap();
+        let reasons = state.classification.reasons.clone();
+
+        reclassify_at_gate(&state_dir, &mut state, None);
+
+        assert_eq!(state.profile, WorkflowProfile::Frontend);
+        assert_eq!(state.classification.work_domain.domain, WorkDomain::General);
+        assert_eq!(state.classification.reasons, reasons);
     }
 
     fn jev_gate_config(
