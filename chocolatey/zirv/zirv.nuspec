@@ -2,7 +2,8 @@
 <package>
   <metadata>
     <id>zirv</id>
-    <version>0.6.2</version>
+    <version>0.0.0-placeholder</version>
+    <!-- NOTE: This is a build-time placeholder. scripts/update_chocolatey.ps1 replaces it with the actual version from Cargo.toml on the CI runner. The committed file is never at the true version. -->
     <title>Zirv CLI</title>
     <authors>Jonathan Solskov</authors>
     <owners>Zirv</owners>
@@ -15,16 +16,15 @@ For detailed documentation, please visit the project homepage.
 Zirv CLI is a powerful command-line tool designed for software engineers. It simplifies workflow automation and provides robust functionality for developers.
     ]]></summary>
     <releaseNotes><![CDATA[
-- Initial release of Zirv CLI.
-- Added core features that enables ways of defining flows in yaml and json.
-- For complete release notes, please visit https://github.com/Glubiz/zirv-dynamic-cli/releases.
+For complete release notes, please visit https://github.com/Glubiz/zirv-cli/releases/tag/v0.0.0-placeholder.
     ]]></releaseNotes>
+    <!-- NOTE: scripts/update_chocolatey.ps1 replaces both the version placeholder and this URL template with the actual release tag. -->
     <iconUrl>https://www.zirv.io/logo.png</iconUrl>
-    <licenseUrl>https://github.com/Glubiz/zirv-dynamic-cli/tree/main/chocolatey/zirv/LICENSE.txt</licenseUrl>
-    <projectUrl>https://github.com/Glubiz/zirv-dynamic-cli</projectUrl>
-    <packageSourceUrl>https://github.com/Glubiz/zirv-dynamic-cli</packageSourceUrl>
-    <docsUrl>https://github.com/Glubiz/zirv-dynamic-cli</docsUrl>
-    <bugTrackerUrl>https://github.com/Glubiz/zirv-dynamic-cli/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/Glubiz/zirv-cli/tree/main/chocolatey/zirv/LICENSE.txt</licenseUrl>
+    <projectUrl>https://github.com/Glubiz/zirv-cli</projectUrl>
+    <packageSourceUrl>https://github.com/Glubiz/zirv-cli</packageSourceUrl>
+    <docsUrl>https://github.com/Glubiz/zirv-cli</docsUrl>
+    <bugTrackerUrl>https://github.com/Glubiz/zirv-cli/issues</bugTrackerUrl>
     <tags>cli tool zirv</tags>
   </metadata>
   <files>
