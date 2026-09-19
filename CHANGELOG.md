@@ -15,6 +15,43 @@ the type/scope is the only breaking-change signal this script reads -- a
 `BREAKING CHANGE:` footer in the commit body is not parsed. Full-rebuild
 command: `scripts/generate-changelog.sh --full`.
 
+## v4.7.0 (2026-09-19)
+
+### Features
+
+- Jev supervisor pre-filters and dispatch model tiering, off by default
+- proxy clarification and domain tags, leaner intake state, Jev-ranked memory retrieval and harvest gate
+- jev::advise as the single gated advisory entry point
+- shared Jev decision client and operator-only [jev] config table
+- harness proxy -- intake decision via TypeSafe Jev with helper and deterministic fallback
+- surface blocked commands in the delegation receipt
+- extend the shipped allow list and escape_allow for the worker capability set
+- blocked-command observability (Change 5a/b/d, reduced 5c)
+
+### Fixes
+
+- dispatch tier override carries the whole tool input in updatedInput
+- drop the removed harnesses field from the typesafe wrapper test
+- memory reranking never truncates or drops candidates when Jev is off or silent
+- keep Question::noul allowed as dead code until its intake caller lands
+- append Jev decisions atomically and re-point the parity matrix at the moved tests
+- proxy derives execution from complexity and launches a single seat
+- narrow launchctl SSH agent access
+- silence safe command permission prompts
+- preserve pipe structure across a keyword-stripped segment head
+- keyword-aware segment candidates and docker/kubectl exec decoding
+
+### Documentation
+
+- spec for built-in safe-command policy and blocked-command observability
+- disclaimer, ctx module boundaries, latency targets, generated changelog (#430, #431, #432, #433)
+
+### Chores
+
+- drop the dead-code allow on Question::noul now that intake calls it
+- cover the typesafe wrapper's delegation to jev::ask
+- 4.4.0
+
 ## v4.0.2 (2026-09-16)
 
 ### Fixes
