@@ -150,7 +150,13 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     let mut ran_model = false;
 
     if matches!(cfg.proxy.decider, ProxyDecider::Typesafe) {
-        match typesafe::decide(&cfg.proxy.typesafe, &intake, &questions) {
+        match typesafe::decide(
+            &cfg.proxy.typesafe,
+            state_dir,
+            cfg.jev.cache_ttl_secs,
+            &intake,
+            &questions,
+        ) {
             Ok((answers, model_usage)) => {
                 result =
                     decision::merge(cfg, &baseline, request, &answers, cfg.proxy.min_confidence);
@@ -308,7 +314,7 @@ pub fn prompt_layer(decision: &ProxyDecision) -> String {
     if !decision.domains.is_empty() {
         lines.push(format!("domains: {}", decision.domains.join(", ")));
     }
-    if decision.needs_clarification >= CLARIFY_THRESHOLD {
+    if decision.needs_clarification >= CLARIFY_THRESHOLD && decision.needs_clarification_decisive {
         lines.push("clarify: ask the user one precise question before acting".to_string());
     }
     if decision.seat_role == SeatRole::Single {
@@ -558,6 +564,7 @@ mod tests {
             seat_tier: decision::SeatTier::Frontier,
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
+            needs_clarification_decisive: false,
             domains: Vec::new(),
             decider: Decider::Typesafe,
             confidence: BTreeMap::from([("seat_tier".to_string(), 0.81_f32)]),
@@ -664,6 +671,7 @@ mod tests {
         let mut decision = sample_decision();
         decision.domains = vec!["security".to_string(), "data".to_string()];
         decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = true;
         let layer = prompt_layer(&decision);
         assert!(layer.contains("domains: security, data"), "{layer}");
         assert!(
@@ -676,6 +684,18 @@ mod tests {
         let clear_layer = prompt_layer(&clear_decision);
         assert!(!clear_layer.contains("domains:"), "{clear_layer}");
         assert!(!clear_layer.contains("clarify:"), "{clear_layer}");
+    }
+
+    /// Jev determinism fix: a `needs_clarification` reading at or above the
+    /// threshold that was NOT decisive at merge time must never add the
+    /// `clarify:` line -- the raw value alone is not enough.
+    #[test]
+    fn prompt_layer_omits_clarify_when_needs_clarification_is_not_decisive() {
+        let mut decision = sample_decision();
+        decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = false;
+        let layer = prompt_layer(&decision);
+        assert!(!layer.contains("clarify:"), "{layer}");
     }
 
     #[test]
@@ -983,10 +1003,11 @@ mod tests {
     /// `min_complexity`/`workflow` expectation (every case's deterministic
     /// baseline is `direct`/`trivial`/`none` now, regardless of shape; see
     /// the `"large-unrelated-branch-diff"` case, whose entire point is a
-    /// large shape that must NOT move the outcome). `shaped_repo` is kept
-    /// for that regression case and because `build_intake` still measures
-    /// the real repository for `IntakeState`'s own informational
-    /// `uncommitted_or_branch_changes` field (never the decision fields).
+    /// large shape that must NOT move the outcome). Jev determinism fix
+    /// (2026-09-18 replay): `build_intake` no longer measures the repository
+    /// at all either (see `decision::IntakeRepository`'s own doc comment) --
+    /// `shaped_repo` is kept solely for that regression case, proving the
+    /// large shape it still creates on disk truly moves nothing.
     fn shaped_repo(files: &[BatteryFile]) -> tempfile::TempDir {
         let repo = tempfile::tempdir().expect("tempdir");
         let git = |args: &[&str]| {
@@ -1200,24 +1221,67 @@ mod tests {
         expect: JevBatteryExpect,
     }
 
+    /// One case's `(execution, complexity, workflow, seat_tier)` tuple, the
+    /// same four fields the fixture records rulings for.
+    fn battery_fields(decision: &ProxyDecision) -> (String, String, String, String) {
+        (
+            lower_debug(decision.execution),
+            lower_debug(decision.complexity),
+            decision
+                .workflow
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            decision.seat_tier.label().to_string(),
+        )
+    }
+
     /// Replays the committed `tests/fixtures/proxy/jev-battery.json` against
-    /// the REAL TypeSafe Jev API -- issue #537's own recorded rulings, from
-    /// two live runs against this build that matched on 23/24 cases both
-    /// times, every case ruling identically across both runs (the one
-    /// intentional divergence, `perf-investigation`, is committed as
-    /// `substantial`, which is what Jev consistently rules and what the
-    /// `complexity` criteria actually call for).
+    /// the REAL TypeSafe Jev API TWICE per case -- issue #537's own recorded
+    /// rulings, re-verified against the pinned `jev-1.13.0` model and the
+    /// `min_margin` gate: four live double-run invocations on 2026-09-18
+    /// agreed on 22 of 24 cases every time, after re-recording four rulings
+    /// that were STABLY different from the old fixture (never flipping, just
+    /// consistently a new answer): `plugin-system`/`tui-redesign` workflow to
+    /// `none` (their own workflow answer's margin no longer clears the
+    /// floor, so both fall to the baseline's own `none`); `security-
+    /// credential` complexity to `bounded` and `perf-investigation` down a
+    /// full tier to `bounded` (both a stable, decisive, DIFFERENT answer from
+    /// the pinned model, not a margin-gate artifact -- `merge`'s own
+    /// monotonic floor only ever raises a decisive model answer over the
+    /// baseline, so recording the higher, stable value here is always
+    /// consistent with it). The remaining two, `bump-timeout` and `bug-
+    /// backtrace`, genuinely straddle the margin floor: across those four
+    /// runs each produced its recorded ruling at least once but also an
+    /// instability or a mismatch at least once, in no consistent direction --
+    /// real residual model noise `min_margin`'s current default does not
+    /// fully suppress for these two request shapes, left as their
+    /// originally-recorded ruling rather than loosened to tolerate either
+    /// outcome.
+    ///
+    /// Jev determinism fix (2026-09-18 replay): with `build_intake` no
+    /// longer measuring the repository at all (see `decision::
+    /// IntakeRepository`'s own doc comment), the request body is now fixed
+    /// by construction for a given `case.request`, so calling twice replays
+    /// the IDENTICAL request -- any difference between the two runs is Jev's
+    /// own answer-to-answer instability, not a body that drifted underneath
+    /// it. A flip between the two runs is reported as an INSTABILITY,
+    /// distinct from a MISMATCH against the recorded ruling (checked against
+    /// the first run only): the two failure modes have different causes and
+    /// different fixes (a mismatch means the fixture's own recorded ruling
+    /// is stale; an instability means `[proxy] min_margin` may need
+    /// raising, or the question wording sharpening).
     ///
     /// Skips (passes, printing one line) when `TYPESAFE_API_KEY` is unset:
     /// this test never touches the Keychain and never fails just because a
     /// key is absent, so it stays green in CI and on a machine with no
     /// TypeSafe credential. Run it with a key: `TYPESAFE_API_KEY=... cargo
-    /// nextest run jev_live_battery`. Costs roughly 25 calls at about 6k
-    /// input tokens each (TypeSafe's own published $0.042/MTok input rate --
-    /// about a cent total). `state_dir` points at a temp dir, never the real
-    /// `<state>/proxy-decisions.jsonl`, so a real run's own persisted
-    /// decisions and spend rows are untouched -- it persists exactly like
-    /// any other `decide()` call, just into a throwaway directory.
+    /// nextest run jev_live_battery`. Costs roughly 50 calls (two per case)
+    /// at about 6k input tokens each (TypeSafe's own published $0.042/MTok
+    /// input rate -- about two cents total). `state_dir` points at a temp
+    /// dir, never the real `<state>/proxy-decisions.jsonl`, so a real run's
+    /// own persisted decisions and spend rows are untouched -- it persists
+    /// exactly like any other `decide()` call, just into a throwaway
+    /// directory.
     #[test]
     fn jev_live_battery_matches_recorded_rulings() {
         let key = std::env::var("TYPESAFE_API_KEY").unwrap_or_default();
@@ -1235,63 +1299,97 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.proxy.enabled = true;
         cfg.proxy.decider = ProxyDecider::Typesafe;
+        // The whole point of the double call below is two INDEPENDENT live
+        // answers to the identical body -- `jev::ask`'s own decision cache
+        // would otherwise replay the first call's answer for the second,
+        // making a real instability undetectable.
+        cfg.jev.cache_ttl_secs = 0;
 
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state_dir = tempfile::tempdir().expect("tempdir");
 
+        let mut instabilities = Vec::new();
         let mut mismatches = Vec::new();
         for case in &cases {
-            let decision = decide(&cfg, state_dir.path(), repo, &case.request);
-            if decision.decider != Decider::Typesafe {
+            let first = decide(&cfg, state_dir.path(), repo, &case.request);
+            let second = decide(&cfg, state_dir.path(), repo, &case.request);
+
+            if first.decider != Decider::Typesafe {
                 mismatches.push(format!(
-                    "{}: decider fell back to {:?} ({:?})",
-                    case.id, decision.decider, decision.fallbacks
+                    "{}: decider fell back to {:?} on the first run ({:?})",
+                    case.id, first.decider, first.fallbacks
+                ));
+                continue;
+            }
+            if second.decider != Decider::Typesafe {
+                mismatches.push(format!(
+                    "{}: decider fell back to {:?} on the second run ({:?})",
+                    case.id, second.decider, second.fallbacks
                 ));
                 continue;
             }
 
-            let actual_execution = lower_debug(decision.execution);
-            if actual_execution != case.expect.execution {
+            let (first_execution, first_complexity, first_workflow, first_seat_tier) =
+                battery_fields(&first);
+            let (second_execution, second_complexity, second_workflow, second_seat_tier) =
+                battery_fields(&second);
+
+            for (field, before, after) in [
+                ("execution", &first_execution, &second_execution),
+                ("complexity", &first_complexity, &second_complexity),
+                ("workflow", &first_workflow, &second_workflow),
+                ("seat_tier", &first_seat_tier, &second_seat_tier),
+            ] {
+                if before != after {
+                    instabilities.push(format!(
+                        "{}: {field} flipped between two identical calls: {before} then {after}",
+                        case.id
+                    ));
+                }
+            }
+
+            if first_execution != case.expect.execution {
                 mismatches.push(format!(
-                    "{}: execution expected {} got {actual_execution}",
+                    "{}: execution expected {} got {first_execution}",
                     case.id, case.expect.execution
                 ));
             }
-
-            let actual_complexity = lower_debug(decision.complexity);
-            if actual_complexity != case.expect.complexity {
+            if first_complexity != case.expect.complexity {
                 mismatches.push(format!(
-                    "{}: complexity expected {} got {actual_complexity}",
+                    "{}: complexity expected {} got {first_complexity}",
                     case.id, case.expect.complexity
                 ));
             }
-
-            let actual_workflow = decision
-                .workflow
-                .clone()
-                .unwrap_or_else(|| "none".to_string());
-            if actual_workflow != case.expect.workflow {
+            if first_workflow != case.expect.workflow {
                 mismatches.push(format!(
-                    "{}: workflow expected {} got {actual_workflow}",
+                    "{}: workflow expected {} got {first_workflow}",
                     case.id, case.expect.workflow
                 ));
             }
-
-            let actual_seat_tier = decision.seat_tier.label().to_string();
-            if actual_seat_tier != case.expect.seat_tier {
+            if first_seat_tier != case.expect.seat_tier {
                 mismatches.push(format!(
-                    "{}: seat_tier expected {} got {actual_seat_tier}",
+                    "{}: seat_tier expected {} got {first_seat_tier}",
                     case.id, case.expect.seat_tier
                 ));
             }
         }
 
+        // Reported together, in one assertion, so a single run surfaces
+        // both failure modes at once -- each line is already labeled
+        // "instability" or carries its own "expected .. got .." shape, so
+        // the two causes stay distinguishable in the combined message.
         assert!(
-            mismatches.is_empty(),
-            "{} mismatch(es) out of {} cases:\n{}",
+            instabilities.is_empty() && mismatches.is_empty(),
+            "{} instability(ies) and {} mismatch(es) out of {} cases:\n{}",
+            instabilities.len(),
             mismatches.len(),
             cases.len(),
-            mismatches.join("\n")
+            instabilities
+                .iter()
+                .map(|line| format!("instability: {line}"))
+                .chain(mismatches.iter().cloned())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }

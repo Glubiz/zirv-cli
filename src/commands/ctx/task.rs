@@ -824,7 +824,7 @@ fn jev_crash_cause(
         &questions,
     )?;
     let answer = answers.get("cause")?;
-    if answer.confidence < CRASH_TRIAGE_FLOOR {
+    if !answer.decisive(CRASH_TRIAGE_FLOOR, jev::DEFAULT_MIN_MARGIN) {
         return None;
     }
     match answer.as_choice()? {
@@ -2422,7 +2422,7 @@ mod tests {
         });
         let body = r#"{"model": "jev-latest", "answers": {
             "cause": {"type": "choice", "choice": "access",
-                      "probabilities": {"access": 0.95}, "confidence": 0.95}
+                      "probabilities": {"access": 0.95, "other": 0.05}, "confidence": 0.95}
         }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
         let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
         let credential_env = "TASK_TEST_JEV_ACCESS_095";
@@ -2445,6 +2445,42 @@ mod tests {
             matches!(verdict, RespawnVerdict::AutoBlock(_)),
             "{verdict:?}"
         );
+    }
+
+    /// Jev determinism fix: the identical `access` answer at a confidence
+    /// (0.95) above `CRASH_TRIAGE_FLOOR`, but with a thin margin (0.51/0.49)
+    /// between its own top and runner-up probability, must fall through to
+    /// today's attempt-count logic exactly like a low-confidence answer.
+    #[test]
+    fn respawn_decision_with_jev_falls_through_on_a_thin_margin_answer() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.attempts = 1;
+        card.block = Some(Block {
+            reason: "token expired, run login again".to_string(),
+            by: "sess-1".to_string(),
+        });
+        let body = r#"{"model": "jev-latest", "answers": {
+            "cause": {"type": "choice", "choice": "access",
+                      "probabilities": {"access": 0.51, "transient": 0.49}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "TASK_TEST_JEV_THIN_MARGIN";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let verdict =
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert_eq!(verdict, RespawnVerdict::Respawn);
     }
 
     /// The identical `access` answer at 0.85 -- below `CRASH_TRIAGE_FLOOR`

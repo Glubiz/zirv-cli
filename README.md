@@ -358,9 +358,25 @@ questions — `intent`, `complexity`, `risk`, `workflow`, `needs_clarification`,
 and six additive domain tags (`security`, `data`, `docs_only`, `devops`,
 `architecture`, `frontend`) — never `execution`, seat tier or worker tier
 directly: a live battery found those unreliable, and any many-option seat/
-tier question never cleared the confidence floor. A field whose model
-confidence is below `min_confidence`
-keeps the baseline value instead, with a recorded reason; `complexity` and
+tier question never cleared the confidence floor. A field whose model answer
+is not *decisive* keeps the baseline value instead, with a recorded reason:
+decisive means BOTH its confidence is at or above `min_confidence` AND its
+margin (the gap between its top and runner-up probability; for a yes/no
+question, distance from the maximally uncertain 0.5, doubled) is at or above
+`min_margin`. A completed 2026-09-18 measurement (497 live calls across the
+intake battery) found flipped `intent`/`workflow`/`architecture` answers
+topped out at margin 0.14, while their own stable answers sat at 0.17 or
+higher — confidence alone missed this, since a flipped answer's confidence
+was not noticeably lower than a stable one's. The gate is a determinism
+tool, not an accuracy tool: one stable `complexity` answer for
+`perf-investigation` sits at margin 0.18-0.24 and is simply wrong, and one
+genuinely ambiguous prompt still flipped at margin 0.54 — the same request
+body giving the same answer twice is the property this floor buys, not
+correctness. The shared Jev client backs that further with its own decision
+cache: an identical request body (hashed with SHA-256) served twice within
+`[jev] cache_ttl_secs` (default a day, `0` disables it) returns the exact
+same stored answer instead of asking Jev again, at zero additional cost.
+`complexity` and
 `risk` are always merged with `max(model, baseline)` — a monotonic floor, so
 a model decision can raise them but never lower them — and `validation` is
 recomputed from the merged complexity and risk, so a raise always
@@ -376,22 +392,31 @@ decision's own seat tier; an unknown workflow id falls back to the baseline)
 before it is applied. The committed `tests/fixtures/proxy/jev-battery.json`
 documents the expected ruling (execution, complexity, workflow, seat tier)
 per request class, verified against the real API; `TYPESAFE_API_KEY=...
-cargo nextest run jev_live_battery` replays it against Jev directly.
+cargo nextest run jev_live_battery` replays it against Jev directly, running
+each case TWICE and asserting the two merged decisions are identical to each
+other as well as to the recorded ruling — a flip between the two runs is
+reported as an instability, distinct from an outright mismatch.
 
 **Domain tags.** A substring keyword match (the deterministic classifier's
 own security-domain detection) misses phrasing that never uses one of its
 fixed keywords — "rotate the shared token" names none of `security`/`auth`/
 `permission`/`credential`/`secret` — so a model decider is also asked
-directly, one yes/no question per tag. A confident (`>= 0.5`) `true` answer
-adds that tag to `decision.domains`; tags only ever accumulate, and a
-confident `security` tag applies the same risk/execution floor the keyword
-trigger already does (risk at least High, execution at least Bounded). Shown
+directly, one yes/no question per tag. A `true` (`>= 0.5`) answer that also
+clears the margin floor (see "Decider chain" above; a yes/no question has no
+separate confidence to check, so only its margin gates it) adds that tag to
+`decision.domains`; tags only ever accumulate, and a confident `security` tag
+applies the same risk/execution floor the keyword trigger already does (risk
+at least High, execution at least Bounded). Shown
 in `zirv ctx proxy`'s human/`--json` output, the `proxy:` announce line, and
 the `[zirv proxy]` prompt layer as `domains: security, data` — omitted
 everywhere when empty.
 
-**Clarification.** When the winning decision's `needs_clarification` is at
-or above `0.5`, an interactive `zirv chat`/bare `zirv` launch prints one
+**Clarification.** `needs_clarification` always keeps the model's raw
+yes/no reading, but a consumer only acts on it when it is ALSO decisive at
+`min_margin` (a confident-looking but thin-margin "ambiguous" reading must
+not interrupt a launch on its own). When the winning decision's
+`needs_clarification` is at or above `0.5` and decisive, an interactive
+`zirv chat`/bare `zirv` launch prints one
 prompt (`proxy: the request looks ambiguous (0.72). Add detail and press
 Enter, or press Enter to launch as is:`) and reads one line from stdin. An
 empty answer leaves the decision as is; a non-empty one is appended to the
@@ -401,7 +426,8 @@ never a second round, however ambiguous the new decision still looks.
 `needs_clarification` as a plain field, same as every other value. A launch
 that never got the chance to ask (a dashboard pane, a resumed session) still
 carries a `clarify: ask the user one precise question before acting` line in
-its `[zirv proxy]` prompt layer at or above the same threshold.
+its `[zirv proxy]` prompt layer when the same threshold-and-decisive
+condition holds.
 
 **When it takes over.** Bare `zirv` and `zirv chat` open the proxy's intake
 view first only when `[proxy] enabled = true` and the configured decider has a
@@ -425,7 +451,7 @@ zirv ▸ proxy: direct · single seat · claude/sonnet (cheap) · no workflow ·
 
 Before either decider call runs, one `zirv ▸ proxy: asking …` line tells the
 operator the request has gone out, e.g. `proxy: asking typesafe
-(jev-latest)…` or `proxy: asking helper model…`.
+(jev-1.13.0)…` or `proxy: asking helper model…`.
 
 **Single seat vs. orchestrator seat.** A Direct or Bounded decision launches
 the harness as a `single` seat (`PromptRole::Single`): it gets none of the
@@ -453,25 +479,41 @@ Disabled by default:
 enabled = false              # ZIRV_CTX_PROXY_ENABLED
 decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY_DECIDER
 min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
+min_margin = 0.2             # ZIRV_CTX_PROXY_MIN_MARGIN -- see "Decider chain" above
 request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
 
 [proxy.typesafe]
 base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
 credential_env = "TYPESAFE_API_KEY"       # ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV
-model = "jev-latest"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL
+model = "jev-1.13.0"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL -- pinned; see below
 timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 ```
 
+**Pinned model.** `model` defaults to a specific Jev release (`jev-1.13.0`,
+what `jev-latest` itself resolves to today) rather than the `jev-latest`
+moving alias: the pin is for reproducibility across FUTURE alias moves, not
+because today's alias is wrong -- an alias that can change underneath a
+deployed config would confound Jev's own answer-to-answer instability (see
+"Decider chain" above) with an actual model upgrade, making either one
+impossible to diagnose from the outside. Set `model = "jev-latest"`
+explicitly to opt back into automatic upgrades, or to a newer pinned version
+once you've verified it against `tests/fixtures/proxy/jev-battery.json`.
+
 **Privacy.** The state sent to a model decider carries the request text
-(truncated to `request_max_bytes`) plus names and counts only — repository
-name, changed-file/line counts, active workflow, primary extensions, and
-workflow ids/descriptions — never file contents or secrets. The harness/
-model catalogue (names, readiness, headroom, prices) used to ride along too;
-it was dropped (no question ever read it, and TypeSafe's own guidance is
-that irrelevant state degrades answer accuracy) — the harness roster is
-still policed against the live roster directly when the decision is applied,
-never through this state. The TypeSafe credential is read only from the
-environment variable named by `credential_env`.
+(truncated to `request_max_bytes`) plus the repository name and the
+registered workflow ids/descriptions — never file contents, secrets, or any
+live-measured repository fact (uncommitted/branch changes, the active
+workflow, primary file extensions all used to ride along here too; stripping
+them changed no answer's accuracy in the 2026-09-18 replay, and it means the
+request body now depends only on the request text, the workflow registry and
+the policy, never on anything that can drift between two calls for the same
+request). The harness/model catalogue (names, readiness, headroom, prices)
+used to ride along as well; it was dropped for the same reason (no question
+ever read it, and TypeSafe's own guidance is that irrelevant state degrades
+answer accuracy) — the harness roster is still policed against the live
+roster directly when the decision is applied, never through this state. The
+TypeSafe credential is read only from the environment variable named by
+`credential_env`.
 
 **Price.** TypeSafe Jev is priced through the catalogue's `typesafe` vendor
 at $0.042 per MTok input, output free — see [Model
@@ -3258,12 +3300,13 @@ events = true   # the `zirv ▸` announcement channel on stderr
 enabled = false              # ZIRV_CTX_PROXY_ENABLED
 decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY_DECIDER
 min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
+min_margin = 0.2             # ZIRV_CTX_PROXY_MIN_MARGIN
 request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
 
 [proxy.typesafe]
 base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
 credential_env = "TYPESAFE_API_KEY"       # ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV
-model = "jev-latest"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL
+model = "jev-1.13.0"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL -- pinned, not jev-latest
 timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 
 # operator-only: which advisory sites besides the harness proxy may consult
@@ -3275,6 +3318,7 @@ supervisor = false  # judge pre-filter, crash triage, handoff quality; ZIRV_CTX_
 dispatch = false    # model tier for an omitted Agent model; ZIRV_CTX_JEV_DISPATCH
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
+cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
@@ -3572,6 +3616,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `proxy.enabled` | `ZIRV_CTX_PROXY_ENABLED` |
 | `proxy.decider` | `ZIRV_CTX_PROXY_DECIDER` |
 | `proxy.min_confidence` | `ZIRV_CTX_PROXY_MIN_CONFIDENCE` |
+| `proxy.min_margin` | `ZIRV_CTX_PROXY_MIN_MARGIN` |
 | `proxy.request_max_bytes` | `ZIRV_CTX_PROXY_REQUEST_MAX_BYTES` |
 | `proxy.typesafe.base_url` | `ZIRV_CTX_PROXY_TYPESAFE_BASE_URL` |
 | `proxy.typesafe.credential_env` | `ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV` |
@@ -3582,6 +3627,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.dispatch` | `ZIRV_CTX_JEV_DISPATCH` |
 | `jev.review` | `ZIRV_CTX_JEV_REVIEW` |
 | `jev.gates` | `ZIRV_CTX_JEV_GATES` |
+| `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `capabilities` | `ZIRV_CTX_CAPABILITIES` |
 | `runtime` | `ZIRV_CTX_RUNTIME` |
 
@@ -5295,7 +5341,10 @@ same string, so the id is shown only where it differs.
 rung, and `meta` has no `Deep` rung — not every vendor fills all three tiers.
 `typesafe` is not a harness vendor: it is used only by the [harness
 proxy](#harness-proxy)'s TypeSafe Jev decider, priced at $0.042 per MTok
-input and $0 output.
+input and $0 output. `[proxy.typesafe] model` defaults to the pinned
+`jev-1.13.0` rather than the `jev-latest` alias (see "Pinned model" above);
+both price identically, since `jev-1.13.0` is also carried as an extra
+priced id on the same rung.
 Beyond the ladder, zirv also recognises `claude-fable-5` and the `[1m]`
 long-context variants `claude-fable-5[1m]`, `claude-fable-5-1[1m]`,
 `claude-mythos-5[1m]` and `claude-opus-5[1m]` on Anthropic, and

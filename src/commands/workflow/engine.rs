@@ -1594,7 +1594,7 @@ fn pin_current_artifact_with_config(
             &advice_state,
             &questions,
         ) && let Some(answer) = answers.get("substance")
-            && answer.confidence >= JEV_ARTIFACT_CONFIDENCE
+            && answer.decisive(JEV_ARTIFACT_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
             && let AnswerValue::Choice(choice) = &answer.value
         {
             match choice.as_str() {
@@ -2366,18 +2366,32 @@ fn apply_jev_gate_advice(
     if state.classification.work_domain.domain == WorkDomain::Frontend {
         measured.work_domain = state.classification.work_domain.clone();
     }
-    if answers
-        .get("sensitive_surface")
-        .and_then(|answer| answer.as_noul())
-        .is_some_and(|probability| probability >= JEV_SENSITIVE_PROBABILITY)
-    {
+    // Jev determinism fix: each `is_some_and` below now also requires the
+    // answer to be `decisive` (margin at or above `jev::DEFAULT_MIN_MARGIN`);
+    // for a noul, that is a margin-only check (no separate confidence on the
+    // wire), so `decisive(0.0, ..)` -- the additional condition only ever
+    // narrows which answers apply, never widens. No "thin margin at the
+    // floor" test exists for `sensitive_surface`/the five tags below: their
+    // own floors (`JEV_SENSITIVE_PROBABILITY`/`JEV_TAG_PROBABILITY`, both
+    // 0.7) sit far enough from 0.5 that every value clearing them already has
+    // margin `>= |0.7 - 0.5| * 2 = 0.4`, well clear of the default -- the
+    // gate is real (see `jev::Answer::decisive`'s own tests) but structurally
+    // a no-op at this floor, the same reasoning `memory.rs`'s harvest gate
+    // documents for its own floor.
+
+    if answers.get("sensitive_surface").is_some_and(|answer| {
+        answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+            && answer
+                .as_noul()
+                .is_some_and(|probability| probability >= JEV_SENSITIVE_PROBABILITY)
+    }) {
         measured.risk = measured.risk.max(RiskBand::High);
         measured.risk_score = measured.risk_score.max(45);
     }
     if measured.work_domain.domain == WorkDomain::General
         && answers.get("work_domain").is_some_and(|answer| {
             matches!(&answer.value, AnswerValue::Choice(choice) if choice == "frontend")
-                && answer.confidence >= JEV_FRONTEND_CONFIDENCE
+                && answer.decisive(JEV_FRONTEND_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
         })
     {
         measured.work_domain.domain = WorkDomain::Frontend;
@@ -2390,11 +2404,12 @@ fn apply_jev_gate_advice(
         ("devops", "devops"),
         ("architecture", "architecture"),
     ] {
-        if answers
-            .get(question)
-            .and_then(|answer| answer.as_noul())
-            .is_some_and(|probability| probability >= JEV_TAG_PROBABILITY)
-            && !state.jev_tags.iter().any(|existing| existing == tag)
+        if answers.get(question).is_some_and(|answer| {
+            answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+                && answer
+                    .as_noul()
+                    .is_some_and(|probability| probability >= JEV_TAG_PROBABILITY)
+        }) && !state.jev_tags.iter().any(|existing| existing == tag)
         {
             state.jev_tags.push(tag.to_string());
         }
@@ -8630,7 +8645,7 @@ mod tests {
 
     #[test]
     fn jev_artifact_refuses_template_copy_at_high_confidence() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.95},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -8661,9 +8676,47 @@ mod tests {
         assert!(state.artifacts["intent"].accepted_hash.is_none());
     }
 
+    /// Jev determinism fix: a `template_copy` verdict with a confidence
+    /// (0.95) above `JEV_ARTIFACT_CONFIDENCE`, but a thin margin (0.51/0.49)
+    /// between its own top and runner-up probability, must NOT refuse the
+    /// artifact -- it falls through and pins exactly like the gate-off path.
+    #[test]
+    fn jev_artifact_pins_a_thin_margin_template_copy_verdict() {
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.51,"substantive":0.49},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_THIN_MARGIN");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_ARTIFACT_THIN_MARGIN",
+            Some("secret"),
+        )]);
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = artifact_gate_state(repo.path());
+        ensure_current_artifact_template(&state).unwrap();
+        let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
+        let body_text = "# Intent\n\n## Problem\nChanged wording\n";
+        std::fs::write(&path, body_text).unwrap();
+
+        let (stage, warning) =
+            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
+        request.recv().unwrap();
+
+        assert_eq!(stage, ArtifactStage::Intent);
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(
+            state.artifacts["intent"].accepted_hash.as_deref(),
+            Some(hash_bytes(body_text.as_bytes()).as_str())
+        );
+    }
+
     #[test]
     fn jev_artifact_warns_and_pins_thin_content_at_high_confidence() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"thin","probabilities":{"thin":0.95},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"thin","probabilities":{"thin":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -8696,7 +8749,7 @@ mod tests {
 
     #[test]
     fn deterministic_template_equality_refuses_before_substantive_advice() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"substantive","probabilities":{"substantive":0.99},"confidence":0.99}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"substantive","probabilities":{"substantive":0.99,"other":0.01},"confidence":0.99}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -9495,7 +9548,7 @@ mod tests {
 
     #[test]
     fn jev_gate_frontend_choice_sets_an_unset_frontend_domain() {
-        let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.95},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -9525,9 +9578,45 @@ mod tests {
         assert_eq!(measured.work_domain.domain, WorkDomain::Frontend);
     }
 
+    /// Jev determinism fix: a `frontend` choice with a confidence (0.95)
+    /// above `JEV_FRONTEND_CONFIDENCE`, but a thin margin (0.51/0.49)
+    /// between its own top and runner-up probability, must NOT set the
+    /// domain -- it falls through exactly like a low-confidence answer.
+    #[test]
+    fn jev_gate_frontend_choice_with_a_thin_margin_never_sets_the_domain() {
+        let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.51,"backend":0.49},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_gate_config(url, "JEV_TEST_GATE_FRONTEND_THIN_MARGIN");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_GATE_FRONTEND_THIN_MARGIN",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let repo = tempdir().unwrap();
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "update the view".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        let mut measured = state.classification.clone();
+
+        apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
+        request.recv().unwrap();
+
+        assert_ne!(measured.work_domain.domain, WorkDomain::Frontend);
+    }
+
     #[test]
     fn jev_gate_permissive_answers_never_lower_risk_or_unset_frontend() {
-        let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.05},"work_domain":{"type":"choice","choice":"backend","probabilities":{"backend":0.99},"confidence":0.99},"security":{"type":"noul","noul":0.05},"data":{"type":"noul","noul":0.05},"docs_only":{"type":"noul","noul":0.05},"devops":{"type":"noul","noul":0.05},"architecture":{"type":"noul","noul":0.05}},"usage":{"input_tokens":20,"output_tokens":7}}"#;
+        let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.05},"work_domain":{"type":"choice","choice":"backend","probabilities":{"backend":0.99,"other":0.01},"confidence":0.99},"security":{"type":"noul","noul":0.05},"data":{"type":"noul","noul":0.05},"docs_only":{"type":"noul","noul":0.05},"devops":{"type":"noul","noul":0.05},"architecture":{"type":"noul","noul":0.05}},"usage":{"input_tokens":20,"output_tokens":7}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
