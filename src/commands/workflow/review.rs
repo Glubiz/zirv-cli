@@ -14,6 +14,8 @@ use super::classify::RiskBand;
 use super::engine::{self, ArtifactStage, WorkflowState, WorkflowStatus};
 use super::verification::{self, VerificationReport};
 use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::config::CtxConfig;
+use crate::commands::ctx::jev::{self, AnswerValue, Question};
 use crate::commands::ctx::runtime::RuntimeKind;
 use crate::commands::ctx::state::{StateDir, now_secs};
 
@@ -40,6 +42,13 @@ const MAX_REVIEW_FINDINGS_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_FIX_REVIEW_ROUNDS: u8 = 3;
 const REVIEW_RESULT_PREFIX: &str = "ZIRV_REVIEW_RESULT ";
+const MAX_JEV_FINDING_DETAIL_BYTES: usize = 1024;
+const MAX_JEV_FINDINGS_PER_BATCH: usize = 20;
+const MAX_JEV_PREVIOUS_FINDINGS: usize = 10;
+/// Minimum disposition confidence from the 2026-09-18 probe.
+const JEV_DISPOSITION_CONFIDENCE: f32 = 0.7;
+/// Minimum duplicate probability from the 2026-09-18 probe.
+const JEV_DEDUP_PROBABILITY: f64 = 0.9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -61,7 +70,7 @@ pub enum FindingDisposition {
     Residual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewFinding {
     pub id: String,
     pub severity: FindingSeverity,
@@ -72,7 +81,56 @@ pub struct ReviewFinding {
     pub disposition: FindingDisposition,
     #[serde(default)]
     pub recommended_disposition: Option<FindingDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_of: Option<String>,
     pub created_at: u64,
+}
+
+#[derive(Serialize)]
+struct JevFindingState {
+    id: String,
+    severity: FindingSeverity,
+    title: String,
+    detail: String,
+    file: Option<String>,
+    line: Option<u32>,
+}
+
+impl From<&ReviewFinding> for JevFindingState {
+    fn from(finding: &ReviewFinding) -> Self {
+        let detail = crate::utils::truncate_bytes(
+            finding.summary.clone(),
+            Some(MAX_JEV_FINDING_DETAIL_BYTES),
+        );
+        let title = detail.lines().next().unwrap_or_default().to_string();
+        Self {
+            id: finding.id.clone(),
+            severity: finding.severity,
+            title,
+            detail,
+            file: finding
+                .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            line: finding.line,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct JevDispositionState {
+    repository_context: String,
+    findings: Vec<JevFindingState>,
+}
+
+#[derive(Serialize)]
+struct JevDedupState {
+    new_finding: JevFindingState,
+    previous_findings: Vec<JevFindingState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -124,6 +182,171 @@ fn finding_key(finding: &ReviewFinding) -> String {
     }
 }
 
+fn one_line_context(context: &str) -> String {
+    crate::utils::truncate_bytes(
+        context.split_whitespace().collect::<Vec<_>>().join(" "),
+        Some(MAX_JEV_FINDING_DETAIL_BYTES),
+    )
+}
+
+fn advisory_rank(finding: &ReviewFinding) -> u8 {
+    match finding.advisory_disposition.as_deref() {
+        Some("fix_now") => 0,
+        Some("verify") => 1,
+        Some("defer") => 2,
+        Some("reject") => 3,
+        _ => 4,
+    }
+}
+
+fn sort_findings_by_advisory(findings: &mut [ReviewFinding]) {
+    findings.sort_by_key(advisory_rank);
+}
+
+fn advise_dispositions(
+    cfg: &CtxConfig,
+    state_dir: &StateDir,
+    repository_context: &str,
+    findings: &mut [ReviewFinding],
+) {
+    for batch in findings.chunks_mut(MAX_JEV_FINDINGS_PER_BATCH) {
+        let state = JevDispositionState {
+            repository_context: one_line_context(repository_context),
+            findings: batch.iter().map(JevFindingState::from).collect(),
+        };
+        let questions: Vec<Question> = batch
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                Question::choice(
+                    &format!("f{index}"),
+                    "Classify this review finding's advisory disposition.",
+                    &[
+                        ("fix_now", "a confirmed defect worth fixing in this change"),
+                        ("defer", "real but out of scope or cosmetic"),
+                        (
+                            "reject",
+                            "not a defect, false positive or contradicts the stated context",
+                        ),
+                        (
+                            "verify",
+                            "plausible but the evidence shown does not prove it",
+                        ),
+                    ],
+                )
+            })
+            .collect();
+        let Some(answers) = jev::advise(
+            cfg,
+            state_dir,
+            "workflow-review-disposition",
+            cfg.jev.review,
+            &state,
+            &questions,
+        ) else {
+            continue;
+        };
+        for (index, finding) in batch.iter_mut().enumerate() {
+            let Some(answer) = answers.get(&format!("f{index}")) else {
+                continue;
+            };
+            let AnswerValue::Choice(choice) = &answer.value else {
+                continue;
+            };
+            if answer.confidence >= JEV_DISPOSITION_CONFIDENCE
+                && matches!(choice.as_str(), "fix_now" | "verify" | "defer" | "reject")
+            {
+                finding.advisory_disposition = Some(choice.clone());
+                finding.advisory_confidence = Some(answer.confidence);
+            }
+        }
+    }
+    sort_findings_by_advisory(findings);
+}
+
+fn apply_duplicate_answer(
+    incoming: &mut ReviewFinding,
+    previous: &ReviewFinding,
+    probability: f64,
+) {
+    if matches!(
+        incoming.severity,
+        FindingSeverity::Note | FindingSeverity::Minor
+    ) && probability >= JEV_DEDUP_PROBABILITY
+    {
+        incoming.duplicate_of = Some(finding_key(previous));
+    }
+}
+
+fn advise_duplicates(
+    cfg: &CtxConfig,
+    state_dir: &StateDir,
+    previous: &[ReviewFinding],
+    incoming: &mut [ReviewFinding],
+) {
+    let candidates: Vec<&ReviewFinding> = previous
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.severity,
+                FindingSeverity::Note | FindingSeverity::Minor
+            )
+        })
+        .take(MAX_JEV_PREVIOUS_FINDINGS)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let exact: BTreeSet<String> = previous.iter().map(finding_key).collect();
+    for finding in incoming.iter_mut().filter(|finding| {
+        matches!(
+            finding.severity,
+            FindingSeverity::Note | FindingSeverity::Minor
+        ) && !exact.contains(&finding_key(finding))
+    }) {
+        let state = JevDedupState {
+            new_finding: JevFindingState::from(&*finding),
+            previous_findings: candidates
+                .iter()
+                .map(|candidate| JevFindingState::from(*candidate))
+                .collect(),
+        };
+        let questions: Vec<Question> = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                Question::noul(
+                    &format!("p{index}"),
+                    "Is this the same underlying issue as the new finding?",
+                    "the same underlying issue",
+                    "a different issue",
+                )
+            })
+            .collect();
+        let Some(answers) = jev::advise(
+            cfg,
+            state_dir,
+            "workflow-review-dedup",
+            cfg.jev.review,
+            &state,
+            &questions,
+        ) else {
+            continue;
+        };
+        let best = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let probability = answers.get(&format!("p{index}"))?.as_noul()?;
+                Some((*candidate, probability))
+            })
+            .max_by(|left, right| left.1.total_cmp(&right.1));
+        if let Some((candidate, probability)) = best {
+            apply_duplicate_answer(finding, candidate, probability);
+        }
+    }
+}
+
 /// H-7: "recurred" means the same finding identity survived across a fix
 /// pass into a *later* review round, not merely that two findings from the
 /// same round happen to share a location. `build_review_findings` stamps
@@ -160,6 +383,7 @@ pub fn new_finding_count(existing: &[ReviewFinding], incoming: &[ReviewFinding])
     let mut fresh = BTreeSet::new();
     incoming
         .iter()
+        .filter(|finding| finding.duplicate_of.is_none())
         .map(finding_key)
         .filter(|key| !seen.contains(key) && fresh.insert(key.clone()))
         .count()
@@ -1164,6 +1388,8 @@ fn package_pull_request(
     let diff_truncated = diff_truncated || raw_diff_truncated;
     let change_fingerprint = pr_fingerprint(&view.head_ref_oid)?;
     let required_reviews = required_independent_reviews_for(state);
+    let mut existing_findings = state.review_findings.clone();
+    sort_findings_by_advisory(&mut existing_findings);
     Ok(ReviewPackage {
         schema_version: 5,
         repo_root: state.repo.clone(),
@@ -1207,7 +1433,7 @@ fn package_pull_request(
         // A PR review is always packaged as round 1 (see `review_round: 1`
         // just below), so this stays the full list -- never a delta -- the
         // same "round 1 is never a delta" rule `package()` follows.
-        existing_findings: state.review_findings.clone(),
+        existing_findings,
         unchanged_existing_findings: 0,
         review_round: 1,
         max_review_rounds: MAX_FIX_REVIEW_ROUNDS,
@@ -1283,23 +1509,58 @@ fn github_api_pages<T: for<'de> Deserialize<'de>>(
     parse_paginated(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn severity_from_github_comment(body: &str) -> FindingSeverity {
+fn is_github_approval(body: &str) -> bool {
+    const APPROVALS: &[&str] = &[
+        "looks good to me",
+        "ready to merge",
+        "good to go",
+        "great work",
+        "looks great",
+        "looks good",
+        "all good",
+        "approved",
+        "approve",
+        "ship it",
+        "lgtm",
+        "nice work",
+        "nice",
+        "thumbs up",
+        ":+1:",
+        "+1",
+        "👍",
+        "✅",
+    ];
+    let normalized = body.trim().to_lowercase();
+    APPROVALS.iter().any(|approval| {
+        normalized
+            .strip_prefix(approval)
+            .is_some_and(|suffix| suffix.chars().all(|character| !character.is_alphanumeric()))
+    })
+}
+
+fn github_comment_defaults(body: &str) -> Option<(FindingSeverity, FindingDisposition)> {
+    if is_github_approval(body) {
+        return None;
+    }
     let normalized = body.trim_start().to_ascii_lowercase();
-    if normalized.starts_with("[critical]")
+    let defaults = if normalized.starts_with("[critical]")
         || normalized.starts_with("critical:")
         || normalized.starts_with("blocker:")
     {
-        FindingSeverity::Critical
+        (FindingSeverity::Critical, FindingDisposition::Fixed)
+    } else if normalized.starts_with("[major]") || normalized.starts_with("major:") {
+        (FindingSeverity::Major, FindingDisposition::Fixed)
     } else if normalized.starts_with("[minor]")
         || normalized.starts_with("minor:")
         || normalized.starts_with("nit:")
     {
-        FindingSeverity::Minor
+        (FindingSeverity::Minor, FindingDisposition::Fixed)
     } else if normalized.starts_with("[note]") || normalized.starts_with("note:") {
-        FindingSeverity::Note
+        (FindingSeverity::Note, FindingDisposition::Fixed)
     } else {
-        FindingSeverity::Major
-    }
+        (FindingSeverity::Minor, FindingDisposition::Open)
+    };
+    Some(defaults)
 }
 
 fn github_summary(pr: u64, author: Option<&GhUser>, body: &str, url: Option<&str>) -> String {
@@ -1342,13 +1603,17 @@ fn ingest_pull_request_comments(
         if existing.contains(&id) || comment.body.trim().is_empty() {
             continue;
         }
+        let Some((severity, recommended_disposition)) = github_comment_defaults(&comment.body)
+        else {
+            continue;
+        };
         let path = comment.path.and_then(|path| {
             (path.len() <= MAX_FINDING_PATH_BYTES && !Path::new(&path).is_absolute())
                 .then(|| PathBuf::from(path))
         });
         incoming.push(ReviewFinding {
             id,
-            severity: severity_from_github_comment(&comment.body),
+            severity,
             summary: github_summary(
                 pr,
                 comment.user.as_ref(),
@@ -1358,7 +1623,10 @@ fn ingest_pull_request_comments(
             path,
             line: comment.line.or(comment.original_line),
             disposition: FindingDisposition::Open,
-            recommended_disposition: Some(FindingDisposition::Fixed),
+            recommended_disposition: Some(recommended_disposition),
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: now_secs(),
         });
     }
@@ -1371,14 +1639,20 @@ fn ingest_pull_request_comments(
         if existing.contains(&id) {
             continue;
         }
+        let Some((severity, recommended_disposition)) = github_comment_defaults(&body) else {
+            continue;
+        };
         incoming.push(ReviewFinding {
             id,
-            severity: severity_from_github_comment(&body),
+            severity,
             summary: github_summary(pr, review.user.as_ref(), &body, review.html_url.as_deref()),
             path: None,
             line: None,
             disposition: FindingDisposition::Open,
-            recommended_disposition: Some(FindingDisposition::Fixed),
+            recommended_disposition: Some(recommended_disposition),
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: now_secs(),
         });
     }
@@ -1816,8 +2090,9 @@ pub fn package(
     };
     // Issue #326 B2: bounds the aggregate size of what just got selected
     // above, regardless of which branch selected it.
-    let existing_findings =
+    let mut existing_findings =
         cap_findings_payload(existing_findings, MAX_REVIEW_FINDINGS_PAYLOAD_BYTES);
+    sort_findings_by_advisory(&mut existing_findings);
     let verification = verification::load_latest(state_dir, &state.repo)?
         .map(|report| VerificationEvidence::from_report(report, current_fingerprint, &state.repo));
     let required_reviews = required_independent_reviews_for(state);
@@ -2354,6 +2629,9 @@ fn build_review_findings(findings: Vec<ReviewerFinding>, created_at: u64) -> Vec
                 line: finding.line,
                 disposition: FindingDisposition::Open,
                 recommended_disposition,
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
                 created_at,
             }
         })
@@ -3031,7 +3309,16 @@ fn run_independent_review(
     let mut state = engine::load(&state_dir, &state.repo, &args.id)?;
     // Only a completed round can have converged; a dashboard ack or a failed
     // launch reviewed nothing, so it is never mistaken for zero new findings.
-    let incoming_findings = build_review_findings(parsed_findings, now_secs());
+    let mut incoming_findings = build_review_findings(parsed_findings, now_secs());
+    if recorded && let Ok(cfg) = CtxConfig::load(&state.repo, &|key| std::env::var(key).ok()) {
+        advise_dispositions(&cfg, &state_dir, &state.task, &mut incoming_findings);
+        advise_duplicates(
+            &cfg,
+            &state_dir,
+            &state.review_findings,
+            &mut incoming_findings,
+        );
+    }
     // Computed against the state loaded above, before `append_reviewer_
     // findings` merges `incoming_findings` into it -- otherwise every finding
     // would trivially count as "already recorded".
@@ -3265,6 +3552,9 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 line: args.line,
                 disposition: FindingDisposition::Open,
                 recommended_disposition: None,
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
                 created_at: now_secs(),
             };
             state.review_findings.push(finding.clone());
@@ -3286,12 +3576,20 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 // moved.
                 let (_, results) = engine::apply_recommended_dispositions(&state_dir, state)?;
                 for result in &results {
-                    match result.applied {
-                        Some(disposition) => {
-                            writeln!(writer, "{}: {:?}", result.finding_id, disposition)?
-                        }
-                        None => {
-                            writeln!(writer, "{}: open (no recommendation)", result.finding_id)?
+                    if result.requires_explicit_disposition {
+                        writeln!(
+                            writer,
+                            "{}: open (explicit disposition required)",
+                            result.finding_id
+                        )?;
+                    } else {
+                        match result.applied {
+                            Some(disposition) => {
+                                writeln!(writer, "{}: {:?}", result.finding_id, disposition)?
+                            }
+                            None => {
+                                writeln!(writer, "{}: open (no recommendation)", result.finding_id)?
+                            }
                         }
                     }
                 }
@@ -3485,6 +3783,9 @@ mod tests {
                 line: None,
                 disposition: FindingDisposition::Open,
                 recommended_disposition: None,
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
                 created_at: now_secs(),
             });
             engine::save(&state_dir, &theirs, true)?;
@@ -4357,20 +4658,51 @@ mod tests {
     #[test]
     fn github_review_severity_mapping_is_deterministic() {
         assert_eq!(
-            severity_from_github_comment("[critical] auth bypass"),
-            FindingSeverity::Critical
+            github_comment_defaults("[critical] auth bypass"),
+            Some((FindingSeverity::Critical, FindingDisposition::Fixed))
         );
         assert_eq!(
-            severity_from_github_comment("nit: rename this"),
-            FindingSeverity::Minor
+            github_comment_defaults("nit: rename this"),
+            Some((FindingSeverity::Minor, FindingDisposition::Fixed))
         );
         assert_eq!(
-            severity_from_github_comment("note: optional"),
-            FindingSeverity::Note
+            github_comment_defaults("note: optional"),
+            Some((FindingSeverity::Note, FindingDisposition::Fixed))
         );
         assert_eq!(
-            severity_from_github_comment("This changes semantics"),
-            FindingSeverity::Major
+            github_comment_defaults("This changes semantics"),
+            Some((FindingSeverity::Minor, FindingDisposition::Open))
+        );
+    }
+
+    #[test]
+    fn github_approval_comments_are_skipped() {
+        for body in [
+            "LGTM",
+            "looks good! 🚀",
+            "Approve.",
+            "APPROVED ✅",
+            "ship it!",
+            "Nice 👍",
+            "+1",
+        ] {
+            assert_eq!(github_comment_defaults(body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn github_unmarked_defect_defaults_to_minor_and_open() {
+        assert_eq!(
+            github_comment_defaults("This changes semantics"),
+            Some((FindingSeverity::Minor, FindingDisposition::Open))
+        );
+    }
+
+    #[test]
+    fn github_marked_major_comment_keeps_major_fixed_defaults() {
+        assert_eq!(
+            github_comment_defaults("[Major] This changes semantics"),
+            Some((FindingSeverity::Major, FindingDisposition::Fixed))
         );
     }
 
@@ -4797,6 +5129,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: Some(12),
             disposition,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at,
         };
         state
@@ -4829,6 +5164,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: Some(10),
             disposition: FindingDisposition::Open,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: 1,
         };
         state.review_findings.push(finding("one"));
@@ -4851,6 +5189,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: Some(line),
             disposition: FindingDisposition::Open,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: now_secs(),
         }
     }
@@ -4866,8 +5207,132 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: None,
             disposition: FindingDisposition::Open,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: now_secs(),
         }
+    }
+
+    fn jev_review_config(
+        base_url: String,
+        credential_env: &str,
+    ) -> crate::commands::ctx::config::CtxConfig {
+        let mut cfg = crate::commands::ctx::config::CtxConfig::default();
+        cfg.jev.review = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg
+    }
+
+    #[test]
+    fn jev_disposition_annotates_and_sorts_without_changing_stored_dispositions() {
+        let body = r#"{"model":"jev-latest","answers":{"f0":{"type":"choice","choice":"reject","probabilities":{"reject":0.95},"confidence":0.95},"f1":{"type":"choice","choice":"fix_now","probabilities":{"fix_now":0.95},"confidence":0.95},"f2":{"type":"choice","choice":"verify","probabilities":{"verify":0.95},"confidence":0.95},"f3":{"type":"choice","choice":"defer","probabilities":{"defer":0.95},"confidence":0.95}},"usage":{"input_tokens":20,"output_tokens":4}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_review_config(url, "JEV_TEST_REVIEW_DISPOSITION");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_REVIEW_DISPOSITION",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut findings = vec![
+            finding_at("src/reject.rs", 1, "reject"),
+            finding_at("src/fix.rs", 2, "fix"),
+            finding_at("src/verify.rs", 3, "verify"),
+            finding_at("src/defer.rs", 4, "defer"),
+        ];
+        findings[0].disposition = FindingDisposition::Accepted;
+
+        advise_dispositions(&cfg, &state_dir, "review the repository", &mut findings);
+        request.recv().unwrap();
+
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.advisory_disposition.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("fix_now"),
+                Some("verify"),
+                Some("defer"),
+                Some("reject")
+            ]
+        );
+        assert_eq!(findings[3].disposition, FindingDisposition::Accepted);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.advisory_confidence == Some(0.95))
+        );
+    }
+
+    #[test]
+    fn jev_dedup_marks_a_nit_duplicate_and_counts_it_as_converged() {
+        let body = r#"{"model":"jev-latest","answers":{"p0":{"type":"noul","noul":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let cfg = jev_review_config(url, "JEV_TEST_REVIEW_DEDUP");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_REVIEW_DEDUP",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut previous = finding_at("src/old.rs", 8, "use clearer naming");
+        previous.severity = FindingSeverity::Note;
+        let mut incoming = finding_at("src/new.rs", 14, "rename the temporary");
+        incoming.severity = FindingSeverity::Note;
+
+        advise_duplicates(
+            &cfg,
+            &state_dir,
+            std::slice::from_ref(&previous),
+            std::slice::from_mut(&mut incoming),
+        );
+        request.recv().unwrap();
+
+        assert_eq!(incoming.duplicate_of, Some(finding_key(&previous)));
+        assert_eq!(new_finding_count(&[previous], &[incoming]), 0);
+    }
+
+    #[test]
+    fn jev_dedup_never_marks_a_major_even_for_a_permissive_answer() {
+        let previous = finding_at("src/old.rs", 8, "old major");
+        let mut incoming = finding_at("src/new.rs", 14, "new major");
+        apply_duplicate_answer(&mut incoming, &previous, 0.95);
+        assert_eq!(incoming.severity, FindingSeverity::Major);
+        assert!(incoming.duplicate_of.is_none());
+    }
+
+    #[test]
+    fn jev_disposition_failure_leaves_findings_identical_to_gate_off() {
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            500,
+            "{}",
+            "application/json",
+        );
+        let cfg = jev_review_config(url, "JEV_TEST_REVIEW_500");
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_TEST_REVIEW_500",
+            Some("secret"),
+        )]);
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut findings = vec![finding_at("src/lib.rs", 1, "finding")];
+        let expected = findings.clone();
+
+        advise_dispositions(&cfg, &state_dir, "review the repository", &mut findings);
+        request.recv().unwrap();
+
+        assert_eq!(findings, expected);
     }
 
     fn finding_with(
@@ -4883,6 +5348,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: Some(1),
             disposition,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at,
         }
     }
@@ -5943,6 +6411,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: None,
             disposition: FindingDisposition::Open,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: 1,
         });
         state.review_findings.push(ReviewFinding {
@@ -5953,6 +6424,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: None,
             disposition: FindingDisposition::Open,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: 1,
         });
         // Round 1's evidence snapshots BOTH findings as they stood when that
@@ -6174,6 +6648,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: None,
             disposition: FindingDisposition::Open,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: now_secs(),
         });
         let id = state.id.clone();
@@ -6221,6 +6698,32 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         let mut state = running_review_state(repo.path(), "HEAD");
         state.review_findings = vec![
             ReviewFinding {
+                id: "critical-dismissal".into(),
+                severity: FindingSeverity::Critical,
+                summary: "critical defect".into(),
+                path: None,
+                line: None,
+                disposition: FindingDisposition::Open,
+                recommended_disposition: Some(FindingDisposition::Dismissed),
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
+                created_at: now_secs(),
+            },
+            ReviewFinding {
+                id: "minor-dismissal".into(),
+                severity: FindingSeverity::Minor,
+                summary: "minor false positive".into(),
+                path: None,
+                line: None,
+                disposition: FindingDisposition::Open,
+                recommended_disposition: Some(FindingDisposition::Dismissed),
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
+                created_at: now_secs(),
+            },
+            ReviewFinding {
                 id: "has-recommendation".into(),
                 severity: FindingSeverity::Major,
                 summary: "real defect".into(),
@@ -6228,6 +6731,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
                 line: None,
                 disposition: FindingDisposition::Open,
                 recommended_disposition: Some(FindingDisposition::Fixed),
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
                 created_at: now_secs(),
             },
             ReviewFinding {
@@ -6238,6 +6744,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
                 line: None,
                 disposition: FindingDisposition::Open,
                 recommended_disposition: None,
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
                 created_at: now_secs(),
             },
         ];
@@ -6265,6 +6774,14 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             "applied finding should be named: {text}"
         );
         assert!(
+            text.contains("critical-dismissal: open (explicit disposition required)"),
+            "withheld major/critical dismissals must be named: {text}"
+        );
+        assert!(
+            text.contains("minor-dismissal: Dismissed"),
+            "minor dismissals should still be applied: {text}"
+        );
+        assert!(
             text.contains("no-recommendation: open (no recommendation)"),
             "an open finding with no recommendation must still be listed: {text}"
         );
@@ -6280,6 +6797,14 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         assert_eq!(
             finding("has-recommendation").disposition,
             FindingDisposition::Fixed
+        );
+        assert_eq!(
+            finding("critical-dismissal").disposition,
+            FindingDisposition::Open
+        );
+        assert_eq!(
+            finding("minor-dismissal").disposition,
+            FindingDisposition::Dismissed
         );
         assert_eq!(
             finding("no-recommendation").disposition,
@@ -6317,6 +6842,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
                 line: None,
                 disposition: FindingDisposition::Open,
                 recommended_disposition: None,
+                advisory_disposition: None,
+                advisory_confidence: None,
+                duplicate_of: None,
                 created_at: now_secs(),
             });
         }
@@ -6410,6 +6938,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: None,
             disposition: FindingDisposition::Fixed,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: now_secs(),
         };
         state.review_findings.push(finding.clone());
@@ -6452,6 +6983,9 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             line: None,
             disposition: FindingDisposition::Fixed,
             recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
             created_at: now_secs(),
         };
 

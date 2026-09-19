@@ -891,7 +891,10 @@ to the section that documents it in depth.
   composition](#team-composition).
 - **Review** — `review` (`package`/`run`/`add`/`dispose`/`list`/
   `ingest-pr-comments`) builds compact review packages and persists finding
-  dispositions; `run --runtime native` runs the reviewer seat natively.
+  dispositions; `run --runtime native` runs the reviewer seat natively. With
+  operator-owned `jev.review` enabled, bounded advisory dispositions order the
+  package and high-confidence Nit/Minor duplicate matches can converge a round;
+  stored severity and disposition remain authoritative.
 - **Maintenance and telemetry** — `maintain` (`scan`) runs deterministic
   operator-configured maintenance detectors, and `stats` aggregates
   privacy-conscious local workflow telemetry. See [Maintain
@@ -1476,7 +1479,11 @@ zirv workflow stats
 Built-in workflows cover `feature`, `bugfix`, `refactor`, `spike`, and
 `review`. Deterministic intent/complexity/risk classification selects
 proportional design, approval, test, and review depth; sensitive auth/security
-and database/schema changes cannot be downgraded below High risk.
+and database/schema changes cannot be downgraded below High risk. Optional
+operator-owned `jev.gates` advice can only tighten gate-time classification,
+add displayed workflow tags, or refuse a high-confidence template-copy
+artifact; high-confidence thin artifacts warn and pin, and the exact
+untouched-template check always runs first.
 
 ### The full verb set
 
@@ -1485,7 +1492,7 @@ zirv workflow list [--json] [--built-in-only] [--repo <path>]        # registry 
 zirv workflow show feature [--json] [--built-in-only] [--repo <path>] # one definition's steps
 zirv workflow classify --task "..."               # classify without starting
 zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>]
-zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off, per-step wall-clock, and pinned definition/drift
+zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off, Jev tags, per-step wall-clock, and pinned definition/drift
 zirv workflow resume <id>                         # restore as the active workflow
 zirv workflow context [id]                        # the current step's resolved skill context
 zirv workflow artifacts <id> [--json]              # committed work-product state
