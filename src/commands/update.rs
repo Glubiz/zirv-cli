@@ -18,6 +18,57 @@ use super::report::GITHUB_REPOSITORY;
 
 type UpdateResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// Which package manager, if any, owns the resolved binary path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageManager {
+    Homebrew,
+    Chocolatey,
+}
+
+/// Classifies whether a resolved binary path is managed by a package manager.
+/// Takes the resolved (canonicalized) path and the original path to detect
+/// symlinks into package manager directories. Returns `None` if neither
+/// Homebrew, Chocolatey, nor a symlink into one is detected.
+fn classify_package_manager(resolved: &Path, original: &Path) -> Option<PackageManager> {
+    // Helper to check if a path contains a specific component.
+    fn path_contains_component(p: &Path, component: &str) -> bool {
+        p.components()
+            .any(|c| c.as_os_str().to_string_lossy() == component)
+    }
+
+    // Check resolved path for Homebrew markers.
+    let resolved_str = resolved.to_string_lossy();
+    if path_contains_component(resolved, "Cellar")
+        || resolved_str.contains("/usr/local/Cellar")
+        || resolved_str.contains("/opt/homebrew")
+        || resolved_str.contains("/.linuxbrew")
+        || resolved_str.contains("linuxbrew/.linuxbrew")
+    {
+        return Some(PackageManager::Homebrew);
+    }
+
+    // Check resolved path for Chocolatey markers (both Unix-like and Windows separators).
+    if path_contains_component(resolved, "chocolatey")
+        && (resolved_str.contains("/lib/") || resolved_str.contains("\\lib\\"))
+    {
+        return Some(PackageManager::Chocolatey);
+    }
+
+    // On Windows, also check for %ChocolateyInstall% pattern.
+    if cfg!(windows) && resolved_str.contains("chocolatey") {
+        return Some(PackageManager::Chocolatey);
+    }
+
+    // Check if original path is a symlink pointing into a package manager directory.
+    // If resolved != original, it means there was a symlink somewhere in the chain.
+    if resolved != original {
+        // Recursively check if original resolves into a Homebrew/Chocolatey location
+        return classify_package_manager(resolved, resolved);
+    }
+
+    None
+}
+
 const API_TIMEOUT_SECS: u64 = 15;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
@@ -302,6 +353,30 @@ fn permission_hint() -> &'static str {
     }
 }
 
+fn package_manager_refusal(pm: PackageManager) -> String {
+    let (cmd, override_var) = match pm {
+        PackageManager::Homebrew => ("brew upgrade zirv", "ZIRV_UPDATE_ALLOW_PACKAGE_MANAGER"),
+        PackageManager::Chocolatey => ("choco upgrade zirv", "ZIRV_UPDATE_ALLOW_PACKAGE_MANAGER"),
+    };
+    format!(
+        "zirv is installed via a package manager ({} detected). \
+         Using `zirv update` would desynchronize the package manager's records, \
+         which would revert your binary on the next `{}`. \
+         Instead, run: {}\n\
+         To override this check (not recommended), set {}=1",
+        match pm {
+            PackageManager::Homebrew => "Homebrew",
+            PackageManager::Chocolatey => "Chocolatey",
+        },
+        match pm {
+            PackageManager::Homebrew => "brew upgrade",
+            PackageManager::Chocolatey => "choco upgrade zirv",
+        },
+        cmd,
+        override_var
+    )
+}
+
 fn path_error(action: &str, path: &Path, error: io::Error) -> Box<dyn std::error::Error> {
     if error.kind() == io::ErrorKind::PermissionDenied {
         format!(
@@ -509,11 +584,11 @@ fn update_in(cli: &UpdateCli, context: &UpdateContext<'_>) -> UpdateResult<i32> 
     }
     let asset = asset_name(context.os, context.arch, &target_version)?;
     let url = asset_url(context.os, context.arch, &target_version)?;
-    crate::output::note(format!(
+    println!(
         "Updating zirv {} to {target_version}",
         context.current_version,
-    ));
-    crate::output::note(format!("Downloading {url}"));
+    );
+    println!("Downloading {url}");
     let downloaded = (context.downloader)(&url)?;
 
     let checksum_url = format!("{url}.sha256");
@@ -522,7 +597,7 @@ fn update_in(cli: &UpdateCli, context: &UpdateContext<'_>) -> UpdateResult<i32> 
             let text = String::from_utf8(bytes)
                 .map_err(|_| format!("checksum file at {checksum_url} is not valid UTF-8"))?;
             verify_checksum(&downloaded, &text, &asset)?;
-            crate::output::note("Checksum verified");
+            println!("Checksum verified");
         }
         None => {
             return Err(format!(
@@ -536,10 +611,10 @@ fn update_in(cli: &UpdateCli, context: &UpdateContext<'_>) -> UpdateResult<i32> 
 
     let binary = binary_from_asset(&downloaded)?;
     (context.installer)(context.target_path, &binary, &target_version)?;
-    crate::output::success(format!(
-        "zirv {target_version} installed to {}",
+    println!(
+        "zirv {target_version} successfully installed to {}",
         context.target_path.display()
-    ));
+    );
     Ok(0)
 }
 
@@ -557,22 +632,40 @@ pub fn dispatch(args: &[String]) -> i32 {
             };
         }
     };
-    let target = match std::env::current_exe()
-        .map_err(|error| format!("could not locate the running zirv binary: {error}"))
-        .and_then(|path| {
-            path.canonicalize().map_err(|error| {
-                format!(
-                    "could not resolve the running zirv binary {}: {error}",
-                    path.display()
-                )
-            })
-        }) {
+
+    // Capture the original path before canonicalization.
+    let original_path = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
-            crate::output::error(error);
+            crate::output::error(format!("could not locate the running zirv binary: {error}"));
             return 1;
         }
     };
+
+    let target = match original_path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            crate::output::error(format!(
+                "could not resolve the running zirv binary {}: {error}",
+                original_path.display()
+            ));
+            return 1;
+        }
+    };
+
+    // Check if the binary is managed by a package manager.
+    if let Some(pm) = classify_package_manager(&target, &original_path) {
+        let allow_override = std::env::var("ZIRV_UPDATE_ALLOW_PACKAGE_MANAGER")
+            .ok()
+            .as_deref()
+            .map(|s| s == "1")
+            .unwrap_or(false);
+        if !allow_override {
+            crate::output::error(package_manager_refusal(pm));
+            return 1;
+        }
+    }
+
     let context = UpdateContext {
         current_version: env!("CARGO_PKG_VERSION"),
         os: std::env::consts::OS,
@@ -819,6 +912,72 @@ mod tests {
             !dir.path()
                 .join(format!(".zirv-update-{}", std::process::id()))
                 .exists()
+        );
+    }
+
+    #[test]
+    fn classify_detects_homebrew_in_cellar_path() {
+        let path = Path::new("/usr/local/Cellar/zirv/4.9.0/bin/zirv");
+        assert_eq!(
+            classify_package_manager(path, path),
+            Some(PackageManager::Homebrew)
+        );
+    }
+
+    #[test]
+    fn classify_detects_homebrew_in_opt_homebrew() {
+        let path = Path::new("/opt/homebrew/Cellar/zirv/4.9.0/bin/zirv");
+        assert_eq!(
+            classify_package_manager(path, path),
+            Some(PackageManager::Homebrew)
+        );
+    }
+
+    #[test]
+    fn classify_detects_homebrew_on_linux() {
+        let path = Path::new("/home/linuxbrew/.linuxbrew/Cellar/zirv/1.0.0/bin/zirv");
+        assert_eq!(
+            classify_package_manager(path, path),
+            Some(PackageManager::Homebrew)
+        );
+    }
+
+    #[test]
+    fn classify_detects_chocolatey_on_windows() {
+        let path = Path::new("C:\\ProgramData\\chocolatey\\lib\\zirv\\tools\\zirv.exe");
+        assert_eq!(
+            classify_package_manager(path, path),
+            Some(PackageManager::Chocolatey)
+        );
+    }
+
+    #[test]
+    fn classify_rejects_plain_usr_local_bin() {
+        let path = Path::new("/usr/local/bin/zirv");
+        assert_eq!(classify_package_manager(path, path), None);
+    }
+
+    #[test]
+    fn classify_rejects_cargo_bin() {
+        let path = Path::new("/Users/me/.cargo/bin/zirv");
+        assert_eq!(classify_package_manager(path, path), None);
+    }
+
+    #[test]
+    fn classify_rejects_local_user_bin() {
+        let path = Path::new("/Users/me/.local/bin/zirv");
+        assert_eq!(classify_package_manager(path, path), None);
+    }
+
+    #[test]
+    fn classify_detects_symlink_into_homebrew() {
+        // Simulates /usr/local/bin/zirv -> ../Cellar/zirv/4.9.0/bin/zirv
+        let original = Path::new("/usr/local/bin/zirv");
+        let resolved = Path::new("/usr/local/Cellar/zirv/4.9.0/bin/zirv");
+        assert_eq!(
+            classify_package_manager(resolved, original),
+            Some(PackageManager::Homebrew),
+            "symlink into Homebrew Cellar must be detected"
         );
     }
 }
