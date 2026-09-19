@@ -724,7 +724,7 @@ Inspect the built result, not the implementation story. Review all captures toge
             &[Cap::TestRun],
             &[Phase::Implement],
             &[],
-            "Read the affected code and repository instructions before editing. Keep the change scoped and preserve established interfaces unless the task requires otherwise. Run the fastest relevant deterministic check after meaningful edits. Do not overwrite unrelated working-tree changes. Report exact blockers and evidence, never inferred success.",
+            "Read the affected code and repository instructions before editing. Keep the change scoped and preserve established interfaces unless the task requires otherwise. When a behavior-focused test is possible, write the smallest one first, confirm it fails for the missing behavior (not setup noise), then implement the minimum change that makes it pass and rerun that test before broadening verification -- keep each red/green cycle attributable to one behavior. Skip this test-first loop for generated files, pure configuration, exploratory spikes, or changes whose only useful assertion is at a broader integration boundary. After each meaningful edit, run the fastest relevant deterministic check, including the repository's own formatting and lint checks, so a nit is caught now rather than at the test step. Before reporting done, self-check the diff against what review will look for -- correctness, security, data loss, compatibility, and missing tests -- and fix what you can rather than leave it for a review round. Do not overwrite unrelated working-tree changes. Report exact blockers and evidence, never inferred success.",
         ),
         manifest(
             "systematic-debugging",
@@ -1057,6 +1057,65 @@ mod tests {
                 .contains("a trivial diff usually has none"),
             "review skill should say findings scale with the change"
         );
+    }
+
+    /// Issue #699 (shift-left): a pack step's `skills` list is validated and
+    /// displayed in full, but `materialize_from_definition` (engine.rs) only
+    /// ever takes `skills.first()` into the running `WorkflowStep::skill` (a
+    /// single `String`, not a `Vec`) -- so listing `tdd` alongside
+    /// `implement` on a step never reaches the model; only the first entry
+    /// does. Reaching a `tdd`-shaped discipline from every implement step
+    /// therefore has to live in the `implement` skill's own instructions,
+    /// which every pack's implement step already resolves. This folds in
+    /// `tdd`'s substance (test-first, red/green, its own exemptions) and the
+    /// `review` rubric's dimensions, so the implementer self-checks against
+    /// both before handoff. `tdd` itself stays registered, unmodified, for
+    /// `workflow show`, operator-authored packs, and the day a step can
+    /// carry more than one skill.
+    #[test]
+    fn implement_manifest_carries_test_first_discipline_and_the_review_rubric() {
+        let skills = builtin_manifests().expect("valid builtins");
+        let implement = skills
+            .iter()
+            .find(|skill| skill.id == "implement")
+            .expect("implement skill exists");
+        for phrase in [
+            "smallest",
+            "fails for the missing behavior",
+            "minimum change that makes it pass",
+            "red/green",
+            "generated files, pure configuration, exploratory spikes",
+        ] {
+            assert!(
+                implement.instructions.contains(phrase),
+                "implement skill should carry tdd's test-first substance ('{phrase}')"
+            );
+        }
+        for dimension in [
+            "correctness",
+            "security",
+            "data loss",
+            "compatibility",
+            "missing tests",
+        ] {
+            assert!(
+                implement.instructions.contains(dimension),
+                "implement skill should name review rubric dimension '{dimension}'"
+            );
+        }
+        assert!(
+            implement.instructions.contains("formatting and lint"),
+            "implement skill should run the repo's own fast formatting/lint checks per unit of work"
+        );
+
+        // tdd itself is untouched: still registered, same dependency, same
+        // instructions -- this change only widens what `implement` says.
+        let tdd = skills
+            .iter()
+            .find(|skill| skill.id == "tdd")
+            .expect("tdd skill exists");
+        assert_eq!(tdd.dependencies, vec!["testing".to_string()]);
+        assert!(tdd.description.contains("red, green, refactor loop"));
     }
 
     #[test]
