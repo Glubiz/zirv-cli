@@ -82,6 +82,7 @@ criterion).
 | `ctx handover` | N16 (#485) |  |
 | `ctx hook` | N22 (#491) |  |
 | `ctx inbox` | N10 (#479) | a consuming read is an orchestrator checkpoint: it drains delegation messages an attention latch deferred (#468) and drops a duplicate delivery identity (#452) |
+| `ctx jev` | shared | reads configuration only; never makes network calls or reads credential values |
 | `ctx kill` | harness-backend | terminates a supervised OS process; a native session is interrupted via the runtime protocol instead |
 | `ctx learn` | N06 (#475) |  |
 | `ctx loop` | N09 (#478) |  |
@@ -155,6 +156,7 @@ criterion).
 | `test all` | shared |  |
 | `test baseline` | shared |  |
 | `test changed` | shared |  |
+| `tour` | shared | prints hardcoded tour sections; reads no state and makes no network calls |
 | `update` | shared |  |
 | `verify` | shared |  |
 | `version` | shared |  |
