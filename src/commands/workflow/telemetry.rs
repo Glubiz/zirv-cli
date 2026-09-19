@@ -2437,6 +2437,7 @@ mod tests {
             source: "configured".into(),
             repo: PathBuf::from("/repo"),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,

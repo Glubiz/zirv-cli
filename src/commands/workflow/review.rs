@@ -5839,6 +5839,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             source: "configured".into(),
             repo: repo.to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,

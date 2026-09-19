@@ -3123,6 +3123,7 @@ mod tests {
             source: "configured".into(),
             repo: repo.to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: verification::change_fingerprint(repo).expect("fingerprint"),
             changed_paths: vec![],
             fallback_to_full: false,

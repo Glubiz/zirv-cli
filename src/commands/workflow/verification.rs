@@ -610,6 +610,21 @@ pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The checkout's current commit, trimmed. Kept independent of
+/// `change_fingerprint`'s own `rev-parse HEAD` read below (folded into a
+/// one-way hash there, so it cannot be recovered from a fingerprint alone):
+/// issue #699's per-check evidence reuse needs to compare two reports'
+/// literal HEAD shas directly (rule 1 -- same HEAD only), which a hash
+/// cannot answer.
+fn head_sha(repo: &Path) -> CtxResult<String> {
+    let root = git_root(repo);
+    let output = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
+    if !output.status.success() {
+        return Err("cannot resolve repository HEAD".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     let root = git_root(repo);
     let head = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
@@ -817,6 +832,18 @@ pub struct VerificationReport {
     /// field existed.
     #[serde(default)]
     pub branch: String,
+    /// The checkout's exact commit (`git rev-parse HEAD`, trimmed) when this
+    /// report was produced. Issue #699 rule 1 (per-check evidence reuse):
+    /// committing can rewrite lockfiles, submodules, generated files, and
+    /// toolchain pins in ways a working-tree path diff would never show, so
+    /// a check may only be reused across a *moved* `change_fingerprint` when
+    /// this matches the current HEAD exactly -- see `per_check_reuse_source`.
+    /// `#[serde(default)]` (empty) for a report persisted before this field
+    /// existed, or when HEAD itself could not be resolved (an unborn
+    /// branch): either way, an empty value never equals a real HEAD sha, so
+    /// it safely disables per-check reuse rather than widening it.
+    #[serde(default)]
+    pub head_sha: String,
     pub change_fingerprint: u64,
     pub changed_paths: Vec<PathBuf>,
     pub fallback_to_full: bool,
@@ -826,7 +853,9 @@ pub struct VerificationReport {
     /// as a satisfied gate.
     #[serde(default)]
     pub narrowed_to: Vec<String>,
-    /// Clamps, truncations, and skips applied to this run.
+    /// Clamps, truncations, and skips applied to this run, plus which prior
+    /// report's checks were reused verbatim
+    /// (`reused_check_ids_from_notes`).
     #[serde(default)]
     pub notes: Vec<String>,
     pub started_at: u64,
@@ -2528,6 +2557,91 @@ fn reusable_test_evidence(
     }
 }
 
+/// Issue #699 (per-check evidence), Tier B: the prior report a `Final` run
+/// may pull *individual* checks from even though its own whole-changeset
+/// `change_fingerprint` no longer matches (`reusable_test_evidence` above --
+/// Tier A -- already covers the exact-match case, unconditionally on paths).
+/// Unlike Tier A, this is not restricted to a `Changed`/`All`-mode source:
+/// a second `zirv verify` after a small fix is exactly the same shape of
+/// problem. Still requires `narrowed_to` empty (rule 5 -- a narrowed run is
+/// evidence about the checks it ran, not a trustworthy snapshot of "what
+/// changed" for path comparison) and, per rule 1, the *exact* same HEAD
+/// commit as right now: committing can rewrite lockfiles, submodules,
+/// generated files, and toolchain pins in ways a working-tree path diff
+/// would never show, so two different HEADs are never bridged this way.
+/// A prior report with no recorded HEAD at all (persisted before #699) never
+/// matches, deliberately including against a current empty `current_head`
+/// (an unborn branch) -- "reuse nothing" is exactly as safe as always. A
+/// stale-by-mode-mismatch case does not exist here since mode is not
+/// consulted; a missing or otherwise ineligible report yields `None`,
+/// treated as "nothing to reuse".
+fn per_check_reuse_source(
+    state: &StateDir,
+    repo: &Path,
+    current_head: &str,
+) -> CtxResult<Option<VerificationReport>> {
+    let Some(report) = load_latest(state, repo)? else {
+        return Ok(None);
+    };
+    if report.narrowed_to.is_empty()
+        && !report.head_sha.is_empty()
+        && !current_head.is_empty()
+        && report.head_sha == current_head
+    {
+        Ok(Some(report))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Issue #699 rule 4: the paths that may have changed between `prior`'s own
+/// snapshot and now, derived honestly from recorded data rather than
+/// assumed. `prior.changed_paths` is exactly what `changed_paths(repo)` (the
+/// uncommitted diff against HEAD, plus untracked files) saw at the moment
+/// `prior` was produced; `current` is that same function's result right
+/// now. Given the identical HEAD at both times (the caller,
+/// `per_check_reuse_source`, has already checked this), a path absent from
+/// BOTH snapshots is *proven* unchanged: had its content (or existence)
+/// differed from HEAD's at either snapshot, it would appear in that
+/// snapshot's list; absent from both means it equalled HEAD's content at
+/// both times, hence equalled itself across the gap. So the union of the
+/// two snapshots is a sound upper bound on what could have changed -- it
+/// can only ever over-flag a path that in fact stayed the same (a
+/// redundant but harmless rerun), never miss one that actually changed.
+/// Owned rather than borrowed: the source report is moved alongside this set
+/// into `run_mode`'s `per_check_evidence`, so a set borrowing out of it would
+/// be self-referential. The extra clone is one run's worth of short path
+/// strings, not a hot loop.
+fn changed_paths_union(
+    prior: &VerificationReport,
+    current: &[PathBuf],
+) -> std::collections::BTreeSet<PathBuf> {
+    prior
+        .changed_paths
+        .iter()
+        .cloned()
+        .chain(current.iter().cloned())
+        .collect()
+}
+
+/// Issue #699 rule 3: empty `paths` means "depends on everything", so a
+/// check that declares none can never be proven unaffected. The only caller
+/// (`run_mode`'s Tier B branch) reaches this exclusively once Tier A's
+/// exact-fingerprint reuse has already found nothing for the whole run --
+/// i.e. something in the changeset did change -- so an unscoped check must
+/// always re-run.
+fn check_paths_touched(paths: &[String], changed: &std::collections::BTreeSet<PathBuf>) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    changed.iter().any(|candidate| {
+        let candidate = candidate.to_string_lossy();
+        paths
+            .iter()
+            .any(|pattern| path_matches(pattern, &candidate))
+    })
+}
+
 /// Weighs an already-failing `report` against the operator's recorded
 /// per-repository baseline (`zirv test baseline`), sharing this one code path
 /// between the step gate (`latest_is_fresh_and_passing`) and the review
@@ -2612,6 +2726,12 @@ fn run_mode(
     let repo_gates = super::repo_gates(repo);
     let repo_checks_enabled = repo_gates.checks;
     let mut notes = resolved.notes;
+    // Issue #699: read once, up front -- before any check has a chance to
+    // run -- so both the early "no checks" return below and the main path
+    // record the exact same HEAD, and so the later Tier B lookup
+    // (`per_check_reuse_source`) compares against this same snapshot rather
+    // than a second, potentially different `git rev-parse HEAD` call.
+    let current_head = head_sha(repo).unwrap_or_default();
     // Issue #268's degraded-gate ban: zero checks configured or
     // discoverable is reported, not silently treated as a pass and not a
     // hard `Err` either (an empty/absent `verify.toml` must not brick `zirv
@@ -2637,6 +2757,7 @@ fn run_mode(
             source: resolved.origin.to_string(),
             repo: repo.to_path_buf(),
             branch: current_branch(repo),
+            head_sha: current_head,
             change_fingerprint: change_fingerprint(repo)?,
             changed_paths: Vec::new(),
             fallback_to_full: false,
@@ -2709,16 +2830,35 @@ fn run_mode(
     let started_at = now_secs();
     // Before the checks, not after: a fingerprint taken afterwards records
     // edits made *during* a long suite as if they had been tested.
+    // `current_head` (issue #699) was already captured above, before even
+    // `resolved.checks.is_empty()` was checked, for the same reason.
     let change_fingerprint = change_fingerprint(repo)?;
     // A `zirv verify` (Final) run reuses `zirv test changed`/`zirv test all`'s
     // own fresh, un-narrowed evidence for this exact fingerprint rather than
     // re-executing every check it already ran. `dry_run` never reuses: it
     // exists to preview what would run, not to report history in its place.
-    let reusable = if mode == VerificationMode::Final && !dry_run {
-        StateDir::resolve(&|key| std::env::var(key).ok())
-            .ok()
-            .and_then(|state| reusable_test_evidence(&state, repo, change_fingerprint).ok())
-            .flatten()
+    let state_for_reuse = if mode == VerificationMode::Final && !dry_run {
+        StateDir::resolve(&|key| std::env::var(key).ok()).ok()
+    } else {
+        None
+    };
+    let reusable = state_for_reuse
+        .as_ref()
+        .and_then(|state| reusable_test_evidence(state, repo, change_fingerprint).ok())
+        .flatten();
+    // Issue #699 (per-check evidence), Tier B: Tier A above only fires when
+    // the *whole* changeset fingerprint is byte-identical. When it moved --
+    // typically a fix landing between `zirv test` and `zirv verify` -- a
+    // specific check may still be safely reused when nothing it declares in
+    // `paths` changed since the prior report. Computed only once Tier A
+    // found nothing, since an exact-fingerprint match already covers every
+    // matching check regardless of its own paths (nothing at all changed).
+    let per_check_evidence = if reusable.is_none() {
+        state_for_reuse.as_ref().and_then(|state| {
+            let source = per_check_reuse_source(state, repo, &current_head).ok()??;
+            let changed = changed_paths_union(&source, &paths);
+            Some((source, changed))
+        })
     } else {
         None
     };
@@ -2749,6 +2889,28 @@ fn run_mode(
             // so reusing one would carry a stale non-answer forward instead
             // of letting this run evaluate the check for real -- e.g.
             // `workflow.repo_checks_enabled` toggled on between the two runs.
+            // Deliberately still allows a prior `Failed` through, unlike
+            // Tier B's rule 2 below: an exact-fingerprint match means
+            // *nothing at all* changed, so a prior failure is still the
+            // correct verdict for this check right now, not a stale one.
+            reused_ids.push(check.spec.id.clone());
+            checks.push(prior.clone());
+            continue;
+        }
+        // Issue #699 (per-check evidence), Tier B: only an unambiguous prior
+        // `Passed` is ever eligible (rule 2 -- a failure, `Skipped`,
+        // `DryRun`, or anything else proves nothing about *this* run and
+        // must always re-execute), and only when this check's own `paths`
+        // did not touch anything in the union of what changed between the
+        // prior report and now (rule 3/4 -- `check_paths_touched` refuses
+        // outright for a check with no declared `paths`).
+        if let Some((source, changed)) = &per_check_evidence
+            && !check_paths_touched(&check.spec.paths, changed)
+            && let Some(prior) = source
+                .checks
+                .iter()
+                .find(|prior| prior.id == check.spec.id && prior.status == CheckStatus::Passed)
+        {
             reused_ids.push(check.spec.id.clone());
             checks.push(prior.clone());
             continue;
@@ -2770,7 +2932,17 @@ fn run_mode(
         }
         checks.push(result);
     }
-    if let Some(source) = &reusable
+    // Exactly one of the two tiers can ever have supplied a reused check in
+    // a single run (Tier B is only computed when Tier A found nothing), so
+    // there is exactly one candidate source report to name here -- extending
+    // the one existing reused-ids note (`reused_check_ids_from_notes`)
+    // rather than inventing a second, parallel mechanism (issue #699 rule
+    // 6). The note's shape is unchanged: readers that already parse it
+    // (`update_baseline_after_run`) need no update.
+    let reuse_note_source = reusable
+        .as_ref()
+        .or_else(|| per_check_evidence.as_ref().map(|(source, _)| source));
+    if let Some(source) = reuse_note_source
         && !reused_ids.is_empty()
     {
         notes.push(format!(
@@ -2788,6 +2960,7 @@ fn run_mode(
         source: resolved.origin.to_string(),
         repo: repo.to_path_buf(),
         branch: current_branch(repo),
+        head_sha: current_head,
         change_fingerprint,
         changed_paths: paths,
         fallback_to_full,
@@ -3899,6 +4072,14 @@ mod tests {
     /// The mirror of the above: once the tree changes, the fingerprint moves
     /// and the prior evidence no longer applies -- `verify` must fall back to
     /// actually re-running the check rather than trusting stale results.
+    ///
+    /// Issue #699 note: this check declares no `paths` (the verify.toml body
+    /// below has no `paths=` line, so `CheckSpec::paths` defaults to empty),
+    /// so it also pins rule 3 of per-check evidence reuse -- a check with no
+    /// declared paths can never be proven unaffected by a moved fingerprint,
+    /// so it must always re-run. `verify_reuses_a_check_whose_paths_do_not_
+    /// match_the_moved_fingerprint` below is this test's mirror for a check
+    /// that *does* declare `paths` and survives.
     #[test]
     fn verify_reruns_when_the_fingerprint_has_moved() {
         let repo = git_repo();
@@ -3933,6 +4114,319 @@ mod tests {
                 verify.notes
             );
         });
+    }
+
+    /// Issue #699 (per-check evidence), Tier B: a check whose declared
+    /// `paths` do not cover anything in the union of what changed between
+    /// the prior report and now must still be reused even though the
+    /// whole-changeset fingerprint moved -- the entire point of the lever.
+    #[test]
+    fn verify_reuses_a_check_whose_paths_do_not_match_the_moved_fingerprint() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\npaths=['src/']\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1, "the changed run must execute once");
+            assert_eq!(changed.checks[0].status, CheckStatus::Passed);
+
+            // `tracked.txt` sits at the repo root, well outside `src/`, so
+            // it never matches this check's own declared `paths` -- but it
+            // still moves the whole-changeset fingerprint.
+            std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+            let before = change_fingerprint(repo.path()).unwrap();
+            assert_ne!(
+                before, changed.change_fingerprint,
+                "the edit must actually move the whole-changeset fingerprint"
+            );
+
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(
+                ran_count(&marker),
+                1,
+                "an unaffected check must be reused across a moved fingerprint"
+            );
+            assert_eq!(verify.checks.len(), 1);
+            assert_eq!(verify.checks[0].status, CheckStatus::Passed);
+            assert!(verify.narrowed_to.is_empty());
+            assert!(
+                verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")
+                        && note.contains(&changed.id)
+                        && note.contains("unit")),
+                "got {:?}",
+                verify.notes
+            );
+        });
+    }
+
+    /// The mirror of the above: a check whose declared `paths` DO cover a
+    /// path that changed since the prior report must re-run, even though a
+    /// sibling check elsewhere might have survived the same moved
+    /// fingerprint.
+    #[test]
+    fn verify_reruns_a_check_whose_paths_match_the_moved_fingerprint() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\npaths=['tracked.txt']\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1);
+
+            std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(
+                ran_count(&marker),
+                2,
+                "a check whose own paths were touched must always re-run"
+            );
+            assert!(
+                !verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")),
+                "got {:?}",
+                verify.notes
+            );
+        });
+    }
+
+    /// Issue #699 rule 2: only an unambiguous prior `Passed` is ever
+    /// reusable. A check that was already failing must re-run even though
+    /// none of its own declared `paths` changed -- a stale `Failed` carried
+    /// forward would be a silently weakened gate in the other direction
+    /// (hiding a fix that actually landed), which is exactly as unsafe as
+    /// silently reusing a stale pass.
+    #[test]
+    fn verify_reruns_a_previously_failing_check_even_though_its_paths_did_not_change() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='custom'\ncommand='{} && false'\npaths=['src/']\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1);
+            assert_eq!(changed.checks[0].status, CheckStatus::Failed);
+
+            // Outside `src/`, exactly like the reused-check test above --
+            // only the prior FAILURE, not a path touch, must force the rerun.
+            std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(
+                ran_count(&marker),
+                2,
+                "a previously failing check must always re-run, regardless of its paths"
+            );
+            assert_eq!(verify.checks[0].status, CheckStatus::Failed);
+            assert!(
+                !verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")),
+                "a failing check must never be reported via the reuse note: {:?}",
+                verify.notes
+            );
+        });
+    }
+
+    /// Issue #699 rule 1: same HEAD only. Even though this check's own
+    /// declared `paths` were never touched by anything, committing between
+    /// the two runs must still force a real rerun -- a commit can rewrite
+    /// lockfiles, submodules, generated files, and toolchain pins in ways a
+    /// working-tree path diff alone would never show.
+    #[test]
+    fn verify_reuses_nothing_when_head_has_moved() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\npaths=['src/']\n",
+                counting_command(&marker)
+            ),
+        );
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1);
+
+            // A brand new commit, touching a path this check's `paths` never
+            // covers at all -- HEAD moving alone must still force a rerun.
+            std::fs::write(repo.path().join("extra.txt"), "new\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "second"]);
+
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(
+                ran_count(&marker),
+                2,
+                "a moved HEAD must force a real rerun even when no declared path was touched"
+            );
+            assert!(
+                !verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")),
+                "got {:?}",
+                verify.notes
+            );
+        });
+    }
+
+    /// Issue #699 rule 5: reuse is not narrowing. A report built with a
+    /// Tier-B-reused check must still satisfy `latest_is_fresh_and_passing`
+    /// (full coverage, matches its own fingerprint) and must not set
+    /// `narrowed_to` -- that field means the operator asked for a subset,
+    /// which correctly fails the freshness gate.
+    #[test]
+    fn a_report_with_a_tier_b_reused_check_still_satisfies_the_freshness_gate() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\npaths=['src/']\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+
+            std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert!(
+                verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")),
+                "expected the unit check to be reused via Tier B: {:?}",
+                verify.notes
+            );
+            assert!(verify.narrowed_to.is_empty());
+            persist(&verify, repo.path(), VerificationMode::Final).unwrap();
+
+            assert!(
+                latest_is_fresh_and_passing(&state, repo.path(), true, None).unwrap(),
+                "a report carrying a reused check must still satisfy the freshness gate"
+            );
+        });
+    }
+
+    /// Issue #699: a report persisted by a build before `head_sha` existed
+    /// must still deserialize after upgrade -- the same `#[serde(default)]`
+    /// migration contract every other field on this struct already relies
+    /// on (`branch`, `narrowed_to`, `notes`), and a missing key here must
+    /// degrade to "not Tier-B reusable", never to a load failure. Written by
+    /// hand rather than round-tripped through the current struct: a
+    /// `Serialize` of today's `VerificationReport` always includes
+    /// `head_sha`, so only literal pre-#699 JSON exercises the missing-key
+    /// path this test actually needs to pin.
+    #[test]
+    fn a_report_json_without_head_sha_still_deserializes_and_is_not_tier_b_reusable() {
+        let state_root = tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let repo = PathBuf::from("/some/pre-699/repo");
+        let dir = report_dir(&state, &repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{
+            "schema_version": 2,
+            "id": "pre-699",
+            "mode": "final",
+            "source": "configured",
+            "repo": "/some/pre-699/repo",
+            "change_fingerprint": 1,
+            "changed_paths": [],
+            "fallback_to_full": false,
+            "started_at": 0,
+            "finished_at": 0,
+            "checks": [
+                {
+                    "id": "unit",
+                    "kind": "unit",
+                    "command": "true",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "duration_ms": 1,
+                    "failure_output": null
+                }
+            ]
+        }"#;
+        std::fs::write(dir.join("pre-699.json"), json).unwrap();
+        std::fs::write(dir.join("latest"), "pre-699.json").unwrap();
+
+        let loaded = load_latest(&state, &repo)
+            .expect("a pre-#699 report must still deserialize")
+            .expect("the latest pointer must resolve");
+        assert_eq!(
+            loaded.head_sha, "",
+            "a missing head_sha must default to empty, not fail to load"
+        );
+
+        // Not Tier-B reusable: an empty recorded HEAD must never be treated
+        // as matching a real current one, and deliberately not even an
+        // equally-empty current HEAD (an unresolvable HEAD right now must
+        // never widen reuse just because the recorded value also happens to
+        // be blank) -- see `per_check_reuse_source`.
+        assert!(
+            per_check_reuse_source(&state, &repo, "deadbeef")
+                .unwrap()
+                .is_none(),
+            "an empty recorded HEAD must never match a real current HEAD"
+        );
+        assert!(
+            per_check_reuse_source(&state, &repo, "").unwrap().is_none(),
+            "an empty recorded HEAD must not match an unresolvable current HEAD either"
+        );
     }
 
     /// Issue #467 review (defect 1): report storage must stay keyed by the
@@ -3995,6 +4489,7 @@ mod tests {
                 source: "configured".into(),
                 repo: path.clone(),
                 branch: branch.clone(),
+                head_sha: String::new(),
                 change_fingerprint: fingerprint,
                 changed_paths: vec![],
                 fallback_to_full: false,
@@ -4103,6 +4598,7 @@ mod tests {
             source: "configured".into(),
             repo: worktree_path.clone(),
             branch: report_branch.to_string(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4554,6 +5050,7 @@ mod tests {
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4639,6 +5136,7 @@ mod tests {
             source: "configured".into(),
             repo: PathBuf::from("/repo"),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -4695,6 +5193,7 @@ mod tests {
             source: "configured".into(),
             repo: repo.to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -5139,6 +5638,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             source: "configured".into(),
             repo: PathBuf::from("/repo"),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: 1,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -6075,6 +6575,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -6239,6 +6740,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -6284,6 +6786,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
