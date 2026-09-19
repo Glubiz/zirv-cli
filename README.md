@@ -140,6 +140,24 @@ zirv setup reset codex --scope global --yes
 zirv setup reset all --scope all --yes
 ```
 
+### Guided tour
+
+Start a guided tour of zirv for a new installation:
+
+```bash
+zirv tour
+```
+
+In a terminal, this walks you through seven topics (overview, harnesses, memory, safety, jev, config, unstuck) with paging controls: press `[enter]` or `n` to go to the next section, `b` to go back, `q` to quit. Rerun `zirv tour` to resume where you left off, or jump directly to a topic:
+
+```bash
+zirv tour config
+zirv tour memory
+zirv tour unstuck
+```
+
+In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections plainly and exits 0, suitable for scripts or documentation.
+
 ### `ZIRV.md` instruction files
 
 Zirv's own native instruction file. Sources, closest scope first:
@@ -2056,6 +2074,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
+| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the five advisory gates, the credential env var name and presence (never the value), the endpoint and model, and why it is or is not active — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 
@@ -3337,6 +3356,8 @@ review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
+
+Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
 directory under `zirv/ctx/`, never in the repo. Override with
