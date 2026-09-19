@@ -851,6 +851,188 @@ pub(crate) fn advise(
     }
 }
 
+/// Returns the environment variable name currently configured for the Jev
+/// credential, as set in `cfg.proxy.typesafe.credential_env`. Exposed so
+/// the setup wizard can tell the operator exactly which variable to export.
+#[allow(dead_code)]
+pub fn credential_env_name(cfg: &CtxConfig) -> String {
+    cfg.proxy.typesafe.credential_env.clone()
+}
+
+/// Whether the configured credential environment variable is set and
+/// non-empty, without ever returning or logging its value. Exposed so
+/// the setup wizard can distinguish "credential missing" from "gate off".
+#[allow(dead_code)]
+pub fn credential_present(cfg: &CtxConfig) -> bool {
+    available(&cfg.proxy.typesafe)
+}
+
+use clap::{Args, Subcommand};
+
+/// Subcommands for `zirv ctx jev`.
+#[derive(Debug, Subcommand)]
+pub enum JevCommand {
+    /// Report Jev client status: gates, credential presence, endpoint/model,
+    /// and why it is or is not active. Reads configuration only; never makes
+    /// network calls or reads credential values.
+    Status {
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Arguments for `zirv ctx jev`.
+#[derive(Debug, Args)]
+pub struct JevArgs {
+    #[command(subcommand)]
+    pub command: JevCommand,
+}
+
+/// Handler for the `zirv ctx jev` verb.
+pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx::CtxResult<i32> {
+    match &args.command {
+        JevCommand::Status { repo, json } => {
+            let resolved_repo = match repo {
+                Some(repo) => repo.clone(),
+                None => std::env::current_dir()?,
+            };
+            let cfg = CtxConfig::load(&resolved_repo, &|key| std::env::var(key).ok())?;
+
+            if *json {
+                let gates = [
+                    ("memory", cfg.jev.memory),
+                    ("supervisor", cfg.jev.supervisor),
+                    ("dispatch", cfg.jev.dispatch),
+                    ("review", cfg.jev.review),
+                    ("gates", cfg.jev.gates),
+                ];
+                let any_gate_on = gates.iter().any(|(_, on)| *on);
+                let cred_present = available(&cfg.proxy.typesafe);
+                let cred_env = &cfg.proxy.typesafe.credential_env;
+
+                let verdict = if any_gate_on && cred_present {
+                    "active"
+                } else if any_gate_on && !cred_present {
+                    "inactive_credential_missing"
+                } else if !any_gate_on && cred_present {
+                    "inactive_no_gate"
+                } else {
+                    "inactive_both"
+                };
+
+                let json_output = serde_json::json!({
+                    "gates": {
+                        "memory": cfg.jev.memory,
+                        "supervisor": cfg.jev.supervisor,
+                        "dispatch": cfg.jev.dispatch,
+                        "review": cfg.jev.review,
+                        "gates": cfg.jev.gates,
+                    },
+                    "credential_env": cred_env,
+                    "credential_present": cred_present,
+                    "endpoint": cfg.proxy.typesafe.base_url,
+                    "model": cfg.proxy.typesafe.model,
+                    "status": verdict,
+                });
+                writeln!(writer, "{}", serde_json::to_string_pretty(&json_output)?)?;
+                Ok(0)
+            } else {
+                status(&cfg, writer)?;
+                Ok(0)
+            }
+        }
+    }
+}
+
+/// Prints a read-only status report of whether Jev is enabled and why or why
+/// not: each of the five gates (memory, supervisor, dispatch, review, gates),
+/// the credential env var name and presence, the endpoint base URL, model, and
+/// a one-line verdict. Never makes a network call, never reads the credential
+/// value, never writes config or creates directories. The output format
+/// matches the style of `zirv ctx capabilities` (available/unavailable lines
+/// with diagnosis underneath).
+pub fn status(cfg: &CtxConfig, writer: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fmt::Write as FmtWrite;
+
+    // Determine if any gate is on
+    let gates = [
+        ("memory", cfg.jev.memory),
+        ("supervisor", cfg.jev.supervisor),
+        ("dispatch", cfg.jev.dispatch),
+        ("review", cfg.jev.review),
+        ("gates", cfg.jev.gates),
+    ];
+    let any_gate_on = gates.iter().any(|(_, on)| *on);
+
+    // Check credential
+    let cred_env = &cfg.proxy.typesafe.credential_env;
+    let cred_present = available(&cfg.proxy.typesafe);
+
+    // Determine verdict and diagnosis
+    let mut diagnosis = String::new();
+    let verdict = if any_gate_on && cred_present {
+        "active"
+    } else if any_gate_on && !cred_present {
+        let _ = writeln!(diagnosis, "credential {} not set", cred_env);
+        let _ = writeln!(diagnosis, "remedy: export {}=<api-key>", cred_env);
+        "inactive"
+    } else if !any_gate_on && cred_present {
+        let _ = writeln!(diagnosis, "no gate enabled");
+        let enabled_gates = gates
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| format!("jev.{}", name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if enabled_gates.is_empty() {
+            let _ = writeln!(diagnosis, "remedy: zirv ctx config set jev.memory true");
+        }
+        "inactive"
+    } else {
+        let _ = writeln!(
+            diagnosis,
+            "no gate enabled; credential {} not set",
+            cred_env
+        );
+        let _ = writeln!(
+            diagnosis,
+            "remedy: zirv ctx config set jev.memory true && export {}=<api-key>",
+            cred_env
+        );
+        "inactive"
+    };
+
+    // Print gates
+    for (name, on) in &gates {
+        let status = if *on { "on" } else { "off" };
+        writeln!(writer, "jev.{:<12} {}", name, status)?;
+    }
+
+    // Print credential info
+    if cred_present {
+        writeln!(writer, "credential    present ({}) set", cred_env)?;
+    } else {
+        writeln!(writer, "credential    missing")?;
+        writeln!(writer, "              {}", cred_env)?;
+    }
+
+    // Print endpoint and model
+    writeln!(writer, "endpoint      {}", cfg.proxy.typesafe.base_url)?;
+    writeln!(writer, "model         {}", cfg.proxy.typesafe.model)?;
+
+    // Print verdict
+    writeln!(writer, "status        {}", verdict)?;
+    if !diagnosis.is_empty() {
+        for line in diagnosis.trim().lines() {
+            writeln!(writer, "              {}", line)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1743,5 +1925,154 @@ pub(crate) mod tests {
             decisive.decisive(1.0, 0.2),
             "min_confidence must be ignored for noul"
         );
+    }
+
+    #[test]
+    fn credential_env_name_returns_the_configured_variable_name() {
+        let cfg = config("http://127.0.0.1:0".to_string(), "CUSTOM_ENV_VAR", 5);
+        let ctx_cfg = {
+            let mut ctx = CtxConfig::default();
+            ctx.proxy.typesafe = cfg;
+            ctx
+        };
+        assert_eq!(credential_env_name(&ctx_cfg), "CUSTOM_ENV_VAR");
+    }
+
+    #[test]
+    fn credential_env_name_defaults_to_typesafe_api_key() {
+        let ctx_cfg = CtxConfig::default();
+        assert_eq!(credential_env_name(&ctx_cfg), "TYPESAFE_API_KEY");
+    }
+
+    #[test]
+    fn credential_present_returns_true_when_env_is_set_and_nonempty() {
+        let ctx_cfg = {
+            let mut ctx = CtxConfig::default();
+            ctx.proxy.typesafe.credential_env = "JEV_TEST_CRED_PRESENT".to_string();
+            ctx
+        };
+        with_credential("JEV_TEST_CRED_PRESENT", "secret", || {
+            assert!(credential_present(&ctx_cfg));
+        });
+    }
+
+    #[test]
+    fn credential_present_returns_false_when_env_is_unset() {
+        let ctx_cfg = {
+            let mut ctx = CtxConfig::default();
+            ctx.proxy.typesafe.credential_env = "JEV_TEST_CRED_UNSET_537".to_string();
+            ctx
+        };
+        // SAFETY (test-only): unique env var name
+        unsafe {
+            std::env::remove_var(&ctx_cfg.proxy.typesafe.credential_env);
+        }
+        assert!(!credential_present(&ctx_cfg));
+    }
+
+    #[test]
+    fn credential_present_returns_false_when_env_is_empty() {
+        let ctx_cfg = {
+            let mut ctx = CtxConfig::default();
+            ctx.proxy.typesafe.credential_env = "JEV_TEST_CRED_EMPTY_537".to_string();
+            ctx
+        };
+        with_credential("JEV_TEST_CRED_EMPTY_537", "", || {
+            assert!(!credential_present(&ctx_cfg));
+        });
+    }
+
+    #[test]
+    fn credential_never_appears_in_status_output() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut ctx_cfg = CtxConfig::default();
+        ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_CRED_SENTINEL_537".to_string();
+
+        with_credential(
+            "JEV_TEST_CRED_SENTINEL_537",
+            "sentinel-do-not-print-this-value",
+            || {
+                let mut output = Vec::new();
+                let _ = status(&ctx_cfg, &mut output);
+                let output_str = String::from_utf8_lossy(&output);
+                assert!(
+                    !output_str.contains("sentinel-do-not-print-this-value"),
+                    "credential value must never appear in output: {output_str}"
+                );
+                assert!(
+                    !output_str.contains("sentinel"),
+                    "credential value prefix must never appear in output: {output_str}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn status_with_all_gates_off_names_both_reasons() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut ctx_cfg = CtxConfig::default();
+        ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_BOTH_OFF".to_string();
+
+        unsafe {
+            std::env::remove_var(&ctx_cfg.proxy.typesafe.credential_env);
+        }
+
+        let mut output = Vec::new();
+        let _ = status(&ctx_cfg, &mut output);
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("inactive"),
+            "status should name the condition: {output_str}"
+        );
+        assert!(
+            output_str.contains("no gate enabled"),
+            "status should mention gates are off: {output_str}"
+        );
+    }
+
+    #[test]
+    fn status_with_gate_on_but_credential_missing_names_credential() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut ctx_cfg = CtxConfig::default();
+        ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_CRED_MISSING".to_string();
+        ctx_cfg.jev.memory = true;
+
+        unsafe {
+            std::env::remove_var(&ctx_cfg.proxy.typesafe.credential_env);
+        }
+
+        let mut output = Vec::new();
+        let _ = status(&ctx_cfg, &mut output);
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("JEV_TEST_STATUS_CRED_MISSING"),
+            "status should name the credential env var: {output_str}"
+        );
+        assert!(
+            output_str.contains("not set") || output_str.contains("missing"),
+            "status should indicate credential is missing: {output_str}"
+        );
+    }
+
+    #[test]
+    fn status_with_gate_on_and_credential_present_is_active() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut ctx_cfg = CtxConfig::default();
+        ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_ACTIVE".to_string();
+        ctx_cfg.jev.memory = true;
+
+        with_credential("JEV_TEST_STATUS_ACTIVE", "secret", || {
+            let mut output = Vec::new();
+            let _ = status(&ctx_cfg, &mut output);
+            let output_str = String::from_utf8_lossy(&output);
+            assert!(
+                output_str.contains("active"),
+                "status should indicate active when gate is on and credential is present: {output_str}"
+            );
+        });
     }
 }

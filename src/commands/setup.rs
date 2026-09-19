@@ -2900,12 +2900,30 @@ fn run_apply_with_predicate<W: Write>(
             writeln!(writer, "Codex: not installed, skipping hook installation")?;
         }
     }
-    let completion = if args.dry_run {
-        "setup dry run complete"
+    // Check if any harness is installed
+    let any_harness_installed = ctx::adapters::ADAPTERS
+        .iter()
+        .any(|(name, _)| harness_exists(name));
+
+    if any_harness_installed {
+        let completion = if args.dry_run {
+            "setup dry run complete"
+        } else {
+            "setup complete"
+        };
+        writeln!(writer, "{completion}; run `zirv setup status` to verify")?;
+    } else if args.dry_run {
+        writeln!(writer, "setup dry run complete")?;
     } else {
-        "setup complete"
-    };
-    writeln!(writer, "{completion}; run `zirv setup status` to verify")?;
+        writeln!(
+            writer,
+            "No coding harness is installed. zirv needs Claude, Codex, or another supported harness."
+        )?;
+        writeln!(
+            writer,
+            "Install one and run `zirv setup` again, or set ZIRV_AGENT_CLAUDE_ENABLED=true etc. to use one when it arrives."
+        )?;
+    }
     Ok(0)
 }
 
@@ -7205,5 +7223,89 @@ mod tests {
                 "Claude settings must be created when claude is installed"
             );
         }
+    }
+
+    /// Issue #688: `run_apply` with no harness installed must print the
+    /// install prompt, not claim success. This test verifies the output when
+    /// using an injectable predicate that reports no harness present.
+    #[test]
+    fn run_apply_no_harness_prints_install_message() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home_guard = HomeGuard::set(home.path());
+
+        // Set up minimal repo structure
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+
+        let args = ApplyArgs {
+            repo: repo.path().to_path_buf(),
+            dry_run: false,
+            no_context: true,
+            no_memory: true,
+            no_claude_hooks: true,
+            no_codex_hooks: true,
+            memory_source: None,
+        };
+
+        // Predicate that says no harness is installed
+        let no_harness = |_name: &str| false;
+
+        let mut output = Vec::new();
+        let result = run_apply_with_predicate(&args, &mut output, &no_harness);
+        assert!(result.is_ok(), "run_apply should succeed");
+
+        let output_str = String::from_utf8(output).expect("utf8");
+        assert!(
+            output_str.contains("No coding harness is installed"),
+            "Must print install message when no harness present, got: {output_str}"
+        );
+        assert!(
+            output_str.contains("Install one and run `zirv setup` again"),
+            "Must include install instruction, got: {output_str}"
+        );
+        assert!(
+            !output_str.contains("setup complete;"),
+            "Must NOT print success message, got: {output_str}"
+        );
+    }
+
+    /// Issue #688: `run_apply` with a harness installed must continue to print
+    /// the success message. This test verifies the output when using an
+    /// injectable predicate that reports claude present.
+    #[test]
+    fn run_apply_with_harness_prints_success_message() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home_guard = HomeGuard::set(home.path());
+
+        // Set up minimal repo structure
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+
+        let args = ApplyArgs {
+            repo: repo.path().to_path_buf(),
+            dry_run: false,
+            no_context: true,
+            no_memory: true,
+            no_claude_hooks: true,
+            no_codex_hooks: true,
+            memory_source: None,
+        };
+
+        // Predicate that says claude is installed
+        let claude_present = |name: &str| name == "claude";
+
+        let mut output = Vec::new();
+        let result = run_apply_with_predicate(&args, &mut output, &claude_present);
+        assert!(result.is_ok(), "run_apply should succeed");
+
+        let output_str = String::from_utf8(output).expect("utf8");
+        assert!(
+            output_str.contains("setup complete;"),
+            "Must print success message when harness present, got: {output_str}"
+        );
+        assert!(
+            !output_str.contains("No coding harness is installed"),
+            "Must NOT print install message, got: {output_str}"
+        );
     }
 }

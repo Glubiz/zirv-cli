@@ -634,6 +634,14 @@ async fn main() {
             }
             return;
         }
+        "tour" => {
+            let topic = input.params.first().map(|s| s.as_str());
+            if let Err(e) = commands::tour::run(topic) {
+                output::error(e);
+                std::process::exit(1);
+            }
+            return;
+        }
         _ => {}
     }
 

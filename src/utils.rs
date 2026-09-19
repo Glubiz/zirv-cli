@@ -26,7 +26,7 @@ pub const COMMANDS_DIR_NAME: &str = "commands";
 pub const RESERVED_COMMANDS: &[&str] = &[
     "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent", "memory",
     "context", "setup", "report", "skill", "workflow", "test", "verify", "artifact", "frontend",
-    "commands", "update", "session",
+    "commands", "update", "session", "tour",
     // Issue #540: `native` is a thin top-level alias for `zirv chat --runtime
     // native` (see `main.rs`'s `is_top_level_native_alias`/`rewrite_native_
     // alias_args`), reserved case-insensitively like every other built-in so
@@ -473,6 +473,7 @@ mod tests {
         assert!(is_reserved_command("frontend"));
         assert!(is_reserved_command("setup"));
         assert!(is_reserved_command("update"));
+        assert!(is_reserved_command("tour"));
         assert!(!is_reserved_command("build"));
     }
 
@@ -489,6 +490,7 @@ mod tests {
         assert!(is_reserved_command("FRONTEND"));
         assert!(is_reserved_command("SeTuP"));
         assert!(is_reserved_command("UpDaTe"));
+        assert!(is_reserved_command("TOUR"));
         assert!(!is_reserved_command("Build"));
     }
 

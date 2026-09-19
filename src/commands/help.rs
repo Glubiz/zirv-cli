@@ -242,6 +242,12 @@ fn write_builtins<W: Write>(
                 desc: &["Configure AI context, memory, hooks, migration, and safe resets"],
             },
             Row {
+                name: "tour [topic]",
+                desc: &[
+                    "Guided tour of zirv: overview, harnesses, memory, safety, jev, config, unstuck",
+                ],
+            },
+            Row {
                 name: "update [--version <x.y.z>]",
                 desc: &["Install the latest or a specified zirv release"],
             },
