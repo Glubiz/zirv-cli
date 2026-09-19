@@ -49,12 +49,28 @@ Write-Host "Copying Windows artifact..."
 Copy-Item $windowsSource -Destination $windowsDestination -Force
 Write-Host "  -> $windowsDestination"
 
-# Update nuspec version
+# Update nuspec version and release notes URL
 $nuspecPath = Join-Path $packageFolder "zirv.nuspec"
 [xml]$nuspec = Get-Content $nuspecPath
-$nuspec.package.metadata.version = $Version
+
+# Update version element
+$versionNode = $nuspec.SelectSingleNode('/package/metadata/version')
+if (-not $versionNode) {
+    Write-Error "version element not found in nuspec"
+    exit 1
+}
+$versionNode.InnerText = $Version
+
+# Update release notes element
+$releaseNotesNode = $nuspec.SelectSingleNode('/package/metadata/releaseNotes')
+if (-not $releaseNotesNode) {
+    Write-Error "releaseNotes element not found in nuspec"
+    exit 1
+}
+$releaseNotesNode.InnerText = "For complete release notes, please visit https://github.com/Glubiz/zirv-cli/releases/tag/v$Version."
+
 $nuspec.Save($nuspecPath)
-Write-Host "Updated nuspec version to $Version"
+Write-Host "Updated nuspec version to $Version and release notes URL"
 
 # Pack into the package folder
 Write-Host "Packing the Chocolatey package into $packageFolder..."

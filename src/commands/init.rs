@@ -25,18 +25,33 @@ pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
 
     if !home_zirv.exists() {
         fs::create_dir_all(&home_zirv)?;
-        println!("Created .zirv in home directory: {home_zirv:?}");
+        println!(
+            "Created .zirv in home directory: {}",
+            crate::commands::ctx::state::display_path(&home_zirv)
+        );
     }
     let home_commands = home_zirv.join(COMMANDS_DIR_NAME);
     if !home_commands.exists() {
         fs::create_dir_all(&home_commands)?;
-        println!("Created .zirv/commands in home directory: {home_commands:?}");
+        println!(
+            "Created .zirv/commands in home directory: {}",
+            crate::commands::ctx::state::display_path(&home_commands)
+        );
     }
     // Create default .shortcuts.yaml in home folder if not present.
     let home_shortcuts = home_zirv.join(".shortcuts.yaml");
     if !home_shortcuts.exists() {
         fs::write(&home_shortcuts, DEFAULT_SHORTCUTS)?;
-        println!("Created default .shortcuts.yaml in home directory: {home_shortcuts:?}");
+        println!(
+            "Created default .shortcuts.yaml in home directory: {}",
+            crate::commands::ctx::state::display_path(&home_shortcuts)
+        );
+    }
+    // Mark the machine as configured so first_run_needed returns false.
+    // Write a minimal .settings.toml to indicate configuration has begun.
+    let settings_path = home_zirv.join(".settings.toml");
+    if !settings_path.is_file() {
+        fs::write(&settings_path, "")?;
     }
     Ok(())
 }
@@ -50,15 +65,55 @@ pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
 pub fn scaffold_local_zirv(current_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let current_zirv = current_dir.join(".zirv");
     fs::create_dir_all(&current_zirv)?;
-    println!("Created .zirv in current directory: {current_zirv:?}");
+    println!(
+        "Created .zirv in current directory: {}",
+        crate::commands::ctx::state::display_path(&current_zirv)
+    );
     let current_commands = current_zirv.join(COMMANDS_DIR_NAME);
     fs::create_dir_all(&current_commands)?;
-    println!("Created .zirv/commands in current directory: {current_commands:?}");
+    println!(
+        "Created .zirv/commands in current directory: {}",
+        crate::commands::ctx::state::display_path(&current_commands)
+    );
     let current_shortcuts = current_zirv.join(".shortcuts.yaml");
     if !current_shortcuts.exists() {
         fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
-        println!("Created default .shortcuts.yaml in current directory: {current_shortcuts:?}");
+        println!(
+            "Created default .shortcuts.yaml in current directory: {}",
+            crate::commands::ctx::state::display_path(&current_shortcuts)
+        );
     }
+    Ok(())
+}
+
+/// Idempotent version of local scaffold: creates missing items in `.zirv`
+/// while leaving what exists untouched. Used when `.zirv` directory already exists.
+fn scaffold_local_zirv_idempotent(current_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let current_zirv = current_dir.join(".zirv");
+    let current_commands = current_zirv.join(COMMANDS_DIR_NAME);
+
+    if !current_commands.exists() {
+        fs::create_dir_all(&current_commands)?;
+        println!(
+            "Created .zirv/commands in current directory: {}",
+            crate::commands::ctx::state::display_path(&current_commands)
+        );
+    } else {
+        println!(".zirv/commands already present in current directory.");
+    }
+
+    let current_shortcuts = current_zirv.join(".shortcuts.yaml");
+    if !current_shortcuts.exists() {
+        fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
+        println!(
+            "Created default .shortcuts.yaml in current directory: {}",
+            crate::commands::ctx::state::display_path(&current_shortcuts)
+        );
+    } else {
+        println!(".shortcuts.yaml already present in current directory.");
+    }
+
+    println!(".zirv already present in current directory.");
     Ok(())
 }
 
@@ -82,10 +137,13 @@ where
         if init_current {
             scaffold_local_zirv(&current_dir)?;
         } else {
-            println!(".zirv not created in current directory.");
+            println!(
+                ".zirv not created in current directory. Bare `zirv` will not open a chat session here without it."
+            );
         }
     } else {
-        println!(".zirv already exists in current directory.");
+        // Make local scaffold idempotent: create missing subdirectories and report what happened.
+        scaffold_local_zirv_idempotent(&current_dir)?;
     }
 
     Ok(())
@@ -331,6 +389,91 @@ mod tests {
                 .join(COMMANDS_DIR_NAME)
                 .is_dir(),
             "the local .zirv/commands directory should be created"
+        );
+
+        Ok(())
+    }
+
+    /// Issue #689: when `.zirv` already exists (e.g. from `setup apply`),
+    /// `init` must repair it by creating missing subdirectories like
+    /// `commands/` rather than skipping all local setup.
+    #[test]
+    fn init_fills_in_missing_commands_directory_when_zirv_exists()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fake_home_dir = tempdir()?;
+        let fake_home_path = fake_home_dir.path().to_path_buf();
+        let fake_current_dir = tempdir()?;
+        let fake_current_path = fake_current_dir.path().to_path_buf();
+
+        let _guard =
+            crate::commands::ctx::testenv::EnvGuard::set(&fake_home_path, Some(&fake_current_path));
+
+        // Pre-create a bare `.zirv` directory (simulating `setup apply` creating it).
+        let current_zirv = fake_current_path.join(".zirv");
+        fs::create_dir(&current_zirv)?;
+
+        // Verify the commands directory does not exist yet.
+        let current_commands = current_zirv.join(COMMANDS_DIR_NAME);
+        assert!(
+            !current_commands.exists(),
+            "setup was supposed to leave commands/ missing"
+        );
+
+        // Run init, confirming yes to local .zirv (even though it exists).
+        // In practice, init_zirv_with detects the existing .zirv and calls
+        // scaffold_local_zirv_idempotent instead, which should fill it in.
+        init_zirv_with(|| Ok(true))?;
+
+        // Verify that commands/ was created despite .zirv already existing.
+        assert!(
+            current_commands.is_dir(),
+            "init must create missing .zirv/commands/ even when .zirv exists"
+        );
+
+        Ok(())
+    }
+
+    /// Issue #689: when `.zirv` is fully present with all expected
+    /// subdirectories, `init` must report this and change nothing.
+    #[test]
+    fn init_on_fully_present_zirv_changes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let fake_home_dir = tempdir()?;
+        let fake_home_path = fake_home_dir.path().to_path_buf();
+        let fake_current_dir = tempdir()?;
+        let fake_current_path = fake_current_dir.path().to_path_buf();
+
+        let _guard =
+            crate::commands::ctx::testenv::EnvGuard::set(&fake_home_path, Some(&fake_current_path));
+
+        // Fully scaffold the local .zirv first.
+        scaffold_local_zirv(&fake_current_path)?;
+
+        // Record the initial state of key files.
+        let current_zirv = fake_current_path.join(".zirv");
+        let current_commands = current_zirv.join(COMMANDS_DIR_NAME);
+        let current_shortcuts = current_zirv.join(".shortcuts.yaml");
+
+        let shortcuts_mtime_before = std::fs::metadata(&current_shortcuts)?.modified()?;
+
+        // Run init again (which should detect that everything exists).
+        init_zirv_with(|| Ok(true))?;
+
+        // Verify all directories still exist.
+        assert!(current_zirv.is_dir(), ".zirv should still exist");
+        assert!(
+            current_commands.is_dir(),
+            ".zirv/commands should still exist"
+        );
+        assert!(
+            current_shortcuts.is_file(),
+            ".shortcuts.yaml should still exist"
+        );
+
+        // Verify the shortcuts file was NOT rewritten (mtime unchanged).
+        let shortcuts_mtime_after = std::fs::metadata(&current_shortcuts)?.modified()?;
+        assert_eq!(
+            shortcuts_mtime_before, shortcuts_mtime_after,
+            ".shortcuts.yaml should not have been rewritten"
         );
 
         Ok(())

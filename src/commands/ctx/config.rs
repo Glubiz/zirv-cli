@@ -1,9 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
+
+/// Tracks the source origin of top-level config keys as layers merge.
+/// Maps from top-level key name to a human-readable source description.
+#[derive(Debug, Clone)]
+enum KeyOrigin {
+    Home,
+    Repo,
+    Env(String), // env var name
+}
 
 pub const DEFAULT_MARKER: &str = "[zirv]";
 pub const CTX_CONFIG_FILE: &str = "ctx.toml";
@@ -4907,22 +4916,114 @@ pub fn is_repo_forbidden(error: &(dyn std::error::Error + 'static)) -> bool {
 
 /// Loud rather than silent: a repo that sets one of these gets a message
 /// naming the key and where to put it, which beats wondering why the value in
-/// the file is being ignored.
+/// the file is being ignored. Collects ALL violations before failing, so a repo
+/// config that sets multiple forbidden keys gets them all named in one error.
 fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
+    let mut violations = Vec::new();
     for (key, variable) in REPO_FORBIDDEN {
         if value_at(layer, key).is_some() {
-            return Err(Box::new(RepoForbiddenError(format!(
-                "{}: `{}` may not be set by a repository config, because it names something zirv \
-                 then runs. Set it in ~/{}/{} or with {} instead.",
-                path.display(),
-                key.join("."),
-                crate::utils::SCRIPT_DIR_NAME,
-                CTX_CONFIG_FILE,
-                variable
-            ))));
+            violations.push((key.join("."), variable.to_string()));
         }
     }
+    if !violations.is_empty() {
+        let is_singular = violations.len() == 1;
+        let keys_msg = if is_singular {
+            format!("`{}`", violations[0].0)
+        } else {
+            violations
+                .iter()
+                .map(|(k, _)| format!("`{}`", k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let vars_msg = if is_singular {
+            violations[0].1.clone()
+        } else {
+            violations
+                .iter()
+                .map(|(_, v)| format!("${}", v))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        };
+        let (key_word, pronoun, location_verb) = if is_singular {
+            ("key", "it", "Set it")
+        } else {
+            ("keys", "they", "Set them")
+        };
+        return Err(Box::new(RepoForbiddenError(format!(
+            "{}: {keys_msg} {key_word} may not be set by a repository config, because {pronoun} \
+             names something zirv then runs. {location_verb} in ~/{}/{} or with {} instead.",
+            path.display(),
+            crate::utils::SCRIPT_DIR_NAME,
+            CTX_CONFIG_FILE,
+            vars_msg
+        ))));
+    }
     Ok(())
+}
+
+/// Extracts the field name from a serde error message.
+/// Serde errors typically include the field name in backticks, e.g.
+/// "unknown field `future_feature`" or "invalid type: string `native`, expected struct RuntimeConfig in `runtime`"
+fn extract_field_name(error_msg: &str) -> Option<String> {
+    // Look for field names in backticks: `fieldname`
+    if let Some(start) = error_msg.find('`')
+        && let Some(end) = error_msg[start + 1..].find('`')
+    {
+        return Some(error_msg[start + 1..start + 1 + end].to_string());
+    }
+    None
+}
+
+/// Formats a configuration error message that includes the source layer.
+/// For unknown fields or type mismatches, tries to identify which file or
+/// env var contributed the problematic key, then provides a forward-compatible
+/// error message.
+fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>) -> String {
+    if let Some(field) = extract_field_name(error_msg) {
+        // Check if this is an unknown field error
+        if error_msg.contains("unknown field") {
+            if let Some(origin) = key_origins.get(&field) {
+                let source = match origin {
+                    KeyOrigin::Home => {
+                        format!("~/{}/{}", crate::utils::SCRIPT_DIR_NAME, CTX_CONFIG_FILE)
+                    }
+                    KeyOrigin::Repo => format!(".zirv/{}", CTX_CONFIG_FILE),
+                    KeyOrigin::Env(var) => format!("${var}"),
+                };
+                return format!(
+                    "configuration error: unknown key `{}` in {} — this is usually from a \
+                     newer zirv version. Either remove the key or upgrade zirv.",
+                    field, source
+                );
+            } else {
+                // Field not in our origins map, it came from env or unknown
+                return format!(
+                    "configuration error: unknown key `{}` — this is usually from a newer zirv \
+                     version. Remove the key from your config files or environment variables, or upgrade zirv.",
+                    field
+                );
+            }
+        }
+        // Check if this is a type error
+        if error_msg.contains("invalid type")
+            && let Some(origin) = key_origins.get(&field)
+        {
+            let source = match origin {
+                KeyOrigin::Home => {
+                    format!("~/{}/{}", crate::utils::SCRIPT_DIR_NAME, CTX_CONFIG_FILE)
+                }
+                KeyOrigin::Repo => format!(".zirv/{}", CTX_CONFIG_FILE),
+                KeyOrigin::Env(var) => format!("${var}"),
+            };
+            return format!(
+                "configuration error: wrong type for `{}` in {} — {}",
+                field, source, error_msg
+            );
+        }
+    }
+    // Fallback for errors we can't enhance
+    format!("invalid ctx config: {}", error_msg)
 }
 
 /// A `toml::de::Error`'s own `Display` renders a multi-line diagram (a
@@ -4947,26 +5048,40 @@ fn summarize_parse_error(error: &toml::de::Error) -> String {
     }
 }
 
-/// Reads one config layer, merging it into `into` on success. Returns
-/// `Ok(Some(_))`, not `Err`, when the file exists but fails to *parse* as
-/// TOML: a syntax error in an untrusted layer (either one -- `~/.zirv/
-/// ctx.toml` is operator-owned but still a hand-edited file a stray keystroke
-/// can break) must not abort the whole load, only that layer. `into` is left
-/// unchanged in that case, so the caller's merge sees nothing from it and
-/// defaults/the other layer apply. An I/O error (unreadable file, permission
-/// denied) is a different failure mode and still propagates via `?` -- this
-/// only degrades a *parse* failure.
+/// Reads one config layer, merging it into `into` on success and tracking
+/// origins in `key_origins`. Returns `Ok(Some(_))`, not `Err`, when the file
+/// exists but fails to *parse* as TOML: a syntax error in an untrusted layer
+/// (either one -- `~/.zirv/ctx.toml` is operator-owned but still a hand-edited
+/// file a stray keystroke can break) must not abort the whole load, only that
+/// layer. `into` is left unchanged in that case, so the caller's merge sees
+/// nothing from it and defaults/the other layer apply. An I/O error (unreadable
+/// file, permission denied) is a different failure mode and still propagates
+/// via `?` -- this only degrades a *parse* failure.
 fn read_layer(
     path: &Path,
     into: &mut toml::Table,
     is_home: bool,
+    key_origins: &mut HashMap<String, KeyOrigin>,
 ) -> CtxResult<Option<UnparsableLayer>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(path)?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        let msg: Box<dyn std::error::Error> =
+            format!("unable to read {}: {}", path.display(), e).into();
+        msg
+    })?;
     match toml::from_str::<toml::Table>(&text) {
         Ok(layer) => {
+            let origin = if is_home {
+                KeyOrigin::Home
+            } else {
+                KeyOrigin::Repo
+            };
+            // Track all top-level keys from this layer
+            for key in layer.keys() {
+                key_origins.insert(key.clone(), origin.clone());
+            }
             merge(into, layer);
             Ok(None)
         }
@@ -4989,9 +5104,24 @@ pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
     let mut table: toml::Table = toml::from_str(text)?;
     super::policy::resolve(table.remove(POLICY_SECTION), None, &|_| None)?;
     super::safety::resolve(table.remove(SAFETY_SECTION), None, &|_| None)?;
-    let _: CtxConfig = toml::Value::Table(table)
-        .try_into()
-        .map_err(|e| format!("invalid ctx config: {e}"))?;
+    let _: CtxConfig = toml::Value::Table(table).try_into().map_err(|e| {
+        let error_msg = e.to_string();
+        // For operator validation, we can't track full provenance, but we can still
+        // improve the message for common cases
+        if error_msg.contains("unknown field")
+            && let Some(field) = extract_field_name(&error_msg)
+        {
+            let msg: Box<dyn std::error::Error> = format!(
+                "invalid ctx config: unknown key `{}` — this is usually from a \
+                     newer zirv version. Remove it or upgrade zirv.",
+                field
+            )
+            .into();
+            return msg;
+        }
+        let msg: Box<dyn std::error::Error> = format!("invalid ctx config: {}", error_msg).into();
+        msg
+    })?;
     Ok(())
 }
 
@@ -5034,9 +5164,10 @@ impl CtxConfig {
     pub fn load(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
         let mut merged = toml::Table::new();
         let mut unparsable_layers: Vec<UnparsableLayer> = Vec::new();
+        let mut key_origins: HashMap<String, KeyOrigin> = HashMap::new();
 
         if let Ok(path) = operator_path()
-            && let Some(bad) = read_layer(&path, &mut merged, true)?
+            && let Some(bad) = read_layer(&path, &mut merged, true, &mut key_origins)?
         {
             unparsable_layers.push(bad);
         }
@@ -5242,7 +5373,7 @@ impl CtxConfig {
             .join(CTX_CONFIG_FILE);
         let mut repo_layer = toml::Table::new();
         if !crate::utils::repo_is_home(repo)
-            && let Some(bad) = read_layer(&repo_path, &mut repo_layer, false)?
+            && let Some(bad) = read_layer(&repo_path, &mut repo_layer, false, &mut key_origins)?
         {
             unparsable_layers.push(bad);
         }
@@ -5819,6 +5950,10 @@ impl CtxConfig {
         for (var, path, kind) in ENV_MAP {
             if let Some(raw) = env(var) {
                 let value = env_value(&raw, *kind).map_err(|e| format!("{var}: {e}"))?;
+                // Track top-level key origin for env vars
+                if let Some(first_key) = path.first() {
+                    key_origins.insert(first_key.to_string(), KeyOrigin::Env(var.to_string()));
+                }
                 insert_path(&mut merged, path, value);
             }
         }
@@ -5842,9 +5977,15 @@ impl CtxConfig {
             insert_path(&mut merged, &["supervise", "max_heavy_operations"], old);
         }
 
-        let mut cfg: Self = toml::Value::Table(merged)
-            .try_into()
-            .map_err(|e| format!("invalid ctx config: {e}"))?;
+        let mut cfg: Self = toml::Value::Table(merged).try_into().map_err(|e| {
+            let error_msg = e.to_string();
+            let msg: Box<dyn std::error::Error> = format!(
+                "configuration error: {}",
+                format_config_error(&error_msg, &key_origins)
+            )
+            .into();
+            msg
+        })?;
 
         // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
         // over here, once the full config (both layers, narrowing and env
@@ -12886,5 +13027,148 @@ mod tests {
         assert!(cfg.session.persistent);
         assert!(cfg.session.history);
         assert_eq!(cfg.session.scrollback_rows_or_default(), 64);
+    }
+
+    /// Issue #691: Unknown key in home layer should name the home file.
+    #[test]
+    fn unknown_key_in_home_layer_names_the_file() {
+        let home = tempfile::tempdir().expect("home");
+        let home_config = home.path().join(".zirv");
+        std::fs::create_dir_all(&home_config).expect("mkdir");
+        std::fs::write(home_config.join("ctx.toml"), "future_feature = true\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown key should fail");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("~/.zirv/ctx.toml") || err_str.contains(".zirv"),
+            "error should name home file: {err_str}"
+        );
+        assert!(
+            err_str.contains("future_feature"),
+            "error should name the unknown key: {err_str}"
+        );
+        assert!(
+            err_str.contains("newer zirv") || err_str.contains("upgrade"),
+            "error should explain this is likely from a newer version: {err_str}"
+        );
+    }
+
+    /// Issue #691: Unknown key in repo layer should name the repo file.
+    #[test]
+    fn unknown_key_in_repo_layer_names_the_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "future_feature = true\n",
+        )
+        .expect("write");
+
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown key should fail");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains(".zirv/ctx.toml"),
+            "error should name repo file: {err_str}"
+        );
+        assert!(
+            err_str.contains("future_feature"),
+            "error should name the unknown key: {err_str}"
+        );
+    }
+
+    /// Issue #691: Bad ZIRV_CTX_* value should name that environment variable.
+    #[test]
+    fn bad_env_var_value_names_the_variable() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+
+        // ZIRV_CTX_WINDOW expects an integer
+        let env = env_map(&[("ZIRV_CTX_WINDOW", "not_a_number")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("bad env value should fail");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("ZIRV_CTX_WINDOW"),
+            "error should name the environment variable: {err_str}"
+        );
+    }
+
+    /// Issue #691: Multiple repo REPO_FORBIDDEN keys should all be named together.
+    #[test]
+    fn multiple_repo_forbidden_keys_all_named_in_one_error() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        // Set three forbidden keys in the repo config: two from session, one from worker
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[session]\npersistent = true\nhistory = true\n[worker]\ndefault_depth = 5\n",
+        )
+        .expect("write");
+
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("forbidden keys should fail");
+
+        let err_str = err.to_string();
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a REPO_FORBIDDEN error: {err_str}"
+        );
+        // All three keys should be mentioned
+        assert!(
+            err_str.contains("persistent")
+                && err_str.contains("history")
+                && err_str.contains("default_depth"),
+            "error should name all three forbidden keys: {err_str}"
+        );
+    }
+
+    /// Issue #691: Unreadable config file should include the file path in the error.
+    #[test]
+    fn unreadable_config_file_includes_path() {
+        let home = tempfile::tempdir().expect("home");
+        let home_config = home.path().join(".zirv");
+        std::fs::create_dir_all(&home_config).expect("mkdir");
+        let config_path = home_config.join("ctx.toml");
+
+        // Write a config file
+        std::fs::write(&config_path, "agent = \"claude\"\n").expect("write");
+
+        // Make it unreadable by removing read permissions (Unix only)
+        #[cfg(unix)]
+        {
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, Permissions::from_mode(0o000)).expect("chmod");
+        }
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("unreadable file should fail");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("ctx.toml") || err_str.contains(".zirv"),
+            "error should include the file path: {err_str}"
+        );
+
+        // Cleanup: restore permissions so tempdir cleanup works
+        #[cfg(unix)]
+        {
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&config_path, Permissions::from_mode(0o644));
+        }
     }
 }

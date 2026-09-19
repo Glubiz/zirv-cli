@@ -35,6 +35,17 @@ fn is_top_level_help(argv: &[String]) -> bool {
     matches!(argv.get(1).map(String::as_str), Some("--help") | Some("-h"))
 }
 
+/// True when the top-level invocation is exactly `zirv --version`/`zirv -V`,
+/// i.e. the version flag stands in for the command itself. Checked against
+/// raw argv, before clap parses anything, so the invocation bypasses clap's
+/// own `--version` flag parsing and prints the same output as `zirv version`.
+fn is_top_level_version(argv: &[String]) -> bool {
+    matches!(
+        argv.get(1).map(String::as_str),
+        Some("--version") | Some("-V")
+    )
+}
+
 /// True when argv[1] names the `ctx` built-in, compared **case-insensitively**
 /// to match `utils::is_reserved_command`/`RESERVED_COMMANDS`: on NTFS/APFS a
 /// script file `Ctx.yaml` resolves the same as `ctx.yaml`, so a case-sensitive
@@ -360,26 +371,35 @@ fn first_run_wizard_should_run(
 /// arguments (see that call site), so there is no `--allow-nested` to read
 /// either -- an operator who passes it gets the ordinary `chat` verb's own
 /// check instead, with the real flag.
-fn maybe_run_first_run_wizard(stdin_is_tty: bool, stdout_is_tty: bool, allow_nested: bool) {
+/// Runs the first-run wizard if needed. Returns `true` if the wizard ran and
+/// no harness was enabled (indicating chat should not proceed).
+fn maybe_run_first_run_wizard(stdin_is_tty: bool, stdout_is_tty: bool, allow_nested: bool) -> bool {
     if !stdin_is_tty || !stdout_is_tty {
-        return;
+        return false;
     }
     let Ok(home) = utils::home_dir() else {
-        return;
+        return false;
     };
     let needed = setup::first_run_needed(&home.join(utils::SCRIPT_DIR_NAME));
     if !first_run_wizard_should_run(stdin_is_tty, stdout_is_tty, needed) {
-        return;
+        return false;
     }
     let env = ctx::config::env_from_process();
     if ctx::sessions::nesting_refusal("chat", &env, allow_nested).is_some() {
-        return;
+        return false;
     }
-    if let Err(e) = setup::run_first_run() {
-        eprintln!(
-            "zirv: first-run setup did not finish ({e}); continuing without it. \
-             Run `zirv setup` to configure later."
-        );
+    match setup::run_first_run_and_report_harness_status() {
+        Ok(any_enabled) => {
+            // Return true if no harness was enabled (terminal condition for chat)
+            !any_enabled
+        }
+        Err(e) => {
+            eprintln!(
+                "zirv: first-run setup did not finish ({e}); continuing without it. \
+                 Run `zirv setup` to configure later."
+            );
+            false
+        }
     }
 }
 
@@ -450,11 +470,15 @@ async fn main() {
         // or parse-failure path that `ctx::dispatch` owns downstream; running
         // the wizard first would answer neither and write config besides.
         if verb == "chat" && argv.len() == 2 {
-            maybe_run_first_run_wizard(
+            let wizard_blocked_chat = maybe_run_first_run_wizard(
                 std::io::stdin().is_terminal(),
                 std::io::stdout().is_terminal(),
                 false,
             );
+            // If the wizard just ran and no harness was enabled, don't proceed to chat
+            if wizard_blocked_chat {
+                std::process::exit(1);
+            }
         }
         std::process::exit(ctx::dispatch(&rewrite_ctx_alias_args(verb, &argv)));
     }
@@ -520,7 +544,7 @@ async fn main() {
     if argv.len() == 1 {
         let stdin_is_tty = std::io::stdin().is_terminal();
         let stdout_is_tty = std::io::stdout().is_terminal();
-        maybe_run_first_run_wizard(stdin_is_tty, stdout_is_tty, false);
+        let wizard_blocked_chat = maybe_run_first_run_wizard(stdin_is_tty, stdout_is_tty, false);
         // Re-checked *after* the wizard: it may have just created a local
         // `.zirv` in this directory (step 6), which should immediately count
         // toward the target this same bare invocation resolves to.
@@ -528,6 +552,10 @@ async fn main() {
         let zirv_exists = zirv_dir_present(&cwd);
         match bare_invocation_target(zirv_exists, stdin_is_tty, stdout_is_tty) {
             BareTarget::Chat => {
+                // If the wizard just ran and no harness was enabled, don't proceed to chat
+                if wizard_blocked_chat {
+                    std::process::exit(1);
+                }
                 std::process::exit(ctx::dispatch(&["ctx".to_string(), "chat".to_string()]));
             }
             BareTarget::Help => {
@@ -542,6 +570,14 @@ async fn main() {
 
     if is_top_level_help(&argv) {
         if let Err(e) = show_help(&mut std::io::stdout(), console::colors_enabled()) {
+            output::error(e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if is_top_level_version(&argv) {
+        if let Err(e) = get_version(&mut std::io::stdout()) {
             output::error(e);
             std::process::exit(1);
         }
@@ -682,6 +718,41 @@ mod tests {
         // `--help` passed as a parameter to a script command (not in the
         // command slot itself) is not top-level help.
         assert!(!is_top_level_help(&argv(&["zirv", "build", "--help"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_matches_long_flag() {
+        assert!(is_top_level_version(&argv(&["zirv", "--version"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_matches_short_flag() {
+        assert!(is_top_level_version(&argv(&["zirv", "-V"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_ignores_script_commands() {
+        assert!(!is_top_level_version(&argv(&["zirv", "build"])));
+        assert!(!is_top_level_version(&argv(&["zirv", "version"])));
+        assert!(!is_top_level_version(&argv(&["zirv"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_does_not_match_flag_as_script_param() {
+        // `--version` passed as a parameter to a script command (not in the
+        // command slot itself) is not top-level version.
+        assert!(!is_top_level_version(&argv(&[
+            "zirv",
+            "build",
+            "--version"
+        ])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_matches_with_trailing_args() {
+        // Trailing arguments do not defeat the interception.
+        assert!(is_top_level_version(&argv(&["zirv", "--version", "extra"])));
+        assert!(is_top_level_version(&argv(&["zirv", "-V", "--dry-run"])));
     }
 
     /// FINDING 2: the pre-clap `ctx`/`chat`/`agent` interceptions are matched
@@ -866,6 +937,52 @@ mod tests {
             "--runtime",
             "harness"
         ])));
+    }
+
+    /// Exercised through the real built binary: `version`, `--version`, and
+    /// `-V` all produce identical output and exit 0. This validates that the
+    /// pre-clap interception for `--version`/`-V` prints exactly the same
+    /// output as the clap-dispatched `zirv version` command.
+    #[test]
+    fn version_flag_exits_0_and_matches_version_command() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let bin = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("target/debug")
+            .join(format!("zirv{}", std::env::consts::EXE_SUFFIX));
+
+        let version_cmd = std::process::Command::new(&bin)
+            .arg("version")
+            .output()
+            .expect("run zirv version");
+
+        let version_long_flag = std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .expect("run zirv --version");
+
+        let version_short_flag = std::process::Command::new(&bin)
+            .arg("-V")
+            .output()
+            .expect("run zirv -V");
+
+        assert!(version_cmd.status.success(), "zirv version failed");
+        assert!(version_long_flag.status.success(), "zirv --version failed");
+        assert!(version_short_flag.status.success(), "zirv -V failed");
+
+        let stdout_version = String::from_utf8_lossy(&version_cmd.stdout);
+        let stdout_long = String::from_utf8_lossy(&version_long_flag.stdout);
+        let stdout_short = String::from_utf8_lossy(&version_short_flag.stdout);
+
+        assert_eq!(
+            stdout_version, stdout_long,
+            "zirv version and zirv --version outputs differ"
+        );
+        assert_eq!(
+            stdout_version, stdout_short,
+            "zirv version and zirv -V outputs differ"
+        );
     }
 
     /// Exercised through the real built binary (the same pattern

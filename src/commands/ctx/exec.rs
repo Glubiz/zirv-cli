@@ -1809,8 +1809,10 @@ fn run_with_clock_inner<W: Write>(
         // scope -- which is this loop iteration, i.e. exactly the child's own
         // life. Dropped (and so released) at the end of the iteration, after
         // the child has been reaped, and again by every arm that returns.
-        let (mut child, tap, _child_guard) =
-            supervise::spawn_tapped(command, stdin_prompt.clone())?;
+        let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt.clone())
+            .map_err(|error| {
+                adapters::format_launch_error(error.as_ref(), adapter.name(), adapter.program())
+            })?;
         // Issue #281: this cycle's own work is now in flight -- cleared by
         // `supervise_run`'s tick closure the instant it sees a turn signal
         // for THIS session. Turn `0`: no turn signal has landed yet for this

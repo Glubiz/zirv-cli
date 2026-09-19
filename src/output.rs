@@ -10,7 +10,7 @@ pub fn warn(msg: impl Display) {
 }
 
 pub fn success(msg: impl Display) {
-    eprintln!("{} {msg}", style("done:").green().bold());
+    println!("{} {msg}", style("done:").green().bold());
 }
 
 /// Progress a human reads, not output a caller parses. On stderr with the

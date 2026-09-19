@@ -1,56 +1,46 @@
-Chocolatey Package Verification Checklist for zirv
+Chocolatey Package Verification for zirv
 
-VERIFICATION
-Verification is intended to assist the Chocolatey moderators and community
-in verifying that this package's contents are trustworthy.
+PACKAGE CONTENTS
+The Chocolatey package for zirv contains the following files:
 
-Binary Verification:
----------------------
-The executable included in this package can be verified in the following ways:
+1. tools/zirv.exe
+   - The compiled Windows executable
+   - Built from the official GitHub repository: https://github.com/Glubiz/zirv-cli
+   - Placed in the tools directory by scripts/update_chocolatey.ps1
 
-1. Official Source:
-   The official zirv binary can be downloaded from the GitHub Releases page:
-   https://github.com/Glubiz/zirv-dynamic-cli/releases
+2. LICENSE.txt
+   - MIT License for the project
+   - Included in the package root and in the tools directory
 
-2. Checksum Verification:
-   - Download the official release from the GitHub page linked above
-   - Use the following PowerShell command to generate a checksum:
-     Get-FileHash -Algorithm SHA256 path\to\downloaded\zirv.exe
-   - Compare this checksum with the one from the package binary:
+3. VERIFICATION.txt
+   - This file
+
+BINARY VERIFICATION
+To verify the integrity of the zirv.exe binary included in this package:
+
+1. Identify the Release Version
+   - Check the package version from Chocolatey: choco info zirv
+   - Or review the installed package: Get-ChildItem "$env:ChocolateyInstall\lib\zirv\"
+
+2. Download the Official Release Asset
+   - Visit https://github.com/Glubiz/zirv-cli/releases
+   - Find the release matching the package version
+   - Download zirv-<version>-windows.exe and its accompanying zirv-<version>-windows.exe.sha256 checksum file
+     (e.g., for version 4.9.0: zirv-4.9.0-windows.exe and zirv-4.9.0-windows.exe.sha256)
+
+3. Verify the Checksum
+   - Extract the expected SHA256 from the .sha256 file
+   - Generate the checksum of the installed binary:
      Get-FileHash -Algorithm SHA256 "$env:ChocolateyInstall\lib\zirv\tools\zirv.exe"
-   - The checksums should match exactly
+   - Compare the checksums; they must match exactly
 
-3. Build from Source:
-   You can also build the binary from source:
-   - Clone the repository: git clone https://github.com/Glubiz/zirv-dynamic-cli.git
+4. Build from Source (Alternative)
+   You can also build the binary from source to verify:
+   - Clone the repository: git clone https://github.com/Glubiz/zirv-cli.git
    - Build with Cargo: cargo build --release
    - The resulting binary can be found in target/release/zirv.exe
 
-Note for Package Maintainers:
------------------------------
-When updating this package, ensure that:
-- The SHA256 checksum in the chocolateyinstall.ps1 script matches the official release
-- This verification file is updated with the correct release version and download URL
-
-Additional Package Information:
-------------------------------
-1. Package Metadata:
-   - Verify the nuspec file is correctly configured.
-   - Ensure the version number matches the intended release.
-
-2. Files and Structure:
-   - Confirm inclusion of the compiled binary.
-   - Verify the package contains necessary files (e.g., LICENSE.txt, README.md).
-   - Confirm proper Chocolatey folder structure (e.g., tools folder, scripts).
-
-3. Licensing:
-   - Ensure LICENSE.txt is present and correct.
-   - Confirm license information is accurately reflected in the nuspec file.
-
-4. Installation:
-   - Test installation via Chocolatey.
-   - Verify the zirv command is added to the system PATH.
-   - Run basic commands (e.g., `zirv help`, `zirv build`) to verify operational functionality.
-
-5. Uninstallation:
-   - Verify that the package uninstalls cleanly without leaving residual files.
+LICENSING
+- The project is licensed under the MIT License
+- See LICENSE.txt for the full license text
+- The license matches the official repository license: https://github.com/Glubiz/zirv-cli/blob/main/LICENSE

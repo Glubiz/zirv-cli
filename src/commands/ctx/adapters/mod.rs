@@ -2776,6 +2776,31 @@ fn liveness_probe(adapter_name: &str, program: &str) -> Liveness {
     }
 }
 
+/// Formats a launch error with context about which harness and program failed.
+/// When the error is NotFound, includes a suggestion to install the harness or use --agent.
+pub(crate) fn format_launch_error(
+    error: &(dyn std::error::Error + 'static),
+    adapter_name: &str,
+    program: &str,
+) -> String {
+    // Try to get the io::Error kind directly if available
+    if let Some(io_err) = error.downcast_ref::<std::io::Error>()
+        && io_err.kind() == std::io::ErrorKind::NotFound
+    {
+        return format!(
+            "adapter '{}': program '{}' not found. Install the harness or use --agent to \
+             select one that is installed",
+            adapter_name, program
+        );
+    }
+
+    // For any other error, include adapter/program context
+    format!(
+        "adapter '{}': program '{}' failed to start: {}",
+        adapter_name, program, error
+    )
+}
+
 /// One cached liveness verdict, keyed by [`ProbeCache::key`] (adapter name,
 /// program, resolved `agent_bin` override). `checked_at` is a plain
 /// `now_secs()`-style timestamp the caller supplies -- this module reads no
@@ -7355,5 +7380,24 @@ mod tests {
             seat_role_env(PromptRole::Single),
             vec![(SEAT_ROLE_ENV.to_string(), "single".to_string())]
         );
+    }
+
+    // -- issue #690: launch error formatting and presence-based default selection -
+
+    #[test]
+    fn format_launch_error_recognizes_notfound_errors() {
+        // NotFound io::Error
+        let notfound_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let result = format_launch_error(&notfound_err, "claude", "claude");
+        assert!(result.contains("claude"));
+        assert!(result.contains("not found"));
+        assert!(result.contains("Install"));
+
+        // PermissionDenied io::Error
+        let perm_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let result = format_launch_error(&perm_err, "codex", "codex");
+        assert!(result.contains("codex"));
+        assert!(result.contains("failed to start"));
     }
 }

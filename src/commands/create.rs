@@ -196,9 +196,15 @@ where
 
     if !target_dir.exists() {
         fs::create_dir_all(&target_dir)?;
-        crate::output::note(format!("Created directory: {target_dir:?}"));
+        crate::output::note(format!(
+            "Created directory: {}",
+            crate::commands::ctx::state::display_path(&target_dir)
+        ));
     } else {
-        crate::output::note(format!("Directory already exists: {target_dir:?}"));
+        crate::output::note(format!(
+            "Directory already exists: {}",
+            crate::commands::ctx::state::display_path(&target_dir)
+        ));
     }
 
     let file_name = format!("{name}.yaml");
@@ -209,15 +215,23 @@ where
     // write is safe -- it must never trust the join blindly.
     if !script_path.starts_with(&target_dir) {
         return Err(format!(
-            "'{name}' is not a script name: it would write to {script_path:?}, outside {target_dir:?}"
+            "'{name}' is not a script name: it would write to {}, outside {}",
+            crate::commands::ctx::state::display_path(&script_path),
+            crate::commands::ctx::state::display_path(&target_dir)
         )
         .into());
     }
     if script_path.exists() {
-        crate::output::note(format!("Script file already exists: {script_path:?}"));
+        crate::output::note(format!(
+            "Script file already exists: {}",
+            crate::commands::ctx::state::display_path(&script_path)
+        ));
     } else {
         fs::write(&script_path, DEFAULT_TEMPLATE)?;
-        crate::output::note(format!("Created script file: {script_path:?}"));
+        crate::output::note(format!(
+            "Created script file: {}",
+            crate::commands::ctx::state::display_path(&script_path)
+        ));
     }
 
     if !shortcut.trim().is_empty() {
@@ -231,7 +245,10 @@ where
             .insert(shortcut.trim().to_string(), file_name.clone());
         let yaml_string = serde_yaml_ng::to_string(&shortcuts)?;
         fs::write(&shortcuts_path, yaml_string)?;
-        crate::output::note(format!("Updated shortcuts file: {shortcuts_path:?}"));
+        crate::output::note(format!(
+            "Updated shortcuts file: {}",
+            crate::commands::ctx::state::display_path(&shortcuts_path)
+        ));
     }
 
     Ok(())
