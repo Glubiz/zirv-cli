@@ -985,8 +985,8 @@ to the section that documents it in depth.
   `.zirv/commands/`. See [Initialize a Project](#initialize-a-project) and
   [Creating a New Script](#creating-a-new-script).
 - **Help and version** — `help` lists every available script and shortcut,
-  local and global, and `version` prints the installed version. See
-  [Usage](#usage).
+  local and global, and `version` prints the installed version; `--version` and `-V`
+  are accepted as shorthand equivalents. See [Usage](#usage).
 
 ---
 
@@ -1011,9 +1011,9 @@ brew install zirv
 
 The published binary is universal (Intel and Apple Silicon), so this works on either Mac.
 
-### Linux
+### Linux & macOS
 
-Recommended — install script:
+Recommended — install script (works on both Linux x86_64 and macOS Intel/Apple Silicon):
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
@@ -1024,6 +1024,18 @@ To install a specific version:
 ```bash
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh -s -- <version>
 ```
+
+#### Package Manager Detection
+
+If the script detects a Homebrew-managed `zirv` installation, it refuses to overwrite it by default with a message recommending `brew upgrade zirv` instead. To override this safety check and force an installation (not recommended), set `ZIRV_INSTALL_FORCE=1`:
+
+```bash
+ZIRV_INSTALL_FORCE=1 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
+```
+
+#### PATH Shadowing Warning
+
+After a successful install, the script checks whether the just-installed binary is the one found on your `$PATH`. If not—for example, because `/opt/homebrew/bin` appears before `/usr/local/bin` on Apple Silicon—it warns you to ensure the install directory comes first in your `PATH`.
 
 Alternative — Homebrew on Linux, via the same tap:
 
@@ -1059,9 +1071,12 @@ zirv update
 zirv update --version <x.y.z>
 ```
 
-A Homebrew or Chocolatey installation keeps working after a built-in update,
-but the package manager's recorded version lags until its own upgrade command
-runs.
+If zirv is installed via Homebrew or Chocolatey, `zirv update` is refused
+by default to prevent desynchronization: the package manager's records would
+report the old version, and the next `brew upgrade` or `choco upgrade zirv`
+would silently revert your binary. Use the package-manager-specific command
+instead (see below), or set `ZIRV_UPDATE_ALLOW_PACKAGE_MANAGER=1` to override
+at your own risk.
 
 ### Homebrew (macOS & Linux)
 
@@ -1075,13 +1090,15 @@ brew upgrade zirv
 choco upgrade zirv
 ```
 
-### Install Script (Linux)
+### Install Script (Linux & macOS)
 
 Re-run the install script to get the latest version:
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
 ```
+
+The same package-manager detection and PATH shadowing checks apply. To update a Homebrew installation with the script, use `ZIRV_INSTALL_FORCE=1`.
 
 ### From source
 

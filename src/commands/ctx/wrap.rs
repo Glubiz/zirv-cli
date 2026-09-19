@@ -2418,7 +2418,13 @@ pub fn run_with(
     // would inherit) exactly where it was. See `priority::Posture`.
     super::priority::apply_process(super::priority::posture_for(role));
 
-    let mut child = pair.slave.spawn_command(command)?;
+    let mut child = pair.slave.spawn_command(command)
+        .map_err(|error| format!(
+            "adapter '{}': program '{}' failed to start: {}",
+            adapter.name(),
+            adapter.program(),
+            error
+        ))?;
     // P2/P3: adopted the instant the child exists -- registered for the
     // console-close sweep and put in a kill-on-close job, so neither closing
     // the window nor killing zirv outright can orphan the agent.

@@ -530,7 +530,8 @@ pub(crate) fn run_with_clock<W: Write>(
             // this cycle is registered for the console-close sweep and held
             // in a kill-on-close job for exactly that child's life.
             let (mut child, tap, _child_guard) =
-                supervise::spawn_tapped(command, stdin_prompt.clone())?;
+                supervise::spawn_tapped(command, stdin_prompt.clone())
+                    .map_err(|error| adapters::format_launch_error(error.as_ref(), adapter.name(), adapter.program()))?;
             // Item 3: consumed right after the first spawn that actually
             // carried this cycle's prompt. The drain makes every in-place
             // continuation a no-op here.
