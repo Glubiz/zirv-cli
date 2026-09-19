@@ -3,6 +3,8 @@ use std::io::{self, IsTerminal};
 /// Topics in the tour, in order of presentation.
 const TOPICS: &[&str] = &[
     "overview",
+    "scripts",
+    "workflow",
     "harnesses",
     "memory",
     "safety",
@@ -27,6 +29,52 @@ Codex, or another harness—in a supervised context that:
 
 Start a session with `zirv ctx chat` or `zirv chat` (interactive) or `zirv ctx agent` \
 for headless work.",
+        ),
+        "scripts" => Some(
+            "Scripts
+
+zirv is also a `.zirv/` script runner. Any YAML/JSON/TOML file under `.zirv/commands/` \
+becomes a `zirv <name>` command; the `.zirv/` root itself holds only config and \
+state, so scripts always live one level down, in `commands/`.
+
+Where scripts live:
+  <repo>/.zirv/commands/   repository scripts, checked in with the repo
+  ~/.zirv/commands/        global scripts, available from any repo
+
+Create one (skips every prompt):
+  zirv create --name mytask --shortcut '' --global false
+
+Steps use `${var}` placeholders, filled from positional params (`zirv mytask val1 \
+val2`) and from secrets pulled out of your environment at run time. Add a trailing \
+`?` to a param name ('branch?') to make it optional; optional params must come \
+after every required one.
+
+Reserved built-in names (help, ctx, workflow, tour, and the rest) are matched \
+case-insensitively, so a script or shortcut can never shadow one.",
+        ),
+        "workflow" => Some(
+            "Workflow
+
+`zirv workflow` runs one of 32 built-in packs (feature, bugfix, refactor, security-\
+remediation, and more) as a durable state machine: each step's state and artifacts \
+persist under `.zirv/work/<id>/`, so a workflow survives a restart instead of living \
+only in one session's head.
+
+See the built-in packs:
+  zirv workflow list
+
+Start one, then drive it forward:
+  zirv workflow start --task 'add a widget' --repo .
+  zirv workflow status
+  zirv workflow advance <id> --run-checks
+  zirv workflow approve <id>
+
+A step is not done because a session says so. `advance` on the Test/Verify steps \
+without `--run-checks` (or a fresh recorded pass) is refused outright: there is no \
+evidence yet that the change works. `--run-checks` runs the real gate (`zirv test \
+changed` or `zirv verify`) and only advances on a pass. Gated steps (intent, spec, \
+plan, depending on the pack) also need `approve`, which itself refuses an untouched \
+artifact template.",
         ),
         "harnesses" => Some(
             "Harnesses
@@ -278,6 +326,39 @@ mod tests {
     fn an_unknown_topic_errors() {
         let result = run(Some("nosuchtopic"));
         assert!(result.is_err(), "Unknown topic should error");
+    }
+
+    #[test]
+    fn an_unknown_topic_error_names_every_valid_topic() {
+        let err = run(Some("nosuchtopic")).unwrap_err().to_string();
+        for topic in TOPICS {
+            assert!(
+                err.contains(topic),
+                "unknown-topic error should list '{}', got: {}",
+                topic,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn scripts_topic_covers_where_scripts_live_and_param_substitution() {
+        let text = section_text("scripts").unwrap();
+        assert!(text.contains(".zirv/commands/"));
+        assert!(text.contains("~/.zirv/commands/"));
+        assert!(text.contains("${var}"));
+        assert!(text.contains("zirv create"));
+    }
+
+    #[test]
+    fn workflow_topic_covers_the_pack_shape_and_verification_gate() {
+        let text = section_text("workflow").unwrap();
+        assert!(text.contains("zirv workflow list"));
+        assert!(text.contains("zirv workflow start"));
+        assert!(text.contains("zirv workflow status"));
+        assert!(text.contains("zirv workflow advance"));
+        assert!(text.contains("zirv workflow approve"));
+        assert!(text.contains("fresh"), "should call out fresh evidence");
     }
 
     #[test]
