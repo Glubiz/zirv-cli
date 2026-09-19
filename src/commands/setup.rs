@@ -3044,6 +3044,8 @@ pub fn run_first_run_and_report_harness_status() -> SetupResult<bool> {
         println!(
             "zirv setup complete; run `zirv setup status` to review, `zirv setup` to change it later."
         );
+        // Offer the tour at the end of a successful setup
+        super::tour::offer_after_first_run();
     } else {
         println!(
             "No coding harness is installed. zirv needs Claude, Codex, or another supported harness."
@@ -3084,6 +3086,14 @@ struct FirstRunAnswers {
     install_hooks: bool,
     /// Whether at least one harness was enabled during the wizard.
     any_harness_enabled: bool,
+    /// Whether to enable Jev. `None` = credential absent, `Some(true)` = enable
+    /// with recommended gates, `Some(false)` = credential present but declined.
+    jev_enable: Option<bool>,
+    /// Safety posture preset selection. `None` = default (no change).
+    /// `Some("ask-more")` = stricter, `Some("ask-less")` = looser.
+    safety_posture: Option<&'static str>,
+    /// Whether to enable compact output for `zirv ctx run`. `None` = no preference.
+    compact_output: Option<bool>,
 }
 
 /// Prompts only: no config file, `.settings.toml`, or project directory is
@@ -3095,18 +3105,10 @@ fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
     let mut enabled_names = Vec::new();
     let mut detected_names = Vec::new();
 
-    // First pass: report what was detected
+    // First pass: only report detected harnesses
     for (name, _ctor) in ctx::adapters::ADAPTERS {
-        let detected = executable_exists(name);
-        println!(
-            "{name}: {}",
-            if detected {
-                "detected on PATH"
-            } else {
-                "not detected on PATH"
-            }
-        );
-        if detected {
+        if executable_exists(name) {
+            println!("{name}: detected on PATH");
             detected_names.push(*name);
             if *name == "claude" {
                 report_claude_cli_health();
@@ -3114,22 +3116,47 @@ fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
         }
     }
 
-    // Only ask about detected harnesses; skip undetected ones entirely
-    for name in detected_names {
+    // If no harnesses detected, print the supported list and instructions
+    if detected_names.is_empty() {
+        let mut names: Vec<&str> = ctx::adapters::ADAPTERS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        names.sort();
+        println!();
+        println!("No coding harness found on PATH.");
+        println!("zirv supports: {}.", names.join(", "));
+        println!("Install one, then run `zirv setup` again.");
+        return Ok(FirstRunAnswers {
+            harness_enabled: Vec::new(),
+            default_agent: None,
+            chat_model: None,
+            memory_enabled: true,
+            memory_harvest: false,
+            create_local_zirv: false,
+            install_hooks: false,
+            any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
+        });
+    }
+
+    // Only ask about detected harnesses
+    for name in &detected_names {
         let enable = dialoguer::Confirm::new()
             .with_prompt(format!("Enable the {name} harness?"))
             .default(true)
             .interact()?;
-        harness_enabled.push((name, enable));
+        harness_enabled.push((*name, enable));
         if enable {
-            enabled_names.push(name);
+            enabled_names.push(*name);
         }
     }
 
     let default_agent = if enabled_names.is_empty() {
         println!(
-            "warning: no harness enabled -- `zirv chat`/`zirv agent` will have nothing to \
-             launch until one is (revisit any time with `zirv setup`)."
+            "warning: no harness enabled -- `zirv chat`/`zirv agent` will have nothing to              launch until one is (revisit any time with `zirv setup`)."
         );
         None
     } else {
@@ -3138,9 +3165,6 @@ fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
             .items(&enabled_names)
             .default(0)
             .interact()?;
-        // `Select::interact` only ever returns an index into the items it
-        // was given, but `.get` keeps this free of even a theoretical panic
-        // (release is `panic = "abort"`) at no real cost.
         enabled_names.get(choice).copied()
     };
 
@@ -3169,8 +3193,6 @@ fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
         .default(false)
         .interact()?;
 
-    // Asked here, before hook installation, and the only place that decides
-    // it -- see `apply_first_run_answers`'s doc comment.
     let cwd = std::env::current_dir()?;
     let create_local_zirv =
         if !cwd.join(crate::utils::SCRIPT_DIR_NAME).is_dir() && looks_like_project_dir(&cwd) {
@@ -3187,6 +3209,84 @@ fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
         .default(true)
         .interact()?;
 
+    // Load default config to check Jev credential
+    let cfg =
+        ctx::config::CtxConfig::load(&cwd, &ctx::config::env_from_process()).unwrap_or_default();
+
+    // Jev step: check if credential is present
+    let jev_enable = if ctx::jev::credential_present(&cfg) {
+        println!();
+        println!("Jev is a hosted TypeSafe advisor service for safety and quality analysis.");
+        println!("Enabling it means session data is sent to the TypeSafe API endpoint.");
+        let enable = dialoguer::Confirm::new()
+            .with_prompt("Enable Jev?")
+            .default(false)
+            .interact()?;
+        Some(enable)
+    } else {
+        let env_name = ctx::jev::credential_env_name(&cfg);
+        println!();
+        println!("Jev is an optional TypeSafe advisor, currently off.");
+        println!("To use it, store the API key safely:");
+
+        #[cfg(target_os = "macos")]
+        {
+            println!(r#"  security add-generic-password -a "$USER" -s zirv-typesafe -w"#);
+            println!("Then in your shell profile:");
+            println!(
+                "  export {}=$(security find-generic-password -a \"$USER\" -s zirv-typesafe -w)",
+                env_name
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            println!(
+                r#"  secret-tool store --label='zirv typesafe' service zirv-typesafe username "$USER""#
+            );
+            println!("Then in your shell profile:");
+            println!(
+                "  export {}=$(secret-tool lookup service zirv-typesafe username \"$USER\")",
+                env_name
+            );
+            println!("  (fallback to a 0600 file if secret-tool is unavailable)");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            println!(
+                "  [Environment]::SetEnvironmentVariable('{}', $key, 'User')",
+                env_name
+            );
+        }
+        println!("Enable it later with `zirv setup`, check state with `zirv ctx jev status`.");
+        None
+    };
+
+    // Safety posture step
+    println!();
+    let safety_choice = dialoguer::Select::new()
+        .with_prompt("How should zirv handle risky commands?")
+        .items([
+            "Recommended: allow known-safe commands, ask about the rest",
+            "Stricter: ask before anything zirv has not classified",
+        ])
+        .default(0)
+        .interact()?;
+    let safety_posture = match safety_choice {
+        0 => None,
+        1 => Some("ask-more"),
+        _ => None,
+    };
+
+    // Output compaction step
+    let compact_output = Some(
+        dialoguer::Confirm::new()
+            .with_prompt(
+                "Summarise large command output before your agent reads it (saves tokens)?",
+            )
+            .default(true)
+            .interact()?,
+    );
+
     let any_harness_enabled = !enabled_names.is_empty();
 
     Ok(FirstRunAnswers {
@@ -3198,6 +3298,9 @@ fn collect_first_run_answers() -> SetupResult<FirstRunAnswers> {
         create_local_zirv,
         install_hooks,
         any_harness_enabled,
+        jev_enable,
+        safety_posture,
+        compact_output,
     })
 }
 
@@ -3296,6 +3399,31 @@ fn apply_first_run_answers_with_predicate(
             }
         }
     }
+
+    // Apply Jev settings
+    if let Some(true) = answers.jev_enable {
+        // Enable recommended subset: memory and review
+        set_home_ctx_toml_bool(home, "jev", "memory", true)?;
+        set_home_ctx_toml_bool(home, "jev", "review", true)?;
+        println!(
+            "Jev: enabled for memory and review (other gates can be set with `zirv ctx config`)"
+        );
+    }
+
+    // Apply safety posture preset
+    if let Some(posture) = answers.safety_posture
+        && posture == "ask-more"
+    {
+        // Stricter: ask before running anything zirv has not classified
+        set_home_ctx_toml_string(home, Some("safety"), "interactive_default", "ask")?;
+        println!("Safety: zirv will ask before running anything it has not classified");
+    }
+
+    // Apply compact output setting
+    if let Some(enable) = answers.compact_output {
+        set_home_ctx_toml_bool(home, "output", "compact", enable)?;
+    }
+
     Ok(())
 }
 
@@ -6799,6 +6927,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: true,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         }
     }
 
@@ -6873,6 +7004,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
         apply_first_run_answers(&answers, home.path()).expect("apply");
 
@@ -6908,6 +7042,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
         apply_first_run_answers(&answers, home.path()).expect("apply");
 
@@ -6951,6 +7088,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: true,
             any_harness_enabled: true,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
         apply_first_run_answers(&answers, home.path()).expect("apply");
 
@@ -6987,6 +7127,9 @@ mod tests {
             create_local_zirv: true,
             install_hooks: false,
             any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
         apply_first_run_answers(&answers, home.path()).expect("apply");
 
@@ -7039,6 +7182,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
         apply_first_run_answers(&answers, home.path()).expect("apply");
 
@@ -7072,6 +7218,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
         apply_first_run_answers(&answers, home.path()).expect("apply");
 
@@ -7106,6 +7255,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: false, // <- The key flag
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
 
         assert!(
@@ -7123,6 +7275,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: true, // <- The key flag
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
 
         assert!(
@@ -7150,6 +7305,9 @@ mod tests {
             create_local_zirv: false,
             install_hooks: false,
             any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
         };
 
         // Verify that any_harness_enabled correctly reflects "nothing is enabled"
@@ -7181,6 +7339,9 @@ mod tests {
                 create_local_zirv: false,
                 install_hooks: true,
                 any_harness_enabled: false,
+                jev_enable: None,
+                safety_posture: None,
+                compact_output: None,
             };
 
             // Predicate that says nothing is installed
@@ -7208,6 +7369,9 @@ mod tests {
                 create_local_zirv: false,
                 install_hooks: true,
                 any_harness_enabled: true,
+                jev_enable: None,
+                safety_posture: None,
+                compact_output: None,
             };
 
             // Predicate that says Claude is installed
@@ -7307,5 +7471,189 @@ mod tests {
             !output_str.contains("No coding harness is installed"),
             "Must NOT print install message, got: {output_str}"
         );
+    }
+
+    #[test]
+    fn apply_first_run_answers_enables_jev_gates_when_requested() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        let _var = VarGuard::set(&[("ZIRV_CTX_JEV_MEMORY", None), ("ZIRV_CTX_JEV_REVIEW", None)]);
+
+        let mut answers = full_answers();
+        answers.jev_enable = Some(true);
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert!(cfg.jev.memory, "memory gate must be enabled");
+        assert!(cfg.jev.review, "review gate must be enabled");
+        assert!(!cfg.jev.supervisor, "supervisor gate must NOT be enabled");
+    }
+
+    #[test]
+    fn apply_first_run_answers_skips_jev_when_absent() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+
+        let mut answers = full_answers();
+        answers.jev_enable = None;
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert!(!cfg.jev.memory, "jev.memory must remain false");
+    }
+
+    #[test]
+    fn apply_first_run_answers_writes_compact_output_setting() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+        let _var = VarGuard::set(&[("ZIRV_CTX_OUTPUT_COMPACT", None)]);
+
+        let mut answers = full_answers();
+        answers.compact_output = Some(false);
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert!(!cfg.output.compact, "output.compact must be false");
+    }
+
+    #[test]
+    fn apply_first_run_answers_default_safety_preset_leaves_config_unchanged() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+
+        let mut answers = full_answers();
+        answers.safety_posture = None;
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("load");
+        assert_eq!(
+            cfg.safety.default,
+            super::ctx::safety::Verdict::Ask,
+            "safety.default must remain at default"
+        );
+    }
+
+    #[test]
+    fn collect_first_run_answers_no_harness_returns_minimal_answers() {
+        let no_harness = FirstRunAnswers {
+            harness_enabled: Vec::new(),
+            default_agent: None,
+            chat_model: None,
+            memory_enabled: true,
+            memory_harvest: false,
+            create_local_zirv: false,
+            install_hooks: false,
+            any_harness_enabled: false,
+            jev_enable: None,
+            safety_posture: None,
+            compact_output: None,
+        };
+        assert!(!no_harness.any_harness_enabled);
+    }
+
+    #[test]
+    fn apply_first_run_answers_jev_recommended_gates_only() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+
+        let mut answers = full_answers();
+        answers.jev_enable = Some(true);
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let ctx_toml_path = home.path().join(".zirv").join("ctx.toml");
+        let ctx_toml_text = std::fs::read_to_string(&ctx_toml_path).expect("read ctx.toml");
+
+        assert!(
+            ctx_toml_text.contains("memory = true"),
+            "ctx.toml must contain memory = true"
+        );
+        assert!(
+            ctx_toml_text.contains("review = true"),
+            "ctx.toml must contain review = true"
+        );
+    }
+
+    #[test]
+    fn apply_first_run_answers_stricter_safety_writes_a_valid_verdict() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+
+        let mut answers = full_answers();
+        answers.safety_posture = Some("ask-more");
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let ctx_toml_path = home.path().join(".zirv").join("ctx.toml");
+        let ctx_toml_text = std::fs::read_to_string(&ctx_toml_path).expect("read ctx.toml");
+
+        assert!(
+            ctx_toml_text.contains(r#"interactive_default = "ask""#),
+            "ctx.toml must contain interactive_default = \"ask\" as a STRING"
+        );
+    }
+
+    #[test]
+    fn apply_first_run_answers_stricter_safety_written_file_still_loads() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+
+        let mut answers = full_answers();
+        answers.safety_posture = Some("ask-more");
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("config must load successfully after applying stricter safety preset");
+        assert_eq!(
+            cfg.safety.interactive_default,
+            super::ctx::safety::Verdict::Ask,
+            "interactive_default must be parsed as Ask verdict"
+        );
+    }
+
+    #[test]
+    fn apply_first_run_answers_output_compact_written_as_bool_and_file_loads() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _cwd = ctx::testenv::CwdGuard::enter(cwd.path()).expect("enter cwd");
+
+        let mut answers = full_answers();
+        answers.compact_output = Some(true);
+
+        apply_first_run_answers(&answers, home.path()).expect("apply");
+
+        let ctx_toml_path = home.path().join(".zirv").join("ctx.toml");
+        let ctx_toml_text = std::fs::read_to_string(&ctx_toml_path).expect("read ctx.toml");
+
+        assert!(
+            ctx_toml_text.contains("compact = true"),
+            "ctx.toml must contain compact = true as a BOOL"
+        );
+
+        let _home_guard = HomeGuard::set(home.path());
+        let cfg = ctx::config::CtxConfig::load(cwd.path(), &ctx::config::env_from_process())
+            .expect("config must load successfully after writing compact output setting");
+        assert!(cfg.output.compact);
     }
 }
