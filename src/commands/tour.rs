@@ -263,7 +263,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_topics_have_text() {
+    fn all_topics_have_nonempty_text() {
         for topic in TOPICS {
             let text = section_text(topic);
             assert!(
@@ -275,13 +275,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_topic_errors() {
+    fn an_unknown_topic_errors() {
         let result = run(Some("nosuchtopic"));
         assert!(result.is_err(), "Unknown topic should error");
     }
 
     #[test]
-    fn test_known_topics_succeed() {
+    fn all_known_topics_succeed() {
         for topic in TOPICS {
             let result = run(Some(topic));
             assert!(result.is_ok(), "Topic '{}' should succeed", topic);
@@ -289,13 +289,13 @@ mod tests {
     }
 
     #[test]
-    fn test_noninteractive_tour_output() {
+    fn noninteractive_tour_succeeds_without_error() {
         let result = run_noninteractive_tour();
         assert!(result.is_ok(), "Non-interactive tour should not error");
     }
 
     #[test]
-    fn test_offer_after_first_run_is_noop_when_no_tty() {
+    fn offer_after_first_run_is_a_noop_when_no_tty() {
         // This test verifies the function completes without error when not a TTY.
         // We can't easily test it fails without a TTY in a unit test, but we can
         // ensure it doesn't panic.
