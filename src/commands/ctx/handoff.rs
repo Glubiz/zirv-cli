@@ -7,6 +7,7 @@ use super::CtxResult;
 use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{StructuralContext, VerificationOutcome, VerificationStatus};
+use super::jev;
 use super::sessions::InFlight;
 use super::state::{StateDir, now_secs, repo_slug};
 use super::{adapters, log};
@@ -1411,6 +1412,98 @@ fn carry_forward_undistillable(mut handoff: Handoff, previous: Option<&Handoff>)
     handoff
 }
 
+/// Issue #537 (A4): from a live 2026-09-18 probe.
+const HANDOFF_THIN_FLOOR: f32 = 0.9;
+
+#[derive(Debug, serde::Serialize)]
+struct HandoffQualityState {
+    task: String,
+    next_step: String,
+    constraints: String,
+}
+
+/// Issue #537 (A4): `Handoff::is_usable`'s own deterministic check (non-
+/// empty task and next step) already passed by the time this is called --
+/// this only ever NARROWS that further, never marks usable what the
+/// deterministic check already rejected. One advisory call (site
+/// `"handoff"`) asks whether a restarted session could actually continue
+/// from this alone; a confident (`>= HANDOFF_THIN_FLOOR`) `thin` answer says
+/// no. `adequate`, a low-confidence answer, or no answer at all (gate off,
+/// no credential, any transport/parse error -- `jev::advise`'s own contract)
+/// leaves today's usability verdict (`true`, since the caller only reaches
+/// this after `is_usable()` already passed) unchanged.
+fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> bool {
+    let advise_state = HandoffQualityState {
+        task: crate::utils::truncate_bytes(handoff.task.clone(), Some(2 * 1024)),
+        next_step: crate::utils::truncate_bytes(handoff.next_step.clone(), Some(2 * 1024)),
+        constraints: crate::utils::truncate_bytes(handoff.constraints.join("\n"), Some(2 * 1024)),
+    };
+    let questions = [jev::Question::choice(
+        "quality",
+        "Could a restarted session actually continue this task from this handoff alone?",
+        &[
+            (
+                "thin",
+                "a restarted session could not continue from this alone",
+            ),
+            ("adequate", "a restarted session could continue from this"),
+        ],
+    )];
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "handoff",
+        cfg.jev.supervisor,
+        &advise_state,
+        &questions,
+    ) else {
+        return false;
+    };
+    answers.get("quality").is_some_and(|answer| {
+        answer.as_choice() == Some("thin") && answer.confidence >= HANDOFF_THIN_FLOOR
+    })
+}
+
+/// Issue #537 (A4): the gated wrapper around [`distill_or_structural`] for
+/// the one call site that is genuinely on the restart path (`wrap::pump`'s
+/// own `Action::Restart` handling) -- threading `cfg`/`state` into
+/// `distill_or_structural` itself (or into `Handoff::is_usable`) would mean
+/// touching every one of its other call sites (dash/handover previews, the
+/// memory-harvest note, `zirv ctx handoff` itself), most of which are not
+/// actually about to restart a session onto the result. When
+/// `distill_or_structural` returns a genuinely `"distilled"` handoff, one
+/// additional confident [`jev_handoff_is_thin`] verdict may demote it to the
+/// same structural fallback an `Err` from `distill` itself already takes;
+/// `"no data"`/`"structural"` results (nothing was distilled to begin with)
+/// and any non-thin or unanswered verdict pass through unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn distill_or_structural_with_jev(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    adapter: &dyn AgentAdapter,
+    model: &str,
+    ctx: &StructuralContext,
+    timeout: Duration,
+    chrome_events_enabled: bool,
+    previous: Option<&Handoff>,
+) -> (Handoff, &'static str) {
+    let (handoff, source) = distill_or_structural(
+        adapter,
+        model,
+        ctx,
+        timeout,
+        chrome_events_enabled,
+        previous,
+    );
+    if source != "distilled" || !jev_handoff_is_thin(cfg, state, &handoff) {
+        return (handoff, source);
+    }
+    (
+        carry_forward_undistillable(structural(ctx), previous),
+        "structural",
+    )
+}
+
 #[derive(Debug, clap::Args)]
 pub struct HandoffArgs {
     /// Transcript to distill.
@@ -1976,6 +2069,171 @@ mod tests {
             "from the last user prompt"
         );
         assert!(handoff.is_usable());
+    }
+
+    // -- distill_or_structural_with_jev (issue #537 A4) -----------------------
+
+    fn jev_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.supervisor = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// A confident (0.95) `thin` verdict demotes a genuinely `"distilled"`
+    /// handoff to the same structural fallback an `Err` from `distill`
+    /// itself already takes.
+    #[test]
+    fn distill_or_structural_with_jev_demotes_a_confident_thin_verdict() {
+        let adapter = fake_model_adapter();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "quality": {"type": "choice", "choice": "thin",
+                        "probabilities": {"thin": 0.95}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_THIN_095";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let (handoff, source) = distill_or_structural_with_jev(
+            &cfg,
+            &state,
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+            false,
+            None,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(source, "structural");
+        assert_eq!(
+            handoff.task, "ship the webhook",
+            "demoted to the mechanical fallback: from the last user prompt"
+        );
+    }
+
+    /// An `adequate` verdict leaves a genuinely `"distilled"` handoff
+    /// unchanged.
+    #[test]
+    fn distill_or_structural_with_jev_keeps_an_adequate_verdict() {
+        let adapter = fake_model_adapter();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "quality": {"type": "choice", "choice": "adequate",
+                        "probabilities": {"adequate": 0.95}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_ADEQUATE";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let (handoff, source) = distill_or_structural_with_jev(
+            &cfg,
+            &state,
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+            false,
+            None,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(source, "distilled");
+        assert_eq!(handoff.task, "Ship the webhook");
+    }
+
+    /// A transport/HTTP error (a 500) must leave a genuinely `"distilled"`
+    /// handoff unchanged.
+    #[test]
+    fn distill_or_structural_with_jev_keeps_the_distilled_result_on_a_500() {
+        let adapter = fake_model_adapter();
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let credential_env = "HANDOFF_TEST_JEV_500";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let (handoff, source) = distill_or_structural_with_jev(
+            &cfg,
+            &state,
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+            false,
+            None,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(source, "distilled");
+        assert_eq!(handoff.task, "Ship the webhook");
+    }
+
+    /// The gate off must be byte-identical to calling `distill_or_structural`
+    /// directly -- no call even attempted, despite a credential that looks
+    /// available.
+    #[test]
+    fn distill_or_structural_with_jev_is_identical_to_the_plain_call_when_the_gate_is_off() {
+        let adapter = fake_model_adapter();
+        let credential_env = "HANDOFF_TEST_JEV_GATE_OFF";
+        // The credential looks available, so a bug that ignored the gate
+        // would still attempt a call rather than short-circuiting on it.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.supervisor, "the gate defaults off");
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let (handoff, source) = distill_or_structural_with_jev(
+            &cfg,
+            &state,
+            &adapter,
+            "haiku",
+            &ctx_sample(),
+            TEST_TIMEOUT,
+            false,
+            None,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+
+        assert_eq!(source, "distilled");
+        assert_eq!(handoff.task, "Ship the webhook");
     }
 
     /// Issue #280: the structural (mechanical) fallback can never

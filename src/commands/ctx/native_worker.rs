@@ -131,7 +131,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     let cfg = request.cfg;
     let now = super::state::now_secs();
     if let Err(error) = refuse_harness_only_flags(args) {
-        release_task_claim(state, repo, args);
+        release_task_claim(state, repo, cfg, args);
         return Err(error);
     }
 
@@ -151,7 +151,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     ) {
         Ok(route) => route,
         Err(error) => {
-            release_task_claim(state, repo, args);
+            release_task_claim(state, repo, cfg, args);
             return Err(error);
         }
     };
@@ -167,6 +167,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     if let Some(refusal) = placement.as_ref().and_then(|p| p.refusal.clone()) {
         return refuse(
             (state, repo),
+            cfg,
             args,
             w,
             &request.launch_repo,
@@ -179,7 +180,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     let (worker_budget, reserved_ceiling) = match resolve_worker_budget(&env, args) {
         Ok(budget) => budget,
         Err(error) => {
-            release_task_claim(state, repo, args);
+            release_task_claim(state, repo, cfg, args);
             return Err(error);
         }
     };
@@ -206,6 +207,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             let reason = format!("delegation envelope refused: {err}");
             return refuse(
                 (state, repo),
+                cfg,
                 args,
                 w,
                 &request.launch_repo,
@@ -290,6 +292,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
                 );
                 return refuse(
                     (state, repo),
+                    cfg,
                     args,
                     w,
                     &request.launch_repo,
@@ -431,6 +434,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             finish_task_card(
                 state,
                 repo,
+                cfg,
                 args,
                 super::task::ExitKind::Crash,
                 "launch failed",
@@ -539,6 +543,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     finish_task_card(
         state,
         repo,
+        cfg,
         args,
         exit_kind,
         delegation_outcome(code),
@@ -629,8 +634,10 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
 /// delegation asked for. Nothing has run, so there is no delegation record to
 /// name yet -- exactly what `launch_failure_receipt`'s own `Option`
 /// parameters exist for.
+#[allow(clippy::too_many_arguments)]
 fn refuse<W: Write>(
     claim: (&StateDir, &Path),
+    cfg: &CtxConfig,
     args: &AgentArgs,
     w: &mut W,
     workdir: &Path,
@@ -638,7 +645,7 @@ fn refuse<W: Write>(
     code: i32,
     reason: String,
 ) -> CtxResult<i32> {
-    release_task_claim(claim.0, claim.1, args);
+    release_task_claim(claim.0, claim.1, cfg, args);
     if args.json {
         let receipt = DelegationReceipt {
             schema_version: 1,
@@ -668,10 +675,11 @@ fn refuse<W: Write>(
     Ok(code)
 }
 
-fn release_task_claim(state: &StateDir, repo: &Path, args: &AgentArgs) {
+fn release_task_claim(state: &StateDir, repo: &Path, cfg: &CtxConfig, args: &AgentArgs) {
     finish_task_card(
         state,
         repo,
+        cfg,
         args,
         super::task::ExitKind::Crash,
         "launch refused",
@@ -1032,8 +1040,10 @@ worker='opus'
 
             let mut args = args_for("native");
             args.task = Some(task_id.clone());
+            let cfg = CtxConfig::default();
             refuse(
                 (&state, &repo),
+                &cfg,
                 &args,
                 &mut Vec::new(),
                 &repo,

@@ -44,7 +44,6 @@ mod tests {
                 active_workflow: None,
                 primary_extensions: Vec::new(),
             },
-            harnesses: Vec::new(),
             workflows: Vec::new(),
             policy: IntakePolicy {
                 native_available: false,

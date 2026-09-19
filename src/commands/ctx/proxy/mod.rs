@@ -25,12 +25,21 @@ use clap::Args;
 
 use self::decision::{Answers, Decider, ProxyDecision, Question, SeatRole};
 use super::config::{self, CtxConfig, ProxyDecider};
-use super::{CtxResult, adapters, helper, log, state};
+use super::{CtxResult, adapters, helper, jev, log, state};
 
 const PROXY_DECISIONS_FILE: &str = "proxy-decisions.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` key the proxy's own
 /// spend row on -- see `catalogue.rs`'s `typesafe` vendor.
 const TYPESAFE_MODEL_ID: &str = "jev-latest";
+
+/// Issue #537 (A2): a `decision.needs_clarification` at or above this floor
+/// is worth interrupting an interactive launch for one round of follow-up
+/// (`chat.rs::proxy_intake`); the same floor also gates the `clarify:` line
+/// [`prompt_layer`] adds for a session launched non-interactively (e.g. a
+/// resumed clarification a dashboard pane never got to ask). Chosen as the
+/// midpoint of the noul's own `[0, 1]` confidence range -- above it, "too
+/// ambiguous" is the more likely reading than "clear enough".
+pub(crate) const CLARIFY_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Args)]
 pub struct ProxyArgs {
@@ -83,10 +92,7 @@ pub fn activation(cfg: &CtxConfig) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let credential_set = std::env::var(&cfg.proxy.typesafe.credential_env)
-                .map(|value| !value.is_empty())
-                .unwrap_or(false);
-            if !credential_set {
+            if !jev::available(&cfg.proxy.typesafe) {
                 return Err(format!(
                     "proxy: enabled but {} is unset; starting the orchestrator harness",
                     cfg.proxy.typesafe.credential_env
@@ -189,14 +195,16 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
 /// actually is, and names the resolved seat tier alongside the model:
 ///
 /// - `Single`: `proxy: <execution> \u{b7} single seat \u{b7} <harness>/<model> (<seat-tier>) \u{b7}
-///   <workflow-or-none> \u{b7} <decider> [<mean-confidence>]`
+///   <workflow-or-none> \u{b7} <decider> [\u{b7} domains: <tag>, ...] [<mean-confidence>]`
 /// - `Orchestrator`: `proxy: <execution> \u{b7} orchestrator <harness>/<model> (<seat-tier>) \u{b7}
-///   workers <worker-tier> \u{b7} <workflow-or-none> \u{b7} <decider> [<mean-confidence>]`
+///   workers <worker-tier> \u{b7} <workflow-or-none> \u{b7} <decider> [\u{b7} domains: <tag>, ...]
+///   [<mean-confidence>]`
 ///
 /// `<workflow-or-none>` is `no workflow` when `decision.workflow` is `None`
 /// (the common case now that a `Direct` execution always clears it, see
 /// `decision::apply_direct_execution_workflow_rule`), else `workflow <id>
-/// (<complexity>/<risk>)`.
+/// (<complexity>/<risk>)`. The `domains` segment (issue #537 A2) is omitted
+/// entirely when `decision.domains` is empty, the common case.
 pub fn announce_line(decision: &ProxyDecision) -> String {
     let execution = lower_debug(decision.execution);
     let seat = format!(
@@ -225,6 +233,9 @@ pub fn announce_line(decision: &ProxyDecision) -> String {
             tier_str(decision.worker_tier)
         ),
     };
+    if !decision.domains.is_empty() {
+        line.push_str(&format!(" \u{b7} domains: {}", decision.domains.join(", ")));
+    }
     if let Some(confidence) = mean_confidence(decision) {
         line.push_str(&format!(" {confidence:.2}"));
     }
@@ -260,9 +271,10 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
 }
 
 /// The bounded `[zirv proxy]` context layer (T2 folds this into the compiled
-/// prompt): at most 6 lines -- a header, execution/complexity/risk, the
-/// seat(s), the workflow, and (`Single` only) one line telling the session
-/// plainly that it is the one doing the work, not an orchestrator.
+/// prompt): at most 7 lines -- a header, execution/complexity/risk, the
+/// seat(s), the workflow, (issue #537 A2, both conditional) the domain tags
+/// and a clarify instruction, and (`Single` only) one line telling the
+/// session plainly that it is the one doing the work, not an orchestrator.
 // T2 is the first caller (folds this into `compile.rs`'s composed context);
 // exercised here only by this module's own tests in the meantime.
 #[allow(dead_code)]
@@ -293,6 +305,12 @@ pub fn prompt_layer(decision: &ProxyDecision) -> String {
         "workflow: {}",
         decision.workflow.as_deref().unwrap_or("none")
     ));
+    if !decision.domains.is_empty() {
+        lines.push(format!("domains: {}", decision.domains.join(", ")));
+    }
+    if decision.needs_clarification >= CLARIFY_THRESHOLD {
+        lines.push("clarify: ask the user one precise question before acting".to_string());
+    }
     if decision.seat_role == SeatRole::Single {
         lines.push(
             "You are the single seat for this request: do the work here yourself; do not \
@@ -307,12 +325,13 @@ pub fn prompt_layer(decision: &ProxyDecision) -> String {
 /// is `Some`) a `log::Delegation` spend row -- agent `"typesafe"`, model
 /// `"jev-latest"`, input/output tokens from `usage`, outcome `"ok"` -- so
 /// `zirv ctx spend` prices the call through `catalogue`'s `typesafe` vendor.
-/// `session` is this process's own `ZIRV_CTX_SESSION` (the same identity
-/// `mail::session_identity`/`hook.rs` read), falling back to `"proxy"` only
-/// when this process carries none at all; `principal` is this process's own
-/// `ZIRV_PRINCIPAL` (`agent::PRINCIPAL_ENV`), falling back to `"root"` only
-/// when unset -- the same "root session, no inherited envelope" convention
-/// `agent::root_envelope` establishes, rather than hardcoding either value.
+/// `session`/`principal` come from `jev::session_and_principal` -- this
+/// process's own `ZIRV_CTX_SESSION` (the same identity `mail::
+/// session_identity`/`hook.rs` read) and `ZIRV_PRINCIPAL` (`agent::
+/// PRINCIPAL_ENV`), falling back to `"proxy"`/`"root"` only when unset, the
+/// same "root session, no inherited envelope" convention `agent::
+/// root_envelope` establishes -- shared with `jev::record` so the two
+/// spend-adjacent recorders never drift on what an absent value means.
 /// Best-effort like every other append in this crate's flat logs: the
 /// caller (`decide`) never propagates a write failure.
 pub fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
@@ -322,14 +341,7 @@ pub fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
 
     if let Some(usage) = &d.usage {
         let wrapped = state::StateDir::from_path(state_dir.to_path_buf());
-        let session = std::env::var(adapters::SESSION_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "proxy".to_string());
-        let principal = std::env::var(super::agent::PRINCIPAL_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "root".to_string());
+        let (session, principal) = jev::session_and_principal();
         let _ = log::append_delegation(
             &wrapped,
             &log::Delegation {
@@ -447,6 +459,17 @@ fn human_fields(decision: &ProxyDecision, min_confidence: f32) -> Vec<(&'static 
             "needs_clarification",
             format!("{:.2}", decision.needs_clarification),
         ),
+        // Issue #537 (A2): a plain field, not `row()` -- `domains` aggregates
+        // up to six separate Noul confidences (one per tag question), which
+        // does not fit `row()`'s one-field-one-confidence shape.
+        (
+            "domains",
+            if decision.domains.is_empty() {
+                "none".to_string()
+            } else {
+                decision.domains.join(", ")
+            },
+        ),
     ]
 }
 
@@ -535,6 +558,7 @@ mod tests {
             seat_tier: decision::SeatTier::Frontier,
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
+            domains: Vec::new(),
             decider: Decider::Typesafe,
             confidence: BTreeMap::from([("seat_tier".to_string(), 0.81_f32)]),
             reasons: Vec::new(),
@@ -577,12 +601,81 @@ mod tests {
         );
     }
 
+    /// Issue #537 (A2): the `domains` segment sits between the decider and
+    /// the trailing mean-confidence, and is omitted entirely on the plain
+    /// `sample_decision` (already covered by the two tests above).
+    #[test]
+    fn announce_line_shows_domains_when_present() {
+        let mut decision = sample_decision();
+        decision.execution = ExecutionMode::Direct;
+        decision.seat_role = SeatRole::Single;
+        decision.seat_tier = decision::SeatTier::Cheap;
+        decision.orchestrator = decision::Seat {
+            harness: "claude".to_string(),
+            model: "sonnet".to_string(),
+        };
+        decision.workflow = None;
+        decision.confidence = BTreeMap::new();
+        decision.decider = Decider::Typesafe;
+        decision.domains = vec!["security".to_string(), "data".to_string()];
+        let line = announce_line(&decision);
+        assert_eq!(
+            line,
+            "proxy: direct \u{b7} single seat \u{b7} claude/sonnet (cheap) \u{b7} no workflow \u{b7} \
+             typesafe \u{b7} domains: security, data"
+        );
+    }
+
+    /// Issue #537 (A2): `human_fields`' `domains` row is a plain field (not
+    /// `row()`'s source/confidence shape -- `domains` aggregates up to six
+    /// separate answers, which does not fit one field's single confidence),
+    /// showing `none` when empty and the joined list otherwise.
+    #[test]
+    fn human_fields_shows_domains_as_a_plain_field() {
+        let empty = human_fields(&sample_decision(), 0.5);
+        assert_eq!(
+            empty.iter().find(|(field, _)| *field == "domains"),
+            Some(&("domains", "none".to_string()))
+        );
+
+        let mut decision = sample_decision();
+        decision.domains = vec!["security".to_string(), "data".to_string()];
+        let filled = human_fields(&decision, 0.5);
+        assert_eq!(
+            filled.iter().find(|(field, _)| *field == "domains"),
+            Some(&("domains", "security, data".to_string()))
+        );
+    }
+
     #[test]
     fn prompt_layer_is_bounded_and_starts_with_the_header() {
         let layer = prompt_layer(&sample_decision());
         let lines: Vec<&str> = layer.lines().collect();
-        assert!(lines.len() <= 6, "{lines:?}");
+        assert!(lines.len() <= 8, "{lines:?}");
         assert_eq!(lines[0], "[zirv proxy]");
+    }
+
+    /// Issue #537 (A2): both new lines are conditional -- present together
+    /// on a decision that carries domains and a clarification signal, and
+    /// absent on the plain `sample_decision` (empty domains, `0.0`
+    /// clarification) the test above already covers.
+    #[test]
+    fn prompt_layer_shows_domains_and_a_clarify_instruction_when_present() {
+        let mut decision = sample_decision();
+        decision.domains = vec!["security".to_string(), "data".to_string()];
+        decision.needs_clarification = 0.9;
+        let layer = prompt_layer(&decision);
+        assert!(layer.contains("domains: security, data"), "{layer}");
+        assert!(
+            layer.contains("clarify: ask the user one precise question before acting"),
+            "{layer}"
+        );
+
+        let mut clear_decision = sample_decision();
+        clear_decision.needs_clarification = 0.1;
+        let clear_layer = prompt_layer(&clear_decision);
+        assert!(!clear_layer.contains("domains:"), "{clear_layer}");
+        assert!(!clear_layer.contains("clarify:"), "{clear_layer}");
     }
 
     #[test]

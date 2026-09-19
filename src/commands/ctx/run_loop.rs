@@ -2,13 +2,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{NormalizedEvent, SessionId, SessionRef, input_hash};
 use super::judge::{GateOutcome, Step, WaitOn};
 use super::pace;
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, handoff, judge, log, mail, objective, score};
+use super::{CtxResult, adapters, handoff, jev, judge, log, mail, objective, score};
 
 /// Repeated cycle failures, escalated to the caller.
 pub const EXIT_FAILED: i32 = 75;
@@ -899,6 +901,7 @@ pub(crate) fn run_with_clock<W: Write>(
             session.as_str(),
             parent_short.as_deref(),
             &mut objective_progress,
+            cycle,
         )
         .unwrap_or_else(|step| {
             let _ = writeln!(
@@ -1145,6 +1148,75 @@ else: {\"verdict\": \"done\"|\"blocked\"|\"continue\"|\"wait\", \"reason\": \"..
 only when) verdict is \"wait\", also include \"wait_on\": {\"pid\": <n>} or {\"file\": \"<path>\"} \
 or {\"seconds\": <n>}.";
 
+/// Issue #537 (A4): a confident `continue` from Jev, at or above this floor,
+/// skips this cycle's helper judge call entirely -- `done`/`blocked`/`wait`
+/// stay the helper's sole authority, and Jev is never asked to produce them.
+/// Chosen from a live 2026-09-18 probe.
+const JUDGE_CONTINUE_FLOOR: f32 = 0.7;
+
+#[derive(Debug, Serialize)]
+struct JudgeAdviseState {
+    objective: String,
+    transcript_tail: String,
+    gates_green: bool,
+    cycle: u32,
+}
+
+/// Issue #537 (A4): `true` only for a confident (`>= JUDGE_CONTINUE_FLOOR`)
+/// `continue` answer from Jev (site `"judge"`), in which case the caller
+/// skips this cycle's helper call outright and proceeds exactly as it does
+/// today on a helper `continue` verdict. `false` -- fall through to today's
+/// helper path completely unchanged -- for the gate being off, no
+/// credential, any transport/parse error, or any other answer (`done`,
+/// `blocked`, `wait`, or a `continue` below the floor): Jev never produces
+/// those three verdicts itself, only ever narrows toward the one outcome
+/// (`continue`) the helper would otherwise have to spend a call confirming.
+fn jev_judge_continue(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    record: &objective::Objective,
+    transcript_tail: &str,
+    cycle: u32,
+    gates_green: bool,
+) -> bool {
+    let advise_state = JudgeAdviseState {
+        objective: crate::utils::truncate_bytes(objective::layer_text(record), Some(2 * 1024)),
+        transcript_tail: crate::utils::truncate_bytes(transcript_tail.to_string(), Some(4 * 1024)),
+        gates_green,
+        cycle,
+    };
+    let questions = [jev::Question::choice(
+        "verdict",
+        "What is the state of this objective right now, from the objective and the recent \
+         transcript tail?",
+        &[
+            (
+                "done",
+                "the objective is met and the tail shows the evidence",
+            ),
+            (
+                "blocked",
+                "cannot proceed without a human or external input",
+            ),
+            ("continue", "work is progressing normally"),
+            ("wait", "waiting on a process, file or time"),
+        ],
+    )];
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "judge",
+        cfg.jev.supervisor,
+        &advise_state,
+        &questions,
+    ) else {
+        return false;
+    };
+    answers.get("verdict").is_some_and(|answer| {
+        answer.as_choice() == Some("continue") && answer.confidence >= JUDGE_CONTINUE_FLOOR
+    })
+}
+
 /// The core flow issue #314 asks for: deterministic gates first, a cheap-
 /// model verdict second, `blocked`/`wait` as first-class outcomes. Every
 /// side effect (gate spawn, judge model call, objective record writes,
@@ -1162,6 +1234,7 @@ fn evaluate_objective_after_cycle<W: Write>(
     session: &str,
     parent_short: Option<&str>,
     progress: &mut ObjectiveProgress,
+    cycle: u32,
 ) -> Result<ObjectiveOutcome, Step> {
     let key = super::state::repo_slug(repo);
     let record = match objective::load(state, &key) {
@@ -1244,10 +1317,26 @@ fn evaluate_objective_after_cycle<W: Write>(
             Ok(ObjectiveOutcome::Continue)
         }
         Step::RunJudge => {
-            let model = handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter);
             let transcript_tail = std::fs::read(transcript)
                 .map(|bytes| tail_of_bytes(&bytes, 4 * 1024))
                 .unwrap_or_default();
+
+            // Issue #537 (A4): a confident Jev `continue` skips the helper
+            // call for this cycle entirely -- see `jev_judge_continue`'s own
+            // doc comment for the full merge rule.
+            if jev_judge_continue(
+                cfg,
+                state,
+                &record,
+                &transcript_tail,
+                cycle,
+                curr_gate_green,
+            ) {
+                clear_pending_note();
+                return Ok(ObjectiveOutcome::Continue);
+            }
+
+            let model = handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter);
             let prompt = format!(
                 "{}\n\n---\nRecent transcript (tail):\n{transcript_tail}{JUDGE_OUTPUT_CONTRACT}",
                 objective::layer_text(&record),
@@ -3821,6 +3910,160 @@ mod tests {
             )
             .expect("store objective");
             key
+        }
+
+        // Issue #537 (A4): `jev_judge_continue` unit tests -- direct, no
+        // FAKE_AGENT_MODE subprocess needed, since this is the pre-filter
+        // itself rather than the whole `zirv ctx loop` cycle.
+
+        fn sample_objective() -> objective::Objective {
+            objective::Objective {
+                schema_version: objective::SCHEMA_VERSION,
+                objective: "ship it".to_string(),
+                budget_tokens: None,
+                deadline_secs: None,
+                spent_tokens: 0,
+                started_at: now_secs(),
+                status: objective::Status::Active,
+                pending_note: None,
+                evidence: Vec::new(),
+            }
+        }
+
+        fn jev_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+            let mut cfg = CtxConfig::default();
+            cfg.jev.supervisor = true;
+            cfg.proxy.typesafe.base_url = base_url;
+            cfg.proxy.typesafe.credential_env = credential_env.to_string();
+            cfg.proxy.typesafe.timeout_secs = 5;
+            cfg
+        }
+
+        #[test]
+        fn jev_judge_continue_skips_the_helper_on_a_confident_continue_answer() {
+            let body = r#"{"model": "jev-latest", "answers": {
+                "verdict": {"type": "choice", "choice": "continue",
+                            "probabilities": {"continue": 0.9}, "confidence": 0.9}
+            }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+            let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+            let credential_env = "RUN_LOOP_TEST_JUDGE_CONTINUE";
+            // SAFETY (test-only): a unique env var name this test owns.
+            unsafe {
+                std::env::set_var(credential_env, "secret");
+            }
+            let cfg = jev_test_cfg(url, credential_env);
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+            let skip = jev_judge_continue(
+                &cfg,
+                &state,
+                &sample_objective(),
+                "assistant: done",
+                3,
+                true,
+            );
+
+            unsafe {
+                std::env::remove_var(credential_env);
+            }
+            handle.join().expect("server thread must not panic");
+            assert!(skip, "a confident continue must skip the helper call");
+        }
+
+        #[test]
+        fn jev_judge_continue_never_fires_on_a_confident_done_answer() {
+            let body = r#"{"model": "jev-latest", "answers": {
+                "verdict": {"type": "choice", "choice": "done",
+                            "probabilities": {"done": 0.99}, "confidence": 0.99}
+            }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+            let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+            let credential_env = "RUN_LOOP_TEST_JUDGE_DONE";
+            // SAFETY (test-only): a unique env var name this test owns.
+            unsafe {
+                std::env::set_var(credential_env, "secret");
+            }
+            let cfg = jev_test_cfg(url, credential_env);
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+            let skip = jev_judge_continue(
+                &cfg,
+                &state,
+                &sample_objective(),
+                "assistant: done",
+                3,
+                true,
+            );
+
+            unsafe {
+                std::env::remove_var(credential_env);
+            }
+            handle.join().expect("server thread must not panic");
+            assert!(
+                !skip,
+                "Jev must never authorize done/blocked/wait itself, however confident"
+            );
+        }
+
+        #[test]
+        fn jev_judge_continue_falls_through_on_a_500() {
+            let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+            let credential_env = "RUN_LOOP_TEST_JUDGE_500";
+            // SAFETY (test-only): a unique env var name this test owns.
+            unsafe {
+                std::env::set_var(credential_env, "secret");
+            }
+            let cfg = jev_test_cfg(url, credential_env);
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+            let skip = jev_judge_continue(
+                &cfg,
+                &state,
+                &sample_objective(),
+                "assistant: done",
+                3,
+                true,
+            );
+
+            unsafe {
+                std::env::remove_var(credential_env);
+            }
+            handle.join().expect("server thread must not panic");
+            assert!(
+                !skip,
+                "a transport/HTTP error must fall through to the helper"
+            );
+        }
+
+        #[test]
+        fn jev_judge_continue_is_false_when_the_gate_is_off() {
+            let credential_env = "RUN_LOOP_TEST_JUDGE_GATE_OFF";
+            // The credential looks available, so a bug that ignored the gate
+            // would still attempt a call rather than short-circuiting on it.
+            unsafe {
+                std::env::set_var(credential_env, "secret");
+            }
+            let mut cfg = CtxConfig::default();
+            assert!(!cfg.jev.supervisor, "the gate defaults off");
+            cfg.proxy.typesafe.credential_env = credential_env.to_string();
+            let state_dir = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+            let skip = jev_judge_continue(
+                &cfg,
+                &state,
+                &sample_objective(),
+                "assistant: done",
+                3,
+                true,
+            );
+
+            unsafe {
+                std::env::remove_var(credential_env);
+            }
+            assert!(!skip, "the gate is off, so this must never fire");
         }
 
         #[test]

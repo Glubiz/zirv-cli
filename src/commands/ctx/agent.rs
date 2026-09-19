@@ -2396,13 +2396,15 @@ fn claim_task_for_delegation(
 /// other accounting call in this function's own completion block already
 /// holds. `Reported` (a genuine report-back, or a plain successful exit with
 /// no structural contract declared) marks the card `Done` with `outcome`
-/// verbatim; anything else runs [`super::task::respawn_decision`] and applies
-/// its verdict, so a crash or an unvalidated report-back returns the card to
-/// `Ready` for a fresh delegation to pick up, or auto-blocks it once the
-/// retry ceiling is reached -- NEVER a silent `Done`.
+/// verbatim; anything else runs [`super::task::respawn_decision_with_jev`]
+/// and applies its verdict, so a crash or an unvalidated report-back returns
+/// the card to `Ready` for a fresh delegation to pick up, or auto-blocks it
+/// once the retry ceiling is reached (or, issue #537 A4, once a confident
+/// Jev crash triage says so first) -- NEVER a silent `Done`.
 pub(crate) fn finish_task_card(
     state: &super::state::StateDir,
     repo: &Path,
+    cfg: &CtxConfig,
     args: &AgentArgs,
     exit_kind: super::task::ExitKind,
     outcome: &str,
@@ -2429,7 +2431,13 @@ pub(crate) fn finish_task_card(
             );
         }
         other => {
-            match super::task::respawn_decision(card, other, super::task::DEFAULT_MAX_ATTEMPTS) {
+            match super::task::respawn_decision_with_jev(
+                cfg,
+                state,
+                card,
+                other,
+                super::task::DEFAULT_MAX_ATTEMPTS,
+            ) {
                 super::task::RespawnVerdict::Respawn => {
                     let reset_event = match other {
                         super::task::ExitKind::SilentZero => super::task::Event::Protocol {
@@ -4727,6 +4735,7 @@ pub fn run_with<W: Write>(
                 finish_task_card(
                     &state,
                     repo,
+                    &cfg,
                     args,
                     super::task::ExitKind::Crash,
                     "launch failed",
@@ -5106,6 +5115,7 @@ pub fn run_with<W: Write>(
             finish_task_card(
                 &state_dir,
                 repo,
+                &cfg,
                 args,
                 exit_kind,
                 outcome,
