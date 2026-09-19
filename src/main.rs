@@ -35,6 +35,14 @@ fn is_top_level_help(argv: &[String]) -> bool {
     matches!(argv.get(1).map(String::as_str), Some("--help") | Some("-h"))
 }
 
+/// True when the top-level invocation is exactly `zirv --version`/`zirv -V`,
+/// i.e. the version flag stands in for the command itself. Checked against
+/// raw argv, before clap parses anything, so the invocation bypasses clap's
+/// own `--version` flag parsing and prints the same output as `zirv version`.
+fn is_top_level_version(argv: &[String]) -> bool {
+    matches!(argv.get(1).map(String::as_str), Some("--version") | Some("-V"))
+}
+
 /// True when argv[1] names the `ctx` built-in, compared **case-insensitively**
 /// to match `utils::is_reserved_command`/`RESERVED_COMMANDS`: on NTFS/APFS a
 /// script file `Ctx.yaml` resolves the same as `ctx.yaml`, so a case-sensitive
@@ -548,6 +556,14 @@ async fn main() {
         return;
     }
 
+    if is_top_level_version(&argv) {
+        if let Err(e) = get_version(&mut std::io::stdout()) {
+            output::error(e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let input = Input::parse();
 
     // These live on the shared `Input` struct, so clap accepts them for every
@@ -682,6 +698,37 @@ mod tests {
         // `--help` passed as a parameter to a script command (not in the
         // command slot itself) is not top-level help.
         assert!(!is_top_level_help(&argv(&["zirv", "build", "--help"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_matches_long_flag() {
+        assert!(is_top_level_version(&argv(&["zirv", "--version"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_matches_short_flag() {
+        assert!(is_top_level_version(&argv(&["zirv", "-V"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_ignores_script_commands() {
+        assert!(!is_top_level_version(&argv(&["zirv", "build"])));
+        assert!(!is_top_level_version(&argv(&["zirv", "version"])));
+        assert!(!is_top_level_version(&argv(&["zirv"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_does_not_match_flag_as_script_param() {
+        // `--version` passed as a parameter to a script command (not in the
+        // command slot itself) is not top-level version.
+        assert!(!is_top_level_version(&argv(&["zirv", "build", "--version"])));
+    }
+
+    #[test]
+    fn test_is_top_level_version_matches_with_trailing_args() {
+        // Trailing arguments do not defeat the interception.
+        assert!(is_top_level_version(&argv(&["zirv", "--version", "extra"])));
+        assert!(is_top_level_version(&argv(&["zirv", "-V", "--dry-run"])));
     }
 
     /// FINDING 2: the pre-clap `ctx`/`chat`/`agent` interceptions are matched
@@ -866,6 +913,46 @@ mod tests {
             "--runtime",
             "harness"
         ])));
+    }
+
+    /// Exercised through the real built binary: `version`, `--version`, and
+    /// `-V` all produce identical output and exit 0. This validates that the
+    /// pre-clap interception for `--version`/`-V` prints exactly the same
+    /// output as the clap-dispatched `zirv version` command.
+    #[test]
+    fn version_flag_exits_0_and_matches_version_command() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let bin = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("target/debug")
+            .join(format!("zirv{}", std::env::consts::EXE_SUFFIX));
+
+        let version_cmd = std::process::Command::new(&bin)
+            .arg("version")
+            .output()
+            .expect("run zirv version");
+
+        let version_long_flag = std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .expect("run zirv --version");
+
+        let version_short_flag = std::process::Command::new(&bin)
+            .arg("-V")
+            .output()
+            .expect("run zirv -V");
+
+        assert!(version_cmd.status.success(), "zirv version failed");
+        assert!(version_long_flag.status.success(), "zirv --version failed");
+        assert!(version_short_flag.status.success(), "zirv -V failed");
+
+        let stdout_version = String::from_utf8_lossy(&version_cmd.stdout);
+        let stdout_long = String::from_utf8_lossy(&version_long_flag.stdout);
+        let stdout_short = String::from_utf8_lossy(&version_short_flag.stdout);
+
+        assert_eq!(stdout_version, stdout_long, "zirv version and zirv --version outputs differ");
+        assert_eq!(stdout_version, stdout_short, "zirv version and zirv -V outputs differ");
     }
 
     /// Exercised through the real built binary (the same pattern
