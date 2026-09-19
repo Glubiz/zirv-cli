@@ -419,7 +419,10 @@ pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn s
             writer,
             "{}",
             style::paint(
-                &format!("Home Directory: {}", crate::commands::ctx::state::display_path(&root)),
+                &format!(
+                    "Home Directory: {}",
+                    crate::commands::ctx::state::display_path(&root)
+                ),
                 Tone::Muted,
                 colour
             )
@@ -443,9 +446,7 @@ pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn s
             writer,
             "{}",
             style::paint(
-                &format!(
-                    "No scripts or shortcuts found. To get started, run: `zirv setup`, `zirv init`, or `zirv create`"
-                ),
+                "No scripts or shortcuts found. To get started, run: `zirv setup`, `zirv init`, or `zirv create`",
                 Tone::Muted,
                 colour
             )

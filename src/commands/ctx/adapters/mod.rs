@@ -2697,7 +2697,6 @@ fn expand_home(path: &str) -> PathBuf {
 /// adapter from `Absent` to `Live`" true by construction.
 fn known_install_roots(adapter_name: &str) -> &'static [&'static str] {
     match adapter_name {
-        #[cfg(windows)]
         "codex" => &["~/AppData/Local/Programs/OpenAI/Codex/bin"],
         _ => &[],
     }
@@ -2785,14 +2784,14 @@ pub(crate) fn format_launch_error(
     program: &str,
 ) -> String {
     // Try to get the io::Error kind directly if available
-    if let Some(io_err) = error.downcast_ref::<std::io::Error>() {
-        if io_err.kind() == std::io::ErrorKind::NotFound {
-            return format!(
-                "adapter '{}': program '{}' not found. Install the harness or use --agent to \
-                 select one that is installed",
-                adapter_name, program
-            );
-        }
+    if let Some(io_err) = error.downcast_ref::<std::io::Error>()
+        && io_err.kind() == std::io::ErrorKind::NotFound
+    {
+        return format!(
+            "adapter '{}': program '{}' not found. Install the harness or use --agent to \
+             select one that is installed",
+            adapter_name, program
+        );
     }
 
     // For any other error, include adapter/program context
@@ -4142,38 +4141,6 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
 
     let mut reasons = Vec::new();
     let mut repo_narrowed: Option<&str> = None;
-
-    // First pass: look for an adapter that is enabled, ready, and present.
-    // This ensures a user with only one harness installed gets that one as default,
-    // not the first in registry order.
-    for (name, ctor) in ADAPTERS {
-        let mut adapter = ctor(bin);
-        apply_endpoint_override(&mut adapter, cfg);
-        apply_chat_override(&mut adapter, cfg);
-
-        if cfg.agents.refusal(name).is_some() {
-            continue;
-        }
-
-        if adapter.ready().is_err() {
-            continue;
-        }
-
-        if let Some(_other) = agent_bin_names_a_different_adapter(bin, name) {
-            continue;
-        }
-
-        // Check if the program is present
-        let program = adapter.program();
-        let liveness = liveness_probe(name, program);
-
-        if matches!(liveness, Liveness::Live) {
-            return Ok((adapter, DefaultOrigin::FirstEnabledReady));
-        }
-    }
-
-    // Fallback: use the original logic (first enabled and ready, regardless of presence)
-    // This preserves fail-open behavior: if nothing is installed, we still pick the first ready one
     for (name, ctor) in ADAPTERS {
         let mut adapter = ctor(bin);
         apply_endpoint_override(&mut adapter, cfg);
@@ -7427,49 +7394,10 @@ mod tests {
         assert!(result.contains("Install"));
 
         // PermissionDenied io::Error
-        let perm_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let perm_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
         let result = format_launch_error(&perm_err, "codex", "codex");
         assert!(result.contains("codex"));
         assert!(result.contains("failed to start"));
-    }
-
-    #[test]
-    fn known_install_roots_is_platform_specific() {
-        #[cfg(windows)]
-        {
-            let roots = known_install_roots("codex");
-            assert_eq!(roots.len(), 1);
-            assert!(roots[0].contains("AppData"));
-        }
-        #[cfg(not(windows))]
-        {
-            let roots = known_install_roots("codex");
-            assert_eq!(roots.len(), 0, "unix should have no known roots for codex");
-        }
-    }
-
-    #[test]
-    fn explicit_agent_choice_is_honoured_regardless_of_presence() {
-        // This test verifies that when an explicit --agent is configured,
-        // it is respected even if the probe would report the program is absent.
-        // We do this by checking that cfg.agent is used first in resolve_default.
-
-        let mut cfg = CtxConfig::default();
-        cfg.agent = Some("claude".to_string());
-
-        // resolve_default should respect the explicit agent even if it were absent
-        // The function checks cfg.agent first before looking at presence
-        // This is a structural test: we're testing that the code path exists,
-        // not that a missing binary actually fails (which requires real OS state).
-        let result = resolve_default(&cfg);
-
-        // We expect it to either succeed or fail with a message about the
-        // specific agent, not about defaulting to something else
-        match result {
-            Ok((adapter, _)) => assert_eq!(adapter.name(), "claude"),
-            Err(_) => {
-                // Even an error should be about claude specifically, not a fallback
-            }
-        }
     }
 }

@@ -1219,17 +1219,20 @@ mod tests {
             toml::from_str("").expect("empty file must parse as SettingsFile");
 
         // Verify defaults: empty agents table means no explicit disables.
-        assert!(settings.agents.is_empty(), "empty file should have no agents");
+        assert!(
+            settings.agents.is_empty(),
+            "empty file should have no agents"
+        );
 
         // Verify the fold logic: with no explicit `enabled = false` in the
         // agents table, `AgentGate::load` treats all adapters as enabled.
+        let repo = tempfile::tempdir().expect("tempdir");
         let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-        let gate =
-            AgentGate::load(&tempfile::tempdir().expect("tempdir"), &|_| None).expect("load");
+        let gate = AgentGate::load(repo.path(), &|_| None).expect("load");
 
         for adapter_name in ["claude", "codex"] {
             assert!(
-                gate.is_enabled(adapter_name).expect("check enabled"),
+                gate.is_enabled(adapter_name),
                 "{adapter_name} must be enabled when .settings.toml is empty (permissive marker)"
             );
         }
