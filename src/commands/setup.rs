@@ -347,7 +347,7 @@ const GUIDED_RESTORE_CONFIRM_PROMPT: &str = "Apply this restore now? The overwri
 /// and `run_first_run` -- so both refuse the same way rather than drifting
 /// into two slightly different messages for the same condition.
 const INTERACTIVE_TERMINAL_REQUIRED: &str =
-    "interactive setup requires a terminal; use `zirv setup apply` in automation";
+    "interactive setup requires a terminal; use `zirv setup apply` to configure, or `zirv setup status` to inspect";
 
 #[derive(Debug, Serialize)]
 struct HarnessStatus {
@@ -2773,6 +2773,17 @@ fn run_status<W: Write>(args: &StatusArgs, writer: &mut W) -> SetupResult<i32> {
         status.profile.review_claude.as_deref().unwrap_or("default"),
         status.profile.review_codex.as_deref().unwrap_or("default")
     )?;
+    // Provide next step guidance based on current state
+    writeln!(writer)?; // blank line for clarity
+    if !status.claude.installed && !status.codex.installed {
+        writeln!(writer, "next: install Claude or Codex")?;
+    } else if status.claude_hooks_installed < status.claude_hooks_total
+        || status.codex_hooks_installed < status.codex_hooks_total
+    {
+        writeln!(writer, "next: run `zirv setup apply` to install hooks")?;
+    } else {
+        writeln!(writer, "setup complete")?;
+    }
     Ok(0)
 }
 
@@ -2782,6 +2793,15 @@ fn run_apply<W: Write>(args: &ApplyArgs, writer: &mut W) -> SetupResult<i32> {
         writeln!(writer, "dry run: no files will be changed")?;
     } else {
         std::fs::create_dir_all(repo.join(".zirv"))?;
+        // Mark the machine as configured so first_run_needed returns false after setup apply.
+        // Write a minimal .settings.toml to indicate configuration has begun.
+        let home = home_dir()?;
+        let home_zirv = home.join(crate::utils::SCRIPT_DIR_NAME);
+        std::fs::create_dir_all(&home_zirv)?;
+        let settings_path = home_zirv.join(crate::settings::SETTINGS_FILE);
+        if !settings_path.is_file() {
+            std::fs::write(&settings_path, "")?;
+        }
     }
     if !args.no_context {
         let created = migrate_context(&repo, args.dry_run)?;
@@ -6874,5 +6894,34 @@ mod tests {
         apply_first_run_answers(&answers, home.path()).expect("apply");
 
         assert!(cwd.path().join(".zirv").is_dir());
+    }
+
+    /// Issue #689: after `setup apply` runs, `first_run_needed` must return
+    /// false because the machine is marked as configured via .settings.toml.
+    #[test]
+    fn first_run_needed_is_false_after_setup_apply_marks_machine_configured() {
+        let home_zirv = tempfile::tempdir().expect("home");
+
+        // Initially, first_run_needed returns true because no config files exist.
+        assert!(
+            first_run_needed(home_zirv.path()),
+            "first_run_needed should be true before setup apply"
+        );
+
+        // Simulate what setup apply does: write .settings.toml to mark machine configured.
+        let settings_path = home_zirv.path().join(crate::settings::SETTINGS_FILE);
+        std::fs::write(&settings_path, "").expect("failed to write settings.toml");
+
+        // Now first_run_needed should return false because .settings.toml exists.
+        assert!(
+            !first_run_needed(home_zirv.path()),
+            "first_run_needed should be false after setup apply marks machine configured"
+        );
+
+        // Verify the .settings.toml file actually exists.
+        assert!(
+            settings_path.is_file(),
+            ".settings.toml should exist after marking machine configured"
+        );
     }
 }

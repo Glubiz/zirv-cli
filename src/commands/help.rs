@@ -378,6 +378,7 @@ fn write_builtins<W: Write>(
 
 pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = PathBuf::from(SCRIPT_DIR_NAME);
+    let mut found_any = false;
 
     write_builtins(writer, colour)?;
 
@@ -390,12 +391,14 @@ pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn s
         if commands_dir.is_dir() {
             writeln!(writer, "{}", header(colour, "Available Scripts:"))?;
             write_scripts(writer, &commands_dir, colour)?;
+            found_any = true;
         }
 
         let shortcuts_path = base_dir.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
             writeln!(writer, "{}", header(colour, "Available Shortcuts:"))?;
             write_shortcuts(writer, &base_dir, colour)?;
+            found_any = true;
         }
     }
 
@@ -415,24 +418,34 @@ pub fn show_help<W: Write>(writer: &mut W, colour: bool) -> Result<(), Box<dyn s
         writeln!(
             writer,
             "{}",
-            style::paint(&format!("Home Directory: {root:?}"), Tone::Muted, colour)
+            style::paint(
+                &format!("Home Directory: {}", crate::commands::ctx::state::display_path(&root)),
+                Tone::Muted,
+                colour
+            )
         )?;
         let commands_dir = root.join(COMMANDS_DIR_NAME);
         if commands_dir.is_dir() {
             write_scripts(writer, &commands_dir, colour)?;
+            found_any = true;
         }
 
         let shortcuts_path = root.join(".shortcuts.yaml");
         if shortcuts_path.exists() {
             writeln!(writer, "{}", header(colour, "Global Shortcuts:"))?;
             write_shortcuts(writer, &root, colour)?;
+            found_any = true;
         }
-    } else {
+    }
+
+    if !found_any {
         writeln!(
             writer,
             "{}",
             style::paint(
-                &format!("No scripts found. Please create a .zirv directory in {root:?}."),
+                &format!(
+                    "No scripts or shortcuts found. To get started, run: `zirv setup`, `zirv init`, or `zirv create`"
+                ),
                 Tone::Muted,
                 colour
             )
