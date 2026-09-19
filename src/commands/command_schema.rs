@@ -570,8 +570,8 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
     ));
     entries.push(synthetic(
         "zirv tour",
-        "Guided tour of zirv: overview, harnesses, memory, safety, jev, \
-         config, unstuck.",
+        "Guided tour of zirv: overview, scripts, workflow, harnesses, \
+         memory, safety, jev, config, unstuck.",
         false,
         Vec::new(),
     ));

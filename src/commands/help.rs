@@ -244,7 +244,8 @@ fn write_builtins<W: Write>(
             Row {
                 name: "tour [topic]",
                 desc: &[
-                    "Guided tour of zirv: overview, harnesses, memory, safety, jev, config, unstuck",
+                    "Guided tour of zirv: overview, scripts, workflow, harnesses, memory, safety,",
+                    "jev, config, unstuck",
                 ],
             },
             Row {
