@@ -25,18 +25,27 @@ pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
 
     if !home_zirv.exists() {
         fs::create_dir_all(&home_zirv)?;
-        println!("Created .zirv in home directory: {}", crate::commands::ctx::state::display_path(&home_zirv));
+        println!(
+            "Created .zirv in home directory: {}",
+            crate::commands::ctx::state::display_path(&home_zirv)
+        );
     }
     let home_commands = home_zirv.join(COMMANDS_DIR_NAME);
     if !home_commands.exists() {
         fs::create_dir_all(&home_commands)?;
-        println!("Created .zirv/commands in home directory: {}", crate::commands::ctx::state::display_path(&home_commands));
+        println!(
+            "Created .zirv/commands in home directory: {}",
+            crate::commands::ctx::state::display_path(&home_commands)
+        );
     }
     // Create default .shortcuts.yaml in home folder if not present.
     let home_shortcuts = home_zirv.join(".shortcuts.yaml");
     if !home_shortcuts.exists() {
         fs::write(&home_shortcuts, DEFAULT_SHORTCUTS)?;
-        println!("Created default .shortcuts.yaml in home directory: {}", crate::commands::ctx::state::display_path(&home_shortcuts));
+        println!(
+            "Created default .shortcuts.yaml in home directory: {}",
+            crate::commands::ctx::state::display_path(&home_shortcuts)
+        );
     }
     // Mark the machine as configured so first_run_needed returns false.
     // Write a minimal .settings.toml to indicate configuration has begun.
@@ -56,14 +65,23 @@ pub fn scaffold_global_zirv() -> Result<(), Box<dyn std::error::Error>> {
 pub fn scaffold_local_zirv(current_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let current_zirv = current_dir.join(".zirv");
     fs::create_dir_all(&current_zirv)?;
-    println!("Created .zirv in current directory: {}", crate::commands::ctx::state::display_path(&current_zirv));
+    println!(
+        "Created .zirv in current directory: {}",
+        crate::commands::ctx::state::display_path(&current_zirv)
+    );
     let current_commands = current_zirv.join(COMMANDS_DIR_NAME);
     fs::create_dir_all(&current_commands)?;
-    println!("Created .zirv/commands in current directory: {}", crate::commands::ctx::state::display_path(&current_commands));
+    println!(
+        "Created .zirv/commands in current directory: {}",
+        crate::commands::ctx::state::display_path(&current_commands)
+    );
     let current_shortcuts = current_zirv.join(".shortcuts.yaml");
     if !current_shortcuts.exists() {
         fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
-        println!("Created default .shortcuts.yaml in current directory: {}", crate::commands::ctx::state::display_path(&current_shortcuts));
+        println!(
+            "Created default .shortcuts.yaml in current directory: {}",
+            crate::commands::ctx::state::display_path(&current_shortcuts)
+        );
     }
     Ok(())
 }
@@ -76,7 +94,10 @@ fn scaffold_local_zirv_idempotent(current_dir: &Path) -> Result<(), Box<dyn std:
 
     if !current_commands.exists() {
         fs::create_dir_all(&current_commands)?;
-        println!("Created .zirv/commands in current directory: {}", crate::commands::ctx::state::display_path(&current_commands));
+        println!(
+            "Created .zirv/commands in current directory: {}",
+            crate::commands::ctx::state::display_path(&current_commands)
+        );
     } else {
         println!(".zirv/commands already present in current directory.");
     }
@@ -84,7 +105,10 @@ fn scaffold_local_zirv_idempotent(current_dir: &Path) -> Result<(), Box<dyn std:
     let current_shortcuts = current_zirv.join(".shortcuts.yaml");
     if !current_shortcuts.exists() {
         fs::write(&current_shortcuts, DEFAULT_SHORTCUTS)?;
-        println!("Created default .shortcuts.yaml in current directory: {}", crate::commands::ctx::state::display_path(&current_shortcuts));
+        println!(
+            "Created default .shortcuts.yaml in current directory: {}",
+            crate::commands::ctx::state::display_path(&current_shortcuts)
+        );
     } else {
         println!(".shortcuts.yaml already present in current directory.");
     }
@@ -113,7 +137,9 @@ where
         if init_current {
             scaffold_local_zirv(&current_dir)?;
         } else {
-            println!(".zirv not created in current directory. Bare `zirv` will not open a chat session here without it.");
+            println!(
+                ".zirv not created in current directory. Bare `zirv` will not open a chat session here without it."
+            );
         }
     } else {
         // Make local scaffold idempotent: create missing subdirectories and report what happened.
@@ -372,8 +398,8 @@ mod tests {
     /// `init` must repair it by creating missing subdirectories like
     /// `commands/` rather than skipping all local setup.
     #[test]
-    fn init_fills_in_missing_commands_directory_when_zirv_exists(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn init_fills_in_missing_commands_directory_when_zirv_exists()
+    -> Result<(), Box<dyn std::error::Error>> {
         let fake_home_dir = tempdir()?;
         let fake_home_path = fake_home_dir.path().to_path_buf();
         let fake_current_dir = tempdir()?;

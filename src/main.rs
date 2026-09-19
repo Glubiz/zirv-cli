@@ -40,7 +40,10 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// raw argv, before clap parses anything, so the invocation bypasses clap's
 /// own `--version` flag parsing and prints the same output as `zirv version`.
 fn is_top_level_version(argv: &[String]) -> bool {
-    matches!(argv.get(1).map(String::as_str), Some("--version") | Some("-V"))
+    matches!(
+        argv.get(1).map(String::as_str),
+        Some("--version") | Some("-V")
+    )
 }
 
 /// True when argv[1] names the `ctx` built-in, compared **case-insensitively**
@@ -368,26 +371,35 @@ fn first_run_wizard_should_run(
 /// arguments (see that call site), so there is no `--allow-nested` to read
 /// either -- an operator who passes it gets the ordinary `chat` verb's own
 /// check instead, with the real flag.
-fn maybe_run_first_run_wizard(stdin_is_tty: bool, stdout_is_tty: bool, allow_nested: bool) {
+/// Runs the first-run wizard if needed. Returns `true` if the wizard ran and
+/// no harness was enabled (indicating chat should not proceed).
+fn maybe_run_first_run_wizard(stdin_is_tty: bool, stdout_is_tty: bool, allow_nested: bool) -> bool {
     if !stdin_is_tty || !stdout_is_tty {
-        return;
+        return false;
     }
     let Ok(home) = utils::home_dir() else {
-        return;
+        return false;
     };
     let needed = setup::first_run_needed(&home.join(utils::SCRIPT_DIR_NAME));
     if !first_run_wizard_should_run(stdin_is_tty, stdout_is_tty, needed) {
-        return;
+        return false;
     }
     let env = ctx::config::env_from_process();
     if ctx::sessions::nesting_refusal("chat", &env, allow_nested).is_some() {
-        return;
+        return false;
     }
-    if let Err(e) = setup::run_first_run() {
-        eprintln!(
-            "zirv: first-run setup did not finish ({e}); continuing without it. \
-             Run `zirv setup` to configure later."
-        );
+    match setup::run_first_run_and_report_harness_status() {
+        Ok(any_enabled) => {
+            // Return true if no harness was enabled (terminal condition for chat)
+            !any_enabled
+        }
+        Err(e) => {
+            eprintln!(
+                "zirv: first-run setup did not finish ({e}); continuing without it. \
+                 Run `zirv setup` to configure later."
+            );
+            false
+        }
     }
 }
 
@@ -458,11 +470,15 @@ async fn main() {
         // or parse-failure path that `ctx::dispatch` owns downstream; running
         // the wizard first would answer neither and write config besides.
         if verb == "chat" && argv.len() == 2 {
-            maybe_run_first_run_wizard(
+            let wizard_blocked_chat = maybe_run_first_run_wizard(
                 std::io::stdin().is_terminal(),
                 std::io::stdout().is_terminal(),
                 false,
             );
+            // If the wizard just ran and no harness was enabled, don't proceed to chat
+            if wizard_blocked_chat {
+                std::process::exit(1);
+            }
         }
         std::process::exit(ctx::dispatch(&rewrite_ctx_alias_args(verb, &argv)));
     }
@@ -528,7 +544,7 @@ async fn main() {
     if argv.len() == 1 {
         let stdin_is_tty = std::io::stdin().is_terminal();
         let stdout_is_tty = std::io::stdout().is_terminal();
-        maybe_run_first_run_wizard(stdin_is_tty, stdout_is_tty, false);
+        let wizard_blocked_chat = maybe_run_first_run_wizard(stdin_is_tty, stdout_is_tty, false);
         // Re-checked *after* the wizard: it may have just created a local
         // `.zirv` in this directory (step 6), which should immediately count
         // toward the target this same bare invocation resolves to.
@@ -536,6 +552,10 @@ async fn main() {
         let zirv_exists = zirv_dir_present(&cwd);
         match bare_invocation_target(zirv_exists, stdin_is_tty, stdout_is_tty) {
             BareTarget::Chat => {
+                // If the wizard just ran and no harness was enabled, don't proceed to chat
+                if wizard_blocked_chat {
+                    std::process::exit(1);
+                }
                 std::process::exit(ctx::dispatch(&["ctx".to_string(), "chat".to_string()]));
             }
             BareTarget::Help => {
@@ -721,7 +741,11 @@ mod tests {
     fn test_is_top_level_version_does_not_match_flag_as_script_param() {
         // `--version` passed as a parameter to a script command (not in the
         // command slot itself) is not top-level version.
-        assert!(!is_top_level_version(&argv(&["zirv", "build", "--version"])));
+        assert!(!is_top_level_version(&argv(&[
+            "zirv",
+            "build",
+            "--version"
+        ])));
     }
 
     #[test]
@@ -951,8 +975,14 @@ mod tests {
         let stdout_long = String::from_utf8_lossy(&version_long_flag.stdout);
         let stdout_short = String::from_utf8_lossy(&version_short_flag.stdout);
 
-        assert_eq!(stdout_version, stdout_long, "zirv version and zirv --version outputs differ");
-        assert_eq!(stdout_version, stdout_short, "zirv version and zirv -V outputs differ");
+        assert_eq!(
+            stdout_version, stdout_long,
+            "zirv version and zirv --version outputs differ"
+        );
+        assert_eq!(
+            stdout_version, stdout_short,
+            "zirv version and zirv -V outputs differ"
+        );
     }
 
     /// Exercised through the real built binary (the same pattern

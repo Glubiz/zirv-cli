@@ -4926,7 +4926,8 @@ fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
         }
     }
     if !violations.is_empty() {
-        let keys_msg = if violations.len() == 1 {
+        let is_singular = violations.len() == 1;
+        let keys_msg = if is_singular {
             format!("`{}`", violations[0].0)
         } else {
             violations
@@ -4935,7 +4936,7 @@ fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let vars_msg = if violations.len() == 1 {
+        let vars_msg = if is_singular {
             violations[0].1.clone()
         } else {
             violations
@@ -4944,10 +4945,14 @@ fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
                 .collect::<Vec<_>>()
                 .join(" or ")
         };
-        let plural = if violations.len() == 1 { "key" } else { "keys" };
+        let (key_word, pronoun, location_verb) = if is_singular {
+            ("key", "it", "Set it")
+        } else {
+            ("keys", "they", "Set them")
+        };
         return Err(Box::new(RepoForbiddenError(format!(
-            "{}: {keys_msg} {plural} may not be set by a repository config, because it names \
-             something zirv then runs. Set it in ~/{}/{} or with {} instead.",
+            "{}: {keys_msg} {key_word} may not be set by a repository config, because {pronoun} \
+             names something zirv then runs. {location_verb} in ~/{}/{} or with {} instead.",
             path.display(),
             crate::utils::SCRIPT_DIR_NAME,
             CTX_CONFIG_FILE,
@@ -4962,10 +4967,10 @@ fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
 /// "unknown field `future_feature`" or "invalid type: string `native`, expected struct RuntimeConfig in `runtime`"
 fn extract_field_name(error_msg: &str) -> Option<String> {
     // Look for field names in backticks: `fieldname`
-    if let Some(start) = error_msg.find('`') {
-        if let Some(end) = error_msg[start + 1..].find('`') {
-            return Some(error_msg[start + 1..start + 1 + end].to_string());
-        }
+    if let Some(start) = error_msg.find('`')
+        && let Some(end) = error_msg[start + 1..].find('`')
+    {
+        return Some(error_msg[start + 1..start + 1 + end].to_string());
     }
     None
 }
@@ -4980,7 +4985,9 @@ fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>
         if error_msg.contains("unknown field") {
             if let Some(origin) = key_origins.get(&field) {
                 let source = match origin {
-                    KeyOrigin::Home => format!("~/{}/{}", crate::utils::SCRIPT_DIR_NAME, CTX_CONFIG_FILE),
+                    KeyOrigin::Home => {
+                        format!("~/{}/{}", crate::utils::SCRIPT_DIR_NAME, CTX_CONFIG_FILE)
+                    }
                     KeyOrigin::Repo => format!(".zirv/{}", CTX_CONFIG_FILE),
                     KeyOrigin::Env(var) => format!("${var}"),
                 };
@@ -4999,17 +5006,20 @@ fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>
             }
         }
         // Check if this is a type error
-        if error_msg.contains("invalid type") {
-            if let Some(origin) = key_origins.get(&field) {
-                let source = match origin {
-                    KeyOrigin::Home => format!("~/{}/{}", crate::utils::SCRIPT_DIR_NAME, CTX_CONFIG_FILE),
-                    KeyOrigin::Repo => format!(".zirv/{}", CTX_CONFIG_FILE),
-                    KeyOrigin::Env(var) => format!("${var}"),
-                };
-                return format!(
-                    "configuration error: wrong type for `{}` in {} — {}", field, source, error_msg
-                );
-            }
+        if error_msg.contains("invalid type")
+            && let Some(origin) = key_origins.get(&field)
+        {
+            let source = match origin {
+                KeyOrigin::Home => {
+                    format!("~/{}/{}", crate::utils::SCRIPT_DIR_NAME, CTX_CONFIG_FILE)
+                }
+                KeyOrigin::Repo => format!(".zirv/{}", CTX_CONFIG_FILE),
+                KeyOrigin::Env(var) => format!("${var}"),
+            };
+            return format!(
+                "configuration error: wrong type for `{}` in {} — {}",
+                field, source, error_msg
+            );
         }
     }
     // Fallback for errors we can't enhance
@@ -5057,7 +5067,8 @@ fn read_layer(
         return Ok(None);
     }
     let text = std::fs::read_to_string(path).map_err(|e| {
-        let msg: Box<dyn std::error::Error> = format!("unable to read {}: {}", path.display(), e).into();
+        let msg: Box<dyn std::error::Error> =
+            format!("unable to read {}: {}", path.display(), e).into();
         msg
     })?;
     match toml::from_str::<toml::Table>(&text) {
@@ -5093,25 +5104,24 @@ pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
     let mut table: toml::Table = toml::from_str(text)?;
     super::policy::resolve(table.remove(POLICY_SECTION), None, &|_| None)?;
     super::safety::resolve(table.remove(SAFETY_SECTION), None, &|_| None)?;
-    let _: CtxConfig = toml::Value::Table(table)
-        .try_into()
-        .map_err(|e| {
-            let error_msg = e.to_string();
-            // For operator validation, we can't track full provenance, but we can still
-            // improve the message for common cases
-            if error_msg.contains("unknown field") {
-                if let Some(field) = extract_field_name(&error_msg) {
-                    let msg: Box<dyn std::error::Error> = format!(
-                        "invalid ctx config: unknown key `{}` — this is usually from a \
-                         newer zirv version. Remove it or upgrade zirv.",
-                        field
-                    ).into();
-                    return msg;
-                }
-            }
-            let msg: Box<dyn std::error::Error> = format!("invalid ctx config: {}", error_msg).into();
-            msg
-        })?;
+    let _: CtxConfig = toml::Value::Table(table).try_into().map_err(|e| {
+        let error_msg = e.to_string();
+        // For operator validation, we can't track full provenance, but we can still
+        // improve the message for common cases
+        if error_msg.contains("unknown field")
+            && let Some(field) = extract_field_name(&error_msg)
+        {
+            let msg: Box<dyn std::error::Error> = format!(
+                "invalid ctx config: unknown key `{}` — this is usually from a \
+                     newer zirv version. Remove it or upgrade zirv.",
+                field
+            )
+            .into();
+            return msg;
+        }
+        let msg: Box<dyn std::error::Error> = format!("invalid ctx config: {}", error_msg).into();
+        msg
+    })?;
     Ok(())
 }
 
@@ -5967,16 +5977,15 @@ impl CtxConfig {
             insert_path(&mut merged, &["supervise", "max_heavy_operations"], old);
         }
 
-        let mut cfg: Self = toml::Value::Table(merged)
-            .try_into()
-            .map_err(|e| {
-                let error_msg = e.to_string();
-                let msg: Box<dyn std::error::Error> = format!(
-                    "configuration error: {}",
-                    format_config_error(&error_msg, &key_origins)
-                ).into();
-                msg
-            })?;
+        let mut cfg: Self = toml::Value::Table(merged).try_into().map_err(|e| {
+            let error_msg = e.to_string();
+            let msg: Box<dyn std::error::Error> = format!(
+                "configuration error: {}",
+                format_config_error(&error_msg, &key_origins)
+            )
+            .into();
+            msg
+        })?;
 
         // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
         // over here, once the full config (both layers, narrowing and env
@@ -13026,16 +13035,11 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let home_config = home.path().join(".zirv");
         std::fs::create_dir_all(&home_config).expect("mkdir");
-        std::fs::write(
-            home_config.join("ctx.toml"),
-            "future_feature = true\n",
-        )
-        .expect("write");
+        std::fs::write(home_config.join("ctx.toml"), "future_feature = true\n").expect("write");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
 
         let repo = tempfile::tempdir().expect("repo");
-        let err = CtxConfig::load(repo.path(), &|_| None)
-            .expect_err("unknown key should fail");
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown key should fail");
 
         let err_str = err.to_string();
         assert!(
@@ -13066,8 +13070,7 @@ mod tests {
         )
         .expect("write");
 
-        let err = CtxConfig::load(repo.path(), &|_| None)
-            .expect_err("unknown key should fail");
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown key should fail");
 
         let err_str = err.to_string();
         assert!(
@@ -13107,15 +13110,14 @@ mod tests {
 
         let repo = tempfile::tempdir().expect("repo");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
-        // Set three forbidden keys in the repo config
+        // Set three forbidden keys in the repo config: two from session, one from worker
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "[session]\npersistent = true\nhistory = true\n[worker]\nmax_depth = 5\n",
+            "[session]\npersistent = true\nhistory = true\n[worker]\ndefault_depth = 5\n",
         )
         .expect("write");
 
-        let err = CtxConfig::load(repo.path(), &|_| None)
-            .expect_err("forbidden keys should fail");
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("forbidden keys should fail");
 
         let err_str = err.to_string();
         assert!(
@@ -13124,7 +13126,9 @@ mod tests {
         );
         // All three keys should be mentioned
         assert!(
-            err_str.contains("persistent") && err_str.contains("history") && err_str.contains("max_depth"),
+            err_str.contains("persistent")
+                && err_str.contains("history")
+                && err_str.contains("default_depth"),
             "error should name all three forbidden keys: {err_str}"
         );
     }
@@ -13145,15 +13149,13 @@ mod tests {
         {
             use std::fs::Permissions;
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, Permissions::from_mode(0o000))
-                .expect("chmod");
+            std::fs::set_permissions(&config_path, Permissions::from_mode(0o000)).expect("chmod");
         }
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let repo = tempfile::tempdir().expect("repo");
 
-        let err = CtxConfig::load(repo.path(), &|_| None)
-            .expect_err("unreadable file should fail");
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("unreadable file should fail");
 
         let err_str = err.to_string();
         assert!(

@@ -47,16 +47,22 @@ fn classify_package_manager(resolved: &Path, original: &Path) -> Option<PackageM
         return Some(PackageManager::Homebrew);
     }
 
-    // Check resolved path for Chocolatey markers (both Unix-like and Windows separators).
-    if path_contains_component(resolved, "chocolatey")
-        && (resolved_str.contains("/lib/") || resolved_str.contains("\\lib\\"))
-    {
-        return Some(PackageManager::Chocolatey);
-    }
+    // Check resolved path for Chocolatey markers (handles both forward and back slashes).
+    // Check the string directly since on Unix a Windows path won't be separated into components.
+    if resolved_str.contains("chocolatey") {
+        let has_lib_path = resolved_str.contains("/lib/")
+            || resolved_str.contains("\\lib\\")
+            || resolved_str.contains("\\lib/")
+            || resolved_str.contains("/lib\\");
 
-    // On Windows, also check for %ChocolateyInstall% pattern.
-    if cfg!(windows) && resolved_str.contains("chocolatey") {
-        return Some(PackageManager::Chocolatey);
+        if has_lib_path {
+            return Some(PackageManager::Chocolatey);
+        }
+
+        // On Windows, a path containing chocolatey alone is sufficient
+        if cfg!(windows) {
+            return Some(PackageManager::Chocolatey);
+        }
     }
 
     // Check if original path is a symlink pointing into a package manager directory.
@@ -611,10 +617,10 @@ fn update_in(cli: &UpdateCli, context: &UpdateContext<'_>) -> UpdateResult<i32> 
 
     let binary = binary_from_asset(&downloaded)?;
     (context.installer)(context.target_path, &binary, &target_version)?;
-    println!(
+    crate::output::success(format!(
         "zirv {target_version} successfully installed to {}",
         context.target_path.display()
-    );
+    ));
     Ok(0)
 }
 
@@ -979,5 +985,29 @@ mod tests {
             Some(PackageManager::Homebrew),
             "symlink into Homebrew Cellar must be detected"
         );
+    }
+
+    #[test]
+    fn package_manager_refusal_message_contains_correct_command() {
+        let msg = package_manager_refusal(PackageManager::Homebrew);
+        assert!(msg.contains("brew upgrade zirv"), "got: {}", msg);
+        assert!(
+            msg.contains("ZIRV_UPDATE_ALLOW_PACKAGE_MANAGER=1"),
+            "got: {}",
+            msg
+        );
+        assert!(msg.contains("Homebrew"), "got: {}", msg);
+    }
+
+    #[test]
+    fn package_manager_refusal_message_for_chocolatey() {
+        let msg = package_manager_refusal(PackageManager::Chocolatey);
+        assert!(msg.contains("choco upgrade zirv"), "got: {}", msg);
+        assert!(
+            msg.contains("ZIRV_UPDATE_ALLOW_PACKAGE_MANAGER=1"),
+            "got: {}",
+            msg
+        );
+        assert!(msg.contains("Chocolatey"), "got: {}", msg);
     }
 }
