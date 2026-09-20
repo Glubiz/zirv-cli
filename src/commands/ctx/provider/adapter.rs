@@ -131,6 +131,92 @@ impl ProviderRequest {
             cache: CacheMode::Disabled,
         }
     }
+
+    /// Final native egress boundary. Every string Zirv composes for either a
+    /// direct API adapter or an official-harness execution adapter is masked
+    /// here under one vault transaction. Provider-signed thinking cannot be
+    /// rewritten without invalidating its signature, so a finding there
+    /// fails closed instead of sending or corrupting it.
+    pub fn obfuscate_for_egress(
+        &mut self,
+        state_root: &std::path::Path,
+        repo: &std::path::Path,
+        options: &crate::commands::ctx::obfuscate::Options,
+        surface: &str,
+    ) -> crate::commands::ctx::CtxResult<()> {
+        let mut candidate = self.clone();
+        crate::commands::ctx::obfuscate_store::with_vault(
+            &crate::commands::ctx::obfuscate_store::vault_path(state_root, repo),
+            |vault| {
+                for text in &mut candidate.system {
+                    *text = mask(text, vault, options, surface);
+                }
+                for message in &mut candidate.messages {
+                    for content in &mut message.content {
+                        match content {
+                            ProviderContent::Text { text }
+                            | ProviderContent::ToolResult { content: text, .. }
+                            | ProviderContent::Refusal { text } => {
+                                *text = mask(text, vault, options, surface);
+                            }
+                            ProviderContent::ToolUse { input, .. } => {
+                                mask_json(input, vault, options, surface);
+                            }
+                            ProviderContent::Thinking { thinking, .. } => {
+                                let mut detect = options.clone();
+                                detect.mode = crate::commands::ctx::obfuscate::Mode::Flag;
+                                let (_, findings) = crate::commands::ctx::obfuscate::obfuscate(
+                                    thinking, vault, &detect, surface,
+                                );
+                                if !findings.is_empty() {
+                                    return Err("refusing native request: sensitive data appears in provider-signed thinking and cannot be rewritten safely".into());
+                                }
+                            }
+                            ProviderContent::RedactedThinking { .. } => {}
+                        }
+                    }
+                }
+                for tool in &mut candidate.tools {
+                    tool.description = mask(&tool.description, vault, options, surface);
+                    mask_json(&mut tool.input_schema, vault, options, surface);
+                }
+                Ok(())
+            },
+        )?;
+        *self = candidate;
+        Ok(())
+    }
+}
+
+fn mask(
+    text: &str,
+    vault: &mut crate::commands::ctx::obfuscate::Vault,
+    options: &crate::commands::ctx::obfuscate::Options,
+    surface: &str,
+) -> String {
+    crate::commands::ctx::obfuscate::obfuscate(text, vault, options, surface).0
+}
+
+fn mask_json(
+    value: &mut serde_json::Value,
+    vault: &mut crate::commands::ctx::obfuscate::Vault,
+    options: &crate::commands::ctx::obfuscate::Options,
+    surface: &str,
+) {
+    match value {
+        serde_json::Value::String(text) => *text = mask(text, vault, options, surface),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                mask_json(value, vault, options, surface);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                mask_json(value, vault, options, surface);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

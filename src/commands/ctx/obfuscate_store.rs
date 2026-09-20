@@ -22,6 +22,30 @@ pub fn vault_path(state_root: &Path, repo: &Path) -> PathBuf {
         .join(format!("{}.jsonl", super::state::repo_slug(repo)))
 }
 
+pub fn options_from_config(
+    config: &super::config::ObfuscateConfig,
+    home: &Path,
+) -> CtxResult<Options> {
+    let literals = match config.literals_file.as_deref() {
+        None => Vec::new(),
+        Some(path) => {
+            let path = if let Some(rest) = path.strip_prefix("~/") {
+                home.join(rest)
+            } else {
+                let path = PathBuf::from(path);
+                if path.is_absolute() { path } else { home.join(path) }
+            };
+            std::fs::read_to_string(&path)?
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        }
+    };
+    Ok(config.options(literals))
+}
+
 /// Holds the cross-process lock for the complete load-transform-save
 /// transaction. No caller can observe and then overwrite another process's
 /// newly assigned placeholder.
@@ -55,6 +79,30 @@ pub fn rehydrate_text(state_root: &Path, repo: &Path, text: &str) -> CtxResult<S
     with_vault(&vault_path(state_root, repo), |vault| {
         Ok(super::obfuscate::rehydrate(text, vault))
     })
+}
+
+pub fn rehydrate_json(state_root: &Path, repo: &Path, value: &mut serde_json::Value) -> CtxResult<()> {
+    with_vault(&vault_path(state_root, repo), |vault| {
+        rehydrate_json_value(value, vault);
+        Ok(())
+    })
+}
+
+fn rehydrate_json_value(value: &mut serde_json::Value, vault: &Vault) {
+    match value {
+        serde_json::Value::String(text) => *text = super::obfuscate::rehydrate(text, vault),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rehydrate_json_value(value, vault);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                rehydrate_json_value(value, vault);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 fn load(path: &Path) -> CtxResult<Vault> {
