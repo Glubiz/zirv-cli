@@ -914,6 +914,11 @@ to the section that documents it in depth.
   your instruction files](#reviewing-your-instruction-files) and
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
+- **Jev advisory status** — `jev` (`zirv ctx jev status`) reports whether
+  the hosted TypeSafe Jev advisor is active: each of the five `[jev]`
+  gates (off by default), whether its credential is present (never its
+  value), and the endpoint and model in use. See [Harness
+  proxy](#harness-proxy).
 - **Configured capabilities** — `capabilities` reports every non-shell
   integration a native session can use — MCP servers, web search/fetch,
   browser, language diagnostics, artifact and frontend rendering — as
@@ -1017,6 +1022,12 @@ to the section that documents it in depth.
   restore AI-specific settings separately from the rest of Zirv (`setup
   reset`, `setup restore`). See [AI setup and harness
   migration](#ai-setup-and-harness-migration).
+- **Guided tour** — `tour` (`zirv tour [topic]`) walks a new installation
+  through nine topics (overview, scripts, workflow, harnesses, memory,
+  safety, jev, config, unstuck); pages under a TTY, plain-prints when
+  piped, exits 1 on an unknown topic while naming every valid one, and is
+  offered automatically at the end of a successful first run. See [Guided
+  tour](#guided-tour).
 - **Self-update** — `update` (`--version <x.y.z>`) installs the latest or a
   specified zirv release. See [Upgrading](#upgrading).
 - **Bug and feature reports** — `report` (`bug`/`feature`) files a Zirv
@@ -1542,7 +1553,7 @@ marks it as shadowed in the listing.
 <!-- zchk-doc-reserved:start -->
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
 `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`,
-`commands`, `update`, `session`, `native`, and their short aliases `h`, `v`, `i`, `c`,
+`commands`, `update`, `session`, `tour`, `native`, and their short aliases `h`, `v`, `i`, `c`,
 <!-- zchk-doc-reserved:end -->
 are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
