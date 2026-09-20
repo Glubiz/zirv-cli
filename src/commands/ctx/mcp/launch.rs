@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(argv[1], "--mcp-config=other.json");
         let allowed = argv[3].strip_prefix("--allowedTools=").unwrap();
         let names: Vec<_> = allowed.split(',').collect();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 10);
         assert!(names.contains(&"mcp__zirv__inbox_read"));
         assert!(
             names

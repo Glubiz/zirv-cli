@@ -15,35 +15,35 @@
 //! mirrors its tokenization approach instead, because skill triggers *are*
 //! meant to match whole words/phrases only -- "cat" must not activate a
 //! skill whose trigger is "category".
+//!
+//! Issue #539 chunk E2.2: [`score_skills`] now has a real production
+//! caller -- `ctx::prompt::skill_suggestion_context_for_role`, which renders
+//! its top matches into a session's own prompt as suggestions, not a body.
 
 use std::collections::BTreeSet;
 
 use super::skill::{RegisteredSkill, SkillRegistry, WorkflowPhase};
 
 /// A trigger phrase match is the strongest, most deliberate signal a task
-/// can give -- an operator or skill author chose this exact wording.
-// #[allow(dead_code)]: `score_skills` has no production caller yet -- the
-// issue's own brief defers wiring it into `render_current_context` to a
-// later chunk (adding scored skills to a running step's context needs its
-// own review); only tests exercise this module today.
-#[allow(dead_code)]
-const TRIGGER_MATCH_SCORE: u32 = 3;
+/// can give -- an operator or skill author chose this exact wording. `pub(
+/// crate)`: issue #539 chunk E2.2's task-matched suggestions layer (`ctx::
+/// prompt::skill_suggestion_context_for_role`) filters on this exact floor
+/// to keep a phase-only match out of the composed prompt (see that
+/// function's own doc comment for why).
+pub(crate) const TRIGGER_MATCH_SCORE: u32 = 3;
 /// The active workflow phase alone is a weaker signal than an explicit
 /// trigger match: many skills declare a phase, but only some of those are
 /// actually relevant to what the task says.
-#[allow(dead_code)] // see `TRIGGER_MATCH_SCORE`'s note
 const PHASE_MATCH_SCORE: u32 = 2;
 /// A skill needs at least one substantive signal to activate -- exactly one
 /// phase match alone still clears this (a phase-scoped skill activating for
 /// every task in that phase is intended), but a skill with no trigger and
 /// no phase declared at all, or matching neither, contributes nothing.
-#[allow(dead_code)] // see `TRIGGER_MATCH_SCORE`'s note
 const ACTIVATION_FLOOR: u32 = 2;
 
 /// Mirrors `selection::word_tokens`: any non-alphanumeric byte is a
 /// separator, so a single-word trigger only matches a WHOLE word in the
 /// task text, never a substring inside a longer word.
-#[allow(dead_code)] // see `TRIGGER_MATCH_SCORE`'s note
 fn word_tokens(text: &str) -> BTreeSet<&str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -53,7 +53,6 @@ fn word_tokens(text: &str) -> BTreeSet<&str> {
 /// One skill's deterministic score against `task`/`phase`, and why it
 /// scored that way -- issue #539's requirement that an activation is
 /// reviewable, not just a number.
-#[allow(dead_code)] // see `TRIGGER_MATCH_SCORE`'s note
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillMatch<'a> {
     pub skill: &'a RegisteredSkill,
@@ -67,11 +66,11 @@ pub struct SkillMatch<'a> {
 /// first, ties broken by id -- never by map iteration order, and never by
 /// anything a model decided.
 ///
-/// Not wired into `engine::render_current_context` yet: adding scored
-/// skills to a running workflow step's context changes what a step sees on
-/// every turn, and that needs its own review separate from adding the
-/// scoring function itself.
-#[allow(dead_code)] // see `TRIGGER_MATCH_SCORE`'s note
+/// Issue #539 chunk E2.2: wired into `ctx::prompt::skill_suggestion_context_
+/// for_role`, which additionally requires at least one trigger match
+/// (`TRIGGER_MATCH_SCORE`) before suggesting a skill in a session's prompt --
+/// a bare phase match alone would attach a suggestion to every session in
+/// that phase, which is noise.
 pub fn score_skills<'a>(
     registry: &'a SkillRegistry,
     task: &str,

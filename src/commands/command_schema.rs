@@ -201,6 +201,9 @@ const READ_ONLY: &[&str] = &[
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
+    // Issue #539 chunk E2.3: reads one skill's bundle resource body, the
+    // same on-demand-read shape `zirv ctx recall` already sits in.
+    "zirv skill read",
     // Issue #353: renders the protocol contract compiled into this binary.
     // Touches no disk, no registry and no socket.
     "zirv ctx api schema",
@@ -240,6 +243,9 @@ const MUTATING: &[&str] = &[
     "zirv session stop",
     "zirv init",
     "zirv create",
+    // Issue #539 chunk E2.3: writes a portable bundle directory (`SKILL.md`
+    // plus any resources) to the operator-chosen `--dir`.
+    "zirv skill export",
     "zirv report bug",
     "zirv report feature",
     "zirv update",

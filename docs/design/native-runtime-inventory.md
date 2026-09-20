@@ -153,6 +153,8 @@ criterion).
 | `skill` | N06 (#475) | prints the bundled operator orientation skill |
 | `skill list` | N06 (#475) |  |
 | `skill show` | N06 (#475) |  |
+| `skill export` | N06 (#475) | writes a portable bundle directory for one skill |
+| `skill read` | N06 (#475) | reads one skill's bundle resource body |
 | `test` | shared |  |
 | `test all` | shared |  |
 | `test baseline` | shared |  |

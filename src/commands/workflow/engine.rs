@@ -1065,7 +1065,12 @@ fn resolve_builtin_or_registry(
 /// stable for state/back-compat; substantial implementation additionally
 /// receives the resume-safe accepted-plan executor, whose own dependency stack
 /// includes worktree isolation and the general implementation discipline.
-fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
+///
+/// `pub(crate)`: issue #539 chunk E2.2's task-matched suggestions layer
+/// (`ctx::prompt::skill_suggestion_context_for_role`) calls this to learn
+/// which skill ids the active step already injects, so it never suggests a
+/// skill whose body is already in context.
+pub(crate) fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
     let mut ids = Vec::new();
     if step.phase == WorkflowPhase::Implement
         && classification.complexity >= Complexity::Substantial

@@ -132,6 +132,13 @@ pub enum TelemetryKind {
     /// (a session-level fact, like `AdoptionDetected`); `session_id` names
     /// the session.
     TurnLatencySampled,
+    /// Issue #539 chunk E1: one successful `skill_load` -- native tool or
+    /// MCP bridge, see `skill_surface` -- recorded so a skill an agent chose
+    /// for itself leaves the same durable trail an operator's own `/skill`
+    /// invocation would. A refused load (an unsupported capability or
+    /// integration) records nothing: only a load that actually returned
+    /// instructions is an activation.
+    SkillActivated,
 }
 
 // Issue #293: `Eq` dropped -- `tool_error_rate: Option<f64>` cannot
@@ -271,6 +278,23 @@ pub struct TelemetryEvent {
     /// existed.
     #[serde(default)]
     pub fix_round_cause: Option<FixRoundCause>,
+    /// Issue #539 chunk E1, `SkillActivated` only: the loaded skill's id,
+    /// version, content hash and source (`built-in`/`operator-global`/
+    /// `repository-untrusted`, `SkillSource`'s own `Display` spelling).
+    /// `#[serde(default)]` so an event recorded before this field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub skill_id: Option<String>,
+    #[serde(default)]
+    pub skill_version: Option<u32>,
+    #[serde(default)]
+    pub skill_content_hash: Option<String>,
+    #[serde(default)]
+    pub skill_source: Option<String>,
+    /// `native-tool` or `mcp` -- which surface the agent used to load this
+    /// skill, `SkillActivated` only.
+    #[serde(default)]
+    pub skill_surface: Option<String>,
 }
 
 /// Issue #699 Phase 0: why one review/fix round happened -- the datum the
@@ -426,6 +450,11 @@ impl TelemetryEvent {
             tool_error_rate: None,
             approval_wait_ms: None,
             fix_round_cause: None,
+            skill_id: None,
+            skill_version: None,
+            skill_content_hash: None,
+            skill_source: None,
+            skill_surface: None,
         }
     }
 
@@ -517,6 +546,10 @@ pub fn record(
         &mut event.artifact_stage,
         &mut event.deploy_tier,
         &mut event.agent_id,
+        &mut event.skill_id,
+        &mut event.skill_content_hash,
+        &mut event.skill_source,
+        &mut event.skill_surface,
     ]
     .into_iter()
     .flatten()
@@ -605,6 +638,21 @@ pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
     }
     events.sort_by_key(|event: &TelemetryEvent| (event.timestamp, event.id.clone()));
     Ok(events)
+}
+
+/// Issue #539 chunk E1: every `SkillActivated` event recorded for `repo`,
+/// oldest first (the same order `list` already returns) -- so a CLI surface
+/// or a test can read back what an agent loaded for itself without
+/// re-deriving the filter each time.
+// #[allow(dead_code)]: no CLI surface reads this back yet; only the native
+// tool/MCP bridge tests call it today, to assert what `record_skill_
+// activation` wrote.
+#[allow(dead_code)]
+pub fn skill_activations(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
+    Ok(list(state, repo)?
+        .into_iter()
+        .filter(|event| event.kind == TelemetryKind::SkillActivated)
+        .collect())
 }
 
 pub fn clear(state: &StateDir, repo: &Path) -> CtxResult<usize> {
@@ -1689,6 +1737,66 @@ mod tests {
         )
         .unwrap();
         assert!(list(&state, repo.path()).unwrap().is_empty());
+    }
+
+    /// Issue #539 chunk E1: the new `skill_*` fields are additive
+    /// (`#[serde(default)]`, no `TELEMETRY_SCHEMA_VERSION` bump), so a
+    /// journal line written before they existed -- same schema version,
+    /// fields simply absent -- must still parse rather than being dropped
+    /// by `list`'s own schema-version filter.
+    #[test]
+    fn an_old_event_without_skill_activation_fields_still_parses() {
+        let event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        let mut value = serde_json::to_value(&event).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "skill_id",
+            "skill_version",
+            "skill_content_hash",
+            "skill_source",
+            "skill_surface",
+        ] {
+            object.remove(field);
+        }
+        let parsed: TelemetryEvent =
+            serde_json::from_value(value).expect("an old event without the new fields parses");
+        assert_eq!(parsed.schema_version, TELEMETRY_SCHEMA_VERSION);
+        assert_eq!(parsed.skill_id, None);
+        assert_eq!(parsed.skill_surface, None);
+    }
+
+    #[test]
+    fn skill_activations_reads_back_only_skill_activated_events() {
+        let root = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let config = TelemetryConfig {
+            enabled: true,
+            max_events: 10,
+            retention_days: 0,
+        };
+        let mut skill_event = TelemetryEvent::new(TelemetryKind::SkillActivated);
+        skill_event.skill_id = Some("incident-investigation".into());
+        skill_event.skill_version = Some(1);
+        skill_event.skill_content_hash = Some("deadbeef".into());
+        skill_event.skill_source = Some("built-in".into());
+        skill_event.skill_surface = Some("native-tool".into());
+        record(&state, repo.path(), &skill_event, &config).unwrap();
+        record(
+            &state,
+            repo.path(),
+            &TelemetryEvent::new(TelemetryKind::WorkflowStarted),
+            &config,
+        )
+        .unwrap();
+
+        let activations = skill_activations(&state, repo.path()).unwrap();
+        assert_eq!(activations.len(), 1);
+        assert_eq!(
+            activations[0].skill_id.as_deref(),
+            Some("incident-investigation")
+        );
+        assert_eq!(activations[0].skill_surface.as_deref(), Some("native-tool"));
     }
 
     /// The old reader was `std::env::var(..).and_then(|v| v.parse().ok())

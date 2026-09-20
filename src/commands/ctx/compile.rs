@@ -191,9 +191,10 @@ pub struct CompiledContext {
 /// Built entirely from data [`CompiledContext`] already holds and the exact
 /// literal header constants `prompt.rs`'s own `with_*_layer` functions write
 /// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `WORKFLOW_LAYER_
-/// HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/`MEMORY_SHARED_LAYER_HEADER`,
-/// `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) -- **no file is read again** to
-/// build this list, only `composed.text` and `composed.sources`, both
+/// HEADER`, `SKILL_SUGGESTIONS_LAYER_HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/
+/// `MEMORY_SHARED_LAYER_HEADER`, `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) --
+/// **no file is read again** to build this list, only `composed.text` and
+/// `composed.sources`, both
 /// already in memory. Issue #275 (`zirv context lint`) is the first consumer
 /// (CTX004 proportionality over the built-in `Default`/`Harness` blocks,
 /// sliced straight out of an already-compiled prompt); issue #299 (prefix-
@@ -295,6 +296,17 @@ impl CompiledContext {
                     .map(|header_at| (header_at + CONTEXT_LAYER_HEADER.len(), None, None)),
                 PromptSource::Workflow => find_after(text, cursor, prompt::WORKFLOW_LAYER_HEADER)
                     .map(|header_at| (header_at + prompt::WORKFLOW_LAYER_HEADER.len(), None, None)),
+                PromptSource::SkillSuggestions => {
+                    find_after(text, cursor, prompt::SKILL_SUGGESTIONS_LAYER_HEADER).map(
+                        |header_at| {
+                            (
+                                header_at + prompt::SKILL_SUGGESTIONS_LAYER_HEADER.len(),
+                                None,
+                                None,
+                            )
+                        },
+                    )
+                }
                 // Private-memory entries render first when present; an
                 // all-shared selection (no private entries at all) starts
                 // with the shared header instead -- try both, in the order
@@ -1324,6 +1336,16 @@ pub fn compile_with_harness_roster(
     let composed = prompt::with_workflow_layer(
         composed,
         prompt::workflow_context_for_role(repo, role).as_deref(),
+    );
+    // Issue #539 chunk E2.2: task-matched skill suggestions, immediately
+    // after the workflow-step layer for the same reason `Workflow` itself
+    // sits here rather than ahead of `User`/`Repo`/`Context` -- the task text
+    // this scores against is exactly as volatile as the active step, so
+    // anything positioned after it would fall out of the provider's prompt
+    // cache on every step transition, resume and restart for no benefit.
+    let composed = prompt::with_skill_suggestions_layer(
+        composed,
+        prompt::skill_suggestion_context_for_role(repo, home, role).as_deref(),
     );
     // Issue #155: the one memory layer, injected last of everything zirv
     // composes deterministically -- mail and the command-line layer are the

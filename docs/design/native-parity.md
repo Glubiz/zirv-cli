@@ -188,6 +188,8 @@ means it runs on any supported OS with no provider configured at all.
 | `skill` | `workflow::skill` + `runtime::context::compile` | same zirv code | none | `workflow::skill::tests::builtins_are_valid_compact_and_provider_neutral` | `unit` |
 | `skill list` | `workflow::skill` | same zirv code | none | `workflow::skill::tests::stable_id_and_version_resolution_is_identical_across_adapters` | `unit` |
 | `skill show` | `workflow::skill` | same zirv code | none | `workflow::skill::tests::an_operator_global_skill_still_overrides_a_built_in` | `unit` |
+| `skill export` | `workflow::skill` | same zirv code | none | `workflow::skill::tests::skill_export_then_reload_as_an_operator_bundle_round_trips_at_cli_level` | `unit` |
+| `skill read` | `workflow::skill` | same zirv code | none | `workflow::skill::tests::skill_read_refuses_a_path_escape_at_cli_level` | `unit` |
 | `test` | `workflow::verification` | same zirv code | none | `verification::tests::discovers_rust_checks_without_external_services` | `unit` |
 | `test all` | `workflow::verification` | same zirv code | none | `verification::tests::disabled_repo_checks_are_listed_but_never_executed` | `unit` |
 | `test baseline` | `workflow::verification` | same zirv code | none | `verification::tests::baseline_round_trips_through_the_operator_home_directory`, `verification::tests::a_failure_not_in_the_baseline_blocks_the_gate_and_names_the_new_failure` | `unit` |

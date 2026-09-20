@@ -1583,7 +1583,10 @@ session restart or compaction.
 
 ```bash
 zirv skill list
+zirv skill list --match "production outage, paging alert" --limit 3
 zirv skill show systematic-debugging --agent codex
+zirv skill export systematic-debugging --dir ./bundles
+zirv skill read my-skill references/checklist.md   # a bundle resource; built-ins carry no resources
 zirv workflow classify --task "fix authentication race"
 zirv workflow start bugfix --task "fix authentication race" --agent codex
 zirv workflow start feature --task "use only shipped methodology" --built-in-only
@@ -2094,6 +2097,21 @@ shared under `.zirv/skills/` or kept operator-global under
 persists that choice across resume and prompt composition. Repository skills are untrusted:
 they can request logical capabilities but never grant themselves filesystem,
 shell, network, or other permissions.
+
+Every session that does real work -- worker, single-seat, and orchestrator --
+carries a short standing pointer at the skill library, and a session driving
+an active workflow additionally sees up to 3 task-matched suggestions
+(id, version, description, and why each matched) resolved by the same
+deterministic activation scorer `skill list --match` uses; suggestions are
+metadata only, never an instruction body, and a skill the active step already
+injected is never suggested again. `zirv skill list --match "<task>"
+[--phase <phase>] [--limit N]` prints the same scored matches from a shell;
+`--json` emits digests only unless `--full` is also given, which restores the
+pre-issue-#539 full-manifest `--json` shape. `zirv skill export <id> --dir
+<path>` writes a portable bundle directory (for another host, or to seed
+`~/.zirv/skills/`); `zirv skill read <id> <path>` reads one bundle resource
+body on demand, refusing a `..`/absolute escape the same way the registry's
+own loader does.
 
 Use `zirv workflow review package <id>` for a compact diff/test review input,
 `zirv artifact render <path>` for stable static artifact references, and
@@ -3252,6 +3270,9 @@ configuration so a host's working directory cannot select the wrong project.
 | `worker_status` | Optional `id`, `cursor`, `limit` | Repository-scoped delegation/report records with recorded phase, attempt, exit code where available, report outcome and truncation. Worker IDs sort lexicographically; follow `next_cursor`. |
 | `result_read` | `id`, optional `offset`, `revision`, `max_bytes` | A page of the persisted worker result JSON, including report text, structured result, validation errors and undeclared changes. Use an ID from `worker_status`. |
 | `inbox_read` | Optional `cursor`, `limit`, `max_bytes` | Unread message previews for the launch-bound recipient, with sender labels, truncation and `next_cursor`. Never consumes, acknowledges, claims, expires or retries delivery. |
+| `skill_list` | Optional `query`, `phase`, `limit` | Every registered skill as a metadata-only digest (never instruction text) with no query; with a query, the best-matching skills ranked by the deterministic activation scorer, each with `score` and `reasons`. |
+| `skill_load` | `id` (accepts `id@version`) | The skill's dependency-ordered instruction stack, content hash, and resource list. Refused before any text is returned if this session's capability report does not support the skill's required capabilities or integrations; a repository-sourced skill is marked untrusted data. Records one activation-journal entry on success. |
+| `skill_read_resource` | `id`, `path` | One bundle resource body (reference doc, script or asset) by its bundle-relative path. |
 
 All successful responses contain `captured_at` (Unix seconds), `repository`,
 and `data`, with both an output schema and structured JSON. Tool failures
@@ -3312,7 +3333,7 @@ name is reserved for this automatic entry during the launch. No project or
 user host settings are edited. On Windows, Zirv writes Claude's generated JSON
 under the private state directory's `mcp-launch/` to keep JSON off shell-shim
 command lines; users do not create or maintain that file.
-Claude launches also pre-approve the bridge's seven named read-only tools so
+Claude launches also pre-approve the bridge's ten named read-only tools so
 headless `dontAsk` sessions can use them. Native deny/ask rules and the server's
 current policy gates still apply; other servers receive no added permissions.
 
@@ -3353,7 +3374,7 @@ forward that setting through its MCP server environment configuration.
 See the official [Codex MCP](https://developers.openai.com/codex/mcp) and
 [Claude Code MCP](https://code.claude.com/docs/en/mcp) configuration references.
 
-The server's seven tools neither consume mail nor write memory, run commands, launch
+The server's ten tools neither consume mail nor write memory, run commands, launch
 workers, or advance workflows. Existing hooks, CLI checkpoints and supervisor
 recovery continue independently. Reading a registered report does not certify
 that its claims are correct. Mail mutations, dispatch,
@@ -3367,7 +3388,7 @@ zirv ctx mcp doctor --repo /absolute/path/to/project
 ```
 
 The diagnostic launches the current executable, negotiates MCP, validates all
-seven tool definitions and invokes `session_snapshot`. It prints JSON on success
+ten tool definitions and invokes `session_snapshot`. It prints JSON on success
 and exits nonzero on a denied call, protocol error or timeout. It inherits the
 same state/configuration environment and optional session binding as `serve`,
 and terminates and reaps its subprocess on all paths. This verifies the local

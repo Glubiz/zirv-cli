@@ -31,6 +31,7 @@ pub mod selection;
 pub mod skill;
 pub mod skill_activation;
 pub mod skill_render;
+pub mod skill_tools;
 pub mod team;
 pub mod telemetry;
 pub mod verification;

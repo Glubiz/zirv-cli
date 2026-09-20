@@ -8,6 +8,8 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use super::capability::{CapabilityId, CapabilityReport, IntegrationId};
+use super::skill_activation::score_skills;
+use super::skill_render;
 use crate::commands::ctx::CtxResult;
 
 pub const SKILL_SCHEMA_VERSION: u32 = 1;
@@ -38,9 +40,6 @@ const MAX_COMPATIBILITY_CHARS: usize = 500;
 /// A resource body read on demand through [`SkillRegistry::read_resource`]
 /// is truncated to this many bytes -- progressive disclosure only helps if
 /// the on-demand read stays bounded too, not just the upfront digest.
-// #[allow(dead_code)]: `read_resource` has no caller in this chunk; the tool
-// registry that reads bundle resources on demand is a later #539 chunk.
-#[allow(dead_code)]
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
 /// Issue #539: the whole discovery listing -- one compact line per
 /// registered skill -- must fit this budget. This guards the human-facing
@@ -286,9 +285,6 @@ impl RegisteredSkill {
     /// progressive disclosure): everything needed to decide whether to
     /// activate a skill, and nothing that would spend the discovery budget
     /// on instruction text or a resource body before that decision is made.
-    // #[allow(dead_code)]: the activation scorer that calls this lands in a
-    // later #539 chunk; only tests construct a digest today.
-    #[allow(dead_code)]
     pub fn digest(&self) -> SkillDigest<'_> {
         SkillDigest {
             id: &self.manifest.id,
@@ -312,9 +308,6 @@ impl RegisteredSkill {
 /// Issue #539's progressive disclosure: a compact, serializable summary a
 /// caller can use to decide whether to activate a skill without paying for
 /// its instruction text or any resource body. Deliberately excludes both.
-// #[allow(dead_code)]: no production caller constructs one yet; the
-// activation scorer and discovery CLI land in a later #539 chunk.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SkillDigest<'a> {
     pub id: &'a str,
@@ -513,9 +506,6 @@ impl SkillRegistry {
 
     /// Issue #539's progressive disclosure: every registered skill reduced to
     /// its compact intake summary, with no instruction text or resource body.
-    // #[allow(dead_code)]: the CLI/discovery surfaces that call this are a
-    // later #539 chunk; only tests exercise it today.
-    #[allow(dead_code)]
     pub fn digests(&self) -> Vec<SkillDigest<'_>> {
         self.skills.values().map(RegisteredSkill::digest).collect()
     }
@@ -551,9 +541,6 @@ impl SkillRegistry {
     /// which re-checks the same trust rules the loader applied at discovery
     /// time rather than trusting a path that could have changed on disk
     /// since.
-    // #[allow(dead_code)]: the native tool registry that exposes this to a
-    // running session is a later #539 chunk; only tests call it today.
-    #[allow(dead_code)]
     pub fn read_resource(&self, id: &str, relative: &str) -> CtxResult<String> {
         let skill = self.get(id)?;
         let bundle_root = skill
@@ -1000,8 +987,6 @@ fn compute_content_hash(
     Ok(crate::commands::ctx::safety::sha256_hex(&bytes))
 }
 
-// #[allow(dead_code)]: only `read_resource` calls this today; see its note.
-#[allow(dead_code)]
 fn truncate_tool_output(text: &str) -> String {
     if text.len() <= MAX_TOOL_OUTPUT_BYTES {
         return text.to_string();
@@ -1973,13 +1958,32 @@ pub enum SkillCommand {
     List(SkillListArgs),
     /// Show one resolved skill and capability diagnostics.
     Show(SkillShowArgs),
+    /// Export one skill as a portable bundle directory.
+    Export(SkillExportArgs),
+    /// Read one skill's bundle resource body.
+    Read(SkillReadArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct SkillListArgs {
-    /// Emit machine-readable JSON.
+    /// Emit machine-readable JSON (digests -- metadata only; pass --full for
+    /// instruction bodies too).
     #[arg(long)]
     pub json: bool,
+    /// With --json, include full instruction bodies (the pre-issue-#539
+    /// shape) instead of digests.
+    #[arg(long)]
+    pub full: bool,
+    /// Score every skill against this task text and print the best matches
+    /// instead of the whole registry.
+    #[arg(long = "match")]
+    pub match_task: Option<String>,
+    /// Restrict scoring to this workflow phase (with --match).
+    #[arg(long)]
+    pub phase: Option<String>,
+    /// Maximum number of matches to print (with --match).
+    #[arg(long, default_value_t = 5)]
+    pub limit: usize,
     /// Ignore operator-global and repository-provided skills.
     #[arg(long)]
     pub built_in_only: bool,
@@ -1998,6 +2002,35 @@ pub struct SkillShowArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     pub json: bool,
+    /// Ignore operator-global and repository-provided skills.
+    #[arg(long)]
+    pub built_in_only: bool,
+    /// Repository root; defaults to the current directory.
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillExportArgs {
+    /// Stable skill id, optionally suffixed with @version.
+    pub id: String,
+    /// Directory to export the portable bundle into.
+    #[arg(long)]
+    pub dir: PathBuf,
+    /// Ignore operator-global and repository-provided skills.
+    #[arg(long)]
+    pub built_in_only: bool,
+    /// Repository root; defaults to the current directory.
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillReadArgs {
+    /// Stable skill id, optionally suffixed with @version.
+    pub id: String,
+    /// Bundle resource path, relative to the skill's own bundle root.
+    pub path: String,
     /// Ignore operator-global and repository-provided skills.
     #[arg(long)]
     pub built_in_only: bool,
@@ -2027,87 +2060,159 @@ fn report_warnings(registry: &SkillRegistry) {
     }
 }
 
+/// One `--match` result: a skill's digest plus why and how well it scored.
+/// Digest-only, per issue #539's progressive disclosure -- never the
+/// instruction body.
+#[derive(Serialize)]
+struct SkillMatchRow<'a> {
+    #[serde(flatten)]
+    digest: SkillDigest<'a>,
+    score: u32,
+    reasons: &'a [String],
+}
+
 pub fn run(args: &SkillArgs, writer: &mut impl Write) -> CtxResult<i32> {
     match &args.command {
-        SkillCommand::List(args) => {
-            let registry = registry(args.repo.as_deref(), args.built_in_only)?;
-            report_warnings(&registry);
-            if args.json {
-                serde_json::to_writer_pretty(&mut *writer, &registry.list().collect::<Vec<_>>())?;
-                writeln!(writer)?;
-            } else {
-                writeln!(writer, "ID\tVERSION\tSOURCE\tBUDGET")?;
-                for skill in registry.list() {
-                    writeln!(
-                        writer,
-                        "{}\t{}\t{}\t{} B",
-                        skill.manifest.id,
-                        skill.manifest.version,
-                        skill.source,
-                        skill.manifest.context_budget_bytes
-                    )?;
-                }
-            }
-            Ok(0)
-        }
-        SkillCommand::Show(args) => {
-            let registry = registry(args.repo.as_deref(), args.built_in_only)?;
-            report_warnings(&registry);
-            let skill = registry.get(&args.id)?;
-            let dependency_order = registry
-                .resolve_stack(&args.id)?
-                .into_iter()
-                .map(|skill| skill.manifest.id.as_str())
+        SkillCommand::List(args) => run_list(args, writer),
+        SkillCommand::Show(args) => run_show(args, writer),
+        SkillCommand::Export(args) => run_export(args, writer),
+        SkillCommand::Read(args) => run_read(args, writer),
+    }
+}
+
+fn run_list(args: &SkillListArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let registry = registry(args.repo.as_deref(), args.built_in_only)?;
+    report_warnings(&registry);
+
+    if let Some(task) = &args.match_task {
+        let phase = args
+            .phase
+            .as_deref()
+            .map(|value| {
+                WorkflowPhase::parse(value)
+                    .ok_or_else(|| format!("unknown workflow phase '{value}'"))
+            })
+            .transpose()?;
+        let matches = score_skills(&registry, task, phase, args.limit);
+        if args.json {
+            let rows: Vec<SkillMatchRow> = matches
+                .iter()
+                .map(|found| SkillMatchRow {
+                    digest: found.skill.digest(),
+                    score: found.score,
+                    reasons: &found.reasons,
+                })
                 .collect();
-            let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
-            let capability_report = args
-                .agent
-                .as_deref()
-                .map(|adapter| CapabilityReport::for_repo(adapter, &repo))
-                .transpose()?;
-            if let Some(report) = &capability_report {
-                registry.ensure_supported(&args.id, report)?;
-            }
-            if args.json {
-                serde_json::to_writer_pretty(
-                    &mut *writer,
-                    &SkillShow {
-                        skill,
-                        dependency_order,
-                        capability_report,
-                    },
-                )?;
-                writeln!(writer)?;
-            } else {
-                writeln!(writer, "{}@{}", skill.manifest.id, skill.manifest.version)?;
-                writeln!(writer, "source: {}", skill.source)?;
-                if let Some(path) = &skill.source_path {
-                    writeln!(writer, "path: {}", path.display())?;
-                }
+            serde_json::to_writer_pretty(&mut *writer, &rows)?;
+            writeln!(writer)?;
+        } else {
+            writeln!(writer, "ID\tVERSION\tSCORE\tREASONS")?;
+            for found in &matches {
                 writeln!(
                     writer,
-                    "budget: {} bytes",
-                    skill.manifest.context_budget_bytes
+                    "{}\t{}\t{}\t{}",
+                    found.skill.manifest.id,
+                    found.skill.manifest.version,
+                    found.score,
+                    found.reasons.join("; ")
                 )?;
-                if !dependency_order.is_empty() {
-                    writeln!(writer, "resolution: {}", dependency_order.join(" -> "))?;
-                }
-                if let Some(report) = capability_report {
-                    writeln!(writer, "capabilities ({}):", report.adapter)?;
-                    for capability in skill
-                        .manifest
-                        .required_capabilities
-                        .iter()
-                        .chain(&skill.manifest.optional_capabilities)
-                    {
-                        writeln!(writer, "  {capability}: {}", report.support(*capability))?;
+            }
+        }
+        return Ok(0);
+    }
+
+    if args.json {
+        if args.full {
+            serde_json::to_writer_pretty(&mut *writer, &registry.list().collect::<Vec<_>>())?;
+        } else {
+            serde_json::to_writer_pretty(&mut *writer, &registry.digests())?;
+        }
+        writeln!(writer)?;
+    } else {
+        skill_render::write_digest_list(writer, &registry.digests())?;
+    }
+    Ok(0)
+}
+
+fn run_show(args: &SkillShowArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let registry = registry(args.repo.as_deref(), args.built_in_only)?;
+    report_warnings(&registry);
+    let skill = registry.get(&args.id)?;
+    let dependency_order: Vec<&str> = registry
+        .resolve_stack(&args.id)?
+        .into_iter()
+        .map(|skill| skill.manifest.id.as_str())
+        .collect();
+    let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
+    let capability_report = args
+        .agent
+        .as_deref()
+        .map(|adapter| CapabilityReport::for_repo(adapter, &repo))
+        .transpose()?;
+    if let Some(report) = &capability_report {
+        registry.ensure_supported(&args.id, report)?;
+    }
+    if args.json {
+        serde_json::to_writer_pretty(
+            &mut *writer,
+            &SkillShow {
+                skill,
+                dependency_order,
+                capability_report,
+            },
+        )?;
+        writeln!(writer)?;
+    } else {
+        skill_render::write_digest_detail(writer, skill)?;
+        if !dependency_order.is_empty() {
+            writeln!(writer, "resolution: {}", dependency_order.join(" -> "))?;
+        }
+        if let Some(report) = &capability_report {
+            writeln!(writer, "capabilities ({}):", report.adapter)?;
+            for capability in skill
+                .manifest
+                .required_capabilities
+                .iter()
+                .chain(&skill.manifest.optional_capabilities)
+            {
+                writeln!(writer, "  {capability}: {}", report.support(*capability))?;
+            }
+            if !skill.manifest.required_integrations.is_empty() {
+                writeln!(writer, "integrations ({}):", report.adapter)?;
+                for integration in &skill.manifest.required_integrations {
+                    match report.integration_status(*integration) {
+                        Some(status) => {
+                            write!(writer, "  {integration}: {}", status.state)?;
+                            if let Some(diagnosis) = &status.diagnosis {
+                                write!(writer, " -- {diagnosis}")?;
+                            }
+                            writeln!(writer)?;
+                        }
+                        None => writeln!(writer, "  {integration}: unavailable (not probed)")?,
                     }
                 }
-                writeln!(writer, "\n{}", skill.manifest.instructions)?;
             }
-            Ok(0)
         }
+        writeln!(writer, "\n{}", skill.manifest.instructions)?;
     }
+    Ok(0)
+}
+
+fn run_export(args: &SkillExportArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let registry = registry(args.repo.as_deref(), args.built_in_only)?;
+    report_warnings(&registry);
+    let skill = registry.get(&args.id)?;
+    let bundle_dir = export_bundle(skill, &args.dir)?;
+    writeln!(writer, "{}", bundle_dir.display())?;
+    Ok(0)
+}
+
+fn run_read(args: &SkillReadArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let registry = registry(args.repo.as_deref(), args.built_in_only)?;
+    report_warnings(&registry);
+    let text = registry.read_resource(&args.id, &args.path)?;
+    writeln!(writer, "{text}")?;
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -3155,5 +3260,144 @@ mod tests {
         .unwrap();
         let error = SkillRegistry::load(repo2.path(), None, true, true).unwrap_err();
         assert!(error.to_string().contains("symlinked"));
+    }
+
+    /// Issue #539 chunk E2.3: `skill list --match` ranks by `score_skills`'s
+    /// own deterministic order (score descending, id ascending on a tie),
+    /// running it twice yields byte-identical output, and `--json` without
+    /// `--full` carries only digests -- never an instruction body.
+    #[test]
+    fn skill_list_match_ranks_deterministically_and_json_digest_omits_instructions() {
+        let repo = tempdir().unwrap();
+        let dir = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        write(
+            &dir.join("high.yaml"),
+            "schema_version: 1\nid: high-match\nversion: 1\nname: High\ndescription: test\n\
+             triggers: [\"gadget calibration\"]\ncontext_budget_bytes: 64\nphases: [implement]\n\
+             instructions: SECRET_INSTRUCTION_TEXT\n",
+        );
+        write(
+            &dir.join("low.yaml"),
+            "schema_version: 1\nid: low-match\nversion: 1\nname: Low\ndescription: test\n\
+             triggers: [\"gadget\"]\ncontext_budget_bytes: 64\nphases: [review]\n\
+             instructions: SECRET_INSTRUCTION_TEXT\n",
+        );
+
+        let list_args = |json: bool| SkillArgs {
+            command: SkillCommand::List(SkillListArgs {
+                json,
+                full: false,
+                match_task: Some("calibrate the gadget calibration procedure".into()),
+                phase: Some("implement".into()),
+                limit: 5,
+                built_in_only: false,
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+
+        let mut out = Vec::new();
+        assert_eq!(run(&list_args(false), &mut out).unwrap(), 0);
+        let text = String::from_utf8(out).unwrap();
+        let high_at = text.find("high-match").expect("high-match present");
+        let low_at = text.find("low-match").expect("low-match present");
+        assert!(
+            high_at < low_at,
+            "the phase-matched trigger hit must outrank the trigger-only hit: {text}"
+        );
+
+        let mut out_again = Vec::new();
+        run(&list_args(false), &mut out_again).unwrap();
+        assert_eq!(
+            text.as_bytes(),
+            out_again.as_slice(),
+            "scoring the same registry and task twice must be byte-identical"
+        );
+
+        let mut json_out = Vec::new();
+        assert_eq!(run(&list_args(true), &mut json_out).unwrap(), 0);
+        let json_text = String::from_utf8(json_out).unwrap();
+        assert!(
+            !json_text.contains("SECRET_INSTRUCTION_TEXT"),
+            "a --match --json row is a digest, never an instruction body: {json_text}"
+        );
+        assert!(json_text.contains("\"score\""), "got {json_text}");
+        assert!(json_text.contains("\"reasons\""), "got {json_text}");
+    }
+
+    /// Issue #539 chunk E2.3: exporting a built-in skill straight into an
+    /// operator's `~/.zirv/skills` directory and reloading the registry from
+    /// that home round-trips to an identical manifest, sourced as `Operator
+    /// Global` -- the CLI-level counterpart of `export_reload_roundtrip_
+    /// produces_an_identical_manifest`, which only exercises the library
+    /// call directly.
+    #[test]
+    fn skill_export_then_reload_as_an_operator_bundle_round_trips_at_cli_level() {
+        let repo = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let out_dir = home.path().join(".zirv/skills");
+
+        let export_args = SkillArgs {
+            command: SkillCommand::Export(SkillExportArgs {
+                id: "systematic-debugging".into(),
+                dir: out_dir.clone(),
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        assert_eq!(run(&export_args, &mut out).unwrap(), 0);
+        let printed = String::from_utf8(out).unwrap();
+        assert_eq!(
+            printed.trim(),
+            out_dir.join("systematic-debugging").display().to_string()
+        );
+
+        let original = builtin_manifests()
+            .unwrap()
+            .into_iter()
+            .find(|manifest| manifest.id == "systematic-debugging")
+            .expect("built-in present");
+        let registry = SkillRegistry::load(repo.path(), Some(home.path()), true, false).unwrap();
+        let reloaded = registry.get("systematic-debugging").unwrap();
+        assert_eq!(reloaded.source, SkillSource::OperatorGlobal);
+        assert_eq!(reloaded.manifest, original);
+    }
+
+    /// Issue #539 chunk E2.3: `skill read` refuses a `..` escape at the CLI
+    /// layer too, not just through `SkillRegistry::read_resource` called
+    /// directly, and a legitimate resource path still succeeds.
+    #[test]
+    fn skill_read_refuses_a_path_escape_at_cli_level() {
+        let repo = tempdir().unwrap();
+        let dir = repo.path().join(".zirv/skills/resource-test");
+        std::fs::create_dir_all(dir.join("references")).unwrap();
+        write(
+            &dir.join("SKILL.md"),
+            &bundle_skill_md("resource-test", "", "Body."),
+        );
+        write(&dir.join("references/small.md"), "small body");
+
+        let read_args = |path: &str| SkillArgs {
+            command: SkillCommand::Read(SkillReadArgs {
+                id: "resource-test".into(),
+                path: path.into(),
+                built_in_only: false,
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+
+        let mut escape_out = Vec::new();
+        assert!(
+            run(&read_args("../x"), &mut escape_out).is_err(),
+            "a path escape must be refused"
+        );
+
+        let mut ok_out = Vec::new();
+        assert_eq!(
+            run(&read_args("references/small.md"), &mut ok_out).unwrap(),
+            0
+        );
+        assert_eq!(String::from_utf8(ok_out).unwrap(), "small body\n");
     }
 }
