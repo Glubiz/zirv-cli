@@ -226,7 +226,7 @@ installed binary during self-update; never spawns it).
 | Dash spawn-request fulfillment | `src/commands/ctx/dash/mod.rs` | `fulfill_spawn_request` | N11 (#480) | services a worker/pane spawn request from mail or a dispatch |
 | Headless exec spawn | `src/commands/ctx/exec.rs` | `run_with_clock_inner` | N09 (#478) | `zirv ctx exec`'s main headless spawn via `supervise::spawn_tapped` |
 | Headless in-place resume/compact | `src/commands/ctx/exec.rs` | `compact_in_place` | N09 (#478) | resumes a headless session in place to compact it |
-| Agent loop headless spawn | `src/commands/ctx/run_loop.rs` | `run_with_clock` | N09 (#478) | `zirv ctx loop`'s per-cycle headless spawn |
+| Agent loop headless spawn | `src/commands/ctx/run_loop.rs` | `run_with_clock_and_presence` | N09 (#478) | `zirv ctx loop`'s per-cycle headless spawn; `run_with_clock` is now the thin real-`PATH` wrapper over it (issue #690's launch pre-flight takes an injected presence oracle) |
 | Agent loop objective judge | `src/commands/ctx/run_loop.rs` | `evaluate_objective_after_cycle` | N09 (#478) | distinct helper-model call: judges the objective gate after a loop cycle |
 | Helper-model chokepoint | `src/commands/ctx/handoff.rs` | `helper_answer` | N15 (#484) | the ONE place a non-chat model call is made: native first (`ctx::helper`), harness second. Shared by the distiller, run_loop's judge, memory harvest/consolidation, optimize and ask below |
 | Harness distiller/judge child | `src/commands/ctx/handoff.rs` | `run_model` | N15 (#484) | wraps `distiller_cmd`; reached through `helper_answer` when the helper's role has no native route |

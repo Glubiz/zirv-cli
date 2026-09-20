@@ -971,6 +971,7 @@ pub fn run_with_report<W: Write>(
         None,
         true,
         &mut report,
+        &adapters::liveness_probe,
     )?;
     Ok((code, report))
 }
@@ -986,6 +987,36 @@ pub(crate) fn run_with_clock<W: Write>(
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
+    run_with_clock_and_presence(
+        args,
+        w,
+        repo,
+        env,
+        now_fn,
+        sleep_fn,
+        &adapters::liveness_probe,
+    )
+}
+
+/// Issue #690 (remaining scope): [`run_with_clock`] with the launch
+/// pre-flight's one machine-dependent input injected -- whether the resolved
+/// adapter's program is actually installed -- in the same style
+/// `adapters::resolve_default_with_presence`/`select_with_presence` already
+/// expose. A test of the pre-flight at this entry point (the one `zirv ctx
+/// agent` delegates to) states the machine it assumes rather than inheriting
+/// the developer's own `PATH`, which is also the only way to assert the
+/// *absence* of the pacing and Keychain lines without a real 60-second sleep
+/// and a really uninstalled harness.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_clock_and_presence<W: Write>(
+    args: &ExecArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+) -> CtxResult<i32> {
     let mut report = ExecutionReport::default();
     run_with_clock_inner(
         args,
@@ -997,6 +1028,7 @@ pub(crate) fn run_with_clock<W: Write>(
         None,
         true,
         &mut report,
+        present,
     )
 }
 
@@ -1020,6 +1052,12 @@ fn run_with_clock_inner<W: Write>(
     // provider that is `WaitUntil`.
     initial_launch_allowed: bool,
     report: &mut ExecutionReport,
+    // Issue #690 (remaining scope): the launch pre-flight's presence oracle,
+    // threaded through rather than read from the ambient `PATH` -- see
+    // `run_with_clock_and_presence`'s own doc comment. Passed on unchanged to
+    // the recursive re-entry below, so a provider-switch harness handover
+    // pre-flights against the same stated machine this call did.
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load_for_launch(repo, env)?;
     // Gated only by `cfg.chrome.events` (which already folds in `--quiet` on
@@ -1029,7 +1067,49 @@ fn run_with_clock_inner<W: Write>(
     let announcer =
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
-    let adapter = adapters::select(agent_name, &args.command, &cfg)?;
+    // Issue #690 (remaining scope): whether this run's own spawn is the
+    // adapter's own program (zirv builds the launch) or the operator's
+    // explicit `-- <command>`. Resolved here rather than at its former
+    // position ~90 lines below, because selection and the launch pre-flight
+    // immediately after are the first things that need it, and the
+    // pre-flight must run before pacing, usage polling and the macOS
+    // Keychain-reading path they drag in (`pace::wait_for_window`, ~700
+    // lines below). It reads `args` alone, so hoisting it can change nothing
+    // else; `prefix`, which also needs the resolved adapter, stays where it
+    // was.
+    let adapter_builds_launch = args
+        .command
+        .first()
+        .is_none_or(|first| first.starts_with('-'));
+    // `select_with_presence` rather than `select`, stating the same
+    // `adapter_builds_launch` the pre-flight below is gated on and handing
+    // it the same injected oracle: one stated machine governs both halves of
+    // this launch. `select`'s own derivation (`command.is_empty()`) is
+    // `wrap`'s reading of a wrapped argv -- there the command IS the program
+    // to spawn -- and it is too narrow here: a flags-only `-- --model x` is
+    // adapter-built for `exec`, which appends those flags to
+    // `adapter.program()`. Deriving it there made `zirv ctx exec -- --model
+    // x` keep a default harness this machine does not have and then refuse
+    // it at the pre-flight, on a machine with another one installed.
+    let adapter = adapters::select_with_presence(
+        agent_name,
+        &args.command,
+        &cfg,
+        adapter_builds_launch,
+        present,
+    )?;
+    // Issue #690 (remaining scope): the launch pre-flight -- a harness that
+    // is confidently not on this machine fails here, immediately, instead of
+    // after a Keychain advisory and a blind-mode safety delay for a harness
+    // the operator does not have. Gated on `adapter_builds_launch` because
+    // that is exactly the condition under which the program about to be
+    // spawned IS `adapter.program()`: an explicit `-- <command>` is the
+    // operator's own argv, which this check has no business refusing (see
+    // `adapters::refuse_if_program_absent_with_presence`'s own doc comment).
+    // Fail-open and never substituting, both by construction there.
+    if adapter_builds_launch {
+        adapters::refuse_if_program_absent_with_presence(adapter.as_ref(), &cfg, present)?;
+    }
     let execution_started = Instant::now();
     let execution_model = adapters::last_model_flag(&args.command).map(str::to_string);
     // Issue #155 review finding C2: refused here, before anything is
@@ -1122,11 +1202,9 @@ fn run_with_clock_inner<W: Write>(
     // An argv that names no program -- empty, or starting with a flag -- is
     // not a command to pass through: the adapter builds the launch and these
     // are extra flags for it. That is how an agent step arrives, holding its
-    // prompt as data with no argv to encode it into.
-    let adapter_builds_launch = args
-        .command
-        .first()
-        .is_none_or(|first| first.starts_with('-'));
+    // prompt as data with no argv to encode it into. (`adapter_builds_launch`
+    // itself is now resolved just above `adapters::select_with_presence`,
+    // which is handed it, and the issue #690 launch pre-flight right after.)
     let prefix = if adapter_builds_launch {
         0
     } else {
@@ -2790,6 +2868,7 @@ fn run_with_clock_inner<W: Write>(
                     Some(&registry_short),
                     false,
                     report,
+                    present,
                 );
             }
 
@@ -7351,6 +7430,213 @@ mod tests {
             transcripts_in(&home).len(),
             2,
             "a limit-hit park mints a fresh session, same as an ordinary restart"
+        );
+    }
+
+    /// Issue #690 (remaining scope), the reported defect itself. On a machine
+    /// with no harness installed, `zirv ctx agent claude "say hi"` -- which
+    /// delegates straight to this entry point (see `agent.rs`'s module doc) --
+    /// warned about macOS Keychain access for a harness the operator does not
+    /// have, sat out the blind-mode safety delay because that harness has no
+    /// usage source, and only then said `claude` is not a program. The
+    /// pre-flight has to arrive first, and none of that machinery may run.
+    ///
+    /// Three observations, because the three channels differ:
+    ///
+    /// - `pacing degraded` is written to this call's own writer, so its
+    ///   absence is asserted directly.
+    /// - The 60-second wait is observed through the injected `sleep_fn`
+    ///   rather than really slept. The delay is set to a nonzero value on
+    ///   purpose (`base_env` zeroes it for every other test here), so there
+    ///   genuinely is a wait for the pre-flight to be skipping.
+    /// - The Keychain advisory goes to the announcer's own stderr channel,
+    ///   which no writer here can capture. It is reachable only from `pace::
+    ///   wait_for_window`'s usage refresh, and that call is exactly what logs
+    ///   `pacing-blind` -- so an empty decision log is the structural proof
+    ///   that the advisory could not have been emitted, asserted alongside
+    ///   the literal string.
+    ///
+    /// Deliberately not `base_env`: that helper sets `ZIRV_CTX_AGENT_BIN`,
+    /// which the pre-flight declines to probe at all. The machine is stated
+    /// (`only_installed(&[])`), never inherited from this developer's `PATH`.
+    #[test]
+    fn an_absent_harness_fails_before_pacing_and_before_the_keychain_advisory() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env: HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
+                "60".to_string(),
+            ),
+        ]
+        .into();
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            prompt: Some("say hi".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let slept: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let err = run_with_clock_and_presence(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|d: Duration| slept.borrow_mut().push(d.as_secs()),
+            &adapters::only_installed(&[]),
+        )
+        .expect_err("an absent harness must not launch");
+
+        assert_eq!(
+            err.to_string(),
+            "adapter 'claude': program 'claude' not found. Install it so its program is on \
+             PATH, or point `agent_bin` at it in ~/.zirv/ctx.toml, or name an installed one \
+             with --agent.",
+        );
+        let printed = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            !printed.contains("pacing degraded"),
+            "a harness that cannot be launched must not be paced for: {printed}"
+        );
+        assert!(
+            !printed.contains("Keychain"),
+            "no usage token is worth reading for a harness that is not installed: {printed}"
+        );
+        assert!(
+            slept.borrow().is_empty(),
+            "the operator must not wait out a safety delay for a missing binary, slept {:?}",
+            slept.borrow()
+        );
+        let decisions =
+            std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
+        assert!(
+            !decisions.contains("pacing-blind"),
+            "reaching `pace::wait_for_window` at all is what could emit the Keychain \
+             advisory: {decisions}"
+        );
+    }
+
+    /// Issue #690 (remaining scope), rule 2 at the real entry point: an
+    /// explicit `--agent` naming a harness this machine does not have fails
+    /// under *that* harness's own name, and the installed one is never put in
+    /// its place. The stated machine has claude and not codex, so a
+    /// pre-flight that silently fell back would be plainly visible here.
+    #[test]
+    fn an_explicit_agent_that_is_absent_fails_under_its_own_name() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env: HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let args = ExecArgs {
+            agent: Some("codex".to_string()),
+            prompt: Some("say hi".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = run_with_clock_and_presence(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|_d: Duration| panic!("an absent harness must never reach a pacing wait"),
+            &adapters::only_installed(&["claude"]),
+        )
+        .expect_err("codex is not installed on this stated machine");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("adapter 'codex'"),
+            "the harness the operator named is the one that must be reported: {message}"
+        );
+        assert!(
+            !message.contains("claude"),
+            "the installed harness must never be substituted: {message}"
+        );
+    }
+
+    /// Issue #690 (remaining scope), the case selection and the pre-flight
+    /// used to disagree about: `zirv ctx exec -- --model x` with no
+    /// `--agent`. That argv names no program -- it is flags `exec` appends
+    /// to `adapter.program()` -- so this run IS zirv choosing a harness to
+    /// launch (`adapter_builds_launch`), and on a machine with codex and no
+    /// claude it must choose codex. Until `exec` stated that for itself,
+    /// `adapters::select` derived the answer from a non-empty `command`
+    /// alone, kept claude, and let the pre-flight refuse a harness the
+    /// operator never asked for while an installed one sat there.
+    ///
+    /// Observed through `--max-tool-calls`, which is the first check after
+    /// the pre-flight that names the resolved adapter and the last one
+    /// before this run would start pacing and spawning: codex has no
+    /// verified way to count tool calls, so its refusal is reachable with
+    /// nothing launched and nothing slept. The precondition that makes that
+    /// observation honest is asserted below rather than assumed. The
+    /// machine is stated (`only_installed(&["codex"])`), never this
+    /// developer's own `PATH`, and no `ZIRV_CTX_AGENT_BIN` is set -- an
+    /// `agent_bin` override switches presence off entirely
+    /// (`resolve_default_with_presence`'s `consult_presence`), which would
+    /// make the whole test vacuous.
+    #[test]
+    fn a_flags_only_command_launches_the_harness_this_machine_actually_has() {
+        assert!(
+            !adapters::select(Some("codex"), &[], &CtxConfig::default())
+                .expect("codex adapter")
+                .counts_tool_calls(),
+            "this test reads the --max-tool-calls refusal as proof codex was selected; a codex \
+             that can count tool calls would sail past it into a real spawn"
+        );
+
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env: HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let args = ExecArgs {
+            command: vec!["--model".to_string(), "x".to_string()],
+            prompt: Some("say hi".to_string()),
+            max_tool_calls: Some(1),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = run_with_clock_and_presence(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|_d: Duration| panic!("this run must stop before anything is paced for"),
+            &adapters::only_installed(&["codex"]),
+        )
+        .expect_err("--max-tool-calls is the stop this observation uses");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'codex' adapter"),
+            "a flags-only argv is zirv's own launch, so the installed harness must be the one \
+             selected: {message}"
+        );
+        assert!(
+            !message.contains("not found"),
+            "the harness this machine does not have must never have been selected: {message}"
         );
     }
 

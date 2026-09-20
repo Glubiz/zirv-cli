@@ -126,6 +126,33 @@ pub(crate) fn run_with_clock<W: Write>(
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
+    run_with_clock_and_presence(
+        args,
+        w,
+        repo,
+        env,
+        now_fn,
+        sleep_fn,
+        &adapters::liveness_probe,
+    )
+}
+
+/// Issue #690 (remaining scope): [`run_with_clock`] with the launch
+/// pre-flight's presence oracle injected -- see `exec::run_with_clock_and_
+/// presence`'s own doc comment, same seam, same reason. `loop` always builds
+/// its own launch from the adapter (`adapter.headless_cmd`, never an
+/// operator-supplied argv), so unlike `exec` it needs no second condition
+/// before the pre-flight applies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_clock_and_presence<W: Write>(
+    args: &LoopArgs,
+    w: &mut W,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+) -> CtxResult<i32> {
     if args.cycles == Some(0) {
         return Err("--cycles must be at least 1".into());
     }
@@ -135,6 +162,13 @@ pub(crate) fn run_with_clock<W: Write>(
     let announcer =
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
+    // Issue #690 (remaining scope): the same launch pre-flight `exec` runs,
+    // for the same reason -- every cycle below opens with `pace::wait_for_
+    // window`, whose blind-mode safety delay and usage refresh (macOS
+    // Keychain included) have nothing to pace when there is no program to
+    // launch. Unconditional here: this supervisor's spawn is always
+    // `adapter.headless_cmd`, never an operator's own argv.
+    adapters::refuse_if_program_absent_with_presence(adapter.as_ref(), &cfg, present)?;
     // The pinned model this run actually launches with, if an operator's own
     // `--extra -- --model <name>` (or codex's `-m` alias) names one -- the
     // same `last_model_flag` scan `exec::run_with_clock_inner` uses for its
@@ -2796,6 +2830,55 @@ mod tests {
             Some(2),
             "the blind-mode delay must actually be slept via the injected sleep_fn, got {:?}",
             slept.borrow()
+        );
+    }
+
+    /// Issue #690 (remaining scope): `loop` opens every cycle with the very
+    /// pacing gate the test above exercises, so it had the identical defect
+    /// -- a blind-mode safety delay, and the usage refresh that drags in the
+    /// macOS Keychain read, for a harness with no program to launch. The
+    /// pre-flight has to arrive first here too. The machine is stated
+    /// (`only_installed(&[])`), and the delay is deliberately left at
+    /// `base_env`'s zero *plus* a panicking `sleep_fn`: any wait at all,
+    /// however short, means the gate was reached.
+    ///
+    /// `ZIRV_CTX_AGENT_BIN` is removed from `base_env` on purpose -- an
+    /// operator-set override is never probed, which is the point of the
+    /// companion test in `adapters`.
+    #[test]
+    fn an_absent_harness_fails_before_the_first_cycle_paces() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let mut env = base_env(&tmp.path().join("state"));
+        env.remove("ZIRV_CTX_AGENT_BIN");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let mut out = Vec::new();
+        let err = run_with_clock_and_presence(
+            &args_for(1),
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &crate::commands::ctx::state::now_secs,
+            &|_d: Duration| panic!("an absent harness must never reach the pacing gate"),
+            &adapters::only_installed(&[]),
+        )
+        .expect_err("an absent harness must not start a cycle");
+
+        assert_eq!(
+            err.to_string(),
+            "adapter 'claude': program 'claude' not found. Install it so its program is on \
+             PATH, or point `agent_bin` at it in ~/.zirv/ctx.toml, or name an installed one \
+             with --agent.",
+        );
+        let printed = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            !printed.contains("pacing degraded"),
+            "a harness that cannot be launched must not be paced for: {printed}"
+        );
+        assert!(
+            !printed.contains("Keychain"),
+            "no usage token is worth reading for a harness that is not installed: {printed}"
         );
     }
 

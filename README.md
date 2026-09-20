@@ -4429,6 +4429,32 @@ process's `PATH`, and a hook subprocess routinely inherits a reduced one.
 Only the question "which harness should zirv start for you" asks whether the
 answer exists on the machine, so pure passthrough stays pure and screening
 keeps working where the binary is real but invisible to a `PATH` walk.
+Flags are not a program, though. `zirv ctx exec -- --model x` hands over
+nothing to pass through: zirv still builds that launch from the harness's own
+program and appends your flags to it, so it is the choosing case too, and it
+chooses a harness this machine actually has. `zirv ctx wrap -- ...` reads the
+same argv the other way, because there what you wrote is what gets spawned.
+
+**The missing binary is reported before the waiting, not after.** Once
+`zirv ctx exec`/`zirv ctx agent` and `zirv ctx loop` have resolved the harness
+they are about to launch, they check that its program exists *before* engaging
+pacing, usage polling, or the macOS Keychain read those drag in. On a machine
+with no harness installed, `zirv ctx agent claude "say hi"` used to warn about
+Keychain access for a harness you do not have, sit out the blind-mode safety
+delay (`[pace] blind_delay_secs`, 60s by default) because that harness has no
+usage source, and only then tell you `claude` is not a program; now the
+"program not found" answer arrives immediately, in the same words the spawn
+itself would have used -- and those words name all three ways out, the same
+three the "nothing is installed" error below gives, because a harness missing
+from `PATH` is very often one you have installed somewhere `agent_bin` should
+be pointed at rather than one you need to install at all. This only
+ever makes a failure faster -- it never picks a different harness, so a
+harness you named with `--agent` or `agent =` still fails under its own name;
+only a *confident* absence refuses, so an undecidable probe launches exactly
+as before; an `agent_bin` you configured yourself is not probed at all; and
+a program you supplied yourself (`zirv ctx exec -- <command>`, `zirv ctx wrap
+-- <command>`) is never subject to it, because it is your program, not the
+adapter's.
 
 If *nothing* is installed, the error says so in as many
 words and names the ways out (install one onto `PATH`, point `agent_bin` at
