@@ -190,8 +190,8 @@ pub struct CompiledContext {
 ///
 /// Built entirely from data [`CompiledContext`] already holds and the exact
 /// literal header constants `prompt.rs`'s own `with_*_layer` functions write
-/// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `WORKFLOW_LAYER_
-/// HEADER`, `SKILL_SUGGESTIONS_LAYER_HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/
+/// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `SKILL_INDEX_
+/// HEADER`, `WORKFLOW_LAYER_HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/
 /// `MEMORY_SHARED_LAYER_HEADER`, `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) --
 /// **no file is read again** to build this list, only `composed.text` and
 /// `composed.sources`, both
@@ -287,6 +287,11 @@ impl CompiledContext {
                         },
                     )
                 }
+                // `compose` itself writes this one, right after `Harness`/
+                // `Harnesses` -- see `prompt::SKILL_INDEX_HEADER`'s own doc
+                // comment for why it sits there instead of near `Workflow`.
+                PromptSource::SkillIndex => find_after(text, cursor, prompt::SKILL_INDEX_HEADER)
+                    .map(|header_at| (header_at + prompt::SKILL_INDEX_HEADER.len(), None, None)),
                 // The combined common+harness-specific block: its two
                 // sub-budgets are already reported per-file by `provenance`,
                 // so this range covers the whole block with no single budget
@@ -296,17 +301,6 @@ impl CompiledContext {
                     .map(|header_at| (header_at + CONTEXT_LAYER_HEADER.len(), None, None)),
                 PromptSource::Workflow => find_after(text, cursor, prompt::WORKFLOW_LAYER_HEADER)
                     .map(|header_at| (header_at + prompt::WORKFLOW_LAYER_HEADER.len(), None, None)),
-                PromptSource::SkillSuggestions => {
-                    find_after(text, cursor, prompt::SKILL_SUGGESTIONS_LAYER_HEADER).map(
-                        |header_at| {
-                            (
-                                header_at + prompt::SKILL_SUGGESTIONS_LAYER_HEADER.len(),
-                                None,
-                                None,
-                            )
-                        },
-                    )
-                }
                 // Private-memory entries render first when present; an
                 // all-shared selection (no private entries at all) starts
                 // with the shared header instead -- try both, in the order
@@ -1336,16 +1330,6 @@ pub fn compile_with_harness_roster(
     let composed = prompt::with_workflow_layer(
         composed,
         prompt::workflow_context_for_role(repo, role).as_deref(),
-    );
-    // Issue #539 chunk E2.2: task-matched skill suggestions, immediately
-    // after the workflow-step layer for the same reason `Workflow` itself
-    // sits here rather than ahead of `User`/`Repo`/`Context` -- the task text
-    // this scores against is exactly as volatile as the active step, so
-    // anything positioned after it would fall out of the provider's prompt
-    // cache on every step transition, resume and restart for no benefit.
-    let composed = prompt::with_skill_suggestions_layer(
-        composed,
-        prompt::skill_suggestion_context_for_role(repo, home, role).as_deref(),
     );
     // Issue #155: the one memory layer, injected last of everything zirv
     // composes deterministically -- mail and the command-line layer are the
@@ -3008,15 +2992,21 @@ mod tests {
         );
 
         // The truncation is real, not merely reported: the composed prompt's
-        // own roster section is capped too.
+        // own roster section is capped too. Issue #539 chunk F: the skill
+        // index now follows the roster in the composed text, so the roster's
+        // own delivered slice must stop at the NEXT layer's separator rather
+        // than running to the end of the whole prompt.
         let text = compiled.composed.expect("composed").text;
         const LABEL: &str = "zirv harness roster (session)\n\n";
         let roster_at = text.find(LABEL).expect("roster label present") + LABEL.len();
+        let delivered = &text[roster_at..];
+        let delivered = delivered
+            .find("\n\n---\n\n")
+            .map_or(delivered, |end| &delivered[..end]);
         assert_eq!(
-            text[roster_at..].len(),
+            delivered.len(),
             5,
-            "the delivered roster in the composed prompt must match the budget: {:?}",
-            &text[roster_at..]
+            "the delivered roster in the composed prompt must match the budget: {delivered:?}"
         );
     }
 

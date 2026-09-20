@@ -2098,14 +2098,19 @@ persists that choice across resume and prompt composition. Repository skills are
 they can request logical capabilities but never grant themselves filesystem,
 shell, network, or other permissions.
 
-Every session that does real work -- worker, single-seat, and orchestrator --
-carries a short standing pointer at the skill library, and a session driving
-an active workflow additionally sees up to 3 task-matched suggestions
-(id, version, description, and why each matched) resolved by the same
-deterministic activation scorer `skill list --match` uses; suggestions are
-metadata only, never an instruction body, and a skill the active step already
-injected is never suggested again. `zirv skill list --match "<task>"
-[--phase <phase>] [--limit N]` prints the same scored matches from a shell;
+Every session that does real work -- worker, single-seat, sub-orchestrator,
+and orchestrator -- carries a standing skill index: one line per
+implicit-activation skill (`- <id>: <description>`, the skill's own
+description verbatim, a repository-layer skill marked
+`(repository-untrusted)`), in a stable, task-independent layer so it never
+falls out of the provider's prompt cache. Zirv only surfaces which skills
+exist; it never matches, pre-selects, or injects one for a task -- the agent
+reads the descriptions and decides, the same way it would judge any other
+tool's documentation, and `skill_load`'s own tool description asks it to
+check the index before starting work a listed skill covers. `zirv skill list
+--match "<task>" [--phase <phase>] [--limit N]` runs the same deterministic
+scorer from a shell for an agent (or operator) that wants a ranked shortlist
+instead of reading the whole index;
 `--json` emits digests only unless `--full` is also given, which restores the
 pre-issue-#539 full-manifest `--json` shape. `zirv skill export <id> --dir
 <path>` writes a portable bundle directory (for another host, or to seed

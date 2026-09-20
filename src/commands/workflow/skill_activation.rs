@@ -16,21 +16,24 @@
 //! meant to match whole words/phrases only -- "cat" must not activate a
 //! skill whose trigger is "category".
 //!
-//! Issue #539 chunk E2.2: [`score_skills`] now has a real production
-//! caller -- `ctx::prompt::skill_suggestion_context_for_role`, which renders
-//! its top matches into a session's own prompt as suggestions, not a body.
+//! Issue #539 chunk F: the operator's own design decision on that chunk is
+//! that zirv may make a skill's MATCH deterministic but never the choice to
+//! use one -- so [`score_skills`] backs only the agent's own search
+//! (`skill_tools::skill_list`'s `query`, `zirv skill list --match`), never a
+//! standing prompt layer that pre-selects a skill for a task. A session's
+//! own standing skill index (`ctx::prompt::skill_index_text`) is a plain,
+//! unscored listing of every implicit-activation skill instead -- see that
+//! function's own doc comment.
 
 use std::collections::BTreeSet;
 
 use super::skill::{RegisteredSkill, SkillRegistry, WorkflowPhase};
 
 /// A trigger phrase match is the strongest, most deliberate signal a task
-/// can give -- an operator or skill author chose this exact wording. `pub(
-/// crate)`: issue #539 chunk E2.2's task-matched suggestions layer (`ctx::
-/// prompt::skill_suggestion_context_for_role`) filters on this exact floor
-/// to keep a phase-only match out of the composed prompt (see that
-/// function's own doc comment for why).
-pub(crate) const TRIGGER_MATCH_SCORE: u32 = 3;
+/// can give -- an operator or skill author chose this exact wording, as
+/// opposed to a bare phase match ([`PHASE_MATCH_SCORE`] alone, which many
+/// skills in the same phase would share regardless of what the task says).
+const TRIGGER_MATCH_SCORE: u32 = 3;
 /// The active workflow phase alone is a weaker signal than an explicit
 /// trigger match: many skills declare a phase, but only some of those are
 /// actually relevant to what the task says.
@@ -86,11 +89,10 @@ pub struct SkillMatch<'a> {
 /// iteration order, and never by
 /// anything a model decided.
 ///
-/// Issue #539 chunk E2.2: wired into `ctx::prompt::skill_suggestion_context_
-/// for_role`, which additionally requires at least one trigger match
-/// (`TRIGGER_MATCH_SCORE`) before suggesting a skill in a session's prompt --
-/// a bare phase match alone would attach a suggestion to every session in
-/// that phase, which is noise.
+/// Issue #539 chunk F: the agent's own search, not a standing prompt layer
+/// -- wired into `skill_tools::skill_list`'s `query` (and `zirv skill list
+/// --match`), both initiated by the agent or operator, never by zirv
+/// pre-selecting a skill for a task on its own.
 pub fn score_skills<'a>(
     registry: &'a SkillRegistry,
     task: &str,

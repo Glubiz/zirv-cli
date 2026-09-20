@@ -65,6 +65,16 @@ pub enum SourceKind {
     /// layer, per this module's doc.
     NativeInstructions,
     CanonicalContext,
+    /// Issue #539 chunk F: one line per skill the registry resolves for this
+    /// repository (`implicit_activation == true` only), each with its own
+    /// `description` verbatim -- the native-runtime twin of `ctx::prompt::
+    /// PromptSource::SkillIndex`, rendered by the exact same `prompt::
+    /// skill_index_text` so the wrapped-harness and native paths can never
+    /// list a different set of skills or word a line differently. Zirv's own
+    /// design decision on this chunk: the agent chooses which skill fits
+    /// from these descriptions, zirv never pre-selects or matches one to a
+    /// task.
+    SkillIndex,
     Workflow,
     Skill,
     Memory,
@@ -363,6 +373,41 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
         Retention::Required,
         true,
     );
+
+    // Issue #539 chunk F: the skill index, task-independent like the three
+    // sources just above it, so it sits in this same stable group rather
+    // than near `Workflow`/`UserTask` further down. Every role that does
+    // real work gets it (no role gate here, mirroring `prompt::compose`'s
+    // own unconditional call). `Retention::Optional`, unlike the fixed-size
+    // methodology sources above it: the catalogue grows with the number of
+    // registered skills, and `Required` would fail a whole compile closed
+    // for a small-context model the moment the index alone stopped fitting
+    // -- worse than a session that simply never sees it. `skill_index_text`
+    // returns `None` on a registry load failure or an empty catalogue --
+    // `push` already treats that as "nothing to add", the same
+    // degrade-quietly contract every other optional source here holds.
+    //
+    // The instructive intro is `prompt::SKILL_INDEX_HEADER` itself, stripped
+    // of the `\n\n---\n\n` markdown-separator wrapper `compose`'s own
+    // concatenated prose needs but a standalone native message does not --
+    // reusing the one literal rather than a second, independently-typed
+    // copy that could drift on wording.
+    if let Some(index) = prompt::skill_index_text(request.repo, request.home) {
+        let intro = prompt::SKILL_INDEX_HEADER
+            .trim_start_matches("\n\n---\n\n")
+            .trim_end();
+        push(
+            &mut out,
+            "zirv:skill-index",
+            SourceKind::SkillIndex,
+            MessageRole::Instruction,
+            SourceTrust::Zirv,
+            None,
+            format!("{intro}\n\n{index}"),
+            Retention::Optional,
+            true,
+        );
+    }
 
     if let Some(home) = request.home {
         let file = match request.role {
@@ -1566,6 +1611,60 @@ mod tests {
         assert!(text.contains("common rule"));
         assert!(!text.contains("claude-only"));
         assert!(!text.contains("codex-only"));
+    }
+
+    /// Issue #539 chunk F: the native runtime's own compile path carries the
+    /// same skill index the wrapped-harness `prompt::compose` does, as a
+    /// trusted zirv `Instruction` source -- `PromptRole::Worker` (this
+    /// helper's default), proving it reaches a role with no active workflow
+    /// too, not just an Orchestrator.
+    #[test]
+    fn native_compile_carries_the_skill_index_as_a_trusted_instruction_source() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let compiled = compile(&request(
+            Some(home.path()),
+            repo.path(),
+            &state,
+            &cfg,
+            "implement it",
+            ample_budget(),
+        ))
+        .unwrap();
+
+        let entry = compiled
+            .provenance
+            .iter()
+            .find(|entry| entry.source == SourceKind::SkillIndex)
+            .expect("the skill index must be provenanced");
+        assert_eq!(entry.trust, SourceTrust::Zirv);
+
+        let message = compiled
+            .messages
+            .iter()
+            .find(|message| message.source == SourceKind::SkillIndex)
+            .expect("the skill index must reach the compiled messages");
+        assert_eq!(message.role, MessageRole::Instruction);
+        assert!(
+            message.content.contains("Skill index."),
+            "got {}",
+            message.content
+        );
+        assert!(
+            message.content.contains("- incident-investigation: "),
+            "a built-in id must be named: {}",
+            message.content
+        );
+        assert!(
+            !message
+                .content
+                .contains("Restoring service and explaining the failure"),
+            "the index must never carry an instruction-body sentence: {}",
+            message.content
+        );
     }
 
     #[test]

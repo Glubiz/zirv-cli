@@ -1066,11 +1066,13 @@ fn resolve_builtin_or_registry(
 /// receives the resume-safe accepted-plan executor, whose own dependency stack
 /// includes worktree isolation and the general implementation discipline.
 ///
-/// `pub(crate)`: issue #539 chunk E2.2's task-matched suggestions layer
-/// (`ctx::prompt::skill_suggestion_context_for_role`) calls this to learn
-/// which skill ids the active step already injects, so it never suggests a
-/// skill whose body is already in context.
-pub(crate) fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
+/// Private: `render_current_context` (this module) is its only caller. Issue
+/// #539 chunk E2.2 briefly made this `pub(crate)` for a task-matched
+/// suggestions layer in `ctx::prompt`; that layer was removed in chunk F
+/// (the operator's own design decision: zirv only surfaces which skills
+/// exist, via a stable session-wide index, and never pre-selects one for a
+/// task), so the cross-module visibility is no longer needed.
+fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
     let mut ids = Vec::new();
     if step.phase == WorkflowPhase::Implement
         && classification.complexity >= Complexity::Substantial
