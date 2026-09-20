@@ -29,6 +29,8 @@ pub mod registry;
 pub mod review;
 pub mod selection;
 pub mod skill;
+pub mod skill_activation;
+pub mod skill_render;
 pub mod team;
 pub mod telemetry;
 pub mod verification;

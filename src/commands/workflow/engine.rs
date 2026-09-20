@@ -3621,8 +3621,9 @@ pub fn render_current_context(
             let body = refusal_for(&skill.manifest.id, headless)
                 .unwrap_or_else(|| skill.manifest.instructions.trim());
             let body = sanitize_skill_body(body);
+            let hash_prefix = &skill.content_hash[..skill.content_hash.len().min(12)];
             rendered.push_str(&format!(
-                "\n{SKILL_HEADER_SENTINEL}[skill {}@{}; source={}]\n{}\n",
+                "\n{SKILL_HEADER_SENTINEL}[skill {}@{}; source={}; hash={hash_prefix}]\n{}\n",
                 skill.manifest.id, skill.manifest.version, skill.source, body
             ));
         }
@@ -10160,6 +10161,35 @@ mod tests {
         assert!(testing.contains("[skill testing@1"));
     }
 
+    /// Issue #539 (chunk C): a skill header must name a hash an operator or
+    /// a resumed session can compare against the registry's own
+    /// `content_hash`, so a skill that changed underneath a session is
+    /// detectable rather than silently re-activated under the same id.
+    #[test]
+    fn rendered_step_context_names_the_skill_version_and_a_twelve_char_hash() {
+        let repo = tempdir().unwrap();
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        ));
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        let registry = SkillRegistry::load_for_repo(repo.path(), None, true).unwrap();
+        let skill = registry.get("implement").unwrap();
+        let expected_hash = &skill.content_hash[..skill.content_hash.len().min(12)];
+        assert_eq!(expected_hash.len(), 12);
+        let expected_header = format!("[skill implement@1; source=built-in; hash={expected_hash}]");
+        assert!(
+            context.contains(&expected_header),
+            "expected header {expected_header:?} in:\n{context}"
+        );
+    }
+
     #[test]
     fn substantial_implementation_composes_execute_plan_and_worktree() {
         let repo = tempdir().unwrap();
@@ -10273,7 +10303,7 @@ mod tests {
         let context = render_current_context(&state, repo.path(), None)
             .unwrap()
             .unwrap();
-        assert!(context.contains("[skill implement@1; source=built-in]"));
+        assert!(context.contains("[skill implement@1; source=built-in; hash="));
         assert!(!context.contains("repository override"));
     }
 

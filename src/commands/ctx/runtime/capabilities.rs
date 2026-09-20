@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::super::config::{BrowserCapabilityConfig, CtxConfig, EnvLookup, WebCapabilityConfig};
+use super::super::config::{
+    BrowserCapabilityConfig, CapabilitiesConfig, CtxConfig, EnvLookup, WebCapabilityConfig,
+};
 use super::super::pace::redact_for_log;
 use crate::commands::workflow::capability::{IntegrationId, IntegrationState, IntegrationStatus};
 
@@ -761,6 +763,24 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
         )
     });
 
+    rows.push(named_mcp_status(
+        IntegrationId::Linear,
+        capabilities,
+        "linear",
+        |name| name.eq_ignore_ascii_case("linear"),
+    ));
+    rows.push(named_mcp_status(
+        IntegrationId::Kibana,
+        capabilities,
+        "kibana",
+        |name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "kibana" | "elastic" | "elasticsearch"
+            )
+        },
+    ));
+
     rows.push(web_status(
         IntegrationId::WebSearch,
         capabilities.enabled,
@@ -829,6 +849,43 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
     });
 
     rows
+}
+
+/// A specific-backend integration (issue #539: Linear, Kibana) is never
+/// inferred from the generic `mcp` row above -- a skill that names one of
+/// these needs THAT server, not just some server, configured and enabled.
+/// Matching is ASCII-case-insensitive on the server's declared name, per
+/// `matches`. Like the generic MCP row, this never reports `available` from
+/// configuration alone: an enabled, name-matching entry is `unverified`
+/// until `zirv ctx capabilities --probe` actually contacts it.
+fn named_mcp_status(
+    integration: IntegrationId,
+    capabilities: &CapabilitiesConfig,
+    label: &str,
+    matches: impl Fn(&str) -> bool,
+) -> IntegrationStatus {
+    if !capabilities.enabled {
+        return IntegrationStatus::unavailable(
+            integration,
+            "capabilities.enabled is false",
+            "set capabilities.enabled in ~/.zirv/ctx.toml or ZIRV_CTX_CAPABILITIES",
+        );
+    }
+    match capabilities
+        .active_servers()
+        .find(|server| matches(&server.name))
+    {
+        Some(server) => IntegrationStatus::unverified(
+            integration,
+            format!("MCP server `{}`", server.name),
+            "configured but not contacted this run; run `zirv ctx capabilities --probe`",
+        ),
+        None => IntegrationStatus::unavailable(
+            integration,
+            format!("no MCP server named `{label}` is configured or enabled"),
+            format!("add a [[capabilities.mcp]] entry named `{label}` with enabled = true"),
+        ),
+    }
 }
 
 fn web_status(
@@ -1394,5 +1451,90 @@ mod tests {
                 .iter()
                 .any(|tool| tool["program"] == "rust-analyzer" && tool["relevant_to_repo"] == true)
         );
+    }
+
+    /// Issue #539: Linear and Kibana are never inferred from the generic
+    /// `mcp` row -- a skill naming one of them needs THAT server, not just
+    /// some server, and never gets `Available` from configuration alone.
+    #[test]
+    fn linear_and_kibana_need_a_specifically_named_and_enabled_mcp_server() {
+        use crate::commands::ctx::config::{
+            CapabilitiesConfig, McpServerConfig, McpTransportConfig,
+        };
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let rows = discover(&cfg, repo.path());
+        let linear = rows
+            .iter()
+            .find(|row| row.integration == IntegrationId::Linear)
+            .expect("a linear row");
+        assert_eq!(linear.state, IntegrationState::Unavailable);
+        assert!(
+            linear
+                .diagnosis
+                .as_deref()
+                .is_some_and(|text| text.contains("capabilities.enabled")),
+            "{linear:?}"
+        );
+
+        let cfg = CtxConfig {
+            capabilities: CapabilitiesConfig {
+                enabled: true,
+                mcp: vec![
+                    McpServerConfig {
+                        name: "docs".into(),
+                        enabled: true,
+                        transport: McpTransportConfig::Stdio {
+                            command: "mcp-docs".into(),
+                            args: Vec::new(),
+                            cwd: None,
+                            environment: BTreeMap::new(),
+                        },
+                        ..McpServerConfig::default()
+                    },
+                    McpServerConfig {
+                        name: "Elastic".into(),
+                        enabled: true,
+                        transport: McpTransportConfig::Stdio {
+                            command: "mcp-elastic".into(),
+                            args: Vec::new(),
+                            cwd: None,
+                            environment: BTreeMap::new(),
+                        },
+                        ..McpServerConfig::default()
+                    },
+                ],
+                ..CapabilitiesConfig::default()
+            },
+            ..CtxConfig::default()
+        };
+        let rows = discover(&cfg, repo.path());
+        let linear = rows
+            .iter()
+            .find(|row| row.integration == IntegrationId::Linear)
+            .expect("a linear row");
+        assert_eq!(
+            linear.state,
+            IntegrationState::Unavailable,
+            "an unrelated configured server never satisfies a named integration"
+        );
+        assert!(
+            linear
+                .diagnosis
+                .as_deref()
+                .is_some_and(|text| text.contains("linear")),
+            "{linear:?}"
+        );
+        let kibana = rows
+            .iter()
+            .find(|row| row.integration == IntegrationId::Kibana)
+            .expect("a kibana row");
+        assert_eq!(
+            kibana.state,
+            IntegrationState::Unverified,
+            "case-insensitive `elastic` matches the kibana integration"
+        );
+        assert!(kibana.detail.contains("Elastic"), "{kibana:?}");
     }
 }

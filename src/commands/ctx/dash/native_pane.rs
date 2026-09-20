@@ -981,8 +981,8 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
         }
         "/help" => Some(
             "commands: /clear /compact /context /status /agents /agent /team /workflows \
-             /workflow \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C Ctrl+C quit, Shift+Tab \
-             cycle mode"
+             /workflow /skills /skill \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C Ctrl+C \
+             quit, Shift+Tab cycle mode"
                 .to_string(),
         ),
         "/compact" => {
@@ -4285,6 +4285,14 @@ impl NativePaneRuntime {
             self.notice = Some(notice);
             return;
         }
+        // Issue #539 chunk C: `/skills`/`/skill <id>` need this pane's own
+        // repo/home access to load the resolved `SkillRegistry`, so -- same
+        // shape of exception as `/workflow*` above -- they are handled here
+        // rather than in the pure `apply_slash_command` helper.
+        if let Some(notice) = self.skill_slash_notice(&text) {
+            self.notice = Some(notice);
+            return;
+        }
         if let Some(notice) = apply_slash_command(&mut self.presentation, &text) {
             if !notice.is_empty() {
                 self.notice = Some(notice);
@@ -4551,6 +4559,50 @@ impl NativePaneRuntime {
                 String::from_utf8_lossy(&buf).trim_end().to_string()
             }
             Err(err) => format!("could not start '{id}': {err}"),
+        }
+    }
+
+    /// Issue #539 chunk C: `/skills` lists this session's resolved skill
+    /// catalogue; `/skill <id>` shows one skill's digest detail and
+    /// instruction body (`id@version` accepted, same as `SkillRegistry::
+    /// get`). Both render through the SAME `dash::native_ux::render_skill_
+    /// *` functions any future `zirv skill` CLI rewrite would use, mirroring
+    /// the `/workflows`/`/workflow` precedent immediately above.
+    fn skill_slash_notice(&self, text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        let head = trimmed.split_whitespace().next()?;
+        match head {
+            "/skills" => Some(self.render_skill_list()),
+            "/skill" => {
+                let id = trimmed["/skill".len()..].trim();
+                if id.is_empty() {
+                    return Some("usage: /skill <id>".to_string());
+                }
+                Some(self.render_skill_show(id))
+            }
+            _ => None,
+        }
+    }
+
+    fn render_skill_list(&self) -> String {
+        use crate::commands::workflow::skill::SkillRegistry;
+        match SkillRegistry::load_for_repo(&self.repo, dirs::home_dir().as_deref(), true) {
+            Ok(registry) => {
+                let digests = registry.digests();
+                super::native_ux::render_skill_list(&digests, registry.warnings())
+            }
+            Err(err) => format!("skill registry unavailable: {err}"),
+        }
+    }
+
+    fn render_skill_show(&self, id: &str) -> String {
+        use crate::commands::workflow::skill::SkillRegistry;
+        match SkillRegistry::load_for_repo(&self.repo, dirs::home_dir().as_deref(), true) {
+            Ok(registry) => match registry.get(id) {
+                Ok(skill) => super::native_ux::render_skill_detail(skill),
+                Err(err) => format!("{err}"),
+            },
+            Err(err) => format!("skill registry unavailable: {err}"),
         }
     }
 
@@ -6674,6 +6726,64 @@ mod tests {
         assert_eq!(
             pane.workflow_slash_notice("/workflow status"),
             Some(expected_status)
+        );
+    }
+
+    /// Issue #539 chunk C: `/skills` and `/skill <id>` must render from the
+    /// SAME `skill_render` writer functions any future `zirv skill` CLI
+    /// rewrite would use -- proven here the same way
+    /// `workflow_views_render_the_headless_structs` proves it for
+    /// `/workflows`/`/workflow`: reconstruct the expected string directly
+    /// from the shared writer over the identical registry, and assert the
+    /// slash command's own notice equals it exactly.
+    #[test]
+    fn skill_views_render_the_headless_structs() {
+        use crate::commands::workflow::skill::SkillRegistry;
+        use crate::commands::workflow::skill_render;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        git_init_with_commit(&repo);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = pane_fixture(&state, "s1", "sess-skill", 1, None);
+        pane.repo = repo.clone();
+
+        let registry = SkillRegistry::load_for_repo(&repo, None, true).expect("registry");
+        let digests = registry.digests();
+        let mut expected_list = Vec::new();
+        skill_render::write_digest_list(&mut expected_list, &digests).expect("write list");
+        let expected_list = String::from_utf8(expected_list)
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert_eq!(pane.skill_slash_notice("/skills"), Some(expected_list));
+
+        let skill = registry.get("implement").expect("implement skill");
+        let mut expected_detail = Vec::new();
+        skill_render::write_digest_detail(&mut expected_detail, skill).expect("write detail");
+        let mut expected_show = String::from_utf8(expected_detail)
+            .unwrap()
+            .trim_end()
+            .to_string();
+        expected_show.push_str("\n\n");
+        expected_show.push_str(skill.manifest.instructions.trim());
+        assert_eq!(
+            pane.skill_slash_notice("/skill implement"),
+            Some(expected_show)
+        );
+
+        // Issue #539 chunk C: an unknown id surfaces the registry's own
+        // error text, never a bespoke pane message.
+        let expected_error = registry.get("does-not-exist").unwrap_err().to_string();
+        assert_eq!(
+            pane.skill_slash_notice("/skill does-not-exist"),
+            Some(expected_error)
+        );
+
+        assert_eq!(
+            pane.skill_slash_notice("/skill"),
+            Some("usage: /skill <id>".to_string())
         );
     }
 
