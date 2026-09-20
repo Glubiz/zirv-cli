@@ -1149,11 +1149,13 @@ pub fn helper_answer(
 
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let env = super::config::env_from_process();
+    let (protected_prompt, _) =
+        super::obfuscate_store::protect_text_with_env(&repo, prompt, "helper_model_input", &env)?;
     if helper::available(&repo, role, None, &env) {
         match helper::run(
             &HelperRequest {
                 repo: &repo,
-                prompt,
+                prompt: &protected_prompt,
                 role,
                 route: None,
                 // A helper answers from the prompt it was handed. No tools at
@@ -1172,7 +1174,7 @@ pub fn helper_answer(
             }
         }
     }
-    run_model(adapter, model, prompt, timeout)
+    run_model(adapter, model, &protected_prompt, timeout)
 }
 
 /// Runs one fresh model call through the resolved coding harness and returns

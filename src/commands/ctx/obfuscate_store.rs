@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::CtxResult;
+use super::config::{CtxConfig, EnvLookup, ObfuscateMode};
 use super::obfuscate::{Options, Vault, VaultEntry};
+use super::state::StateDir;
 
 struct LockGuard(PathBuf);
 
@@ -48,6 +50,49 @@ pub fn options_from_config(
         }
     };
     Ok(config.options(literals))
+}
+
+/// The shared protection boundary for text Zirv is about to compose into a
+/// model prompt, persist in a shared surface, or send over the network.
+/// `off` is a byte-identical pass-through; every other mode uses the same
+/// per-repository vault and detector configuration.
+pub fn protect_text(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    text: &str,
+    surface: &str,
+) -> CtxResult<(String, Vec<super::obfuscate::Finding>)> {
+    if cfg.obfuscate.mode == ObfuscateMode::Off {
+        return Ok((text.to_string(), Vec::new()));
+    }
+    let home = crate::utils::home_dir()?;
+    let options = options_from_config(&cfg.obfuscate, &home)?;
+    obfuscate_text(state.root(), repo, text, &options, surface)
+}
+
+pub fn protect_text_with_env(
+    repo: &Path,
+    text: &str,
+    surface: &str,
+    env: EnvLookup<'_>,
+) -> CtxResult<(String, Vec<super::obfuscate::Finding>)> {
+    let cfg = CtxConfig::load(repo, env)?;
+    let state = StateDir::resolve(env)?;
+    protect_text(&state, repo, &cfg, text, surface)
+}
+
+pub fn protect_composed(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    mut composed: Option<super::prompt::ComposedPrompt>,
+    surface: &str,
+) -> CtxResult<Option<super::prompt::ComposedPrompt>> {
+    if let Some(prompt) = composed.as_mut() {
+        prompt.text = protect_text(state, repo, cfg, &prompt.text, surface)?.0;
+    }
+    Ok(composed)
 }
 
 /// Holds the cross-process lock for the complete load-transform-save

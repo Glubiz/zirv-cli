@@ -4032,6 +4032,9 @@ pub fn run_remember_with<W: Write>(
             {
                 eprintln!("{warning}");
             }
+            let body =
+                super::obfuscate_store::protect_text(&state, repo, &cfg, &body, "memory_remember")?
+                    .0;
             let now = now_secs();
             let entry = Entry {
                 key: args.key.clone(),
