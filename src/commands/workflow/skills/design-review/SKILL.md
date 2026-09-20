@@ -6,7 +6,7 @@ metadata:
   x-zirv-id: design-review
   x-zirv-version: "1"
   x-zirv-name: Design review
-  x-zirv-triggers: design review,rfc review,proposal review,review this design,architecture review
+  x-zirv-triggers: design review,rfc,rfc review,proposal review,review this design,architecture review
   x-zirv-phases: review
   x-zirv-required-capabilities: repo.read
   x-zirv-context-budget-bytes: "2300"

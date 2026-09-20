@@ -6,7 +6,7 @@ metadata:
   x-zirv-id: adr-authoring
   x-zirv-version: "1"
   x-zirv-name: ADR authoring
-  x-zirv-triggers: adr,decision record,architecture decision,rfc,design decision
+  x-zirv-triggers: adr,decision record,architecture decision,record the decision,design decision
   x-zirv-phases: design
   x-zirv-required-capabilities: repo.read
   x-zirv-optional-capabilities: repo.write

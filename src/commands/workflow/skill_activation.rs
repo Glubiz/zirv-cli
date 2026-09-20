@@ -40,6 +40,21 @@ const PHASE_MATCH_SCORE: u32 = 2;
 /// every task in that phase is intended), but a skill with no trigger and
 /// no phase declared at all, or matching neither, contributes nothing.
 const ACTIVATION_FLOOR: u32 = 2;
+/// Each word beyond the first makes a trigger more specific: "terraform
+/// plan" says far more about a task than "plan" does, and without this a
+/// generic one-word trigger ties with the phrase that actually describes the
+/// work and the tie falls to alphabetical order.
+const PHRASE_WORD_BONUS: u32 = 1;
+
+/// A phrase matches only as a contiguous run of whole words, so "log search"
+/// does not fire inside "blog searching".
+fn phrase_matches(task_lower: &str, phrase: &str) -> bool {
+    task_lower.match_indices(phrase).any(|(start, matched)| {
+        let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+        boundary(task_lower[..start].chars().next_back())
+            && boundary(task_lower[start + matched.len()..].chars().next())
+    })
+}
 
 /// Mirrors `selection::word_tokens`: any non-alphanumeric byte is a
 /// separator, so a single-word trigger only matches a WHOLE word in the
@@ -58,12 +73,17 @@ pub struct SkillMatch<'a> {
     pub skill: &'a RegisteredSkill,
     pub score: u32,
     pub reasons: Vec<String>,
+    /// How many of the skill's own triggers the task hit. Equal scores are
+    /// ordered by the share of a skill's triggers that matched, so a skill
+    /// the task fully describes outranks one it merely brushes against.
+    pub matched_triggers: usize,
 }
 
 /// Deterministic, model-independent skill activation. Scores every skill
 /// the registry resolved against the task text and the active phase and
 /// returns the best matches above [`ACTIVATION_FLOOR`], highest score
-/// first, ties broken by id -- never by map iteration order, and never by
+/// first, ties broken by matched-trigger share then id -- never by map
+/// iteration order, and never by
 /// anything a model decided.
 ///
 /// Issue #539 chunk E2.2: wired into `ctx::prompt::skill_suggestion_context_
@@ -90,23 +110,26 @@ pub fn score_skills<'a>(
         .filter_map(|skill| {
             let mut score = 0u32;
             let mut reasons = Vec::new();
+            let mut matched_triggers = 0usize;
 
             for trigger in &skill.manifest.triggers {
                 let trigger_lower = trigger.trim().to_lowercase();
                 if trigger_lower.is_empty() {
                     continue;
                 }
-                let matched = if trigger_lower.contains(char::is_whitespace) {
+                let extra_words = trigger_lower.split_whitespace().count().saturating_sub(1);
+                let matched = if extra_words > 0 {
                     // A multi-word trigger is a phrase: matched as a
                     // contiguous whole-word run rather than tokenized
                     // membership, which would accept the same words in any
                     // order or position.
-                    task_lower.contains(&trigger_lower)
+                    phrase_matches(&task_lower, &trigger_lower)
                 } else {
                     task_words.contains(trigger_lower.as_str())
                 };
                 if matched {
-                    score += TRIGGER_MATCH_SCORE;
+                    score += TRIGGER_MATCH_SCORE + PHRASE_WORD_BONUS * extra_words as u32;
+                    matched_triggers += 1;
                     reasons.push(format!("trigger '{trigger}' matched the task"));
                 }
             }
@@ -122,13 +145,18 @@ pub fn score_skills<'a>(
                 skill,
                 score,
                 reasons,
+                matched_triggers,
             })
         })
         .collect();
 
     scored.sort_by(|a, b| {
+        // Match share compared by cross-multiplication: no floats, so the
+        // order is exact and identical on every platform.
+        let total = |m: &SkillMatch<'_>| m.skill.manifest.triggers.len().max(1);
         b.score
             .cmp(&a.score)
+            .then_with(|| (b.matched_triggers * total(a)).cmp(&(a.matched_triggers * total(b))))
             .then_with(|| a.skill.manifest.id.cmp(&b.skill.manifest.id))
     });
     scored.truncate(limit);
@@ -184,7 +212,7 @@ mod tests {
             .iter()
             .find(|m| m.skill.manifest.id == "incident-probe")
             .unwrap();
-        assert_eq!(hit.score, TRIGGER_MATCH_SCORE);
+        assert_eq!(hit.score, TRIGGER_MATCH_SCORE + PHRASE_WORD_BONUS);
         assert!(hit.reasons.iter().any(|r| r.contains("production outage")));
     }
 
@@ -282,5 +310,86 @@ mod tests {
         let registry = registry_with(repo.path());
         let matches = score_skills(&registry, "", None, 10);
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn a_phrase_outranks_a_generic_one_word_trigger() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).expect("registry");
+        let matches = score_skills(
+            &registry,
+            "Look over this terraform plan before I apply it.",
+            None,
+            3,
+        );
+        assert_eq!(matches[0].skill.manifest.id, "infrastructure-review");
+        assert_eq!(matches[0].score, TRIGGER_MATCH_SCORE + PHRASE_WORD_BONUS);
+    }
+
+    #[test]
+    fn equal_scores_order_by_the_share_of_a_skills_triggers_that_matched() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).expect("registry");
+        // `verify` and `frontend-verify` both match "complete" and "verify",
+        // but those are all of `verify`'s triggers and half of the other's.
+        let matches = score_skills(
+            &registry,
+            "Confirm the work is complete and verify it.",
+            Some(WorkflowPhase::Verify),
+            3,
+        );
+        assert_eq!(matches[0].skill.manifest.id, "verify");
+        assert_eq!(matches[0].score, matches[1].score);
+    }
+
+    #[test]
+    fn a_phrase_only_matches_on_whole_word_boundaries() {
+        assert!(phrase_matches("run a log search now", "log search"));
+        assert!(phrase_matches("log search", "log search"));
+        assert!(!phrase_matches("my blog searching habit", "log search"));
+    }
+
+    /// The fixture is the catalogue's activation contract: one natural
+    /// request per built-in skill, which must rank that skill first, plus
+    /// requests nothing should claim. A new skill earns its place by adding
+    /// a row here that passes without displacing another.
+    #[test]
+    fn every_fixture_task_ranks_its_expected_skill_first() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).expect("registry");
+        let fixture = include_str!("../../../tests/fixtures/skill-activation/tasks.tsv");
+        let mut covered = BTreeSet::new();
+        for line in fixture
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let mut columns = line.splitn(3, '\t');
+            let (expected, phase, task) = (
+                columns.next().expect("skill column"),
+                columns.next().expect("phase column"),
+                columns.next().expect("task column"),
+            );
+            let phase = (phase != "-").then(|| WorkflowPhase::parse(phase).expect("known phase"));
+            let matches = score_skills(&registry, task, phase, 3);
+            if expected == "-" {
+                assert!(
+                    matches.is_empty(),
+                    "nothing should claim {task:?}: {matches:?}"
+                );
+                continue;
+            }
+            let ranked: Vec<&str> = matches
+                .iter()
+                .map(|m| m.skill.manifest.id.as_str())
+                .collect();
+            assert_eq!(
+                ranked.first(),
+                Some(&expected),
+                "{task:?} ranked {ranked:?}"
+            );
+            covered.insert(expected.to_string());
+        }
+        let all: BTreeSet<String> = registry.list().map(|s| s.manifest.id.clone()).collect();
+        assert_eq!(covered, all, "every built-in skill needs a fixture row");
     }
 }
