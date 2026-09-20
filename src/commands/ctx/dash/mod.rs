@@ -136,14 +136,6 @@ pub enum DashAction {
     /// The prefix key pressed again while armed: the operator meant to send
     /// the child a literal `Ctrl+A`, not invoke a dashboard command.
     LiteralPrefix,
-    /// `Ctrl+A v` -- toggles the dashboard's own mouse reporting off (and
-    /// back on), handing mouse control back to the terminal so its native
-    /// click-drag text selection reaches a pane whose child has enabled its
-    /// own mouse reporting -- the one case the dashboard's own in-pane
-    /// click-drag selection cannot cover, since that only ever engages for a
-    /// child that does *not* want mouse (`Pane::wants_mouse`, see
-    /// `Selection`'s doc comment). See `term::dash_mouse_off_bytes`.
-    ToggleSelectMode,
 }
 
 /// Issue #354: what one pointer event means to the dashboard, decided
@@ -184,8 +176,8 @@ enum MouseRoute {
 
 /// Pure: the dispatch order the behaviour contract calls for, in one place.
 ///
-/// 1. the select-mode / mouse-off guard (mouse capture off means the terminal
-///    itself owns the pointer, so nothing here may act on it);
+/// 1. the mouse-capture-off guard (`dash.mouse = false`; the terminal itself
+///    owns the pointer, so nothing here may act on it);
 /// 2. the modal layer -- an open overlay owns every pointer event, wheel
 ///    included. Phase 3 refines "owns" from "swallows" to "owns its own
 ///    targets": a click on one of the dialog's visible rows selects (or, on a
@@ -194,8 +186,10 @@ enum MouseRoute {
 ///    else inside or around it is consumed and does nothing. Nothing under a
 ///    dialog is ever reachable;
 /// 3. the captured gesture owner -- a drag or release that belongs to an
-///    in-progress text selection stays with the grid wherever it lands, so
-///    every `*_cancels_selection` rule keeps working;
+///    in-progress text selection, or to a left press still waiting on the
+///    click-vs-drag decision (`PendingPress`), stays with the grid wherever
+///    it lands, so neither the translation/cancel rules nor the deferred
+///    click can be defeated by the pointer straying onto chrome mid-gesture;
 /// 4. the chrome hit;
 /// 5. the existing grid path, unchanged.
 ///
@@ -327,19 +321,16 @@ fn session_target(
     rows.get(selected).map(|row| row.short.clone())
 }
 
-/// Pure: whether a left press at `(column, row)` starts zirv's own click-drag
-/// text selection over the focused pane. False while the child owns the mouse
-/// -- its own reports are forwarded instead, and a selection drawn on top of
-/// them would highlight cells the child is about to rewrite.
-fn press_starts_selection(main: Rect, column: u16, row: u16, wants_mouse: bool) -> bool {
-    main.contains(Position::new(column, row)) && !wants_mouse
-}
-
-/// Pure: whether a left drag over a mouse-owning pane should raise the
-/// "text selection is off" notice. Once per session, ever -- the gesture that
-/// silently does nothing is worth explaining exactly one time.
-const fn drag_needs_capture_hint(wants_mouse: bool, already_shown: bool) -> bool {
-    wants_mouse && !already_shown
+/// Pure: whether a left press at `(column, row)` is eligible to start a
+/// pending zirv selection over the focused pane -- issue #697: the dashboard
+/// now owns click-drag inside every pane, including one whose child has
+/// turned on its own mouse reporting (`Pane::wants_mouse`), so this no
+/// longer gates on that at all. What still tells a click for such a child
+/// apart from a drag meant for zirv's own selection is decided later, by how
+/// far the pointer moves before release (see `past_drag_threshold` and
+/// `PendingPress`) -- not by where the press landed.
+fn press_starts_selection(main: Rect, column: u16, row: u16) -> bool {
+    main.contains(Position::new(column, row))
 }
 
 /// Pure: `SelectUp`/`SelectDown` over the *tree* the roster actually drew
@@ -560,7 +551,6 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         // action-descriptor table. `p` was unbound before.
         KeyCode::Char('p') => Some(DashAction::Palette),
         KeyCode::Char('z') => Some(DashAction::Zoom),
-        KeyCode::Char('v') => Some(DashAction::ToggleSelectMode),
         KeyCode::Char('q') => Some(DashAction::Quit),
         KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Some(DashAction::Help),
         _ => None,
@@ -1760,7 +1750,6 @@ const fn follow_focus(selected: usize, focused: usize, pane_count: usize) -> usi
 /// `HeaderFacts` field order.
 fn assemble_header_facts(
     harness: String,
-    select_mode: bool,
     live: usize,
     total: usize,
     error_count: usize,
@@ -1770,7 +1759,6 @@ fn assemble_header_facts(
     ui::HeaderFacts {
         hints: ui::HintContext::default(),
         harness,
-        select_mode,
         live,
         total,
         error_count,
@@ -4616,87 +4604,234 @@ fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16))
 /// A pane-local text selection dragged out with the mouse: the `?1002`
 /// `Drag` events `term::dash_mouse_on_bytes` now enables let the dashboard
 /// offer tmux-style click-drag selection in place of the terminal's own
-/// native one, which enabling any mouse reporting displaced. Only ever
-/// started against a pane that does not itself want mouse events
-/// (`Pane::wants_mouse`) -- one that does keeps getting its clicks forwarded
-/// exactly as before, untouched by any of this.
+/// native one, which enabling any mouse reporting displaced. Issue #697
+/// removed the `!Pane::wants_mouse` gate this used to carry -- the dashboard
+/// now owns click-drag inside every pane, including one whose child has
+/// turned on its own mouse reporting (a plain click still reaches such a
+/// child; see `PendingPress`, which is what decides click from drag before
+/// either a `Selection` or a forwarded click exists).
 ///
 /// `anchor`/`end` are 0-based visible-grid `(row, col)` cells, in whichever
 /// order the drag actually went (not yet normalized -- `normalize_selection`
 /// does that at read time, so a drag that moved up or left works the same as
-/// one that moved down or right). They are only meaningful against the
-/// pane's *current* scrollback offset (`Pane::screen`'s own doc comment:
+/// one that moved down or right). `row` is signed and deliberately never
+/// clamped here: they are only meaningful against the pane's scrollback
+/// offset at the moment each was captured (`Pane::screen`'s own doc comment:
 /// `vt100::Screen::cell`/`contents_between` both reinterpret a `(row, col)`
-/// against whatever is presently scrolled into view) -- so a scroll on this
-/// pane, wheel or `Ctrl+A PageUp`/`Home`/`End` alike, cancels the selection
-/// outright (`scroll_cancels_selection`) rather than carrying a captured
-/// offset here to compare against; see the callers of that function for
-/// where. `pane_short` names the pane the selection belongs to, not a
-/// `panes` index: an index shifts under a reap (`reap_fixup`), while a short
-/// id still names the same pane or plainly does not match any more, which is
+/// against whatever is presently scrolled into view), and issue #697 asked
+/// for scrolling and selecting to work at the same time -- so rather than
+/// cancelling outright the moment that offset moves, `translate_selection`
+/// shifts `anchor`/`end` by exactly the same delta the scroll just applied
+/// to the pane, keeping them exact. A translated row that has been pushed
+/// above row `0` or past the pane's last row genuinely is off-screen right
+/// now (nothing to highlight, nothing in range to copy from), but the true
+/// value is what a later scroll back the other way needs to land on the
+/// right cell again -- `resolve_selection_range` is the one place that
+/// clamps, and only once something is about to actually index the grid.
+/// `pane_short` names the pane the selection belongs to, not a `panes`
+/// index: an index shifts under a reap (`reap_fixup`), while a short id
+/// still names the same pane or plainly does not match any more, which is
 /// all a stale-selection check needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Selection {
     pane_short: String,
-    anchor: (u16, u16),
-    end: (u16, u16),
+    anchor: (i64, u16),
+    end: (i64, u16),
 }
 
-/// Pure: whether a scroll on `scrolled_pane_short` that moved a pane's
-/// scrollback offset from `before` to `after` must cancel `selection`.
+/// A left press inside a pane's grid whose fate -- a click forwarded to the
+/// child, or a drag that becomes zirv's own [`Selection`] -- is not yet
+/// decided. Issue #697's own click-vs-drag deferral: a plain click must
+/// still reach a harness TUI waiting for one (a button in the Claude Code or
+/// Codex TUI), so a press cannot simply become a selection the instant it
+/// lands the way it used to for a pane the child did not want the mouse on.
+/// Cleared the moment the fate is decided -- promoted into a `Selection`
+/// once the pointer moves past [`DRAG_THRESHOLD_CELLS`] (`past_drag_
+/// threshold`), or replayed as a forwarded press-then-release on an
+/// unmoved-enough `Up` -- so it never lives longer than one gesture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPress {
+    pane_short: String,
+    /// Frame-relative coordinates of the ORIGINAL press, exactly as
+    /// crossterm reported them. Kept in frame space, not yet pane-local, so
+    /// both the drag-distance check and the eventual forwarded click
+    /// re-derive pane-local coordinates the same way every other mouse path
+    /// here already does, rather than caching a second projection that
+    /// could quietly drift from it.
+    column: u16,
+    row: u16,
+    /// The pane-local grid cell the press landed on (`pane_local_cell`),
+    /// captured once so a promoted `Selection`'s anchor is exactly where the
+    /// button went down, not wherever the drag was first observed to have
+    /// moved past the threshold.
+    anchor_cell: (u16, u16),
+}
+
+/// How far the pointer must move from a left press, in either axis, before
+/// it counts as a drag rather than a click -- issue #697's own number. A
+/// real mouse routinely reports a cell or so of jitter between a `Down` and
+/// the `Up` that follows it with no drag intended at all, and that jitter
+/// must still forward as a plain click to a harness TUI waiting for one.
+const DRAG_THRESHOLD_CELLS: u16 = 1;
+
+/// Pure: whether a pointer that pressed at `(from_col, from_row)` has moved
+/// far enough, now that it is at `(to_col, to_row)`, to count as a drag
+/// rather than a click -- strictly more than [`DRAG_THRESHOLD_CELLS`] in
+/// either axis. `abs_diff` rather than subtraction: the drag can go in any
+/// direction, and only the magnitude of the move matters here.
+fn past_drag_threshold(from_col: u16, from_row: u16, to_col: u16, to_row: u16) -> bool {
+    from_col.abs_diff(to_col) > DRAG_THRESHOLD_CELLS
+        || from_row.abs_diff(to_row) > DRAG_THRESHOLD_CELLS
+}
+
+/// Pure: the `Selection` a `PendingPress` promotes into, once
+/// `past_drag_threshold` has said this is a drag rather than a click.
+/// `end_cell` is the pane-local cell the pointer is over NOW (already
+/// clamped into the grid by `pane_local_cell`); the anchor is exactly where
+/// the button went down, from `pending.anchor_cell`, never wherever the
+/// drag was first observed to have crossed the threshold. Pulled out of the
+/// event loop so the click-vs-drag promotion is unit-tested without a live
+/// `Pane` or a real terminal.
+fn promote_pending_drag(pending: PendingPress, end_cell: (u16, u16)) -> Selection {
+    Selection {
+        pane_short: pending.pane_short,
+        anchor: (i64::from(pending.anchor_cell.0), pending.anchor_cell.1),
+        end: (i64::from(end_cell.0), end_cell.1),
+    }
+}
+
+/// Pure: the two pane-local, 1-based coordinate pairs -- `(press, release)`
+/// -- a `PendingPress` that reached `Up` without ever crossing
+/// `DRAG_THRESHOLD_CELLS` replays as a forwarded click, in exactly the
+/// shape `Pane::forward_mouse_button` needs (`pane_local_mouse`'s own doc
+/// comment). `main` is the SAME rect both the original press and this
+/// release must be interpreted against. Pulled out of the event loop for
+/// the same reason `promote_pending_drag` is: a click that never crossed
+/// the threshold is provably the coordinate pair this returns, with no live
+/// `Pane` needed to check it -- `Pane::forward_mouse_button` is itself the
+/// `wants_mouse` gate on what the event loop does with them.
+fn deferred_click_coords(
+    pending: &PendingPress,
+    main: Rect,
+    release_column: u16,
+    release_row: u16,
+) -> ((u16, u16), (u16, u16)) {
+    (
+        pane_local_mouse(main, pending.column, pending.row),
+        pane_local_mouse(main, release_column, release_row),
+    )
+}
+
+/// Pure: which direction, if any, dragging the pointer to frame row `row`
+/// while `main` is the focused pane's own rect should auto-scroll that pane
+/// by -- issue #697's "dragging past the top or bottom edge auto-scrolls"
+/// requirement. `Some(1)` (further back into history, the same sign
+/// `Pane::scroll_by`'s own `delta` already uses) once the pointer is above
+/// the grid's top edge, `Some(-1)` (back toward live) once it is at or past
+/// the bottom edge, `None` anywhere inside it.
+fn drag_autoscroll_direction(main: Rect, row: u16) -> Option<isize> {
+    if main.is_empty() {
+        return None;
+    }
+    if row < main.y {
+        Some(1)
+    } else if row >= main.y.saturating_add(main.height) {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
+/// Shifts `selection`'s anchor and end by `delta` rows -- the amount
+/// `scrolled_pane_short`'s scrollback offset just moved by -- if the
+/// selection belongs to that pane and there is anything to shift. Replaces
+/// the old `scroll_cancels_selection`: issue #697 asked for scrolling and
+/// selecting to work at the same time, and a `Selection`'s `(row, col)` is
+/// only meaningful against the offset it was captured at (`Pane::screen`'s
+/// own doc comment on `cell`/`contents_between`), so a scroll has to move
+/// the selection's own coordinates by the same amount it just moved the
+/// pane's, not throw the selection away.
 ///
-/// Any nonzero movement on the *same* pane the selection belongs to
-/// invalidates it, whatever state the selection is in -- still being dragged
-/// (a wheel notch spun while the button is held arrives as its own
-/// `MouseEventKind::ScrollUp`/`ScrollDown` event, not a `Drag`, so nothing
-/// else observes it) or already released and highlighted (`Ctrl+A PageUp`,
-/// or the wheel, scrolled after the button came up). Both `Screen::cell`
-/// (rendering, via `ui::render_grid`) and `Screen::contents_between`
-/// (extraction) reinterpret a `(row, col)` against whatever is presently
-/// scrolled into view, so continuing to use stale coordinates would
-/// highlight -- and copy -- whichever rows now happen to occupy those
-/// coordinates, not what the operator actually dragged over. A scroll on a
-/// *different* pane, or one that clamped to a no-op (already at the oldest
-/// line or already live), leaves the selection alone.
-fn scroll_cancels_selection(
-    selection: &Selection,
-    scrolled_pane_short: &str,
-    before: usize,
-    after: usize,
-) -> bool {
-    before != after && selection.pane_short == scrolled_pane_short
+/// Applying this once per actual scroll -- every `Pane::scroll_wheel`/
+/// `scroll_by`/`scroll_page`/`scroll_to_top`/`scroll_to_live` call site, plus
+/// the drag-past-the-edge auto-scroll below -- ends up exactly equivalent to
+/// storing the offset the anchor was captured at once and re-deriving
+/// `anchor_row + (current_offset - captured_offset)` at read time: the sum
+/// of every incremental delta along the way IS that same total delta,
+/// addition being associative. Nothing here needs to remember the original
+/// offset at all, only apply each move as it happens -- which is also why
+/// `Selection` itself carries no offset field of its own.
+///
+/// `row` is left free to go negative or past the pane's own `grid_rows` (see
+/// `Selection`'s own doc comment on why); this never clamps.
+fn translate_selection(selection: &mut Option<Selection>, scrolled_pane_short: &str, delta: i64) {
+    let Some(sel) = selection.as_mut() else {
+        return;
+    };
+    if delta == 0 || sel.pane_short != scrolled_pane_short {
+        return;
+    }
+    sel.anchor.0 += delta;
+    sel.end.0 += delta;
+}
+
+/// Pure: `sel`'s anchor/end resolved against a grid of `grid_rows` by
+/// `grid_cols`, clamped into `0..grid_rows`/`0..grid_cols` and ordered so
+/// `start <= end` in reading order (`normalize_selection`). This is the one
+/// place a `Selection`'s translated (and possibly out-of-range) coordinates
+/// are ever clamped -- both `ui::render_grid`'s highlighting and the
+/// extraction on release go through here, so a row `translate_selection` has
+/// pushed above the top or past the bottom of the CURRENT view degrades to
+/// "clamped to that edge" for both, rather than indexing past the grid or
+/// (worse, for extraction) silently reading the wrong row.
+fn resolve_selection_range(
+    sel: &Selection,
+    grid_rows: u16,
+    grid_cols: u16,
+) -> ((u16, u16), (u16, u16)) {
+    let clamp_row = |r: i64| -> u16 {
+        if grid_rows == 0 {
+            0
+        } else {
+            r.clamp(0, i64::from(grid_rows) - 1) as u16
+        }
+    };
+    let clamp_col = |c: u16| c.min(grid_cols.saturating_sub(1));
+    let a = (clamp_row(sel.anchor.0), clamp_col(sel.anchor.1));
+    let b = (clamp_row(sel.end.0), clamp_col(sel.end.1));
+    normalize_selection(a, b)
 }
 
 /// Pure: whether newly processed child output on `output_pane_short` must
 /// cancel `selection`.
 ///
-/// The unifying invariant behind every one of these `*_cancels_selection`
-/// functions is that a `Selection`'s `(row, col)` coordinates only stay
-/// meaningful while the pane's *visible content* is static.
-/// `scroll_cancels_selection` covers the offset moving; this covers the far
-/// more common case of the offset staying at `0` while the child simply
-/// keeps printing -- new rows scroll the old ones up under the very
-/// coordinates a selection is still using, and a release after that would
-/// copy whatever text now happens to sit there, not what the operator
-/// dragged over. Any output at all on the selected pane cancels it: telling
-/// "the screen changed" apart from "bytes arrived but repainted the exact
-/// same content" would need a full-screen diff for a benefit no operator
-/// would notice, while the cost of a false cancel here is at most a
-/// selection the operator can just redraw. Output on a *different* pane
-/// leaves the selection alone.
+/// The unifying invariant behind this and `resize_cancels_selection` is that
+/// a `Selection`'s `(row, col)` coordinates only stay meaningful while the
+/// pane's *visible content* is static -- the reason a scroll no longer
+/// cancels (`translate_selection` keeps it exact instead) is precisely that
+/// a scroll does not change what any given row's content IS, only which row
+/// it is currently drawn at. New output has no such invariant to lean on:
+/// new rows scroll the old ones up under the very coordinates a selection is
+/// still using, and a release after that would copy whatever text now
+/// happens to sit there, not what the operator dragged over. Any output at
+/// all on the selected pane cancels it: telling "the screen changed" apart
+/// from "bytes arrived but repainted the exact same content" would need a
+/// full-screen diff for a benefit no operator would notice, while the cost
+/// of a false cancel here is at most a selection the operator can just
+/// redraw. Output on a *different* pane leaves the selection alone.
 fn output_cancels_selection(selection: &Selection, output_pane_short: &str) -> bool {
     selection.pane_short == output_pane_short
 }
 
 /// Pure: whether resizing `resized_pane_short`'s grid from `old_size` to
 /// `new_size` (both `(rows, cols)`, `vt100::Screen::size`'s own order) must
-/// cancel `selection`. The same invariant as `scroll_cancels_selection`/
-/// `output_cancels_selection` from the third angle: a resize does not move
-/// content, but it does mean the pane's grid this selection's `(row, col)`
-/// cells index into is no longer the one they were captured against --
-/// `ui::cell_in_selection`'s middle-row arm would highlight every remaining
-/// row of a shrunk grid, and `contents_between` would copy the trailing row
-/// in full, if the coordinates were left to point past the new bounds.
+/// cancel `selection`. The same invariant as `output_cancels_selection`
+/// from the second angle: a resize does not move content, but it does mean
+/// the pane's grid this selection's `(row, col)` cells index into is no
+/// longer the one they were captured against -- `ui::cell_in_selection`'s
+/// middle-row arm would highlight every remaining row of a shrunk grid, and
+/// `contents_between` would copy the trailing row in full, if the
+/// coordinates were left to point past the new bounds.
 fn resize_cancels_selection(
     selection: &Selection,
     resized_pane_short: &str,
@@ -4826,6 +4961,173 @@ fn copy_to_host_clipboard(text: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
     stdout.write_all(&osc52_copy_sequence(text))?;
     stdout.flush()
+}
+
+/// Pure: `text`, with trailing horizontal whitespace trimmed from every
+/// line. `vt100::Row::write_contents` (what `contents_between`/`rows` read
+/// through) never pads a cell the child truly never wrote into, but a
+/// harness that redraws by clearing to end-of-line with literal spaces (a
+/// prompt box, a right-aligned status strip, ...) writes real space
+/// *characters* there, which `has_contents()` then reports as real content
+/// -- included verbatim in a copy. The operator never saw those as part of
+/// what they selected, and pasting them elsewhere reflows or diffs oddly
+/// against a source that trimmed on write. Only trailing whitespace on each
+/// line is touched; `\n` stays the line separator and leading/interior
+/// whitespace is left exactly as drawn.
+fn trim_trailing_whitespace_per_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One external clipboard command to try, and the argv it needs.
+type ClipboardCommand = (&'static str, &'static [&'static str]);
+
+/// Which external clipboard command a fallback copy tries on this platform,
+/// in order -- the first one that spawns and accepts the write wins. OSC 52
+/// (`copy_to_host_clipboard`) is silently ignored by some terminals (macOS
+/// Terminal.app is the one on record -- issue #697) with no way for this
+/// dashboard to learn that from the write alone, so the fallback always runs
+/// alongside it rather than only once OSC 52's own write has errored (see
+/// `copy_selection`). `wl-copy` before `xclip` on Linux: a Wayland session
+/// has no X server for `xclip` to reach, so trying the X tool first would
+/// cost every Wayland copy a doomed spawn attempt before falling through to
+/// the one that actually works.
+fn fallback_clipboard_commands() -> &'static [ClipboardCommand] {
+    if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("clip.exe", &[])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+    }
+}
+
+/// What [`copy_via_fallback`] needs from whatever launches one clipboard
+/// command: given the program, its args and the text to copy, either it
+/// landed (`Ok`) or it did not (`Err`, for any reason -- missing from
+/// `$PATH`, refused the write, exited non-zero). A trait object rather than
+/// a bare function pointer so a test can inject a closure that records what
+/// it was asked to run and returns a canned result, never actually forking
+/// `pbcopy`/`wl-copy`/`xclip`/`clip.exe`.
+type ClipboardSpawner<'a> = dyn Fn(&str, &[&str], &str) -> io::Result<()> + 'a;
+
+/// Spawns `program args`, writes `text` to its stdin, closes it (so the
+/// command sees EOF and actually acts -- every command
+/// `fallback_clipboard_commands` lists reads until end of input) and waits
+/// for it to exit. The real [`ClipboardSpawner`]; tests inject a fake
+/// instead (see `copy_via_fallback`'s own tests).
+fn spawn_and_write_clipboard(program: &str, args: &[&str], text: &str) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+        // Dropped here, at the end of this block: closing the pipe is what
+        // tells the command the input is complete, which is what lets
+        // `wait` below return promptly instead of blocking on a child still
+        // waiting for more.
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{program} exited with {status}")))
+    }
+}
+
+/// Pure with respect to `spawner`: tries `commands` in order against `text`,
+/// stopping at the first one that succeeds. `false` only when every command
+/// in the list failed (missing from `$PATH`, or rejected the write) -- the
+/// one case [`copy_selection`] must eventually tell the operator the copy
+/// did not land, since silent loss is exactly what issue #697 is about.
+fn copy_via_fallback(
+    spawner: &ClipboardSpawner<'_>,
+    commands: &[ClipboardCommand],
+    text: &str,
+) -> bool {
+    commands
+        .iter()
+        .any(|(program, args)| spawner(program, args, text).is_ok())
+}
+
+/// What copying a selection settled on, once OSC 52's own write and the
+/// background fallback attempt have both had their say. Confirmed and
+/// unconfirmed both mean "do not alarm the operator" -- the difference is
+/// only whether anything could actually verify the copy landed; `Failed` is
+/// the one case whose notice must be an error, since it is the silent loss
+/// the issue is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardOutcome {
+    /// The fallback command actually ran and exited cleanly: the clipboard
+    /// is confirmed set on this machine, whatever OSC 52's own write did.
+    Confirmed,
+    /// OSC 52's write to the host terminal succeeded and no fallback
+    /// command could confirm or deny it (none is installed on this
+    /// platform) -- the same best-effort standing `copy_to_host_clipboard`
+    /// always had on its own.
+    Unconfirmed,
+    /// Neither avenue worked: OSC 52's own write failed AND every fallback
+    /// command failed too.
+    Failed,
+}
+
+/// Pure: folds an OSC 52 write's own result and the fallback attempt's own
+/// result into one [`ClipboardOutcome`]. See that type's own doc comment for
+/// what each arm means to the operator; this is the decision `copy_selection`
+/// hands off to a background thread purely so it stays unit-testable without
+/// spawning anything real.
+fn resolve_clipboard_outcome(osc52_ok: bool, fallback_ok: bool) -> ClipboardOutcome {
+    if fallback_ok {
+        ClipboardOutcome::Confirmed
+    } else if osc52_ok {
+        ClipboardOutcome::Unconfirmed
+    } else {
+        ClipboardOutcome::Failed
+    }
+}
+
+/// Copies `text` to the clipboard: OSC 52 first (synchronous, and fast
+/// enough to never be worth backgrounding -- a handful of bytes to the host
+/// terminal's own stdout), then the platform fallback command on a detached
+/// thread, the same way `FactsRefresher` backgrounds a slow disk read -- so
+/// a hung or missing `pbcopy`/`wl-copy`/`xclip`/`clip.exe` costs the render
+/// loop nothing. `result_tx` is where the outcome lands once the thread
+/// finishes; the event loop drains it with `try_recv`, the same way it
+/// drains `FactsRefresher`'s own channel.
+///
+/// A thread that fails to spawn at all runs the fallback inline instead --
+/// the same "still correct, just not backgrounded" degradation
+/// `FactsRefresher::spawn` uses for its own read -- rather than dropping the
+/// fallback entirely.
+fn copy_selection(text: String, result_tx: &mpsc::Sender<ClipboardOutcome>) {
+    let osc52_ok = copy_to_host_clipboard(&text).is_ok();
+    let tx = result_tx.clone();
+    let thread_text = text.clone();
+    let spawned = std::thread::Builder::new()
+        .name("zirv-dash-clipboard".to_string())
+        .spawn(move || {
+            let fallback_ok = copy_via_fallback(
+                &spawn_and_write_clipboard,
+                fallback_clipboard_commands(),
+                &thread_text,
+            );
+            let _ = tx.send(resolve_clipboard_outcome(osc52_ok, fallback_ok));
+        })
+        .is_ok();
+    if !spawned {
+        let fallback_ok = copy_via_fallback(
+            &spawn_and_write_clipboard,
+            fallback_clipboard_commands(),
+            &text,
+        );
+        let _ = result_tx.send(resolve_clipboard_outcome(osc52_ok, fallback_ok));
+    }
 }
 
 /// Pure: the most recent notice still live as of `now`, if any. The header
@@ -8745,8 +9047,9 @@ struct DashboardFacts<'a> {
     seat: Option<&'a str>,
     state_dir: String,
     uptime_secs: u64,
-    /// Mouse reporting is on (the pointer drives the chrome); `false` is
-    /// select mode, where the terminal owns the pointer for text selection.
+    /// Mouse reporting is on (the pointer drives the chrome and zirv's own
+    /// click-drag selection); `false` is the operator's own `dash.mouse`
+    /// config turned off entirely, handing the pointer to the terminal.
     mouse: bool,
     sidebar_cols: u16,
     /// How stale the throttled disk facts below are.
@@ -8905,7 +9208,7 @@ fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::InspectorView {
             inspect_line("state dir", Some(facts.state_dir.clone())),
             inspect_line(
                 "mouse",
-                Some(if facts.mouse { "on" } else { "select mode" }.to_string()),
+                Some(if facts.mouse { "on" } else { "off" }.to_string()),
             ),
             inspect_line("sidebar", Some(format!("{} cols", facts.sidebar_cols))),
             inspect_line("facts", Some(age(facts.facts_age_secs))),
@@ -11156,7 +11459,10 @@ fn run_dashboard_inner(
 
     // Mouse reporting, which is what makes the wheel scroll a pane's
     // scrollback, a click reach a child that wants one, and a click-drag
-    // select text out of one that doesn't (`Event::Mouse` below).
+    // select text out of any pane -- issue #697: the dashboard owns
+    // click-drag selection everywhere now, deferring a press just long
+    // enough to still forward a plain click to a child that wants one
+    // (`Event::Mouse` below, `PendingPress`).
     //
     // Written as raw bytes from `term::dash_mouse_on_bytes` rather than
     // through crossterm's `EnableMouseCapture`, on purpose: that helper also
@@ -11175,11 +11481,11 @@ fn run_dashboard_inner(
     // `Ctrl+A PageUp`/`Home`, so a failure here is a header notice, never a
     // failed launch. Undone by `term::dash_reset_bytes` on every exit path --
     // the ordinary teardown, the panic hook and the external-kill handler
-    // alike -- so it cannot be left switched on. Also undone, mid-session and
-    // reversibly, by `Ctrl+A v` (`DashAction::ToggleSelectMode`,
-    // `term::dash_mouse_off_bytes`) -- the operator's own escape hatch for a
-    // pane whose child wants mouse itself, which the dashboard's own
-    // click-drag selection cannot help (see `Selection`'s doc comment).
+    // alike -- so it cannot be left switched on. Issue #697 removed the
+    // mid-session `Ctrl+A v` toggle that used to be able to turn it back off
+    // again (`term::dash_mouse_off_bytes`, now gone): once this is on for a
+    // session, it stays on for the session, and `dash.mouse` (checked below)
+    // is the only on/off switch left, decided once, here, at startup.
     if cfg.dash.mouse {
         let mut stdout = io::stdout();
         if let Err(e) = stdout
@@ -11316,28 +11622,28 @@ fn run_dashboard_inner(
     let mut last_overlay_ident = overlay_identity(&ui::Overlay::None);
     let mut zoomed = false;
     let mut prefix_armed = false;
-    // `Ctrl+A v` (`DashAction::ToggleSelectMode`)'s own state: whether the
-    // dashboard's mouse reporting is currently on. Seeded from `cfg.dash.mouse`
-    // itself -- when config never turned it on in the first place, the toggle
-    // is a no-op (see that arm) rather than reaching for bytes that were never
-    // written. Flipped, and the corresponding on/off bytes written to the
-    // terminal, only by that one `DashAction` arm below.
-    let mut mouse_capture = cfg.dash.mouse;
-    // T-discover: latched once per dashboard session (never re-armed by the
-    // toggle either direction) so an operator who drags over a pane whose
-    // child has grabbed the mouse -- the exact gesture that silently does
-    // nothing, which is what filed this bug -- learns the escape hatch
-    // exists without having to already know it or open the help overlay.
-    // Deliberately a notice, never an automatic mode switch: entering select
-    // mode on the gesture's own say-so would break a legitimate drag the
-    // operator meant for the child TUI itself (a text editor's own selection,
-    // a resize handle, ...).
-    let mut mouse_capture_hint_shown = false;
+    // Whether the dashboard's mouse reporting is on for this session --
+    // seeded from `cfg.dash.mouse` and, since issue #697 removed the
+    // mid-session `Ctrl+A v` toggle that used to flip it, never changed
+    // again after this: `dash.mouse` is decided once, at startup, and stays
+    // decided for the life of the session.
+    let mouse_capture = cfg.dash.mouse;
     // Tmux-style in-dashboard click-drag text selection (`Selection`'s own
     // doc comment). `None` whenever nothing is selected or highlighted;
     // `Some` both while a drag is in progress and, after release, for
     // whatever stays highlighted until the next `Down` clears it.
     let mut selection: Option<Selection> = None;
+    // Issue #697: a left press inside a pane's grid whose fate -- a click
+    // forwarded to the child, or a drag that becomes the `Selection` above
+    // -- is not yet decided (`PendingPress`'s own doc comment). `None`
+    // whenever no press is currently outstanding.
+    let mut pending_press: Option<PendingPress> = None;
+    // Issue #697: where a background clipboard-fallback attempt
+    // (`copy_selection`) reports back once it finishes, so a hung or
+    // missing `pbcopy`/`wl-copy`/`xclip`/`clip.exe` never costs the render
+    // loop anything. Drained once per tick, the same way `facts_refresher`'s
+    // own channel is.
+    let (clipboard_tx, clipboard_rx) = mpsc::channel::<ClipboardOutcome>();
     // Issue #490 (roadmap N21 item A): the native pane key contract's own
     // Ctrl+C quit-confirmation clock, held by the dashboard because the pane
     // it belongs to may be swapped out from under it (focus moves, a pane is
@@ -11540,9 +11846,9 @@ fn run_dashboard_inner(
         for idx in produced_output {
             // HIGH (review): live output rewrites this pane's grid rows in
             // place, under a selection's stale `(row, col)` coordinates --
-            // scrollback-offset checks (`scroll_cancels_selection`) never see
-            // this, since the offset itself does not move while the pane
-            // sits at its live view. See `output_cancels_selection`.
+            // `translate_selection` never sees this, since the scrollback
+            // offset itself does not move while the pane sits at its live
+            // view. See `output_cancels_selection`.
             if let Some(sel) = selection.as_ref()
                 && output_cancels_selection(sel, panes[idx].short())
             {
@@ -11773,6 +12079,27 @@ fn run_dashboard_inner(
             // the operator has demonstrably now read.
             facts_cache.disk.attention.insert(short, acked);
         }
+        // Issue #697: the clipboard fallback runs on its own thread
+        // (`copy_selection`) so a hung or missing
+        // `pbcopy`/`wl-copy`/`xclip`/`clip.exe` never costs the render loop
+        // anything; this is where its outcome, if any finished since the
+        // last tick, turns into the one notice or error the operator
+        // actually sees.
+        while let Ok(outcome) = clipboard_rx.try_recv() {
+            match outcome {
+                ClipboardOutcome::Confirmed | ClipboardOutcome::Unconfirmed => push_notice(
+                    &mut notices,
+                    Instant::now(),
+                    "copied selection to clipboard".to_string(),
+                ),
+                ClipboardOutcome::Failed => push_error(
+                    &mut errors,
+                    "clipboard: copy could not be delivered (OSC 52 and the platform \
+                     clipboard command both failed)"
+                        .to_string(),
+                ),
+            }
+        }
         let facts_now = Instant::now();
         let facts_refreshed = facts_cache.refresh_if_due(
             cfg,
@@ -11934,20 +12261,23 @@ fn run_dashboard_inner(
                     // the dispatch order itself.
                     if let Ok(Event::Mouse(mouse)) = read.as_ref() {
                         let mouse = *mouse;
-                        // A fresh left press clears the highlight wherever it
-                        // lands: the grid arm's own `selection = None` is out
-                        // of reach for a chrome click now.
+                        // A fresh left press clears the highlight (and any
+                        // not-yet-decided pending press) wherever it lands:
+                        // the grid arm's own `selection = None`/
+                        // `pending_press = None` is out of reach for a
+                        // chrome click now.
                         if mouse_capture
                             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         {
                             selection = None;
+                            pending_press = None;
                         }
                         let route = route_mouse(
                             &frame_snapshot,
                             mouse,
                             mouse_capture,
                             !matches!(overlay, ui::Overlay::None),
-                            selection.is_some(),
+                            selection.is_some() || pending_press.is_some(),
                         );
                         // Review of #354 (defect 1, HIGH): `frame_snapshot` is
                         // shared by every event this drain processes (see
@@ -13239,18 +13569,13 @@ fn run_dashboard_inner(
                                             // they were captured; a keyboard
                                             // scroll (`Ctrl+A PageUp`/`Home`/
                                             // `End`) moves it exactly like the
-                                            // wheel does, so it cancels the
-                                            // same way (`scroll_cancels_selection`).
-                                            if let Some(sel) = selection.as_ref()
-                                                && scroll_cancels_selection(
-                                                    sel,
-                                                    pane.short(),
-                                                    before,
-                                                    after,
-                                                )
-                                            {
-                                                selection = None;
-                                            }
+                                            // wheel does, so it translates the
+                                            // same way (`translate_selection`).
+                                            translate_selection(
+                                                &mut selection,
+                                                pane.short(),
+                                                after as i64 - before as i64,
+                                            );
                                             if let Some(log) = keylog.as_mut() {
                                                 log.scroll(
                                                     name, alt, mouse, before, after, outcome,
@@ -13426,58 +13751,6 @@ fn run_dashboard_inner(
                                         overlay =
                                             ui::Overlay::Palette(build_palette_view(mode, ctx));
                                     }
-                                    InputVerdict::Dash(DashAction::ToggleSelectMode) => {
-                                        if !cfg.dash.mouse {
-                                            // Nothing was ever turned on: this
-                                            // operator already has native
-                                            // selection everywhere, by config.
-                                            push_notice(
-                                                &mut notices,
-                                                Instant::now(),
-                                                "dash.mouse is off -- text selection is \
-                                                 already native"
-                                                    .to_string(),
-                                            );
-                                        } else {
-                                            mouse_capture = !mouse_capture;
-                                            // A selection's `(row, col)`
-                                            // coordinates are only meaningful
-                                            // under the mouse mode that produced
-                                            // them (see
-                                            // `cancel_selection_on_resize`'s own
-                                            // reasoning); flipping modes is
-                                            // treated the same conservative way.
-                                            selection = None;
-                                            let bytes = if mouse_capture {
-                                                term::dash_mouse_on_bytes()
-                                            } else {
-                                                term::dash_mouse_off_bytes()
-                                            };
-                                            let mut stdout = io::stdout();
-                                            if let Err(e) = stdout
-                                                .write_all(bytes)
-                                                .and_then(|()| stdout.flush())
-                                            {
-                                                push_error(
-                                                    &mut errors,
-                                                    format!("dashboard: mouse toggle failed: {e}"),
-                                                );
-                                            } else {
-                                                push_notice(
-                                                    &mut notices,
-                                                    Instant::now(),
-                                                    if mouse_capture {
-                                                        "mouse reporting back on".to_string()
-                                                    } else {
-                                                        "select mode on -- drag with the \
-                                                         mouse to select text natively, \
-                                                         Ctrl+A v to resume"
-                                                            .to_string()
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -13519,14 +13792,16 @@ fn run_dashboard_inner(
                         // which is a worse wheel, not a better one. Revisit only if
                         // panes are ever tiled.
                         //
-                        // Nothing in this arm checks `mouse_capture` directly: once
-                        // `DashAction::ToggleSelectMode` has written
-                        // `term::dash_mouse_off_bytes()`, the terminal itself stops
-                        // reporting mouse events at all, so `event::read` simply
-                        // never produces `Event::Mouse` while select mode is on --
-                        // the same reason nothing gates on it after
-                        // `dash_reset_bytes` either. This arm is only ever reached
-                        // with `mouse_capture` true.
+                        // Nothing in this arm checks `mouse_capture` directly: when
+                        // `dash.mouse` never wrote `term::dash_mouse_on_bytes()` at
+                        // startup, the terminal was never told to report mouse
+                        // events at all, so `event::read` simply never produces
+                        // `Event::Mouse` in the first place -- the same reason
+                        // nothing gates on it after `dash_reset_bytes` on exit
+                        // either. This arm is only ever reached with
+                        // `mouse_capture` true, and (issue #697) stays true for the
+                        // rest of the session once it is: there is no longer a
+                        // mid-session toggle that could turn it back off.
                         Ok(Event::Mouse(mouse)) => {
                             input_errors = 0;
                             // Issue #490 (roadmap N21 item A): #354's
@@ -13593,20 +13868,18 @@ fn run_dashboard_inner(
                                         // own `ScrollUp`/`ScrollDown` event
                                         // here, not as a `Drag`, so this is
                                         // the one place that observes it --
-                                        // cancel any selection on this pane
-                                        // now, mid-drag or already released
-                                        // and highlighted alike (see
-                                        // `scroll_cancels_selection`).
-                                        if let Some(sel) = selection.as_ref()
-                                            && scroll_cancels_selection(
-                                                sel,
-                                                pane.short(),
-                                                before,
-                                                after,
-                                            )
-                                        {
-                                            selection = None;
-                                        }
+                                        // translate any selection on this
+                                        // pane by the same amount the offset
+                                        // just moved, mid-drag or already
+                                        // released and highlighted alike
+                                        // (see `translate_selection`; issue
+                                        // #697 replaced the old outright
+                                        // cancel with this).
+                                        translate_selection(
+                                            &mut selection,
+                                            pane.short(),
+                                            after as i64 - before as i64,
+                                        );
                                         if let Some(log) = keylog.as_mut() {
                                             log.scroll(
                                                 "wheel",
@@ -13632,10 +13905,18 @@ fn run_dashboard_inner(
                             // a click on the sidebar is aimed at the sidebar,
                             // and a button press is a position, not a
                             // direction. Dropped entirely for a child that
-                            // never turned mouse reporting on.
+                            // never turned mouse reporting on. Left is
+                            // deliberately excluded here (issue #697): its
+                            // press and release are both deferred by the
+                            // click-vs-drag decision below (`PendingPress`)
+                            // instead of forwarding immediately.
                             let button = match mouse.kind {
-                                MouseEventKind::Down(b) => Some((mouse_button_code(b), true)),
-                                MouseEventKind::Up(b) => Some((mouse_button_code(b), false)),
+                                MouseEventKind::Down(b) if b != MouseButton::Left => {
+                                    Some((mouse_button_code(b), true))
+                                }
+                                MouseEventKind::Up(b) if b != MouseButton::Left => {
+                                    Some((mouse_button_code(b), false))
+                                }
                                 _ => None,
                             };
                             if let Some((code, press)) = button {
@@ -13652,38 +13933,38 @@ fn run_dashboard_inner(
                                 }
                             }
 
-                            // Tmux-style in-dashboard text selection
-                            // (`Selection`'s own doc comment), driven by the
-                            // `?1002` drag events `term::dash_mouse_on_bytes`
-                            // now enables. Only ever engages for a pane that
-                            // does not itself want mouse reporting -- one
-                            // that does already got Left forwarded above,
-                            // unaffected by any of this, and a `Drag` for it
-                            // is simply left unhandled here (the same fate
-                            // every mouse kind this loop does not match has
-                            // always had).
+                            // Issue #697: the dashboard owns click-drag
+                            // selection inside every pane now, including one
+                            // whose child wants mouse reporting -- but a
+                            // plain click must still reach such a child (a
+                            // button in the Claude Code or Codex TUI), so a
+                            // Left press is never forwarded, and never
+                            // starts a `Selection`, the instant it lands.
+                            // Instead it becomes a `PendingPress`, and only
+                            // the next event resolves it: past
+                            // `DRAG_THRESHOLD_CELLS` of movement it is a
+                            // drag (promoted into a `Selection`, never
+                            // forwarded), otherwise release replays it as a
+                            // forwarded press-then-release click.
                             match mouse.kind {
                                 MouseEventKind::Down(MouseButton::Left) => {
                                     // A fresh press always clears whatever was
-                                    // selected before, whether or not this one
-                                    // goes on to start a new selection -- the
-                                    // simplest rule that cannot leave a stale
-                                    // highlight on screen. Deliberately not
-                                    // also cleared by every keyboard-forwarded
-                                    // keystroke (which would mean touching
-                                    // `encode_key`'s many call sites); a click
-                                    // is already the obvious, low-traffic
-                                    // place an operator expects a previous
-                                    // selection to go away.
+                                    // selected or pending before, whether or
+                                    // not this one goes on to start a new
+                                    // selection -- the simplest rule that
+                                    // cannot leave a stale highlight or a
+                                    // stale pending press behind. Deliberately
+                                    // not also cleared by every
+                                    // keyboard-forwarded keystroke (which
+                                    // would mean touching `encode_key`'s many
+                                    // call sites); a click is already the
+                                    // obvious, low-traffic place an operator
+                                    // expects a previous selection to go away.
                                     selection = None;
+                                    pending_press = None;
                                     let main = effective_main(full, sidebar_cols, zoomed);
                                     if let Some(pane) = panes.get(focused)
-                                        && press_starts_selection(
-                                            main,
-                                            mouse.column,
-                                            mouse.row,
-                                            pane.wants_mouse(),
-                                        )
+                                        && press_starts_selection(main, mouse.column, mouse.row)
                                     {
                                         let (rows, cols) = pane.screen().size();
                                         if let Some(cell) = pane_local_cell(
@@ -13693,105 +13974,164 @@ fn run_dashboard_inner(
                                             rows,
                                             cols,
                                         ) {
-                                            selection = Some(Selection {
+                                            pending_press = Some(PendingPress {
                                                 pane_short: pane.short().to_string(),
-                                                anchor: cell,
-                                                end: cell,
+                                                column: mouse.column,
+                                                row: mouse.row,
+                                                anchor_cell: cell,
                                             });
                                         }
                                     }
                                 }
                                 MouseEventKind::Drag(MouseButton::Left) => {
-                                    let wants_mouse = panes
-                                        .get(focused)
-                                        .map(|p| p.wants_mouse())
-                                        .unwrap_or(false);
-                                    if wants_mouse {
-                                        // The precise gesture that silently
-                                        // does nothing: a press-then-move over
-                                        // a pane whose child already owns the
-                                        // mouse, so neither zirv's own
-                                        // click-drag selection (gated on
-                                        // `!wants_mouse` the same as the
-                                        // `Down` arm above) nor the
-                                        // terminal's native one can see it.
-                                        // One notice, ever, per session --
-                                        // never re-armed, and never an
-                                        // automatic mode switch (see
-                                        // `mouse_capture_hint_shown`'s own doc
-                                        // comment).
-                                        if drag_needs_capture_hint(
-                                            wants_mouse,
-                                            mouse_capture_hint_shown,
-                                        ) {
-                                            mouse_capture_hint_shown = true;
-                                            push_notice(
-                                                &mut notices,
-                                                Instant::now(),
-                                                "text selection is off while this pane owns \
-                                                 the mouse -- press Ctrl+A v"
-                                                    .to_string(),
+                                    let main = effective_main(full, sidebar_cols, zoomed);
+                                    if selection.is_some() {
+                                        // Already past the threshold: extend
+                                        // the drag. Also covers the pointer
+                                        // running past either edge of the
+                                        // pane -- auto-scroll it one row in
+                                        // that direction per drag event and
+                                        // translate the selection the same
+                                        // way an operator-driven scroll would
+                                        // (`translate_selection`), so it
+                                        // stays correct once scrolled back
+                                        // into view.
+                                        let pane_short =
+                                            selection.as_ref().map(|s| s.pane_short.clone());
+                                        if let Some(pane_short) = pane_short
+                                            && let Some(pane) = panes.get_mut(focused)
+                                            && pane.short() == pane_short
+                                        {
+                                            let before = pane.scrollback();
+                                            if let Some(dir) =
+                                                drag_autoscroll_direction(main, mouse.row)
+                                            {
+                                                pane.scroll_by(dir);
+                                            }
+                                            let after = pane.scrollback();
+                                            translate_selection(
+                                                &mut selection,
+                                                &pane_short,
+                                                after as i64 - before as i64,
                                             );
+                                            let (rows, cols) = pane.screen().size();
+                                            if let Some(cell) = pane_local_cell(
+                                                main,
+                                                mouse.column,
+                                                mouse.row,
+                                                rows,
+                                                cols,
+                                            ) && let Some(sel) = selection.as_mut()
+                                            {
+                                                sel.end = (i64::from(cell.0), cell.1);
+                                            }
                                         }
-                                    } else if let Some(sel) = selection.as_mut()
-                                        && let Some(pane) = panes.get(focused)
-                                        && pane.short() == sel.pane_short
-                                    {
-                                        // No scrollback check here -- a wheel
-                                        // notch spun mid-drag arrives as its
-                                        // own `ScrollUp`/`ScrollDown` event,
-                                        // not a `Drag`, and already cancelled
-                                        // the selection at the point it
-                                        // happened (see
-                                        // `scroll_cancels_selection`'s
-                                        // callers). If a selection is still
-                                        // `Some` here, its pane has not
-                                        // scrolled since.
-                                        let main = effective_main(full, sidebar_cols, zoomed);
-                                        let (rows, cols) = pane.screen().size();
-                                        if let Some(cell) = pane_local_cell(
-                                            main,
-                                            mouse.column,
-                                            mouse.row,
-                                            rows,
-                                            cols,
-                                        ) {
-                                            sel.end = cell;
+                                    } else if let Some(pending) = pending_press.take() {
+                                        let matches_focus = panes
+                                            .get(focused)
+                                            .is_some_and(|pane| pane.short() == pending.pane_short);
+                                        if matches_focus
+                                            && past_drag_threshold(
+                                                pending.column,
+                                                pending.row,
+                                                mouse.column,
+                                                mouse.row,
+                                            )
+                                        {
+                                            if let Some(pane) = panes.get(focused) {
+                                                let (rows, cols) = pane.screen().size();
+                                                let end_cell = pane_local_cell(
+                                                    main,
+                                                    mouse.column,
+                                                    mouse.row,
+                                                    rows,
+                                                    cols,
+                                                )
+                                                .unwrap_or(pending.anchor_cell);
+                                                selection =
+                                                    Some(promote_pending_drag(pending, end_cell));
+                                            }
+                                            // else: the focused pane vanished
+                                            // between the press and this
+                                            // drag -- drop it silently, the
+                                            // same "cannot use stale
+                                            // coordinates" rule every other
+                                            // cancel in this module follows.
+                                        } else if matches_focus {
+                                            // Still within the threshold:
+                                            // keep waiting.
+                                            pending_press = Some(pending);
                                         }
+                                        // else: focus changed since the press;
+                                        // drop it.
                                     }
                                 }
                                 MouseEventKind::Up(MouseButton::Left) => {
-                                    // LOW (review): `.take()` runs before the
-                                    // `pane_short` match below, so a focus
-                                    // change between `Down` and this `Up`
-                                    // deliberately drops the selection with no
-                                    // copy rather than releasing it against
-                                    // the wrong (now-focused) pane -- this is
-                                    // not a restore path, it is the same
-                                    // "cannot use stale coordinates" call
-                                    // every other `*_cancels_selection` check
-                                    // in this module makes.
-                                    if let Some(sel) = selection.take()
+                                    if let Some(pending) = pending_press.take() {
+                                        // Never crossed the threshold: a
+                                        // click, not a drag. Replay the
+                                        // ORIGINAL press now (deferred this
+                                        // far) and this release, to the same
+                                        // pane. `forward_mouse_button` is
+                                        // itself the `wants_mouse` gate, so a
+                                        // click over a pane that never asked
+                                        // for the mouse simply forwards
+                                        // nothing and does nothing -- the
+                                        // "otherwise do nothing" half of the
+                                        // contract.
+                                        if let Some(pane) = panes.get_mut(focused)
+                                            && pane.short() == pending.pane_short
+                                        {
+                                            let main = effective_main(full, sidebar_cols, zoomed);
+                                            let code = mouse_button_code(MouseButton::Left);
+                                            let (press_coords, release_coords) =
+                                                deferred_click_coords(
+                                                    &pending,
+                                                    main,
+                                                    mouse.column,
+                                                    mouse.row,
+                                                );
+                                            if let Err(e) = pane.forward_mouse_button(
+                                                code,
+                                                true,
+                                                press_coords.0,
+                                                press_coords.1,
+                                            ) {
+                                                push_error(&mut errors, format!("mouse: {e}"));
+                                            }
+                                            if let Err(e) = pane.forward_mouse_button(
+                                                code,
+                                                false,
+                                                release_coords.0,
+                                                release_coords.1,
+                                            ) {
+                                                push_error(&mut errors, format!("mouse: {e}"));
+                                            }
+                                        }
+                                    } else if let Some(sel) = selection.take()
                                         && let Some(pane) = panes.get(focused)
                                         && pane.short() == sel.pane_short
                                     {
+                                        // LOW (review): `.take()` runs before
+                                        // the `pane_short` match above, so a
+                                        // focus change between the promoting
+                                        // `Drag` and this `Up` deliberately
+                                        // drops the selection with no copy
+                                        // rather than releasing it against
+                                        // the wrong (now-focused) pane -- the
+                                        // same "cannot use stale coordinates"
+                                        // call every other cancel in this
+                                        // module makes.
                                         let (kept, copy) = selection_on_release(sel);
                                         if copy && let Some(s) = kept.as_ref() {
-                                            let (start, end) = normalize_selection(s.anchor, s.end);
+                                            let (rows, cols) = pane.screen().size();
+                                            let (start, end) =
+                                                resolve_selection_range(s, rows, cols);
                                             let text = pane
                                                 .screen()
                                                 .contents_between(start.0, start.1, end.0, end.1);
-                                            match copy_to_host_clipboard(&text) {
-                                                Ok(()) => push_notice(
-                                                    &mut notices,
-                                                    Instant::now(),
-                                                    "copied selection to clipboard".to_string(),
-                                                ),
-                                                Err(e) => push_error(
-                                                    &mut errors,
-                                                    format!("clipboard: {e}"),
-                                                ),
-                                            }
+                                            let text = trim_trailing_whitespace_per_line(&text);
+                                            copy_selection(text, &clipboard_tx);
                                         }
                                         selection = kept;
                                     }
@@ -13919,7 +14259,6 @@ fn run_dashboard_inner(
             .count();
         let mut facts = assemble_header_facts(
             harness_label.clone(),
-            !mouse_capture,
             total_live,
             rows.len(),
             errors.sticky_count(),
@@ -14115,7 +14454,10 @@ fn run_dashboard_inner(
                 let selection_range = selection
                     .as_ref()
                     .filter(|sel| sel.pane_short == pane.short())
-                    .map(|sel| normalize_selection(sel.anchor, sel.end));
+                    .map(|sel| {
+                        let (rows, cols) = pane.screen().size();
+                        resolve_selection_range(sel, rows, cols)
+                    });
                 // Issue #490 (roadmap N21 item A): a native pane draws its own
                 // conversation inside this frame's chrome. Everything around
                 // it -- the header, the sidebar, the rule, the footer, the
@@ -14483,9 +14825,11 @@ mod tests {
             filter_key(true, key(KeyCode::Char('z'), KeyModifiers::NONE)).1,
             InputVerdict::Dash(DashAction::Zoom)
         ));
+        // Issue #697: `Ctrl+A v` (select mode) is gone -- `v` is simply
+        // unbound now, the same as any other key with no dashboard meaning.
         assert!(matches!(
             filter_key(true, key(KeyCode::Char('v'), KeyModifiers::NONE)).1,
-            InputVerdict::Dash(DashAction::ToggleSelectMode)
+            InputVerdict::ToChild(ref bytes) if bytes.is_empty()
         ));
         assert!(matches!(
             filter_key(true, key(KeyCode::Char('q'), KeyModifiers::NONE)).1,
@@ -14985,7 +15329,7 @@ mod tests {
         assert_eq!(normalize_selection((4, 4), (4, 4)), ((4, 4), (4, 4)));
     }
 
-    fn selection_at(anchor: (u16, u16), end: (u16, u16)) -> Selection {
+    fn selection_at(anchor: (i64, u16), end: (i64, u16)) -> Selection {
         Selection {
             pane_short: "aaa11111".to_string(),
             anchor,
@@ -14993,38 +15337,49 @@ mod tests {
         }
     }
 
-    /// The invariant the scrollback gap review asked for directly: any
-    /// change to the *same* pane's scrollback offset cancels the selection,
-    /// whatever state it is in -- still being dragged, or already released
-    /// and highlighted. Covers both gaps a mouse-only cancellation check
-    /// would have missed: a wheel notch spun while the button is held
-    /// (arrives as its own `ScrollUp`/`ScrollDown`, with no intervening
-    /// `Drag` event to catch it before an `Up`), and a scroll -- wheel or
-    /// `Ctrl+A PageUp`/`Home`/`End` -- after release, while the highlight is
-    /// still shown.
+    /// Issue #697: scrolling no longer cancels a selection -- it translates
+    /// it, by exactly the amount the pane's own scrollback offset just moved
+    /// by, so the selection stays exact wherever the pane's own content
+    /// happens to be currently drawn. Replaces the old
+    /// `scroll_cancels_a_selection_on_the_same_pane_but_not_others`, which
+    /// pinned the opposite (and now removed) behaviour; the invariant it
+    /// protected -- a selection must never be evaluated against stale
+    /// coordinates -- is now `translate_selection`'s job instead of a
+    /// cancel's.
     #[test]
-    fn scroll_cancels_a_selection_on_the_same_pane_but_not_others() {
-        let sel = selection_at((1, 0), (3, 5));
-        assert!(
-            scroll_cancels_selection(&sel, "aaa11111", 0, 3),
-            "the same pane, offset actually moved"
+    fn translate_selection_shifts_anchor_and_end_by_the_scroll_delta_on_the_same_pane_only() {
+        let mut sel = Some(selection_at((1, 0), (3, 5)));
+        translate_selection(&mut sel, "aaa11111", 3); // offset 0 -> 3.
+        assert_eq!(
+            sel,
+            Some(selection_at((4, 0), (6, 5))),
+            "both anchor and end move by the same delta"
         );
-        assert!(
-            scroll_cancels_selection(&sel, "aaa11111", 5, 0),
-            "scrolling back to live is still a move"
-        );
-        assert!(
-            !scroll_cancels_selection(&sel, "aaa11111", 4, 4),
-            "a clamped no-op scroll (already at an edge) leaves it alone"
-        );
-        assert!(
-            !scroll_cancels_selection(&sel, "bbb22222", 0, 3),
+
+        translate_selection(&mut sel, "aaa11111", -3); // offset 3 -> 0, back where it started.
+        assert_eq!(sel, Some(selection_at((1, 0), (3, 5))));
+
+        let before = sel.clone();
+        translate_selection(&mut sel, "aaa11111", 0);
+        assert_eq!(sel, before, "a delta of zero is a no-op");
+
+        translate_selection(&mut sel, "bbb22222", 5);
+        assert_eq!(
+            sel, before,
             "a scroll on a different pane never touches this selection"
+        );
+
+        translate_selection(&mut sel, "aaa11111", -10);
+        assert_eq!(
+            sel,
+            Some(selection_at((-9, 0), (-7, 5))),
+            "a translation past row 0 keeps its true (negative) value rather than \
+             clamping in storage -- only resolve_selection_range clamps"
         );
     }
 
-    /// HIGH (review): the gap `scroll_cancels_selection` alone cannot cover
-    /// -- live output at scrollback offset 0 rewrites the grid rows under a
+    /// HIGH (review): the gap `translate_selection` alone cannot cover --
+    /// live output at scrollback offset 0 rewrites the grid rows under a
     /// selection's stale coordinates with the offset never moving at all.
     #[test]
     fn processed_output_cancels_a_selection_on_the_same_pane_but_not_others() {
@@ -15056,6 +15411,113 @@ mod tests {
         assert!(
             !resize_cancels_selection(&sel, "bbb22222", (24, 80), (20, 80)),
             "a resize of a different pane never touches this selection"
+        );
+    }
+
+    /// Issue #697: translating a selection by more than one screenful's
+    /// worth of rows (the grid this fixture implies is nowhere near 10 rows
+    /// tall) must still be exact, not clamp or lose precision partway --
+    /// the case a naive "cancel past the edge" rule, or a translation that
+    /// saturated instead of staying signed, would have broken. Complements
+    /// `scroll_translates_a_selection_and_resolves_the_same_text_after_
+    /// scrolling_back_into_view` below, which pins the same property against
+    /// a real `vt100::Parser`.
+    #[test]
+    fn a_selection_survives_translating_more_than_one_screenful_away_and_back() {
+        let mut sel = Some(selection_at((0, 0), (2, 4)));
+        translate_selection(&mut sel, "aaa11111", 10);
+        assert_eq!(
+            sel,
+            Some(selection_at((10, 0), (12, 4))),
+            "translation is exact however far past a single screen the scroll went"
+        );
+        translate_selection(&mut sel, "aaa11111", -10);
+        assert_eq!(
+            sel,
+            Some(selection_at((0, 0), (2, 4))),
+            "and scrolling back the same amount restores it exactly"
+        );
+    }
+
+    /// `resolve_selection_range` is the one place a translated selection's
+    /// coordinates are ever clamped -- issue #697's own "clamp to the grid
+    /// edge for highlight purposes but keep the true translated value"
+    /// requirement, from the other side: given a selection already pushed
+    /// out of range, this is what a renderer or an extraction actually gets.
+    #[test]
+    fn resolve_selection_range_clamps_out_of_range_rows_and_columns_to_the_grid_edge() {
+        let sel = selection_at((-5, 3), (2, 999));
+        assert_eq!(
+            resolve_selection_range(&sel, 3, 10),
+            ((0, 3), (2, 9)),
+            "a negative row clamps to 0, an over-wide column clamps to the last one"
+        );
+        // Ordering still holds after clamping: the more-negative row is
+        // still `start`, whatever it clamped to.
+        let sel = selection_at((7, 0), (-3, 0));
+        assert_eq!(resolve_selection_range(&sel, 3, 10), ((0, 0), (2, 0)));
+        // A zero-sized grid never panics; everything clamps to row/col 0.
+        let sel = selection_at((4, 4), (4, 4));
+        assert_eq!(resolve_selection_range(&sel, 0, 0), ((0, 0), (0, 0)));
+    }
+
+    /// Issue #697's click-vs-drag deferral, the click half: a release within
+    /// `DRAG_THRESHOLD_CELLS` of the press is a plain click, never a drag.
+    /// `deferred_click_coords` is exactly the pane-local coordinate pair the
+    /// event loop hands `Pane::forward_mouse_button` for it (press, then
+    /// release) -- that function is itself the `wants_mouse` gate on
+    /// whether those bytes actually reach the child (`pane.rs`'s own
+    /// suite), so proving the dashboard computes and would forward the
+    /// right pair, for a press that never crossed the threshold, is what is
+    /// testable here without a live `Pane` or a spawned child.
+    #[test]
+    fn a_press_and_release_within_the_threshold_replays_as_a_deferred_click() {
+        let pending = PendingPress {
+            pane_short: "aaa11111".to_string(),
+            column: 50,
+            row: 6,
+            anchor_cell: (2, 3),
+        };
+        // One cell of movement: still within the threshold.
+        assert!(!past_drag_threshold(pending.column, pending.row, 51, 6));
+
+        let main = Rect::new(45, 2, 35, 16);
+        let (press, release) = deferred_click_coords(&pending, main, 51, 6);
+        assert_eq!(
+            press,
+            pane_local_mouse(main, 50, 6),
+            "the ORIGINAL press coordinates are replayed, not the release's"
+        );
+        assert_eq!(release, pane_local_mouse(main, 51, 6));
+    }
+
+    /// The drag half of the same deferral: once the release (or an
+    /// intervening drag) has moved past the threshold, the press is
+    /// promoted into a `Selection` instead -- and, structurally, the event
+    /// loop's `Up` handler can then never reach the click-forwarding branch
+    /// for it: `pending_press` was already consumed (`.take()`) by the
+    /// `Drag` event that promoted it, so only the `Selection`-copy path
+    /// remains, which never calls `Pane::forward_mouse_button` at all.
+    #[test]
+    fn a_press_moved_past_the_threshold_promotes_into_a_selection_instead_of_a_click() {
+        let pending = PendingPress {
+            pane_short: "aaa11111".to_string(),
+            column: 50,
+            row: 6,
+            anchor_cell: (2, 3),
+        };
+        // Two cells of movement: past the threshold, a drag.
+        assert!(past_drag_threshold(pending.column, pending.row, 52, 6));
+
+        let sel = promote_pending_drag(pending, (4, 7));
+        assert_eq!(
+            sel,
+            Selection {
+                pane_short: "aaa11111".to_string(),
+                anchor: (2, 3),
+                end: (4, 7),
+            },
+            "the anchor is exactly where the button went down, not the current cell"
         );
     }
 
@@ -15109,6 +15571,58 @@ mod tests {
         assert_eq!(text, "ghij\nKL");
     }
 
+    /// Issue #697's central claim, pinned against a real `vt100::Parser` the
+    /// way `extraction_reads_the_right_text_out_of_a_known_screen` does: a
+    /// scroll never cancels a selection any more, and translating it by the
+    /// scroll's own delta means the SAME text extracts once the pane is
+    /// scrolled back to where it was -- even though, mid-scroll, the
+    /// translated coordinates briefly point past the bottom of the grid
+    /// that is visible right then (exactly the "clamp for highlight
+    /// purposes but keep the true value" case `resolve_selection_range`'s
+    /// own doc comment describes).
+    #[test]
+    fn scroll_translates_a_selection_and_resolves_the_same_text_after_scrolling_back_into_view() {
+        let mut parser = vt100::Parser::new(3, 10, 10);
+        // No trailing `\r\n` after the last line: three lines scroll into
+        // history (line1..line3), leaving line4..line6 as the live screen.
+        parser.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6");
+        assert_eq!(parser.screen().scrollback(), 0, "starts at the live view");
+
+        // Select all of line4 through the first 4 columns of line6, while
+        // still live.
+        let mut sel = Some(selection_at((0, 0), (2, 4)));
+        let (rows, cols) = parser.screen().size();
+        let expected = {
+            let (start, end) = resolve_selection_range(sel.as_ref().unwrap(), rows, cols);
+            parser
+                .screen()
+                .contents_between(start.0, start.1, end.0, end.1)
+        };
+        assert_eq!(expected, "line4\nline5\nline");
+
+        // Scroll all the way back into history: line1..line3 are now what
+        // is drawn at rows 0..2, so the selection's own translated rows
+        // (3 and 5) point past the bottom of what is CURRENTLY visible --
+        // selecting nothing sensible if resolved right now, which is
+        // exactly why nothing tries to extract or highlight it at this
+        // point.
+        parser.screen_mut().set_scrollback(3);
+        translate_selection(&mut sel, "aaa11111", 3);
+        assert_eq!(sel, Some(selection_at((3, 0), (5, 4))));
+
+        // Scroll back to live: the selection translates back to its
+        // original coordinates, and extracting it now reproduces the exact
+        // same text as before the round trip.
+        parser.screen_mut().set_scrollback(0);
+        translate_selection(&mut sel, "aaa11111", -3);
+        assert_eq!(sel, Some(selection_at((0, 0), (2, 4))));
+        let (start, end) = resolve_selection_range(sel.as_ref().unwrap(), rows, cols);
+        let actual = parser
+            .screen()
+            .contents_between(start.0, start.1, end.0, end.1);
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn b64_encode_matches_known_vectors() {
         // RFC 4648 test vectors.
@@ -15160,6 +15674,124 @@ mod tests {
         assert!(
             payload_len <= OSC52_MAX_BASE64_BYTES,
             "base64 payload was {payload_len} bytes"
+        );
+    }
+
+    /// Issue #697: `vt100::Screen::contents_between`/`rows` pad every line
+    /// out to the pane's own column count, so a copied selection carries
+    /// trailing spaces the operator never saw as meaningful. Only trailing
+    /// whitespace is touched -- leading and interior spacing survive
+    /// untouched, and `\n` stays the line separator.
+    #[test]
+    fn trim_trailing_whitespace_per_line_trims_only_trailing_runs() {
+        assert_eq!(
+            trim_trailing_whitespace_per_line("line4     \nline5     \nline6"),
+            "line4\nline5\nline6"
+        );
+        assert_eq!(
+            trim_trailing_whitespace_per_line("  indented  \nplain"),
+            "  indented\nplain",
+            "leading whitespace is left alone -- only trailing is trimmed"
+        );
+        assert_eq!(trim_trailing_whitespace_per_line(""), "");
+        assert_eq!(
+            trim_trailing_whitespace_per_line("no trailing space"),
+            "no trailing space"
+        );
+    }
+
+    /// Pure with respect to the injected spawner: `copy_via_fallback` stops
+    /// at the first command that succeeds, and never calls a later one.
+    #[test]
+    fn copy_via_fallback_stops_at_the_first_command_that_succeeds() {
+        let calls: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+        let spawner = |program: &str, _args: &[&str], _text: &str| -> io::Result<()> {
+            calls.lock().unwrap().push(match program {
+                "wl-copy" => "wl-copy",
+                "xclip" => "xclip",
+                other => panic!("unexpected program {other}"),
+            });
+            if program == "wl-copy" {
+                Ok(())
+            } else {
+                Err(io::Error::other("should never be reached"))
+            }
+        };
+        let commands: &[ClipboardCommand] = &[("wl-copy", &[]), ("xclip", &["-selection"])];
+        assert!(copy_via_fallback(&spawner, commands, "hello"));
+        assert_eq!(*calls.lock().unwrap(), vec!["wl-copy"]);
+    }
+
+    /// The other half: every command failing is a real `false`, not a panic
+    /// or a false positive, and every one of them was actually tried.
+    #[test]
+    fn copy_via_fallback_tries_every_command_before_giving_up() {
+        let calls: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+        let spawner = |program: &str, _args: &[&str], _text: &str| -> io::Result<()> {
+            calls.lock().unwrap().push(match program {
+                "wl-copy" => "wl-copy",
+                "xclip" => "xclip",
+                other => panic!("unexpected program {other}"),
+            });
+            Err(io::Error::other("not installed"))
+        };
+        let commands: &[ClipboardCommand] = &[("wl-copy", &[]), ("xclip", &["-selection"])];
+        assert!(!copy_via_fallback(&spawner, commands, "hello"));
+        assert_eq!(*calls.lock().unwrap(), vec!["wl-copy", "xclip"]);
+    }
+
+    /// An empty command list (should never happen -- every platform branch
+    /// of `fallback_clipboard_commands` lists at least one -- but the
+    /// function itself makes no such assumption) is simply `false`.
+    #[test]
+    fn copy_via_fallback_with_no_commands_is_false() {
+        let spawner = |_: &str, _: &[&str], _: &str| -> io::Result<()> {
+            panic!("must never be called with an empty command list")
+        };
+        assert!(!copy_via_fallback(&spawner, &[], "hello"));
+    }
+
+    /// `fallback_clipboard_commands` names a real, non-empty command list for
+    /// whichever platform this test happens to run on.
+    #[test]
+    fn fallback_clipboard_commands_matches_this_platform() {
+        let commands = fallback_clipboard_commands();
+        assert!(!commands.is_empty());
+        if cfg!(target_os = "macos") {
+            assert_eq!(commands[0].0, "pbcopy");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(commands[0].0, "clip.exe");
+        } else {
+            assert_eq!(commands[0].0, "wl-copy");
+            assert!(commands.iter().any(|(program, _)| *program == "xclip"));
+        }
+    }
+
+    /// Issue #697: the clipboard fallback is what gets chosen -- and
+    /// confirms the copy -- exactly when OSC 52 could not be trusted on its
+    /// own; `resolve_clipboard_outcome` is the pure decision `copy_selection`
+    /// hands to its background thread, so this is testable with no process
+    /// ever spawned.
+    #[test]
+    fn resolve_clipboard_outcome_prefers_a_confirmed_fallback_and_only_fails_when_both_do() {
+        assert_eq!(
+            resolve_clipboard_outcome(true, true),
+            ClipboardOutcome::Confirmed
+        );
+        assert_eq!(
+            resolve_clipboard_outcome(false, true),
+            ClipboardOutcome::Confirmed,
+            "the fallback confirming the copy wins even if OSC 52's own write failed"
+        );
+        assert_eq!(
+            resolve_clipboard_outcome(true, false),
+            ClipboardOutcome::Unconfirmed,
+            "OSC 52 unavailable to double check is not by itself a failure"
+        );
+        assert_eq!(
+            resolve_clipboard_outcome(false, false),
+            ClipboardOutcome::Failed,
+            "neither avenue worked: the one case that must not be silent"
         );
     }
 
@@ -16449,9 +17081,8 @@ mod tests {
     }
 
     #[test]
-    fn assemble_header_facts_carries_select_mode_live_and_total_through() {
-        let facts = assemble_header_facts("claude".to_string(), false, 2, 5, 0, None, None);
-        assert!(!facts.select_mode);
+    fn assemble_header_facts_carries_live_and_total_through() {
+        let facts = assemble_header_facts("claude".to_string(), 2, 5, 0, None, None);
         assert_eq!(facts.live, 2);
         assert_eq!(facts.total, 5);
         assert_eq!(facts.error_count, 0);
@@ -16460,14 +17091,12 @@ mod tests {
 
         let facts = assemble_header_facts(
             "claude".to_string(),
-            true,
             1,
             1,
             3,
             Some("mail send: disk full".to_string()),
             None,
         );
-        assert!(facts.select_mode);
         assert_eq!(facts.error_count, 3);
         assert_eq!(facts.latest_error.as_deref(), Some("mail send: disk full"));
     }
@@ -16476,7 +17105,6 @@ mod tests {
     fn assemble_header_facts_carries_the_harness_and_notice_through() {
         let facts = assemble_header_facts(
             "claude (opus)".to_string(),
-            false,
             1,
             1,
             0,
@@ -25337,7 +25965,10 @@ mod tests {
         let view = build_dashboard_inspector(&facts);
         let all = view.rows().join("\n");
         assert!(all.contains(style::PLACEHOLDER), "{all}");
-        assert!(all.contains("select mode"), "mouse off says so: {all}");
+        assert!(
+            all.contains(&inspect_line("mouse", Some("off".to_string()))),
+            "mouse off says so: {all}"
+        );
         // The usage section has no harnesses at all, so it draws the shared
         // empty-section placeholder rather than vanishing.
         assert!(
@@ -31214,36 +31845,85 @@ mod tests {
         assert_eq!(calls.len(), 3);
     }
 
-    /// A2-1: the two arms the deleted `wants_mouse` loops above never
-    /// reached. `route_mouse` says the event belongs to the grid; whether
-    /// zirv then draws its OWN selection over it is decided separately, by
-    /// whether the child already owns the mouse.
+    /// Issue #697: a mouse-owning pane no longer suppresses zirv's own
+    /// selection at all -- the dashboard owns click-drag inside every pane
+    /// now, including one whose child wants mouse reporting, so
+    /// `press_starts_selection` dropped the `wants_mouse` gate this test
+    /// used to pin (and the once-per-session capture-hint notice it also
+    /// covered, `drag_needs_capture_hint`, is gone with it: there is nothing
+    /// left to explain once a mouse-owning pane is no longer a dead end).
+    /// What still tells a click for such a pane's child apart from a drag
+    /// meant for zirv's own selection is the separate click-vs-drag
+    /// threshold (`past_drag_threshold`), pinned by its own test below.
     #[test]
-    fn a_mouse_owning_pane_suppresses_zirv_selection_and_explains_itself_once() {
+    fn a_press_inside_the_grid_is_eligible_regardless_of_whether_the_child_wants_mouse() {
         let main = Rect::new(45, 2, 35, 16);
         assert!(
-            press_starts_selection(main, 50, 5, false),
-            "a press inside the grid over a plain pane starts a selection"
+            press_starts_selection(main, 50, 5),
+            "a press inside the grid over a plain pane is eligible"
         );
         assert!(
-            !press_starts_selection(main, 50, 5, true),
-            "the child owns the mouse, so zirv must not draw a selection over it"
-        );
-        assert!(
-            !press_starts_selection(main, 5, 5, false),
+            !press_starts_selection(main, 5, 5),
             "a press outside the grid never starts one"
         );
+    }
+
+    /// Issue #697's own click-vs-drag number: strictly more than one cell of
+    /// movement in either axis is a drag, one cell of jitter (or none at
+    /// all) is still a click.
+    #[test]
+    fn past_drag_threshold_requires_more_than_one_cell_of_movement_in_either_axis() {
+        assert!(!past_drag_threshold(10, 5, 10, 5), "no movement at all");
         assert!(
-            drag_needs_capture_hint(true, false),
-            "the first silent drag over a mouse-owning pane explains itself"
+            !past_drag_threshold(10, 5, 11, 5),
+            "one cell of jitter, column"
         );
         assert!(
-            !drag_needs_capture_hint(true, true),
-            "and never explains itself twice"
+            !past_drag_threshold(10, 5, 10, 6),
+            "one cell of jitter, row"
         );
-        assert!(
-            !drag_needs_capture_hint(false, false),
-            "a drag that really is selecting text has nothing to explain"
+        assert!(!past_drag_threshold(10, 5, 9, 5), "one cell the other way");
+        assert!(past_drag_threshold(10, 5, 12, 5), "two cells, column");
+        assert!(past_drag_threshold(10, 5, 10, 7), "two cells, row");
+        assert!(past_drag_threshold(10, 5, 8, 5), "two cells, backward");
+    }
+
+    /// Issue #697: dragging the pointer past either edge of the focused
+    /// pane's own rect auto-scrolls it -- back into history above the top
+    /// edge, toward live at or past the bottom edge -- and does nothing
+    /// anywhere inside it.
+    #[test]
+    fn drag_autoscroll_direction_only_fires_past_either_edge() {
+        let main = Rect::new(45, 2, 35, 16); // rows 2..=17.
+        assert_eq!(
+            drag_autoscroll_direction(main, 1),
+            Some(1),
+            "above the top edge scrolls further into history"
+        );
+        assert_eq!(
+            drag_autoscroll_direction(main, 18),
+            Some(-1),
+            "at or past the bottom edge scrolls toward live"
+        );
+        assert_eq!(
+            drag_autoscroll_direction(main, 2),
+            None,
+            "the top row itself is still inside the grid"
+        );
+        assert_eq!(
+            drag_autoscroll_direction(main, 17),
+            None,
+            "the bottom row itself is still inside the grid"
+        );
+        assert_eq!(
+            drag_autoscroll_direction(main, 9),
+            None,
+            "well inside the grid"
+        );
+        assert_eq!(
+            drag_autoscroll_direction(Rect::new(0, 0, 0, 0), 5),
+            None,
+            "an empty rect never auto-scrolls"
         );
     }
 
