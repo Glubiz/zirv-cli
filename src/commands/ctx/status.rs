@@ -1603,11 +1603,7 @@ fn render_report<W: Write>(
             w,
             "\n{} {}",
             label(colour, "chat:"),
-            style::paint(
-                &format!("unavailable (configuration error: {e})"),
-                Tone::Err,
-                colour
-            )
+            style::paint(&format!("unavailable ({e})"), Tone::Err, colour)
         )?,
     }
 
@@ -4147,6 +4143,64 @@ mod tests {
         assert!(
             !chat_line.contains('\u{2014}'),
             "no em dashes in user-facing copy: {chat_line}"
+        );
+    }
+
+    /// Verify that when there's a config error, the "configuration error:" prefix
+    /// appears exactly once in the chat line, not duplicated from multiple layers.
+    #[test]
+    fn status_shows_config_error_with_prefix_appearing_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        // Create a bad config with an unknown future feature
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[some_future_feature]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+                agents: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        // Find the chat line which should show the config error
+        let chat_line = text.lines().find(|l| l.starts_with("chat:")).unwrap_or("");
+        assert!(
+            chat_line.contains("unavailable"),
+            "chat line should show unavailable: {chat_line}"
+        );
+        assert!(
+            chat_line.contains("unknown key"),
+            "chat line should mention unknown key: {chat_line}"
+        );
+
+        // Count occurrences of the prefix -- should be exactly 1
+        let prefix_count = chat_line.matches("configuration error:").count();
+        assert_eq!(
+            prefix_count, 1,
+            "prefix should appear exactly once in chat line, but got {}: {}",
+            prefix_count, chat_line
         );
     }
 
