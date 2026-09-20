@@ -167,6 +167,18 @@ pub enum Event {
     /// operator can, with `--quiet`/`ZIRV_CTX_QUIET`, which is exactly the
     /// trust asymmetry the rest of this codebase already holds.
     ChatModel { model: String },
+    /// Issue #690: the default-harness fallback landed on `chosen` because
+    /// `not_found`, ahead of it in registry order, is not installed on this
+    /// machine. Presence is an operator-owned fact, so consulting it is
+    /// right -- but a provider chosen for an operator must never be chosen
+    /// *silently*, and this channel is where that is said. The same
+    /// reasoning `ChatModel` above rests on applies with more force here: a
+    /// repo may turn the banner off (`[chrome] banner` is not
+    /// `REPO_FORBIDDEN`), and the banner's compact tiers have no room for
+    /// the missing harness anyway, so the disclosure that one vendor was
+    /// picked over another rides `chrome.events`, which a repo cannot
+    /// silence.
+    HarnessAutoSelected { chosen: String, not_found: String },
     /// A `zirv ctx nudge` wake-up marker was claimed. `from` names the
     /// *sending* session's short id, read out of the marker file itself
     /// (C4): every emitter used to pass its own short id here, so the line
@@ -425,6 +437,10 @@ impl Event {
                 format!("{agent} session ended (exit code {code})")
             }
             Event::ChatModel { model } => format!("chat model '{model}' (from config)"),
+            Event::HarnessAutoSelected { chosen, not_found } => format!(
+                "using '{chosen}': '{not_found}' is not installed on this machine. Set `agent` \
+                 in ~/.zirv/ctx.toml (or pass --agent) to pin the harness yourself"
+            ),
             Event::Nudge { from, disposition } => match disposition {
                 NudgeDisposition::Relaunching => {
                     format!("nudged by {from}; relaunching with the guidance")
@@ -761,6 +777,29 @@ mod tests {
             event.line().contains("chat model 'fable' (from config)"),
             "got {}",
             event.line()
+        );
+    }
+
+    /// Issue #690: the line that keeps "your only installed harness" from
+    /// being a silent provider switch. It has to name all three things an
+    /// operator needs -- what was chosen, what was missing, and how to pin
+    /// the choice -- on the one channel a repo checkout cannot silence.
+    #[test]
+    fn the_auto_selected_harness_announcement_names_the_choice_the_gap_and_the_fix() {
+        let event = Event::HarnessAutoSelected {
+            chosen: "codex".to_string(),
+            not_found: "claude".to_string(),
+        };
+        let line = event.line();
+        assert!(line.contains("'codex'"), "names what it picked: {line}");
+        assert!(
+            line.contains("'claude' is not installed"),
+            "names what was missing: {line}"
+        );
+        assert!(line.contains("--agent"), "names the fix: {line}");
+        assert!(
+            line.contains("~/.zirv/ctx.toml"),
+            "names the operator's own file, never the repo's: {line}"
         );
     }
 

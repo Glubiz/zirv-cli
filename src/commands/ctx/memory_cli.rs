@@ -806,8 +806,11 @@ pub fn run_optimize_with<W: Write>(
         return Ok(0);
     }
 
-    let adapter = match adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)
-    {
+    let adapter = match adapters::select_for_identity(
+        args.agent.as_deref().or(cfg.agent.as_deref()),
+        &[],
+        &cfg,
+    ) {
         Ok(adapter) => adapter,
         Err(e) => {
             writeln!(

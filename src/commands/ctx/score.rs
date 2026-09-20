@@ -391,7 +391,10 @@ pub fn score_transcript(
     env: EnvLookup<'_>,
 ) -> CtxResult<Score> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
+    // Issue #690: `select_for_identity` -- scoring parses a transcript that
+    // already exists and spawns nothing, so whether the harness is installed
+    // on this machine has no bearing on which format to read it as.
+    let adapter = adapters::select_for_identity(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     full_score(adapter.as_ref(), transcript, &cfg.score)
 }
 
@@ -468,7 +471,7 @@ pub fn window_breakdown_for_transcript(
 ) -> CtxResult<(BreakdownSummary, Option<u64>)> {
     let cfg = CtxConfig::load(repo, env)?;
     let state = StateDir::resolve(env)?;
-    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
+    let adapter = adapters::select_for_identity(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     let jsonl = std::fs::read_to_string(transcript)
         .map_err(|e| format!("{}: {e}", transcript.display()))?;
     Ok(window_breakdown_core(
@@ -1091,7 +1094,7 @@ pub fn score_transcript_cached(
     env: EnvLookup<'_>,
 ) -> CtxResult<(Score, ScreenReport, Option<SpeedMetrics>)> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
+    let adapter = adapters::select_for_identity(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
     let screen_thresholds = cfg.screen.thresholds();
     let Ok(state_dir) = StateDir::resolve(env) else {
         let score = full_score(adapter.as_ref(), transcript, &cfg.score)?;
