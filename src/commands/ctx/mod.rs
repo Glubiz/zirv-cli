@@ -58,6 +58,8 @@ pub(crate) mod native_account;
 pub mod native_hooks;
 pub mod native_worker;
 pub mod objective;
+pub mod obfuscate;
+pub mod obfuscate_store;
 pub mod optimize;
 pub mod output;
 pub(crate) mod output_diff;
