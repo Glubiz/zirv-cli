@@ -74,7 +74,6 @@ pub enum ActionId {
     Memory,
     Errors,
     Zoom,
-    SelectMode,
     Palette,
     Help,
     Quit,
@@ -599,16 +598,6 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         checks: &[(ch('z'), DashAction::Zoom)],
     },
     ActionDescriptor {
-        id: ActionId::SelectMode,
-        chord: "^A v",
-        label: "select mode",
-        description: "toggle text selection",
-        section: ActionSection::Dashboard,
-        availability: always,
-        menu: None,
-        checks: &[(ch('v'), DashAction::ToggleSelectMode)],
-    },
-    ActionDescriptor {
         id: ActionId::Palette,
         chord: "^A p",
         label: "palette",
@@ -972,7 +961,6 @@ mod tests {
         literal_prefix: bool,
         help: bool,
         palette: bool,
-        toggle_select_mode: bool,
         context_actions: bool,
         collapse_group: bool,
         expand_group: bool,
@@ -1014,7 +1002,6 @@ mod tests {
                     DashAction::LiteralPrefix => cov.literal_prefix = true,
                     DashAction::Help => cov.help = true,
                     DashAction::Palette => cov.palette = true,
-                    DashAction::ToggleSelectMode => cov.toggle_select_mode = true,
                     DashAction::Inspect => cov.inspect = true,
                     DashAction::RestoreRow => cov.restore_row = true,
                 }
@@ -1040,7 +1027,6 @@ mod tests {
                 && cov.literal_prefix
                 && cov.help
                 && cov.palette
-                && cov.toggle_select_mode
                 && cov.context_actions
                 && cov.collapse_group
                 && cov.expand_group
