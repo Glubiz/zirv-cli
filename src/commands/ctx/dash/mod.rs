@@ -24935,9 +24935,14 @@ mod tests {
             "cccccccc-1111-4333-8444-555555555555",
             &state,
         );
+        // Issue #701 (2026-09-20): with no `chat.claude_permission_mode`
+        // configured, zirv pins no `--permission-mode` on an interactive
+        // launch at all -- it stopped overriding the operator's own
+        // `permissions.defaultMode`, which a CLI flag outranks. The pane is
+        // still interactive; what carries the prompting posture is the
+        // `zirv ctx safety check` hook plus claude's own configured mode.
         assert!(
-            claude_extra.contains(&"--permission-mode".to_string())
-                && claude_extra.contains(&"default".to_string()),
+            !claude_extra.contains(&"--permission-mode".to_string()),
             "got {claude_extra:?}"
         );
         assert!(
