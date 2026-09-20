@@ -631,6 +631,19 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// `ps`, `printf`, `date`, `basename`, `dirname`, `xargs`, `tee`, `mktemp`,
 /// `realpath`), plus the fixed macOS SSH-agent environment lookup
 /// (`launchctl getenv` and `export SSH_AUTH_SOCK=...`).
+///
+/// **Fix round 7 (2026-09-20): the remaining harmless built-ins.** `Grep`,
+/// `Glob`, `AskUserQuestion`, `TodoWrite`, `NotebookRead` and `TaskOutput`
+/// are added as whole-tool allow entries alongside `WebFetch`/`WebSearch`
+/// above -- each is either read-only (`Grep`, `Glob`, `NotebookRead`,
+/// `TaskOutput`) or pure in-conversation UI state with no filesystem or
+/// process effect (`AskUserQuestion`, `TodoWrite`), so none of them can
+/// touch the machine, the repo or production. `Monitor`, `Skill` and
+/// `Agent`/`Task` are deliberately excluded even though they also showed up
+/// in `permission-prompts.jsonl`: `Monitor` can run and stream arbitrary
+/// shell commands, and `Skill`/`Agent` can themselves invoke
+/// `Bash`/`Write`/`Edit`, so all three must stay behind the same gate as
+/// `Bash` rather than being pre-approved as leaf tools.
 pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Read(./**)", "read anything inside the workspace"),
     (
@@ -651,6 +664,32 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ),
     ("WebFetch", "fetch a URL's contents, read-only"),
     ("WebSearch", "search the web, read-only"),
+    // Fix round 7 (2026-09-20): whole-tool allow entries for the remaining
+    // built-ins that cannot touch the machine, the repo or production --
+    // each is either read-only or purely in-conversation UI state, so
+    // gating them behind a prompt bought nothing (permission-prompts.jsonl:
+    // Grep 14, Glob 1, AskUserQuestion 7 of the 345 logged prompts were
+    // exactly this). `Monitor`, `Skill` and `Agent`/`Task` are deliberately
+    // NOT here even though they also showed up in that log: `Monitor` can
+    // run and stream arbitrary shell commands, and `Skill`/`Agent` can
+    // themselves invoke `Bash`/`Write`/`Edit`, so all three stay gated by
+    // the same posture that gates `Bash` itself rather than being
+    // pre-approved as if they were leaf tools.
+    ("Grep", "search file contents, read-only"),
+    ("Glob", "match file paths by pattern, read-only"),
+    (
+        "AskUserQuestion",
+        "ask the operator a clarifying question; no side effects",
+    ),
+    (
+        "TodoWrite",
+        "update the in-conversation todo list; conversation state, not a file or shell write",
+    ),
+    (
+        "NotebookRead",
+        "read a Jupyter notebook's cells and outputs, read-only",
+    ),
+    ("TaskOutput", "read a delegated agent's output; read-only"),
     // Whole toolchain families (2026-08-23, fix round 4, issue #104) -- see
     // this constant's own doc comment for why the narrower per-subcommand
     // entries these replace were still inert-by-omission on anything else
@@ -4799,6 +4838,38 @@ pub(crate) fn git_dirs(path: &Path) -> Option<(PathBuf, PathBuf)> {
 mod tests {
     use super::*;
 
+    /// Fix round 7 (2026-09-20): the six read-only/UI built-ins that cannot
+    /// touch the machine, the repo or production must be whole-tool allow
+    /// entries so they stop prompting, while `Bash`, `Agent`/`Task`, `Skill`
+    /// and `Monitor` -- which CAN reach the shell or spawn work that can --
+    /// must never appear as a blanket allow.
+    #[test]
+    fn shipped_posture_allow_pre_approves_the_harmless_builtins_but_not_the_shell_reaching_ones() {
+        let rules: Vec<&str> = SHIPPED_POSTURE_ALLOW
+            .iter()
+            .map(|(rule, _)| *rule)
+            .collect();
+        for tool in [
+            "Grep",
+            "Glob",
+            "AskUserQuestion",
+            "TodoWrite",
+            "NotebookRead",
+            "TaskOutput",
+        ] {
+            assert!(
+                rules.contains(&tool),
+                "expected a whole-tool allow entry for {tool}, got {rules:?}"
+            );
+        }
+        for excluded in ["Bash", "Agent", "Task", "Skill", "Monitor", "NotebookEdit"] {
+            assert!(
+                !rules.contains(&excluded),
+                "{excluded} must never be a blanket allow entry, got {rules:?}"
+            );
+        }
+    }
+
     #[test]
     fn restrictive_codex_policy_has_one_sandbox_and_approval_option() {
         let mut cfg = CtxConfig::default();
@@ -4992,10 +5063,15 @@ mod tests {
         let interactive = policy_launch_args(&cfg, &claude, &[], LaunchMode::Interactive);
         let headless = policy_launch_args(&cfg, &claude, &[], LaunchMode::Headless);
         assert_ne!(interactive, headless);
+        // Issue #504 revision (2026-09-20): with no `chat.claude_permission_mode`
+        // configured, the interactive projection omits `--permission-mode`
+        // entirely so Claude Code's own configured `defaultMode` applies --
+        // forcing `"default"` here silently overrode an operator's own
+        // `permissions.defaultMode`, which a CLI flag outranks. Headless
+        // keeps `dontAsk` hardcoded and always emitted.
         assert!(
-            interactive
-                .windows(2)
-                .any(|w| w == ["--permission-mode", "default"])
+            !interactive.iter().any(|arg| arg == "--permission-mode"),
+            "an unset chat.claude_permission_mode must omit the flag: {interactive:?}"
         );
         assert!(
             headless
