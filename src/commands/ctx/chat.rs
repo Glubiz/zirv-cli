@@ -415,12 +415,35 @@ fn proxy_intake<E: Write>(
         stderr,
         "zirv \u{25b8} proxy: describe the task (empty line to send)"
     )?;
-    let Some(request) = proxy::read_request(reader) else {
-        return Ok(ProxyIntakeOutcome::Inactive {
-            advisory: Some(
-                "proxy: no request given; starting the orchestrator harness".to_string(),
-            ),
-        });
+    // Issue #701 (operator field report): a blank FIRST line used to skip the
+    // proxy outright, and that skip is invisible -- the advisory below is
+    // wiped by the harness's own alternate screen a moment later, so the
+    // launch looks exactly like one where the proxy never ran at all. Two
+    // ordinary things produce that blank line: the reflexive Enter at a
+    // prompt an operator did not expect, and a stray newline left in the
+    // console input buffer by a line editor (clink on `cmd.exe` here). Ask
+    // once more, naming both ways out; only a SECOND blank line (or EOF)
+    // skips, so a deliberate skip still costs one keypress.
+    let request = match proxy::read_request(reader) {
+        Some(request) => request,
+        None => {
+            writeln!(
+                stderr,
+                "zirv \u{25b8} proxy: nothing typed -- describe the task, or press Enter again to \
+                 start the harness without the proxy"
+            )?;
+            match proxy::read_request(reader) {
+                Some(request) => request,
+                None => {
+                    return Ok(ProxyIntakeOutcome::Inactive {
+                        advisory: Some(
+                            "proxy: no request given; starting the orchestrator harness"
+                                .to_string(),
+                        ),
+                    });
+                }
+            }
+        }
     };
     // Issue #537 review (operator field report): nothing on screen showed
     // that the request was actually sent to the configured decider, so a
@@ -3849,6 +3872,97 @@ mod tests {
             printed.contains(&proxy::asking_line(&cfg)),
             "the asking line must reach the operator before decide() runs: {printed}"
         );
+    }
+
+    /// Issue #701 (operator field report): the launch looked like the proxy
+    /// had never run at all. A blank FIRST line -- the reflexive Enter at an
+    /// unexpected prompt, or a stray newline a console line editor left in
+    /// the input buffer -- used to skip the proxy outright, and the one-line
+    /// advisory saying so is wiped by the harness's alternate screen a
+    /// moment later. `proxy_intake` must re-prompt once and decide on the
+    /// request that follows.
+    #[test]
+    fn a_blank_first_line_reprompts_instead_of_skipping_the_proxy() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
+        cfg.proxy.typesafe.timeout_secs = 1;
+        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
+            cfg.proxy.typesafe.credential_env.as_str(),
+            Some("a-test-key"),
+        )]);
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            true,
+            &mut &b"
+fix the flaky retry test
+"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        match outcome {
+            ProxyIntakeOutcome::Decided { request, .. } => {
+                assert_eq!(request, "fix the flaky retry test");
+            }
+            other => panic!("expected Decided after the re-prompt, got {other:?}"),
+        }
+        let printed = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            printed.contains("nothing typed"),
+            "the re-prompt must say why it is asking again: {printed}"
+        );
+    }
+
+    /// The other half of the test above: a deliberate skip is still one
+    /// keypress away -- a SECOND blank line (or EOF) falls through to the
+    /// ordinary harness launch with the same named advisory as before.
+    #[test]
+    fn a_second_blank_line_still_skips_the_proxy() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
+        cfg.proxy.typesafe.timeout_secs = 1;
+        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
+            cfg.proxy.typesafe.credential_env.as_str(),
+            Some("a-test-key"),
+        )]);
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            true,
+            &mut &b"
+
+"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        match outcome {
+            ProxyIntakeOutcome::Inactive {
+                advisory: Some(reason),
+            } => {
+                assert!(reason.contains("no request given"), "got {reason}");
+            }
+            other => panic!("expected an Inactive skip, got {other:?}"),
+        }
     }
 
     /// Issue #537 (A2): below `proxy::CLARIFY_THRESHOLD`, `maybe_clarify` is
