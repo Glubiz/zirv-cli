@@ -7058,7 +7058,13 @@ mod tests {
     /// I2's core regression: installing hooks when the operator declined a
     /// local `.zirv` must never create one as a side effect. Exercises the
     /// `install_claude_integration`/`install_codex_integration` fallback
-    /// directly (no local `.zirv` exists), which is home-scoped only.
+    /// directly (no local `.zirv` exists), which is home-scoped only. Pins
+    /// the fallback path with *both* harnesses present -- via
+    /// `apply_first_run_answers_with_predicate` rather than the ambient-PATH
+    /// wrapper -- matching `answers.harness_enabled` above, so both
+    /// installers this test's primary assertion is guarding against
+    /// actually run, instead of inheriting whatever the CI runner happens
+    /// to have on PATH.
     #[test]
     fn apply_first_run_answers_never_creates_a_local_zirv_as_a_side_effect_of_hook_install() {
         let home = tempfile::tempdir().expect("home");
@@ -7092,7 +7098,9 @@ mod tests {
             safety_posture: None,
             compact_output: None,
         };
-        apply_first_run_answers(&answers, home.path()).expect("apply");
+        let harness_present = |_name: &str| true;
+        apply_first_run_answers_with_predicate(&answers, home.path(), &harness_present)
+            .expect("apply");
 
         assert!(
             !cwd.path().join(".zirv").exists(),
@@ -7101,6 +7109,11 @@ mod tests {
         assert!(
             home.path().join(".claude/settings.json").is_file(),
             "hook install must still have run, home-scoped, via the fallback path"
+        );
+        assert!(
+            home.path().join(".codex/hooks.json").is_file(),
+            "codex's fallback install must also have run, home-scoped -- it is part of \
+             the surface the local-.zirv assertion above is guarding"
         );
     }
 
