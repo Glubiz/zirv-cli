@@ -79,6 +79,47 @@ pub fn obfuscate_text(
     })
 }
 
+pub fn obfuscate_json(
+    state_root: &Path,
+    repo: &Path,
+    value: &mut serde_json::Value,
+    options: &Options,
+    surface: &str,
+) -> CtxResult<Vec<super::obfuscate::Finding>> {
+    with_vault(&vault_path(state_root, repo), |vault| {
+        let mut findings = Vec::new();
+        obfuscate_json_value(value, vault, options, surface, &mut findings);
+        Ok(findings)
+    })
+}
+
+fn obfuscate_json_value(
+    value: &mut serde_json::Value,
+    vault: &mut Vault,
+    options: &Options,
+    surface: &str,
+    findings: &mut Vec<super::obfuscate::Finding>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            let (masked, mut found) = super::obfuscate::obfuscate(text, vault, options, surface);
+            *text = masked;
+            findings.append(&mut found);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                obfuscate_json_value(value, vault, options, surface, findings);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                obfuscate_json_value(value, vault, options, surface, findings);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 pub fn rehydrate_text(state_root: &Path, repo: &Path, text: &str) -> CtxResult<String> {
     with_vault(&vault_path(state_root, repo), |vault| {
         Ok(super::obfuscate::rehydrate(text, vault))

@@ -1740,7 +1740,7 @@ fn launch_settings_value(
             // `Bash|PowerShell` PreToolUse entry above: nothing here can
             // touch a permission decision.
             "PostToolUse": [{
-                "matcher": "Bash",
+                "matcher": ".*",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook posttool"
@@ -4393,17 +4393,17 @@ mod tests {
         assert_eq!(settings["hooks"]["PermissionDenied"], observer);
     }
 
-    /// Issue #326: the compact-output hook is wired as its own `PostToolUse`
-    /// entry on `Bash`, synchronously (no `"background": true`) -- a
-    /// background hook's `updatedToolOutput` would arrive after claude had
-    /// already been handed the original result.
+    /// Issues #326 and #466: the compact/obfuscation hook covers every tool
+    /// synchronously (no `"background": true`) -- a background hook's
+    /// `updatedToolOutput` would arrive after Claude had already been handed
+    /// the original result.
     #[test]
     fn launch_settings_wire_the_compact_output_hook_on_post_tool_use() {
         let settings = test_launch_settings();
         assert_eq!(
             settings["hooks"]["PostToolUse"],
             serde_json::json!([{
-                "matcher": "Bash",
+                "matcher": ".*",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook posttool"
