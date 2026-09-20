@@ -225,19 +225,40 @@ pub(crate) fn resolve_adapter(
     cfg: &CtxConfig,
     requested: Option<&str>,
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
+    resolve_adapter_with_presence(cfg, requested, &adapters::liveness_probe)
+}
+
+/// [`resolve_adapter`] with the presence oracle passed in rather than read
+/// off the ambient `PATH` -- the same seam, and for the same reason, as
+/// `adapters::resolve_default_with_presence`'s own doc comment gives: issue
+/// #690 made the last arm's answer depend on what this machine has, so a
+/// test that reads the real `PATH` proves only what the developer happens to
+/// have installed. Threaded through every arm, not just the fallback, so an
+/// injected machine state is the whole truth for a test rather than most of
+/// it; the explicit and configured arms consult it no more than they did
+/// before (`select_with_presence` reaches the oracle only in its own
+/// fallback).
+pub(crate) fn resolve_adapter_with_presence(
+    cfg: &CtxConfig,
+    requested: Option<&str>,
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
     if requested.is_some() {
-        let adapter = adapters::select(requested, &[], cfg)?;
+        let adapter = adapters::select_with_presence(requested, &[], cfg, present)?;
         return Ok((adapter, HarnessRule::Explicit));
     }
     match cfg.agent.as_deref() {
         Some(name) => Ok((
-            adapters::select(Some(name), &[], cfg)?,
+            adapters::select_with_presence(Some(name), &[], cfg, present)?,
             HarnessRule::Configured,
         )),
-        None => adapters::resolve_default(cfg).map(|(adapter, origin)| {
+        None => adapters::resolve_default_with_presence(cfg, present).map(|(adapter, origin)| {
             let rule = match origin {
                 DefaultOrigin::Configured => HarnessRule::Configured,
                 DefaultOrigin::FirstEnabledReady => HarnessRule::FirstEnabledReady,
+                DefaultOrigin::FirstInstalledReady { not_found } => {
+                    HarnessRule::FirstInstalledReady { not_found }
+                }
             };
             (adapter, rule)
         }),
@@ -1029,6 +1050,7 @@ pub fn run_with<W: Write, E: Write>(
     // dashboard branch and the `wrap` fallback disclose identically, and
     // independently of whether a banner was printed at all.
     announce_model_choice(stderr, &cfg, args.quiet);
+    announce_harness_choice(stderr, &cfg, args.quiet, adapter.name(), rule);
 
     // Issue #352: the persistent runtime, when the operator has turned it on
     // and there is a terminal to attach. Checked before the dashboard branch
@@ -1192,6 +1214,42 @@ fn announce_model_choice<E: Write>(stderr: &mut E, cfg: &CtxConfig, quiet: bool)
         stderr,
         &super::announce::Event::ChatModel {
             model: model.clone(),
+        },
+    );
+}
+
+/// Issue #690: discloses that the harness was chosen because the one ahead
+/// of it in registry order is not installed -- which one was picked, which
+/// one was missing, and how to pin the choice instead of leaving it to this
+/// rule. A no-op for every other `HarnessRule`, so the common case gains no
+/// line at all.
+///
+/// On the same channel, and for the same reason, as `announce_model_choice`
+/// above: `chrome.banner` is not `REPO_FORBIDDEN` and the banner's compact
+/// tiers have no room for this anyway, while `chrome.events` **is**, so this
+/// is a disclosure a repo checkout cannot silence and the operator still
+/// can (`--quiet`/`ZIRV_CTX_QUIET`). Presence is an operator-owned fact and
+/// acting on it is right; acting on it without saying so is what would make
+/// it a silent provider switch.
+fn announce_harness_choice<E: Write>(
+    stderr: &mut E,
+    cfg: &CtxConfig,
+    quiet: bool,
+    chosen: &str,
+    rule: HarnessRule,
+) {
+    let HarnessRule::FirstInstalledReady { not_found } = rule else {
+        return;
+    };
+    super::announce::Announcer::new(
+        cfg.chrome.events && !quiet,
+        console::colors_enabled_stderr(),
+    )
+    .emit_to(
+        stderr,
+        &super::announce::Event::HarnessAutoSelected {
+            chosen: chosen.to_string(),
+            not_found: not_found.to_string(),
         },
     );
 }
@@ -2531,6 +2589,49 @@ mod tests {
         .expect("resolves");
         assert_eq!(prompt, None);
         assert!(out.is_empty());
+    }
+
+    /// Issue #690: the banner's rule has to carry what the origin carries,
+    /// or the one surface an operator reads at launch says "auto" where the
+    /// truth is "the harness you configured nothing about is the only one
+    /// you have". Injected rather than read off `PATH`: on a runner with no
+    /// harness installed at all, an ambient probe would make this assert
+    /// about the runner instead of about the mapping.
+    #[test]
+    fn the_harness_rule_carries_the_missing_harness_the_origin_named() {
+        let cfg = CtxConfig::default();
+
+        let (adapter, rule) =
+            resolve_adapter_with_presence(&cfg, None, &adapters::only_installed(&["codex"]))
+                .expect("codex is installed, so there is an answer");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(
+            rule,
+            HarnessRule::FirstInstalledReady {
+                not_found: "claude"
+            }
+        );
+
+        let (adapter, rule) =
+            resolve_adapter_with_presence(&cfg, None, &adapters::everything_installed())
+                .expect("a default exists");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(
+            rule,
+            HarnessRule::FirstEnabledReady,
+            "with nothing missing the banner reads exactly as it always did"
+        );
+
+        // An explicitly requested harness bypasses presence entirely, even
+        // when this machine is the one that does not have it.
+        let (adapter, rule) = resolve_adapter_with_presence(
+            &cfg,
+            Some("claude"),
+            &adapters::only_installed(&["codex"]),
+        )
+        .expect("an explicit --agent is never second-guessed");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(rule, HarnessRule::Explicit);
     }
 
     /// The registry's own aggregated error (naming every candidate and why it

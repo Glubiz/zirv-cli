@@ -4399,6 +4399,44 @@ explicitly (`--agent`, `agent =` in your own `~/.zirv/ctx.toml`, or the
 Narrowing which agent is *possible* is a repo's call; narrowing which one you
 actually get is not.
 
+**A harness you have not installed is a different matter.** That is a fact
+about your own machine, not something a checked-out repository can assert, so
+the same fallback -- and *only* the fallback: an explicit `--agent`, an
+argv-detected harness, and a configured `agent =` all still resolve exactly
+as before, missing binary and all -- skips a candidate whose program is
+confidently absent, and moves on to the next enabled, ready, installed one.
+Only a confident absence removes a candidate: a probe that cannot decide
+(an unreadable `PATH` entry, or an install root zirv does not know about)
+keeps it, so nothing is ever lost to a guess -- and an `agent_bin` you
+configured yourself is never checked at all, since you have already named the
+program (it may not even be a path, as a wrapper command is not).
+
+When presence rather than
+registry order decided the answer, zirv says so: `zirv ctx chat` prints a
+`zirv ▸` line naming the harness it chose, the one it did not find, and how
+to pin the choice yourself, and `zirv ctx status`'s `chat:` line carries the
+same fact as a standing one. That announcement rides `[chrome] events`, which
+a repository cannot turn off (`[chrome] banner`, which it can, is not relied
+on for it); `--quiet`/`ZIRV_CTX_QUIET` still silences it, because that is the
+operator's own call.
+
+**Presence gates the choice, never the reading.** Naming which adapter's
+transcript to parse (the Stop hook's screening, `zirv ctx score`,
+`zirv ctx handoff`), which account a usage readout belongs to, or which
+program you handed `zirv ctx wrap -- ...` yourself never consults it: a
+transcript written by claude is claude's whether or not `claude` is on that
+process's `PATH`, and a hook subprocess routinely inherits a reduced one.
+Only the question "which harness should zirv start for you" asks whether the
+answer exists on the machine, so pure passthrough stays pure and screening
+keeps working where the binary is real but invisible to a `PATH` walk.
+
+If *nothing* is installed, the error says so in as many
+words and names the ways out (install one onto `PATH`, point `agent_bin` at
+it in `~/.zirv/ctx.toml`, or pass `--agent`), instead of only reporting the
+first harness's own "program not found"; when some candidates were merely
+disabled, it names the ones that are missing and claims nothing about the
+rest.
+
 ### Hook registration (Claude Code)
 
 Add to `~/.claude/settings.json`:

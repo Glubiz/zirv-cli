@@ -2276,7 +2276,18 @@ pub fn run_with<W: Write>(
     // call below, the same adapter `score`/`exec`/`wrap` would use to parse
     // this agent's transcripts: a future codex parser needs no separate
     // wiring in this verb.
-    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg);
+    //
+    // Issue #690: `select_for_identity`, not `select` -- `collect_evidence`
+    // below feeds this adapter's parser over transcripts that already exist,
+    // and letting presence switch which one gets picked would parse a claude
+    // transcript with a codex parser and hand `collect_evidence` silently
+    // wrong evidence. The judgment-call spawn further down already fails
+    // loudly when the configured harness is genuinely missing, which beats
+    // optimizing against garbage. Matches `memory_cli.rs::run_optimize_with`,
+    // this verb's sibling optimize path, already converted for the same
+    // reason.
+    let adapter =
+        adapters::select_for_identity(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg);
 
     let sample = args.sessions.unwrap_or(cfg.optimize.sessions_sampled);
     let transcripts = window::projects_root()

@@ -777,7 +777,7 @@ fn built_in_prompt_layers(
 ) -> Vec<context_lint::LintLayer> {
     if let (Ok(state), Ok(adapter)) = (
         StateDir::resolve(env),
-        adapters::select(cfg.agent.as_deref(), &[], cfg),
+        adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg),
     ) {
         let home = crate::utils::home_dir().ok();
         let compiled = compile::compile(

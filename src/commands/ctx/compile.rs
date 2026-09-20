@@ -1552,7 +1552,11 @@ pub fn run_with<W: std::io::Write>(
     let cfg = CtxConfig::load(repo, env)?;
     let home = crate::utils::home_dir().ok();
     let state = StateDir::resolve(env)?;
-    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
+    // Issue #690: `select_for_identity` -- `compile` renders the prompt an
+    // adapter *would* be given and spawns nothing, so it must keep working
+    // on a machine where no harness binary is visible.
+    let adapter =
+        adapters::select_for_identity(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let role = PromptRole::Orchestrator;
 
     let compiled = compile_with_harness_roster(
