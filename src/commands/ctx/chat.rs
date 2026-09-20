@@ -243,13 +243,17 @@ pub(crate) fn resolve_adapter_with_presence(
     requested: Option<&str>,
     present: &dyn Fn(&str, &str) -> adapters::Liveness,
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
+    // `true`, the `adapter_builds_launch` answer every empty command carries
+    // (`adapters::select` derives exactly this for a `&[]` caller): `chat`
+    // has no wrapped argv at all, so whatever it resolves is a harness zirv
+    // itself would launch.
     if requested.is_some() {
-        let adapter = adapters::select_with_presence(requested, &[], cfg, present)?;
+        let adapter = adapters::select_with_presence(requested, &[], cfg, true, present)?;
         return Ok((adapter, HarnessRule::Explicit));
     }
     match cfg.agent.as_deref() {
         Some(name) => Ok((
-            adapters::select_with_presence(Some(name), &[], cfg, present)?,
+            adapters::select_with_presence(Some(name), &[], cfg, true, present)?,
             HarnessRule::Configured,
         )),
         None => adapters::resolve_default_with_presence(cfg, present).map(|(adapter, origin)| {

@@ -2832,6 +2832,35 @@ pub(crate) fn liveness_probe(adapter_name: &str, program: &str) -> Liveness {
     }
 }
 
+/// The one sentence zirv uses for "this adapter's program is not on this
+/// machine", wherever that answer is reached from.
+///
+/// Issue #690 (remaining scope) added a second way to reach it -- the launch
+/// pre-flight ([`refuse_if_program_absent_with_presence`]) that decides it
+/// *before* the spawn rather than from the spawn's own `NotFound` -- and a
+/// second `format!` would have been a second wording to keep in step. Factored
+/// here instead, so the fast answer and the slow one are byte-identical: the
+/// pre-flight only ever turns a slow failure into a fast one, and an operator
+/// comparing the two never has to wonder whether they mean different things.
+///
+/// All three ways out, in the same words [`resolve_default_with_presence`]'s
+/// aggregate "no harness is installed" error already uses. The `agent_bin`
+/// remedy is the one that matters most here and used to be missing: this
+/// message is reached precisely when no `agent_bin` is set (the pre-flight
+/// does not probe an override at all), so its reader may well be someone
+/// whose harness *is* installed, just not anywhere a `PATH` walk reaches --
+/// see [`known_install_roots`] and CLAUDE.md's own note that codex on this
+/// repo's dev machine lives at a real install outside `PATH`. Telling that
+/// operator to install software they already have is the wrong answer, and
+/// it was the only one this sentence gave.
+fn program_not_found_message(adapter_name: &str, program: &str) -> String {
+    format!(
+        "adapter '{adapter_name}': program '{program}' not found. Install it so its program is \
+         on PATH, or point `agent_bin` at it in ~/.zirv/ctx.toml, or name an installed one with \
+         --agent."
+    )
+}
+
 /// Formats a launch error with context about which harness and program failed.
 /// When the error is NotFound, includes a suggestion to install the harness or use --agent.
 pub(crate) fn format_launch_error(
@@ -2843,11 +2872,7 @@ pub(crate) fn format_launch_error(
     if let Some(io_err) = error.downcast_ref::<std::io::Error>()
         && io_err.kind() == std::io::ErrorKind::NotFound
     {
-        return format!(
-            "adapter '{}': program '{}' not found. Install the harness or use --agent to \
-             select one that is installed",
-            adapter_name, program
-        );
+        return program_not_found_message(adapter_name, program);
     }
 
     // For any other error, include adapter/program context
@@ -2855,6 +2880,70 @@ pub(crate) fn format_launch_error(
         "adapter '{}': program '{}' failed to start: {}",
         adapter_name, program, error
     )
+}
+
+/// Issue #690 (remaining scope): the launch pre-flight. Once a launch path
+/// has resolved the adapter it is about to *start*, and before it engages
+/// pacing, usage polling or the macOS Keychain-reading path any of that
+/// drags in, refuse outright if that adapter's program is confidently not on
+/// this machine.
+///
+/// The defect this exists for: on a machine with no harness installed,
+/// `zirv ctx agent claude "say hi"` used to warn about Keychain access for a
+/// harness the operator does not have, sit out `[pace] blind_delay_secs` of
+/// safety delay because that harness has no usage source, and only then
+/// report that `claude` is not a program. None of that machinery has anything
+/// to pace or poll when there is no process to launch.
+///
+/// Three rules, none of them new -- each is the rule an existing seam in this
+/// module already holds to:
+///
+/// 1. Fail-open. Only [`Liveness::Absent`] refuses; `Live` and `Unknown` both
+///    proceed exactly as before the pre-flight existed. A probe that could
+///    not decide must never cost a launch that would have worked -- see
+///    [`Liveness`]'s and [`program_is_present`]'s own doc comments for how
+///    wrong this probe is allowed to be.
+/// 2. Never substitute. This only ever turns a slow failure into a fast one;
+///    it chooses nothing. An explicitly named `--agent`, or a configured
+///    `agent`, fails here under *its own* name -- the invariant
+///    [`resolve_default_with_presence`]'s G/G3 notes pin, that a harness the
+///    operator named is never silently swapped for another, is not weakened
+///    by making its failure arrive sooner.
+/// 3. No probe at all while `agent_bin` is set. An operator-set override
+///    need not be a path a `stat` can answer (the `sh <wrapper>.sh` shape
+///    this codebase's own fixtures use throughout resolves to nothing on
+///    disk), so probing it would hard-fail working setups. This is
+///    [`resolve_default_with_presence`]'s own `consult_presence = bin.
+///    is_none()` rule, reused rather than a second rule invented beside it.
+///
+/// It is the caller's job to apply this only where the program about to be
+/// spawned actually *is* `adapter.program()`. `exec`'s explicit
+/// `-- <command>` passthrough and `wrap`'s wrapped argv are the operator's
+/// own program, not this adapter's, and refusing those would worsen a
+/// session rather than fail one faster.
+///
+/// `_with_presence` and no un-injected twin, unlike [`resolve_default`]/
+/// [`resolve_default_with_presence`]: every production caller is a *launch
+/// entry point* (`exec::run_with_clock`, `run_loop::run_with_clock`) that
+/// already names [`liveness_probe`] once for its whole call, so a second
+/// wrapper naming it again here would only be a second place for a caller
+/// to reach the probe from -- and dead code besides.
+pub(crate) fn refuse_if_program_absent_with_presence(
+    adapter: &dyn AgentAdapter,
+    cfg: &CtxConfig,
+    present: &dyn Fn(&str, &str) -> Liveness,
+) -> CtxResult<()> {
+    // Rule 3, before anything touches the filesystem.
+    if cfg.agent_bin.is_some() {
+        return Ok(());
+    }
+    match present(adapter.name(), adapter.program()) {
+        // Rule 1: only a confident absence refuses.
+        Liveness::Absent(_) => {
+            Err(program_not_found_message(adapter.name(), adapter.program()).into())
+        }
+        Liveness::Live | Liveness::Unknown(_) => Ok(()),
+    }
 }
 
 /// One cached liveness verdict, keyed by [`ProbeCache::key`] (adapter name,
@@ -4456,12 +4545,45 @@ pub(crate) fn resolve_default_with_presence(
 /// (issue #690). A caller that only needs to name an adapter -- to parse a
 /// transcript, attribute usage, read capabilities -- wants
 /// [`select_for_identity`] instead, where absence has no say.
+///
+/// It reads `command` the way `wrap` does ([`adapter_builds_launch`]): the
+/// argv IS the program about to be spawned. A caller for which that is not
+/// true -- `exec`, which appends a flags-only `-- --model x` to
+/// `adapter.program()` -- says so for itself through
+/// [`select_with_presence`] rather than taking this derivation.
 pub fn select(
     name: Option<&str>,
     command: &[String],
     cfg: &CtxConfig,
 ) -> CtxResult<Box<dyn AgentAdapter>> {
-    select_with_presence(name, command, cfg, &liveness_probe)
+    select_with_presence(
+        name,
+        command,
+        cfg,
+        adapter_builds_launch(command),
+        &liveness_probe,
+    )
+}
+
+/// What [`select`] and [`select_for_identity`] answer
+/// [`select_with_presence`]'s `adapter_builds_launch` question with, on
+/// behalf of a caller whose `command` IS the program about to be spawned --
+/// `wrap` above all (`wrap.rs`'s `adapters::select(agent_name,
+/// &args.command, &cfg)`, where `wrap -- --foo` really would try to spawn
+/// `--foo`). For such a caller a non-empty `command` is the operator's own
+/// argv, so zirv is not choosing a harness at all, and only an empty one
+/// leaves the launch to `adapter.program()`.
+///
+/// Deliberately NOT widened to match `exec`'s own, looser notion (a
+/// flags-only `-- --model x` is adapter-built there, because `exec` appends
+/// those flags to `adapter.program()` rather than spawning them). Widened
+/// here, `wrap -- --foo` would claim to be choosing a harness while it is
+/// in fact about to spawn `--foo` itself, so an absent default harness
+/// would refuse the operator's own argv -- the one thing `wrap` may never
+/// do. `exec` states its own answer at the call site instead; see
+/// [`select_with_presence`].
+fn adapter_builds_launch(command: &[String]) -> bool {
+    command.is_empty()
 }
 
 /// The oracle for a caller that is not choosing a harness to launch. It
@@ -4492,7 +4614,13 @@ pub fn select_for_identity(
     command: &[String],
     cfg: &CtxConfig,
 ) -> CtxResult<Box<dyn AgentAdapter>> {
-    select_with_presence(name, command, cfg, &presence_not_consulted)
+    select_with_presence(
+        name,
+        command,
+        cfg,
+        adapter_builds_launch(command),
+        &presence_not_consulted,
+    )
 }
 
 /// [`select`] with [`resolve_default_with_presence`]'s own injected presence
@@ -4504,10 +4632,23 @@ pub fn select_for_identity(
 /// choose for you) are pinned through this public entry point, and a test
 /// that reached past it to `resolve_default` would no longer be testing what
 /// it claims to.
+///
+/// `adapter_builds_launch` is the caller's own statement of whether it is
+/// *choosing a harness to launch* -- whether the program it is about to
+/// spawn will be `adapter.program()`. It is stated rather than derived from
+/// `command` here because `command` means different things to different
+/// callers, and no single derivation is right for all of them: for `wrap`
+/// the command IS the program to spawn, so `wrap -- --foo` is the
+/// operator's own argv; for `exec` a flags-only `-- --model x` is
+/// adapter-built, because `exec` builds the launch from `adapter.program()`
+/// and appends those flags to it. [`select`] and [`select_for_identity`]
+/// answer it with [`adapter_builds_launch`] on their callers' behalf, which
+/// is `wrap`'s reading; `exec` passes its own.
 pub(crate) fn select_with_presence(
     name: Option<&str>,
     command: &[String],
     cfg: &CtxConfig,
+    adapter_builds_launch: bool,
     present: &dyn Fn(&str, &str) -> Liveness,
 ) -> CtxResult<Box<dyn AgentAdapter>> {
     let bin = cfg.agent_bin.as_deref();
@@ -4542,15 +4683,24 @@ pub(crate) fn select_with_presence(
         return Ok(adapter);
     }
 
-    // G3 and passthrough: reaching here with a non-empty `command` means the
-    // operator handed zirv a program no adapter claims, so zirv is not
-    // choosing a harness to launch at all -- it is labelling someone else's
-    // (`wrap --no-supervise -- echo hi`, `exec -- ./script.sh`). Presence
-    // belongs to the choosing case. Refusing to run an operator's own
-    // command because zirv's own default harness is not installed would
-    // worsen a session outright, which `wrap` may never do (CLAUDE.md's own
-    // rule: supervision failure is pure passthrough).
-    let present: &dyn Fn(&str, &str) -> Liveness = if command.is_empty() {
+    // G3 and passthrough: the caller says whether it is choosing a harness
+    // to launch, and presence belongs to the choosing case alone. A caller
+    // that says no reached here having handed zirv a program no adapter
+    // claims, so zirv is not choosing anything -- it is labelling someone
+    // else's (`wrap --no-supervise -- echo hi`, `exec -- ./script.sh`).
+    // Refusing to run an operator's own command because zirv's own default
+    // harness is not installed would worsen a session outright, which `wrap`
+    // may never do (CLAUDE.md's own rule: supervision failure is pure
+    // passthrough).
+    //
+    // Stated by the caller rather than re-derived from `command` here
+    // because the two callers read the same argv differently: `wrap` would
+    // spawn `-- --foo` itself, while `exec` appends `-- --model x` to
+    // `adapter.program()` and so IS choosing a harness. Deriving it from a
+    // non-empty `command` alone used to make `exec -- --model x` keep an
+    // absent default harness that the very next pre-flight then refused,
+    // where the operator had an installed one to be given.
+    let present: &dyn Fn(&str, &str) -> Liveness = if adapter_builds_launch {
         present
     } else {
         &presence_not_consulted
@@ -7045,7 +7195,7 @@ mod tests {
     fn empty_command_defaults_to_claude() {
         let cfg = permissive_cfg();
         let adapter =
-            select_with_presence(None, &[], &cfg, &everything_installed()).expect("default");
+            select_with_presence(None, &[], &cfg, true, &everything_installed()).expect("default");
         assert!(
             cfg.agents.is_enabled(adapter.name()),
             "must be gate-enabled"
@@ -7107,7 +7257,7 @@ mod tests {
     #[test]
     fn the_default_fallback_refuses_rather_than_silently_switching_provider() {
         let cfg = cfg_disabling("claude");
-        let err = select_with_presence(None, &[], &cfg, &everything_installed())
+        let err = select_with_presence(None, &[], &cfg, true, &everything_installed())
             .expect_err("a repo may narrow, not select");
         let msg = err.to_string();
         assert!(msg.contains("claude"), "got {msg}");
@@ -7412,15 +7562,92 @@ mod tests {
     /// must never turn `wrap --no-supervise -- echo hi` into a refusal. With
     /// nothing to pass through it is the launch case again, and still
     /// refuses.
+    ///
+    /// Both calls answer `adapter_builds_launch` through
+    /// [`adapter_builds_launch`] itself rather than writing `false`/`true`
+    /// out, because it is `select`'s -- and so `wrap`'s -- derivation that
+    /// is on trial here, not `select_with_presence`'s handling of an answer
+    /// already given. Widening that derivation to `exec`'s (a flags-only
+    /// argv is adapter-built) would make this test fail, which is exactly
+    /// what it is for.
     #[test]
     fn an_operators_own_command_is_never_refused_for_a_missing_harness() {
         let command = vec!["echo".to_string(), "hello".to_string()];
-        let adapter = select_with_presence(None, &command, &permissive_cfg(), &only_installed(&[]))
-            .expect("passthrough must never be refused");
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            adapter_builds_launch(&command),
+            &only_installed(&[]),
+        )
+        .expect("passthrough must never be refused");
         assert_eq!(adapter.name(), "claude");
 
-        select_with_presence(None, &[], &permissive_cfg(), &only_installed(&[]))
-            .expect_err("choosing a harness to launch still needs one to exist");
+        select_with_presence(
+            None,
+            &[],
+            &permissive_cfg(),
+            adapter_builds_launch(&[]),
+            &only_installed(&[]),
+        )
+        .expect_err("choosing a harness to launch still needs one to exist");
+    }
+
+    /// The case `command.is_empty()` alone got wrong: `zirv ctx exec --
+    /// --model x` hands over an argv that names no program, only flags that
+    /// `exec` appends to `adapter.program()`. That is zirv choosing a
+    /// harness to launch every bit as much as an empty argv is, so on a
+    /// machine with codex and no claude it must land on the one that is
+    /// actually there. Derived from `command` here, this said "operator's
+    /// own program, do not consult presence", kept the absent default, and
+    /// left `exec`'s launch pre-flight to refuse a harness the operator
+    /// never asked for over one they had installed.
+    ///
+    /// The stated machine is `only_installed(&["codex"])`, so nothing here
+    /// depends on what this developer has: a caller that stopped consulting
+    /// presence would answer "claude" and fail on the assertion below.
+    #[test]
+    fn a_flags_only_command_is_a_harness_this_machine_has_to_have() {
+        let command = vec!["--model".to_string(), "x".to_string()];
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            true,
+            &only_installed(&["codex"]),
+        )
+        .expect("a machine with codex installed can launch codex");
+        assert_eq!(adapter.name(), "codex");
+    }
+
+    /// The other side of that widening, and the reason it is safe: stating
+    /// `adapter_builds_launch` does not reorder anything. On an ordinary
+    /// machine that does have the first candidate, the same flags-only argv
+    /// still resolves to registry order's own answer -- presence gets a say
+    /// only about candidates it can rule out, never a preference between
+    /// two installed ones.
+    #[test]
+    fn a_flags_only_command_still_takes_the_first_candidate_that_is_installed() {
+        let command = vec!["--model".to_string(), "x".to_string()];
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            true,
+            &only_installed(&["claude", "codex"]),
+        )
+        .expect("claude is installed on this stated machine");
+        assert_eq!(adapter.name(), "claude");
+
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            true,
+            &everything_installed(),
+        )
+        .expect("everything is installed on this stated machine");
+        assert_eq!(adapter.name(), "claude");
     }
 
     /// The fallback is only reached when neither an explicit `--agent` nor
@@ -7581,6 +7808,7 @@ mod tests {
             Some("claude"),
             &[],
             &permissive_cfg(),
+            true,
             &only_installed(&["codex"]),
         )
         .expect("an explicit --agent does not consult presence either");
@@ -8097,5 +8325,120 @@ mod tests {
         let result = format_launch_error(&perm_err, "codex", "codex");
         assert!(result.contains("codex"));
         assert!(result.contains("failed to start"));
+    }
+
+    // -- issue #690 (remaining scope): the launch pre-flight ------------------
+
+    /// The pre-flight's refusal must be the same sentence the spawn's own
+    /// `NotFound` would have produced, to the byte -- it turns a slow failure
+    /// into a fast one and nothing else, so an operator who has seen the slow
+    /// one must not have to decide whether the fast one means something
+    /// different.
+    #[test]
+    fn the_launch_preflight_refuses_with_the_spawns_own_not_found_wording() {
+        let cfg = permissive_cfg();
+        let adapter = select_with_presence(Some("claude"), &[], &cfg, true, &only_installed(&[]))
+            .expect("naming an adapter never consults presence");
+
+        let err = refuse_if_program_absent_with_presence(
+            adapter.as_ref(),
+            &cfg,
+            &only_installed(&["codex"]),
+        )
+        .expect_err("a confidently absent harness must not reach pacing");
+
+        let from_the_spawn = format_launch_error(
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            adapter.name(),
+            adapter.program(),
+        );
+        assert_eq!(err.to_string(), from_the_spawn);
+    }
+
+    /// Fail-open, the discipline [`Liveness`] and [`program_is_present`]
+    /// already hold every other presence consumer to: a probe that reached no
+    /// verdict leaves the launch behaving exactly as it did before a
+    /// pre-flight existed.
+    #[test]
+    fn the_launch_preflight_lets_an_undecidable_probe_launch() {
+        let cfg = permissive_cfg();
+        let adapter = select_with_presence(Some("claude"), &[], &cfg, true, &nothing_decidable())
+            .expect("claude resolves");
+
+        refuse_if_program_absent_with_presence(adapter.as_ref(), &cfg, &nothing_decidable())
+            .expect("Unknown must never cost a launch that would have worked");
+    }
+
+    /// The other half of fail-open, and the ordinary case: an installed
+    /// harness is waved straight through.
+    #[test]
+    fn the_launch_preflight_lets_an_installed_harness_launch() {
+        let cfg = permissive_cfg();
+        let adapter =
+            select_with_presence(Some("claude"), &[], &cfg, true, &everything_installed())
+                .expect("claude resolves");
+
+        refuse_if_program_absent_with_presence(
+            adapter.as_ref(),
+            &cfg,
+            &only_installed(&["claude"]),
+        )
+        .expect("an installed harness launches");
+    }
+
+    /// `resolve_default_with_presence`'s own `consult_presence = bin.
+    /// is_none()` rule, reused rather than re-invented: an operator-set
+    /// `agent_bin` need not be a path a `stat` can answer (the `sh
+    /// <wrapper>.sh` shape below is this codebase's own fixture convention
+    /// and resolves to nothing on disk), so the pre-flight must not probe it
+    /// at all. Proven by an oracle that panics if it is ever consulted --
+    /// "returned Ok" alone would also be satisfied by a probe that ran and
+    /// happened to answer `Live`.
+    #[test]
+    fn the_launch_preflight_never_probes_while_agent_bin_is_set() {
+        let cfg = CtxConfig {
+            agent_bin: Some("sh /nowhere/wrapper.sh".to_string()),
+            ..CtxConfig::default()
+        };
+        let adapter =
+            select_with_presence(Some("claude"), &[], &cfg, true, &everything_installed())
+                .expect("claude resolves");
+        let never: &dyn Fn(&str, &str) -> Liveness = &|_name: &str, _program: &str| -> Liveness {
+            panic!("an operator-set agent_bin must never be probed")
+        };
+
+        refuse_if_program_absent_with_presence(adapter.as_ref(), &cfg, never)
+            .expect("an agent_bin override is an operator choice, not a presence question");
+    }
+
+    /// Never substitute: the pre-flight only ever makes a failure arrive
+    /// sooner. A configured `agent` naming a harness this machine does not
+    /// have fails under *that* harness's own name, and the installed one is
+    /// never quietly put in its place.
+    #[test]
+    fn the_launch_preflight_names_the_configured_harness_and_never_switches_it() {
+        let cfg = CtxConfig {
+            agent: Some("codex".to_string()),
+            ..CtxConfig::default()
+        };
+        let (adapter, _origin) = resolve_default_with_presence(&cfg, &only_installed(&["claude"]))
+            .expect("a configured agent is never re-chosen by presence");
+        assert_eq!(adapter.name(), "codex");
+
+        let err = refuse_if_program_absent_with_presence(
+            adapter.as_ref(),
+            &cfg,
+            &only_installed(&["claude"]),
+        )
+        .expect_err("codex is not installed on this stated machine");
+        let message = err.to_string();
+        assert!(
+            message.contains("adapter 'codex'"),
+            "the refusal must name the harness the operator asked for: {message}"
+        );
+        assert!(
+            !message.contains("claude"),
+            "the installed harness must never appear as a substitute: {message}"
+        );
     }
 }
