@@ -33,7 +33,11 @@ pub fn options_from_config(
                 home.join(rest)
             } else {
                 let path = PathBuf::from(path);
-                if path.is_absolute() { path } else { home.join(path) }
+                if path.is_absolute() {
+                    path
+                } else {
+                    home.join(path)
+                }
             };
             std::fs::read_to_string(&path)?
                 .lines()
@@ -81,7 +85,11 @@ pub fn rehydrate_text(state_root: &Path, repo: &Path, text: &str) -> CtxResult<S
     })
 }
 
-pub fn rehydrate_json(state_root: &Path, repo: &Path, value: &mut serde_json::Value) -> CtxResult<()> {
+pub fn rehydrate_json(
+    state_root: &Path,
+    repo: &Path,
+    value: &mut serde_json::Value,
+) -> CtxResult<()> {
     with_vault(&vault_path(state_root, repo), |vault| {
         rehydrate_json_value(value, vault);
         Ok(())
@@ -116,9 +124,8 @@ fn load(path: &Path) -> CtxResult<Vault> {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: VaultEntry = serde_json::from_str(line).map_err(|error| {
-            format!("invalid obfuscation vault row {}: {error}", index + 1)
-        })?;
+        let entry: VaultEntry = serde_json::from_str(line)
+            .map_err(|error| format!("invalid obfuscation vault row {}: {error}", index + 1))?;
         entries.push(entry);
     }
     Vault::from_entries(entries).map_err(Into::into)
@@ -156,7 +163,11 @@ fn acquire_lock(vault_path: &Path) -> CtxResult<LockGuard> {
                     continue;
                 }
                 if Instant::now() >= deadline {
-                    return Err(format!("timed out locking obfuscation vault {}", vault_path.display()).into());
+                    return Err(format!(
+                        "timed out locking obfuscation vault {}",
+                        vault_path.display()
+                    )
+                    .into());
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -187,16 +198,22 @@ mod tests {
         std::fs::remove_file(&path).expect("remove fixture");
         let options = Options::default();
         with_vault(&path, |vault| {
-            let _ = super::super::obfuscate::obfuscate(
-                "jane@company.dk", vault, &options, "test",
-            );
+            let _ = super::super::obfuscate::obfuscate("jane@company.dk", vault, &options, "test");
             Ok(())
-        }).expect("persist");
+        })
+        .expect("persist");
         assert!(path.exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
     }
 }

