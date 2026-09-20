@@ -66,6 +66,16 @@ model = "fable"
 # standard = "gpt-5.6-terra"        # Default: unset (built-in ladder default "gpt-5.6-terra").
 # deep = "gpt-5.6-sol"              # Default: unset (built-in ladder default "gpt-5.6-sol").
 
+# [model_tiers.claude]              # every key below is REPO-FORBIDDEN (ZIRV_CTX_MODEL_TIERS_CLAUDE_FAST / _STANDARD / _DEEP) -- issue #699 cost-routing lever: resolves a workflow seat's declared ModelTier to a real model id on a claude harness.
+# fast = "haiku"                    # Default: unset (no model is passed; the adapter's own default applies -- zirv never guesses one).
+# standard = "sonnet"               # Default: unset, same reasoning.
+# deep = "opus"                     # Default: unset, same reasoning. Zirv never downgrades a Deep seat on its own; this only ever reflects the operator's own explicit choice.
+
+# [model_tiers.codex]               # every key below is REPO-FORBIDDEN (ZIRV_CTX_MODEL_TIERS_CODEX_FAST / _STANDARD / _DEEP) -- same, for a codex harness.
+# fast = "gpt-5.4-mini"             # Default: unset (no model is passed).
+# standard = "gpt-5.6-terra"        # Default: unset, same reasoning.
+# deep = "gpt-5.6-sol"              # Default: unset, same reasoning.
+
 # [score]
 # window = 10                        # trailing turns the rolling rot score looks over
 # min_turns = 10                     # turns required before the score is trusted at all

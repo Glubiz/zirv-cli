@@ -1523,8 +1523,12 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// default re-loads the effective canonical policy, applies the normal
     /// headless sandbox/policy projection, and finally applies the adapter's
     /// read-only floor when the seat requires it. Provider-specific model ids
-    /// are accepted only when an operator/caller explicitly supplies one;
-    /// `model_tier` remains a routing hint rather than a guessed model name.
+    /// are accepted only when an operator/caller explicitly supplies one, or
+    /// the operator's own `[model_tiers.<adapter>]` map (issue #699) names
+    /// one for this exact `(adapter, manifest.model_tier)` pair -- see
+    /// [`resolve_tiered_model`]. `model_tier` remains a routing hint zirv
+    /// itself never turns into a guessed model name; only the operator's
+    /// explicit pin or explicit map entry ever reaches argv.
     fn dispatch_agent(
         &self,
         manifest: &crate::commands::workflow::agents::AgentManifest,
@@ -1549,7 +1553,16 @@ pub trait AgentAdapter: std::fmt::Debug {
         }
 
         let mut extra = policy_launch_args(&cfg, self, &[], LaunchMode::Headless);
-        if let Some(model) = task.model.as_deref() {
+        // Resolution order (issue #699): an explicit per-invocation pin always
+        // wins; otherwise consult the operator's tier map for this adapter,
+        // never a guess of zirv's own. Neither branch ever narrows or widens
+        // `manifest.model_tier` itself -- the tier resolved is always the one
+        // the manifest already declared.
+        let resolved_model = task
+            .model
+            .as_deref()
+            .or_else(|| resolve_tiered_model(&cfg, self.name(), manifest.model_tier));
+        if let Some(model) = resolved_model {
             extra.extend(self.model_args(model));
         }
         let system_prompt = format!(
@@ -3737,6 +3750,38 @@ pub(crate) fn resolve_review_model(
     }
 }
 
+/// The operator's configured model id for `(adapter, tier)`, from `ctx.
+/// toml`'s `[model_tiers.<adapter>]` table (`config::ModelTiersConfig`) --
+/// issue #699's cost-routing lever. `None` when the operator has not mapped
+/// this exact pair, and `dispatch_agent` must read that as "pass no model",
+/// never as license to guess one.
+///
+/// Unlike [`resolve_worker_model`] below (which falls back to `adapter`'s
+/// own hard default) or `handover::resolve_model` (which falls back to a
+/// built-in per-vendor ladder), this function has NO fallback of its own:
+/// `manifest.model_tier` is a routing hint the manifest already declared,
+/// and zirv must never decide by itself that a `Deep` seat may run cheaper
+/// than the operator configured. Only the tier word the manifest already
+/// carries is ever looked up; this never substitutes a different one.
+fn resolve_tiered_model<'a>(
+    cfg: &'a CtxConfig,
+    adapter: &str,
+    tier: crate::commands::workflow::agents::ModelTier,
+) -> Option<&'a str> {
+    use crate::commands::workflow::agents::ModelTier;
+    let tiers = match adapter {
+        "claude" => &cfg.model_tiers.claude,
+        "codex" => &cfg.model_tiers.codex,
+        _ => return None,
+    };
+    let configured = match tier {
+        ModelTier::Fast => tiers.fast.as_deref(),
+        ModelTier::Standard => tiers.standard.as_deref(),
+        ModelTier::Deep => tiers.deep.as_deref(),
+    };
+    configured.filter(|model| !model.trim().is_empty())
+}
+
 /// The resolved `worker.<name>` model for a delegated headless worker: the
 /// operator's own `cfg.worker.<name>` value if set, else `adapter`'s own
 /// `AgentAdapter::default_worker_model`. `None` means neither exists, so a
@@ -4798,6 +4843,194 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A synthetic seat manifest for the `resolve_tiered_model`/`dispatch_
+    /// agent` tests below, parameterised only by the routing hint they need
+    /// to probe. Mirrors `dispatch_agent_invariants_hold_for_claude_and_
+    /// codex`'s own inline `AgentManifest` construction, with `read_only:
+    /// false` and no required capabilities so it dispatches under the
+    /// default permissive policy with no extra setup.
+    fn tiered_probe_manifest(
+        tier: crate::commands::workflow::agents::ModelTier,
+    ) -> crate::commands::workflow::agents::AgentManifest {
+        use crate::commands::workflow::agents::{AGENT_SCHEMA_VERSION, AgentManifest};
+        AgentManifest {
+            schema_version: AGENT_SCHEMA_VERSION,
+            id: "tiered-probe".to_string(),
+            version: 1,
+            name: "Tiered Probe".to_string(),
+            description: "issue #699 cost-routing lever probe".to_string(),
+            role: "worker".to_string(),
+            model_tier: tier,
+            read_only: false,
+            required_capabilities: Vec::new(),
+            optional_capabilities: Vec::new(),
+            context_budget_bytes: 4096,
+            instructions: "Do the thing.".to_string(),
+            team_role: None,
+            skills: Vec::new(),
+        }
+    }
+
+    /// Whether `argv` carries a `--model <value>` pair anywhere, the same
+    /// flag both `ClaudeAdapter`/`CodexAdapter` `model_args` emit.
+    fn argv_model(argv: &[String]) -> Option<&str> {
+        argv.windows(2)
+            .find(|w| w[0] == "--model")
+            .map(|w| w[1].as_str())
+    }
+
+    /// Issue #699, the most important property of the whole lever: an
+    /// operator who configures nothing (`[model_tiers]` absent from both
+    /// layers) sees zero behaviour change -- `dispatch_agent` must still
+    /// pass no `--model` flag at all, exactly as it did before this lever
+    /// existed. Covers every built-in tier, on both registered adapters, so
+    /// no single tier or adapter can quietly start guessing.
+    #[test]
+    fn dispatch_agent_passes_no_model_when_the_tier_map_is_empty() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+
+        for name in ["claude", "codex"] {
+            let adapter = select(Some(name), &[], &permissive_cfg())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Deep] {
+                let manifest = tiered_probe_manifest(tier);
+                let argv = flatten_command(
+                    adapter
+                        .dispatch_agent(&manifest, &task)
+                        .unwrap_or_else(|e| panic!("{name}/{tier}: {e}")),
+                );
+                assert_eq!(
+                    argv_model(&argv),
+                    None,
+                    "{name}/{tier}: an empty model_tiers map must add no --model flag, got {argv:?}"
+                );
+            }
+        }
+    }
+
+    /// A `[model_tiers.<agent>]` entry deserializes and, with the operator's
+    /// value set on the HOME layer (never REPO_FORBIDDEN there -- see
+    /// `reject_untrusted_keys`, only ever applied to the repo layer), an
+    /// unmapped tier for that SAME mapped adapter still falls through to no
+    /// model at all: the map is per-(adapter, tier), not a whole-adapter
+    /// switch.
+    #[test]
+    fn dispatch_agent_falls_through_to_no_model_for_an_unmapped_tier_on_a_mapped_adapter() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\nfast = \"haiku-cheap\"\n",
+        )
+        .expect("write home ctx.toml");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+
+        let adapter = select(Some("claude"), &[], &permissive_cfg()).expect("claude");
+        let manifest = tiered_probe_manifest(ModelTier::Standard);
+        let argv = flatten_command(adapter.dispatch_agent(&manifest, &task).expect("dispatch"));
+        assert_eq!(
+            argv_model(&argv),
+            None,
+            "claude/standard: fast is mapped but standard is not, so this must still add no \
+             --model flag, got {argv:?}"
+        );
+    }
+
+    /// The lever's actual payoff: a mapped `(adapter, tier)` resolves to the
+    /// operator's configured model id, reaching the real launch argv.
+    #[test]
+    fn dispatch_agent_resolves_a_mapped_adapter_and_tier_to_the_configured_model() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\ndeep = \"opus-max\"\n[model_tiers.codex]\ndeep = \"gpt-mega\"\n",
+        )
+        .expect("write home ctx.toml");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+        let manifest = tiered_probe_manifest(ModelTier::Deep);
+
+        for (name, expected) in [("claude", "opus-max"), ("codex", "gpt-mega")] {
+            let adapter = select(Some(name), &[], &permissive_cfg())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let argv = flatten_command(
+                adapter
+                    .dispatch_agent(&manifest, &task)
+                    .unwrap_or_else(|e| panic!("{name}: {e}")),
+            );
+            assert_eq!(
+                argv_model(&argv),
+                Some(expected),
+                "{name}/deep: expected the configured model in argv, got {argv:?}"
+            );
+        }
+    }
+
+    /// Resolution order rule 1 (issue #699): an explicit `AgentTask::model`
+    /// pin always wins over the operator's tier map, even when the map has
+    /// an entry for the exact same `(adapter, tier)` pair.
+    #[test]
+    fn dispatch_agent_prefers_an_explicit_task_model_pin_over_the_tier_map() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\nstandard = \"mapped-model\"\n\
+             [model_tiers.codex]\nstandard = \"mapped-model\"\n",
+        )
+        .expect("write home ctx.toml");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let manifest = tiered_probe_manifest(ModelTier::Standard);
+
+        for name in ["claude", "codex"] {
+            let task = AgentTask {
+                prompt: "do the thing".to_string(),
+                repo: repo.path().to_path_buf(),
+                model: Some("pinned-model".to_string()),
+            };
+            let adapter = select(Some(name), &[], &permissive_cfg())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let argv = flatten_command(
+                adapter
+                    .dispatch_agent(&manifest, &task)
+                    .unwrap_or_else(|e| panic!("{name}: {e}")),
+            );
+            assert_eq!(
+                argv_model(&argv),
+                Some("pinned-model"),
+                "{name}: an explicit AgentTask::model pin must win over a mapped tier, got {argv:?}"
+            );
         }
     }
 

@@ -2112,6 +2112,63 @@ pub struct HandoverConfig {
     pub codex: HandoverTierConfig,
 }
 
+/// One adapter's operator-declared model id for each of the three
+/// [`workflow::agents::ModelTier`](crate::commands::workflow::agents::
+/// ModelTier) routing hints a built-in seat's `AgentManifest.model_tier`
+/// already carries (issue #699's cost-routing lever). `None` -- the default
+/// for all three -- means the operator has not mapped this tier for this
+/// adapter, which `adapters::mod::resolve_tiered_model` reads as "pass no
+/// model", never as a built-in ladder to fall back to: unlike
+/// `HandoverTierConfig`'s `handover::tier_default`, there is no built-in
+/// default here, deliberately, because zirv must never decide on its own
+/// that a `Deep` seat may run at a cheaper model. Only the exact tier word
+/// the manifest already declares is ever looked up; zirv itself never
+/// substitutes a different one.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelTierConfig {
+    pub fast: Option<String>,
+    pub standard: Option<String>,
+    pub deep: Option<String>,
+}
+
+/// Per-adapter model-tier map for `zirv workflow`'s seat dispatch (issue
+/// #699), keyed by harness the same way `ReviewConfig`/`WorkerConfig`/
+/// `HandoverConfig` are: `[model_tiers.<adapter>]` with `fast`/`standard`/
+/// `deep` keys, each an explicit provider model id. Empty by default (every
+/// field of every adapter unset), so an operator who configures nothing
+/// changes nothing: `AgentAdapter::dispatch_agent`'s default impl already
+/// never guesses a model id when this map has nothing to say, exactly
+/// today's behaviour.
+///
+/// `REPO_FORBIDDEN` as a whole table, the same trust asymmetry as
+/// `review.*`/`worker.*`/`handover.*` above and for the identical reason
+/// this issue's own design calls out: a repo-owned `<repo>/.zirv/ctx.toml`
+/// choosing which model a seat runs on is a provider/model switch, the exact
+/// hazard the reverted `resolve_default` change was rejected for (silently
+/// picking a different vendor's model than the operator configured is not a
+/// narrowing, no matter how the choice is framed). `value_at` matches a
+/// table node the same way it matches a leaf (see `pace.use_credits`/
+/// `review`/`worker`/`handover` above), so one entry in `REPO_FORBIDDEN`
+/// blocks the whole `[model_tiers]` table -- every adapter, every tier --
+/// together. Only the operator's own `~/.zirv/ctx.toml`, the matching
+/// `ZIRV_CTX_MODEL_TIERS_<AGENT>_<TIER>` env var, or a future explicit flag
+/// may set any key here.
+///
+/// Downgrade note: `deny_unknown_fields` means a zirv release older than
+/// this one hard-fails on a persisted key it does not recognise. This
+/// change adds exactly one new top-level key (`model_tiers`); an operator
+/// config that never sets it deserializes identically before and after this
+/// change (`#[serde(default)]` yields the same empty map either way), so a
+/// 4.10.0 -> 4.9.0 downgrade stays safe for everyone except an operator who
+/// has actually written a `[model_tiers.*]` entry.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelTiersConfig {
+    pub claude: ModelTierConfig,
+    pub codex: ModelTierConfig,
+}
+
 /// Issue #395: an operator-only endpoint override pointing one harness at an
 /// Anthropic-/OpenAI-compatible vendor endpoint (GLM, Kimi, DeepSeek, Qwen,
 /// Mistral, MiniMax, a local Ollama/LM Studio/vLLM runtime) instead of that
@@ -2740,6 +2797,11 @@ pub struct CtxConfig {
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
     pub handover: HandoverConfig,
+    /// Issue #699's cost-routing lever: the operator's `[model_tiers.
+    /// <adapter>]` map from a workflow seat's declared `ModelTier` to a
+    /// concrete model id. The whole table is `REPO_FORBIDDEN`; see
+    /// [`ModelTiersConfig`].
+    pub model_tiers: ModelTiersConfig,
     pub endpoint: EndpointConfig,
     pub fallback: FallbackConfig,
     pub sandbox: SandboxConfig,
@@ -3514,6 +3576,39 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_HANDOVER_CODEX_DEEP",
         &["handover", "codex", "deep"],
+        EnvKind::Str,
+    ),
+    // Issue #699: the cost-routing lever's env override, one entry per
+    // (adapter, tier) leaf, the same enumeration `handover.<agent>.<tier>`
+    // right above uses.
+    (
+        "ZIRV_CTX_MODEL_TIERS_CLAUDE_FAST",
+        &["model_tiers", "claude", "fast"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_MODEL_TIERS_CLAUDE_STANDARD",
+        &["model_tiers", "claude", "standard"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_MODEL_TIERS_CLAUDE_DEEP",
+        &["model_tiers", "claude", "deep"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_MODEL_TIERS_CODEX_FAST",
+        &["model_tiers", "codex", "fast"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_MODEL_TIERS_CODEX_STANDARD",
+        &["model_tiers", "codex", "standard"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_MODEL_TIERS_CODEX_DEEP",
+        &["model_tiers", "codex", "deep"],
         EnvKind::Str,
     ),
     (
@@ -4608,6 +4703,18 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // `worker` above), so this one entry blocks the whole `[handover]`
     // table -- both agents, all three tiers -- together.
     (&["handover"], "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP"),
+    // Issue #699 (cost-routing lever): `[model_tiers.<agent>]` chooses which
+    // model a workflow seat dispatches on for its declared `ModelTier`
+    // routing hint -- the same trust asymmetry as `handover.*` right above,
+    // applied to a workflow seat's model instead of the orchestrator's own.
+    // A repo checkout picking a cheaper (or different-vendor) model for a
+    // seat is exactly the "silent provider switch" the reverted
+    // `resolve_default` change was rejected for; there is no narrowing
+    // reading of "choose this seat's model" available to a checkout. `value_
+    // at` matches a table node the same way it matches a leaf (see
+    // `handover` right above), so this one entry blocks the whole
+    // `[model_tiers]` table -- every adapter, every tier -- together.
+    (&["model_tiers"], "ZIRV_CTX_MODEL_TIERS_CLAUDE_FAST"),
     // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` choose which vendor
     // ACCOUNT a harness spends -- picking the account is the same trust
     // asymmetry `agent`/`review.*`/`worker.*`/`handover.*` above already
@@ -4914,6 +5021,19 @@ pub fn is_repo_forbidden(error: &(dyn std::error::Error + 'static)) -> bool {
     error.is::<RepoForbiddenError>()
 }
 
+/// Wraps a config error with "configuration error: " prefix, except for
+/// REPO_FORBIDDEN errors which have their own message format. This is the
+/// single chokepoint where all config errors get their prefix exactly once,
+/// ensuring consistency across all error paths (deserialization, validation,
+/// safety resolution, policy resolution, etc.).
+fn add_config_error_prefix(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    if is_repo_forbidden(&*e) {
+        e
+    } else {
+        format!("configuration error: {}", e).into()
+    }
+}
+
 /// Loud rather than silent: a repo that sets one of these gets a message
 /// naming the key and where to put it, which beats wondering why the value in
 /// the file is being ignored. Collects ALL violations before failing, so a repo
@@ -4992,14 +5112,14 @@ fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>
                     KeyOrigin::Env(var) => format!("${var}"),
                 };
                 return format!(
-                    "configuration error: unknown key `{}` in {} — this is usually from a \
+                    "unknown key `{}` in {} — this is usually from a \
                      newer zirv version. Either remove the key or upgrade zirv.",
                     field, source
                 );
             } else {
                 // Field not in our origins map, it came from env or unknown
                 return format!(
-                    "configuration error: unknown key `{}` — this is usually from a newer zirv \
+                    "unknown key `{}` — this is usually from a newer zirv \
                      version. Remove the key from your config files or environment variables, or upgrade zirv.",
                     field
                 );
@@ -5016,10 +5136,7 @@ fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>
                 KeyOrigin::Repo => format!(".zirv/{}", CTX_CONFIG_FILE),
                 KeyOrigin::Env(var) => format!("${var}"),
             };
-            return format!(
-                "configuration error: wrong type for `{}` in {} — {}",
-                field, source, error_msg
-            );
+            return format!("wrong type for `{}` in {} — {}", field, source, error_msg);
         }
     }
     // Fallback for errors we can't enhance
@@ -5979,12 +6096,9 @@ impl CtxConfig {
 
         let mut cfg: Self = toml::Value::Table(merged).try_into().map_err(|e| {
             let error_msg = e.to_string();
-            let msg: Box<dyn std::error::Error> = format!(
-                "configuration error: {}",
-                format_config_error(&error_msg, &key_origins)
-            )
-            .into();
-            msg
+            let msg: Box<dyn std::error::Error> =
+                format_config_error(&error_msg, &key_origins).into();
+            add_config_error_prefix(msg)
         })?;
 
         // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
@@ -6011,7 +6125,9 @@ impl CtxConfig {
             ),
         ] {
             if !(0.0..=100.0).contains(&value) {
-                return Err(format!("{key} must be between 0 and 100, got {value}").into());
+                return Err(add_config_error_prefix(
+                    format!("{key} must be between 0 and 100, got {value}").into(),
+                ));
             }
         }
         let mut seen = std::collections::HashSet::new();
@@ -6020,27 +6136,33 @@ impl CtxConfig {
                 .iter()
                 .any(|(known, _)| known == name)
             {
-                return Err(format!(
-                    "fallback.order contains unknown agent '{name}'; known adapters: {}",
-                    super::adapters::ADAPTERS
-                        .iter()
-                        .map(|(known, _)| *known)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-                .into());
+                return Err(add_config_error_prefix(
+                    format!(
+                        "fallback.order contains unknown agent '{name}'; known adapters: {}",
+                        super::adapters::ADAPTERS
+                            .iter()
+                            .map(|(known, _)| *known)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                    .into(),
+                ));
             }
             if !seen.insert(name.clone()) {
-                return Err(format!("fallback.order contains duplicate agent '{name}'").into());
+                return Err(add_config_error_prefix(
+                    format!("fallback.order contains duplicate agent '{name}'").into(),
+                ));
             }
         }
         if let Some(value) = cfg.fallback.orchestrator_rollover_headroom_pct
             && !(0.0..=100.0).contains(&value)
         {
-            return Err(format!(
-                "fallback.orchestrator_rollover_headroom_pct must be between 0 and 100, got {value}"
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "fallback.orchestrator_rollover_headroom_pct must be between 0 and 100, got {value}"
+                )
+                .into(),
+            ));
         }
         // Issue #455 (review round 1, finding 9): the breaker's own knobs.
         // `open_after_failures` above the observation ring can never be
@@ -6050,12 +6172,14 @@ impl CtxConfig {
         if !(1..=super::health::MAX_OBSERVATIONS as u32)
             .contains(&cfg.fallback.health.open_after_failures)
         {
-            return Err(format!(
-                "fallback.health.open_after_failures must be between 1 and {}, got {}",
-                super::health::MAX_OBSERVATIONS,
-                cfg.fallback.health.open_after_failures
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "fallback.health.open_after_failures must be between 1 and {}, got {}",
+                    super::health::MAX_OBSERVATIONS,
+                    cfg.fallback.health.open_after_failures
+                )
+                .into(),
+            ));
         }
         for (key, value) in [
             (
@@ -6068,7 +6192,9 @@ impl CtxConfig {
             ),
         ] {
             if value == 0 {
-                return Err(format!("{key} must be greater than 0, got {value}").into());
+                return Err(add_config_error_prefix(
+                    format!("{key} must be greater than 0, got {value}").into(),
+                ));
             }
         }
         // Slice A: the degrade knobs. A 0% rate degrades every route that
@@ -6076,11 +6202,13 @@ impl CtxConfig {
         // a single sample is not a rate at all; and a sub-second first-token
         // threshold would mark every thinking model degraded.
         if !(1..=100).contains(&cfg.fallback.health.degrade_error_rate_pct) {
-            return Err(format!(
-                "fallback.health.degrade_error_rate_pct must be between 1 and 100, got {}",
-                cfg.fallback.health.degrade_error_rate_pct
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "fallback.health.degrade_error_rate_pct must be between 1 and 100, got {}",
+                    cfg.fallback.health.degrade_error_rate_pct
+                )
+                .into(),
+            ));
         }
         // Finding 12: bounded above by the ring the samples land in, or the
         // signal can never fire at all -- a minimum the evidence store
@@ -6094,42 +6222,48 @@ impl CtxConfig {
             super::health::MAX_SAMPLES as u32
         };
         if !(2..=sample_ceiling).contains(&cfg.fallback.health.degrade_min_samples) {
-            return Err(format!(
-                "fallback.health.degrade_min_samples must be between 2 and {sample_ceiling}, got {}",
-                cfg.fallback.health.degrade_min_samples
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "fallback.health.degrade_min_samples must be between 2 and {sample_ceiling}, got {}",
+                    cfg.fallback.health.degrade_min_samples
+                )
+                .into(),
+            ));
         }
         if let Some(ttft_ms) = cfg.fallback.health.degrade_ttft_ms
             && ttft_ms < 1_000
         {
-            return Err(format!(
-                "fallback.health.degrade_ttft_ms must be at least 1000, got {ttft_ms}"
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!("fallback.health.degrade_ttft_ms must be at least 1000, got {ttft_ms}")
+                    .into(),
+            ));
         }
         for (name, limits) in &cfg.fallback.harness {
             if !super::adapters::ADAPTERS
                 .iter()
                 .any(|(known, _)| known == name)
             {
-                return Err(format!(
-                    "fallback.harness contains unknown agent '{name}'; known adapters: {}",
-                    super::adapters::ADAPTERS
-                        .iter()
-                        .map(|(known, _)| *known)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-                .into());
+                return Err(add_config_error_prefix(
+                    format!(
+                        "fallback.harness contains unknown agent '{name}'; known adapters: {}",
+                        super::adapters::ADAPTERS
+                            .iter()
+                            .map(|(known, _)| *known)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                    .into(),
+                ));
             }
             if let Some(value) = limits.reserve_headroom_pct
                 && !(0.0..=100.0).contains(&value)
             {
-                return Err(format!(
-                    "fallback.harness.{name}.reserve_headroom_pct must be between 0 and 100, got {value}"
-                )
-                .into());
+                return Err(add_config_error_prefix(
+                    format!(
+                        "fallback.harness.{name}.reserve_headroom_pct must be between 0 and 100, got {value}"
+                    )
+                    .into(),
+                ));
             }
         }
 
@@ -6195,12 +6329,14 @@ impl CtxConfig {
         // `output::render_summary` must never do. Refused by name rather than
         // silently clamped.
         if cfg.output.max_summary_bytes < MIN_MAX_SUMMARY_BYTES {
-            return Err(format!(
-                "`output.max_summary_bytes` must be at least {MIN_MAX_SUMMARY_BYTES} (got {}): a \
-                 smaller cap cannot hold a summary's own failure lines and its retrieval line.",
-                cfg.output.max_summary_bytes
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "`output.max_summary_bytes` must be at least {MIN_MAX_SUMMARY_BYTES} (got {}): a \
+                     smaller cap cannot hold a summary's own failure lines and its retrieval line.",
+                    cfg.output.max_summary_bytes
+                )
+                .into(),
+            ));
         }
 
         // Issue #417: every `[[output.filter]]` rule's regexes must compile,
@@ -6272,11 +6408,13 @@ impl CtxConfig {
         if let Some(mode) = cfg.chat.claude_permission_mode.as_deref()
             && !matches!(mode, "default" | "acceptEdits" | "bypassPermissions")
         {
-            return Err(format!(
-                "chat.claude_permission_mode must be \"default\", \"acceptEdits\" or \
-                 \"bypassPermissions\", got \"{mode}\""
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "chat.claude_permission_mode must be \"default\", \"acceptEdits\" or \
+                     \"bypassPermissions\", got \"{mode}\""
+                )
+                .into(),
+            ));
         }
 
         // `review.claude`/`review.codex` land in injected prompt text (see
@@ -6331,6 +6469,29 @@ impl CtxConfig {
             validate_model_str("handover.codex.deep", model)?;
         }
 
+        // `model_tiers.<agent>.<tier>` (issue #699) reach a real launch argv
+        // directly (`adapters::resolve_tiered_model` -> `dispatch_agent` ->
+        // `AgentAdapter::model_args`), the same path `worker.*`/`handover.*`
+        // take, so the same guard applies to all six leaves.
+        if let Some(model) = cfg.model_tiers.claude.fast.as_deref() {
+            validate_model_str("model_tiers.claude.fast", model)?;
+        }
+        if let Some(model) = cfg.model_tiers.claude.standard.as_deref() {
+            validate_model_str("model_tiers.claude.standard", model)?;
+        }
+        if let Some(model) = cfg.model_tiers.claude.deep.as_deref() {
+            validate_model_str("model_tiers.claude.deep", model)?;
+        }
+        if let Some(model) = cfg.model_tiers.codex.fast.as_deref() {
+            validate_model_str("model_tiers.codex.fast", model)?;
+        }
+        if let Some(model) = cfg.model_tiers.codex.standard.as_deref() {
+            validate_model_str("model_tiers.codex.standard", model)?;
+        }
+        if let Some(model) = cfg.model_tiers.codex.deep.as_deref() {
+            validate_model_str("model_tiers.codex.deep", model)?;
+        }
+
         // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` are `REPO_
         // FORBIDDEN` outright (see that entry's own comment), so by this
         // point either is `Some` only from the operator's own home layer.
@@ -6350,37 +6511,48 @@ impl CtxConfig {
         // own doc comment for why this is a load-time error, not a silent
         // clamp, matching the `fallback.*` percentage checks above.
         if !(0.0..=1.0).contains(&cfg.proxy.min_confidence) {
-            return Err(format!(
-                "proxy.min_confidence must be between 0.0 and 1.0, got {}",
-                cfg.proxy.min_confidence
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "proxy.min_confidence must be between 0.0 and 1.0, got {}",
+                    cfg.proxy.min_confidence
+                )
+                .into(),
+            ));
         }
         if !(0.0..=1.0).contains(&cfg.proxy.min_margin) {
-            return Err(format!(
-                "proxy.min_margin must be between 0.0 and 1.0, got {}",
-                cfg.proxy.min_margin
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "proxy.min_margin must be between 0.0 and 1.0, got {}",
+                    cfg.proxy.min_margin
+                )
+                .into(),
+            ));
         }
         if cfg.proxy.typesafe.timeout_secs < 1 {
-            return Err(format!(
-                "proxy.typesafe.timeout_secs must be at least 1, got {}",
-                cfg.proxy.typesafe.timeout_secs
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "proxy.typesafe.timeout_secs must be at least 1, got {}",
+                    cfg.proxy.typesafe.timeout_secs
+                )
+                .into(),
+            ));
         }
         if cfg.proxy.request_max_bytes < MIN_PROXY_REQUEST_MAX_BYTES {
-            return Err(format!(
-                "proxy.request_max_bytes must be at least {MIN_PROXY_REQUEST_MAX_BYTES}, got {}",
-                cfg.proxy.request_max_bytes
-            )
-            .into());
+            return Err(add_config_error_prefix(
+                format!(
+                    "proxy.request_max_bytes must be at least {MIN_PROXY_REQUEST_MAX_BYTES}, got {}",
+                    cfg.proxy.request_max_bytes
+                )
+                .into(),
+            ));
         }
 
-        cfg.agents = crate::settings::AgentGate::load(repo, env)?;
-        cfg.policy = super::policy::resolve(home_policy, repo_policy, env)?;
-        cfg.safety = super::safety::resolve(home_safety, repo_safety, env)?;
+        cfg.agents =
+            crate::settings::AgentGate::load(repo, env).map_err(add_config_error_prefix)?;
+        cfg.policy = super::policy::resolve(home_policy, repo_policy, env)
+            .map_err(add_config_error_prefix)?;
+        cfg.safety = super::safety::resolve(home_safety, repo_safety, env)
+            .map_err(add_config_error_prefix)?;
         cfg.unparsable_layers = unparsable_layers;
         announce_unparsable_layers_once(&cfg);
         Ok(cfg)
@@ -12022,6 +12194,12 @@ mod tests {
         ("handover.codex", "cheap"),
         ("handover.codex", "standard"),
         ("handover.codex", "deep"),
+        ("model_tiers.claude", "fast"),
+        ("model_tiers.claude", "standard"),
+        ("model_tiers.claude", "deep"),
+        ("model_tiers.codex", "fast"),
+        ("model_tiers.codex", "standard"),
+        ("model_tiers.codex", "deep"),
         ("score", "window"),
         ("score", "min_turns"),
         ("score", "token_floor"),
@@ -13029,6 +13207,81 @@ mod tests {
         assert_eq!(cfg.session.scrollback_rows_or_default(), 64);
     }
 
+    /// Issue #699 (cost-routing lever): every `[model_tiers.<agent>]` leaf is
+    /// operator-only, the same trust asymmetry as `review.*`/`worker.*`/
+    /// `handover.*` -- a repo checkout choosing which model a workflow seat
+    /// dispatches on is a provider/model switch, never a narrowing. One
+    /// assertion per leaf, on both known adapters, so a future edit that
+    /// narrows or drops the `REPO_FORBIDDEN` entry fails here naming the
+    /// offending config.
+    #[test]
+    fn model_tiers_keys_are_repo_forbidden() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        for toml in [
+            "[model_tiers.claude]\nfast = \"haiku\"\n",
+            "[model_tiers.claude]\nstandard = \"sonnet\"\n",
+            "[model_tiers.claude]\ndeep = \"opus\"\n",
+            "[model_tiers.codex]\nfast = \"gpt-5.4-mini\"\n",
+            "[model_tiers.codex]\nstandard = \"gpt-5.6-terra\"\n",
+            "[model_tiers.codex]\ndeep = \"gpt-5.6-sol\"\n",
+        ] {
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write repo");
+            let err = CtxConfig::load(repo.path(), &|_| None)
+                .err()
+                .unwrap_or_else(|| panic!("a repo checkout must not be able to set `{toml}`"));
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "`{toml}` must be a REPO_FORBIDDEN rejection: {err}"
+            );
+            assert!(
+                err.to_string().contains("model_tiers"),
+                "the refusal must name model_tiers: {err}"
+            );
+        }
+    }
+
+    /// The operator's own home layer is unaffected: `[model_tiers.<agent>]`
+    /// set there loads cleanly and reaches `CtxConfig.model_tiers`, exactly
+    /// the escape hatch `REPO_FORBIDDEN`'s own doc comment promises.
+    #[test]
+    fn model_tiers_keys_are_settable_from_the_operators_home_layer() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\nfast = \"haiku\"\ndeep = \"opus\"\n",
+        )
+        .expect("write home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg =
+            CtxConfig::load(repo.path(), &|_| None).expect("the operator's own layer must load");
+        assert_eq!(cfg.model_tiers.claude.fast.as_deref(), Some("haiku"));
+        assert_eq!(cfg.model_tiers.claude.standard, None);
+        assert_eq!(cfg.model_tiers.claude.deep.as_deref(), Some("opus"));
+        assert_eq!(cfg.model_tiers.codex, ModelTierConfig::default());
+    }
+
+    /// The design note's own headline downgrade-safety property: a config
+    /// that never sets `[model_tiers]` at all -- the overwhelmingly common
+    /// case, and the only one a pre-#699 `~/.zirv/ctx.toml` can express --
+    /// deserializes to the same empty map a fresh `CtxConfig::default()`
+    /// carries, so an operator who configures nothing sees no change at all.
+    #[test]
+    fn model_tiers_deserializes_to_empty_defaults_when_absent() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let cfg = CtxConfig::load(repo.path(), &|_| None).expect("load with no model_tiers at all");
+        assert_eq!(cfg.model_tiers, ModelTiersConfig::default());
+        assert_eq!(cfg.model_tiers.claude.fast, None);
+        assert_eq!(cfg.model_tiers.codex.deep, None);
+    }
+
     /// Issue #691: Unknown key in home layer should name the home file.
     #[test]
     fn unknown_key_in_home_layer_names_the_file() {
@@ -13099,6 +13352,54 @@ mod tests {
         assert!(
             err_str.contains("ZIRV_CTX_WINDOW"),
             "error should name the environment variable: {err_str}"
+        );
+    }
+
+    /// Verify that "configuration error:" prefix appears exactly once in the error message.
+    /// This ensures we don't have duplicated prefixes from multiple layers of error wrapping.
+    #[test]
+    fn configuration_error_prefix_appears_exactly_once_for_unknown_key() {
+        let home = tempfile::tempdir().expect("home");
+        let home_config = home.path().join(".zirv");
+        std::fs::create_dir_all(&home_config).expect("mkdir");
+        std::fs::write(home_config.join("ctx.toml"), "future_feature = true\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown key should fail");
+
+        let err_str = err.to_string();
+        let prefix_count = err_str.matches("configuration error:").count();
+        assert_eq!(
+            prefix_count, 1,
+            "prefix should appear exactly once, but got {}: {}",
+            prefix_count, err_str
+        );
+    }
+
+    /// Verify that "configuration error:" prefix appears exactly once for wrong type errors.
+    #[test]
+    fn configuration_error_prefix_appears_exactly_once_for_wrong_type() {
+        let home = tempfile::tempdir().expect("home");
+        let home_config = home.path().join(".zirv");
+        std::fs::create_dir_all(&home_config).expect("mkdir");
+        // score.window expects an integer, not a string
+        std::fs::write(
+            home_config.join("ctx.toml"),
+            "[score]\nwindow = \"not a number\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let err = CtxConfig::load(repo.path(), &|_| None).expect_err("wrong type should fail");
+
+        let err_str = err.to_string();
+        let prefix_count = err_str.matches("configuration error:").count();
+        assert_eq!(
+            prefix_count, 1,
+            "prefix should appear exactly once, but got {}: {}",
+            prefix_count, err_str
         );
     }
 

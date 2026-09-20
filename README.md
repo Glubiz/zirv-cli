@@ -50,6 +50,7 @@
 - [Development Workflows](#development-workflows)
   - [The full verb set](#the-full-verb-set)
   - [Lifecycle and artifacts](#lifecycle-and-artifacts)
+  - [Implementation and review](#implementation-and-review)
   - [Deploy tiers](#deploy-tiers)
   - [Workflow adoption](#workflow-adoption)
   - [Agent registry](#agent-registry)
@@ -337,6 +338,26 @@ handover](#cross-harness-fallback-and-handover) below), `z` zooms the focused
 pane, `e` shows recent errors, `?`/`h` shows help, and `q` quits. On quit, the
 dashboard writes a restore roster so a next launch can offer to reopen the
 same panes.
+
+The dashboard's own mouse reporting stays on for the whole session (subject
+only to `dash.mouse` below, the operator's on/off switch — there is no
+mid-session toggle, `Ctrl+A v`/"select mode" has been removed). Click-drag
+inside any pane — including one whose child has turned on its own mouse
+reporting, such as the Claude Code or Codex TUI — selects that pane's text:
+a plain click still reaches the child (a press is forwarded only once
+release proves it moved no more than one cell, so a real click never turns
+into an accidental drag), while a genuine drag is the dashboard's own
+selection, built strictly from that pane's screen contents so the sidebar,
+borders and other chrome can never be copied, with trailing whitespace
+trimmed from each line. The wheel keeps scrolling — the dashboard's own
+scrollback, or forwarded to the child, exactly as before — without cancelling
+an in-progress or already-highlighted selection, and dragging past the top or
+bottom edge of the pane auto-scrolls it. Releasing the drag copies to the
+system clipboard via OSC 52, with a platform fallback (`pbcopy` on macOS,
+`wl-copy` then `xclip` on Linux, `clip.exe` on Windows) run in the background
+for a terminal that silently ignores OSC 52 (macOS Terminal.app is the one on
+record); if neither lands, the header shows a notice rather than losing the
+copy silently.
 
 Every dashboard control below is repo-forbidden (see [Trust
 boundary](#trust-boundary) below — a checkout cannot switch it on/off or
@@ -971,12 +992,22 @@ to the section that documents it in depth.
   pre-existing failure never blocks a workflow gate. See [The full verb
   set](#the-full-verb-set).
 - **Final verification** — `verify` runs the full check suite plus zirv's
-  own built-in self-check registry, reusing fresh `test` evidence when
-  nothing has changed since. See [The full verb set](#the-full-verb-set).
+  own built-in self-check registry. When the whole-changeset fingerprint
+  (HEAD plus the uncommitted diff) matches the prior `test` run exactly, it
+  reuses that run's evidence wholesale; otherwise it can still reuse an
+  individual check's prior result, per check, when the checkout is on the
+  same commit as that report, the report was not narrowed to a `--check`
+  subset, the check passed outright, and nothing under that check's own
+  declared `paths` changed since. A check with no declared `paths` always
+  re-runs, and a report built from a mix of reused and fresh checks still
+  covers every required check. See [The full verb
+  set](#the-full-verb-set).
 - **Repository check configuration** — optional, schema-versioned
   `.zirv/verify.toml` declares check id/kind/command/path patterns/phase
   eligibility/timeout; without it, Cargo commands and `npm run` scripts are
-  discovered from the manifests present. See [Frontend
+  discovered from the manifests present, each with its own default `paths`.
+  Declaring `paths` narrowly lets an unrelated change elsewhere skip
+  re-running that check at final verification. See [Frontend
   quality](#frontend-quality).
 
 ### Housekeeping
@@ -1581,7 +1612,7 @@ zirv workflow approve <id>                        # approve the current gated st
 zirv workflow advance <id> --outcome success|failure
 zirv workflow review package <id> | run <id> --agent <name> | add | ...
 zirv workflow maintain scan [--repo <path>] [--json]
-zirv workflow stats                               # local bounded telemetry
+zirv workflow stats                               # local bounded telemetry: per-phase timing, the implement/validate wall-clock split, approval wait, and fix-round causes (issue #699 Phase 0)
 ```
 
 ### Workflow definitions v2 (issue #542)
@@ -1774,6 +1805,29 @@ into a review or verify step, so a review/verify gate the initial `workflow
 start` measurement missed (an empty tree, before any code existed) still gets
 added once the real change exists.
 
+### Implementation and review
+
+When a behavior-focused test is possible, the `implement` skill asks for the
+same test-first loop the standalone `tdd` skill describes: write the
+smallest test first, confirm it fails for the missing behavior rather than
+setup noise, implement the minimum change that makes it pass, then rerun
+that test before broadening verification, keeping each red/green cycle
+attributable to one behavior. The same exemptions apply as in `tdd`:
+generated files, pure configuration, exploratory spikes, or a change whose
+only useful assertion sits at a broader integration boundary. `implement`
+also runs the repository's own fast formatting and lint checks after each
+meaningful edit rather than deferring them to `test`.
+
+Before reporting done, `implement` self-checks its diff against the same
+five dimensions `review` scores — correctness, security, data loss,
+compatibility, and missing tests — and fixes what it can rather than leaving
+it for a review round; `review` itself keeps the same rubric and bar. A
+workflow step's `skills` list only ever materializes its first entry as the
+step's running skill, so this discipline lives directly in `implement`
+rather than in a second, unread `tdd` entry; `tdd` stays registered and
+unmodified for `workflow show`, operator-authored packs, and a future step
+that can carry more than one skill id.
+
 ### Linked worktrees
 
 A workflow started in a repository's main checkout can be found from, and
@@ -1896,6 +1950,35 @@ text); an unknown or version-mismatched reference is refused by
 `AgentRegistry::validate_against`. `zirv workflow agents list|show` inspects
 the resolved registry and provenance; `zirv workflow agents dispatch <id>
 --adapter <name> --prompt <task>` launches that seat directly.
+
+Every built-in seat also carries a `model_tier` (`fast`/`standard`/`deep`) —
+a routing hint for how mechanical its work is, not a model choice.
+`doc-keeper`/`explorer` are `fast`; `security-scanner`/`architect` are
+`deep`; every other built-in seat is `standard`. Zirv never turns this hint
+into a model id on its own; the operator may map `(adapter, tier)` to a real
+model id under `[model_tiers.<agent>]` in `~/.zirv/ctx.toml`:
+
+```toml
+[model_tiers.claude]
+fast = "haiku"
+standard = "sonnet"
+deep = "opus"
+
+[model_tiers.codex]
+fast = "gpt-5.4-mini"
+standard = "gpt-5.6-terra"
+deep = "gpt-5.6-sol"
+```
+
+When a seat dispatches (`zirv workflow agents dispatch --model <id>`, and any
+workflow step that dispatches a seat under the hood), resolution order is: an
+explicit per-invocation model pin always wins; otherwise a mapped `(adapter,
+tier)` pair supplies the model; otherwise no model flag is added and the
+adapter's own default applies. An operator who sets nothing sees no change in
+behavior. `model_tiers` is repo-forbidden — a repository choosing which model
+a seat runs on would be a silent provider/model switch — so only the
+operator's own `~/.zirv/ctx.toml` or the matching
+`ZIRV_CTX_MODEL_TIERS_<AGENT>_<TIER>` environment variable may set it.
 
 ### Team composition
 
@@ -3595,6 +3678,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
+| `model_tiers` (`model_tiers.<agent>.<tier>`) | `ZIRV_CTX_MODEL_TIERS_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_MODEL_TIERS_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
 | `route.<id>.execution` | `~/.zirv/native.toml` only; selects an official provider process and optional absolute executable path. Repository layers cannot select executables, login methods, billing or startup settings; all effects retain the native broker |
 | Claude Code authentication environment and public user settings | User-owned process environment and `~/.claude/settings.json` (or an absolute `CLAUDE_CONFIG_DIR` outside the repository); only authentication settings are carried into the restricted model invocation. Official login receives options after `--`. Inherited auth values are excluded from persisted settings and diagnostic output |

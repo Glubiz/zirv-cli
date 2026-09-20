@@ -5352,9 +5352,10 @@ fn parse_layer(layer: Option<toml::Value>, origin: &str) -> CtxResult<SafetyLaye
     let Some(layer) = layer else {
         return Ok(SafetyLayer::default());
     };
-    layer
-        .try_into()
-        .map_err(|e| format!("{origin}: invalid [safety] section: {e}").into())
+    layer.try_into().map_err(|e| {
+        let error_msg = e.to_string().replace('\n', " ");
+        format!("{origin}: invalid [safety] section: {error_msg}").into()
+    })
 }
 
 fn rules_from(patterns: &[String], origin: Origin) -> Vec<Rule> {
