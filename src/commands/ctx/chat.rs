@@ -143,10 +143,9 @@ pub fn build_launch(
 /// text channel `exec.rs`/`run_loop.rs`/`dash::compose_worker_prompt` already
 /// use for exactly this adapter shape (see `prompt::task_prompt_with_
 /// composed_fallback`'s own doc comment for why the task prompt is the one
-/// channel such an adapter has). A no-op (returns `initial_prompt`
-/// unchanged) whenever the adapter *is* supported, so a claude launch --
-/// which always reports supported, see `ClaudeAdapter`'s lack of a `system_
-/// prompt_supported` override -- is byte-for-byte unaffected.
+/// channel such an adapter has). Whenever the adapter *is* supported, the
+/// composed fallback stays a no-op, but the positional prompt still passes
+/// through the same masking boundary as the fallback path.
 ///
 /// `adapter.system_prompt_supported(&[])` (an empty launch) is deliberately
 /// probed here rather than against the eventual full launch argv: this runs
@@ -181,31 +180,30 @@ fn orchestrator_initial_prompt(
     proxy_layer: Option<&str>,
     role: PromptRole,
 ) -> Option<String> {
-    if adapter.system_prompt_supported(&[]) {
-        return initial_prompt;
-    }
-    let compiled = super::compile::compile(
-        home,
-        repo,
-        simple,
-        cfg,
-        adapter,
-        role,
-        state,
-        super::state::now_secs(),
-        super::adapters::LaunchMode::Interactive,
-        false,
-    );
-    // Issue #537 (T2a): the harness proxy's own bounded layer, when an
-    // active decision took over this launch -- a no-op for every other
-    // launch (`proxy_layer` is `None`). Only reachable for an adapter with
-    // no verified system-prompt injection mechanism (the early return
-    // above); every other adapter gets this same layer through `wrap.rs`'s
-    // or `dash_orchestrator_pane`'s own `compile::with_proxy_layer` call.
-    let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
-    let base = initial_prompt.unwrap_or_default();
-    let text =
-        super::prompt::task_prompt_with_composed_fallback(&base, false, compiled.composed.as_ref());
+    let text = if adapter.system_prompt_supported(&[]) {
+        initial_prompt.unwrap_or_default()
+    } else {
+        let compiled = super::compile::compile(
+            home,
+            repo,
+            simple,
+            cfg,
+            adapter,
+            role,
+            state,
+            super::state::now_secs(),
+            super::adapters::LaunchMode::Interactive,
+            false,
+        );
+        // Issue #537 (T2a): the harness proxy's own bounded layer, when an
+        // active decision took over this launch -- a no-op for every other
+        // launch (`proxy_layer` is `None`). Every adapter with verified
+        // system-prompt injection gets this layer through `wrap.rs`'s or
+        // `dash_orchestrator_pane`'s own `compile::with_proxy_layer` call.
+        let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
+        let base = initial_prompt.unwrap_or_default();
+        super::prompt::task_prompt_with_composed_fallback(&base, false, compiled.composed.as_ref())
+    };
     if text.is_empty() {
         None
     } else {
@@ -1700,9 +1698,9 @@ mod tests {
         );
     }
 
-    /// Bug B: claude always reports `system_prompt_supported`, so this
-    /// function must be a true no-op for it -- byte-for-byte the same
-    /// `initial_prompt` in and out, whether or not one was given.
+    /// Bug B: claude always reports `system_prompt_supported`, so the
+    /// composed fallback must be a no-op for it. With masking disabled (the
+    /// default), the positional prompt stays byte-for-byte unchanged too.
     #[test]
     fn orchestrator_initial_prompt_is_a_no_op_for_a_supported_adapter() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -1740,6 +1738,34 @@ mod tests {
             ),
             Some("resume this".to_string())
         );
+    }
+
+    #[test]
+    fn orchestrator_initial_prompt_masks_a_supported_adapters_positional_prompt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+
+        let prompt = orchestrator_initial_prompt(
+            &adapter,
+            Some(format!("use {secret}")),
+            &cfg,
+            Some(&home),
+            tmp.path(),
+            false,
+            &state,
+            None,
+            PromptRole::Orchestrator,
+        )
+        .expect("the masked prompt is preserved");
+
+        assert!(!prompt.contains(secret), "{prompt}");
+        assert!(prompt.contains("ZIRV_SECRET_GITHUB_TOKEN_1"), "{prompt}");
     }
 
     /// Bug B, the actual fix: on a Windows npm-installed `codex.cmd` shim --

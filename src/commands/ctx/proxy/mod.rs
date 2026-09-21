@@ -130,6 +130,21 @@ fn try_helper(cfg: &CtxConfig, questions: &[Question]) -> Result<Answers, String
     .map_err(|error| format!("helper: {error}"))
 }
 
+fn protected_model_intake(
+    cfg: &CtxConfig,
+    state_dir: &Path,
+    repo: &Path,
+    request: &str,
+    roster: &decision::Roster,
+) -> CtxResult<(decision::IntakeState, Vec<Question>)> {
+    let state = state::StateDir::from_path(state_dir.to_path_buf());
+    let request =
+        super::obfuscate_store::protect_text(&state, repo, cfg, request, "proxy_jev_request")?.0;
+    let intake = decision::build_intake(cfg, repo, state_dir, &request, roster);
+    let questions = decision::questions(&intake);
+    Ok((intake, questions))
+}
+
 /// Computes one [`ProxyDecision`] for `request`, in `repo`, under `cfg`.
 /// Never fails: every I/O-touching step inside is best-effort, and the
 /// deterministic baseline is always a valid answer on its own. Persists the
@@ -140,8 +155,8 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     let classification = decision::classify_request(request);
     let roster = decision::Roster::gather(cfg, repo);
     let baseline = decision::baseline(cfg, repo, request, &classification, &roster);
-    let intake = decision::build_intake(cfg, repo, state_dir, request, &roster);
-    let questions = decision::questions(&intake);
+    let model_input = (!matches!(cfg.proxy.decider, ProxyDecider::Deterministic))
+        .then(|| protected_model_intake(cfg, state_dir, repo, request, &roster));
 
     let mut fallbacks = Vec::new();
     let mut winner = Decider::Deterministic;
@@ -149,13 +164,19 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     let mut result = baseline.clone();
     let mut ran_model = false;
 
-    if matches!(cfg.proxy.decider, ProxyDecider::Typesafe) {
+    if let Some(Err(error)) = &model_input {
+        fallbacks.push(format!("sensitive-data masking: {error}"));
+    }
+
+    if matches!(cfg.proxy.decider, ProxyDecider::Typesafe)
+        && let Some(Ok((intake, questions))) = &model_input
+    {
         match typesafe::decide(
             &cfg.proxy.typesafe,
             state_dir,
             cfg.jev.cache_ttl_secs,
-            &intake,
-            &questions,
+            intake,
+            questions,
         ) {
             Ok((answers, model_usage)) => {
                 result =
@@ -173,8 +194,9 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
             cfg.proxy.decider,
             ProxyDecider::Typesafe | ProxyDecider::Helper
         )
+        && let Some(Ok((_, questions))) = &model_input
     {
-        match try_helper(cfg, &questions) {
+        match try_helper(cfg, questions) {
             Ok(answers) => {
                 result =
                     decision::merge(cfg, &baseline, request, &answers, cfg.proxy.min_confidence);
@@ -925,6 +947,79 @@ mod tests {
                 std::env::set_var("TYPESAFE_API_KEY", value);
             }
         }
+    }
+
+    #[test]
+    fn proxy_model_intake_masks_the_request_with_a_stable_cache_input() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = repo.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = repo.path().join("state");
+        let mut cfg = CtxConfig::default();
+        cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
+        let roster = decision::Roster::gather(&cfg, repo.path());
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+
+        let first = protected_model_intake(
+            &cfg,
+            &state_dir,
+            repo.path(),
+            &format!("review token {secret}"),
+            &roster,
+        )
+        .expect("first protected intake");
+        let second = protected_model_intake(
+            &cfg,
+            &state_dir,
+            repo.path(),
+            &format!("review token {secret}"),
+            &roster,
+        )
+        .expect("second protected intake");
+
+        assert!(!first.0.request.contains(secret), "{}", first.0.request);
+        assert!(
+            first.0.request.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{}",
+            first.0.request
+        );
+        assert_eq!(
+            super::super::jev::cache_key_for(&first.0, &first.1, &cfg.proxy.typesafe.model)
+                .expect("first cache key"),
+            super::super::jev::cache_key_for(&second.0, &second.1, &cfg.proxy.typesafe.model)
+                .expect("second cache key"),
+            "stable placeholders must preserve Jev's serialized-payload cache key"
+        );
+    }
+
+    #[test]
+    fn proxy_falls_back_to_deterministic_when_request_masking_fails() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let home = repo.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = repo.path().join("state");
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
+        cfg.obfuscate.literals_file = Some("missing-sensitive-literals.txt".to_string());
+
+        let decision = decide(
+            &cfg,
+            &state_dir,
+            repo.path(),
+            "review ghp_abcdefghijklmnopqrstuvwxyz123456",
+        );
+
+        assert_eq!(decision.decider, Decider::Deterministic);
+        assert!(decision.usage.is_none());
+        assert!(
+            decision
+                .fallbacks
+                .iter()
+                .any(|line| line.contains("sensitive-data masking")),
+            "{:?}",
+            decision.fallbacks
+        );
     }
 
     #[derive(Debug, serde::Deserialize)]

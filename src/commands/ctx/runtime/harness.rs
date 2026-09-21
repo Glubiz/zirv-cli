@@ -173,9 +173,23 @@ impl RuntimeBackend for HarnessBackend {
             .conversation
             .as_ref()
             .ok_or_else(|| RuntimeError::UnknownSession(session.logical_id.clone()))?;
+        let cwd = self
+            .tracked
+            .get(&session.logical_id)
+            .ok_or_else(|| RuntimeError::UnknownSession(session.logical_id.clone()))?
+            .cwd
+            .clone();
+        let env = config::env_from_process();
+        let input = super::super::obfuscate_store::protect_text_with_env(
+            &cwd,
+            input,
+            "harness_resume_prompt",
+            &env,
+        )?
+        .0;
         let Some(mut command) =
             self.adapter
-                .headless_resume_cmd(Some(input), &conversation.conversation, &[])
+                .headless_resume_cmd(Some(&input), &conversation.conversation, &[])
         else {
             return Err(RuntimeError::Unsupported(format!(
                 "{} cannot resume a headless conversation",
@@ -187,7 +201,7 @@ impl RuntimeBackend for HarnessBackend {
             .tracked
             .get_mut(&session.logical_id)
             .ok_or_else(|| RuntimeError::UnknownSession(session.logical_id.clone()))?;
-        command.current_dir(&entry.cwd);
+        command.current_dir(&cwd);
         let (child, _tap, guard) = supervise::spawn_tapped(command, None)?;
         entry.child = Some(child);
         entry.guard = Some(guard);
@@ -422,6 +436,22 @@ mod tests {
             cmd
         }
 
+        fn headless_resume_cmd(
+            &self,
+            prompt: Option<&str>,
+            _session_id: &str,
+            _extra: &[String],
+        ) -> Option<std::process::Command> {
+            let prompt = prompt?;
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg("printf '%s' \"$1\" > \"$2\"")
+                .arg("stub")
+                .arg(prompt)
+                .arg(&self.transcript);
+            Some(cmd)
+        }
+
         fn interactive_cmd(
             &self,
             _initial_prompt: Option<&str>,
@@ -536,6 +566,63 @@ mod tests {
                     if text == "hello from the stub"
             )),
             "expected a TurnCompleted event, got {events:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn submit_masks_a_resumed_turn_before_the_adapter_receives_it() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_root = tmp.path().join("state");
+        let state_text = state_root.display().to_string();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                crate::commands::ctx::state::STATE_ENV,
+                Some(state_text.as_str()),
+            ),
+            ("ZIRV_CTX_OBFUSCATE_MODE", Some("obfuscate")),
+        ]);
+        let transcript = tmp.path().join("submitted-prompt.txt");
+        let adapter = StubAdapter {
+            transcript: transcript.clone(),
+        };
+        let mut backend = HarnessBackend::new(Box::new(adapter));
+        let spec = SessionSpec {
+            runtime: RuntimeKind::Harness,
+            role: "worker".to_string(),
+            agent: None,
+            provider_route: None,
+            model: None,
+            surface: super::super::UiSurface::Headless,
+            cwd: tmp.path().to_path_buf(),
+            prompt: "initial turn".to_string(),
+            extra_args: Vec::new(),
+        };
+        let handle = backend.start(&spec).expect("start");
+        if let Some(entry) = backend.tracked.get_mut(&handle.logical_id)
+            && let Some(child) = entry.child.as_mut()
+        {
+            child.wait().expect("initial child exits");
+        }
+        let _ = std::fs::remove_file(&transcript);
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+
+        backend
+            .submit(&handle, &format!("continue with {secret}"))
+            .expect("submit");
+        if let Some(entry) = backend.tracked.get_mut(&handle.logical_id)
+            && let Some(child) = entry.child.as_mut()
+        {
+            child.wait().expect("resumed child exits");
+        }
+        let submitted = std::fs::read_to_string(&transcript).expect("captured prompt");
+
+        assert!(!submitted.contains(secret), "{submitted}");
+        assert!(
+            submitted.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{submitted}"
         );
     }
 

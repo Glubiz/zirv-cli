@@ -600,6 +600,26 @@ pub(crate) fn headless_resume_launch(
     Some((probe, None))
 }
 
+fn protect_compaction_continuation(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    prompt: &str,
+) -> CtxResult<String> {
+    let continuation = format!(
+        "{prompt}\n\nContinue the same task after the verified in-place \
+         compaction without redoing completed work."
+    );
+    Ok(super::obfuscate_store::protect_text(
+        state,
+        repo,
+        cfg,
+        &continuation,
+        "exec_compaction_continuation",
+    )?
+    .0)
+}
+
 pub(crate) fn compact_in_place<F>(
     adapter: &dyn adapters::AgentAdapter,
     transcript: Option<&Path>,
@@ -2208,10 +2228,8 @@ fn run_with_clock_inner<W: Write>(
                 let prompt_text = prompt
                     .as_deref()
                     .ok_or_else(|| "no prompt available for continuation".to_string())?;
-                let continuation = format!(
-                    "{prompt_text}\n\nContinue the same task after the verified in-place \
-                     compaction without redoing completed work."
-                );
+                let continuation = protect_compaction_continuation(&state, repo, &cfg, prompt_text)
+                    .map_err(|error| format!("sensitive-data masking failed: {error}"))?;
                 let session_ref = SessionRef {
                     id: session.clone(),
                     cwd: repo.to_path_buf(),
@@ -5908,6 +5926,35 @@ mod tests {
         assert!(!should_attempt_compact(true, true));
         assert!(should_attempt_compact(true, false));
         assert!(!should_attempt_compact(false, false));
+    }
+
+    #[test]
+    fn post_compaction_continuation_masks_the_original_task() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+
+        let continuation = protect_compaction_continuation(
+            &state,
+            tmp.path(),
+            &cfg,
+            &format!("finish the task with {secret}"),
+        )
+        .expect("mask continuation");
+
+        assert!(!continuation.contains(secret), "{continuation}");
+        assert!(
+            continuation.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{continuation}"
+        );
+        assert!(
+            continuation.contains("Continue the same task after the verified in-place compaction"),
+            "{continuation}"
+        );
     }
 
     #[test]

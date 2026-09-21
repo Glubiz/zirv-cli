@@ -6713,6 +6713,18 @@ fn worker_task_prompt(
     strip_leading_separator_for_an_empty_prompt(&req.prompt, text)
 }
 
+fn protect_worker_task_prompt(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    prompt: &str,
+) -> super::CtxResult<String> {
+    Ok(
+        super::obfuscate_store::protect_text(state, repo, cfg, prompt, "dash_worker_task_prompt")?
+            .0,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fulfill_spawn_request(
     req: &spawnreq::SpawnRequest,
@@ -7290,7 +7302,7 @@ fn fulfill_spawn_request(
         None
     };
 
-    let (composed, mut mail_entries, mut mail_messages) = compose_worker_prompt(
+    let (mut composed, mut mail_entries, mut mail_messages) = compose_worker_prompt(
         req,
         adapter.as_ref(),
         &registry_short,
@@ -7300,6 +7312,21 @@ fn fulfill_spawn_request(
         &slug,
         verified_parent.as_deref(),
     );
+    composed = match super::obfuscate_store::protect_composed(
+        state,
+        repo,
+        cfg,
+        composed,
+        "dash_worker_system_prompt",
+    ) {
+        Ok(composed) => composed,
+        Err(error) => {
+            rollback_admission();
+            return Err(SpawnRefusal::policy(format!(
+                "sensitive-data masking failed: {error}"
+            )));
+        }
+    };
 
     let prompt_args = match prompt::injection_args_for_session(
         adapter.as_ref(),
@@ -7393,6 +7420,15 @@ fn fulfill_spawn_request(
         fallback_is_safe,
         verified_parent.as_deref(),
     );
+    let effective_prompt = match protect_worker_task_prompt(state, repo, cfg, &effective_prompt) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            rollback_admission();
+            return Err(SpawnRefusal::policy(format!(
+                "sensitive-data masking failed: {error}"
+            )));
+        }
+    };
 
     let extra = worker_pane_extra_args(req, cfg, adapter.as_ref(), prompt_args, &session_id, state);
     let argv = flatten_command(adapter.interactive_cmd(Some(&effective_prompt), &extra));
@@ -20869,6 +20905,46 @@ mod tests {
             None,
         );
         assert_eq!(prompt, "do the work");
+    }
+
+    #[test]
+    fn worker_launch_masks_both_task_and_composed_prompt_channels() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let task = protect_worker_task_prompt(
+            &state,
+            tmp.path(),
+            &cfg,
+            &format!("complete the task with {secret}"),
+        )
+        .expect("mask task prompt");
+        let composed = super::super::obfuscate_store::protect_composed(
+            &state,
+            tmp.path(),
+            &cfg,
+            Some(prompt::ComposedPrompt {
+                text: format!("system context contains {secret}"),
+                sources: vec![prompt::PromptSource::CommandLine],
+                version: prompt::DEFAULT_PROMPT_VERSION,
+            }),
+            "dash_worker_system_prompt",
+        )
+        .expect("mask composed prompt")
+        .expect("composed prompt remains present");
+
+        assert!(!task.contains(secret), "{task}");
+        assert!(task.contains("ZIRV_SECRET_GITHUB_TOKEN_1"), "{task}");
+        assert!(!composed.text.contains(secret), "{}", composed.text);
+        assert!(
+            composed.text.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{}",
+            composed.text
+        );
     }
 
     /// A Codex shell-shim launch cannot safely carry `developer_instructions`,

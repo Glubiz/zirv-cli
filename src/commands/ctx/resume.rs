@@ -72,6 +72,15 @@ redo work marked as done.\n\n{injected}"
     )
 }
 
+fn protect_resume_prompt(
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    prompt: &str,
+) -> CtxResult<String> {
+    Ok(super::obfuscate_store::protect_text(state, repo, cfg, prompt, "resume_prompt")?.0)
+}
+
 /// Issue #281: `state`/`repo`/`session` feed the host-verified working-set
 /// manifest (`handoff::working_set`) and the crash-interruption witness
 /// (`sessions::take_interrupted_in_flight`), both folded in through the one
@@ -268,6 +277,7 @@ pub fn run_with<W: Write>(
         &handoff,
         &cfg.screen.thresholds(),
     );
+    let prompt = protect_resume_prompt(&state, repo, &cfg, &prompt)?;
 
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
 
@@ -499,6 +509,28 @@ mod tests {
             "say where this came from: {prompt}"
         );
         assert!(!prompt.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_resume_masks_the_handoff_before_it_reaches_the_adapter() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let prompt = wrap_resume_prompt(&format!("continue with token {secret}"));
+
+        let protected = protect_resume_prompt(&state, tmp.path(), &cfg, &prompt)
+            .expect("mask the resume prompt");
+
+        assert!(!protected.contains(secret), "{protected}");
+        assert!(
+            protected.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{protected}"
+        );
+        assert!(protected.contains("previous session"), "{protected}");
     }
 
     #[test]
