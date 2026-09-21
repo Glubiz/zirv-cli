@@ -15,6 +15,71 @@ the type/scope is the only breaking-change signal this script reads -- a
 `BREAKING CHANGE:` footer in the commit body is not parsed. Full-rebuild
 command: `scripts/generate-changelog.sh --full`.
 
+## v4.12.1 (2026-09-21)
+
+### Features
+
+- choose the default harness by what is installed, and say so (#690)
+- route a seat's model tier, and say "configuration error" once
+- reuse a passing check whose inputs did not change (#699)
+- shift the review rubric and test-first loop into implement (#699)
+- cover the script runner and workflow
+- make the implement-vs-validate split measurable (#699 phase 0)
+- finish the first-run wizard and classify the new commands
+- add zirv tour and zirv ctx jev status
+- make Jev decisions deterministic: margin gate, frozen intake state, pinned model, decision cache
+- gated Jev advisory for review triage, gate reclassification and artifact substance
+- Jev supervisor pre-filters and dispatch model tiering, off by default
+- proxy clarification and domain tags, leaner intake state, Jev-ranked memory retrieval and harvest gate
+- jev::advise as the single gated advisory entry point
+- shared Jev decision client and operator-only [jev] config table
+- harness proxy -- intake decision via TypeSafe Jev with helper and deterministic fallback
+- surface blocked commands in the delegation receipt
+- extend the shipped allow list and escape_allow for the worker capability set
+- blocked-command observability (Change 5a/b/d, reduced 5c)
+
+### Fixes
+
+- address review findings on the three terminal and intake fixes
+- floor complexity for an explicit parallel/multi-agent delegation request
+- keep a drag-selection highlight across ticks, and give the proxy intake prompt a real cursor
+- re-prompt instead of skipping the proxy on a blank first line
+- stop overriding the operator's own claude permission mode
+- run the proxy intake on the native runtime too
+- fail fast when the harness is not installed (#690)
+- pin the hook-install fallback test to an injected machine
+- select and scroll together, and copy only the pane (#697)
+- collapse the first-run harness storm and stop claiming success without one
+- name the harness, the config layer, and the package manager
+- accept --version, mark the machine configured, repair a partial .zirv
+- correct package metadata and make release templating robust
+- dispatch tier override carries the whole tool input in updatedInput
+- keep the deterministic frontend trigger byte-identical when the Jev gate is off
+- approvals never become findings, no auto-dismiss of Critical/Major, wider test-runner safety net
+- drop the removed harnesses field from the typesafe wrapper test
+- memory reranking never truncates or drops candidates when Jev is off or silent
+- keep Question::noul allowed as dead code until its intake caller lands
+- append Jev decisions atomically and re-point the parity matrix at the moved tests
+- proxy derives execution from complexity and launches a single seat
+- narrow launchctl SSH agent access
+- silence safe command permission prompts
+- preserve pipe structure across a keyword-stripped segment head
+- keyword-aware segment candidates and docker/kubectl exec decoding
+
+### Documentation
+
+- document tour and ctx jev status where the gates require it
+- spec for built-in safe-command policy and blocked-command observability
+- disclaimer, ctx module boundaries, latency targets, generated changelog (#430, #431, #432, #433)
+
+### Chores
+
+- bump version to 4.11.0
+- bump version to 4.8.0
+- drop the dead-code allow on Question::noul now that intake calls it
+- cover the typesafe wrapper's delegation to jev::ask
+- 4.4.0
+
 ## v4.0.2 (2026-09-16)
 
 ### Fixes
