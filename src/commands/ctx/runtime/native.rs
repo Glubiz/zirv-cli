@@ -1261,11 +1261,16 @@ impl<'a> NativeLoop<'a> {
         };
         let context = self.obfuscation_context()?;
         #[cfg(not(test))]
-        let context = Some(context.ok_or(
-            "native provider request has no obfuscation context; refusing egress",
-        )?);
+        let context = Some(
+            context.ok_or("native provider request has no obfuscation context; refusing egress")?,
+        );
         if let Some((state_root, repo, options)) = context {
-            request.obfuscate_for_egress(&state_root, &repo, &options, "native_provider_request")?;
+            request.obfuscate_for_egress(
+                &state_root,
+                &repo,
+                &options,
+                "native_provider_request",
+            )?;
         }
         // Advance only after the final egress transformation succeeds. A
         // corrupt vault or an unrewritable signed-thinking finding must leave
@@ -2016,9 +2021,10 @@ impl<'a> NativeLoop<'a> {
         };
         let context = self.obfuscation_context()?;
         #[cfg(not(test))]
-        let context = Some(context.ok_or(
-            "native subscription request has no obfuscation context; refusing egress",
-        )?);
+        let context = Some(
+            context
+                .ok_or("native subscription request has no obfuscation context; refusing egress")?,
+        );
         if let Some((state_root, repo, options)) = context {
             egress.obfuscate_for_egress(
                 &state_root,

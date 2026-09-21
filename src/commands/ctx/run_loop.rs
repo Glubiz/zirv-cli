@@ -516,14 +516,9 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             cfg.mail.max_delivered_bytes,
             parent_short.as_deref(),
         );
-        let prompt = super::obfuscate_store::protect_text(
-            &state,
-            repo,
-            &cfg,
-            &prompt,
-            "loop_task_prompt",
-        )?
-        .0;
+        let prompt =
+            super::obfuscate_store::protect_text(&state, repo, &cfg, &prompt, "loop_task_prompt")?
+                .0;
 
         // FIX B: on a Windows npm `.cmd` shim launch, cmd.exe reparses the
         // downstream argv, so the prompt is delivered on stdin instead of as

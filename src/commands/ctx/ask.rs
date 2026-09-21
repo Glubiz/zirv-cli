@@ -240,14 +240,9 @@ fn run_with_provider<W: Write>(
     let answer = if record.agent == super::runtime::RuntimeKind::Native.as_str() {
         let ctx = native_structural_context(&state, &record.session, cfg.handoff.tail_items)?;
         let prompt = ask_prompt(&ctx, &args.question);
-        let prompt = super::obfuscate_store::protect_text(
-            &state,
-            repo,
-            &cfg,
-            &prompt,
-            "ask_helper_prompt",
-        )?
-        .0;
+        let prompt =
+            super::obfuscate_store::protect_text(&state, repo, &cfg, &prompt, "ask_helper_prompt")?
+                .0;
         native_ask_answer(repo, &cfg, env, &prompt, timeout, provider_override)
             .map_err(|e| format!("zirv ctx ask: distiller failed: {e}"))?
     } else {
@@ -278,14 +273,9 @@ fn run_with_provider<W: Write>(
         let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
         let model = resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
         let prompt = ask_prompt(&ctx, &args.question);
-        let prompt = super::obfuscate_store::protect_text(
-            &state,
-            repo,
-            &cfg,
-            &prompt,
-            "ask_helper_prompt",
-        )?
-        .0;
+        let prompt =
+            super::obfuscate_store::protect_text(&state, repo, &cfg, &prompt, "ask_helper_prompt")?
+                .0;
         // Unlike `distill_or_structural`, a failure here is never masked
         // behind a mechanical fallback -- there is no structural equivalent
         // of "answer a free-form question," so the operator sees exactly why

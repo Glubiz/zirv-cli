@@ -3107,22 +3107,10 @@ fn write_durable(
 ) -> CtxResult<usize> {
     let mut written = 0usize;
     for (key, body) in accepted {
-        let key = super::obfuscate_store::protect_text(
-            state,
-            repo,
-            cfg,
-            key,
-            "memory_harvest_key",
-        )?
-        .0;
-        let body = super::obfuscate_store::protect_text(
-            state,
-            repo,
-            cfg,
-            body,
-            "memory_harvest_body",
-        )?
-        .0;
+        let key =
+            super::obfuscate_store::protect_text(state, repo, cfg, key, "memory_harvest_key")?.0;
+        let body =
+            super::obfuscate_store::protect_text(state, repo, cfg, body, "memory_harvest_body")?.0;
         if let Some(existing) = get_scoped(MemoryScope::Shared, repo, state, slug, cfg, &key)?
             && existing.source == "explicit"
         {
@@ -4002,14 +3990,8 @@ pub fn run_remember_with<W: Write>(
         ""
     };
     let bank_label = ctx_scope_label(scope);
-    let protected_key = super::obfuscate_store::protect_text(
-        &state,
-        repo,
-        &cfg,
-        &args.key,
-        "memory_key",
-    )?
-    .0;
+    let protected_key =
+        super::obfuscate_store::protect_text(&state, repo, &cfg, &args.key, "memory_key")?.0;
 
     match resolve_remember(args, stdin)? {
         RememberIntent::VerifyOnly => {

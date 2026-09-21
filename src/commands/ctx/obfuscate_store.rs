@@ -142,8 +142,8 @@ pub fn protect_text(
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let session = std::env::var(super::adapters::SESSION_ENV)
-            .unwrap_or_else(|_| "operator".to_string());
+        let session =
+            std::env::var(super::adapters::SESSION_ENV).unwrap_or_else(|_| "operator".to_string());
         let _ = super::log::append(
             state,
             &super::log::Decision {

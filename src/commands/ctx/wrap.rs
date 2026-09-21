@@ -1666,14 +1666,8 @@ fn relaunch_command(
     )
     .map(|protected| protected.0)
     .unwrap_or_default();
-    let prompt = super::prompt::interactive_handoff_prompt(
-        adapter,
-        &[],
-        &mut args,
-        &prompt,
-        state,
-        session,
-    );
+    let prompt =
+        super::prompt::interactive_handoff_prompt(adapter, &[], &mut args, &prompt, state, session);
     adapter.interactive_cmd(Some(&prompt), &args)
 }
 
