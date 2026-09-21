@@ -271,9 +271,9 @@ notices still print normally.
   satisfied), `reported_contract_failed` (a declared contract failed even
   after the one bounded retry — see `errors`).
 - **`result_path`** — where the worker's own record was persisted, when
-  one was; `exited_no_report` always gets one too (`outcome:
-  "exited_no_report"`, no report text) so a clean exit with nothing usable
-  is never left with no durable trace (see
+  one was; on the harness runtime `exited_no_report` always gets one too
+  (`outcome: "exited_no_report"`, no report text) so a clean exit with
+  nothing usable is never left with no durable trace (see
   [Sending mail between sessions](#sending-mail-between-sessions)
   below for the file's own shape).
 
