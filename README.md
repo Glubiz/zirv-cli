@@ -4003,7 +4003,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `output.filter` | `~/.zirv/ctx.toml only` |
 | `output.filter_defaults` | `ZIRV_CTX_OUTPUT_FILTER_DEFAULTS` |
 | `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
-| `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
+| `fallback.rollover_cooldown_secs` (also the base delay for failed rollover retries) | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
 | `fallback.reactive_force_after_secs` | `ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS` |
 | `fallback.health.open_after_failures` | `ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES` |
 | `fallback.health.window_secs` | `ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS` |
@@ -5036,9 +5036,26 @@ are the operator's final override. `orchestrator_rollover_headroom_pct`,
 tuning an already-enabled rollover's timing is an operator decision, the same
 as `handoff.model`.
 
-**The displaced harness is parked, not closed.** A rollover has to quit the
-source child — one seat, one live pane — but quitting a harness does not
-destroy its conversation. The seat records the harness it was rolled off,
+**Failed dashboard rollovers preserve the running session.** An automatic
+harness-to-harness successor starts separately and acknowledges the handoff
+before the dashboard retires the source. Until then the original process,
+subagents, screen and seat generation remain intact. A successor that exits
+(including CLI exit 2), times out, or cannot commit its seat is discarded;
+the source is not relaunched or sent a continuation prompt. Codex readiness
+requires a completed assistant reply in its new rollout, not a quiet startup
+screen. Other harnesses must provide a turn-completion signal for this
+automatic transfer. New operator input cancels the pending transfer. Handoff lookup uses
+the harness's observed conversation ID; a missing user task prevents an
+automatic transfer.
+
+Failed attempts persist `last_rollover_at` and a consecutive failure count.
+Automatic retries require newer usage evidence and wait at least
+`max(rollover_cooldown_secs, 60)` seconds, doubling after each failure up to
+one week or the binding window reset, whichever comes first. A successful
+transfer clears the count. These timing controls remain operator-only.
+
+**The displaced harness is parked, not closed.** A successful rollover quits
+the source child, but quitting a harness does not destroy its conversation. The seat records the harness it was rolled off,
 together with that harness's OWN conversation id (observed at a turn
 boundary, which is the only place zirv's session uuid and the harness's
 conversation id are both visible), and keeps it until the seat comes home.

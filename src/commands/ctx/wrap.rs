@@ -5984,17 +5984,22 @@ mod tests {
         );
 
         let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
-        assert!(
-            seen.contains("--sandbox workspace-write")
-                || seen.contains("--sandbox\nworkspace-write"),
-            "the shipped sandbox posture must reach a plain wrap launch: {seen:?}"
-        );
-        let never =
-            seen.contains("--ask-for-approval never") || seen.contains("--ask-for-approval\nnever");
-        let reviewed = (seen.contains("--ask-for-approval on-request")
-            || seen.contains("--ask-for-approval\non-request"))
-            && seen.contains("--approve-for-me");
-        assert!(never || reviewed, "got: {seen:?}");
+        // Inspect actual leading argv, excluding the developer prompt, which
+        // can itself mention policy flags. The automatic-review preset is
+        // mutually exclusive with explicit sandbox and approval flags (#710).
+        let argv = seen.split_once("argv: ").expect("stub argv").1;
+        let posture = argv.split(" -c ").next().unwrap_or(argv);
+        if posture.contains("--approve-for-me") {
+            assert!(!posture.contains("--sandbox"), "{posture}");
+            assert!(!posture.contains("--ask-for-approval"), "{posture}");
+        } else {
+            assert!(posture.contains("--sandbox workspace-write"), "{posture}");
+            assert!(
+                posture.contains("--ask-for-approval never")
+                    || posture.contains("--ask-for-approval on-request"),
+                "{posture}"
+            );
+        }
 
         h.writer.write_all(b"/exit\r").expect("write");
         h.writer.flush().expect("flush");

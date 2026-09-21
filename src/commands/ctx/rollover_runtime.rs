@@ -768,6 +768,11 @@ pub trait SuccessorLauncher {
         Ok(())
     }
 
+    /// A staged launcher settles subagents only after successor readiness.
+    fn defers_settlement(&self) -> bool {
+        false
+    }
+
     fn launch(&mut self, plan: &SuccessorPlan) -> Result<String, SuccessorRefusal>;
 }
 
@@ -943,7 +948,9 @@ pub fn launch_successor(
     // Admission first: a seam that cannot take this plan must not have this
     // seat's subagents settled on its behalf.
     launcher.admits(plan)?;
-    settle_subagents(state, repo, &plan.short, parent_session, drain, now);
+    if !launcher.defers_settlement() {
+        settle_subagents(state, repo, &plan.short, parent_session, drain, now);
+    }
     launcher.launch(plan)
 }
 
@@ -1379,6 +1386,8 @@ mod tests {
             phase: seat::Phase::Idle,
             visited: Vec::new(),
             last_rollover_at: None,
+            rollover_failures: 0,
+            failed_rollover_observed_at: None,
             pending: None,
             displaced: None,
             created_at: 1,
