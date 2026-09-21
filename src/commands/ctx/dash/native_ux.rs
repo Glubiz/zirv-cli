@@ -2040,6 +2040,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/help", "show the shortcut list"),
     ("/instructions", "alias for /context"),
+    ("/skill", "show one resolved skill's digest and body"),
+    ("/skills", "list the repository's resolved skills"),
     ("/status", "show the authoritative session status"),
     ("/team", "show or recompile the current team plan"),
     (
@@ -2169,6 +2171,46 @@ pub fn render_agent_plan(
         Ok(plan) => render_team_plan(Some(plan)),
         Err(reason) => format!("refused: {reason}"),
     }
+}
+
+// =========================================================================
+// Issue #539 chunk C: `/skills`, `/skill <id>` -- rendered through the SAME
+// `workflow::skill_render` writer functions a future `zirv skill list`/
+// `show` rewrite would use, mirroring the `/workflows`/`/workflow`
+// precedent (issue #542 chunk 3b, decision 5) so the discovery table and
+// the detail view can never silently drift from whatever the CLI prints.
+// =========================================================================
+
+/// `/skills`: the session repository's resolved skill catalogue, plus the
+/// registry's own collision warnings appended verbatim -- an ignored
+/// repository override (a manifest shadowed by a built-in or operator-
+/// global id) is exactly what an operator needs told about, not swallowed.
+pub fn render_skill_list(
+    digests: &[crate::commands::workflow::skill::SkillDigest<'_>],
+    warnings: &[String],
+) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = crate::commands::workflow::skill_render::write_digest_list(&mut buf, digests);
+    let mut text = String::from_utf8_lossy(&buf).trim_end().to_string();
+    for warning in warnings {
+        text.push_str("\nwarning: ");
+        text.push_str(warning);
+    }
+    text
+}
+
+/// `/skill <id>`: the digest detail `write_digest_detail` renders, followed
+/// by the instruction body -- the body is deliberately not part of the
+/// shared writer (issue #539's progressive disclosure keeps it a separate
+/// stage), so this is the one place that appends it for the operator who
+/// explicitly asked to see it.
+pub fn render_skill_detail(skill: &crate::commands::workflow::skill::RegisteredSkill) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = crate::commands::workflow::skill_render::write_digest_detail(&mut buf, skill);
+    let mut text = String::from_utf8_lossy(&buf).trim_end().to_string();
+    text.push_str("\n\n");
+    text.push_str(skill.manifest.instructions.trim());
+    text
 }
 
 #[cfg(test)]
@@ -3709,6 +3751,8 @@ mod tests {
                 "/context",
                 "/help",
                 "/instructions",
+                "/skill",
+                "/skills",
                 "/status",
                 "/team",
                 "/workflow",

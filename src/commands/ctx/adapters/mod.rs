@@ -2186,6 +2186,15 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
+    /// Extra argv registering zirv's own skills as native host skills, for a
+    /// launch whose own trailing `flags` are given (so an adapter can back
+    /// off when those flags already disable its plugin surface). Default
+    /// empty; only `ClaudeAdapter` overrides it.
+    fn plugin_dir_args(&self, flags: &[String]) -> Vec<String> {
+        let _ = flags;
+        Vec::new()
+    }
+
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup;
 
     /// Argv tokens that select `model` for one interactive launch (the
@@ -4080,7 +4089,7 @@ pub fn policy_launch_args_for_surface(
     surface_mode: LaunchMode,
 ) -> Vec<String> {
     if flags_pin_policy(flags) {
-        return Vec::new();
+        return adapter.plugin_dir_args(flags);
     }
     let policy = adapter.policy_args(&cfg.policy, surface_mode);
     // Codex's restrictive policy already supplies sandbox and approval.
@@ -4092,6 +4101,7 @@ pub fn policy_launch_args_for_surface(
         Vec::new()
     };
     out.extend(policy);
+    out.extend(adapter.plugin_dir_args(flags));
     out
 }
 

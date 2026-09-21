@@ -201,6 +201,15 @@ const READ_ONLY: &[&str] = &[
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
+    // Issue #539 chunk E2.3: reads one skill's bundle resource body, the
+    // same on-demand-read shape `zirv ctx recall` already sits in.
+    "zirv skill read",
+    // Issue #539 chunk G: calls the same shared `skill_tools::skill_load`
+    // function the `skill_load` tool calls, and best-effort records one
+    // activation-journal entry -- internal zirv bookkeeping, not a
+    // repository or process mutation, the same class `zirv ctx proxy`'s own
+    // bookkeeping (above) already sits in.
+    "zirv skill load",
     // Issue #353: renders the protocol contract compiled into this binary.
     // Touches no disk, no registry and no socket.
     "zirv ctx api schema",
@@ -240,6 +249,9 @@ const MUTATING: &[&str] = &[
     "zirv session stop",
     "zirv init",
     "zirv create",
+    // Issue #539 chunk E2.3: writes a portable bundle directory (`SKILL.md`
+    // plus any resources) to the operator-chosen `--dir`.
+    "zirv skill export",
     "zirv report bug",
     "zirv report feature",
     "zirv update",
@@ -721,6 +733,25 @@ mod tests {
             "got flags: {long_flags:?}"
         );
         assert!(long_flags.contains(&"workdir"), "got flags: {long_flags:?}");
+    }
+
+    /// Issue #539 chunk G: `zirv skill load` calls the same shared
+    /// `skill_tools::skill_load` function the `skill_load` tool calls and
+    /// best-effort records one activation-journal entry -- internal zirv
+    /// bookkeeping, not a repository or process mutation, the same class
+    /// `zirv ctx proxy`'s own bookkeeping sits in -- so it is classified
+    /// read-only, like `zirv skill show`/`zirv skill read` beside it.
+    #[test]
+    fn skill_load_is_classified_read_only() {
+        let entries = command_entries().expect("classified");
+        let entry = entries
+            .iter()
+            .find(|entry| entry.path == "zirv skill load")
+            .expect("zirv skill load must be discovered");
+        assert!(
+            !entry.mutating,
+            "zirv skill load only writes zirv's own activation journal"
+        );
     }
 
     #[test]

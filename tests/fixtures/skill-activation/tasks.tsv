@@ -1,0 +1,57 @@
+# expected_skill	phase	task
+# One natural request per built-in skill; the task never has to name the skill.
+# phase is "-" when the request arrives outside a workflow step.
+adr-authoring	-	We picked Postgres over DynamoDB for the ledger last week; write up the architecture decision so the reasoning is not lost.
+alert-rule-diagnosis	-	The checkout latency rule stayed quiet through the whole slowdown last night. Work out why we had a silent alert.
+architecture-discovery	-	I just inherited the billing platform and it is an unfamiliar codebase to me; work out the real service boundaries before we change anything.
+cicd-diagnosis	-	CI is red on main since this morning and the failing job passes when I re-run it. Figure out what is going on.
+dashboard-review	-	Review this dashboard the payments team uses during incidents and tell me which panels are worth keeping.
+data-analysis	-	Run the numbers on trial signups: what is the rate of conversion to paid by signup week?
+data-quality-validation	-	The nightly orders export keeps producing duplicate keys; add data quality checks to the pipeline so it fails loudly.
+data-source-audit	-	Before we build on the events table I need a dataset audit: what does this table mean, what is its grain, and who produces it?
+dependency-risk-review	-	Audit dependencies for this service before the security questionnaire: outdated packages, licenses, anything abandoned.
+deployment-rollback-planning	-	We ship to production on Thursday and the change includes a column drop. I need a rollback plan before we go.
+design-review	-	Here is the RFC for the new rate limiter. Do a design review before anyone starts building it.
+evidence-visualization	-	I have the latency comparison results; make a graph that the platform team can act on.
+incident-investigation	-	We are having an outage: checkout error rates jumped ten minutes ago and the on-call was paged. Help me investigate.
+infrastructure-review	-	Look over this terraform plan before I apply it; it touches the production VPC and some IAM roles.
+kibana-log-investigation	-	Search the Kibana logs for the 502s the gateway returned between 02:00 and 03:00 and tell me which upstream caused them.
+linear-issue-management	-	File a bug in Linear for the broken CSV export, and check first that nobody has reported it already.
+migration-planning	-	We need to move user sessions from Redis to Postgres without downtime. Plan the migration, including backfill and cutover.
+postmortem	-	Last night's outage is resolved. Write the postmortem.
+project-cycle-planning	-	Help me with sprint planning for the next two weeks; we have four engineers and one is on call.
+runbook-authoring	-	Write a runbook for failing over the primary database that someone on call can follow at 3am.
+saved-object-change-management	-	Update the alert rule for disk usage to fire at 85 percent instead of 90, and edit the dashboard to match.
+simplify	-	This change works, but it is too complicated. Simplify it without changing behaviour.
+stakeholder-summary	-	Write an executive summary of the platform migration for the leadership meeting; they need to decide on funding phase two.
+statistical-sanity	-	Marketing says the new banner lifted conversion by 12 percent. Is this significant, or does this claim not hold up?
+status-reporting	-	Draft this week's status update for the data platform project.
+technical-documentation	-	Document this module's public API; the README is out of date and new users keep asking the same questions.
+threat-modeling	-	We are adding a public file upload endpoint. Do a threat model and map the attack surface before we design it.
+brainstorm	intent	I have a rough idea for an export feature; help me brainstorm the requirements before we commit to anything.
+write-intent	intent	Turn this request into a clear intent with requirements; work autonomous, no back-and-forth needed.
+write-plan	plan	Produce the implementation plan for the accepted rate limiter design.
+plan	plan	This is a substantial, architectural change; break it into ordered units we can plan around.
+worktree	implement	Set up a worktree so this parallel implementation stays in isolation from my working tree.
+execute-plan	implement	Resume the accepted work and execute plan task by task.
+implement	implement	Apply the bugfix for the retry loop.
+design	design	Choose a design for the new notifications feature that fits the existing architecture.
+systematic-debugging	debug	The retry test shows a failure I cannot explain; debug it properly before changing code.
+testing	test	Pick the right checks to test this change and verify them proportionally.
+tdd	test	Add the regression test first, tdd style, then make it pass.
+review	review	Review this diff for correctness and risk.
+verify	verify	Confirm the work is complete and verify it with fresh evidence.
+finish-branch	deploy	Finish branch: get this ready for a pull request and merge.
+delegate	delegate	Delegate the docs update to a worker with a bounded brief.
+parallelize	delegate	These three tasks are independent; run them in parallel.
+frontend-craft	implement	Build the settings screen as a responsive frontend component with real visual care.
+frontend-design	design	Set the visual direction for the new onboarding frontend UI design.
+frontend-plan	plan	Plan the frontend UI work for the billing page.
+frontend-implement	implement	Implement the billing page frontend UI component so it is responsive.
+frontend-debug	debug	There is a visual bug in the frontend UI: the modal overflows on narrow screens.
+frontend-test	test	Test the frontend UI for accessibility and state coverage.
+frontend-review	review	Review the rendered frontend UI; do the visual QA.
+frontend-verify	verify	Verify the frontend UI change is complete with fresh render evidence.
+# Negatives: nothing should be suggested for these.
+-	-	What time zone does the server log in?
+-	-	Rename the variable foo to bar in utils.

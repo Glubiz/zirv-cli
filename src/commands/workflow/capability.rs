@@ -66,6 +66,14 @@ impl CapabilityId {
             Self::NetworkAccess => "network.access",
         }
     }
+
+    /// Issue #539: the inverse of [`Self::as_str`], for reading a capability
+    /// name out of a portable bundle's flat metadata map.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|capability| capability.as_str() == value)
+    }
 }
 
 impl std::fmt::Display for CapabilityId {
@@ -137,10 +145,17 @@ pub enum IntegrationId {
     ArtifactRender,
     #[serde(rename = "frontend.render")]
     FrontendRender,
+    /// Issue #539: a Linear MCP server, for skills that read or file issues.
+    #[serde(rename = "linear")]
+    Linear,
+    /// Issue #539: a Kibana/Elasticsearch MCP server, for skills that query
+    /// logs or dashboards.
+    #[serde(rename = "kibana")]
+    Kibana,
 }
 
 impl IntegrationId {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Mcp,
         Self::WebSearch,
         Self::WebFetch,
@@ -148,6 +163,8 @@ impl IntegrationId {
         Self::Diagnostics,
         Self::ArtifactRender,
         Self::FrontendRender,
+        Self::Linear,
+        Self::Kibana,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -159,6 +176,8 @@ impl IntegrationId {
             Self::Diagnostics => "diagnostics",
             Self::ArtifactRender => "artifact.render",
             Self::FrontendRender => "frontend.render",
+            Self::Linear => "linear",
+            Self::Kibana => "kibana",
         }
     }
 

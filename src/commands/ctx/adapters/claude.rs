@@ -1208,6 +1208,12 @@ pub struct ClaudeAdapter {
     forced_file_support: Option<bool>,
     #[cfg(test)]
     forced_launch_settings: Option<Option<PathBuf>>,
+    /// Test seam: bypasses the real registry load/state dir resolution/sync
+    /// `claude_plugin_dir` otherwise performs -- defaults to `Some(None)` so
+    /// an ordinary test never touches the developer's real state dir or
+    /// races another test's own `ZIRV_CTX_STATE_DIR` guard.
+    #[cfg(test)]
+    forced_plugin_dir: Option<Option<PathBuf>>,
 }
 
 impl ClaudeAdapter {
@@ -1230,6 +1236,8 @@ impl ClaudeAdapter {
             forced_launch_settings: Some(Some(PathBuf::from(
                 "zirv-test-claude-launch-settings.json",
             ))),
+            #[cfg(test)]
+            forced_plugin_dir: Some(None),
         }
     }
 
@@ -1283,6 +1291,14 @@ impl ClaudeAdapter {
     #[cfg(test)]
     fn with_live_launch_settings(mut self) -> Self {
         self.forced_launch_settings = None;
+        self
+    }
+
+    /// Test seam: exercises the real registry load and directory sync,
+    /// rooted at an injected state directory rather than the real machine's.
+    #[cfg(test)]
+    pub fn with_live_plugin_dir(mut self, state_root: PathBuf) -> Self {
+        self.forced_plugin_dir = Some(Some(state_root.join("host-skills").join("claude")));
         self
     }
 
@@ -1365,6 +1381,47 @@ impl ClaudeAdapter {
                 None
             }
         }
+    }
+
+    /// Syncs zirv's own skill library into a session-scoped Claude Code
+    /// plugin directory (`<state>/host-skills/claude/`) and returns it.
+    /// `None` on any failure -- registry load, state dir resolution, or the
+    /// sync itself -- so a launch never fails or worsens because this could
+    /// not run.
+    ///
+    /// Deliberately does NOT use [`Self::home_dir`]: that falls back to `.`
+    /// (the process cwd, ordinarily the repo root) when no real home
+    /// resolves, which would hand `SkillRegistry::load_for_repo` the repo's
+    /// own `.zirv/skills` as the OPERATOR-GLOBAL layer -- a checkout's own
+    /// skills, mislabeled trusted, would then pass `host_registerable` and
+    /// get registered with the host. With no real home, this instead loads
+    /// built-ins only: `home: None` alone already keeps a repo skill correctly
+    /// labeled `Repository` (untrusted, never registered), and `include_custom:
+    /// false` skips loading it at all rather than depend on that label.
+    fn claude_plugin_dir(&self) -> Option<PathBuf> {
+        use crate::commands::workflow::skill::{SkillRegistry, sync_claude_plugin_dir};
+
+        #[cfg(test)]
+        let dir = match &self.forced_plugin_dir {
+            Some(forced) => forced.clone()?,
+            None => self.resolved_plugin_dir()?,
+        };
+        #[cfg(not(test))]
+        let dir = self.resolved_plugin_dir()?;
+
+        let repo = std::env::current_dir().ok()?;
+        let real_home = self.home.clone().or_else(|| crate::utils::home_dir().ok());
+        let registry =
+            SkillRegistry::load_for_repo(&repo, real_home.as_deref(), real_home.is_some()).ok()?;
+        sync_claude_plugin_dir(&registry, &dir, env!("CARGO_PKG_VERSION")).ok()?;
+        Some(dir)
+    }
+
+    fn resolved_plugin_dir(&self) -> Option<PathBuf> {
+        let state =
+            super::super::state::StateDir::resolve(&super::super::config::env_from_process())
+                .ok()?;
+        Some(state.root().join("host-skills").join("claude"))
     }
 }
 
@@ -2775,6 +2832,26 @@ impl AgentAdapter for ClaudeAdapter {
                 .flat_map(|path| ["--add-dir".to_string(), path.clone()]),
         );
         args
+    }
+
+    /// Registers zirv's own host-registerable skills (built-in/operator,
+    /// implicit-activation-on) as native Claude Code skills (`zirv:<id>`),
+    /// so an agent that already knows the id can reach for it with its own
+    /// `Skill` tool instead of guessing at zirv's ids -- the agent still
+    /// chooses whether to use it; this only makes the id resolvable.
+    /// `--bare`/`--disable-slash-commands` turn Claude's plugin surface off
+    /// entirely, so the flag is skipped rather than passed uselessly.
+    fn plugin_dir_args(&self, flags: &[String]) -> Vec<String> {
+        if flags
+            .iter()
+            .any(|flag| flag == "--bare" || flag == "--disable-slash-commands")
+        {
+            return Vec::new();
+        }
+        match self.claude_plugin_dir() {
+            Some(dir) => vec!["--plugin-dir".to_string(), dir.display().to_string()],
+            None => Vec::new(),
+        }
     }
 
     /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
@@ -4931,6 +5008,74 @@ mod tests {
                 .expect("the launch must carry its hook settings");
             assert_eq!(args.get(index + 1), Some(&path.display().to_string()));
         }
+    }
+
+    #[test]
+    fn plugin_dir_args_names_the_state_scoped_host_skills_directory() {
+        let state = tempfile::tempdir().expect("state");
+        let home = tempfile::tempdir().expect("home");
+        let adapter = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_plugin_dir(state.path().to_path_buf());
+
+        let args = adapter.plugin_dir_args(&[]);
+        let index = args
+            .iter()
+            .position(|arg| arg == "--plugin-dir")
+            .expect("the launch must register zirv's own skills");
+        let dir = PathBuf::from(&args[index + 1]);
+        assert_eq!(dir.file_name(), Some(std::ffi::OsStr::new("claude")));
+        assert_eq!(
+            dir.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("host-skills"))
+        );
+        assert!(
+            dir.join(".claude-plugin/plugin.json").exists(),
+            "the real sync must have run against the injected state root"
+        );
+    }
+
+    #[test]
+    fn plugin_dir_args_is_empty_under_bare_or_disabled_slash_commands() {
+        let adapter = ClaudeAdapter::new(None);
+        assert!(adapter.plugin_dir_args(&["--bare".to_string()]).is_empty());
+        assert!(
+            adapter
+                .plugin_dir_args(&["--disable-slash-commands".to_string()])
+                .is_empty()
+        );
+    }
+
+    /// Without this fix, `claude_plugin_dir` fell back to `home_dir()`'s `.`
+    /// (cwd) whenever no real home resolved, so a repo's own `.zirv/skills`
+    /// loaded as the OPERATOR-GLOBAL layer -- trusted -- and a checkout-
+    /// planted skill would be registered with the host. With `self.home`
+    /// unset and `HOME`/`USERPROFILE` both cleared, that planted skill must
+    /// never appear as a stub.
+    #[test]
+    fn claude_plugin_dir_never_registers_the_checkouts_own_skills_when_home_does_not_resolve() {
+        let repo = tempfile::tempdir().expect("repo");
+        let skills_dir = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir");
+        std::fs::write(
+            skills_dir.join("evil.yaml"),
+            "schema_version: 1\nid: evil\nversion: 1\nname: Evil\ndescription: repo-planted\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: do the thing\n",
+        )
+        .expect("write fixture skill");
+        let _cwd = super::super::super::testenv::CwdGuard::enter(repo.path()).expect("chdir");
+        let _vars =
+            super::super::super::testenv::VarGuard::set(&[("HOME", None), ("USERPROFILE", None)]);
+
+        let state = tempfile::tempdir().expect("state");
+        let adapter = ClaudeAdapter::new(None).with_live_plugin_dir(state.path().to_path_buf());
+
+        let dir = adapter
+            .claude_plugin_dir()
+            .expect("built-ins alone still generate a plugin dir");
+        assert!(
+            !dir.join("skills/evil").exists(),
+            "a repo-planted skill must never be registered with the host when home cannot resolve"
+        );
     }
 
     #[test]

@@ -190,10 +190,11 @@ pub struct CompiledContext {
 ///
 /// Built entirely from data [`CompiledContext`] already holds and the exact
 /// literal header constants `prompt.rs`'s own `with_*_layer` functions write
-/// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `WORKFLOW_LAYER_
-/// HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/`MEMORY_SHARED_LAYER_HEADER`,
-/// `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) -- **no file is read again** to
-/// build this list, only `composed.text` and `composed.sources`, both
+/// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `SKILL_INDEX_
+/// HEADER`, `WORKFLOW_LAYER_HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/
+/// `MEMORY_SHARED_LAYER_HEADER`, `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) --
+/// **no file is read again** to build this list, only `composed.text` and
+/// `composed.sources`, both
 /// already in memory. Issue #275 (`zirv context lint`) is the first consumer
 /// (CTX004 proportionality over the built-in `Default`/`Harness` blocks,
 /// sliced straight out of an already-compiled prompt); issue #299 (prefix-
@@ -286,6 +287,11 @@ impl CompiledContext {
                         },
                     )
                 }
+                // `compose` itself writes this one, right after `Harness`/
+                // `Harnesses` -- see `prompt::SKILL_INDEX_HEADER`'s own doc
+                // comment for why it sits there instead of near `Workflow`.
+                PromptSource::SkillIndex => find_after(text, cursor, prompt::SKILL_INDEX_HEADER)
+                    .map(|header_at| (header_at + prompt::SKILL_INDEX_HEADER.len(), None, None)),
                 // The combined common+harness-specific block: its two
                 // sub-budgets are already reported per-file by `provenance`,
                 // so this range covers the whole block with no single budget
@@ -2986,15 +2992,21 @@ mod tests {
         );
 
         // The truncation is real, not merely reported: the composed prompt's
-        // own roster section is capped too.
+        // own roster section is capped too. Issue #539 chunk F: the skill
+        // index now follows the roster in the composed text, so the roster's
+        // own delivered slice must stop at the NEXT layer's separator rather
+        // than running to the end of the whole prompt.
         let text = compiled.composed.expect("composed").text;
         const LABEL: &str = "zirv harness roster (session)\n\n";
         let roster_at = text.find(LABEL).expect("roster label present") + LABEL.len();
+        let delivered = &text[roster_at..];
+        let delivered = delivered
+            .find("\n\n---\n\n")
+            .map_or(delivered, |end| &delivered[..end]);
         assert_eq!(
-            text[roster_at..].len(),
+            delivered.len(),
             5,
-            "the delivered roster in the composed prompt must match the budget: {:?}",
-            &text[roster_at..]
+            "the delivered roster in the composed prompt must match the budget: {delivered:?}"
         );
     }
 
@@ -4094,7 +4106,10 @@ mod tests {
         );
 
         let described = composed.describe();
-        assert!(described.starts_with("v11 "), "got {described}");
+        assert!(
+            described.starts_with(&format!("{} ", super::prompt::DEFAULT_PROMPT_VERSION)),
+            "got {described}"
+        );
         assert_eq!(
             described.matches("memory").count(),
             1,

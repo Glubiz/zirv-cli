@@ -121,6 +121,10 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "worker.max_depth",    // narrow-only fold: repo may only lower the depth cap.
     "wrap.debounce_ms",
     "wrap.inject_timeout_ms",
+    // Issue #539 fix round: narrow-only fold (`narrow_skill_index_bool`) --
+    // repo may only turn the standing skill index off, never force it back
+    // on for an operator who disabled it.
+    "prompt.skill_index",
 ];
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
