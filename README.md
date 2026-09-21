@@ -5626,12 +5626,19 @@ sql = "on"                       # operator-only, REPO-FORBIDDEN
 Rules are glob patterns (`*` matches any run of characters); a command is
 matched deny-first, then ask, then allow, first match wins within a
 category. Unmatched commands use `interactive_default` for an interactive
-launch and `default` for a headless one. With SQL classification on, one
+launch and `default` for a headless one. The Claude hook treats every non-empty
+permission mode except `dontAsk` as interactive, including `auto` and
+`bypassPermissions`; an empty or missing mode is headless.
+`ZIRV_CTX_LAUNCH_MODE=interactive` overrides either case to interactive.
+With SQL classification on, one
 provably read-only `SELECT`/`EXPLAIN`/`SHOW` through a recognized client runs
 silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
 input asks conservatively.
 
 With the default `interactive_default = "allow"`, the hook answers "allow" for commands no rule matches and suppresses the harness's own permission prompt, so enabling the hook widens what runs without a prompt; set `[safety] interactive_default = "ask"` in `~/.zirv/ctx.toml` to keep the harness's prompt for unmatched commands.
+
+Same-command literal variable assignments are resolved when judging scratchpad-confined writes and redirects under the hook payload's cwd on an unsandboxed retry; unresolved expansions still require approval.
+Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`) are read-only for the network classifier and retry screen; client config files disqualify this exception.
 
 The analyzer evaluates the most restrictive result across quote-aware compound
 segments (`;`, `&`, `&&`, `||`, pipes and newlines), nested
