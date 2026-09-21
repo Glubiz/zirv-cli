@@ -400,16 +400,17 @@ and six additive domain tags (`security`, `data`, `docs_only`, `devops`,
 directly: a live battery found those unreliable, and any many-option seat/
 tier question never cleared the confidence floor. A field whose model answer
 is not *decisive* keeps the baseline value instead, with a recorded reason,
-except `complexity`/`risk`: these resolve to the higher of the two most
-probable levels when their indices are parseable, and that level is taken
-only when it is above the baseline. This keeps a near-tie deterministic
-whichever level wins, and avoids the 2026-09-21 case, when an exhaustive
-multi-system investigation landed on a single haiku seat because a
-bounded/substantial near-tie fell to the text-only baseline. The two levels
-need not be adjacent, so an answer whose mass splits between distant levels
-resolves to the far one: deliberate, since under-sizing a request costs more
-than over-sizing it, and the resolution can never exceed the model's own
-runner-up. The recorded reason names what actually happened — `resolved
+except `complexity`/`risk` when it is the *margin* alone that fell short:
+these resolve to the higher of the two most probable levels, and that level
+is taken only when it is above the baseline. This keeps a near-tie
+deterministic whichever level wins, and avoids the 2026-09-21 case, when an
+exhaustive multi-system investigation landed on a single haiku seat because
+a bounded/substantial near-tie (confidence 0.57, margin 0.14) fell to the
+text-only baseline. A confidence *below* `min_confidence` still keeps the
+baseline: that is the model having no opinion rather than a tie between two
+candidates, and escalating it over-sized the live battery's `bump-timeout`
+and `ambiguous` cases from trivial/direct/cheap into bounded work on a
+standard seat. The recorded reason names what actually happened — `resolved
 upward to <label>` or `kept baseline`. A model answer is decisive when BOTH
 its confidence is at or above `min_confidence` AND its
 margin (the gap between its top and runner-up probability; for a yes/no

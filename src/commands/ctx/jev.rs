@@ -246,11 +246,22 @@ impl Answer {
 
     /// The higher of a Score answer's two most probable level indices, with
     /// probability ties broken toward the higher level; `None` for other
-    /// answer kinds or fewer than two parseable indices. Resolving a near-tie
-    /// upward keeps the same result whichever of the pair is the argmax,
-    /// preserving determinism while letting monotonic fields rise cautiously.
-    pub(crate) fn cautious_score(&self) -> Option<f64> {
-        if !matches!(self.value, AnswerValue::Score(_)) {
+    /// answer kinds, for fewer than two parseable indices, or when the
+    /// answer's own `confidence` is below `min_confidence`.
+    ///
+    /// Only a thin MARGIN is the near-tie this resolves: two levels are both
+    /// real candidates and the argmax would flip on an identical re-ask, so
+    /// taking the higher keeps the same result whichever side wins -- as
+    /// deterministic as discarding the answer, and it lets a monotonic field
+    /// rise instead of dropping to the text-only baseline. A confidence
+    /// BELOW its floor is the opposite situation: the model has no opinion
+    /// and its mass is spread, so there is no pair to break and the baseline
+    /// is the better signal. Resolving those upward too over-sized the
+    /// `bump-timeout` and `ambiguous` cases of the live battery (trivial and
+    /// direct on a cheap seat) into bounded work on a standard one -- the
+    /// mirror of the under-sizing this whole path exists to prevent.
+    pub(crate) fn near_tie_score(&self, min_confidence: f32) -> Option<f64> {
+        if !matches!(self.value, AnswerValue::Score(_)) || self.confidence < min_confidence {
             return None;
         }
         let mut levels: Vec<(u32, f32)> = self
@@ -1905,7 +1916,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cautious_score_returns_the_higher_of_the_two_most_probable_levels() {
+    fn near_tie_score_returns_the_higher_of_the_two_most_probable_levels() {
         for (value, bounded, substantial) in [(1.0, 0.57, 0.43), (2.0, 0.43, 0.57)] {
             let answer = Answer {
                 value: AnswerValue::Score(value),
@@ -1917,12 +1928,12 @@ pub(crate) mod tests {
                     ("3".to_string(), 0.0_f32),
                 ]),
             };
-            assert_eq!(answer.cautious_score(), Some(2.0));
+            assert_eq!(answer.near_tie_score(0.5), Some(2.0));
         }
     }
 
     #[test]
-    fn cautious_score_breaks_probability_ties_upward() {
+    fn near_tie_score_breaks_probability_ties_upward() {
         for probabilities in [
             BTreeMap::from([("1".to_string(), 0.5_f32), ("2".to_string(), 0.5_f32)]),
             BTreeMap::from([
@@ -1936,12 +1947,12 @@ pub(crate) mod tests {
                 confidence: 0.5,
                 probabilities,
             };
-            assert_eq!(answer.cautious_score(), Some(2.0));
+            assert_eq!(answer.near_tie_score(0.5), Some(2.0));
         }
     }
 
     #[test]
-    fn cautious_score_is_none_with_fewer_than_two_parseable_indices() {
+    fn near_tie_score_is_none_with_fewer_than_two_parseable_indices() {
         for probabilities in [
             BTreeMap::new(),
             BTreeMap::from([("1".to_string(), 1.0_f32)]),
@@ -1952,12 +1963,31 @@ pub(crate) mod tests {
                 confidence: 0.5,
                 probabilities,
             };
-            assert_eq!(answer.cautious_score(), None);
+            assert_eq!(answer.near_tie_score(0.5), None);
         }
     }
 
+    /// A confidence below the floor is the model having no opinion, not a
+    /// near-tie between two candidate levels: there is nothing to resolve
+    /// upward, and the deterministic baseline is the better signal.
     #[test]
-    fn cautious_score_is_none_for_choice_and_noul() {
+    fn near_tie_score_is_none_below_the_confidence_floor() {
+        let answer = Answer {
+            value: AnswerValue::Score(1.0),
+            confidence: 0.45,
+            probabilities: BTreeMap::from([
+                ("0".to_string(), 0.1_f32),
+                ("1".to_string(), 0.45_f32),
+                ("2".to_string(), 0.4_f32),
+                ("3".to_string(), 0.05_f32),
+            ]),
+        };
+        assert_eq!(answer.near_tie_score(0.5), None);
+        assert_eq!(answer.near_tie_score(0.45), Some(2.0));
+    }
+
+    #[test]
+    fn near_tie_score_is_none_for_choice_and_noul() {
         for value in [AnswerValue::Choice("1".to_string()), AnswerValue::Noul(0.5)] {
             let answer = Answer {
                 value,
@@ -1967,7 +1997,7 @@ pub(crate) mod tests {
                     ("2".to_string(), 0.5_f32),
                 ]),
             };
-            assert_eq!(answer.cautious_score(), None);
+            assert_eq!(answer.near_tie_score(0.5), None);
         }
     }
 

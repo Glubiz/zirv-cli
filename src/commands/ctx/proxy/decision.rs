@@ -1110,12 +1110,14 @@ fn risk_from_index(index: f64) -> RiskBand {
 /// [`Answer::decisive`] (either its confidence is below `min_confidence`, or
 /// its margin is below `cfg.proxy.min_margin` -- see that method's own doc
 /// comment for why margin, not confidence alone, is what catches the
-/// 2026-09-18 replay's instability) resolves complexity/risk to the higher of
-/// its two most probable levels, or keeps the baseline if no pair is
-/// parseable; complexity/risk only ever rise, so that resolved level is taken
-/// only when it is above the baseline. The recorded reason names the outcome
-/// that actually happened (`resolved upward to <label>` or `kept baseline`),
-/// never the level a `max` discarded. Every other
+/// 2026-09-18 replay's instability) resolves complexity/risk to the higher
+/// of its two most probable levels -- but only when it is the MARGIN that
+/// fell short, see [`Answer::near_tie_score`] for why a below-floor
+/// confidence keeps the baseline instead. Complexity/risk only ever rise, so
+/// that resolved level is taken only when it is above the baseline. The
+/// recorded reason names the outcome that actually happened (`resolved
+/// upward to <label>` or `kept baseline`), never a level the comparison
+/// discarded. Every other
 /// ASKED field (`intent`, `workflow`, a domain tag) is replaced/added outright
 /// when decisive. Existence checks against the live roster (a workflow id, a
 /// harness/model pair) are deferred to [`validate`], which runs right after
@@ -1183,7 +1185,7 @@ pub fn merge(
     if let Some(answer) = answers.get("complexity") {
         if !answer.decisive(min_confidence, min_margin) {
             let raised = answer
-                .cautious_score()
+                .near_tie_score(min_confidence)
                 .map(complexity_from_index)
                 .filter(|resolved| *resolved > decision.complexity);
             if let Some(complexity) = raised {
@@ -1202,7 +1204,7 @@ pub fn merge(
     if let Some(answer) = answers.get("risk") {
         if !answer.decisive(min_confidence, min_margin) {
             let raised = answer
-                .cautious_score()
+                .near_tie_score(min_confidence)
                 .map(risk_from_index)
                 .filter(|resolved| *resolved > decision.risk);
             if let Some(risk) = raised {
@@ -1597,8 +1599,12 @@ mod tests {
         );
     }
 
+    /// A confidence below the floor is not the near-tie this path resolves:
+    /// the model has no opinion, so the baseline stands. Escalating here
+    /// instead over-sized the live battery's `bump-timeout` and `ambiguous`
+    /// cases (trivial/direct/cheap) into bounded work on a standard seat.
     #[test]
-    fn a_low_confidence_complexity_answer_resolves_upward_and_records_a_reason() {
+    fn a_low_confidence_complexity_answer_keeps_the_baseline() {
         let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let ans = Answers::from([(
@@ -1615,10 +1621,12 @@ mod tests {
             },
         )]);
         let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
-        assert_eq!(merged.complexity, Complexity::Substantial);
+        assert_eq!(merged.complexity, baseline.complexity);
         assert!(
-            merged.reasons.iter().any(|reason| reason
-                == "complexity: confidence 0.45 < 0.50, resolved upward to substantial"),
+            merged
+                .reasons
+                .iter()
+                .any(|reason| reason == "complexity: confidence 0.45 < 0.50, kept baseline"),
             "{:?}",
             merged.reasons
         );
