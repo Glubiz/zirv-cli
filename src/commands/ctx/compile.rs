@@ -4106,7 +4106,10 @@ mod tests {
         );
 
         let described = composed.describe();
-        assert!(described.starts_with("v11 "), "got {described}");
+        assert!(
+            described.starts_with(&format!("{} ", super::prompt::DEFAULT_PROMPT_VERSION)),
+            "got {described}"
+        );
         assert_eq!(
             described.matches("memory").count(),
             1,

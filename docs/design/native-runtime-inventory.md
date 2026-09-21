@@ -155,6 +155,7 @@ criterion).
 | `skill show` | N06 (#475) |  |
 | `skill export` | N06 (#475) | writes a portable bundle directory for one skill |
 | `skill read` | N06 (#475) | reads one skill's bundle resource body |
+| `skill load` | N06 (#475) | issue #539 chunk G: the shell-native sibling of the `skill_load` tool -- calls the same shared function and best-effort records one `cli` activation-journal entry |
 | `test` | shared |  |
 | `test all` | shared |  |
 | `test baseline` | shared |  |

@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use super::capability::{CapabilityId, CapabilityReport, IntegrationId};
+use super::capability::{self, CapabilityId, CapabilityReport, IntegrationId};
 use super::skill_activation::score_skills;
 use super::skill_render;
+use super::skill_tools::{self, SkillLoadSurface};
 use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::state::StateDir;
 
 pub const SKILL_SCHEMA_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: usize = 32 * 1024;
@@ -1962,6 +1964,11 @@ pub enum SkillCommand {
     Export(SkillExportArgs),
     /// Read one skill's bundle resource body.
     Read(SkillReadArgs),
+    /// Load one skill's instructions the way the `skill_load` tool does,
+    /// from a shell -- the agent-facing sibling of that tool (issue #539
+    /// chunk G). Records one activation-journal entry on success; a refusal
+    /// records nothing.
+    Load(SkillLoadArgs),
 }
 
 #[derive(Debug, Args)]
@@ -2039,6 +2046,26 @@ pub struct SkillReadArgs {
     pub repo: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+pub struct SkillLoadArgs {
+    /// Stable skill id, optionally suffixed with @version.
+    pub id: String,
+    /// Adapter to resolve the capability/integration report for. Defaults to
+    /// zirv's own conservative baseline adapter, the same one the MCP bridge
+    /// falls back to when no session is bound.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Emit the exact JSON payload the `skill_load` tool returns.
+    #[arg(long)]
+    pub json: bool,
+    /// Ignore operator-global and repository-provided skills.
+    #[arg(long)]
+    pub built_in_only: bool,
+    /// Repository root; defaults to the current directory.
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+}
+
 #[derive(Serialize)]
 struct SkillShow<'a> {
     skill: &'a RegisteredSkill,
@@ -2077,6 +2104,7 @@ pub fn run(args: &SkillArgs, writer: &mut impl Write) -> CtxResult<i32> {
         SkillCommand::Show(args) => run_show(args, writer),
         SkillCommand::Export(args) => run_export(args, writer),
         SkillCommand::Read(args) => run_read(args, writer),
+        SkillCommand::Load(args) => run_load(args, writer),
     }
 }
 
@@ -2213,6 +2241,81 @@ fn run_read(args: &SkillReadArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let text = registry.read_resource(&args.id, &args.path)?;
     writeln!(writer, "{text}")?;
     Ok(0)
+}
+
+/// `zirv skill load <id>` (issue #539 chunk G): the agent-facing sibling of
+/// the `skill_load` tool, calling the exact same shared function
+/// (`skill_tools::skill_load`) so the capability/integration gate,
+/// dependency-ordered instructions, untrusted marking and refusal text are
+/// identical on all three surfaces. A refusal propagates through `?`
+/// unchanged -- `workflow::dispatch` already prints an `Err` to stderr and
+/// exits non-zero for every other subcommand here, so this needs no special
+/// handling to satisfy "prints the refusal to stderr and exits non-zero" --
+/// and, since `record_skill_activation` is only ever reached below a
+/// successful load, a refusal is guaranteed to record nothing.
+fn run_load(args: &SkillLoadArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let registry = registry(args.repo.as_deref(), args.built_in_only)?;
+    report_warnings(&registry);
+    let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
+    let adapter = args.agent.as_deref().unwrap_or(capability::NATIVE_ADAPTER);
+    let report = CapabilityReport::for_repo(adapter, &repo)?;
+    let loaded = skill_tools::skill_load(&registry, &args.id, &report)?;
+
+    if args.json {
+        serde_json::to_writer_pretty(&mut *writer, &loaded)?;
+        writeln!(writer)?;
+    } else {
+        write_load_text(writer, &loaded)?;
+    }
+
+    // Best-effort, like every other `record_skill_activation` call site: a
+    // journal write failure must never fail a load that already succeeded.
+    if let Ok(state) = StateDir::resolve(&|key| std::env::var(key).ok()) {
+        let _ = skill_tools::record_skill_activation(&state, &repo, &loaded, SkillLoadSurface::Cli);
+    }
+    Ok(0)
+}
+
+/// The plain-text shape `zirv skill load` prints, designed to be read by a
+/// model in a terminal: a header line naming id/version/source/hash, the
+/// trust line for a repository-sourced skill (the exact wording the tool
+/// payload's own `trust` field carries), each instruction part in
+/// dependency order under its own `id@version` line, then a `resources:`
+/// list with a one-line pointer to `zirv skill read` when the requested
+/// skill carries any.
+fn write_load_text(
+    writer: &mut impl Write,
+    loaded: &skill_tools::SkillLoadResult,
+) -> CtxResult<()> {
+    let hash_prefix = &loaded.content_hash[..loaded.content_hash.len().min(12)];
+    writeln!(
+        writer,
+        "skill {}@{} ({}; hash {hash_prefix})",
+        loaded.id, loaded.version, loaded.source
+    )?;
+    if loaded.source == SkillSource::Repository.to_string() {
+        writeln!(writer, "trust: {}", loaded.trust)?;
+    }
+    for part in &loaded.instructions {
+        writeln!(writer, "\n{}@{}", part.id, part.version)?;
+        writeln!(writer, "{}", part.instructions)?;
+    }
+    if !loaded.resources.is_empty() {
+        writeln!(writer, "\nresources:")?;
+        for resource in &loaded.resources {
+            writeln!(
+                writer,
+                "  {}\t{}\t{} B",
+                resource.path, resource.kind, resource.bytes
+            )?;
+        }
+        writeln!(
+            writer,
+            "read one with: zirv skill read {} <path>",
+            loaded.id
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3399,5 +3502,156 @@ mod tests {
             0
         );
         assert_eq!(String::from_utf8(ok_out).unwrap(), "small body\n");
+    }
+
+    /// Points `StateDir::resolve` at a fresh, isolated tempdir for the
+    /// duration of the test -- `zirv skill load`'s own best-effort journal
+    /// write goes through the real env-based resolver
+    /// (`run_load`/`skill_tools::record_skill_activation`), not an injected
+    /// `StateDir`, the same seam `workflow::engine`'s own approval tests use
+    /// for the identical reason.
+    fn state_dir_guard(root: &Path) -> crate::commands::ctx::testenv::VarGuard {
+        crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.to_str().expect("utf-8 tempdir path")),
+        )])
+    }
+
+    fn load_args(id: &str, repo: &Path) -> SkillArgs {
+        SkillArgs {
+            command: SkillCommand::Load(SkillLoadArgs {
+                id: id.into(),
+                agent: None,
+                json: false,
+                built_in_only: false,
+                repo: Some(repo.to_path_buf()),
+            }),
+        }
+    }
+
+    /// Issue #539 chunk G: `zirv skill load <id>` prints the header line and
+    /// the instruction body, and records exactly one `cli` activation event
+    /// carrying the skill's content hash -- the CLI-level counterpart of
+    /// `skill_load_tool_returns_instructions_and_records_one_activation`
+    /// (`ctx::runtime::tools`) and `skill_load_tool_matches_the_shared_
+    /// function_the_native_tool_also_calls` (`ctx::mcp`).
+    #[test]
+    fn skill_load_prints_header_and_writes_one_activation_event_at_cli_level() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let _vars = state_dir_guard(state_root.path());
+
+        let mut out = Vec::new();
+        assert_eq!(
+            run(&load_args("incident-investigation", repo.path()), &mut out).unwrap(),
+            0
+        );
+        let printed = String::from_utf8(out).unwrap();
+        let registry = registry(Some(repo.path()), false).unwrap();
+        let skill = registry.get("incident-investigation").unwrap();
+        let hash_prefix = &skill.content_hash[..skill.content_hash.len().min(12)];
+        assert_eq!(
+            printed.lines().next(),
+            Some(format!("skill incident-investigation@1 (built-in; hash {hash_prefix})").as_str())
+        );
+        // A distinctive sentence from `incident-investigation`'s own body,
+        // proving the instruction text -- not just the header -- was printed.
+        assert!(printed.contains("Restoring service and explaining the failure"));
+
+        let state = StateDir::resolve(&|key| std::env::var(key).ok()).expect("state dir");
+        let events =
+            crate::commands::workflow::telemetry::skill_activations(&state, repo.path()).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0].skill_id.as_deref(),
+            Some("incident-investigation")
+        );
+        assert_eq!(
+            events[0].skill_content_hash.as_deref(),
+            Some(skill.content_hash.as_str())
+        );
+        assert_eq!(events[0].skill_surface.as_deref(), Some("cli"));
+    }
+
+    /// Issue #539 chunk G: a skill whose required integration is unavailable
+    /// on this machine is refused, the refusal names the missing
+    /// integration, and no activation is recorded -- the same contract the
+    /// tool surfaces hold (`skill_load_tool_refuses_an_unavailable_
+    /// integration_and_records_no_activation`).
+    #[test]
+    fn skill_load_refuses_a_missing_integration_and_records_no_event_at_cli_level() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let _vars = state_dir_guard(state_root.path());
+
+        let mut out = Vec::new();
+        let error = run(
+            &load_args("kibana-log-investigation", repo.path()),
+            &mut out,
+        )
+        .expect_err("kibana is not configured for this repo");
+        assert!(error.to_string().contains("kibana"), "{error}");
+
+        let state = StateDir::resolve(&|key| std::env::var(key).ok()).expect("state dir");
+        let events =
+            crate::commands::workflow::telemetry::skill_activations(&state, repo.path()).unwrap();
+        assert!(
+            events.is_empty(),
+            "a refusal must not be journalled: {events:?}"
+        );
+    }
+
+    /// Issue #539 chunk G: `--json` prints exactly the payload
+    /// `skill_tools::skill_load` returns -- the same parity property the
+    /// native tool and MCP bridge tests already hold between themselves.
+    #[test]
+    fn skill_load_json_matches_the_shared_function_payload_at_cli_level() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let _vars = state_dir_guard(state_root.path());
+
+        let mut json_args = load_args("incident-investigation", repo.path());
+        if let SkillCommand::Load(args) = &mut json_args.command {
+            args.json = true;
+        }
+        let mut out = Vec::new();
+        assert_eq!(run(&json_args, &mut out).unwrap(), 0);
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        let registry = registry(Some(repo.path()), false).unwrap();
+        let report = CapabilityReport::for_repo(capability::NATIVE_ADAPTER, repo.path()).unwrap();
+        let expected =
+            skill_tools::skill_load(&registry, "incident-investigation", &report).unwrap();
+        assert_eq!(printed, serde_json::to_value(&expected).unwrap());
+    }
+
+    /// Issue #539 chunk G: `zirv skill show` remains the human inspection
+    /// command and must never journal an activation, unlike `zirv skill
+    /// load`.
+    #[test]
+    fn skill_show_writes_no_activation_event() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let _vars = state_dir_guard(state_root.path());
+
+        let show_args = SkillArgs {
+            command: SkillCommand::Show(SkillShowArgs {
+                id: "incident-investigation".into(),
+                agent: None,
+                json: false,
+                built_in_only: false,
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        assert_eq!(run(&show_args, &mut out).unwrap(), 0);
+
+        let state = StateDir::resolve(&|key| std::env::var(key).ok()).expect("state dir");
+        let events =
+            crate::commands::workflow::telemetry::skill_activations(&state, repo.path()).unwrap();
+        assert!(
+            events.is_empty(),
+            "`skill show` must never journal: {events:?}"
+        );
     }
 }

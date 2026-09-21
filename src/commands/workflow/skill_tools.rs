@@ -5,9 +5,14 @@
 //! `ctx::mcp` (the read-only MCP bridge wrapped Claude/Codex sessions see)
 //! -- call these functions rather than rendering a skill twice, so the two
 //! can never answer differently for the same registry and the same id.
+//! Issue #539 chunk G adds a third caller of `skill_load`: `zirv skill load
+//! <id>` (`workflow::skill::run_load`), the shell-native sibling of the
+//! `skill_load` tool -- every harness has a shell, not every harness offers
+//! a deferred tool without friction, so this is the lowest-friction path an
+//! agent has to the identical refusal/trust/instruction contract.
 //!
 //! Everything here is read-only: loading a skill's instructions changes no
-//! repository or external state. The one side effect either surface may
+//! repository or external state. The one side effect any calling surface may
 //! choose to record -- one activation-journal entry per successful
 //! `skill_load` -- is deliberately NOT done here (see
 //! [`record_skill_activation`]'s own doc): only the calling surface knows
@@ -207,11 +212,15 @@ pub fn skill_read_resource(registry: &SkillRegistry, id: &str, path: &str) -> Ct
 
 /// Which tool surface a `skill_load` activation came through, carried into
 /// the activation journal so an operator can tell a native session's own
-/// choice from one an MCP-bridged harness made.
+/// choice from one an MCP-bridged harness made -- or, since issue #539 chunk
+/// G, one an agent made by running `zirv skill load <id>` from a shell
+/// instead of reaching for either tool. All three call this exact function,
+/// so a `cli` activation is measured on the same footing as the other two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillLoadSurface {
     NativeTool,
     Mcp,
+    Cli,
 }
 
 impl SkillLoadSurface {
@@ -219,6 +228,7 @@ impl SkillLoadSurface {
         match self {
             Self::NativeTool => "native-tool",
             Self::Mcp => "mcp",
+            Self::Cli => "cli",
         }
     }
 }

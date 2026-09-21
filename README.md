@@ -955,8 +955,9 @@ to the section that documents it in depth.
 ### Development workflow commands
 
 - **Skills** — `skill` inspects model-agnostic engineering skills (`list`,
-  `show <id>`) layered from built-in, operator-global, and repository
-  sources. See [Development Workflows](#development-workflows).
+  `show`, `load`, `export`, `read`, each taking an `<id>`) layered from
+  built-in, operator-global, and repository sources. See [Development
+  Workflows](#development-workflows).
 - **Workflow lifecycle** — `workflow` runs the durable `intent → spec → plan
   → implement → test → review → verify → deploy` lifecycle: `list` built-in
   definitions, `show` one, `classify` a task without starting, `start` and
@@ -1585,6 +1586,7 @@ session restart or compaction.
 zirv skill list
 zirv skill list --match "production outage, paging alert" --limit 3
 zirv skill show systematic-debugging --agent codex
+zirv skill load incident-investigation
 zirv skill export systematic-debugging --dir ./bundles
 zirv skill read my-skill references/checklist.md   # a bundle resource; built-ins carry no resources
 zirv workflow classify --task "fix authentication race"
@@ -2106,11 +2108,20 @@ description verbatim, a repository-layer skill marked
 falls out of the provider's prompt cache. Zirv only surfaces which skills
 exist; it never matches, pre-selects, or injects one for a task -- the agent
 reads the descriptions and decides, the same way it would judge any other
-tool's documentation, and `skill_load`'s own tool description asks it to
-check the index before starting work a listed skill covers. `zirv skill list
---match "<task>" [--phase <phase>] [--limit N]` runs the same deterministic
-scorer from a shell for an agent (or operator) that wants a ranked shortlist
-instead of reading the whole index;
+tool's documentation. The index's own loading instruction leads with
+`zirv skill load <id>`, run from a shell: it works in every session,
+including a wrapped host where the `skill_load` tool is namespaced and
+deferred behind a tool-search lookup a small model rarely takes. `zirv skill
+load` is the agent-facing sibling of that tool -- it calls the identical
+shared function, so the capability/integration gate, dependency-ordered
+instructions and untrusted marking never disagree between the two, and a
+successful load records one activation-journal entry the same way the tool
+does; a refusal (an unsupported capability or a missing integration) prints
+the registry's own refusal text to stderr, exits non-zero, and records
+nothing. `zirv skill show` remains the human inspection command and never
+journals. `zirv skill list --match "<task>" [--phase <phase>] [--limit N]`
+runs the same deterministic scorer from a shell for an agent (or operator)
+that wants a ranked shortlist instead of reading the whole index;
 `--json` emits digests only unless `--full` is also given, which restores the
 pre-issue-#539 full-manifest `--json` shape. `zirv skill export <id> --dir
 <path>` writes a portable bundle directory (for another host, or to seed
