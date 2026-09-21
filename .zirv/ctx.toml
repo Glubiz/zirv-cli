@@ -166,11 +166,12 @@ model = "fable"
 # recommend_corrections = 3          # correction count that triggers a recommendation
 # recommend_cooldown_secs = 86_400   # minimum time between optimize recommendations
 
-# [prompt]                           # every key below is REPO-FORBIDDEN
+# [prompt]                           # every key below is REPO-FORBIDDEN except skill_index -- repo may only narrow it to false.
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_PROMPT): whether the composed system prompt is injected at all. Default: true.
 # repo_layer = true                  # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_REPO): whether <repo>/.zirv/system-prompt.md is read. Default: true.
 # max_repo_bytes = 4096              # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_MAX_REPO_BYTES): cap on the untrusted repo layer. Default: 4096.
 # harnesses = true                   # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_HARNESSES): whether the derived harness roster is injected. Default: true.
+# skill_index = true                 # not REPO-FORBIDDEN (repo may only narrow to false, like context.dedupe_native): whether the standing skill index layer is composed. Default: true.
 # codex_orchestrator = true          # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR): whether a codex Orchestrator session gets codex's own orchestrator-conventions layer. Default: true.
 # verbosity = "verbose"              # REPO-FORBIDDEN (ZIRV_CTX_PROMPT_VERBOSITY): tier for the Orchestrator-only meta-harness orientation layer -- "minimal" | "standard" | "verbose". Default: "verbose".
 

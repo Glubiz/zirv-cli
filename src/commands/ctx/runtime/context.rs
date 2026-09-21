@@ -392,7 +392,9 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
     // concatenated prose needs but a standalone native message does not --
     // reusing the one literal rather than a second, independently-typed
     // copy that could drift on wording.
-    if let Some(index) = prompt::skill_index_text(request.repo, request.home) {
+    if request.config.prompt.skill_index
+        && let Some(index) = prompt::skill_index_text(request.repo, request.home)
+    {
         let intro = prompt::SKILL_INDEX_HEADER
             .trim_start_matches("\n\n---\n\n")
             .trim_end();

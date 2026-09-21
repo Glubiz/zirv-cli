@@ -1388,6 +1388,16 @@ impl ClaudeAdapter {
     /// `None` on any failure -- registry load, state dir resolution, or the
     /// sync itself -- so a launch never fails or worsens because this could
     /// not run.
+    ///
+    /// Deliberately does NOT use [`Self::home_dir`]: that falls back to `.`
+    /// (the process cwd, ordinarily the repo root) when no real home
+    /// resolves, which would hand `SkillRegistry::load_for_repo` the repo's
+    /// own `.zirv/skills` as the OPERATOR-GLOBAL layer -- a checkout's own
+    /// skills, mislabeled trusted, would then pass `host_registerable` and
+    /// get registered with the host. With no real home, this instead loads
+    /// built-ins only: `home: None` alone already keeps a repo skill correctly
+    /// labeled `Repository` (untrusted, never registered), and `include_custom:
+    /// false` skips loading it at all rather than depend on that label.
     fn claude_plugin_dir(&self) -> Option<PathBuf> {
         use crate::commands::workflow::skill::{SkillRegistry, sync_claude_plugin_dir};
 
@@ -1400,8 +1410,9 @@ impl ClaudeAdapter {
         let dir = self.resolved_plugin_dir()?;
 
         let repo = std::env::current_dir().ok()?;
-        let home = self.home_dir();
-        let registry = SkillRegistry::load_for_repo(&repo, Some(&home), true).ok()?;
+        let real_home = self.home.clone().or_else(|| crate::utils::home_dir().ok());
+        let registry =
+            SkillRegistry::load_for_repo(&repo, real_home.as_deref(), real_home.is_some()).ok()?;
         sync_claude_plugin_dir(&registry, &dir, env!("CARGO_PKG_VERSION")).ok()?;
         Some(dir)
     }
@@ -5032,6 +5043,38 @@ mod tests {
             adapter
                 .plugin_dir_args(&["--disable-slash-commands".to_string()])
                 .is_empty()
+        );
+    }
+
+    /// Without this fix, `claude_plugin_dir` fell back to `home_dir()`'s `.`
+    /// (cwd) whenever no real home resolved, so a repo's own `.zirv/skills`
+    /// loaded as the OPERATOR-GLOBAL layer -- trusted -- and a checkout-
+    /// planted skill would be registered with the host. With `self.home`
+    /// unset and `HOME`/`USERPROFILE` both cleared, that planted skill must
+    /// never appear as a stub.
+    #[test]
+    fn claude_plugin_dir_never_registers_the_checkouts_own_skills_when_home_does_not_resolve() {
+        let repo = tempfile::tempdir().expect("repo");
+        let skills_dir = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir");
+        std::fs::write(
+            skills_dir.join("evil.yaml"),
+            "schema_version: 1\nid: evil\nversion: 1\nname: Evil\ndescription: repo-planted\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: do the thing\n",
+        )
+        .expect("write fixture skill");
+        let _cwd = super::super::super::testenv::CwdGuard::enter(repo.path()).expect("chdir");
+        let _vars =
+            super::super::super::testenv::VarGuard::set(&[("HOME", None), ("USERPROFILE", None)]);
+
+        let state = tempfile::tempdir().expect("state");
+        let adapter = ClaudeAdapter::new(None).with_live_plugin_dir(state.path().to_path_buf());
+
+        let dir = adapter
+            .claude_plugin_dir()
+            .expect("built-ins alone still generate a plugin dir");
+        assert!(
+            !dir.join("skills/evil").exists(),
+            "a repo-planted skill must never be registered with the host when home cannot resolve"
         );
     }
 

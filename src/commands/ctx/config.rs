@@ -684,6 +684,13 @@ pub struct PromptConfig {
     /// repo checkout must not be able to suppress a layer the operator
     /// relies on to see what this session may delegate to.
     pub harnesses: bool,
+    /// Whether the standing skill index layer is composed at all; skills
+    /// stay loadable through `zirv skill list`/`load` either way. NOT
+    /// `REPO_FORBIDDEN`: a repo checkout may only narrow it to `false`
+    /// (`narrow_skill_index_bool`), the same asymmetry `context.
+    /// dedupe_native` uses, never force it back on for an operator who
+    /// turned it off.
+    pub skill_index: bool,
     /// Whether a codex Orchestrator session's composed prompt gets codex's
     /// own `AgentAdapter::base_system_prompt` layer (issue #167,
     /// `adapters::codex::ORCHESTRATOR_PROMPT`) -- the codex analogue of
@@ -719,6 +726,7 @@ impl Default for PromptConfig {
             verbosity: PromptVerbosity::Verbose,
             max_repo_bytes: 4096,
             harnesses: true,
+            skill_index: true,
             codex_orchestrator: true,
             orchestrator_writes: OrchestratorWrites::Advise,
         }
@@ -3388,6 +3396,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_PROMPT_SKILL_INDEX",
+        &["prompt", "skill_index"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
         &["prompt", "codex_orchestrator"],
         EnvKind::Bool,
@@ -4135,6 +4148,16 @@ fn orchestrator_writes_at(
 /// on a home layer that left dedupe on) -- the mirror of `narrow_pace_bool`'s
 /// own `unwrap_or(false)`.
 fn narrow_dedupe_bool(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// Issue #539 fix round (inline-argv budget regression): the repo-narrowing
+/// fold for `prompt.skill_index` -- the same polarity as `narrow_dedupe_
+/// bool`, since `false` (the layer is off) is this key's strict direction.
+/// A repo checkout may turn the index off for itself but never force it back
+/// on for an operator who disabled it (e.g. to work around a host's own
+/// inline-argv limits).
+fn narrow_skill_index_bool(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
@@ -5475,6 +5498,10 @@ impl CtxConfig {
         // function's own doc comment for why the polarity is inverted.
         let home_context_dedupe_native =
             bool_at(take_nested(&mut merged, "context", "dedupe_native"));
+        // Issue #539 fix round: `prompt.skill_index` gets the identical
+        // lift-before-merge treatment, folded by `narrow_skill_index_bool` --
+        // unlike every other `[prompt]` key, this one is not `REPO_FORBIDDEN`.
+        let home_prompt_skill_index = bool_at(take_nested(&mut merged, "prompt", "skill_index"));
         // Issue #309: `verify_on_stop.enabled`/`max_nudges` get the identical
         // lift-before-merge treatment -- see `narrow_verify_on_stop_enabled`/
         // `narrow_max_nudges` below for each field's strict direction.
@@ -5666,6 +5693,8 @@ impl CtxConfig {
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
         let repo_context_dedupe_native =
             bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
+        let repo_prompt_skill_index =
+            bool_at(take_nested(&mut repo_layer, "prompt", "skill_index"));
         let repo_verify_on_stop_enabled =
             bool_at(take_nested(&mut repo_layer, "verify_on_stop", "enabled"));
         let repo_verify_on_stop_max_nudges =
@@ -5931,6 +5960,15 @@ impl CtxConfig {
             toml::Value::Boolean(narrow_dedupe_bool(
                 home_context_dedupe_native.unwrap_or(default_context.dedupe_native),
                 repo_context_dedupe_native,
+            )),
+        );
+        let default_prompt = PromptConfig::default();
+        insert_path(
+            &mut merged,
+            &["prompt", "skill_index"],
+            toml::Value::Boolean(narrow_skill_index_bool(
+                home_prompt_skill_index.unwrap_or(default_prompt.skill_index),
+                repo_prompt_skill_index,
             )),
         );
         let default_verify_on_stop = VerifyOnStopConfig::default();
@@ -12523,6 +12561,7 @@ mod tests {
         ("prompt", "repo_layer"),
         ("prompt", "max_repo_bytes"),
         ("prompt", "harnesses"),
+        ("prompt", "skill_index"),
         ("prompt", "codex_orchestrator"),
         ("prompt", "verbosity"),
         ("context", "max_common_bytes"),

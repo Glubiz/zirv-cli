@@ -643,6 +643,15 @@ impl Scope {
     fn skill_read_resource(&self, args: SkillReadResourceArgs) -> CtxResult<Value> {
         let registry = self.skill_registry()?;
         let content = skill_tools::skill_read_resource(&registry, &args.id, &args.path)?;
+        // `content` may already be truncated to `MAX_TOOL_OUTPUT_BYTES`
+        // (32768) with a suffix appended, which alone can exceed this
+        // bridge's own `MAX_RESULT_BYTES` cap before the JSON envelope
+        // `response` adds is even counted -- re-truncate with headroom for
+        // both rather than let every over-budget resource hard-refuse.
+        let content = crate::commands::workflow::skill::truncate_tool_output_to(
+            &content,
+            MAX_RESULT_BYTES.saturating_sub(2048),
+        );
         self.response(SkillResourceResult { content })
     }
 
@@ -1472,6 +1481,40 @@ mod tests {
                     json!({"id":"incident-investigation", "path":"../x"})
                 )
                 .is_err()
+        );
+    }
+
+    /// Finding G (issue #539 fix round): a resource over `MAX_TOOL_OUTPUT_
+    /// BYTES` (32768) used to hard-refuse here, because the shared helper's
+    /// own truncation-plus-suffix already exceeded this bridge's own
+    /// `MAX_RESULT_BYTES` cap before the JSON envelope was even added. A
+    /// ~40 KiB resource must now come back truncated, not as an error.
+    #[test]
+    fn skill_read_resource_tool_truncates_a_large_resource_instead_of_erroring() {
+        let f = Fixture::new();
+        let skill_dir = f.root.path().join("home/.zirv/skills/big-resource-skill");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: big-resource-skill\ndescription: A test skill for issue #539.\nmetadata:\n  x-zirv-schema-version: \"1\"\n  x-zirv-id: big-resource-skill\n  x-zirv-context-budget-bytes: \"64\"\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let big = "a".repeat(40 * 1024);
+        std::fs::write(skill_dir.join("references/big.md"), &big).unwrap();
+
+        let result = f
+            .scope
+            .call(
+                "skill_read_resource",
+                json!({"id":"big-resource-skill", "path":"references/big.md"}),
+            )
+            .expect("a large resource must truncate, not error");
+        let content = result["data"]["content"].as_str().expect("content field");
+        assert!(content.len() < big.len(), "content must be truncated");
+        assert!(content.contains("truncated"), "{content}");
+        assert!(
+            serde_json::to_vec(&result).unwrap().len() <= MAX_RESULT_BYTES,
+            "the whole envelope must still respect the transport cap"
         );
     }
 

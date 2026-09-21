@@ -2103,13 +2103,19 @@ shell, network, or other permissions.
 
 Every session that does real work -- worker, single-seat, sub-orchestrator,
 and orchestrator -- carries a standing skill index: one line per
-implicit-activation skill (`- <id>: <description>`, the skill's own
-description verbatim, a repository-layer skill marked
+implicit-activation skill (`- <id>: <first sentence>`, the first sentence of
+the skill's own description, a repository-layer skill marked
 `(repository-untrusted)`), in a stable, task-independent layer so it never
 falls out of the provider's prompt cache. Zirv only surfaces which skills
 exist; it never matches, pre-selects, or injects one for a task -- the agent
 reads the descriptions and decides, the same way it would judge any other
-tool's documentation. The index's own loading instruction leads with
+tool's documentation. The full description remains one `zirv skill list`/
+`show` call away. `prompt.skill_index` (`ZIRV_CTX_PROMPT_SKILL_INDEX`,
+default `true`, not `REPO_FORBIDDEN` -- a repository may only narrow it to
+`false`, never force it back on) turns the layer off entirely when a host's
+own inline-argv limits make even the compact index too much; skills stay
+loadable through `zirv skill list`/`load` either way. The index's own
+loading instruction leads with
 `zirv skill load <id>`, run from a shell: it works in every session,
 including a wrapped host where the `skill_load` tool is namespaced and
 deferred behind a tool-search lookup a small model rarely takes. `zirv skill

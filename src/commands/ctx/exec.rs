@@ -4405,6 +4405,16 @@ mod tests {
                 "ZIRV_CTX_PACE_BLIND_DELAY_SECS".to_string(),
                 "0".to_string(),
             ),
+            // Fix round (inline-argv budget regression): these fixtures
+            // deliver the composed prompt as one argv element through
+            // Git-for-Windows `sh.exe`, which silently truncates a single
+            // argument at ~8186 bytes -- the index has its own tests in
+            // prompt.rs. A test asserting the index IS present sets this
+            // back to "true" explicitly.
+            (
+                "ZIRV_CTX_PROMPT_SKILL_INDEX".to_string(),
+                "false".to_string(),
+            ),
         ]
         .into()
     }
@@ -8204,6 +8214,10 @@ mod tests {
             ("FAKE_AGENT_MODE", Some("healthy")),
             ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
             ("FAKE_AGENT_PARENT_ENV_LOG", parent_env_log.to_str()),
+            // Fix round (inline-argv budget regression): see `base_env`'s own
+            // comment -- this test calls `run`, not `run_with`, so it is not
+            // covered by that helper and needs the same override directly.
+            ("ZIRV_CTX_PROMPT_SKILL_INDEX", Some("false")),
         ]);
 
         let args = ExecArgs {
