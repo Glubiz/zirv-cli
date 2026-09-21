@@ -209,9 +209,19 @@ fn orchestrator_initial_prompt(
     if text.is_empty() {
         None
     } else {
-        super::obfuscate_store::protect_text(state, repo, cfg, &text, "chat_initial_prompt")
-            .ok()
-            .map(|protected| protected.0)
+        match super::obfuscate_store::protect_text(state, repo, cfg, &text, "chat_initial_prompt") {
+            Ok(protected) => Some(protected.0),
+            Err(error) => {
+                // Fail closed: never send the unprotected text. This is
+                // rare (obfuscate.mode is off by default) and otherwise
+                // silent, so the operator has something to act on rather
+                // than a session that quietly opened with no initial task.
+                crate::output::warn(format!(
+                    "sensitive-data masking failed ({error}); starting without the initial task prompt"
+                ));
+                None
+            }
+        }
     }
 }
 

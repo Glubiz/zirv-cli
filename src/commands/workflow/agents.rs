@@ -907,6 +907,18 @@ pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
             for warning in registry.warnings() {
                 crate::output::warn(warning);
             }
+            // Issue #466: the one prompt this dispatch composes, protected
+            // before it reaches either launch path below -- the native
+            // seat's helper call and the legacy adapter's `dispatch_agent`
+            // both go straight to a model.
+            let dispatch_env = crate::commands::ctx::config::env_from_process();
+            let prompt = crate::commands::ctx::obfuscate_store::protect_text_with_env(
+                &repo,
+                &args.prompt,
+                "workflow_agent_dispatch_prompt",
+                &dispatch_env,
+            )?
+            .0;
             // An unrecognised `--runtime` is an error, never a silent fall
             // back to the harness -- the same rule every other zirv runtime
             // seam applies.
@@ -920,14 +932,14 @@ pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let report = CapabilityReport::for_repo(report_for, &repo)?;
             let seat = registry.ensure_supported(&args.id, &report)?;
             if native {
-                return dispatch_native_seat(&repo, &args.adapter, seat, &args.prompt, writer);
+                return dispatch_native_seat(&repo, &args.adapter, seat, &prompt, writer);
             }
             let adapter = crate::commands::ctx::adapters::all(None)
                 .into_iter()
                 .find(|candidate| candidate.name() == args.adapter)
                 .ok_or_else(|| format!("unknown adapter '{}'", args.adapter))?;
             let task = AgentTask {
-                prompt: args.prompt.clone(),
+                prompt,
                 repo,
                 model: args.model.clone(),
             };
