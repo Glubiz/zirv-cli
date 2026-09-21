@@ -214,6 +214,11 @@ pub struct Seat {
     pub visited: Vec<Visit>,
     #[serde(default)]
     pub last_rollover_at: Option<u64>,
+    /// Consecutive failed attempts, retained across usage refreshes and restarts.
+    #[serde(default)]
+    pub rollover_failures: u32,
+    #[serde(default)]
+    pub failed_rollover_observed_at: Option<u64>,
     #[serde(default)]
     pub pending: Option<Pending>,
     /// The harness this seat was rolled off and still wants back, with the
@@ -358,6 +363,8 @@ pub fn register(
             phase: Phase::Idle,
             visited: Vec::new(),
             last_rollover_at: None,
+            rollover_failures: 0,
+            failed_rollover_observed_at: None,
             pending: None,
             created_at: now,
             updated_at: now,
@@ -611,6 +618,8 @@ pub fn commit(
         previously_displaced
     };
     seat.last_rollover_at = Some(now);
+    seat.rollover_failures = 0;
+    seat.failed_rollover_observed_at = None;
     seat.phase = Phase::Idle;
     seat.pending = None;
     seat.updated_at = now;
@@ -648,11 +657,48 @@ pub fn abort(state: &StateDir, short: &str, generation: u64, now: u64) -> CtxRes
         epoch: cause.observed_at().unwrap_or(now),
         at: now,
     });
+    seat.last_rollover_at = Some(now);
+    seat.rollover_failures = seat.rollover_failures.saturating_add(1);
+    seat.failed_rollover_observed_at = cause.observed_at();
     seat.phase = Phase::Idle;
     seat.pending = None;
     seat.updated_at = now;
     store(state, &seat)?;
     Ok(seat)
+}
+
+/// A failed successor must not be retried on every refreshed usage sample.
+/// Start at the configured cooldown (at least one minute), double after each
+/// failure, and cap at one week. A known window reset releases the delay.
+/// Even after the delay, unchanged usage evidence cannot launch another attempt.
+pub fn failure_backoff_active(
+    seat: &Seat,
+    cfg: &CtxConfig,
+    now: u64,
+    observed_at: u64,
+    resets_at: Option<u64>,
+) -> bool {
+    if seat.rollover_failures == 0 {
+        return false;
+    }
+    let Some(last) = seat.last_rollover_at else {
+        return false;
+    };
+    let delay = cfg
+        .fallback
+        .rollover_cooldown_secs
+        .max(60)
+        .saturating_mul(1u64 << seat.rollover_failures.saturating_sub(1).min(20))
+        .min(7 * 24 * 60 * 60);
+    let retry_at = resets_at
+        .filter(|reset| *reset > last)
+        .map_or(last.saturating_add(delay), |reset| {
+            reset.min(last.saturating_add(delay))
+        });
+    now < retry_at
+        || seat
+            .failed_rollover_observed_at
+            .is_some_and(|failed| observed_at <= failed)
 }
 
 /// Parks a seat: moves it to [`Phase::Parked`] until `until`, for whatever
@@ -1470,6 +1516,8 @@ mod tests {
             phase: Phase::Idle,
             visited: Vec::new(),
             last_rollover_at: None,
+            rollover_failures: 0,
+            failed_rollover_observed_at: None,
             pending: None,
             created_at: 1_000,
             updated_at: 1_000,
@@ -1494,6 +1542,69 @@ mod tests {
         let json = serde_json::to_string(&parsed).expect("serialize");
         let round_tripped: Seat = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped.runtime, RuntimeKind::Harness);
+    }
+
+    #[test]
+    fn failed_rollover_backoff_survives_refresh_and_grows_until_reset() {
+        let (_dir, state) = state();
+        let cfg = CtxConfig::default();
+        register(
+            &state,
+            "abcd1234",
+            "session-a",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            100,
+        )
+        .unwrap();
+        for (attempt, at) in [(1, 1_000), (2, 2_000), (3, 4_000)] {
+            let generation = prepare(
+                &state,
+                "abcd1234",
+                "codex",
+                None,
+                Cause::Proactive {
+                    headroom_pct: 10.0,
+                    observed_at: at,
+                },
+                at,
+            )
+            .unwrap();
+            let seat = abort(&state, "abcd1234", generation, at).unwrap();
+            assert_eq!(seat.generation, 1);
+            assert_eq!(seat.rollover_failures, attempt);
+            assert_eq!(seat.last_rollover_at, Some(at));
+            let delay = cfg.fallback.rollover_cooldown_secs * (1 << (attempt - 1));
+            assert!(failure_backoff_active(
+                &seat,
+                &cfg,
+                at + delay - 1,
+                at + 1,
+                None
+            ));
+            assert!(!failure_backoff_active(
+                &seat,
+                &cfg,
+                at + delay,
+                at + 1,
+                None
+            ));
+            assert!(failure_backoff_active(&seat, &cfg, at + delay, at, None));
+            assert!(!failure_backoff_active(
+                &seat,
+                &cfg,
+                at + 30,
+                at + 1,
+                Some(at + 30)
+            ));
+        }
+        let generation = prepare(&state, "abcd1234", "codex", None, Cause::Manual, 9_000).unwrap();
+        let seat = commit(&state, "abcd1234", generation, "successor", 9_001).unwrap();
+        assert_eq!(seat.rollover_failures, 0);
+        assert_eq!(seat.failed_rollover_observed_at, None);
     }
 
     #[test]

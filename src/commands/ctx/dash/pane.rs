@@ -122,7 +122,6 @@ pub struct PaneSpec {
 pub(crate) struct SwapLaunch {
     pub spec: PaneSpec,
     pub turn_env: Vec<(String, String)>,
-    pub quit_sequence: String,
     /// The successor adapter's own provider, carried rather than re-derived:
     /// this pane's token reservation moves onto it, and `AgentAdapter::
     /// provider` is the answer the adapter itself gives.
@@ -820,6 +819,8 @@ pub struct Pane {
     /// the dashboard's `Vec<Pane>` did not have to become a `Vec<PaneKind>`
     /// for a native pane to live in it.
     kind: PaneKind,
+    /// An automatic successor under observation; the source still owns this pane.
+    pending_handover: Option<PendingHandover>,
     /// Issue #330 (review finding 2): whether the last drain left this pane's
     /// reader channel unfinished -- it stopped on its share of the tick's
     /// budget rather than on an empty channel. `dash::reap_ended_panes` holds
@@ -1092,6 +1093,67 @@ pub struct PtyPane {
     server: Option<SignalServer>,
 }
 
+fn rollover_receipt_prompt(
+    req: &super::super::handover::HandoverRequest,
+    prompt: String,
+    session: &str,
+) -> String {
+    if req.generation.is_none() {
+        return prompt;
+    }
+    format!(
+        "{prompt} Rollover readiness check: acknowledge receipt of this handoff only. \
+        Do not use tools, delegate, or continue the task yet. The original session still owns \
+        the work. Reply with {} and wait for zirv's next message confirming the transfer before proceeding.",
+        rollover_receipt_token(req, session),
+    )
+}
+
+fn rollover_receipt_token(req: &super::super::handover::HandoverRequest, session: &str) -> String {
+    format!(
+        "zirv-rollover-ready-{}-{}-{}",
+        session,
+        req.generation.unwrap_or(0),
+        req.requested_at
+    )
+}
+
+/// Fully assembled successor, kept separate until it proves ready. Its socket
+/// and screen cannot consume the source's signals or replace its scrollback.
+struct PendingHandover {
+    pty: PtyPane,
+    argv: Vec<String>,
+    agent: String,
+    provider: String,
+    quit_sequence: String,
+    turn_signal_capable: bool,
+    idle_quiet: Duration,
+    launched_at: Instant,
+    handover_at: u64,
+    parser: vt100::Parser,
+    last_output_at: Option<Instant>,
+    signal_seen: bool,
+    forced_drain: bool,
+    started_ms: u64,
+    rollout: Option<PathBuf>,
+    last_readiness_poll: Option<Instant>,
+    source_input_at: Option<Instant>,
+    receipt: String,
+    source_conversation: Option<String>,
+}
+
+impl PendingHandover {
+    fn stop(&mut self) {
+        #[cfg(not(unix))]
+        if let Some(pid) = self.pty.child.process_id() {
+            supervise::kill_tree(pid);
+        }
+        let _ = self.pty.child.kill();
+        let _ = self.pty.child.wait();
+        self.pty.lifecycle.release();
+    }
+}
+
 /// The one message every pty-only operation refuses a native pane with.
 pub(crate) const NOT_A_PTY_PANE: &str =
     "dashboard pane: this is a native pane; it has no pty to write to";
@@ -1258,6 +1320,7 @@ impl Pane {
             session_id,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
             kind: PaneKind::Native(Box::new(native)),
+            pending_handover: None,
             pending_output: false,
             guard,
             state_dir: state.clone(),
@@ -1592,6 +1655,7 @@ impl Pane {
                 rx,
                 server,
             }),
+            pending_handover: None,
             pending_output: false,
             guard,
             state_dir: state.clone(),
@@ -2688,6 +2752,7 @@ impl Pane {
     /// registry record and unpublishes its socket path. A second call is a
     /// no-op -- see `done`'s own doc comment.
     pub fn shutdown(&mut self, quit_sequence: &str) -> CtxResult<()> {
+        self.cancel_handover();
         if self.done {
             return Ok(());
         }
@@ -2747,6 +2812,7 @@ impl Pane {
     /// The socket path unpublished is this pane's OWN session id, which the
     /// successor does not share, so that one is an ordinary release.
     pub fn retire_for_successor(&mut self, quit_sequence: &str) {
+        self.cancel_handover();
         if self.done {
             return;
         }
@@ -2797,6 +2863,7 @@ impl Pane {
     /// Idempotent via `done`, exactly like [`Pane::shutdown`] -- calling both
     /// is safe, the second is a no-op.
     pub fn finish_shutdown(&mut self) -> CtxResult<()> {
+        self.cancel_handover();
         if self.done {
             return Ok(());
         }
@@ -2949,6 +3016,11 @@ impl Pane {
                         &self.state_dir,
                         session_id,
                     );
+                    let prompt_text = if self.is_native() {
+                        prompt_text
+                    } else {
+                        rollover_receipt_prompt(req, prompt_text, session_id)
+                    };
                     new_adapter.interactive_cmd(Some(&prompt_text), &extra)
                 } else {
                     // Issue #440's source recovery: the role layer only --
@@ -2964,6 +3036,11 @@ impl Pane {
                     &self.state_dir,
                     session_id,
                 );
+                let prompt_text = if self.is_native() {
+                    prompt_text
+                } else {
+                    rollover_receipt_prompt(req, prompt_text, session_id)
+                };
                 new_adapter.interactive_cmd(Some(&prompt_text), &extra)
             };
             std::iter::once(command.get_program().to_string_lossy().to_string())
@@ -3025,7 +3102,6 @@ impl Pane {
                 title,
             },
             turn_env,
-            quit_sequence: new_adapter.quit_sequence().to_string(),
             provider: new_adapter.provider().to_string(),
             turn_signal_capable: new_adapter.capabilities().turn_signal,
             idle_quiet: Duration::from_millis(cfg.dash.idle_quiet_ms),
@@ -3033,7 +3109,7 @@ impl Pane {
     }
 
     /// Issue #84: swaps this pane's harness/model in place, keeping its
-    /// registry short id (the same socket, the same mail/nudge address) --
+    /// registry short id (the same mail/nudge address) --
     /// only the pty, the child, its job/console-close guard, the writer, the
     /// reader channel, the vt100 screen, and the turn-signal capability/
     /// idle-quiet knobs the new adapter carries are replaced. Mirrors
@@ -3048,6 +3124,10 @@ impl Pane {
     /// through the successor's system-prompt file when it has one, and on the
     /// bounded positional/task-prompt channel otherwise, so a target adapter
     /// with no system-prompt mechanism at all (codex) still receives it.
+    ///
+    /// Automatic transfers stage the new child on a separate socket and
+    /// leave the source intact until `commit_handover` confirms readiness.
+    /// Manual handovers install immediately.
     ///
     /// The caller has already decided this is a safe moment to act (`Pane::
     /// state() == PaneState::Idle`, or the operator's own explicit override)
@@ -3074,6 +3154,26 @@ impl Pane {
                     .into(),
             );
         }
+        if self.pending_handover.is_some() {
+            return Err("dashboard pane: a successor is already being checked".into());
+        }
+        let quit_sequence = super::super::adapters::select(Some(self.agent()), &[], cfg)?
+            .quit_sequence()
+            .to_string();
+        let source_conversation = sessions::native_conversation(
+            &self.state_dir,
+            self.short(),
+            self.agent(),
+            self.session_id(),
+            super::super::runtime::RuntimeKind::Harness,
+        );
+        let staged_server = if req.generation.is_some() {
+            Some(SignalServer::bind(
+                &self.state_dir.socket_for(&uuid::Uuid::new_v4().to_string()),
+            )?)
+        } else {
+            None
+        };
         let launch = self.build_swap_launch(
             cfg,
             req,
@@ -3081,8 +3181,9 @@ impl Pane {
             role,
             repo,
             &self.session_id.clone(),
-            self.pty()
-                .and_then(|pty| pty.server.as_ref())
+            staged_server
+                .as_ref()
+                .or_else(|| self.pty().and_then(|pty| pty.server.as_ref()))
                 .map(super::super::signal::SignalServer::path),
             self.title.clone(),
         )?;
@@ -3094,11 +3195,13 @@ impl Pane {
                     ..
                 },
             turn_env,
-            quit_sequence,
             provider: new_provider,
             turn_signal_capable,
             idle_quiet,
         } = launch;
+        if req.generation.is_some() && !turn_signal_capable && new_agent_name != "codex" {
+            return Err("automatic rollover requires a verified successor answer signal; original session retained".into());
+        }
         let mcp_args = super::super::mcp::launch::arguments(
             &new_agent_name,
             repo,
@@ -3151,6 +3254,10 @@ impl Pane {
         wrap::answer_inherit_cursor_probe(&mut *first_writer);
         let writer = Arc::new(Mutex::new(first_writer));
 
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
@@ -3182,6 +3289,236 @@ impl Pane {
             }
         });
 
+        let prepared = PendingHandover {
+            pty: PtyPane {
+                master,
+                child,
+                lifecycle,
+                writer,
+                rx,
+                server: staged_server,
+            },
+            argv: new_argv,
+            agent: new_agent_name,
+            provider: new_provider,
+            quit_sequence,
+            turn_signal_capable,
+            idle_quiet,
+            launched_at,
+            handover_at,
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
+            last_output_at: None,
+            signal_seen: false,
+            forced_drain: req.structural_only,
+            started_ms,
+            rollout: None,
+            last_readiness_poll: None,
+            source_input_at: self.last_local_input_at,
+            receipt: rollover_receipt_token(req, self.session_id()),
+            source_conversation,
+        };
+        if req.generation.is_some() {
+            self.pending_handover = Some(prepared);
+            return Ok(());
+        }
+        self.install_handover(prepared)?;
+        Ok(())
+    }
+
+    pub(crate) fn has_pending_handover(&self) -> bool {
+        self.pending_handover.is_some()
+    }
+
+    /// Poll only the candidate. A source turn or repaint is never readiness
+    /// evidence for its successor. Keep the UI's source pane alive throughout.
+    pub(crate) fn poll_handover(
+        &mut self,
+        timeout: Duration,
+    ) -> (super::super::rollover::Readiness, String) {
+        use super::super::rollover::Readiness;
+        let Some(pending) = self.pending_handover.as_mut() else {
+            return (Readiness::Dead, "the staged successor is gone".to_string());
+        };
+        if pending.source_input_at != self.last_local_input_at {
+            return (
+                Readiness::Dead,
+                "the source received new input; original session retained".to_string(),
+            );
+        }
+        let (any, _, _) = drain_into(&pending.pty.rx, &mut pending.parser, DRAIN_BUDGET_BYTES);
+        if any {
+            pending.last_output_at = Some(Instant::now());
+        }
+        if let Some(server) = pending.pty.server.as_ref() {
+            while server.try_recv().is_some() {
+                pending.signal_seen = true;
+            }
+        }
+        if let Ok(Some(status)) = pending.pty.child.try_wait() {
+            let tail = pending
+                .parser
+                .screen()
+                .contents()
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .chars()
+                .take(160)
+                .collect::<String>();
+            return (
+                Readiness::Dead,
+                format!(
+                    "the successor exited before it answered (exit {}): {}",
+                    status.exit_code(),
+                    tail
+                ),
+            );
+        }
+        let codex = pending.agent == "codex";
+        if codex
+            && !pending.signal_seen
+            && pending
+                .last_readiness_poll
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            pending.last_readiness_poll = Some(Instant::now());
+            pending.signal_seen = super::super::adapters::codex::successor_answered(
+                &self.cwd,
+                pending.started_ms,
+                &pending.receipt,
+                &mut pending.rollout,
+            );
+        }
+        let readiness = super::super::rollover::successor_readiness(
+            true,
+            pending.turn_signal_capable || codex,
+            pending.signal_seen,
+            signal_less_quiescent(
+                pending.last_output_at,
+                None,
+                Instant::now(),
+                pending.idle_quiet,
+            ),
+            pending.launched_at.elapsed(),
+            timeout,
+        );
+        (
+            readiness,
+            "the successor did not answer within handoff.timeout_secs".to_string(),
+        )
+    }
+
+    pub(crate) fn cancel_handover(&mut self) {
+        if let Some(mut pending) = self.pending_handover.take() {
+            pending.stop();
+            // A candidate hook can report a conversation under this stable
+            // address. On abort, keep the live source's observed reference.
+            if let Some(conversation) = pending.source_conversation {
+                sessions::record_native_conversation(
+                    &self.state_dir,
+                    self.short(),
+                    self.agent(),
+                    self.session_id(),
+                    &conversation,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn commit_handover(&mut self, repo: &Path, generation: u64) -> CtxResult<()> {
+        if self.pending_handover.is_none() {
+            return Err("no staged successor".into());
+        }
+        // Preserve the displaced conversation even if the candidate's first
+        // hook has already written its own conversation at this seat address.
+        let candidate_conversation = self.pending_handover.as_ref().and_then(|pending| {
+            sessions::native_conversation(
+                &self.state_dir,
+                self.short(),
+                &pending.agent,
+                self.session_id(),
+                super::super::runtime::RuntimeKind::Harness,
+            )
+        });
+        if let Some(conversation) = self
+            .pending_handover
+            .as_ref()
+            .and_then(|pending| pending.source_conversation.as_deref())
+        {
+            sessions::record_native_conversation(
+                &self.state_dir,
+                self.short(),
+                self.agent(),
+                self.session_id(),
+                conversation,
+            );
+        }
+        // Persist ownership before retiring anything. A failed commit cancels
+        // only the staged child, leaving the source and all its workers alive.
+        if let Err(error) = super::super::rollover::commit(
+            &self.state_dir,
+            "dash",
+            self.short(),
+            generation,
+            self.session_id(),
+            super::super::state::now_secs(),
+        ) {
+            self.cancel_handover();
+            return Err(error);
+        }
+        let pending = self.pending_handover.take().ok_or("no staged successor")?;
+        super::super::rollover_runtime::settle_subagents(
+            &self.state_dir,
+            repo,
+            self.short(),
+            Some(self.session_id()),
+            if pending.forced_drain {
+                super::super::rollover_runtime::Drain::Forced
+            } else {
+                super::super::rollover_runtime::Drain::Quiesced
+            },
+            super::super::state::now_secs(),
+        );
+        self.install_handover(pending)?;
+        if let Some(conversation) = candidate_conversation {
+            sessions::record_native_conversation(
+                &self.state_dir,
+                self.short(),
+                self.agent(),
+                self.session_id(),
+                &conversation,
+            );
+        }
+        self.inject_visible(
+            "zirv rollover",
+            "The transfer is confirmed. Continue the task from the handoff now.",
+        )
+    }
+
+    fn install_handover(&mut self, prepared: PendingHandover) -> CtxResult<()> {
+        let PendingHandover {
+            pty:
+                PtyPane {
+                    master,
+                    child,
+                    lifecycle,
+                    writer,
+                    rx,
+                    server,
+                },
+            argv: new_argv,
+            agent: new_agent_name,
+            provider: new_provider,
+            quit_sequence,
+            turn_signal_capable,
+            idle_quiet,
+            launched_at,
+            handover_at,
+            parser,
+            last_output_at,
+            signal_seen,
+            ..
+        } = prepared;
         // The successor is fully assembled and alive now -- only committing
         // remains, so it is safe to retire the old child.
         //
@@ -3257,10 +3594,13 @@ impl Pane {
         // The turn-signal socket is this pane's own and survives the swap:
         // the successor is told the same socket path, so the server moves to
         // the new backend rather than being rebound.
-        let server = match &mut self.kind {
+        let server = server.or_else(|| match &mut self.kind {
             PaneKind::Wrapped(pty) => pty.server.take(),
             _ => None,
-        };
+        });
+        if let Some(server) = &server {
+            wrap::publish_socket_path(&self.state_dir, &self.session_id, server.path());
+        }
         self.kind = PaneKind::Wrapped(PtyPane {
             master,
             child,
@@ -3272,10 +3612,10 @@ impl Pane {
         // A fresh channel has nothing outstanding on it: whatever the old
         // child left queued died with its receiver.
         self.pending_output = false;
-        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
+        self.parser = parser;
         self.turn_signal_capable = turn_signal_capable;
         self.idle_quiet = idle_quiet;
-        self.last_signal_at = None;
+        self.last_signal_at = signal_seen.then(Instant::now);
         self.launch_model = super::super::adapters::last_model_flag(&new_argv).map(str::to_string);
         self.measured_usage = None;
         // A3-2: both latches belong to the CHILD, not to this pane -- the
@@ -3285,7 +3625,7 @@ impl Pane {
         // same reason; a swap is the same kind of event.
         self.budget_soft_warned = false;
         self.budget_grace_given = false;
-        self.last_output_at = None;
+        self.last_output_at = last_output_at;
         self.last_local_input_at = None;
         self.injected_awaiting_turn = false;
         self.user_typed_since_turn = false;
@@ -3345,6 +3685,276 @@ impl Pane {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// #710: exercise usage admission, a real PTY successor, and the dashboard's
+    /// settlement loop. The source process, its worker, socket and screen survive
+    /// both an exit-2 launch failure and a successor that never answers.
+    #[cfg(unix)]
+    #[test]
+    fn usage_rollover_keeps_source_until_successor_answers() {
+        use crate::commands::ctx::{rollover, rollover_runtime, seat, window};
+        for outcome in ["exit2", "timeout", "ready", "commit-failure", "new-input"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = StateDir::from_root(tmp.path().join("s"));
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let script = tmp.path().join("successor.sh");
+            std::fs::write(
+                &script,
+                if outcome == "exit2" {
+                    "#!/bin/sh\necho 'error: incompatible CLI flags'\nexit 2\n"
+                } else {
+                    "#!/bin/sh\necho 'candidate startup screen'\nexec sleep 60\n"
+                },
+            )
+            .unwrap();
+            let mut cfg = super::super::CtxConfig {
+                agent_bin: Some(format!("sh {}", script.display())),
+                ..Default::default()
+            };
+            cfg.pace.estimator = false;
+            cfg.fallback.auto_orchestrator_rollover = Some(true);
+            let session = "71000000-3333-4444-8888-555555555555";
+            let mut spec = test_spec(session);
+            spec.agent_name = "claude".into();
+            spec.role = PromptRole::Orchestrator;
+            spec.verb = Verb::Chat;
+            spec.argv = vec![
+                "sh".into(),
+                "-c".into(),
+                "echo source-context; sleep 60 & echo $! > worker.pid; wait".into(),
+            ];
+            let mut source = Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                DEFAULT_IDLE_QUIET,
+            )
+            .unwrap();
+            let pid = source.child_pid().unwrap();
+            let short = source.short().to_string();
+            sessions::record_native_conversation(
+                &state,
+                &short,
+                "claude",
+                session,
+                "original-conversation",
+            );
+            let socket = source
+                .pty()
+                .unwrap()
+                .server
+                .as_ref()
+                .unwrap()
+                .path()
+                .to_path_buf();
+            let now = crate::commands::ctx::state::now_secs();
+            for (provider, used) in [("anthropic", 90.0), ("openai", 10.0)] {
+                window::store_for(
+                    &state,
+                    provider,
+                    &window::UsageWindows {
+                        five_hour: None,
+                        seven_day: Some(window::Window {
+                            used_percentage: used,
+                            resets_at: now + 86_400,
+                            observed_at: now,
+                            overage_covered: false,
+                            limit_reached: false,
+                        }),
+                    },
+                )
+                .unwrap();
+            }
+            let rollover::Evaluation::Rollover {
+                request,
+                generation,
+                ..
+            } = rollover::evaluate(&state, &cfg, "dash", &short, now, true, None, true)
+            else {
+                panic!("usage exhaustion must prepare a successor")
+            };
+            let note = crate::commands::ctx::handoff::structural(
+                &crate::commands::ctx::event::StructuralContext {
+                    user_messages: vec!["Finish the task while preserving the worker".into()],
+                    ..Default::default()
+                },
+            );
+            let plan = rollover_runtime::plan_successor(
+                crate::commands::ctx::runtime::RuntimeKind::Harness,
+                crate::commands::ctx::runtime::RuntimeKind::Harness,
+                &short,
+                generation,
+                Some("codex"),
+                request.target_model.as_deref(),
+                None,
+                None,
+                None,
+            );
+            let mut launcher = super::super::PaneSuccessorLauncher {
+                pane: &mut source,
+                cfg: &cfg,
+                req: &request,
+                note: &note,
+                role: PromptRole::Orchestrator,
+                repo: &repo,
+                size: (80, 24),
+                native: Default::default(),
+            };
+            rollover_runtime::launch_successor(
+                &state,
+                &repo,
+                &mut launcher,
+                &plan,
+                Some(session),
+                rollover_runtime::Drain::Quiesced,
+                now,
+            )
+            .unwrap();
+            assert_eq!(source.child_pid(), Some(pid));
+            sessions::record_native_conversation(
+                &state,
+                &short,
+                "codex",
+                session,
+                "unconfirmed-conversation",
+            );
+            assert_ne!(
+                source
+                    .pending_handover
+                    .as_ref()
+                    .unwrap()
+                    .pty
+                    .server
+                    .as_ref()
+                    .unwrap()
+                    .path(),
+                socket
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !repo.join("worker.pid").is_file() && Instant::now() < deadline {
+                source.drain();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            source.drain();
+            let worker: u32 = std::fs::read_to_string(repo.join("worker.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // Neither a source turn nor quiet startup output proves a Codex answer.
+            source.last_signal_at = Some(Instant::now());
+            if outcome == "new-input" {
+                source.last_local_input_at = Some(Instant::now());
+            }
+            let staged = source.pending_handover.as_mut().unwrap();
+            staged.last_output_at = Some(Instant::now() - Duration::from_secs(30));
+            staged.last_readiness_poll = Some(Instant::now());
+            if outcome == "timeout" {
+                staged.launched_at =
+                    Instant::now() - Duration::from_secs(cfg.handoff.timeout_secs + 1);
+            } else if matches!(outcome, "ready" | "commit-failure") {
+                let rollout = tmp.path().join("answer.jsonl");
+                std::fs::write(&rollout,
+                    serde_json::json!({"type":"event_msg", "payload": {"type":"task_complete", "last_agent_message": staged.receipt}}).to_string()).unwrap();
+                staged.rollout = Some(rollout);
+                staged.last_readiness_poll = None;
+                if outcome == "commit-failure" {
+                    seat::abort(&state, &short, generation, now).unwrap();
+                }
+            }
+            let mut panes = vec![source];
+            let mut pending = Some((short.clone(), generation, Instant::now()));
+            let mut errors = super::super::ErrorLog::default();
+            while pending.is_some() && Instant::now() < deadline {
+                panes[0].drain();
+                super::super::settle_pending_rollover(
+                    &mut panes,
+                    &cfg,
+                    &repo,
+                    &state,
+                    &mut pending,
+                    &mut errors,
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(pending.is_none(), "{outcome}: candidate did not settle");
+            let saved = seat::load(&state, &short).unwrap();
+            let log =
+                std::fs::read_to_string(state.logs().join(crate::commands::ctx::log::LOG_FILE))
+                    .unwrap();
+            assert_eq!(log.matches(rollover::PREPARED).count(), 1, "{log}");
+            if outcome == "ready" {
+                assert_ne!(panes[0].child_pid(), Some(pid));
+                assert_eq!(saved.generation, generation);
+                assert_eq!(log.matches(rollover::COMMITTED).count(), 1);
+                assert_eq!(saved.rollover_failures, 0);
+            } else {
+                assert_eq!(panes[0].child_pid(), Some(pid));
+                assert_eq!(panes[0].agent(), "claude");
+                assert!(sessions::is_alive(pid));
+                assert!(
+                    sessions::is_alive(worker),
+                    "{outcome}: the subagent must survive"
+                );
+                assert!(panes[0].screen().contents().contains("source-context"));
+                assert!(
+                    !panes[0]
+                        .screen()
+                        .contents()
+                        .contains("Continue from the handoff")
+                );
+                assert_eq!(
+                    panes[0].pty().unwrap().server.as_ref().unwrap().path(),
+                    socket
+                );
+                assert_eq!(
+                    sessions::native_conversation(
+                        &state,
+                        &short,
+                        "claude",
+                        session,
+                        crate::commands::ctx::runtime::RuntimeKind::Harness
+                    )
+                    .as_deref(),
+                    Some("original-conversation")
+                );
+                assert_eq!(saved.generation, 1);
+                assert_eq!(saved.rollover_failures, 1);
+                assert!(saved.last_rollover_at.is_some());
+                assert_eq!(log.matches(rollover::FAILED).count(), 1, "{log}");
+                assert!(!log.contains(rollover::COMMITTED));
+                if outcome == "exit2" {
+                    assert!(log.contains("exit 2"), "{log}");
+                }
+                let refreshed = now + 1;
+                window::store_for(
+                    &state,
+                    "anthropic",
+                    &window::UsageWindows {
+                        five_hour: None,
+                        seven_day: Some(window::Window {
+                            used_percentage: 91.0,
+                            resets_at: now + 86_400,
+                            observed_at: refreshed,
+                            overage_covered: false,
+                            limit_reached: false,
+                        }),
+                    },
+                )
+                .unwrap();
+                assert!(
+                    matches!(rollover::evaluate(&state, &cfg, "dash", &short, refreshed, true, None, true),
+                    rollover::Evaluation::Skip(reason) if reason.contains("backoff"))
+                );
+            }
+            panes[0].finish_shutdown().unwrap();
+        }
+    }
 
     #[test]
     fn pane_state_maps_turn_signals_to_glyph_states() {
