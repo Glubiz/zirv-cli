@@ -475,6 +475,7 @@ pub fn baseline(
         created_at: 0,
     };
     apply_security_risk_floor(&mut decision);
+    apply_orchestration_request_complexity_floor(&mut decision, request);
     finalize_derived_fields(&mut decision, cfg);
     decision
 }
@@ -497,6 +498,57 @@ fn apply_security_risk_floor(decision: &mut ProxyDecision) {
         decision
             .reasons
             .push("risk: raised to high because the request names a security surface".to_string());
+    }
+}
+
+/// An explicit request for parallel or delegated multi-agent work is itself
+/// a coordination requirement, even when intake has no diff to measure and
+/// every model decider is unavailable. Without this floor, the text-only
+/// deterministic baseline classifies such requests as `Trivial`, so a Jev
+/// authentication failure followed by a helper timeout silently collapses
+/// the requested team to one cheap seat. The one place this rule lives,
+/// called from the tail of both [`baseline`] and [`merge`].
+fn apply_orchestration_request_complexity_floor(decision: &mut ProxyDecision, request: &str) {
+    let text = request.to_ascii_lowercase();
+    let explicitly_parallel = [
+        "parallelize",
+        "parallelise",
+        "in parallel",
+        "parallel agents",
+        "parallel workers",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal));
+    let explicitly_multi_agent = [
+        "multiple agents",
+        "multiple workers",
+        "multiple harnesses",
+        "spawn agents",
+        "spawn workers",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal));
+    let delegates_work = ["delegate", "for some of the work", "for part of the work"]
+        .iter()
+        .any(|signal| text.contains(signal));
+    let names_another_harness = adapters::ADAPTERS.iter().any(|(name, _)| {
+        *name != decision.orchestrator.harness
+            && text
+                .split(|c: char| !c.is_alphanumeric() && c != '-')
+                .any(|word| word == *name)
+    });
+
+    if decision.complexity < Complexity::Substantial
+        && (explicitly_parallel
+            || explicitly_multi_agent
+            || (delegates_work && names_another_harness))
+    {
+        decision.complexity = Complexity::Substantial;
+        decision.validation.independent_test = true;
+        decision.reasons.push(
+            "complexity: raised to substantial because the request explicitly asks for parallel or delegated multi-agent work"
+                .to_string(),
+        );
     }
 }
 
@@ -1098,6 +1150,7 @@ pub fn merge(
     decision.validation.independent_test |= recomputed_validation.independent_test;
     decision.validation.security_review |= recomputed_validation.security_review;
     apply_security_risk_floor(&mut decision);
+    apply_orchestration_request_complexity_floor(&mut decision, request);
     finalize_derived_fields(&mut decision, cfg);
 
     decision
@@ -1688,6 +1741,46 @@ mod tests {
         assert!(raised.validation.independent_review);
     }
 
+    #[test]
+    fn explicit_parallel_delegation_floors_baseline_and_merge_to_orchestrated() {
+        let request = concat!(
+            "We need to add a way of creating / adding short links to sms' within the marketing ",
+            "backoffice. We have some existing logic regarding short links in the monolith at ",
+            "the moment, but i dont know how this works. Linear card: ",
+            "https://linear.app/cego/issue/MARKAU-131/undersog-hvordan-vi-skal-gore-i-forhold-til-shortlinks-til-bla-smser. ",
+            "Parallelize as much of the work as possible, and use codex (sol / astra) for some ",
+            "of the work."
+        );
+        let classification = classify_request(request);
+        assert_eq!(classification.complexity, Complexity::Trivial);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let roster = Roster {
+            harnesses: Vec::new(),
+            registry: None,
+        };
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.complexity, Complexity::Substantial);
+        assert_eq!(decision.execution, ExecutionMode::Orchestrated);
+        assert_eq!(decision.seat_role, SeatRole::Orchestrator);
+        assert!(decision.validation.independent_test);
+        assert!(decision.reasons.iter().any(|reason| {
+            reason.contains("request explicitly asks for parallel or delegated multi-agent work")
+        }));
+
+        let mut unfloored_baseline = sample_decision();
+        unfloored_baseline.complexity = Complexity::Trivial;
+        unfloored_baseline.execution = ExecutionMode::Direct;
+        unfloored_baseline.seat_role = SeatRole::Single;
+        unfloored_baseline.validation = ValidationProfile::default();
+        let merged = merge(&cfg, &unfloored_baseline, request, &Answers::new(), 0.5);
+        assert_eq!(merged.complexity, Complexity::Substantial);
+        assert_eq!(merged.execution, ExecutionMode::Orchestrated);
+        assert_eq!(merged.seat_role, SeatRole::Orchestrator);
+        assert!(merged.validation.independent_test);
+    }
+
     /// Issue #537 battery finding: a sensitive-surface risk floor must also
     /// floor execution, so a one-line auth change can never route as
     /// `Direct` on wording or diff size alone.
@@ -1769,6 +1862,7 @@ mod tests {
         );
         assert_eq!(plain_decision.risk, RiskBand::Low);
         assert_eq!(plain_decision.execution, ExecutionMode::Direct);
+        assert_eq!(plain_decision.seat_role, SeatRole::Single);
     }
 
     /// Issue #537 fix: a feature branch can carry thousands of lines that
