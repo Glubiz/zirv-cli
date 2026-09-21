@@ -1202,4 +1202,39 @@ mod tests {
             .expect_err("only 'small' is a valid capacity value");
         assert!(err.to_string().contains("small"), "got {err}");
     }
+
+    /// Issue #689: verify that an empty `.settings.toml` marker file (written
+    /// by `setup apply` and `zirv init` to mark the machine configured) is
+    /// read as permissive (all adapters enabled) and NOT as fail-closed. This
+    /// is critical: if an empty file triggered the fail-closed path,
+    /// `first_run_needed` would check true, but the machine would have all
+    /// harnesses disabled, which is worse than the original bug.
+    #[test]
+    fn an_empty_settings_toml_marker_leaves_all_adapters_enabled() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_settings(home.path(), ""); // Empty file, like the setup apply marker
+
+        // Verify the empty file can be read (not fail-closed).
+        let settings: SettingsFile =
+            toml::from_str("").expect("empty file must parse as SettingsFile");
+
+        // Verify defaults: empty agents table means no explicit disables.
+        assert!(
+            settings.agents.is_empty(),
+            "empty file should have no agents"
+        );
+
+        // Verify the fold logic: with no explicit `enabled = false` in the
+        // agents table, `AgentGate::load` treats all adapters as enabled.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let gate = AgentGate::load(repo.path(), &|_| None).expect("load");
+
+        for adapter_name in ["claude", "codex"] {
+            assert!(
+                gate.is_enabled(adapter_name),
+                "{adapter_name} must be enabled when .settings.toml is empty (permissive marker)"
+            );
+        }
+    }
 }

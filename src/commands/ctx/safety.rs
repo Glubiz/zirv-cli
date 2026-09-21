@@ -5352,9 +5352,10 @@ fn parse_layer(layer: Option<toml::Value>, origin: &str) -> CtxResult<SafetyLaye
     let Some(layer) = layer else {
         return Ok(SafetyLayer::default());
     };
-    layer
-        .try_into()
-        .map_err(|e| format!("{origin}: invalid [safety] section: {e}").into())
+    layer.try_into().map_err(|e| {
+        let error_msg = e.to_string().replace('\n', " ");
+        format!("{origin}: invalid [safety] section: {error_msg}").into()
+    })
 }
 
 fn rules_from(patterns: &[String], origin: Origin) -> Vec<Rule> {
@@ -18806,18 +18807,37 @@ mod tests {
     /// an operator who pinned `dontAsk` in their own trailing flags. Pinned
     /// end to end against the argv the adapter actually builds, not a
     /// hand-written mode string.
+    ///
+    /// Issue #701 (2026-09-20): an interactive launch with no
+    /// `chat.claude_permission_mode` configured now pins NO `--permission-
+    /// mode` at all -- zirv stopped overriding the operator's own
+    /// `permissions.defaultMode`, which a CLI flag outranks. The effective
+    /// mode is then whatever claude itself resolves, whose own shipped
+    /// default is `"default"`; that is what this test feeds `hook_output`
+    /// for the interactive case, and the absence of the token is asserted
+    /// directly rather than inferred.
     #[test]
     fn the_dont_ask_suppression_is_reachable_only_from_the_headless_posture() {
         use crate::commands::ctx::adapters::{AgentAdapter, claude::ClaudeAdapter};
 
+        /// Claude Code's own shipped `permissions.defaultMode`, which applies
+        /// whenever zirv pins nothing.
+        const CLAUDE_OWN_DEFAULT: &str = "default";
+
         let adapter = ClaudeAdapter::new(None);
-        let mode_of = |mode| -> String {
+        let pinned_mode_of = |mode| -> Option<String> {
             let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
-            let position = args
-                .iter()
-                .position(|a| a == "--permission-mode")
-                .expect("a --permission-mode token");
-            args[position + 1].clone()
+            let position = args.iter().position(|a| a == "--permission-mode")?;
+            Some(args[position + 1].clone())
+        };
+
+        assert_eq!(
+            pinned_mode_of(LaunchMode::Interactive),
+            None,
+            "an unconfigured interactive launch must pin no --permission-mode"
+        );
+        let mode_of = |mode| -> String {
+            pinned_mode_of(mode).unwrap_or_else(|| CLAUDE_OWN_DEFAULT.to_string())
         };
 
         let ask = Outcome {

@@ -1572,7 +1572,13 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
-    let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
+    // Issue #690: `select_for_identity` -- the adapter is needed first to
+    // *parse* the transcript, which `--no-model` never goes beyond. The
+    // optional distiller child below still fails with the adapter's own
+    // not-found error if its binary really is missing, exactly as it did
+    // before presence was consulted anywhere.
+    let adapter =
+        adapters::select_for_identity(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let jsonl = std::fs::read_to_string(&args.transcript)
         .map_err(|e| format!("{}: {e}", args.transcript.display()))?;
     let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);

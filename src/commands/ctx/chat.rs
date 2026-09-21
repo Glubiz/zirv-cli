@@ -231,19 +231,44 @@ pub(crate) fn resolve_adapter(
     cfg: &CtxConfig,
     requested: Option<&str>,
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
+    resolve_adapter_with_presence(cfg, requested, &adapters::liveness_probe)
+}
+
+/// [`resolve_adapter`] with the presence oracle passed in rather than read
+/// off the ambient `PATH` -- the same seam, and for the same reason, as
+/// `adapters::resolve_default_with_presence`'s own doc comment gives: issue
+/// #690 made the last arm's answer depend on what this machine has, so a
+/// test that reads the real `PATH` proves only what the developer happens to
+/// have installed. Threaded through every arm, not just the fallback, so an
+/// injected machine state is the whole truth for a test rather than most of
+/// it; the explicit and configured arms consult it no more than they did
+/// before (`select_with_presence` reaches the oracle only in its own
+/// fallback).
+pub(crate) fn resolve_adapter_with_presence(
+    cfg: &CtxConfig,
+    requested: Option<&str>,
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
+    // `true`, the `adapter_builds_launch` answer every empty command carries
+    // (`adapters::select` derives exactly this for a `&[]` caller): `chat`
+    // has no wrapped argv at all, so whatever it resolves is a harness zirv
+    // itself would launch.
     if requested.is_some() {
-        let adapter = adapters::select(requested, &[], cfg)?;
+        let adapter = adapters::select_with_presence(requested, &[], cfg, true, present)?;
         return Ok((adapter, HarnessRule::Explicit));
     }
     match cfg.agent.as_deref() {
         Some(name) => Ok((
-            adapters::select(Some(name), &[], cfg)?,
+            adapters::select_with_presence(Some(name), &[], cfg, true, present)?,
             HarnessRule::Configured,
         )),
-        None => adapters::resolve_default(cfg).map(|(adapter, origin)| {
+        None => adapters::resolve_default_with_presence(cfg, present).map(|(adapter, origin)| {
             let rule = match origin {
                 DefaultOrigin::Configured => HarnessRule::Configured,
                 DefaultOrigin::FirstEnabledReady => HarnessRule::FirstEnabledReady,
+                DefaultOrigin::FirstInstalledReady { not_found } => {
+                    HarnessRule::FirstInstalledReady { not_found }
+                }
             };
             (adapter, rule)
         }),
@@ -396,12 +421,35 @@ fn proxy_intake<E: Write>(
         stderr,
         "zirv \u{25b8} proxy: describe the task (empty line to send)"
     )?;
-    let Some(request) = proxy::read_request(reader) else {
-        return Ok(ProxyIntakeOutcome::Inactive {
-            advisory: Some(
-                "proxy: no request given; starting the orchestrator harness".to_string(),
-            ),
-        });
+    // Issue #701 (operator field report): a blank FIRST line used to skip the
+    // proxy outright, and that skip is invisible -- the advisory below is
+    // wiped by the harness's own alternate screen a moment later, so the
+    // launch looks exactly like one where the proxy never ran at all. Two
+    // ordinary things produce that blank line: the reflexive Enter at a
+    // prompt an operator did not expect, and a stray newline left in the
+    // console input buffer by a line editor (clink on `cmd.exe` here). Ask
+    // once more, naming both ways out; only a SECOND blank line (or EOF)
+    // skips, so a deliberate skip still costs one keypress.
+    let request = match proxy::read_request(reader) {
+        Some(request) => request,
+        None => {
+            writeln!(
+                stderr,
+                "zirv \u{25b8} proxy: nothing typed -- describe the task, or press Enter again to \
+                 start the harness without the proxy"
+            )?;
+            match proxy::read_request(reader) {
+                Some(request) => request,
+                None => {
+                    return Ok(ProxyIntakeOutcome::Inactive {
+                        advisory: Some(
+                            "proxy: no request given; starting the orchestrator harness"
+                                .to_string(),
+                        ),
+                    });
+                }
+            }
+        }
     };
     // Issue #537 review (operator field report): nothing on screen showed
     // that the request was actually sent to the configured decider, so a
@@ -720,6 +768,36 @@ fn run_native_chat<E: Write>(
     // `run_with`'s own nesting refusal (F2) already ran, before `cfg` was
     // even loaded, and covers this branch too -- not repeated here.
     let state = StateDir::resolve(env)?;
+    // Issue #537 (T2/T3, native seam): the harness proxy's own intake used
+    // to be reachable ONLY from the wrapped path below (`run_with`'s own
+    // call, after `resolve_adapter`'s ChromeCaps/adapter setup) -- a native
+    // launch never ran it at all, and unconditionally hardcoded the
+    // `Orchestrator` seat below even with the proxy enabled and answering
+    // correctly. Called here instead -- after every earlier refusal above
+    // (bogus `--runtime`, a wrapped-only flag, no TTY), exactly where the
+    // wrapped path calls it relative to ITS OWN earlier refusals -- so a
+    // native launch honors the same decision through the same guards; see
+    // `proxy_intake`'s own doc comment for the full skip/refuse/decide
+    // sequence.
+    let intake = proxy_intake(
+        cfg,
+        &state,
+        repo,
+        args,
+        stdin_is_tty,
+        &mut std::io::stdin().lock(),
+        stderr,
+    )?;
+    if let ProxyIntakeOutcome::Refuse { message } = &intake {
+        writeln!(stderr, "{message}")?;
+        return Ok(1);
+    }
+    // Issue #537 (T3): the seat this launch actually runs as -- `Single` for
+    // the proxy's own direct/bounded decision, `Orchestrator` for every
+    // other outcome -- the SAME mapping `run_with` applies for the wrapped
+    // path, reused rather than re-derived. See `native_pane_spec` for where
+    // it lands.
+    let seat_role = proxy_prompt_role(&intake);
     // Issue #490 (roadmap N21 item A): the native conversation is the FIRST
     // PANE of the ordinary dashboard now, not a loop of its own. Everything
     // the dashboard already provides -- the sidebar roster, the mail sweep,
@@ -727,29 +805,50 @@ fn run_native_chat<E: Write>(
     // spend -- therefore applies to it unchanged, and a wrapped harness pane
     // can be spawned beside it in the same process.
     let session = uuid::Uuid::new_v4().to_string();
+    let (pane_spec, native_spec) = native_pane_spec(repo, session, seat_role);
     dash::run_dashboard(
         cfg,
         repo,
         env,
         &state,
+        pane_spec,
+        Some(native_spec),
+        args.force_pace,
+    )
+}
+
+/// Issue #537 (T3, native seam): the native pane's own seat spec -- both
+/// `PaneSpec.role` and `NativeDashboardSpec.role` (its string form, via
+/// `PromptRole::label`, the same inverse `dash::mod.rs`'s worker spawn path
+/// already uses for a `requested_role`) come from the ONE `seat_role`
+/// `run_native_chat` already resolved through `proxy_prompt_role` -- never a
+/// hardcoded `Orchestrator` literal. Split out of `run_native_chat` so the
+/// mapping is testable without a real TTY or an actual native session:
+/// `dash::run_dashboard` below it is an interactive loop that would
+/// otherwise need one.
+fn native_pane_spec(
+    repo: &Path,
+    session: String,
+    seat_role: PromptRole,
+) -> (dash::PaneSpec, dash::native_pane::NativeDashboardSpec) {
+    (
         dash::PaneSpec {
             agent_name: super::runtime::RuntimeKind::Native.as_str().to_string(),
             argv: Vec::new(),
-            role: super::prompt::PromptRole::Orchestrator,
+            role: seat_role,
             verb: super::sessions::Verb::Chat,
             session_id: session,
             title: "orch".to_string(),
         },
-        Some(dash::native_pane::NativeDashboardSpec {
+        dash::native_pane::NativeDashboardSpec {
             repo: repo.to_path_buf(),
-            role: "orchestrator".to_string(),
+            role: seat_role.label().to_string(),
             route: None,
             writing: true,
             provider: None,
             seat: None,
             initial_input: None,
-        }),
-        args.force_pace,
+        },
     )
 }
 
@@ -806,13 +905,25 @@ pub fn run_with<W: Write, E: Write>(
     let (stdout_is_tty, stdin_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
 
     // Issue #480 (roadmap N11): `--runtime native` branches out to the
-    // structured native pane before any of the wrapped-harness setup below
-    // (adapter resolution, `ChromeCaps`, `dash_eligible`) -- none of it
-    // applies to a session with no coding harness and no PTY. `_vt_guard`
+    // structured native pane before any of the wrapped-harness-ONLY setup
+    // below (adapter resolution, `ChromeCaps`, `dash_eligible`) -- none of
+    // it applies to a session with no coding harness and no PTY. `_vt_guard`
     // stays in scope across this call (it is a `let`-bound local of this
     // same function, not dropped until `run_with` itself returns), so the
     // native pane's own `ratatui`/`crossterm` setup sees the same VT mode
     // `wrap`'s raw-mode session would have.
+    //
+    // Issue #537 (T2/T3, native seam): the harness proxy's own intake used
+    // to be reachable ONLY below, once this function had already committed
+    // to the wrapped path -- a native launch never ran it at all, and
+    // `run_native_chat` always started as a hardcoded `Orchestrator` seat
+    // even with the proxy enabled and answering correctly. `run_native_chat`
+    // now calls `proxy_intake` itself, after its own earlier refusals
+    // (bogus `--runtime`, a wrapped-only flag, no TTY) and before building
+    // its pane spec -- see that function's own doc comment and
+    // `native_pane_spec`. Nothing here has to change to make that happen:
+    // `native` is still decided purely from `args.runtime`/`configured`,
+    // with no state or proxy dependency of its own.
     //
     // Issue #491 (roadmap N22): with no `--runtime` at all, the operator's
     // own `[runtime]` table decides, through the same `runtime::resolve`
@@ -1035,6 +1146,7 @@ pub fn run_with<W: Write, E: Write>(
     // dashboard branch and the `wrap` fallback disclose identically, and
     // independently of whether a banner was printed at all.
     announce_model_choice(stderr, &cfg, args.quiet);
+    announce_harness_choice(stderr, &cfg, args.quiet, adapter.name(), rule);
 
     // Issue #352: the persistent runtime, when the operator has turned it on
     // and there is a terminal to attach. Checked before the dashboard branch
@@ -1198,6 +1310,42 @@ fn announce_model_choice<E: Write>(stderr: &mut E, cfg: &CtxConfig, quiet: bool)
         stderr,
         &super::announce::Event::ChatModel {
             model: model.clone(),
+        },
+    );
+}
+
+/// Issue #690: discloses that the harness was chosen because the one ahead
+/// of it in registry order is not installed -- which one was picked, which
+/// one was missing, and how to pin the choice instead of leaving it to this
+/// rule. A no-op for every other `HarnessRule`, so the common case gains no
+/// line at all.
+///
+/// On the same channel, and for the same reason, as `announce_model_choice`
+/// above: `chrome.banner` is not `REPO_FORBIDDEN` and the banner's compact
+/// tiers have no room for this anyway, while `chrome.events` **is**, so this
+/// is a disclosure a repo checkout cannot silence and the operator still
+/// can (`--quiet`/`ZIRV_CTX_QUIET`). Presence is an operator-owned fact and
+/// acting on it is right; acting on it without saying so is what would make
+/// it a silent provider switch.
+fn announce_harness_choice<E: Write>(
+    stderr: &mut E,
+    cfg: &CtxConfig,
+    quiet: bool,
+    chosen: &str,
+    rule: HarnessRule,
+) {
+    let HarnessRule::FirstInstalledReady { not_found } = rule else {
+        return;
+    };
+    super::announce::Announcer::new(
+        cfg.chrome.events && !quiet,
+        console::colors_enabled_stderr(),
+    )
+    .emit_to(
+        stderr,
+        &super::announce::Event::HarnessAutoSelected {
+            chosen: chosen.to_string(),
+            not_found: not_found.to_string(),
         },
     );
 }
@@ -2546,6 +2694,49 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// Issue #690: the banner's rule has to carry what the origin carries,
+    /// or the one surface an operator reads at launch says "auto" where the
+    /// truth is "the harness you configured nothing about is the only one
+    /// you have". Injected rather than read off `PATH`: on a runner with no
+    /// harness installed at all, an ambient probe would make this assert
+    /// about the runner instead of about the mapping.
+    #[test]
+    fn the_harness_rule_carries_the_missing_harness_the_origin_named() {
+        let cfg = CtxConfig::default();
+
+        let (adapter, rule) =
+            resolve_adapter_with_presence(&cfg, None, &adapters::only_installed(&["codex"]))
+                .expect("codex is installed, so there is an answer");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(
+            rule,
+            HarnessRule::FirstInstalledReady {
+                not_found: "claude"
+            }
+        );
+
+        let (adapter, rule) =
+            resolve_adapter_with_presence(&cfg, None, &adapters::everything_installed())
+                .expect("a default exists");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(
+            rule,
+            HarnessRule::FirstEnabledReady,
+            "with nothing missing the banner reads exactly as it always did"
+        );
+
+        // An explicitly requested harness bypasses presence entirely, even
+        // when this machine is the one that does not have it.
+        let (adapter, rule) = resolve_adapter_with_presence(
+            &cfg,
+            Some("claude"),
+            &adapters::only_installed(&["codex"]),
+        )
+        .expect("an explicit --agent is never second-guessed");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(rule, HarnessRule::Explicit);
+    }
+
     /// The registry's own aggregated error (naming every candidate and why it
     /// was skipped) is the message shown when nothing is both enabled and
     /// ready -- the same one `adapters::resolve_default` produces on its own.
@@ -3696,6 +3887,97 @@ mod tests {
         );
     }
 
+    /// Issue #701 (operator field report): the launch looked like the proxy
+    /// had never run at all. A blank FIRST line -- the reflexive Enter at an
+    /// unexpected prompt, or a stray newline a console line editor left in
+    /// the input buffer -- used to skip the proxy outright, and the one-line
+    /// advisory saying so is wiped by the harness's alternate screen a
+    /// moment later. `proxy_intake` must re-prompt once and decide on the
+    /// request that follows.
+    #[test]
+    fn a_blank_first_line_reprompts_instead_of_skipping_the_proxy() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
+        cfg.proxy.typesafe.timeout_secs = 1;
+        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
+            cfg.proxy.typesafe.credential_env.as_str(),
+            Some("a-test-key"),
+        )]);
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            true,
+            &mut &b"
+fix the flaky retry test
+"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        match outcome {
+            ProxyIntakeOutcome::Decided { request, .. } => {
+                assert_eq!(request, "fix the flaky retry test");
+            }
+            other => panic!("expected Decided after the re-prompt, got {other:?}"),
+        }
+        let printed = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            printed.contains("nothing typed"),
+            "the re-prompt must say why it is asking again: {printed}"
+        );
+    }
+
+    /// The other half of the test above: a deliberate skip is still one
+    /// keypress away -- a SECOND blank line (or EOF) falls through to the
+    /// ordinary harness launch with the same named advisory as before.
+    #[test]
+    fn a_second_blank_line_still_skips_the_proxy() {
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.enabled = true;
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
+        cfg.proxy.typesafe.timeout_secs = 1;
+        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
+            cfg.proxy.typesafe.credential_env.as_str(),
+            Some("a-test-key"),
+        )]);
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let args = chat_args(false);
+        let mut stderr = Vec::new();
+
+        let outcome = proxy_intake(
+            &cfg,
+            &state,
+            repo.path(),
+            &args,
+            true,
+            &mut &b"
+
+"[..],
+            &mut stderr,
+        )
+        .expect("never errors");
+
+        match outcome {
+            ProxyIntakeOutcome::Inactive {
+                advisory: Some(reason),
+            } => {
+                assert!(reason.contains("no request given"), "got {reason}");
+            }
+            other => panic!("expected an Inactive skip, got {other:?}"),
+        }
+    }
+
     /// Issue #537 (A2): below `proxy::CLARIFY_THRESHOLD`, `maybe_clarify` is
     /// a complete no-op -- no prompt, `decision`/`request` unchanged --
     /// regardless of what stdin holds; at or above it with an empty answer
@@ -3976,6 +4258,54 @@ mod tests {
             vec![(adapters::SEAT_ROLE_ENV.to_string(), "single".to_string())],
             "the hook write guard and the subagent guard both key off this env pair"
         );
+    }
+
+    /// Issue #537 (T3, native seam): the actual bug this fixes -- a native
+    /// launch's `PaneSpec`/`NativeDashboardSpec` used to hardcode
+    /// `Orchestrator` no matter what the proxy decided, because `proxy_
+    /// intake` never even ran on that path. Reproduced at the seam that
+    /// actually builds those two structs (`native_pane_spec`), fed the SAME
+    /// `proxy_prompt_role(&Decided{SeatRole::Single, ..})` the wrapped
+    /// path's own `a_decided_single_seat_launches_with_no_orchestrator_
+    /// conventions` test above proves for `dash_orchestrator_pane`.
+    #[test]
+    fn native_pane_spec_uses_the_single_seat_role_for_a_decided_single_seat() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let decision = sample_decision(repo.path(), "claude", "fable", None);
+        let outcome = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "fix a typo in README".to_string(),
+        };
+        let seat_role = proxy_prompt_role(&outcome);
+        assert_eq!(seat_role, PromptRole::Single);
+
+        let (pane, native) = native_pane_spec(repo.path(), "session-1".to_string(), seat_role);
+
+        assert_eq!(pane.role, PromptRole::Single);
+        assert_eq!(
+            native.role, "single",
+            "NativeDashboardSpec.role must carry PromptRole::Single's own \
+             label, not a hardcoded string"
+        );
+    }
+
+    /// The mirror of the test above: an intake that never decided this
+    /// launch at all (the disabled-by-default case, exercised end to end by
+    /// `proxy_disabled_by_default_is_silently_inactive`) must still produce
+    /// today's `Orchestrator` seat on the native pane -- not just leave
+    /// `proxy_prompt_role` unchanged (already proven by `proxy_prompt_role_
+    /// maps_seat_role_and_leaves_an_undecided_launch_alone`), but actually
+    /// carry that role through into both fields `run_native_chat` builds.
+    #[test]
+    fn native_pane_spec_keeps_the_orchestrator_role_when_the_proxy_never_decided() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let seat_role = proxy_prompt_role(&ProxyIntakeOutcome::Inactive { advisory: None });
+        assert_eq!(seat_role, PromptRole::Orchestrator);
+
+        let (pane, native) = native_pane_spec(repo.path(), "session-2".to_string(), seat_role);
+
+        assert_eq!(pane.role, PromptRole::Orchestrator);
+        assert_eq!(native.role, "orchestrator");
     }
 
     fn git_init_with_commit(repo: &Path) {

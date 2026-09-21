@@ -117,6 +117,7 @@ means it runs on any supported OS with no provider configured at all.
 | `ctx handover` | -- | `ctx::handover` swaps one vendor CLI for another | a native seat's model is `[roles]` configuration, not a handover -- there is no vendor CLI under a native seat to swap | -- | `legacy-only` |
 | `ctx hook` | `ctx::hook` | same zirv code | none | `hook::tests::hook_status_reports_no_baseline_before_any_install` | `unit` |
 | `ctx inbox` | `ctx::mail` + native `wait`/`result` tools | same zirv code | none | `mail::tests::inbox_marks_a_fan_out_message_read_without_removing_it_for_other_sessions` | `unit` |
+| `ctx jev` | `ctx::jev` | same zirv code | none | `jev::tests::available_is_false_when_the_credential_env_is_unset_or_empty`, `jev::tests::status_with_gate_on_and_credential_present_is_active` | `unit` |
 | `ctx kill` | -- | `ctx::sessions::run_kill` terminates a supervised OS process | a native session is interrupted over the runtime protocol; there is no supervised vendor process to signal | -- | `legacy-only` |
 | `ctx learn` | `ctx::learn` | same zirv code | none | `learn::tests::classify_error_detects_each_class` | `unit` |
 | `ctx loop` | each cycle is a native `ctx exec` | each cycle is a harness `ctx exec` | any configured native route | `run_loop::tests::a_compact_tier_loop_cycle_compacts_and_continues_the_same_session` | `unit` |
@@ -190,6 +191,7 @@ means it runs on any supported OS with no provider configured at all.
 | `test all` | `workflow::verification` | same zirv code | none | `verification::tests::disabled_repo_checks_are_listed_but_never_executed` | `unit` |
 | `test baseline` | `workflow::verification` | same zirv code | none | `verification::tests::baseline_round_trips_through_the_operator_home_directory`, `verification::tests::a_failure_not_in_the_baseline_blocks_the_gate_and_names_the_new_failure` | `unit` |
 | `test changed` | `workflow::verification` | same zirv code | none | `verification::tests::changed_paths_since_base_includes_untracked_and_drops_deleted_paths` | `unit` |
+| `tour` | `commands::tour` | same zirv code | none | `tour::tests::all_topics_have_nonempty_text`, `tour::tests::all_known_topics_succeed` | `unit` |
 | `update` | `commands::update` | same zirv code | none | `update::tests::assets_match_supported_platforms_and_release_urls` | `unit` |
 | `verify` | `workflow::verification` + `workflow::checks` | same zirv code | none | `verification::tests::verify_still_runs_checks_the_test_gate_did_not_cover`, `parity::tests::the_real_repo_parity_matrix_passes`, `CI: Verify Native Parity Matrix` | `ci-matrix` |
 | `version` | `commands::version` | same zirv code | none | `version::tests::test_get_version_output` | `unit` |
@@ -241,7 +243,7 @@ keyed `path::symbol` exactly as that table spells them.
 | `src/commands/ctx/dash/mod.rs::fulfill_spawn_request` | fulfils a native worker/pane spawn request | fulfils a harness one | none | `dash::tests::a_depth_refusal_is_not_retryable` | `unit` |
 | `src/commands/ctx/exec.rs::run_with_clock_inner` | forks to `native::run_headless` before any adapter is selected | `supervise::spawn_tapped` on a vendor CLI | none | `exec::tests::exec_resolves_the_configured_default_against_its_own_role` | `unit` |
 | `src/commands/ctx/exec.rs::compact_in_place` | `runtime::compaction` inside the same native session | resumes the vendor CLI in place | none | `runtime::native::tests::a_context_overflow_recovers_through_a_compaction_without_repeating_an_effect` | `integration` |
-| `src/commands/ctx/run_loop.rs::run_with_clock` | each cycle is a native `ctx exec` | each cycle spawns the vendor CLI | none | `run_loop::tests::a_compact_tier_loop_cycle_compacts_and_continues_the_same_session` | `unit` |
+| `src/commands/ctx/run_loop.rs::run_with_clock_and_presence` | each cycle is a native `ctx exec` | each cycle spawns the vendor CLI | none | `run_loop::tests::a_compact_tier_loop_cycle_compacts_and_continues_the_same_session` | `unit` |
 | `src/commands/ctx/run_loop.rs::evaluate_objective_after_cycle` | `handoff::helper_answer` at role `distiller` | `handoff::run_model` + `distiller_cmd` | a route for the `distiller` role | `helper::tests::every_helper_role_answers_with_every_coding_harness_removed_from_path` | `ci-matrix` |
 | `src/commands/ctx/handoff.rs::helper_answer` | the one chokepoint every non-chat model call reaches: native first | falls back to `run_model` when the role has no native route | a route for the helper's role | `handoff::tests::helper_answer_falls_back_to_the_harness_when_no_native_route_exists`, `helper::tests::every_helper_role_answers_with_every_coding_harness_removed_from_path` | `ci-matrix` |
 | `src/commands/ctx/handoff.rs::run_model` | -- | the harness half behind `helper_answer`; wraps `distiller_cmd` | kept deliberately as the fallback when a role has no native route -- not a gap | `handoff::tests::run_model_gives_up_at_the_timeout` | `legacy-only` |

@@ -150,6 +150,7 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx measure",
     "zirv ctx discover",
     "zirv ctx explain-status",
+    "zirv ctx jev status",
     "zirv ctx wait",
     "zirv ctx worktree list",
     "zirv ctx worktree finalize",
@@ -566,6 +567,13 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
          clap model.",
         false,
         vec![json_flag()],
+    ));
+    entries.push(synthetic(
+        "zirv tour",
+        "Guided tour of zirv: overview, scripts, workflow, harnesses, \
+         memory, safety, jev, config, unstuck.",
+        false,
+        Vec::new(),
     ));
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));

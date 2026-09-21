@@ -50,6 +50,7 @@
 - [Development Workflows](#development-workflows)
   - [The full verb set](#the-full-verb-set)
   - [Lifecycle and artifacts](#lifecycle-and-artifacts)
+  - [Implementation and review](#implementation-and-review)
   - [Deploy tiers](#deploy-tiers)
   - [Workflow adoption](#workflow-adoption)
   - [Agent registry](#agent-registry)
@@ -139,6 +140,24 @@ zirv setup reset claude --scope project --dry-run
 zirv setup reset codex --scope global --yes
 zirv setup reset all --scope all --yes
 ```
+
+### Guided tour
+
+Start a guided tour of zirv for a new installation:
+
+```bash
+zirv tour
+```
+
+In a terminal, this walks you through seven topics (overview, harnesses, memory, safety, jev, config, unstuck) with paging controls: press `[enter]` or `n` to go to the next section, `b` to go back, `q` to quit. Rerun `zirv tour` to resume where you left off, or jump directly to a topic:
+
+```bash
+zirv tour config
+zirv tour memory
+zirv tour unstuck
+```
+
+In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections plainly and exits 0, suitable for scripts or documentation.
 
 ### `ZIRV.md` instruction files
 
@@ -319,6 +338,26 @@ handover](#cross-harness-fallback-and-handover) below), `z` zooms the focused
 pane, `e` shows recent errors, `?`/`h` shows help, and `q` quits. On quit, the
 dashboard writes a restore roster so a next launch can offer to reopen the
 same panes.
+
+The dashboard's own mouse reporting stays on for the whole session (subject
+only to `dash.mouse` below, the operator's on/off switch — there is no
+mid-session toggle, `Ctrl+A v`/"select mode" has been removed). Click-drag
+inside any pane — including one whose child has turned on its own mouse
+reporting, such as the Claude Code or Codex TUI — selects that pane's text:
+a plain click still reaches the child (a press is forwarded only once
+release proves it moved no more than one cell, so a real click never turns
+into an accidental drag), while a genuine drag is the dashboard's own
+selection, built strictly from that pane's screen contents so the sidebar,
+borders and other chrome can never be copied, with trailing whitespace
+trimmed from each line. The wheel keeps scrolling — the dashboard's own
+scrollback, or forwarded to the child, exactly as before — without cancelling
+an in-progress or already-highlighted selection, and dragging past the top or
+bottom edge of the pane auto-scrolls it. Releasing the drag copies to the
+system clipboard via OSC 52, with a platform fallback (`pbcopy` on macOS,
+`wl-copy` then `xclip` on Linux, `clip.exe` on Windows) run in the background
+for a terminal that silently ignores OSC 52 (macOS Terminal.app is the one on
+record); if neither lands, the header shows a notice rather than losing the
+copy silently.
 
 Every dashboard control below is repo-forbidden (see [Trust
 boundary](#trust-boundary) below — a checkout cannot switch it on/off or
@@ -875,6 +914,11 @@ to the section that documents it in depth.
   your instruction files](#reviewing-your-instruction-files) and
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
+- **Jev advisory status** — `jev` (`zirv ctx jev status`) reports whether
+  the hosted TypeSafe Jev advisor is active: each of the five `[jev]`
+  gates (off by default), whether its credential is present (never its
+  value), and the endpoint and model in use. See [Harness
+  proxy](#harness-proxy).
 - **Configured capabilities** — `capabilities` reports every non-shell
   integration a native session can use — MCP servers, web search/fetch,
   browser, language diagnostics, artifact and frontend rendering — as
@@ -953,12 +997,22 @@ to the section that documents it in depth.
   pre-existing failure never blocks a workflow gate. See [The full verb
   set](#the-full-verb-set).
 - **Final verification** — `verify` runs the full check suite plus zirv's
-  own built-in self-check registry, reusing fresh `test` evidence when
-  nothing has changed since. See [The full verb set](#the-full-verb-set).
+  own built-in self-check registry. When the whole-changeset fingerprint
+  (HEAD plus the uncommitted diff) matches the prior `test` run exactly, it
+  reuses that run's evidence wholesale; otherwise it can still reuse an
+  individual check's prior result, per check, when the checkout is on the
+  same commit as that report, the report was not narrowed to a `--check`
+  subset, the check passed outright, and nothing under that check's own
+  declared `paths` changed since. A check with no declared `paths` always
+  re-runs, and a report built from a mix of reused and fresh checks still
+  covers every required check. See [The full verb
+  set](#the-full-verb-set).
 - **Repository check configuration** — optional, schema-versioned
   `.zirv/verify.toml` declares check id/kind/command/path patterns/phase
   eligibility/timeout; without it, Cargo commands and `npm run` scripts are
-  discovered from the manifests present. See [Frontend
+  discovered from the manifests present, each with its own default `paths`.
+  Declaring `paths` narrowly lets an unrelated change elsewhere skip
+  re-running that check at final verification. See [Frontend
   quality](#frontend-quality).
 
 ### Housekeeping
@@ -968,6 +1022,12 @@ to the section that documents it in depth.
   restore AI-specific settings separately from the rest of Zirv (`setup
   reset`, `setup restore`). See [AI setup and harness
   migration](#ai-setup-and-harness-migration).
+- **Guided tour** — `tour` (`zirv tour [topic]`) walks a new installation
+  through nine topics (overview, scripts, workflow, harnesses, memory,
+  safety, jev, config, unstuck); pages under a TTY, plain-prints when
+  piped, exits 1 on an unknown topic while naming every valid one, and is
+  offered automatically at the end of a successful first run. See [Guided
+  tour](#guided-tour).
 - **Self-update** — `update` (`--version <x.y.z>`) installs the latest or a
   specified zirv release. See [Upgrading](#upgrading).
 - **Bug and feature reports** — `report` (`bug`/`feature`) files a Zirv
@@ -985,8 +1045,8 @@ to the section that documents it in depth.
   `.zirv/commands/`. See [Initialize a Project](#initialize-a-project) and
   [Creating a New Script](#creating-a-new-script).
 - **Help and version** — `help` lists every available script and shortcut,
-  local and global, and `version` prints the installed version. See
-  [Usage](#usage).
+  local and global, and `version` prints the installed version; `--version` and `-V`
+  are accepted as shorthand equivalents. See [Usage](#usage).
 
 ---
 
@@ -1011,9 +1071,9 @@ brew install zirv
 
 The published binary is universal (Intel and Apple Silicon), so this works on either Mac.
 
-### Linux
+### Linux & macOS
 
-Recommended — install script:
+Recommended — install script (works on both Linux x86_64 and macOS Intel/Apple Silicon):
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
@@ -1024,6 +1084,18 @@ To install a specific version:
 ```bash
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh -s -- <version>
 ```
+
+#### Package Manager Detection
+
+If the script detects a Homebrew-managed `zirv` installation, it refuses to overwrite it by default with a message recommending `brew upgrade zirv` instead. To override this safety check and force an installation (not recommended), set `ZIRV_INSTALL_FORCE=1`:
+
+```bash
+ZIRV_INSTALL_FORCE=1 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
+```
+
+#### PATH Shadowing Warning
+
+After a successful install, the script checks whether the just-installed binary is the one found on your `$PATH`. If not—for example, because `/opt/homebrew/bin` appears before `/usr/local/bin` on Apple Silicon—it warns you to ensure the install directory comes first in your `PATH`.
 
 Alternative — Homebrew on Linux, via the same tap:
 
@@ -1059,9 +1131,12 @@ zirv update
 zirv update --version <x.y.z>
 ```
 
-A Homebrew or Chocolatey installation keeps working after a built-in update,
-but the package manager's recorded version lags until its own upgrade command
-runs.
+If zirv is installed via Homebrew or Chocolatey, `zirv update` is refused
+by default to prevent desynchronization: the package manager's records would
+report the old version, and the next `brew upgrade` or `choco upgrade zirv`
+would silently revert your binary. Use the package-manager-specific command
+instead (see below), or set `ZIRV_UPDATE_ALLOW_PACKAGE_MANAGER=1` to override
+at your own risk.
 
 ### Homebrew (macOS & Linux)
 
@@ -1075,13 +1150,15 @@ brew upgrade zirv
 choco upgrade zirv
 ```
 
-### Install Script (Linux)
+### Install Script (Linux & macOS)
 
 Re-run the install script to get the latest version:
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
 ```
+
+The same package-manager detection and PATH shadowing checks apply. To update a Homebrew installation with the script, use `ZIRV_INSTALL_FORCE=1`.
 
 ### From source
 
@@ -1476,7 +1553,7 @@ marks it as shadowed in the listing.
 <!-- zchk-doc-reserved:start -->
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
 `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`,
-`commands`, `update`, `session`, `native`, and their short aliases `h`, `v`, `i`, `c`,
+`commands`, `update`, `session`, `tour`, `native`, and their short aliases `h`, `v`, `i`, `c`,
 <!-- zchk-doc-reserved:end -->
 are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
@@ -1546,7 +1623,7 @@ zirv workflow approve <id>                        # approve the current gated st
 zirv workflow advance <id> --outcome success|failure
 zirv workflow review package <id> | run <id> --agent <name> | add | ...
 zirv workflow maintain scan [--repo <path>] [--json]
-zirv workflow stats                               # local bounded telemetry
+zirv workflow stats                               # local bounded telemetry: per-phase timing, the implement/validate wall-clock split, approval wait, and fix-round causes (issue #699 Phase 0)
 ```
 
 ### Workflow definitions v2 (issue #542)
@@ -1739,6 +1816,29 @@ into a review or verify step, so a review/verify gate the initial `workflow
 start` measurement missed (an empty tree, before any code existed) still gets
 added once the real change exists.
 
+### Implementation and review
+
+When a behavior-focused test is possible, the `implement` skill asks for the
+same test-first loop the standalone `tdd` skill describes: write the
+smallest test first, confirm it fails for the missing behavior rather than
+setup noise, implement the minimum change that makes it pass, then rerun
+that test before broadening verification, keeping each red/green cycle
+attributable to one behavior. The same exemptions apply as in `tdd`:
+generated files, pure configuration, exploratory spikes, or a change whose
+only useful assertion sits at a broader integration boundary. `implement`
+also runs the repository's own fast formatting and lint checks after each
+meaningful edit rather than deferring them to `test`.
+
+Before reporting done, `implement` self-checks its diff against the same
+five dimensions `review` scores — correctness, security, data loss,
+compatibility, and missing tests — and fixes what it can rather than leaving
+it for a review round; `review` itself keeps the same rubric and bar. A
+workflow step's `skills` list only ever materializes its first entry as the
+step's running skill, so this discipline lives directly in `implement`
+rather than in a second, unread `tdd` entry; `tdd` stays registered and
+unmodified for `workflow show`, operator-authored packs, and a future step
+that can carry more than one skill id.
+
 ### Linked worktrees
 
 A workflow started in a repository's main checkout can be found from, and
@@ -1861,6 +1961,35 @@ text); an unknown or version-mismatched reference is refused by
 `AgentRegistry::validate_against`. `zirv workflow agents list|show` inspects
 the resolved registry and provenance; `zirv workflow agents dispatch <id>
 --adapter <name> --prompt <task>` launches that seat directly.
+
+Every built-in seat also carries a `model_tier` (`fast`/`standard`/`deep`) —
+a routing hint for how mechanical its work is, not a model choice.
+`doc-keeper`/`explorer` are `fast`; `security-scanner`/`architect` are
+`deep`; every other built-in seat is `standard`. Zirv never turns this hint
+into a model id on its own; the operator may map `(adapter, tier)` to a real
+model id under `[model_tiers.<agent>]` in `~/.zirv/ctx.toml`:
+
+```toml
+[model_tiers.claude]
+fast = "haiku"
+standard = "sonnet"
+deep = "opus"
+
+[model_tiers.codex]
+fast = "gpt-5.4-mini"
+standard = "gpt-5.6-terra"
+deep = "gpt-5.6-sol"
+```
+
+When a seat dispatches (`zirv workflow agents dispatch --model <id>`, and any
+workflow step that dispatches a seat under the hood), resolution order is: an
+explicit per-invocation model pin always wins; otherwise a mapped `(adapter,
+tier)` pair supplies the model; otherwise no model flag is added and the
+adapter's own default applies. An operator who sets nothing sees no change in
+behavior. `model_tiers` is repo-forbidden — a repository choosing which model
+a seat runs on would be a silent provider/model switch — so only the
+operator's own `~/.zirv/ctx.toml` or the matching
+`ZIRV_CTX_MODEL_TIERS_<AGENT>_<TIER>` environment variable may set it.
 
 ### Team composition
 
@@ -2087,6 +2216,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
+| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the five advisory gates, the credential env var name and presence (never the value), the endpoint and model, and why it is or is not active — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 
@@ -3369,6 +3499,8 @@ gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
+Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
+
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
 directory under `zirv/ctx/`, never in the repo. Override with
 `ZIRV_CTX_STATE_DIR`. On unix the state directory is created `0700` and its
@@ -3610,6 +3742,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
+| `model_tiers` (`model_tiers.<agent>.<tier>`) | `ZIRV_CTX_MODEL_TIERS_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_MODEL_TIERS_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
 | `route.<id>.execution` | `~/.zirv/native.toml` only; selects an official provider process and optional absolute executable path. Repository layers cannot select executables, login methods, billing or startup settings; all effects retain the native broker |
 | Claude Code authentication environment and public user settings | User-owned process environment and `~/.claude/settings.json` (or an absolute `CLAUDE_CONFIG_DIR` outside the repository); only authentication settings are carried into the restricted model invocation. Official login receives options after `--`. Inherited auth values are excluded from persisted settings and diagnostic output |
@@ -4318,6 +4451,70 @@ explicitly (`--agent`, `agent =` in your own `~/.zirv/ctx.toml`, or the
 `agent`; it is a forbidden repo key).
 Narrowing which agent is *possible* is a repo's call; narrowing which one you
 actually get is not.
+
+**A harness you have not installed is a different matter.** That is a fact
+about your own machine, not something a checked-out repository can assert, so
+the same fallback -- and *only* the fallback: an explicit `--agent`, an
+argv-detected harness, and a configured `agent =` all still resolve exactly
+as before, missing binary and all -- skips a candidate whose program is
+confidently absent, and moves on to the next enabled, ready, installed one.
+Only a confident absence removes a candidate: a probe that cannot decide
+(an unreadable `PATH` entry, or an install root zirv does not know about)
+keeps it, so nothing is ever lost to a guess -- and an `agent_bin` you
+configured yourself is never checked at all, since you have already named the
+program (it may not even be a path, as a wrapper command is not).
+
+When presence rather than
+registry order decided the answer, zirv says so: `zirv ctx chat` prints a
+`zirv ▸` line naming the harness it chose, the one it did not find, and how
+to pin the choice yourself, and `zirv ctx status`'s `chat:` line carries the
+same fact as a standing one. That announcement rides `[chrome] events`, which
+a repository cannot turn off (`[chrome] banner`, which it can, is not relied
+on for it); `--quiet`/`ZIRV_CTX_QUIET` still silences it, because that is the
+operator's own call.
+
+**Presence gates the choice, never the reading.** Naming which adapter's
+transcript to parse (the Stop hook's screening, `zirv ctx score`,
+`zirv ctx handoff`), which account a usage readout belongs to, or which
+program you handed `zirv ctx wrap -- ...` yourself never consults it: a
+transcript written by claude is claude's whether or not `claude` is on that
+process's `PATH`, and a hook subprocess routinely inherits a reduced one.
+Only the question "which harness should zirv start for you" asks whether the
+answer exists on the machine, so pure passthrough stays pure and screening
+keeps working where the binary is real but invisible to a `PATH` walk.
+Flags are not a program, though. `zirv ctx exec -- --model x` hands over
+nothing to pass through: zirv still builds that launch from the harness's own
+program and appends your flags to it, so it is the choosing case too, and it
+chooses a harness this machine actually has. `zirv ctx wrap -- ...` reads the
+same argv the other way, because there what you wrote is what gets spawned.
+
+**The missing binary is reported before the waiting, not after.** Once
+`zirv ctx exec`/`zirv ctx agent` and `zirv ctx loop` have resolved the harness
+they are about to launch, they check that its program exists *before* engaging
+pacing, usage polling, or the macOS Keychain read those drag in. On a machine
+with no harness installed, `zirv ctx agent claude "say hi"` used to warn about
+Keychain access for a harness you do not have, sit out the blind-mode safety
+delay (`[pace] blind_delay_secs`, 60s by default) because that harness has no
+usage source, and only then tell you `claude` is not a program; now the
+"program not found" answer arrives immediately, in the same words the spawn
+itself would have used -- and those words name all three ways out, the same
+three the "nothing is installed" error below gives, because a harness missing
+from `PATH` is very often one you have installed somewhere `agent_bin` should
+be pointed at rather than one you need to install at all. This only
+ever makes a failure faster -- it never picks a different harness, so a
+harness you named with `--agent` or `agent =` still fails under its own name;
+only a *confident* absence refuses, so an undecidable probe launches exactly
+as before; an `agent_bin` you configured yourself is not probed at all; and
+a program you supplied yourself (`zirv ctx exec -- <command>`, `zirv ctx wrap
+-- <command>`) is never subject to it, because it is your program, not the
+adapter's.
+
+If *nothing* is installed, the error says so in as many
+words and names the ways out (install one onto `PATH`, point `agent_bin` at
+it in `~/.zirv/ctx.toml`, or pass `--agent`), instead of only reporting the
+first harness's own "program not found"; when some candidates were merely
+disabled, it names the ones that are missing and claims nothing about the
+rest.
 
 ### Hook registration (Claude Code)
 

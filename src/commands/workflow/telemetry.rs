@@ -15,6 +15,35 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, prune_to_newest, repo_slug, write_private,
 };
 
+/// Issue #699 Phase 0: the "build" (implement) side of the prompt-to-PR
+/// split -- everything up to and including `implement`, classified by
+/// `WorkflowPhase` rather than by step id so a domain variant step (for
+/// example `implement-frontend`, whose `phase` is still `Implement`) lands
+/// in the right bucket automatically. `Debug`/`Delegate`/`Present` are
+/// intentionally in neither array: they are informational phases outside
+/// the `feature`/`bugfix` pack spine this issue measures, so a workflow
+/// using them contributes nothing to either side rather than being guessed
+/// into one.
+const BUILD_PHASES: [WorkflowPhase; 4] = [
+    WorkflowPhase::Intent,
+    WorkflowPhase::Design,
+    WorkflowPhase::Plan,
+    WorkflowPhase::Implement,
+];
+/// The "validate" side. `Deploy` (the pack's "Finish branch" step) is
+/// deliberately bucketed here, not with `BUILD_PHASES`: issue #699's own
+/// problem statement explicitly lists "finish-branch" alongside
+/// test/review/verify as part of the ~75% validation-and-fixing side, not
+/// the ~25% build side -- CLAUDE.md's own required `cargo build && cargo
+/// nextest run --no-fail-fast && cargo fmt -- --check && cargo clippy
+/// --all-targets -- -D warnings` gate runs at exactly this step.
+const VALIDATE_PHASES: [WorkflowPhase; 4] = [
+    WorkflowPhase::Test,
+    WorkflowPhase::Review,
+    WorkflowPhase::Verify,
+    WorkflowPhase::Deploy,
+];
+
 const TELEMETRY_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_MAX_EVENTS: usize = 1000;
 const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -221,6 +250,131 @@ pub struct TelemetryEvent {
     pub ttft_p50_ms: Option<u64>,
     #[serde(default)]
     pub tool_error_rate: Option<f64>,
+    /// Issue #699 Phase 0: on an `ArtifactAccepted` event for an
+    /// approval-gated step (intent/spec/plan-style artifact gates, or a
+    /// gate-only `approval = true` step with no artifact), the wall-clock
+    /// this step spent in `WorkflowStatus::AwaitingApproval` before
+    /// `zirv workflow approve` cleared it -- `engine.rs`'s own
+    /// `phase_started_at`/`record_step_duration_ms` machinery, read at the
+    /// same place, not a second measurement. The engine does not
+    /// distinguish an agent still drafting the artifact from an operator
+    /// reviewing a finished one within that span, so this is the WHOLE
+    /// span, never subdivided further -- the closest honest approximation,
+    /// not an invented number. `None` for every other event kind, and for
+    /// an `ArtifactAccepted` event recorded before this field existed.
+    #[serde(default)]
+    pub approval_wait_ms: Option<u64>,
+    /// Issue #699 Phase 0, `PhaseFailed` only: why this fix round happened,
+    /// per `classify_fix_round_cause`'s documented precedence. `None` for
+    /// every other event kind, for a `PhaseFailed` outside
+    /// Test/Review/Verify, and for an event recorded before this field
+    /// existed.
+    #[serde(default)]
+    pub fix_round_cause: Option<FixRoundCause>,
+}
+
+/// Issue #699 Phase 0: why one review/fix round happened -- the datum the
+/// issue's two competing hypotheses (defective early code vs. over-thorough
+/// validation) turn on. See [`classify_fix_round_cause`] for how one is
+/// derived and its documented precedence when a round trips more than one
+/// signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FixRoundCause {
+    /// The only checks that failed on the latest persisted
+    /// `VerificationReport` were `Format`/`Lint` kind -- a mechanical nit,
+    /// not a functional defect.
+    FmtClippy,
+    /// At least one `Unit`/`Integration` check on the latest persisted
+    /// `VerificationReport` did not pass -- a genuine functional failure.
+    FailingTest,
+    /// The failing step is the review phase itself: engine.rs's review gate
+    /// never consults `VerificationReport` at all, only `review_findings`/
+    /// `review_evidence` (open findings, or not enough fresh independent
+    /// review runs), so a review-phase failure is always this.
+    ReviewFinding,
+    /// The no-progress guard's own verdict (issue #287,
+    /// `TransitionEvidence::verification_unchanged`): the worktree was
+    /// byte-identical to this step's previous failed attempt, so nothing
+    /// was even re-executed -- the round exists purely because the
+    /// evidence-freshness gate required a re-run, not because anything
+    /// actually needed fixing.
+    StaleEvidence,
+}
+
+impl FixRoundCause {
+    /// The kebab-case spelling this cause serializes as, reused verbatim as
+    /// `StatsReport::fix_round_causes`'s map key so `--json` and the
+    /// text-mode line never drift apart -- the same pattern
+    /// `InconclusiveReason::as_str` uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FmtClippy => "fmt-clippy",
+            Self::FailingTest => "failing-test",
+            Self::ReviewFinding => "review-finding",
+            Self::StaleEvidence => "stale-evidence",
+        }
+    }
+}
+
+/// Issue #699 Phase 0. Precedence (documented, not inferred, because a
+/// single round can trip more than one signal at once):
+///
+/// 1. [`FixRoundCause::StaleEvidence`] -- `verification_unchanged` is the
+///    no-progress guard's own verdict; nothing else about the round is
+///    meaningful once this is true, since no check was even re-executed.
+/// 2. [`FixRoundCause::ReviewFinding`] -- the failing step IS the review
+///    phase; engine.rs's review gate never depends on `VerificationReport`
+///    checks at all, so a review-phase failure is always this.
+/// 3. [`FixRoundCause::FailingTest`] -- the latest persisted
+///    `VerificationReport` has at least one `Unit`/`Integration` check that
+///    did not pass. A genuine functional failure outranks a style/lint one.
+/// 4. [`FixRoundCause::FmtClippy`] -- otherwise, at least one `Format`/
+///    `Lint` check did not pass.
+///
+/// `None` when `phase` is not Test/Review/Verify, or (Test/Verify only)
+/// when no `VerificationReport` is available to inspect -- this must never
+/// guess a cause it has no evidence for.
+pub(crate) fn classify_fix_round_cause(
+    phase: super::skill::WorkflowPhase,
+    verification_unchanged: bool,
+    report: Option<&super::verification::VerificationReport>,
+) -> Option<FixRoundCause> {
+    use super::skill::WorkflowPhase;
+    use super::verification::{CheckKind, CheckStatus};
+
+    if !matches!(
+        phase,
+        WorkflowPhase::Test | WorkflowPhase::Review | WorkflowPhase::Verify
+    ) {
+        return None;
+    }
+    if verification_unchanged {
+        return Some(FixRoundCause::StaleEvidence);
+    }
+    if phase == WorkflowPhase::Review {
+        return Some(FixRoundCause::ReviewFinding);
+    }
+    let report = report?;
+    let failing_kinds: Vec<CheckKind> = report
+        .checks
+        .iter()
+        .filter(|check| check.status != CheckStatus::Passed)
+        .map(|check| check.kind)
+        .collect();
+    if failing_kinds
+        .iter()
+        .any(|kind| matches!(kind, CheckKind::Unit | CheckKind::Integration))
+    {
+        return Some(FixRoundCause::FailingTest);
+    }
+    if failing_kinds
+        .iter()
+        .any(|kind| matches!(kind, CheckKind::Format | CheckKind::Lint))
+    {
+        return Some(FixRoundCause::FmtClippy);
+    }
+    None
 }
 
 impl TelemetryEvent {
@@ -270,6 +424,8 @@ impl TelemetryEvent {
             turn_max_ms: None,
             ttft_p50_ms: None,
             tool_error_rate: None,
+            approval_wait_ms: None,
+            fix_round_cause: None,
         }
     }
 
@@ -699,6 +855,42 @@ pub struct StatsReport {
     /// `overall_cost_micros` is `None`.
     #[serde(default)]
     pub overall_price_as_of: Option<String>,
+    /// Issue #699 Phase 0: summed MACHINE `duration_ms` (never
+    /// `approval_wait_ms`) over every `PhaseCompleted`/`PhaseFailed` event
+    /// whose `phase` is Intent/Design/Plan/Implement -- the "build" side of
+    /// the implement-vs-validate split. See `BUILD_PHASES`/`VALIDATE_PHASES`
+    /// for the exact bucketing and why `Deploy` lands in `validate_ms`
+    /// instead.
+    #[serde(default)]
+    pub build_ms: u64,
+    /// Same as `build_ms`, for the Test/Review/Verify/Deploy "validate"
+    /// side.
+    #[serde(default)]
+    pub validate_ms: u64,
+    /// Issue #699 Phase 0: summed `approval_wait_ms` over every
+    /// `ArtifactAccepted` event that carried one -- see that field's own
+    /// doc comment for why this is the whole approval-gated step span, not
+    /// a sub-divided "human-only" figure. Deliberately excluded from
+    /// `build_ms`/`validate_ms` so an operator idling on an approval gate
+    /// can never skew that ratio.
+    #[serde(default)]
+    pub approval_wait_ms: u64,
+    /// How many `ArtifactAccepted` events contributed to `approval_wait_ms`
+    /// -- zero means "no data", never a manufactured `0ms`.
+    #[serde(default)]
+    pub approval_wait_steps: usize,
+    /// Issue #699 Phase 0: how many recorded fix rounds (`PhaseFailed` on
+    /// Test/Review/Verify) each [`FixRoundCause`] accounts for, keyed by
+    /// `FixRoundCause::as_str()`. Only ever has the four keys that cause can
+    /// produce; a fix round whose cause could not be determined is counted
+    /// in `fix_rounds_unclassified` instead, never folded into one of these.
+    #[serde(default)]
+    pub fix_round_causes: BTreeMap<String, usize>,
+    /// Fix rounds recorded whose cause `classify_fix_round_cause` could not
+    /// determine (most likely: no `VerificationReport` had been persisted
+    /// yet for a Test/Verify failure).
+    #[serde(default)]
+    pub fix_rounds_unclassified: usize,
     /// Issue #293.
     #[serde(default)]
     pub speed: SpeedStats,
@@ -742,6 +934,10 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
     let mut ttft_p50_count = 0usize;
     let mut tool_error_rate_sum = 0.0f64;
     let mut tool_error_rate_count = 0usize;
+    let mut approval_wait_ms = 0u64;
+    let mut approval_wait_steps = 0usize;
+    let mut fix_round_causes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut fix_rounds_unclassified = 0usize;
     for event in events {
         overall_input_tokens = overall_input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
         // `TelemetryEvent::cache_hit_ratio()`'s own "no data, no ratio"
@@ -875,7 +1071,28 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
                     frontend_visual_review_failures += 1;
                 }
             }
-            TelemetryKind::ArtifactAccepted => artifact_acceptances += 1,
+            TelemetryKind::ArtifactAccepted => {
+                artifact_acceptances += 1;
+                if let Some(wait) = event.approval_wait_ms {
+                    approval_wait_ms = approval_wait_ms.saturating_add(wait);
+                    approval_wait_steps += 1;
+                }
+            }
+            TelemetryKind::PhaseFailed
+                if matches!(
+                    event.phase,
+                    Some(WorkflowPhase::Test | WorkflowPhase::Review | WorkflowPhase::Verify)
+                ) =>
+            {
+                match event.fix_round_cause {
+                    Some(cause) => {
+                        *fix_round_causes
+                            .entry(cause.as_str().to_string())
+                            .or_default() += 1;
+                    }
+                    None => fix_rounds_unclassified += 1,
+                }
+            }
             TelemetryKind::AgentDispatched => agent_dispatches += 1,
             TelemetryKind::DeployGateEvaluated => {
                 deploy_gate_evaluations += 1;
@@ -1001,6 +1218,16 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         .max_by_key(|(_, stats)| stats.input_tokens.saturating_add(stats.output_tokens))
         .filter(|(_, stats)| stats.input_tokens > 0 || stats.output_tokens > 0)
         .map(|(phase, _)| phase.clone());
+    let build_ms: u64 = BUILD_PHASES
+        .iter()
+        .filter_map(|phase| phases.get(phase.to_string().as_str()))
+        .map(|stats| stats.duration_ms)
+        .sum();
+    let validate_ms: u64 = VALIDATE_PHASES
+        .iter()
+        .filter_map(|phase| phases.get(phase.to_string().as_str()))
+        .map(|stats| stats.duration_ms)
+        .sum();
     StatsReport {
         events: events.len(),
         phases,
@@ -1035,6 +1262,12 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         overall_cache_hit_ratio,
         overall_cost_micros,
         overall_price_as_of,
+        build_ms,
+        validate_ms,
+        approval_wait_ms,
+        approval_wait_steps,
+        fix_round_causes,
+        fix_rounds_unclassified,
         speed,
         adoption,
     }
@@ -1207,6 +1440,13 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 .as_deref()
                 .unwrap_or("unknown")
         )?;
+        // Issue #699 Phase 0: the implement-vs-validate split and its
+        // separately-reported approval wait, right after the per-phase
+        // summaries above -- see `render_build_validate_line`/
+        // `render_approval_wait_line`'s own doc comments for the exact
+        // bucketing and why wait is never folded into the split.
+        writeln!(writer, "{}", render_build_validate_line(&report))?;
+        writeln!(writer, "{}", render_approval_wait_line(&report))?;
         writeln!(
             writer,
             "verification: {} runs, {} failures",
@@ -1228,6 +1468,10 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 ))
                 .unwrap_or_else(|| "no ReviewRun events recorded yet".to_string())
         )?;
+        // Issue #699 Phase 0: which of the two competing hypotheses
+        // (defective early code vs. over-thorough validation) the review/fix
+        // loop's rounds actually support.
+        writeln!(writer, "{}", render_fix_round_causes_line(&report))?;
         if !report.workflows.is_empty() {
             writeln!(writer, "workflows:")?;
             for (workflow_id, stats) in &report.workflows {
@@ -1276,27 +1520,106 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
     Ok(0)
 }
 
-/// `speed: no data` when no `TurnLatencySampled` event has ever been
-/// recorded; otherwise `speed: N samples, turn p50 ~Xms (max Yms), ttft p50
-/// ~Zms, tool error rate ~W%` -- any of the three rate/latency clauses
-/// itself reads `n/a` when that particular field never had a sample (a
-/// session with no timestamps at all still contributes a sample with every
-/// field `None`, see `score::derive_speed_metrics`'s own "empty" contract).
+/// Issue #699 Phase 0: this line used to read `speed: no data`, which a
+/// reader chasing `zirv workflow stats`'s "slowest phase: unknown" problem
+/// could easily (and, per the issue, actually did) mistake for *workflow
+/// phase timing* being unmeasured. It is not that: `SpeedStats` comes
+/// entirely from `TurnLatencySampled` events, a chat/harness per-turn
+/// latency sampler (`score::derive_speed_metrics`) with no relationship to
+/// a workflow step's own wall-clock -- see `render_build_validate_line`/
+/// `render_approval_wait_line` for the actual workflow-timing lines. The
+/// label now says so explicitly so this line is never read as a workflow
+/// measurement again; the metric itself is unchanged.
+///
+/// `chat turn latency (...): no data` when no `TurnLatencySampled` event has
+/// ever been recorded; otherwise `chat turn latency (...): N samples, turn
+/// p50 ~Xms (max Yms), ttft p50 ~Zms, tool error rate ~W%` -- any of the
+/// three rate/latency clauses itself reads `n/a` when that particular field
+/// never had a sample (a session with no timestamps at all still
+/// contributes a sample with every field `None`, see
+/// `score::derive_speed_metrics`'s own "empty" contract).
 fn render_speed_line(stats: &SpeedStats) -> String {
+    const LABEL: &str = "chat turn latency (harness per-turn sampler, not workflow phase timing)";
     if stats.samples == 0 {
-        return "speed: no data".to_string();
+        return format!("{LABEL}: no data");
     }
     let ms_or_na = |v: Option<u64>| v.map_or_else(|| "n/a".to_string(), |v| format!("{v}ms"));
     let rate_or_na =
         |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |v| format!("{:.1}%", v * 100.0));
     format!(
-        "speed: {} samples, turn p50 ~{} (max {}), ttft p50 ~{}, tool error rate ~{}",
+        "{LABEL}: {} samples, turn p50 ~{} (max {}), ttft p50 ~{}, tool error rate ~{}",
         stats.samples,
         ms_or_na(stats.turn_p50_ms_avg),
         ms_or_na(stats.turn_max_ms),
         ms_or_na(stats.ttft_p50_ms_avg),
         rate_or_na(stats.tool_error_rate_avg)
     )
+}
+
+/// Issue #699 Phase 0: the wall-clock split the issue tracks (~25/75 today,
+/// targeting ~60/40), in MACHINE milliseconds only -- `report.build_ms`/
+/// `report.validate_ms`, which sum `duration_ms` (never `approval_wait_ms`)
+/// per `WorkflowPhase` via `BUILD_PHASES`/`VALIDATE_PHASES`. Operator
+/// approval wait is reported separately by `render_approval_wait_line`,
+/// deliberately never mixed into this ratio -- see that function's own doc
+/// comment for why. "no data" when neither side has ever recorded a
+/// duration, never a fabricated `0ms (0%) / 0ms (0%)` split.
+fn render_build_validate_line(report: &StatsReport) -> String {
+    let total = report.build_ms.saturating_add(report.validate_ms);
+    if total == 0 {
+        return "implement/validate split: no data (no step machine-time recorded yet)".to_string();
+    }
+    format!(
+        "implement/validate split: build {}ms ({:.0}%) / validate {}ms ({:.0}%) -- machine \
+         time only, excludes operator approval wait (see the approval wait line)",
+        report.build_ms,
+        report.build_ms as f64 / total as f64 * 100.0,
+        report.validate_ms,
+        report.validate_ms as f64 / total as f64 * 100.0,
+    )
+}
+
+/// Issue #699 Phase 0: total operator/approval wait across every
+/// approval-gated step completed (intent/spec/plan-style artifact gates, or
+/// a gate-only `approval = true` step) -- see `TelemetryEvent::
+/// approval_wait_ms`'s own doc comment for why this is the WHOLE
+/// `AwaitingApproval` span, never sub-divided into "agent drafting" vs.
+/// "human reviewing": the engine's own state has no signal to draw that
+/// line, so this is the closest honest approximation, reported on its own
+/// rather than folded into `render_build_validate_line`'s ratio. "no data"
+/// when no approval-gated step has completed yet.
+fn render_approval_wait_line(report: &StatsReport) -> String {
+    if report.approval_wait_steps == 0 {
+        return "approval wait: no data (no approval-gated step completed yet)".to_string();
+    }
+    format!(
+        "approval wait: {}ms across {} approval-gated step(s) -- operator/agent-drafting time, \
+         not counted in the implement/validate split above",
+        report.approval_wait_ms, report.approval_wait_steps
+    )
+}
+
+/// Issue #699 Phase 0: which of the issue's two competing hypotheses
+/// (defective early code, so `failing-test`/`review-finding` dominate, vs.
+/// over-thorough/redundant validation, so `stale-evidence` dominates) the
+/// recorded fix rounds actually support -- see `classify_fix_round_cause`'s
+/// documented precedence. "no fix rounds recorded yet" when nothing has
+/// been classified (or left unclassified) at all.
+fn render_fix_round_causes_line(report: &StatsReport) -> String {
+    let classified: usize = report.fix_round_causes.values().sum();
+    let total = classified + report.fix_rounds_unclassified;
+    if total == 0 {
+        return "fix-round causes: no fix rounds recorded yet".to_string();
+    }
+    let mut parts: Vec<String> = report
+        .fix_round_causes
+        .iter()
+        .map(|(cause, count)| format!("{cause} {count}"))
+        .collect();
+    if report.fix_rounds_unclassified > 0 {
+        parts.push(format!("unclassified {}", report.fix_rounds_unclassified));
+    }
+    format!("fix-round causes: {total} total ({})", parts.join(", "))
 }
 
 /// `adoption: no substantial sessions observed` when nothing has crossed the
@@ -2012,13 +2335,18 @@ mod tests {
     }
 
     /// A state dir with only pre-change events (none of them
-    /// `TurnLatencySampled`) prints the speed block as "no data".
+    /// `TurnLatencySampled`) prints the speed block as "no data" -- issue
+    /// #699 Phase 0: relabeled so it is never mistaken for workflow phase
+    /// timing (see `render_speed_line`'s own doc comment).
     #[test]
     fn a_report_with_no_turn_latency_samples_has_no_data() {
         let event = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
         let report = aggregate(&[event]);
         assert_eq!(report.speed.samples, 0);
-        assert_eq!(render_speed_line(&report.speed), "speed: no data");
+        assert_eq!(
+            render_speed_line(&report.speed),
+            "chat turn latency (harness per-turn sampler, not workflow phase timing): no data"
+        );
     }
 
     #[test]
@@ -2047,8 +2375,8 @@ mod tests {
         assert!((report.speed.tool_error_rate_avg.unwrap() - 0.5).abs() < 1e-9);
         assert_eq!(
             render_speed_line(&report.speed),
-            "speed: 2 samples, turn p50 ~300ms (max 500ms), ttft p50 ~150ms, tool error rate \
-             ~50.0%"
+            "chat turn latency (harness per-turn sampler, not workflow phase timing): 2 \
+             samples, turn p50 ~300ms (max 500ms), ttft p50 ~150ms, tool error rate ~50.0%"
         );
     }
 
@@ -2066,7 +2394,239 @@ mod tests {
         assert_eq!(report.speed.tool_error_rate_avg, None);
         assert_eq!(
             render_speed_line(&report.speed),
-            "speed: 1 samples, turn p50 ~n/a (max n/a), ttft p50 ~n/a, tool error rate ~n/a"
+            "chat turn latency (harness per-turn sampler, not workflow phase timing): 1 \
+             samples, turn p50 ~n/a (max n/a), ttft p50 ~n/a, tool error rate ~n/a"
+        );
+    }
+
+    // -- Issue #699 Phase 0: implement-vs-validate split, approval wait,
+    // and fix-round cause classification --
+
+    fn check(
+        id: &str,
+        kind: super::super::verification::CheckKind,
+        status: super::super::verification::CheckStatus,
+    ) -> super::super::verification::CheckResult {
+        super::super::verification::CheckResult {
+            id: id.into(),
+            kind,
+            command: "true".into(),
+            source: super::super::verification::CheckSource::DiscoveredToolchain,
+            status,
+            exit_code: Some(
+                if status == super::super::verification::CheckStatus::Passed {
+                    0
+                } else {
+                    1
+                },
+            ),
+            duration_ms: 1,
+            failure_output: None,
+            failure_test_names: Vec::new(),
+            inconclusive_reason: None,
+        }
+    }
+
+    fn report_with_checks(
+        checks: Vec<super::super::verification::CheckResult>,
+    ) -> super::super::verification::VerificationReport {
+        super::super::verification::VerificationReport {
+            schema_version: super::super::verification::VERIFY_REPORT_SCHEMA_VERSION,
+            id: "r1".into(),
+            mode: super::super::verification::VerificationMode::Final,
+            source: "configured".into(),
+            repo: PathBuf::from("/repo"),
+            branch: String::new(),
+            head_sha: String::new(),
+            change_fingerprint: 1,
+            changed_paths: vec![],
+            fallback_to_full: false,
+            narrowed_to: vec![],
+            notes: vec![],
+            started_at: 0,
+            finished_at: 0,
+            checks,
+        }
+    }
+
+    /// Precedence rule 1: `verification_unchanged` (the no-progress guard's
+    /// own verdict) wins over everything else, even a report that also has
+    /// genuine failing checks -- the round did no work at all, so nothing
+    /// else about it is meaningful.
+    #[test]
+    fn classify_fix_round_cause_stale_evidence_outranks_a_failing_report() {
+        use super::super::verification::{CheckKind, CheckStatus};
+        let report = report_with_checks(vec![check("test", CheckKind::Unit, CheckStatus::Failed)]);
+        let cause = classify_fix_round_cause(WorkflowPhase::Test, true, Some(&report));
+        assert_eq!(cause, Some(FixRoundCause::StaleEvidence));
+    }
+
+    /// Precedence rule 2: a review-phase failure is always `ReviewFinding`,
+    /// regardless of what (if anything) a `VerificationReport` says -- the
+    /// review gate never consults it.
+    #[test]
+    fn classify_fix_round_cause_review_phase_is_always_review_finding() {
+        let cause = classify_fix_round_cause(WorkflowPhase::Review, false, None);
+        assert_eq!(cause, Some(FixRoundCause::ReviewFinding));
+    }
+
+    /// Precedence rule 3: a genuine functional failure outranks a
+    /// mechanical one when a single report has both.
+    #[test]
+    fn classify_fix_round_cause_failing_test_outranks_fmt_clippy_in_the_same_report() {
+        use super::super::verification::{CheckKind, CheckStatus};
+        let report = report_with_checks(vec![
+            check("format", CheckKind::Format, CheckStatus::Failed),
+            check("test", CheckKind::Unit, CheckStatus::Failed),
+        ]);
+        let cause = classify_fix_round_cause(WorkflowPhase::Verify, false, Some(&report));
+        assert_eq!(cause, Some(FixRoundCause::FailingTest));
+    }
+
+    /// Rule 4: only style/lint checks failed.
+    #[test]
+    fn classify_fix_round_cause_fmt_clippy_when_only_style_or_lint_checks_fail() {
+        use super::super::verification::{CheckKind, CheckStatus};
+        let report = report_with_checks(vec![
+            check("format", CheckKind::Format, CheckStatus::Passed),
+            check("clippy", CheckKind::Lint, CheckStatus::Failed),
+            check("test", CheckKind::Unit, CheckStatus::Passed),
+        ]);
+        let cause = classify_fix_round_cause(WorkflowPhase::Test, false, Some(&report));
+        assert_eq!(cause, Some(FixRoundCause::FmtClippy));
+    }
+
+    /// Never invents a cause: a phase this classifier does not cover, or a
+    /// Test/Verify failure with no persisted report to inspect, is `None`.
+    #[test]
+    fn classify_fix_round_cause_never_guesses_without_evidence() {
+        assert_eq!(
+            classify_fix_round_cause(WorkflowPhase::Implement, false, None),
+            None,
+            "implement is not a fix-round phase at all"
+        );
+        assert_eq!(
+            classify_fix_round_cause(WorkflowPhase::Verify, false, None),
+            None,
+            "a Test/Verify failure with no report is unclassified, never guessed"
+        );
+    }
+
+    /// The build/validate split classifies by `WorkflowPhase`, not step id
+    /// -- a frontend variant step (`implement-frontend`) still has
+    /// `phase = Implement`, so it lands in `build_ms` exactly like the
+    /// primary `implement` step would.
+    #[test]
+    fn build_validate_split_buckets_a_frontend_variant_step_by_phase_not_step_id() {
+        let mut implement_frontend = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        implement_frontend.phase = Some(WorkflowPhase::Implement);
+        implement_frontend.duration_ms = Some(4_000);
+
+        let mut verify = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        verify.phase = Some(WorkflowPhase::Verify);
+        verify.duration_ms = Some(1_000);
+
+        let report = aggregate(&[implement_frontend, verify]);
+        assert_eq!(report.build_ms, 4_000);
+        assert_eq!(report.validate_ms, 1_000);
+        assert_eq!(
+            render_build_validate_line(&report),
+            "implement/validate split: build 4000ms (80%) / validate 1000ms (20%) -- machine \
+             time only, excludes operator approval wait (see the approval wait line)"
+        );
+    }
+
+    /// `deploy` (the pack's "Finish branch" step) lands on the validate
+    /// side -- issue #699's own problem statement lists it there.
+    #[test]
+    fn build_validate_split_counts_deploy_as_validation() {
+        let mut deploy = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        deploy.phase = Some(WorkflowPhase::Deploy);
+        deploy.duration_ms = Some(500);
+        let report = aggregate(&[deploy]);
+        assert_eq!(report.build_ms, 0);
+        assert_eq!(report.validate_ms, 500);
+    }
+
+    #[test]
+    fn build_validate_line_reports_no_data_when_nothing_recorded() {
+        let report = aggregate(&[]);
+        assert_eq!(
+            render_build_validate_line(&report),
+            "implement/validate split: no data (no step machine-time recorded yet)"
+        );
+    }
+
+    /// Approval wait is summed from `ArtifactAccepted.approval_wait_ms` and
+    /// reported separately, never folded into `build_ms`/`validate_ms`.
+    #[test]
+    fn approval_wait_is_summed_and_excluded_from_the_build_validate_split() {
+        let mut intent_approved = TelemetryEvent::new(TelemetryKind::ArtifactAccepted);
+        intent_approved.phase = Some(WorkflowPhase::Intent);
+        intent_approved.approval_wait_ms = Some(600_000);
+
+        let mut implement = TelemetryEvent::new(TelemetryKind::PhaseCompleted);
+        implement.phase = Some(WorkflowPhase::Implement);
+        implement.duration_ms = Some(1_000);
+
+        let report = aggregate(&[intent_approved, implement]);
+        assert_eq!(report.approval_wait_ms, 600_000);
+        assert_eq!(report.approval_wait_steps, 1);
+        assert_eq!(report.build_ms, 1_000, "wait must not leak into build_ms");
+        assert_eq!(
+            render_approval_wait_line(&report),
+            "approval wait: 600000ms across 1 approval-gated step(s) -- operator/agent-drafting \
+             time, not counted in the implement/validate split above"
+        );
+    }
+
+    #[test]
+    fn approval_wait_line_reports_no_data_when_nothing_recorded() {
+        let report = aggregate(&[]);
+        assert_eq!(
+            render_approval_wait_line(&report),
+            "approval wait: no data (no approval-gated step completed yet)"
+        );
+    }
+
+    /// `aggregate` tallies each `PhaseFailed` Test/Review/Verify event's
+    /// `fix_round_cause` into `fix_round_causes`, keeping an unclassified
+    /// one in its own separate counter rather than silently dropping it.
+    #[test]
+    fn aggregate_tallies_fix_round_causes_and_unclassified_separately() {
+        let mut review_finding = TelemetryEvent::new(TelemetryKind::PhaseFailed);
+        review_finding.phase = Some(WorkflowPhase::Review);
+        review_finding.fix_round_cause = Some(FixRoundCause::ReviewFinding);
+
+        let mut stale = TelemetryEvent::new(TelemetryKind::PhaseFailed);
+        stale.phase = Some(WorkflowPhase::Verify);
+        stale.fix_round_cause = Some(FixRoundCause::StaleEvidence);
+
+        let mut unclassified = TelemetryEvent::new(TelemetryKind::PhaseFailed);
+        unclassified.phase = Some(WorkflowPhase::Test);
+        unclassified.fix_round_cause = None;
+
+        // A `PhaseFailed` outside Test/Review/Verify must never be counted.
+        let mut implement_failed = TelemetryEvent::new(TelemetryKind::PhaseFailed);
+        implement_failed.phase = Some(WorkflowPhase::Implement);
+
+        let report = aggregate(&[review_finding, stale, unclassified, implement_failed]);
+        assert_eq!(report.fix_round_causes.get("review-finding"), Some(&1));
+        assert_eq!(report.fix_round_causes.get("stale-evidence"), Some(&1));
+        assert_eq!(report.fix_round_causes.get("fmt-clippy"), None);
+        assert_eq!(report.fix_rounds_unclassified, 1);
+        assert_eq!(
+            render_fix_round_causes_line(&report),
+            "fix-round causes: 3 total (review-finding 1, stale-evidence 1, unclassified 1)"
+        );
+    }
+
+    #[test]
+    fn fix_round_causes_line_reports_no_rounds_when_nothing_recorded() {
+        let report = aggregate(&[]);
+        assert_eq!(
+            render_fix_round_causes_line(&report),
+            "fix-round causes: no fix rounds recorded yet"
         );
     }
 }

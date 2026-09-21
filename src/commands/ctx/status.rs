@@ -834,18 +834,45 @@ pub fn group_tree_lines_brief(
 /// "; " here (dropping the "no agent is both enabled and ready:" summary
 /// line) so the status line stays on one row like every other line `status`
 /// prints, instead of splitting a single logical fact across several.
+///
+/// Issue #690: `FirstInstalledReady` -- the fallback landed here because a
+/// higher-priority harness is not installed -- spends more of that row than
+/// the other two rules do, naming the missing harness and how to pin the
+/// choice. A standing configuration fact an operator can only act on if it
+/// says what is missing and what to do about it is worth the width; the two
+/// rules that chose nothing on the operator's behalf still read exactly as
+/// they did.
 fn describe_chat(cfg: &CtxConfig, colour: bool) -> String {
-    match adapters::resolve_default(cfg) {
+    describe_chat_with_presence(cfg, colour, &adapters::liveness_probe)
+}
+
+/// [`describe_chat`] with `resolve_default`'s own machine-dependent input --
+/// whether a harness is actually installed -- passed in rather than read off
+/// the ambient `PATH`. Issue #690 made this line's answer depend on what the
+/// machine has, so a test of it that reads the real `PATH` asserts about the
+/// developer's laptop (claude and codex both installed) and fails on a CI
+/// runner with neither. The wrapper above keeps the production signature;
+/// every test goes through here and states the machine it assumes.
+fn describe_chat_with_presence(
+    cfg: &CtxConfig,
+    colour: bool,
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+) -> String {
+    match adapters::resolve_default_with_presence(cfg, present) {
         Ok((adapter, origin)) => {
             let rule = match origin {
-                DefaultOrigin::Configured => "configured",
-                DefaultOrigin::FirstEnabledReady => "first enabled and ready",
+                DefaultOrigin::Configured => "configured".to_string(),
+                DefaultOrigin::FirstEnabledReady => "first enabled and ready".to_string(),
+                DefaultOrigin::FirstInstalledReady { not_found } => format!(
+                    "first installed and ready; '{not_found}' is not installed -- set `agent` \
+                     in ~/.zirv/ctx.toml or pass --agent to pin this"
+                ),
             };
             format!(
                 "{} {} ({})",
                 label(colour, "chat:"),
                 style::paint(adapter.name(), Tone::Accent, colour),
-                style::paint(rule, Tone::Muted, colour)
+                style::paint(&rule, Tone::Muted, colour)
             )
         }
         Err(e) => {
@@ -1614,11 +1641,7 @@ fn render_report<W: Write>(
             w,
             "\n{} {}",
             label(colour, "chat:"),
-            style::paint(
-                &format!("unavailable (configuration error: {e})"),
-                Tone::Err,
-                colour
-            )
+            style::paint(&format!("unavailable ({e})"), Tone::Err, colour)
         )?,
     }
 
@@ -3134,6 +3157,7 @@ mod tests {
             source: "configured".into(),
             repo: repo.to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: verification::change_fingerprint(repo).expect("fingerprint"),
             changed_paths: vec![],
             fallback_to_full: false,
@@ -3987,9 +4011,13 @@ mod tests {
     /// `agent = "claude"` in `ctx.toml` is reported as configured instead.
     #[test]
     fn status_names_the_agent_chat_would_launch_and_the_rule_that_chose_it() {
+        // Issue #690: the machine is injected, not inherited. This line's
+        // answer now depends on what is installed, so reading the real
+        // `PATH` would assert about the developer's own laptop and fail on
+        // a CI runner with no harness at all.
         let default_cfg = CtxConfig::default();
         assert_eq!(
-            describe_chat(&default_cfg, false),
+            describe_chat_with_presence(&default_cfg, false, &adapters::everything_installed()),
             "chat: claude (first enabled and ready)"
         );
 
@@ -3998,9 +4026,28 @@ mod tests {
             ..CtxConfig::default()
         };
         assert_eq!(
-            describe_chat(&configured_cfg, false),
+            describe_chat_with_presence(&configured_cfg, false, &adapters::everything_installed()),
             "chat: claude (configured)"
         );
+    }
+
+    /// The other half of the same line, and the reason the seam exists:
+    /// with claude simply not installed, `chat:` names what it would really
+    /// launch and says why -- an operator can act on that, where the bare
+    /// rule name would leave them guessing.
+    #[test]
+    fn status_says_which_harness_is_missing_when_presence_chose_the_adapter() {
+        let line = describe_chat_with_presence(
+            &CtxConfig::default(),
+            false,
+            &adapters::only_installed(&["codex"]),
+        );
+        assert!(line.contains("chat: codex"), "got {line}");
+        assert!(
+            line.contains("'claude' is not installed"),
+            "names the missing harness: {line}"
+        );
+        assert!(line.contains("--agent"), "says how to pin it: {line}");
     }
 
     /// `describe_proxy` is `off` while `[proxy] enabled` is false, regardless
@@ -4157,6 +4204,64 @@ mod tests {
         assert!(
             !chat_line.contains('\u{2014}'),
             "no em dashes in user-facing copy: {chat_line}"
+        );
+    }
+
+    /// Verify that when there's a config error, the "configuration error:" prefix
+    /// appears exactly once in the chat line, not duplicated from multiple layers.
+    #[test]
+    fn status_shows_config_error_with_prefix_appearing_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        // Create a bad config with an unknown future feature
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[some_future_feature]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+                agents: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        // Find the chat line which should show the config error
+        let chat_line = text.lines().find(|l| l.starts_with("chat:")).unwrap_or("");
+        assert!(
+            chat_line.contains("unavailable"),
+            "chat line should show unavailable: {chat_line}"
+        );
+        assert!(
+            chat_line.contains("unknown key"),
+            "chat line should mention unknown key: {chat_line}"
+        );
+
+        // Count occurrences of the prefix -- should be exactly 1
+        let prefix_count = chat_line.matches("configuration error:").count();
+        assert_eq!(
+            prefix_count, 1,
+            "prefix should appear exactly once in chat line, but got {}: {}",
+            prefix_count, chat_line
         );
     }
 
@@ -5047,6 +5152,21 @@ mod tests {
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         write_claude_hooks_installed(&home);
+        // Issue #690: this end-to-end run now prints a `chat:` line that says
+        // so when the default harness is not installed, and these assertions
+        // read the whole of `status`'s output for the words "not installed".
+        // The premise here is about *hooks*, not about which binaries exist,
+        // so the machine is stated rather than inherited: a stub on `PATH` is
+        // enough, since `program_is_present` asks `is_file`, never
+        // executability.
+        let path_dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in crate::commands::ctx::adapters::ADAPTERS {
+            std::fs::write(path_dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(path_dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let env = env_for(state.root());
@@ -5118,6 +5238,21 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         // No `write_claude_hooks_installed(&home)` call: no settings.json at
         // all, exactly the fresh-machine state.
+        // Issue #690: this end-to-end run now prints a `chat:` line that says
+        // so when the default harness is not installed, and these assertions
+        // read the whole of `status`'s output for the words "not installed".
+        // The premise here is about *hooks*, not about which binaries exist,
+        // so the machine is stated rather than inherited: a stub on `PATH` is
+        // enough, since `program_is_present` asks `is_file`, never
+        // executability.
+        let path_dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in crate::commands::ctx::adapters::ADAPTERS {
+            std::fs::write(path_dir.path().join(name), "").expect("write stub");
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(path_dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let env = env_for(state.root());

@@ -1190,15 +1190,19 @@ pub struct ClaudeAdapter {
     /// `with_endpoint` (tests/direct construction) -- never set from a repo
     /// layer, see `config.rs`'s `REPO_FORBIDDEN` entry for `endpoint`.
     endpoint: Option<super::super::config::EndpointTarget>,
-    /// Issue #504: an operator-only `chat.claude_permission_mode` override
-    /// for the INTERACTIVE launch's `--permission-mode`, attached
-    /// post-construction via `AgentAdapter::apply_chat_config` (production)
-    /// or `with_claude_permission_mode` (tests/direct construction) --
-    /// mirrors `endpoint`'s own pattern immediately above, and never set
-    /// from a repo layer (see `config.rs`'s `REPO_FORBIDDEN` entry for
-    /// `chat.claude_permission_mode`). `None` reproduces the shipped
-    /// `"default"` posture exactly -- see `default_sandbox_args`'s own doc
-    /// comment.
+    /// Issue #504 (revised 2026-09-20, permission-prompts.jsonl audit): an
+    /// operator-only `chat.claude_permission_mode` override for the
+    /// INTERACTIVE launch's `--permission-mode`, attached post-construction
+    /// via `AgentAdapter::apply_chat_config` (production) or
+    /// `with_claude_permission_mode` (tests/direct construction) -- mirrors
+    /// `endpoint`'s own pattern immediately above, and never set from a repo
+    /// layer (see `config.rs`'s `REPO_FORBIDDEN` entry for
+    /// `chat.claude_permission_mode`). `None` (the operator has not set this
+    /// key) now OMITS `--permission-mode` from the launch argv entirely --
+    /// see `default_sandbox_args`'s own doc comment for why forcing
+    /// `"default"` on every launch turned out to be zirv silently
+    /// overriding the operator's own `permissions.defaultMode`, which a CLI
+    /// flag outranks.
     claude_permission_mode: Option<String>,
     #[cfg(test)]
     forced_file_support: Option<bool>,
@@ -1809,8 +1813,9 @@ fn launch_settings_value(
     // Request Claude's OS sandbox when Claude Code can provide it (macOS,
     // Linux and WSL2, not native Windows). Linux needs bubblewrap (`bwrap`)
     // and socat; if missing, Claude Code warns and runs without OS sandboxing.
-    // Zirv's `--permission-mode default`, allowed/disallowed tools and
-    // `zirv ctx safety check` PreToolUse hook still apply.
+    // Zirv's allowed/disallowed tools and `zirv ctx safety check`
+    // PreToolUse hook still apply, as does `--permission-mode` when the
+    // operator has configured `chat.claude_permission_mode` (issue #504).
     #[cfg(not(windows))]
     if let Some(object) = settings.as_object_mut() {
         let mut filesystem = serde_json::json!({
@@ -2424,12 +2429,19 @@ impl AgentAdapter for ClaudeAdapter {
              resolve in headless `-p` mode";
         const SETTINGS: &str = "claude's own permission prompts and `.claude/settings.json` permissions, which zirv \
              reads and never rewrites";
-        // 2026-08-24: an INTERACTIVE launch carries `--permission-mode
-        // default` plus the `zirv ctx safety check` PreToolUse hook as the
-        // sole prompting gate. That is a real, verified per-run mechanism, so
-        // an `Ask` stance stops being purely operator-controlled -- but only
-        // `Degraded`: the hook is registered for the `Bash` tool alone, so
-        // every other tool still lands on claude's own settings.
+        // 2026-08-24 (revised 2026-09-20, issue #504): an INTERACTIVE launch
+        // always carries the `zirv ctx safety check` PreToolUse hook as its
+        // prompting gate, independent of `--permission-mode`. The
+        // `--permission-mode` flag itself is only emitted when the operator
+        // has set `chat.claude_permission_mode`; left unset, zirv omits the
+        // flag entirely and Claude Code's own configured `defaultMode`
+        // applies (see `default_sandbox_args`'s own doc comment -- forcing
+        // `"default"` on every launch was zirv overriding config a CLI flag
+        // outranks). Either way that hook is a real, verified per-run
+        // mechanism, so an `Ask` stance stops being purely
+        // operator-controlled -- but only `Degraded`: the hook is registered
+        // for the `Bash` tool alone, so every other tool still lands on
+        // claude's own settings.
         //
         // KNOWN RESIDUAL (2026-08-24, filed rather than guessed at): this
         // `Degraded` claim assumes `launch_settings_path` actually wrote the
@@ -2443,13 +2455,14 @@ impl AgentAdapter for ClaudeAdapter {
         // argv-based fallback that does not depend on writing a file at
         // all; both are out of scope for this pass, so the gap is
         // documented rather than silently left implied-fixed.
-        const ASK_INTERACTIVE: &str = "--permission-mode default plus the `zirv ctx safety check` PreToolUse hook as the \
-             sole prompting gate, which allows everyday and unclassified commands outright and \
-             prompts only on zirv's own short dangerous-command list; the hook matches the Bash \
-             tool only, so every other tool still falls to claude's own settings";
-        const OUTSIDE_REPO_ASK_INTERACTIVE: &str = "--permission-mode default with --allowedTools scoped to Edit(./**) plus the \
-             workspace scratchpad: a write outside those paths is not pre-approved, so claude \
-             prompts rather than failing silently";
+        const ASK_INTERACTIVE: &str = "the `zirv ctx safety check` PreToolUse hook (present on every interactive launch \
+             regardless of which `--permission-mode` wins, if any) as the sole prompting gate, \
+             which allows everyday and unclassified commands outright and prompts only on zirv's \
+             own short dangerous-command list; the hook matches the Bash tool only, so every \
+             other tool still falls to claude's own settings";
+        const OUTSIDE_REPO_ASK_INTERACTIVE: &str = "--allowedTools scoped to Edit(./**) plus the workspace scratchpad, present \
+             regardless of which `--permission-mode` wins, if any: a write outside those paths \
+             is not pre-approved, so claude prompts rather than failing silently";
 
         match capability {
             Capability::RepoFsWrite | Capability::ShellExec => match stance {
@@ -2706,40 +2719,52 @@ impl AgentAdapter for ClaudeAdapter {
         // `dontAsk` is "don't prompt, deny if not pre-approved" (the
         // installed CLI's own `--help` text, quoted in this method's doc
         // comment) -- correct with no human present, and exactly wrong with
-        // one. `default` prompts for anything not pre-approved, which is what
-        // lets the safety hook's own decisions be the whole story, and stays
-        // the shipped default: `acceptEdits`/`bypassPermissions` were probed
-        // live and both auto-run unapproved destructive actions, so zirv
-        // never picks either FOR the operator.
+        // one. Headless therefore keeps this hardcoded unconditionally:
+        // `acceptEdits`/`bypassPermissions` were probed live and both
+        // auto-run unapproved destructive actions with nobody there to
+        // answer a prompt, so zirv never picks either FOR the operator.
         //
-        // Issue #504: the CLI flag outranks `permissions.defaultMode` in the
-        // operator's own `~/.claude/settings.json`, so before this override
-        // there was no way to widen the interactive posture from config --
-        // an operator running several native subagents in delegation
-        // worktrees got prompted for every Edit/Write outside `./**` and
-        // every unlisted compound command, with no knob to quiet it.
+        // Issue #504 (revised 2026-09-20, permission-prompts.jsonl audit:
+        // 345 logged prompts, 0 of them under `bypassPermissions` even
+        // though the operator's own `~/.claude/settings.json` sets
+        // `permissions.defaultMode = "bypassPermissions"`): a
+        // `--permission-mode` CLI flag outranks `permissions.defaultMode` in
+        // that file, so unconditionally emitting `--permission-mode default`
+        // here -- as this method used to -- silently forced `default` on
+        // every interactive launch and made the operator's own configured
+        // mode unreachable. That is zirv overriding operator-owned config,
+        // which this project's own layering rule reserves the operator
+        // (config wins; only the repo layer may narrow). The fix: when
+        // `self.claude_permission_mode` is `None` (operator has not set
+        // `chat.claude_permission_mode`), omit `--permission-mode` from the
+        // argv entirely and let Claude Code fall through to its own
+        // configured `defaultMode` -- unchanged behavior for an operator who
+        // never touches the setting, since Claude Code's own shipped default
+        // for `defaultMode` is itself `"default"`. When the operator HAS set
         // `chat.claude_permission_mode` (operator-only, `REPO_FORBIDDEN` --
-        // see `config.rs`) now picks the mode this adapter INSTANCE carries
-        // (`self.claude_permission_mode`, attached by `AgentAdapter::
-        // apply_chat_config`); `None` (unset) reproduces `"default"` exactly,
-        // so behavior is unchanged for every operator who never sets it.
-        // Headless is untouched either way -- `dontAsk` stays hardcoded --
-        // and picking `bypassPermissions` here changes only this flag: the
-        // `--allowedTools`/`--disallowedTools` lists above are built exactly
-        // the same regardless of which mode wins, never suppressed or
-        // widened further for it.
-        let permission_mode = if mode.is_interactive() {
-            self.claude_permission_mode.as_deref().unwrap_or("default")
+        // see `config.rs`), that mode reaches the flag exactly as before via
+        // `self.claude_permission_mode` (attached by `AgentAdapter::
+        // apply_chat_config`). Headless is untouched either way -- `dontAsk`
+        // stays hardcoded and always emitted -- and none of this changes the
+        // `--allowedTools`/`--disallowedTools` lists above, built exactly
+        // the same regardless of which mode wins or whether the flag is
+        // emitted at all: zirv's own hard protections (the deny list, and
+        // the `zirv ctx safety check` hook's `deny` verdict, which blocks
+        // via exit code 2 in every permission mode) are not weakened by
+        // this.
+        let permission_mode: Option<&str> = if mode.is_interactive() {
+            self.claude_permission_mode.as_deref()
         } else {
-            "dontAsk"
+            Some("dontAsk")
         };
 
-        let mut args = vec![
-            "--permission-mode".to_string(),
-            permission_mode.to_string(),
-            format!("--allowedTools={allow}"),
-            format!("--disallowedTools={deny}"),
-        ];
+        let mut args: Vec<String> = Vec::new();
+        if let Some(permission_mode) = permission_mode {
+            args.push("--permission-mode".to_string());
+            args.push(permission_mode.to_string());
+        }
+        args.push(format!("--allowedTools={allow}"));
+        args.push(format!("--disallowedTools={deny}"));
         if let Some(path) = self.launch_settings_path(sandbox, safety) {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
@@ -4910,7 +4935,12 @@ mod tests {
     /// blanket-allows Bash and lets the safety hook gate; Design B (see the
     /// plan's Task 3 Step 1) drops the blanket entry and lets the hook's own
     /// explicit `"allow"` carry it. This test pins what BOTH designs share:
-    /// the mode is `default`, and no per-command Bash allow-list is emitted.
+    /// with no `chat.claude_permission_mode` configured, no `--permission-
+    /// mode` flag is emitted at all (issue #504 revision, 2026-09-20 -- an
+    /// unset operator mode must not force `default` and silently override
+    /// whatever `permissions.defaultMode` the operator's own
+    /// `settings.json` carries), and no per-command Bash allow-list is
+    /// emitted either.
     #[test]
     fn the_interactive_projection_never_emits_a_finite_bash_allow_list() {
         let adapter = ClaudeAdapter::new(None);
@@ -4919,9 +4949,9 @@ mod tests {
             &Default::default(),
             super::super::LaunchMode::Interactive,
         );
-        assert_eq!(
-            &args[0..2],
-            &["--permission-mode".to_string(), "default".to_string()]
+        assert!(
+            !args.iter().any(|arg| arg == "--permission-mode"),
+            "an unset chat.claude_permission_mode must omit the flag entirely: {args:?}"
         );
         let allow_arg = args
             .iter()
@@ -5057,7 +5087,27 @@ mod tests {
                 &Default::default(),
                 super::super::LaunchMode::Interactive,
             );
-        let without_mode_flag = |args: &[String]| args[2..].to_vec();
+        // `plain` carries no `--permission-mode` flag at all now (issue
+        // #504 revision, 2026-09-20 -- an unset `chat.claude_permission_mode`
+        // omits the flag rather than forcing `default`), so strip the flag
+        // and its value from either side rather than assuming a fixed
+        // leading position.
+        let without_mode_flag = |args: &[String]| -> Vec<String> {
+            let mut out = Vec::with_capacity(args.len());
+            let mut skip_next = false;
+            for arg in args {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if arg == "--permission-mode" {
+                    skip_next = true;
+                    continue;
+                }
+                out.push(arg.clone());
+            }
+            out
+        };
         assert_eq!(
             without_mode_flag(&plain),
             without_mode_flag(&bypassed),

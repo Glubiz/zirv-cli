@@ -614,7 +614,11 @@ fn save_correction_checkpoint(path: &Path, checkpoint: &CorrectionCheckpoint) {
 /// to those same lines -- the same property that already lets
 /// `fold_adoption_delta` treat `adapter.parse_events` incrementally.
 fn corrections_in(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> usize {
-    let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) else {
+    // Issue #690: `select_for_identity`, never `select` -- this names the
+    // adapter whose transcript format to parse, and a hook subprocess with
+    // a reduced `PATH` must not stop screening because a presence probe
+    // could not see the harness that is running it.
+    let Ok(adapter) = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg) else {
         return 0;
     };
     let path = correction_checkpoint_path(state, transcript);
@@ -1043,7 +1047,7 @@ fn adoption_stop_nudge(
     let path = adoption_record_path(state, session);
     let mut record = load_adoption_record(&path);
 
-    if let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) {
+    if let Ok(adapter) = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg) {
         fold_adoption_delta(&mut record, transcript, adapter.as_ref());
     }
     record.turns = score.signals.turns;
@@ -1232,7 +1236,7 @@ pub(crate) fn session_has_modification(
     transcript: &Path,
     cfg: &CtxConfig,
 ) -> bool {
-    let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) else {
+    let Ok(adapter) = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg) else {
         return false;
     };
     let path = modification_checkpoint_path(state, transcript);
@@ -1424,7 +1428,7 @@ fn diagnostics_stop_nudge(
     if !cfg.diagnostics.enabled {
         return None;
     }
-    let adapter = adapters::select(cfg.agent.as_deref(), &[], cfg).ok()?;
+    let adapter = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg).ok()?;
     let jsonl = std::fs::read_to_string(transcript).ok()?;
     let files_modified = adapter.structural_context(&jsonl, 64).files_modified;
     let target = diagnostics::diagnostics_target_dir(state, repo);
@@ -1625,7 +1629,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // Issue #312: independent of the rot `Verdict` ladder above -- a
         // cost-driven tier of its own, gated on stale tool-result tokens and
         // window fraction, never on `score.verdict`.
-        if let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], &cfg) {
+        if let Ok(adapter) = adapters::select_for_identity(cfg.agent.as_deref(), &[], &cfg) {
             compact_advisory_nudge = compact_advisory_stop_nudge(
                 &state,
                 &repo,

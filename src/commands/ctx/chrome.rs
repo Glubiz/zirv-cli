@@ -117,16 +117,28 @@ pub enum HarnessRule {
     /// No explicit or configured choice; the first registry entry that was
     /// both gate-enabled and `ready()`.
     FirstEnabledReady,
+    /// As `FirstEnabledReady`, but a harness ahead of it in registry order
+    /// was skipped for not being installed on this machine (`not_found`) --
+    /// `adapters::DefaultOrigin::FirstInstalledReady` carried through. The
+    /// banner is not the disclosure this rule relies on (a repo may set
+    /// `[chrome] banner = false`; it may not touch `[chrome] events`), so
+    /// only the legacy tier's full sentence names the missing harness, and
+    /// `chat::announce_harness_choice` carries the full disclosure on the
+    /// announcement channel instead.
+    FirstInstalledReady { not_found: &'static str },
 }
 
 impl HarnessRule {
     /// The old, full-sentence form: used only by the legacy (no-VT) banner
     /// tier, which never changed shape from the pre-#202 banner.
-    pub fn describe(&self) -> &'static str {
+    pub fn describe(&self) -> String {
         match self {
-            HarnessRule::Explicit => "requested with --agent",
-            HarnessRule::Configured => "configured as the default agent",
-            HarnessRule::FirstEnabledReady => "the first enabled, ready harness",
+            HarnessRule::Explicit => "requested with --agent".to_string(),
+            HarnessRule::Configured => "configured as the default agent".to_string(),
+            HarnessRule::FirstEnabledReady => "the first enabled, ready harness".to_string(),
+            HarnessRule::FirstInstalledReady { not_found } => {
+                format!("the first installed, ready harness; '{not_found}' is not installed")
+            }
         }
     }
 
@@ -137,6 +149,7 @@ impl HarnessRule {
             HarnessRule::Explicit => "explicit",
             HarnessRule::Configured => "configured",
             HarnessRule::FirstEnabledReady => "auto",
+            HarnessRule::FirstInstalledReady { .. } => "auto",
         }
     }
 }
@@ -975,6 +988,26 @@ mod tests {
         assert!(
             text.contains("configured as the default agent"),
             "got {text}"
+        );
+    }
+
+    /// Issue #690: the legacy tier has room for the full sentence, so it
+    /// names the harness that was missing rather than only the rule. The
+    /// compact tiers do not, which is why the disclosure this rule really
+    /// rests on is `chat::announce_harness_choice`'s own line on the
+    /// announcement channel -- a repo can turn the banner off, but not that.
+    #[test]
+    fn the_banner_names_the_missing_harness_when_presence_chose_this_one() {
+        let mut auto = facts();
+        auto.harness = "codex".to_string();
+        auto.rule = HarnessRule::FirstInstalledReady {
+            not_found: "claude",
+        };
+        let text = banner(&auto, false, false, None);
+        assert!(text.contains("codex"), "got {text}");
+        assert!(
+            text.contains("'claude' is not installed"),
+            "the rule alone never says which harness was missing: {text}"
         );
     }
 

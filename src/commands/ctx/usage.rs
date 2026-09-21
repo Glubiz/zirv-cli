@@ -1449,6 +1449,22 @@ mod tests {
         .expect("write");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
 
+        // Issue #690: the fallback now asks whether the adapter it lands on
+        // is actually installed, so this test has to say which machine it
+        // is run on rather than inherit the developer's. `run_with` is a
+        // command entry point three layers above `resolve_default`, so the
+        // machine is stated the way `chat::harness_list`'s own test already
+        // states it -- a `PATH` holding exactly the harnesses this test
+        // means to have -- instead of threading an oracle through a public
+        // CLI signature for one assertion. A plain file is enough:
+        // `program_is_present` asks `is_file`, never executability.
+        let path_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(path_dir.path().join("codex"), "").expect("write stub");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(path_dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
         let env: std::collections::HashMap<String, String> = [(
             crate::commands::ctx::state::STATE_ENV.to_string(),
             tmp.path().join("state").display().to_string(),

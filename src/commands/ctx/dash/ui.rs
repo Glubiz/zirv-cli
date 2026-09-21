@@ -85,7 +85,6 @@ pub struct HarnessUsage {
 pub struct HeaderFacts {
     pub hints: HintContext,
     pub harness: String,
-    pub select_mode: bool,
     pub live: usize,
     pub total: usize,
     pub error_count: usize,
@@ -1282,9 +1281,13 @@ fn map_color(c: vt100::Color) -> Color {
 /// Ordered exactly as the design calls for: the ` zirv ` chip, the harness
 /// label (bold, standing in for the generic app name -- see [`HeaderFacts`]'s
 /// own doc comment for why this is `harness` rather than a literal "dash"),
-/// the live/total count (muted), select-mode's own reminder when it is on,
-/// then the one flexible segment -- the sticky error line or a transient
-/// notice -- and finally the hint cluster, always kept, always on the right.
+/// the live/total count (muted), then the one flexible segment -- the sticky
+/// error line or a transient notice -- and finally the hint cluster, always
+/// kept, always on the right. Issue #697 removed select mode (`Ctrl+A v`)
+/// entirely, so there is no longer a `SELECT` marker to reserve room for
+/// here -- the dashboard now keeps its own mouse reporting on for the whole
+/// session (subject only to `dash.mouse`, an operator/config decision, not
+/// a runtime toggle this header would need to reflect).
 ///
 /// Only the flexible middle ever loses a character to width pressure: the
 /// fixed chrome (chip, harness, live count, hints) is reserved first, and
@@ -1300,20 +1303,15 @@ fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(R
     let chip_text = " zirv ".to_string();
     let harness_text = format!(" {}", facts.harness);
     let live_text = format!(" \u{b7} {}/{} live", facts.live, facts.total);
-    let select_text = if facts.select_mode {
-        Some("  SELECT".to_string())
-    } else {
-        None
-    };
 
-    // The chip and the hint cluster always show, and the live count and
-    // SELECT marker are short and fixed-shape; the harness/model label is
-    // the one variable-length piece of the left side, so it is the one that
-    // gives up room when the row is narrow. Ellipsis-truncate it to
-    // whatever is left after those fixed pieces, rather than drawing it at
-    // full length: a long-but-valid label would otherwise consume the row
-    // and push the hint cluster past the Paragraph's own right edge, where
-    // ratatui clips it off-screen with no ellipsis and no warning.
+    // The chip and the hint cluster always show, and the live count is
+    // short and fixed-shape; the harness/model label is the one
+    // variable-length piece of the left side, so it is the one that gives
+    // up room when the row is narrow. Ellipsis-truncate it to whatever is
+    // left after those fixed pieces, rather than drawing it at full length:
+    // a long-but-valid label would otherwise consume the row and push the
+    // hint cluster past the Paragraph's own right edge, where ratatui clips
+    // it off-screen with no ellipsis and no warning.
     let hints = header_hints(&facts.hints);
     let hints_w = hints
         .iter()
@@ -1323,22 +1321,15 @@ fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(R
     let gap_before_hints = 2usize;
     let chip_w = style::display_width(&chip_text);
     let live_w = style::display_width(&live_text);
-    let select_w = select_text
-        .as_deref()
-        .map(style::display_width)
-        .unwrap_or(0);
-    let fixed_w = chip_w + live_w + select_w;
+    let fixed_w = chip_w + live_w;
     let harness_budget = cols.saturating_sub(fixed_w + hints_w + gap_before_hints);
     let harness_text = style::truncate_display_ellipsis(&harness_text, harness_budget).into_owned();
 
-    let mut left: Vec<(String, Style)> = vec![
+    let left: Vec<(String, Style)> = vec![
         (chip_text, style::tui::chip()),
         (harness_text, style::tui::title()),
         (live_text, style::tui::muted()),
     ];
-    if let Some(text) = select_text {
-        left.push((text, style::tui::muted()));
-    }
     let left_w: usize = left.iter().map(|(t, _)| style::display_width(t)).sum();
 
     let reserved = left_w + hints_w + gap_before_hints;
@@ -4838,7 +4829,6 @@ mod tests {
         HeaderFacts {
             hints: HintContext::default(),
             harness: "claude".to_string(),
-            select_mode: false,
             live: 1,
             total: 1,
             error_count: 0,
@@ -4879,19 +4869,17 @@ mod tests {
         assert!(text.contains("help"), "got {text}");
     }
 
-    /// `Ctrl+A v`'s own state renders a visible reminder while it is on, since
-    /// it changes how every click and wheel notch behaves until toggled back.
+    /// Issue #697 removed select mode (`Ctrl+A v`) entirely -- the dashboard
+    /// keeps its own mouse reporting on for the whole session now, so there
+    /// is no runtime state left for a `SELECT` marker to report, and
+    /// `HeaderFacts` no longer even carries a field for it. This pins the
+    /// negative: whatever else the header shows, `SELECT` never appears.
     #[test]
-    fn header_shows_select_mode_only_while_active() {
+    fn header_never_shows_a_select_mode_marker() {
         let facts = base_facts();
         let area = Rect::new(0, 0, 80, 1);
         let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
         assert!(!text.contains("SELECT"), "header text was: {text}");
-
-        let mut facts = base_facts();
-        facts.select_mode = true;
-        let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
-        assert!(text.contains("SELECT"), "header text was: {text}");
     }
 
     /// A long-but-valid harness/model label must not consume the whole row:

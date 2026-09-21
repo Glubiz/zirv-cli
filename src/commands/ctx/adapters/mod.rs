@@ -631,6 +631,19 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
 /// `ps`, `printf`, `date`, `basename`, `dirname`, `xargs`, `tee`, `mktemp`,
 /// `realpath`), plus the fixed macOS SSH-agent environment lookup
 /// (`launchctl getenv` and `export SSH_AUTH_SOCK=...`).
+///
+/// **Fix round 7 (2026-09-20): the remaining harmless built-ins.** `Grep`,
+/// `Glob`, `AskUserQuestion`, `TodoWrite`, `NotebookRead` and `TaskOutput`
+/// are added as whole-tool allow entries alongside `WebFetch`/`WebSearch`
+/// above -- each is either read-only (`Grep`, `Glob`, `NotebookRead`,
+/// `TaskOutput`) or pure in-conversation UI state with no filesystem or
+/// process effect (`AskUserQuestion`, `TodoWrite`), so none of them can
+/// touch the machine, the repo or production. `Monitor`, `Skill` and
+/// `Agent`/`Task` are deliberately excluded even though they also showed up
+/// in `permission-prompts.jsonl`: `Monitor` can run and stream arbitrary
+/// shell commands, and `Skill`/`Agent` can themselves invoke
+/// `Bash`/`Write`/`Edit`, so all three must stay behind the same gate as
+/// `Bash` rather than being pre-approved as leaf tools.
 pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Read(./**)", "read anything inside the workspace"),
     (
@@ -651,6 +664,32 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ),
     ("WebFetch", "fetch a URL's contents, read-only"),
     ("WebSearch", "search the web, read-only"),
+    // Fix round 7 (2026-09-20): whole-tool allow entries for the remaining
+    // built-ins that cannot touch the machine, the repo or production --
+    // each is either read-only or purely in-conversation UI state, so
+    // gating them behind a prompt bought nothing (permission-prompts.jsonl:
+    // Grep 14, Glob 1, AskUserQuestion 7 of the 345 logged prompts were
+    // exactly this). `Monitor`, `Skill` and `Agent`/`Task` are deliberately
+    // NOT here even though they also showed up in that log: `Monitor` can
+    // run and stream arbitrary shell commands, and `Skill`/`Agent` can
+    // themselves invoke `Bash`/`Write`/`Edit`, so all three stay gated by
+    // the same posture that gates `Bash` itself rather than being
+    // pre-approved as if they were leaf tools.
+    ("Grep", "search file contents, read-only"),
+    ("Glob", "match file paths by pattern, read-only"),
+    (
+        "AskUserQuestion",
+        "ask the operator a clarifying question; no side effects",
+    ),
+    (
+        "TodoWrite",
+        "update the in-conversation todo list; conversation state, not a file or shell write",
+    ),
+    (
+        "NotebookRead",
+        "read a Jupyter notebook's cells and outputs, read-only",
+    ),
+    ("TaskOutput", "read a delegated agent's output; read-only"),
     // Whole toolchain families (2026-08-23, fix round 4, issue #104) -- see
     // this constant's own doc comment for why the narrower per-subcommand
     // entries these replace were still inert-by-omission on anything else
@@ -1523,8 +1562,12 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// default re-loads the effective canonical policy, applies the normal
     /// headless sandbox/policy projection, and finally applies the adapter's
     /// read-only floor when the seat requires it. Provider-specific model ids
-    /// are accepted only when an operator/caller explicitly supplies one;
-    /// `model_tier` remains a routing hint rather than a guessed model name.
+    /// are accepted only when an operator/caller explicitly supplies one, or
+    /// the operator's own `[model_tiers.<adapter>]` map (issue #699) names
+    /// one for this exact `(adapter, manifest.model_tier)` pair -- see
+    /// [`resolve_tiered_model`]. `model_tier` remains a routing hint zirv
+    /// itself never turns into a guessed model name; only the operator's
+    /// explicit pin or explicit map entry ever reaches argv.
     fn dispatch_agent(
         &self,
         manifest: &crate::commands::workflow::agents::AgentManifest,
@@ -1549,7 +1592,16 @@ pub trait AgentAdapter: std::fmt::Debug {
         }
 
         let mut extra = policy_launch_args(&cfg, self, &[], LaunchMode::Headless);
-        if let Some(model) = task.model.as_deref() {
+        // Resolution order (issue #699): an explicit per-invocation pin always
+        // wins; otherwise consult the operator's tier map for this adapter,
+        // never a guess of zirv's own. Neither branch ever narrows or widens
+        // `manifest.model_tier` itself -- the tier resolved is always the one
+        // the manifest already declared.
+        let resolved_model = task
+            .model
+            .as_deref()
+            .or_else(|| resolve_tiered_model(&cfg, self.name(), manifest.model_tier));
+        if let Some(model) = resolved_model {
             extra.extend(self.model_args(model));
         }
         let system_prompt = format!(
@@ -2774,11 +2826,54 @@ fn inconclusive_reason(adapter_name: &str, program: &str) -> Option<String> {
         })
 }
 
+/// Issue #690: the machine a selection test assumes, stated rather than
+/// inherited -- `only_installed` names every adapter whose program is
+/// `Live`, and every other adapter is confidently `Absent`. Without an
+/// injected oracle a test of the fallback reads the developer's own `PATH`,
+/// passing on a laptop with claude and codex installed and failing on a CI
+/// runner with neither.
+///
+/// `pub(crate)`, and deliberately not inside this module's own `mod tests`:
+/// the seam belongs to every module whose tests reach selection at all --
+/// `status.rs`'s `chat:` line, `chat.rs`'s harness rule, `usage.rs`'s
+/// provider readout -- and each of them re-rolling its own closure is how
+/// two would quietly end up asserting different machines.
+#[cfg(test)]
+pub(crate) fn only_installed(names: &'static [&'static str]) -> impl Fn(&str, &str) -> Liveness {
+    move |name: &str, program: &str| {
+        if names.contains(&name) {
+            Liveness::Live
+        } else {
+            Liveness::Absent(format!("no '{program}' found"))
+        }
+    }
+}
+
+/// Every adapter installed: the machine every pre-#690 selection test
+/// silently assumed, now said out loud.
+#[cfg(test)]
+pub(crate) fn everything_installed() -> impl Fn(&str, &str) -> Liveness {
+    |_name: &str, _program: &str| Liveness::Live
+}
+
+/// A probe that reaches no verdict at all -- an unreadable `PATH` entry, a
+/// permission error. Fail-open: `Unknown` must leave selection behaving
+/// exactly as it did before presence was ever consulted.
+#[cfg(test)]
+pub(crate) fn nothing_decidable() -> impl Fn(&str, &str) -> Liveness {
+    |_name: &str, program: &str| Liveness::Unknown(format!("could not check '{program}'"))
+}
+
 /// The full issue #298 probe: `Live` when [`program_is_present_widened`]
 /// finds `program`, `Unknown` when the search could not reach a confident
 /// verdict (fail-open -- see [`Liveness`]'s own doc comment), `Absent`
 /// otherwise.
-fn liveness_probe(adapter_name: &str, program: &str) -> Liveness {
+///
+/// `pub(crate)` because it is also the presence oracle every *production*
+/// caller hands to the injected selection path ([`resolve_default_with_
+/// presence`] and its callers in `status.rs`/`chat.rs`): one probe, named
+/// once, so no surface can drift into a second notion of "installed".
+pub(crate) fn liveness_probe(adapter_name: &str, program: &str) -> Liveness {
     if program.is_empty() {
         return Liveness::Absent("no program name".to_string());
     }
@@ -2788,6 +2883,120 @@ fn liveness_probe(adapter_name: &str, program: &str) -> Liveness {
     match inconclusive_reason(adapter_name, program) {
         Some(reason) => Liveness::Unknown(reason),
         None => Liveness::Absent(format!("no '{program}' found")),
+    }
+}
+
+/// The one sentence zirv uses for "this adapter's program is not on this
+/// machine", wherever that answer is reached from.
+///
+/// Issue #690 (remaining scope) added a second way to reach it -- the launch
+/// pre-flight ([`refuse_if_program_absent_with_presence`]) that decides it
+/// *before* the spawn rather than from the spawn's own `NotFound` -- and a
+/// second `format!` would have been a second wording to keep in step. Factored
+/// here instead, so the fast answer and the slow one are byte-identical: the
+/// pre-flight only ever turns a slow failure into a fast one, and an operator
+/// comparing the two never has to wonder whether they mean different things.
+///
+/// All three ways out, in the same words [`resolve_default_with_presence`]'s
+/// aggregate "no harness is installed" error already uses. The `agent_bin`
+/// remedy is the one that matters most here and used to be missing: this
+/// message is reached precisely when no `agent_bin` is set (the pre-flight
+/// does not probe an override at all), so its reader may well be someone
+/// whose harness *is* installed, just not anywhere a `PATH` walk reaches --
+/// see [`known_install_roots`] and CLAUDE.md's own note that codex on this
+/// repo's dev machine lives at a real install outside `PATH`. Telling that
+/// operator to install software they already have is the wrong answer, and
+/// it was the only one this sentence gave.
+fn program_not_found_message(adapter_name: &str, program: &str) -> String {
+    format!(
+        "adapter '{adapter_name}': program '{program}' not found. Install it so its program is \
+         on PATH, or point `agent_bin` at it in ~/.zirv/ctx.toml, or name an installed one with \
+         --agent."
+    )
+}
+
+/// Formats a launch error with context about which harness and program failed.
+/// When the error is NotFound, includes a suggestion to install the harness or use --agent.
+pub(crate) fn format_launch_error(
+    error: &(dyn std::error::Error + 'static),
+    adapter_name: &str,
+    program: &str,
+) -> String {
+    // Try to get the io::Error kind directly if available
+    if let Some(io_err) = error.downcast_ref::<std::io::Error>()
+        && io_err.kind() == std::io::ErrorKind::NotFound
+    {
+        return program_not_found_message(adapter_name, program);
+    }
+
+    // For any other error, include adapter/program context
+    format!(
+        "adapter '{}': program '{}' failed to start: {}",
+        adapter_name, program, error
+    )
+}
+
+/// Issue #690 (remaining scope): the launch pre-flight. Once a launch path
+/// has resolved the adapter it is about to *start*, and before it engages
+/// pacing, usage polling or the macOS Keychain-reading path any of that
+/// drags in, refuse outright if that adapter's program is confidently not on
+/// this machine.
+///
+/// The defect this exists for: on a machine with no harness installed,
+/// `zirv ctx agent claude "say hi"` used to warn about Keychain access for a
+/// harness the operator does not have, sit out `[pace] blind_delay_secs` of
+/// safety delay because that harness has no usage source, and only then
+/// report that `claude` is not a program. None of that machinery has anything
+/// to pace or poll when there is no process to launch.
+///
+/// Three rules, none of them new -- each is the rule an existing seam in this
+/// module already holds to:
+///
+/// 1. Fail-open. Only [`Liveness::Absent`] refuses; `Live` and `Unknown` both
+///    proceed exactly as before the pre-flight existed. A probe that could
+///    not decide must never cost a launch that would have worked -- see
+///    [`Liveness`]'s and [`program_is_present`]'s own doc comments for how
+///    wrong this probe is allowed to be.
+/// 2. Never substitute. This only ever turns a slow failure into a fast one;
+///    it chooses nothing. An explicitly named `--agent`, or a configured
+///    `agent`, fails here under *its own* name -- the invariant
+///    [`resolve_default_with_presence`]'s G/G3 notes pin, that a harness the
+///    operator named is never silently swapped for another, is not weakened
+///    by making its failure arrive sooner.
+/// 3. No probe at all while `agent_bin` is set. An operator-set override
+///    need not be a path a `stat` can answer (the `sh <wrapper>.sh` shape
+///    this codebase's own fixtures use throughout resolves to nothing on
+///    disk), so probing it would hard-fail working setups. This is
+///    [`resolve_default_with_presence`]'s own `consult_presence = bin.
+///    is_none()` rule, reused rather than a second rule invented beside it.
+///
+/// It is the caller's job to apply this only where the program about to be
+/// spawned actually *is* `adapter.program()`. `exec`'s explicit
+/// `-- <command>` passthrough and `wrap`'s wrapped argv are the operator's
+/// own program, not this adapter's, and refusing those would worsen a
+/// session rather than fail one faster.
+///
+/// `_with_presence` and no un-injected twin, unlike [`resolve_default`]/
+/// [`resolve_default_with_presence`]: every production caller is a *launch
+/// entry point* (`exec::run_with_clock`, `run_loop::run_with_clock`) that
+/// already names [`liveness_probe`] once for its whole call, so a second
+/// wrapper naming it again here would only be a second place for a caller
+/// to reach the probe from -- and dead code besides.
+pub(crate) fn refuse_if_program_absent_with_presence(
+    adapter: &dyn AgentAdapter,
+    cfg: &CtxConfig,
+    present: &dyn Fn(&str, &str) -> Liveness,
+) -> CtxResult<()> {
+    // Rule 3, before anything touches the filesystem.
+    if cfg.agent_bin.is_some() {
+        return Ok(());
+    }
+    match present(adapter.name(), adapter.program()) {
+        // Rule 1: only a confident absence refuses.
+        Liveness::Absent(_) => {
+            Err(program_not_found_message(adapter.name(), adapter.program()).into())
+        }
+        Liveness::Live | Liveness::Unknown(_) => Ok(()),
     }
 }
 
@@ -2910,8 +3119,9 @@ impl ProbeCache {
     /// write to a process-unique temp file, then rename into place, so a
     /// process killed mid-write leaves the previous cache file intact rather
     /// than a truncated one. A no-op when nothing changed (`load` alone
-    /// never dirties the cache) or when this instance has no backing path
-    /// (`ProbeCache::disabled`).
+    /// never dirties the cache) or when this instance has no backing path at
+    /// all (`path: None`, the cacheless shape this module's own tests
+    /// construct directly).
     pub fn save(&self) {
         if !self.dirty {
             return;
@@ -3376,7 +3586,12 @@ pub fn native_artifact_presentation_for_agent_name(
 /// operator configured one -- the same field `seat_model_env` and
 /// `wrap::run_with`'s `seat_cfg_model` already read for that seat.
 pub fn provider_for_usage_readout(cfg: &CtxConfig) -> &'static str {
-    resolve_default(cfg)
+    // Issue #690: presence is not consulted here. This names the account a
+    // readout belongs to, not a harness to launch, and letting an absent
+    // binary fall this through to `LEGACY_USAGE_PROVIDER` would put
+    // Anthropic percentages under a repo configured for another vendor --
+    // the guess this function was written to stop making.
+    resolve_default_with_presence(cfg, &presence_not_consulted)
         .map(|(adapter, _origin)| adapter.provider_for_model(cfg.chat.model.as_deref()))
         .unwrap_or_else(|_| {
             provider_for_agent_and_model(cfg.agent.as_deref(), cfg.chat.model.as_deref())
@@ -3727,6 +3942,38 @@ pub(crate) fn resolve_review_model(
     }
 }
 
+/// The operator's configured model id for `(adapter, tier)`, from `ctx.
+/// toml`'s `[model_tiers.<adapter>]` table (`config::ModelTiersConfig`) --
+/// issue #699's cost-routing lever. `None` when the operator has not mapped
+/// this exact pair, and `dispatch_agent` must read that as "pass no model",
+/// never as license to guess one.
+///
+/// Unlike [`resolve_worker_model`] below (which falls back to `adapter`'s
+/// own hard default) or `handover::resolve_model` (which falls back to a
+/// built-in per-vendor ladder), this function has NO fallback of its own:
+/// `manifest.model_tier` is a routing hint the manifest already declared,
+/// and zirv must never decide by itself that a `Deep` seat may run cheaper
+/// than the operator configured. Only the tier word the manifest already
+/// carries is ever looked up; this never substitutes a different one.
+fn resolve_tiered_model<'a>(
+    cfg: &'a CtxConfig,
+    adapter: &str,
+    tier: crate::commands::workflow::agents::ModelTier,
+) -> Option<&'a str> {
+    use crate::commands::workflow::agents::ModelTier;
+    let tiers = match adapter {
+        "claude" => &cfg.model_tiers.claude,
+        "codex" => &cfg.model_tiers.codex,
+        _ => return None,
+    };
+    let configured = match tier {
+        ModelTier::Fast => tiers.fast.as_deref(),
+        ModelTier::Standard => tiers.standard.as_deref(),
+        ModelTier::Deep => tiers.deep.as_deref(),
+    };
+    configured.filter(|model| !model.trim().is_empty())
+}
+
 /// The resolved `worker.<name>` model for a delegated headless worker: the
 /// operator's own `cfg.worker.<name>` value if set, else `adapter`'s own
 /// `AgentAdapter::default_worker_model`. `None` means neither exists, so a
@@ -4072,6 +4319,15 @@ pub enum DefaultOrigin {
     /// No configured agent; this was the first adapter in registry order
     /// that was both gate-enabled and `ready()`.
     FirstEnabledReady,
+    /// As `FirstEnabledReady`, except that *presence* rather than registry
+    /// order decided it: at least one candidate ahead of it was dropped for
+    /// being confidently absent from this machine, and `not_found` names the
+    /// first such one -- the adapter this fallback would have landed on had
+    /// it been installed. Issue #690: a caller that reports the choice at
+    /// all must report this one, which is what keeps "the only harness you
+    /// actually have" from being a silent provider switch. See
+    /// [`resolve_default`]'s own `G3` note.
+    FirstInstalledReady { not_found: &'static str },
 }
 
 /// Resolves the adapter `select` falls back to when neither an explicit
@@ -4105,7 +4361,77 @@ pub enum DefaultOrigin {
 /// already-unlaunchable adapter via `.settings.toml` could still block a
 /// perfectly good fallback to the next one, over a hypothetical that was
 /// never true.
+///
+/// G3 (issue #690): the fallback arm -- and only that arm -- also drops a
+/// candidate whose program is *confidently* absent from this machine. A repo
+/// checkout narrowing the fallback and a harness simply not being installed
+/// are not the same act by the same actor: the first is an untrusted surface
+/// changing which vendor an operator pays, which G above still refuses; the
+/// second is a fact about the operator's own machine, the same trust tier as
+/// `~/.zirv/ctx.toml`, and refusing there helps nobody -- an operator whose
+/// only harness is codex, with no `agent` configured, otherwise gets
+/// claude's "program 'claude' not found" and no way forward. What was
+/// legitimate in the objection is the word *silent*, so the answer is to
+/// announce rather than refuse: landing on a later adapter because an
+/// earlier one is not installed returns `DefaultOrigin::FirstInstalledReady`,
+/// naming the missing one, and every surface that reports the rule at all
+/// reports that.
+///
+/// Fail-open, exactly as [`Liveness`] and [`program_is_present`] already
+/// require: only `Absent` drops a candidate. `Live` and `Unknown` both keep
+/// it, so a probe that cannot reach a verdict leaves this function behaving
+/// precisely as it did before presence was consulted at all.
+///
+/// G3 and the probe cache: selection probes fresh, every launch.
+/// [`ProbeCache`] exists for the injected roster, which re-renders on every
+/// compile and can afford an hour-stale verdict; a launch path cannot. A
+/// cached `Absent` that outlives the install it describes would keep routing
+/// an operator's work to another vendor for the rest of
+/// `PROBE_CACHE_TTL_SECS` after they installed the harness they actually
+/// want -- and the operator who has just installed one is exactly who this
+/// rule exists for. The cost is a few dozen `stat`s once per launch. The
+/// price is that this fallback and the roster can briefly disagree about one
+/// adapter, which is the right way round: the roster only annotates a
+/// prompt, this decides whose account gets spent.
+///
+/// G3 and `agent_bin`: presence answers "is this adapter's *own* program
+/// installed", which is not a question about a program the operator has
+/// already named. An `agent_bin` override need not even be a path a `stat`
+/// can answer -- the `sh <wrapper>.sh` shape this codebase's own fixtures
+/// use throughout resolves to nothing on disk, and [`program_is_present`]'s
+/// own doc comment records that several call sites depend on
+/// `resolve_program` failing open for exactly such a value. So while an
+/// override is in effect, presence is not consulted at all: pointing zirv
+/// at a binary is the same kind of act as naming the agent, an explicit
+/// operator choice this rule exists to inform rather than to overrule.
+///
+/// G3 and G: presence is folded into G2's existing `repo_narrowed`
+/// condition, not checked beside it. A repo-disabled adapter that is itself
+/// confidently absent was never a candidate this fallback could have landed
+/// on -- the same false premise G2 already guards against, reached by a
+/// different route -- so it records no refusal, and the next adapter is
+/// chosen and announced instead. The refusal itself still runs *before* the
+/// chosen candidate's own presence check: when the repo narrowed a harness
+/// the operator really has, that refusal is the more useful answer, and G
+/// must not regress into a silent switch just because the adapter it would
+/// have named is missing too.
+/// G3, last: this is the *launch* question ("which harness should zirv
+/// start"), so presence has a say here. The naming question ("which adapter
+/// is this configuration about") is [`select_for_identity`], where it has
+/// none.
 pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, DefaultOrigin)> {
+    resolve_default_with_presence(cfg, &liveness_probe)
+}
+
+/// [`resolve_default`] with its one machine-dependent input -- whether an
+/// adapter's program is actually installed -- passed in rather than read
+/// from the ambient `PATH`. Every test of the fallback states the machine it
+/// assumes, instead of passing on the developer's laptop (claude and codex
+/// both installed) and failing on a runner with neither.
+pub(crate) fn resolve_default_with_presence(
+    cfg: &CtxConfig,
+    present: &dyn Fn(&str, &str) -> Liveness,
+) -> CtxResult<(Box<dyn AgentAdapter>, DefaultOrigin)> {
     let bin = cfg.agent_bin.as_deref();
 
     if let Some(name) = cfg.agent.as_deref() {
@@ -4129,8 +4455,16 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
         return Ok((adapter, DefaultOrigin::Configured));
     }
 
+    // G3: whether presence has anything to say about this fallback at all
+    // -- see this function's own doc comment on `agent_bin`.
+    let consult_presence = bin.is_none();
     let mut reasons = Vec::new();
     let mut repo_narrowed: Option<&str> = None;
+    // G3: the first candidate presence alone took off the table (the one
+    // `FirstInstalledReady` names), and every enabled-and-ready one it did,
+    // for the aggregate error's own install line.
+    let mut presence_skipped: Option<&'static str> = None;
+    let mut not_installed: Vec<&str> = Vec::new();
     for (name, ctor) in ADAPTERS {
         let mut adapter = ctor(bin);
         apply_endpoint_override(&mut adapter, cfg);
@@ -4154,7 +4488,21 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
                 && agent_bin_names_a_different_adapter(bin, name).is_none()
                 && adapter.ready().is_ok()
             {
-                repo_narrowed = Some(name);
+                // G3: the last condition G2 was missing. A repo-disabled
+                // adapter that is not installed at all is the same false
+                // premise by another route -- it could not have been this
+                // fallback's answer either way -- so it refuses nothing and
+                // is announced as the missing one instead. `None` here is
+                // an `agent_bin` override in effect, which presence never
+                // speaks to: the refusal then stands exactly as it did.
+                match consult_presence.then(|| present(name, adapter.program())) {
+                    Some(Liveness::Absent(_)) => {
+                        if presence_skipped.is_none() {
+                            presence_skipped = Some(name);
+                        }
+                    }
+                    _ => repo_narrowed = Some(name),
+                }
             }
             reasons.push(format!("{name}: {refusal}"));
             continue;
@@ -4187,16 +4535,57 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
                     reasons.push(format!("{name}: agent_bin names '{other}', not '{name}'"));
                     continue;
                 }
-                return Ok((adapter, DefaultOrigin::FirstEnabledReady));
+                // G3, last of all: the only check here that touches the
+                // filesystem, so it runs once every cheaper reason to skip
+                // this candidate has already been ruled out -- and not at
+                // all while an `agent_bin` override names the program.
+                if let Some(Liveness::Absent(reason)) =
+                    consult_presence.then(|| present(name, adapter.program()))
+                {
+                    reasons.push(format!("{name}: not installed ({reason})"));
+                    not_installed.push(name);
+                    if presence_skipped.is_none() {
+                        presence_skipped = Some(name);
+                    }
+                    continue;
+                }
+                return Ok((
+                    adapter,
+                    match presence_skipped {
+                        Some(not_found) => DefaultOrigin::FirstInstalledReady { not_found },
+                        None => DefaultOrigin::FirstEnabledReady,
+                    },
+                ));
             }
             Err(e) => reasons.push(format!("{name}: {e}")),
         }
     }
-    Err(format!(
+    let mut message = format!(
         "no agent is both enabled and ready:\n{}",
         reasons.join("\n")
-    )
-    .into())
+    );
+    if !not_installed.is_empty() {
+        // G3: the one case the aggregate error used to describe only through
+        // each adapter's own `ready()` text, which fails open on a missing
+        // binary and so never says the plain thing -- nothing is installed.
+        // The plain sentence is only true when absence is the *whole*
+        // story: with a disabled-but-installed adapter in the list too,
+        // "no harness is installed" would be exactly the kind of asserted
+        // absence `Liveness`'s own doc comment forbids, so that case names
+        // what is missing and claims nothing further.
+        let every_candidate = not_installed.len() == reasons.len();
+        let missing = not_installed.join(", ");
+        message.push_str(&format!(
+            "\n{} Install one so its program is on PATH, or point `agent_bin` at it in \
+             ~/.zirv/ctx.toml, or name an installed one with --agent.",
+            if every_candidate {
+                format!("no harness is installed on this machine (looked for: {missing}).")
+            } else {
+                format!("not installed on this machine: {missing}.")
+            }
+        ));
+    }
+    Err(message.into())
 }
 
 /// Explicit `--agent` name, else detection from the wrapped argv, else
@@ -4204,10 +4593,117 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
 /// before `ready()` in every arm: `ready()` reports implementation state,
 /// the gate reports operator policy, and a disabled agent must report the
 /// disable rather than (for codex) "not implemented yet".
+///
+/// This is the entry point for a caller about to *launch* what it selects,
+/// and its fallback arm may therefore drop a harness that is not installed
+/// (issue #690). A caller that only needs to name an adapter -- to parse a
+/// transcript, attribute usage, read capabilities -- wants
+/// [`select_for_identity`] instead, where absence has no say.
+///
+/// It reads `command` the way `wrap` does ([`adapter_builds_launch`]): the
+/// argv IS the program about to be spawned. A caller for which that is not
+/// true -- `exec`, which appends a flags-only `-- --model x` to
+/// `adapter.program()` -- says so for itself through
+/// [`select_with_presence`] rather than taking this derivation.
 pub fn select(
     name: Option<&str>,
     command: &[String],
     cfg: &CtxConfig,
+) -> CtxResult<Box<dyn AgentAdapter>> {
+    select_with_presence(
+        name,
+        command,
+        cfg,
+        adapter_builds_launch(command),
+        &liveness_probe,
+    )
+}
+
+/// What [`select`] and [`select_for_identity`] answer
+/// [`select_with_presence`]'s `adapter_builds_launch` question with, on
+/// behalf of a caller whose `command` IS the program about to be spawned --
+/// `wrap` above all (`wrap.rs`'s `adapters::select(agent_name,
+/// &args.command, &cfg)`, where `wrap -- --foo` really would try to spawn
+/// `--foo`). For such a caller a non-empty `command` is the operator's own
+/// argv, so zirv is not choosing a harness at all, and only an empty one
+/// leaves the launch to `adapter.program()`.
+///
+/// Deliberately NOT widened to match `exec`'s own, looser notion (a
+/// flags-only `-- --model x` is adapter-built there, because `exec` appends
+/// those flags to `adapter.program()` rather than spawning them). Widened
+/// here, `wrap -- --foo` would claim to be choosing a harness while it is
+/// in fact about to spawn `--foo` itself, so an absent default harness
+/// would refuse the operator's own argv -- the one thing `wrap` may never
+/// do. `exec` states its own answer at the call site instead; see
+/// [`select_with_presence`].
+fn adapter_builds_launch(command: &[String]) -> bool {
+    command.is_empty()
+}
+
+/// The oracle for a caller that is not choosing a harness to launch. It
+/// reaches no verdict, ever, which is fail-open by [`Liveness`]'s own rule
+/// and so reproduces the pre-#690 answer exactly: gate, `ready()`, registry
+/// order, nothing else.
+fn presence_not_consulted(_adapter_name: &str, _program: &str) -> Liveness {
+    Liveness::Unknown("presence is not consulted when naming an adapter".to_string())
+}
+
+/// [`select`] for a caller that only needs to *name* the adapter this
+/// configuration is about -- whose transcript format to parse, whose
+/// provider a usage readout belongs to, which capabilities to assume --
+/// rather than one about to launch a harness zirv itself chose.
+///
+/// Issue #690 gates the *choice of what to launch* on whether it is
+/// installed, which is right: picking a vendor for an operator whose machine
+/// leaves only one candidate is the whole point. It is wrong for every other
+/// question. A transcript written by claude is claude's whether or not
+/// `claude` is on this process's `PATH`, and a Stop hook subprocess
+/// routinely inherits a reduced one -- gating there would silently switch
+/// off screening, scoring and usage attribution on exactly the machines that
+/// still have the harness, just not where a bare `PATH` walk can see it.
+/// These callers spawn nothing, so absence costs them nothing and must not
+/// be allowed to refuse them.
+pub fn select_for_identity(
+    name: Option<&str>,
+    command: &[String],
+    cfg: &CtxConfig,
+) -> CtxResult<Box<dyn AgentAdapter>> {
+    select_with_presence(
+        name,
+        command,
+        cfg,
+        adapter_builds_launch(command),
+        &presence_not_consulted,
+    )
+}
+
+/// [`select`] with [`resolve_default_with_presence`]'s own injected presence
+/// oracle threaded through it. Only the last arm consults it at all -- an
+/// explicitly named or argv-detected harness that is missing still produces
+/// exactly the error it always did, never a switch to another vendor -- but
+/// the seam belongs here rather than only on `resolve_default`, because the
+/// invariants that matter most (a repo may narrow the fallback but never
+/// choose for you) are pinned through this public entry point, and a test
+/// that reached past it to `resolve_default` would no longer be testing what
+/// it claims to.
+///
+/// `adapter_builds_launch` is the caller's own statement of whether it is
+/// *choosing a harness to launch* -- whether the program it is about to
+/// spawn will be `adapter.program()`. It is stated rather than derived from
+/// `command` here because `command` means different things to different
+/// callers, and no single derivation is right for all of them: for `wrap`
+/// the command IS the program to spawn, so `wrap -- --foo` is the
+/// operator's own argv; for `exec` a flags-only `-- --model x` is
+/// adapter-built, because `exec` builds the launch from `adapter.program()`
+/// and appends those flags to it. [`select`] and [`select_for_identity`]
+/// answer it with [`adapter_builds_launch`] on their callers' behalf, which
+/// is `wrap`'s reading; `exec` passes its own.
+pub(crate) fn select_with_presence(
+    name: Option<&str>,
+    command: &[String],
+    cfg: &CtxConfig,
+    adapter_builds_launch: bool,
+    present: &dyn Fn(&str, &str) -> Liveness,
 ) -> CtxResult<Box<dyn AgentAdapter>> {
     let bin = cfg.agent_bin.as_deref();
     let adapters = all(bin);
@@ -4241,7 +4737,29 @@ pub fn select(
         return Ok(adapter);
     }
 
-    resolve_default(cfg).map(|(adapter, _origin)| adapter)
+    // G3 and passthrough: the caller says whether it is choosing a harness
+    // to launch, and presence belongs to the choosing case alone. A caller
+    // that says no reached here having handed zirv a program no adapter
+    // claims, so zirv is not choosing anything -- it is labelling someone
+    // else's (`wrap --no-supervise -- echo hi`, `exec -- ./script.sh`).
+    // Refusing to run an operator's own command because zirv's own default
+    // harness is not installed would worsen a session outright, which `wrap`
+    // may never do (CLAUDE.md's own rule: supervision failure is pure
+    // passthrough).
+    //
+    // Stated by the caller rather than re-derived from `command` here
+    // because the two callers read the same argv differently: `wrap` would
+    // spawn `-- --foo` itself, while `exec` appends `-- --model x` to
+    // `adapter.program()` and so IS choosing a harness. Deriving it from a
+    // non-empty `command` alone used to make `exec -- --model x` keep an
+    // absent default harness that the very next pre-flight then refused,
+    // where the operator had an installed one to be given.
+    let present: &dyn Fn(&str, &str) -> Liveness = if adapter_builds_launch {
+        present
+    } else {
+        &presence_not_consulted
+    };
+    resolve_default_with_presence(cfg, present).map(|(adapter, _origin)| adapter)
 }
 
 /// True when the wrapped command can be trusted to actually be this adapter's
@@ -4334,6 +4852,38 @@ pub(crate) fn git_dirs(path: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fix round 7 (2026-09-20): the six read-only/UI built-ins that cannot
+    /// touch the machine, the repo or production must be whole-tool allow
+    /// entries so they stop prompting, while `Bash`, `Agent`/`Task`, `Skill`
+    /// and `Monitor` -- which CAN reach the shell or spawn work that can --
+    /// must never appear as a blanket allow.
+    #[test]
+    fn shipped_posture_allow_pre_approves_the_harmless_builtins_but_not_the_shell_reaching_ones() {
+        let rules: Vec<&str> = SHIPPED_POSTURE_ALLOW
+            .iter()
+            .map(|(rule, _)| *rule)
+            .collect();
+        for tool in [
+            "Grep",
+            "Glob",
+            "AskUserQuestion",
+            "TodoWrite",
+            "NotebookRead",
+            "TaskOutput",
+        ] {
+            assert!(
+                rules.contains(&tool),
+                "expected a whole-tool allow entry for {tool}, got {rules:?}"
+            );
+        }
+        for excluded in ["Bash", "Agent", "Task", "Skill", "Monitor", "NotebookEdit"] {
+            assert!(
+                !rules.contains(&excluded),
+                "{excluded} must never be a blanket allow entry, got {rules:?}"
+            );
+        }
+    }
 
     #[test]
     fn restrictive_codex_policy_has_one_sandbox_and_approval_option() {
@@ -4528,10 +5078,15 @@ mod tests {
         let interactive = policy_launch_args(&cfg, &claude, &[], LaunchMode::Interactive);
         let headless = policy_launch_args(&cfg, &claude, &[], LaunchMode::Headless);
         assert_ne!(interactive, headless);
+        // Issue #504 revision (2026-09-20): with no `chat.claude_permission_mode`
+        // configured, the interactive projection omits `--permission-mode`
+        // entirely so Claude Code's own configured `defaultMode` applies --
+        // forcing `"default"` here silently overrode an operator's own
+        // `permissions.defaultMode`, which a CLI flag outranks. Headless
+        // keeps `dontAsk` hardcoded and always emitted.
         assert!(
-            interactive
-                .windows(2)
-                .any(|w| w == ["--permission-mode", "default"])
+            !interactive.iter().any(|arg| arg == "--permission-mode"),
+            "an unset chat.claude_permission_mode must omit the flag: {interactive:?}"
         );
         assert!(
             headless
@@ -4788,6 +5343,194 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A synthetic seat manifest for the `resolve_tiered_model`/`dispatch_
+    /// agent` tests below, parameterised only by the routing hint they need
+    /// to probe. Mirrors `dispatch_agent_invariants_hold_for_claude_and_
+    /// codex`'s own inline `AgentManifest` construction, with `read_only:
+    /// false` and no required capabilities so it dispatches under the
+    /// default permissive policy with no extra setup.
+    fn tiered_probe_manifest(
+        tier: crate::commands::workflow::agents::ModelTier,
+    ) -> crate::commands::workflow::agents::AgentManifest {
+        use crate::commands::workflow::agents::{AGENT_SCHEMA_VERSION, AgentManifest};
+        AgentManifest {
+            schema_version: AGENT_SCHEMA_VERSION,
+            id: "tiered-probe".to_string(),
+            version: 1,
+            name: "Tiered Probe".to_string(),
+            description: "issue #699 cost-routing lever probe".to_string(),
+            role: "worker".to_string(),
+            model_tier: tier,
+            read_only: false,
+            required_capabilities: Vec::new(),
+            optional_capabilities: Vec::new(),
+            context_budget_bytes: 4096,
+            instructions: "Do the thing.".to_string(),
+            team_role: None,
+            skills: Vec::new(),
+        }
+    }
+
+    /// Whether `argv` carries a `--model <value>` pair anywhere, the same
+    /// flag both `ClaudeAdapter`/`CodexAdapter` `model_args` emit.
+    fn argv_model(argv: &[String]) -> Option<&str> {
+        argv.windows(2)
+            .find(|w| w[0] == "--model")
+            .map(|w| w[1].as_str())
+    }
+
+    /// Issue #699, the most important property of the whole lever: an
+    /// operator who configures nothing (`[model_tiers]` absent from both
+    /// layers) sees zero behaviour change -- `dispatch_agent` must still
+    /// pass no `--model` flag at all, exactly as it did before this lever
+    /// existed. Covers every built-in tier, on both registered adapters, so
+    /// no single tier or adapter can quietly start guessing.
+    #[test]
+    fn dispatch_agent_passes_no_model_when_the_tier_map_is_empty() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+
+        for name in ["claude", "codex"] {
+            let adapter = select(Some(name), &[], &permissive_cfg())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Deep] {
+                let manifest = tiered_probe_manifest(tier);
+                let argv = flatten_command(
+                    adapter
+                        .dispatch_agent(&manifest, &task)
+                        .unwrap_or_else(|e| panic!("{name}/{tier}: {e}")),
+                );
+                assert_eq!(
+                    argv_model(&argv),
+                    None,
+                    "{name}/{tier}: an empty model_tiers map must add no --model flag, got {argv:?}"
+                );
+            }
+        }
+    }
+
+    /// A `[model_tiers.<agent>]` entry deserializes and, with the operator's
+    /// value set on the HOME layer (never REPO_FORBIDDEN there -- see
+    /// `reject_untrusted_keys`, only ever applied to the repo layer), an
+    /// unmapped tier for that SAME mapped adapter still falls through to no
+    /// model at all: the map is per-(adapter, tier), not a whole-adapter
+    /// switch.
+    #[test]
+    fn dispatch_agent_falls_through_to_no_model_for_an_unmapped_tier_on_a_mapped_adapter() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\nfast = \"haiku-cheap\"\n",
+        )
+        .expect("write home ctx.toml");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+
+        let adapter = select(Some("claude"), &[], &permissive_cfg()).expect("claude");
+        let manifest = tiered_probe_manifest(ModelTier::Standard);
+        let argv = flatten_command(adapter.dispatch_agent(&manifest, &task).expect("dispatch"));
+        assert_eq!(
+            argv_model(&argv),
+            None,
+            "claude/standard: fast is mapped but standard is not, so this must still add no \
+             --model flag, got {argv:?}"
+        );
+    }
+
+    /// The lever's actual payoff: a mapped `(adapter, tier)` resolves to the
+    /// operator's configured model id, reaching the real launch argv.
+    #[test]
+    fn dispatch_agent_resolves_a_mapped_adapter_and_tier_to_the_configured_model() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\ndeep = \"opus-max\"\n[model_tiers.codex]\ndeep = \"gpt-mega\"\n",
+        )
+        .expect("write home ctx.toml");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+        let manifest = tiered_probe_manifest(ModelTier::Deep);
+
+        for (name, expected) in [("claude", "opus-max"), ("codex", "gpt-mega")] {
+            let adapter = select(Some(name), &[], &permissive_cfg())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let argv = flatten_command(
+                adapter
+                    .dispatch_agent(&manifest, &task)
+                    .unwrap_or_else(|e| panic!("{name}: {e}")),
+            );
+            assert_eq!(
+                argv_model(&argv),
+                Some(expected),
+                "{name}/deep: expected the configured model in argv, got {argv:?}"
+            );
+        }
+    }
+
+    /// Resolution order rule 1 (issue #699): an explicit `AgentTask::model`
+    /// pin always wins over the operator's tier map, even when the map has
+    /// an entry for the exact same `(adapter, tier)` pair.
+    #[test]
+    fn dispatch_agent_prefers_an_explicit_task_model_pin_over_the_tier_map() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\nstandard = \"mapped-model\"\n\
+             [model_tiers.codex]\nstandard = \"mapped-model\"\n",
+        )
+        .expect("write home ctx.toml");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let manifest = tiered_probe_manifest(ModelTier::Standard);
+
+        for name in ["claude", "codex"] {
+            let task = AgentTask {
+                prompt: "do the thing".to_string(),
+                repo: repo.path().to_path_buf(),
+                model: Some("pinned-model".to_string()),
+            };
+            let adapter = select(Some(name), &[], &permissive_cfg())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let argv = flatten_command(
+                adapter
+                    .dispatch_agent(&manifest, &task)
+                    .unwrap_or_else(|e| panic!("{name}: {e}")),
+            );
+            assert_eq!(
+                argv_model(&argv),
+                Some("pinned-model"),
+                "{name}: an explicit AgentTask::model pin must win over a mapped tier, got {argv:?}"
+            );
         }
     }
 
@@ -5993,7 +6736,9 @@ mod tests {
         // H2: `resolve_default`'s fallback must skip claude's `Err` and land
         // on codex, exercising the `Err(e) => reasons.push(...); continue`
         // arm rather than the `Ok(())` one.
-        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("codex still qualifies");
+        let (adapter, origin) =
+            resolve_default_with_presence(&permissive_cfg(), &everything_installed())
+                .expect("codex still qualifies");
         assert_eq!(adapter.name(), "codex");
         assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
     }
@@ -6540,7 +7285,8 @@ mod tests {
     #[test]
     fn empty_command_defaults_to_claude() {
         let cfg = permissive_cfg();
-        let adapter = select(None, &[], &cfg).expect("default");
+        let adapter =
+            select_with_presence(None, &[], &cfg, true, &everything_installed()).expect("default");
         assert!(
             cfg.agents.is_enabled(adapter.name()),
             "must be gate-enabled"
@@ -6602,7 +7348,8 @@ mod tests {
     #[test]
     fn the_default_fallback_refuses_rather_than_silently_switching_provider() {
         let cfg = cfg_disabling("claude");
-        let err = select(None, &[], &cfg).expect_err("a repo may narrow, not select");
+        let err = select_with_presence(None, &[], &cfg, true, &everything_installed())
+            .expect_err("a repo may narrow, not select");
         let msg = err.to_string();
         assert!(msg.contains("claude"), "got {msg}");
         assert!(msg.contains("codex"), "got {msg}");
@@ -6700,7 +7447,9 @@ mod tests {
 
     #[test]
     fn an_empty_command_falls_back_to_the_first_enabled_and_ready_adapter() {
-        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("a default exists");
+        let (adapter, origin) =
+            resolve_default_with_presence(&permissive_cfg(), &everything_installed())
+                .expect("a default exists");
         assert_eq!(adapter.name(), "claude");
         assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
     }
@@ -6716,7 +7465,8 @@ mod tests {
     #[test]
     fn the_fallback_refuses_to_silently_switch_provider_when_the_repo_disabled_the_default() {
         let cfg = cfg_disabling("claude");
-        let err = resolve_default(&cfg).expect_err("a repo may narrow, not select");
+        let err = resolve_default_with_presence(&cfg, &everything_installed())
+            .expect_err("a repo may narrow, not select");
         let msg = err.to_string();
         assert!(msg.contains("claude"), "names the narrowed adapter: {msg}");
         assert!(
@@ -6748,8 +7498,8 @@ mod tests {
         ]);
 
         let cfg = cfg_disabling("claude");
-        let (adapter, origin) =
-            resolve_default(&cfg).expect("codex qualifies; claude was never a real candidate");
+        let (adapter, origin) = resolve_default_with_presence(&cfg, &everything_installed())
+            .expect("codex qualifies; claude was never a real candidate");
         assert_eq!(adapter.name(), "codex");
         assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
     }
@@ -6799,7 +7549,8 @@ mod tests {
             ..CtxConfig::default()
         };
 
-        let (adapter, origin) = resolve_default(&cfg).expect("the operator's own choice");
+        let (adapter, origin) = resolve_default_with_presence(&cfg, &everything_installed())
+            .expect("the operator's own choice");
         assert_eq!(adapter.name(), "codex");
         assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
     }
@@ -6856,6 +7607,140 @@ mod tests {
         );
     }
 
+    /// The other half of the same error: absence is only *part* of the
+    /// story here (claude is disabled by the repo, the rest are missing), so
+    /// the plain "no harness is installed" sentence would assert something
+    /// this function cannot know -- a disabled adapter may well be sitting
+    /// on `PATH`. It names what is missing and claims nothing about the
+    /// rest, the same discipline `Liveness`'s own doc comment holds every
+    /// other surface to.
+    #[test]
+    fn a_partly_disabled_partly_missing_registry_never_claims_nothing_is_installed() {
+        let cfg = cfg_disabling("claude");
+        let err = resolve_default_with_presence(&cfg, &only_installed(&[]))
+            .expect_err("nothing is both enabled and installed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not installed on this machine: codex"),
+            "names what is actually missing: {msg}"
+        );
+        assert!(
+            !msg.contains("no harness is installed"),
+            "claude is disabled, not known to be absent: {msg}"
+        );
+        assert!(msg.contains("--agent"), "still says how to name one: {msg}");
+    }
+
+    /// Issue #690's other half: presence gates the choice of what to
+    /// *launch*, never the naming of an adapter. `select_for_identity` is
+    /// what the Stop hook's screening, `zirv ctx score` and the usage
+    /// readout ask, and on a machine where the probe finds nothing they must
+    /// answer exactly as they did before presence existed -- a transcript
+    /// written by claude is claude's whether or not `claude` is on this
+    /// process's `PATH`, and a hook subprocess routinely inherits a reduced
+    /// one.
+    #[test]
+    fn naming_an_adapter_never_asks_whether_it_is_installed() {
+        let adapter = select_for_identity(None, &[], &permissive_cfg())
+            .expect("naming an adapter is not a launch");
+        assert_eq!(adapter.name(), "claude");
+    }
+
+    /// The passthrough half of the same rule, and the one CLAUDE.md makes
+    /// non-negotiable ("supervision failure is pure passthrough"): a command
+    /// the operator supplied that no adapter claims is zirv labelling
+    /// someone else's program, not choosing a harness, so an empty machine
+    /// must never turn `wrap --no-supervise -- echo hi` into a refusal. With
+    /// nothing to pass through it is the launch case again, and still
+    /// refuses.
+    ///
+    /// Both calls answer `adapter_builds_launch` through
+    /// [`adapter_builds_launch`] itself rather than writing `false`/`true`
+    /// out, because it is `select`'s -- and so `wrap`'s -- derivation that
+    /// is on trial here, not `select_with_presence`'s handling of an answer
+    /// already given. Widening that derivation to `exec`'s (a flags-only
+    /// argv is adapter-built) would make this test fail, which is exactly
+    /// what it is for.
+    #[test]
+    fn an_operators_own_command_is_never_refused_for_a_missing_harness() {
+        let command = vec!["echo".to_string(), "hello".to_string()];
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            adapter_builds_launch(&command),
+            &only_installed(&[]),
+        )
+        .expect("passthrough must never be refused");
+        assert_eq!(adapter.name(), "claude");
+
+        select_with_presence(
+            None,
+            &[],
+            &permissive_cfg(),
+            adapter_builds_launch(&[]),
+            &only_installed(&[]),
+        )
+        .expect_err("choosing a harness to launch still needs one to exist");
+    }
+
+    /// The case `command.is_empty()` alone got wrong: `zirv ctx exec --
+    /// --model x` hands over an argv that names no program, only flags that
+    /// `exec` appends to `adapter.program()`. That is zirv choosing a
+    /// harness to launch every bit as much as an empty argv is, so on a
+    /// machine with codex and no claude it must land on the one that is
+    /// actually there. Derived from `command` here, this said "operator's
+    /// own program, do not consult presence", kept the absent default, and
+    /// left `exec`'s launch pre-flight to refuse a harness the operator
+    /// never asked for over one they had installed.
+    ///
+    /// The stated machine is `only_installed(&["codex"])`, so nothing here
+    /// depends on what this developer has: a caller that stopped consulting
+    /// presence would answer "claude" and fail on the assertion below.
+    #[test]
+    fn a_flags_only_command_is_a_harness_this_machine_has_to_have() {
+        let command = vec!["--model".to_string(), "x".to_string()];
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            true,
+            &only_installed(&["codex"]),
+        )
+        .expect("a machine with codex installed can launch codex");
+        assert_eq!(adapter.name(), "codex");
+    }
+
+    /// The other side of that widening, and the reason it is safe: stating
+    /// `adapter_builds_launch` does not reorder anything. On an ordinary
+    /// machine that does have the first candidate, the same flags-only argv
+    /// still resolves to registry order's own answer -- presence gets a say
+    /// only about candidates it can rule out, never a preference between
+    /// two installed ones.
+    #[test]
+    fn a_flags_only_command_still_takes_the_first_candidate_that_is_installed() {
+        let command = vec!["--model".to_string(), "x".to_string()];
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            true,
+            &only_installed(&["claude", "codex"]),
+        )
+        .expect("claude is installed on this stated machine");
+        assert_eq!(adapter.name(), "claude");
+
+        let adapter = select_with_presence(
+            None,
+            &command,
+            &permissive_cfg(),
+            true,
+            &everything_installed(),
+        )
+        .expect("everything is installed on this stated machine");
+        assert_eq!(adapter.name(), "claude");
+    }
+
     /// The fallback is only reached when neither an explicit `--agent` nor
     /// detection named an adapter; either one must bypass it entirely.
     #[test]
@@ -6870,7 +7755,8 @@ mod tests {
         // test would see that refusal, not a quiet "codex" answer. The two
         // assertions below are provably distinguishable outcomes, not the
         // same value reached two different ways.
-        resolve_default(&cfg).expect_err("the fallback itself must refuse here");
+        resolve_default_with_presence(&cfg, &everything_installed())
+            .expect_err("the fallback itself must refuse here");
 
         // Explicit name: codex is still enabled by this gate and now
         // resolves successfully, so it is selected directly without ever
@@ -6889,13 +7775,154 @@ mod tests {
     fn resolve_default_reports_which_rule_chose_the_adapter() {
         let mut cfg = permissive_cfg();
         cfg.agent = Some("claude".to_string());
-        let (adapter, origin) = resolve_default(&cfg).expect("claude is configured");
+        let (adapter, origin) = resolve_default_with_presence(&cfg, &everything_installed())
+            .expect("claude is configured");
         assert_eq!(adapter.name(), "claude");
         assert_eq!(origin, DefaultOrigin::Configured);
 
-        let (adapter, origin) = resolve_default(&permissive_cfg()).expect("fallback picks one");
+        let (adapter, origin) =
+            resolve_default_with_presence(&permissive_cfg(), &everything_installed())
+                .expect("fallback picks one");
         assert_eq!(adapter.name(), "claude");
         assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// G3 (issue #690): an operator whose only harness is codex, with no
+    /// `agent` configured, used to get claude's own "program 'claude' not
+    /// found" and no way forward -- registry order alone decided the answer,
+    /// and nothing asked whether that answer exists on this machine. The
+    /// fallback now drops a confidently absent candidate, and says so in the
+    /// origin: choosing a different vendor for an operator whose machine
+    /// leaves only one choice is legitimate; doing it without a word is not.
+    #[test]
+    fn the_fallback_skips_a_harness_that_is_not_installed_and_names_it() {
+        let (adapter, origin) =
+            resolve_default_with_presence(&permissive_cfg(), &only_installed(&["codex"]))
+                .expect("codex is installed, so there is an answer to give");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(
+            origin,
+            DefaultOrigin::FirstInstalledReady {
+                not_found: "claude"
+            },
+            "the origin has to carry the missing harness, or no surface can announce it"
+        );
+    }
+
+    /// Presence only ever *removes* candidates. With both installed,
+    /// registry order still decides exactly as it always did, and the origin
+    /// is the unchanged one -- the common case gains no new wording on any
+    /// surface.
+    #[test]
+    fn with_both_harnesses_installed_registry_order_still_decides() {
+        let (adapter, origin) =
+            resolve_default_with_presence(&permissive_cfg(), &only_installed(&["claude", "codex"]))
+                .expect("a default exists");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// Fail-open, the discipline `Liveness` and `program_is_present` already
+    /// hold every other probe to: a verdict the probe could not reach must
+    /// never cost an operator a harness they may perfectly well have (codex
+    /// on this repo's own Windows dev machine lives outside `PATH`). An
+    /// `Unknown` for everything has to leave the answer identical to the
+    /// pre-#690 one.
+    #[test]
+    fn an_undecidable_probe_changes_nothing_at_all() {
+        let (adapter, origin) =
+            resolve_default_with_presence(&permissive_cfg(), &nothing_decidable())
+                .expect("an inconclusive probe never removes a candidate");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// G3 and `agent_bin`: an operator who pointed zirv at a program has
+    /// already made the choice presence exists to inform, and the override
+    /// need not be a path a `stat` can answer at all -- the `sh
+    /// <wrapper>.sh` shape this codebase's own fixtures use throughout
+    /// resolves to nothing on disk. A probe that would call every candidate
+    /// absent must therefore not be allowed to empty the fallback: with an
+    /// override in effect, presence is not consulted at all.
+    #[test]
+    fn an_agent_bin_override_is_never_second_guessed_by_presence() {
+        let cfg = CtxConfig {
+            agent_bin: Some("sh /repo/tests/fixtures/fake-claude-agent.sh".to_string()),
+            ..permissive_cfg()
+        };
+        let (adapter, origin) = resolve_default_with_presence(&cfg, &only_installed(&[]))
+            .expect("the override names the program; presence has nothing to say about it");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
+    }
+
+    /// G3 meets G2: a repo-disabled adapter that is not installed either was
+    /// never a candidate this fallback could have landed on, so "a repo may
+    /// narrow but not choose for you" has no premise left to refuse over --
+    /// the next adapter is chosen, and announced. The sibling case (repo-
+    /// disabled and genuinely installed) still refuses; that is `the_
+    /// fallback_refuses_to_silently_switch_provider_when_the_repo_disabled_
+    /// the_default`, which now states the machine it assumes rather than
+    /// inheriting one.
+    #[test]
+    fn a_repo_disabled_harness_that_is_not_installed_refuses_nothing() {
+        let cfg = cfg_disabling("claude");
+        let (adapter, origin) = resolve_default_with_presence(&cfg, &only_installed(&["codex"]))
+            .expect("claude was never a candidate here; codex is");
+        assert_eq!(adapter.name(), "codex");
+        assert_eq!(
+            origin,
+            DefaultOrigin::FirstInstalledReady {
+                not_found: "claude"
+            },
+            "the operator still has to be told which harness is missing"
+        );
+    }
+
+    /// Presence is consulted in the fallback arm and nowhere else. A harness
+    /// the operator named -- `agent =` in their own config, or `--agent` --
+    /// comes back exactly as it did before, missing binary and all, so what
+    /// they get is their own harness's launch error rather than a session
+    /// quietly opened against another vendor's account. (`ready()` fails
+    /// open on a missing binary by design, so that error lands at the spawn,
+    /// via `format_launch_error`, not here.)
+    #[test]
+    fn an_explicitly_chosen_harness_is_never_swapped_for_an_installed_one() {
+        let mut cfg = permissive_cfg();
+        cfg.agent = Some("claude".to_string());
+        let (adapter, origin) = resolve_default_with_presence(&cfg, &only_installed(&["codex"]))
+            .expect("the configured arm does not consult presence");
+        assert_eq!(adapter.name(), "claude");
+        assert_eq!(origin, DefaultOrigin::Configured);
+
+        let adapter = select_with_presence(
+            Some("claude"),
+            &[],
+            &permissive_cfg(),
+            true,
+            &only_installed(&["codex"]),
+        )
+        .expect("an explicit --agent does not consult presence either");
+        assert_eq!(adapter.name(), "claude");
+    }
+
+    /// With nothing installed at all there is no honest answer left to give,
+    /// so the aggregate error has to say the plain thing -- no adapter's own
+    /// `ready()` text ever will, since `ready()` fails open on a missing
+    /// binary -- and name the way out.
+    #[test]
+    fn nothing_installed_at_all_is_an_error_that_says_so_and_how_to_fix_it() {
+        let err = resolve_default_with_presence(&permissive_cfg(), &only_installed(&[]))
+            .expect_err("no harness exists on this machine");
+        let msg = err.to_string();
+        assert!(msg.contains("claude"), "names each candidate: {msg}");
+        assert!(msg.contains("codex"), "names each candidate: {msg}");
+        assert!(
+            msg.contains("no harness is installed on this machine"),
+            "says the plain thing rather than only each adapter's own text: {msg}"
+        );
+        assert!(msg.contains("PATH"), "says how to install one: {msg}");
+        assert!(msg.contains("--agent"), "says how to name one: {msg}");
     }
 
     /// The gate wrap and exec use before injecting: a command that matches no
@@ -7369,6 +8396,140 @@ mod tests {
         assert_eq!(
             seat_role_env(PromptRole::Single),
             vec![(SEAT_ROLE_ENV.to_string(), "single".to_string())]
+        );
+    }
+
+    // -- issue #690: launch error formatting and presence-based default selection -
+
+    #[test]
+    fn format_launch_error_recognizes_notfound_errors() {
+        // NotFound io::Error
+        let notfound_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let result = format_launch_error(&notfound_err, "claude", "claude");
+        assert!(result.contains("claude"));
+        assert!(result.contains("not found"));
+        assert!(result.contains("Install"));
+
+        // PermissionDenied io::Error
+        let perm_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let result = format_launch_error(&perm_err, "codex", "codex");
+        assert!(result.contains("codex"));
+        assert!(result.contains("failed to start"));
+    }
+
+    // -- issue #690 (remaining scope): the launch pre-flight ------------------
+
+    /// The pre-flight's refusal must be the same sentence the spawn's own
+    /// `NotFound` would have produced, to the byte -- it turns a slow failure
+    /// into a fast one and nothing else, so an operator who has seen the slow
+    /// one must not have to decide whether the fast one means something
+    /// different.
+    #[test]
+    fn the_launch_preflight_refuses_with_the_spawns_own_not_found_wording() {
+        let cfg = permissive_cfg();
+        let adapter = select_with_presence(Some("claude"), &[], &cfg, true, &only_installed(&[]))
+            .expect("naming an adapter never consults presence");
+
+        let err = refuse_if_program_absent_with_presence(
+            adapter.as_ref(),
+            &cfg,
+            &only_installed(&["codex"]),
+        )
+        .expect_err("a confidently absent harness must not reach pacing");
+
+        let from_the_spawn = format_launch_error(
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            adapter.name(),
+            adapter.program(),
+        );
+        assert_eq!(err.to_string(), from_the_spawn);
+    }
+
+    /// Fail-open, the discipline [`Liveness`] and [`program_is_present`]
+    /// already hold every other presence consumer to: a probe that reached no
+    /// verdict leaves the launch behaving exactly as it did before a
+    /// pre-flight existed.
+    #[test]
+    fn the_launch_preflight_lets_an_undecidable_probe_launch() {
+        let cfg = permissive_cfg();
+        let adapter = select_with_presence(Some("claude"), &[], &cfg, true, &nothing_decidable())
+            .expect("claude resolves");
+
+        refuse_if_program_absent_with_presence(adapter.as_ref(), &cfg, &nothing_decidable())
+            .expect("Unknown must never cost a launch that would have worked");
+    }
+
+    /// The other half of fail-open, and the ordinary case: an installed
+    /// harness is waved straight through.
+    #[test]
+    fn the_launch_preflight_lets_an_installed_harness_launch() {
+        let cfg = permissive_cfg();
+        let adapter =
+            select_with_presence(Some("claude"), &[], &cfg, true, &everything_installed())
+                .expect("claude resolves");
+
+        refuse_if_program_absent_with_presence(
+            adapter.as_ref(),
+            &cfg,
+            &only_installed(&["claude"]),
+        )
+        .expect("an installed harness launches");
+    }
+
+    /// `resolve_default_with_presence`'s own `consult_presence = bin.
+    /// is_none()` rule, reused rather than re-invented: an operator-set
+    /// `agent_bin` need not be a path a `stat` can answer (the `sh
+    /// <wrapper>.sh` shape below is this codebase's own fixture convention
+    /// and resolves to nothing on disk), so the pre-flight must not probe it
+    /// at all. Proven by an oracle that panics if it is ever consulted --
+    /// "returned Ok" alone would also be satisfied by a probe that ran and
+    /// happened to answer `Live`.
+    #[test]
+    fn the_launch_preflight_never_probes_while_agent_bin_is_set() {
+        let cfg = CtxConfig {
+            agent_bin: Some("sh /nowhere/wrapper.sh".to_string()),
+            ..CtxConfig::default()
+        };
+        let adapter =
+            select_with_presence(Some("claude"), &[], &cfg, true, &everything_installed())
+                .expect("claude resolves");
+        let never: &dyn Fn(&str, &str) -> Liveness = &|_name: &str, _program: &str| -> Liveness {
+            panic!("an operator-set agent_bin must never be probed")
+        };
+
+        refuse_if_program_absent_with_presence(adapter.as_ref(), &cfg, never)
+            .expect("an agent_bin override is an operator choice, not a presence question");
+    }
+
+    /// Never substitute: the pre-flight only ever makes a failure arrive
+    /// sooner. A configured `agent` naming a harness this machine does not
+    /// have fails under *that* harness's own name, and the installed one is
+    /// never quietly put in its place.
+    #[test]
+    fn the_launch_preflight_names_the_configured_harness_and_never_switches_it() {
+        let cfg = CtxConfig {
+            agent: Some("codex".to_string()),
+            ..CtxConfig::default()
+        };
+        let (adapter, _origin) = resolve_default_with_presence(&cfg, &only_installed(&["claude"]))
+            .expect("a configured agent is never re-chosen by presence");
+        assert_eq!(adapter.name(), "codex");
+
+        let err = refuse_if_program_absent_with_presence(
+            adapter.as_ref(),
+            &cfg,
+            &only_installed(&["claude"]),
+        )
+        .expect_err("codex is not installed on this stated machine");
+        let message = err.to_string();
+        assert!(
+            message.contains("adapter 'codex'"),
+            "the refusal must name the harness the operator asked for: {message}"
+        );
+        assert!(
+            !message.contains("claude"),
+            "the installed harness must never appear as a substitute: {message}"
         );
     }
 }

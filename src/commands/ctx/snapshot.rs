@@ -380,7 +380,7 @@ fn latest_attestation(
 /// existing extraction/audit machinery read-only -- no new detection logic.
 /// `None`/`--` when the session's transcript cannot be resolved at all.
 fn escalation_info(cfg: &CtxConfig, repo: &Path, session: &str) -> (Option<String>, String) {
-    let Ok(adapter) = adapters::select(cfg.agent.as_deref(), &[], cfg) else {
+    let Ok(adapter) = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg) else {
         return (None, "--".to_string());
     };
     let transcript = adapter.transcript_path(&SessionRef {

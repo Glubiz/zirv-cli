@@ -666,6 +666,13 @@ pub enum CtxVerb {
     /// when a role that would run natively has no usable route. `--live`
     /// additionally contacts each provider's model-list endpoint.
     Doctor(doctor::DoctorArgs),
+    /// Jev client operations: status reports whether it is enabled, the five
+    /// advisory gates, the credential and its presence, and the endpoint/model.
+    /// Reads configuration only; never makes network calls, never reads
+    /// credential values. Distinguishes "no gate enabled" from "gate enabled
+    /// but credential missing", so the operator can identify exactly what is
+    /// blocking Jev when `advise` silently returns `None`.
+    Jev(jev::JevArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -810,6 +817,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Api(a) => api::run(a, &mut out),
         CtxVerb::Capabilities(a) => capabilities_cmd::run(a, &mut out),
         CtxVerb::Doctor(a) => doctor::run(a, &mut out),
+        CtxVerb::Jev(a) => jev::run_jev(a, &mut out),
     };
 
     match result {

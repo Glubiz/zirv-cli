@@ -2635,6 +2635,13 @@ pub fn advance_with_evidence(
         .current()
         .cloned()
         .ok_or("workflow has no current step")?;
+    // Issue #699 Phase 0: this attempt's own machine elapsed time, captured
+    // by the match arms below (`Some` on both outcomes -- each assigns
+    // exactly once, on every path that does not return early) so the
+    // `PhaseCompleted`/`PhaseFailed` telemetry event built after the match
+    // can carry it automatically -- see `phase_elapsed_ms`'s own doc
+    // comment for why the same value is valid for either outcome.
+    let auto_duration_ms: Option<u64>;
     match outcome {
         StepOutcome::Success => {
             let frontend_root: PathBuf = state
@@ -2824,7 +2831,7 @@ pub fn advance_with_evidence(
                     .into());
                 }
             }
-            record_step_duration_ms(&mut state, &current.id);
+            auto_duration_ms = Some(record_step_duration_ms(&mut state, &current.id));
             state.completed_steps.push(current.id.clone());
             state.current_step += 1;
             let jev_cfg = if state.current().is_some_and(|step| {
@@ -2866,6 +2873,11 @@ pub fn advance_with_evidence(
             }
         }
         StepOutcome::Failure => {
+            // Issue #699 Phase 0: captured before `phase_started_at` resets
+            // below -- this failed attempt's own elapsed time, for the
+            // `PhaseFailed` event's `duration_ms` (an explicit
+            // `--duration-ms` still overrides it, same as `Success`).
+            auto_duration_ms = Some(phase_elapsed_ms(&state));
             let attempts = state.attempts.entry(current.id.clone()).or_default();
             *attempts = attempts.saturating_add(1);
             if *attempts >= current.max_attempts {
@@ -2893,7 +2905,13 @@ pub fn advance_with_evidence(
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
     event.work_domain = Some(state.classification.work_domain.domain);
-    event.duration_ms = evidence.duration_ms;
+    // Issue #699 Phase 0: `--duration-ms` remains an explicit override when
+    // a caller passes one; otherwise this is the same elapsed span
+    // `record_step_duration_ms`/`phase_elapsed_ms` already derived from
+    // `phase_started_at` above, so `slowest phase`/the implement-vs-
+    // validate split work for any ordinary run with no special caller
+    // cooperation.
+    event.duration_ms = evidence.duration_ms.or(auto_duration_ms);
     event.adapter = evidence.adapter;
     event.model = evidence.model;
     event.role = evidence.role;
@@ -2923,6 +2941,26 @@ pub fn advance_with_evidence(
     event.findings_meaningful = findings_meaningful;
     event.findings_dismissed = findings_dismissed;
     event.fix_round = state.attempts.get(&current.id).copied().unwrap_or(0);
+    // Issue #699 Phase 0: only a genuine failure is a fix round happening;
+    // a `Success` never gets a cause, even if `attempts` above is nonzero
+    // (a step that failed N times before finally passing). Best-effort --
+    // `load_latest` reads the SAME persisted report the engine's own
+    // Test/Verify gate above already required to be fresh, so this never
+    // does speculative work the gate did not already justify; a load
+    // failure degrades to `None` (unclassified) rather than failing
+    // `advance` itself.
+    event.fix_round_cause = (outcome == StepOutcome::Failure)
+        .then(|| {
+            let report = super::verification::load_latest(state_dir, &state.repo)
+                .ok()
+                .flatten();
+            super::telemetry::classify_fix_round_cause(
+                current.phase,
+                evidence.verification_unchanged,
+                report.as_ref(),
+            )
+        })
+        .flatten();
     event.worker_count = evidence.worker_count;
     // Issue #264: best-effort -- a config load failure here must never fail
     // `advance` itself, so it degrades to the built-in price table (no
@@ -2993,8 +3031,13 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         if let Some(warning) = warning {
             crate::output::warn(warning);
         }
+        // Issue #699 Phase 0: `None` when this artifact was already
+        // completed (the `!contains` guard above is false) -- re-approving
+        // an artifact that drifted back into acceptance without a genuine
+        // new `AwaitingApproval` span has no honest wait to report.
+        let mut approval_wait_ms = None;
         if !state.completed_steps.contains(&completed.id) {
-            record_step_duration_ms(&mut state, &completed.id);
+            approval_wait_ms = Some(record_step_duration_ms(&mut state, &completed.id));
             state.completed_steps.push(completed.id);
         }
         state.current_step += 1;
@@ -3025,6 +3068,11 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         event.work_domain = Some(state.classification.work_domain.domain);
         event.succeeded = Some(true);
         event.artifact_stage = Some(accepted.to_string());
+        // Issue #699 Phase 0: the whole `AwaitingApproval` span this
+        // artifact-gated step spent, agent-drafting time and operator
+        // review time both -- see `TelemetryEvent::approval_wait_ms`'s own
+        // doc comment for why this is never sub-divided further.
+        event.approval_wait_ms = approval_wait_ms;
         let _ = super::telemetry::record(
             state_dir,
             &state.repo,
@@ -3059,11 +3107,24 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     // declarative `approval = true` and immediately re-derive
     // `AwaitingApproval`, making the approval just granted unobservable.
     let approved_phase = state.current().map(|step| step.phase);
+    // Issue #699 Phase 0: this gate-only step's own `AwaitingApproval` span
+    // -- captured before `phase_started_at` resets below. Unlike the
+    // artifact branch above, a gate-only step does NOT complete here (it
+    // stays current and still has to run), so this must never be written to
+    // `step_durations_ms`/`record_step_duration_ms` (that would falsely
+    // mark the step as finished). Resetting `phase_started_at` to now, here,
+    // is what makes the two spans separable at all: without it, the step's
+    // EVENTUAL completion would measure from before this approval, folding
+    // wait and execution back together exactly like the state itself does
+    // not otherwise distinguish them (see `TelemetryEvent::
+    // approval_wait_ms`'s own doc comment).
+    let gate_wait_ms = phase_elapsed_ms(&state);
     if let Some(step) = state.current() {
         state.current_step_approved = Some(step.id.clone());
     }
     state.status = WorkflowStatus::Running;
     state.updated_at = now_secs();
+    state.phase_started_at = state.updated_at;
     save(state_dir, &state, true)?;
 
     // Issue #542 review nit: a gate-only approval is still an approval --
@@ -3080,6 +3141,8 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     event.risk = Some(state.classification.risk);
     event.work_domain = Some(state.classification.work_domain.domain);
     event.succeeded = Some(true);
+    // Issue #699 Phase 0: see the artifact branch's identical assignment.
+    event.approval_wait_ms = Some(gate_wait_ms);
     let _ = super::telemetry::record(
         state_dir,
         &state.repo,
@@ -4192,15 +4255,31 @@ fn run_required_checks(
     }
 }
 
-/// Call before pushing `step_id` onto `completed_steps`, while
-/// `phase_started_at` still names its own start.
-fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) {
-    let elapsed_ms = now_secs()
+/// This attempt's elapsed wall-clock, in milliseconds, since
+/// `state.phase_started_at` -- shared by `record_step_duration_ms` (a
+/// completed step) and, issue #699 Phase 0, by `advance_with_evidence`'s
+/// `Failure` arm (a failed attempt that will retry): `phase_started_at` is
+/// reset unconditionally after EVERY `advance_with_evidence` call,
+/// success or failure, so this is well-defined either way -- it names
+/// "since the step became current, or since the previous attempt was
+/// recorded", never a stale span.
+fn phase_elapsed_ms(state: &WorkflowState) -> u64 {
+    now_secs()
         .saturating_sub(state.phase_started_at)
-        .saturating_mul(1000);
+        .saturating_mul(1000)
+}
+
+/// Call before pushing `step_id` onto `completed_steps`, while
+/// `phase_started_at` still names its own start. Returns the elapsed
+/// milliseconds recorded, so a caller can also feed it (issue #699 Phase 0)
+/// to a telemetry event's `duration_ms` without a second, potentially
+/// inconsistent `now_secs()` read.
+fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) -> u64 {
+    let elapsed_ms = phase_elapsed_ms(state);
     state
         .step_durations_ms
         .insert(step_id.to_string(), elapsed_ms);
+    elapsed_ms
 }
 
 /// `<minutes>m<seconds>s`, e.g. `2m10s`.
@@ -6348,6 +6427,7 @@ mod tests {
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -6463,6 +6543,7 @@ mod tests {
             source: "configured".into(),
             repo: worktree_path.clone(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -6605,6 +6686,7 @@ mod tests {
                 source: "configured".into(),
                 repo: worktree_path.clone(),
                 branch: evidence_branch.to_string(),
+                head_sha: String::new(),
                 change_fingerprint: fingerprint,
                 changed_paths: vec![],
                 fallback_to_full: false,
@@ -7676,6 +7758,7 @@ mod tests {
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -11375,6 +11458,7 @@ present_as = "summary"
             source: "configured".into(),
             repo: repo.path().to_path_buf(),
             branch: String::new(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
@@ -11703,6 +11787,7 @@ present_as = "summary"
             source: "configured".into(),
             repo: state.repo.clone(),
             branch: state.branch.clone(),
+            head_sha: String::new(),
             change_fingerprint: fingerprint,
             changed_paths: vec![],
             fallback_to_full: false,
