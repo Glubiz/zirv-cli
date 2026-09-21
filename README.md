@@ -1805,8 +1805,13 @@ specialised pack actually matched one of its own trigger phrases in the task
 text AND declares `effects` compatible with that intent (`Feature`/`Bugfix`
 need `repository` or `external`, `Review` needs `none`, `Spike` accepts any
 effects, `Refactor` is never displaced), in which case the specialised pack
-replaces it and both packs are recorded in `reasons`/`alternatives`. Nothing
-above the floor selects
+replaces it and both packs are recorded in `reasons`/`alternatives`. Only a
+`built-in` or `operator-global` pack (the registry's own LAYER, shown by
+`zirv workflow list`) may ever refine a legacy intent this way -- a
+`repository`-layer pack is untrusted and may only ADD a non-colliding id
+(see the three layers above), so it never displaces a legacy kind's own
+pack this way; it can still be chosen outright the ordinary way, for
+`Intent::Other`. Nothing above the floor selects
 `adaptive-work`, a small five-step (understand/plan/execute/validate/present)
 fallback pack with no domain/trigger tags of its own (so it never competes
 for another pack's task) that prunes itself down to three steps
@@ -1814,11 +1819,24 @@ for another pack's task) that prunes itself down to three steps
 (`zirv workflow start <id> --task ...`, or the native `/workflow <id> <task>`
 slash command) always wins outright with no selection performed at all, and
 that choice survives `resume`/`reclassify` as the pinned `definition` on the
-running state. A bounded model tie-break for a close, ambiguous score is
-deferred -- the deterministic algorithm's every decision is already
-explainable from `reasons` alone, which a model call would only obscure for
-the near-certain-floor cases it would actually apply to; see the design note
-for the full reasoning.
+running state -- matched case-insensitively (`zirv workflow start Bugfix`
+resolves exactly like `bugfix`; `zirv workflow show` the same way), since
+registry ids are themselves always lowercase. A bounded model tie-break for
+a close, ambiguous score is deferred -- the deterministic algorithm's every
+decision is already explainable from `reasons` alone, which a model call
+would only obscure for the near-certain-floor cases it would actually apply
+to; see the design note for the full reasoning.
+
+`zirv workflow start` never refuses because another workflow is already
+active for this repository -- multiple workflows per repository are
+legitimate, and `zirv workflow resume <id>` restores any of them. When the
+new start silently changes which workflow this repository's active pointer
+names -- a DIFFERENT, still-running (`Running`/`AwaitingApproval`) workflow
+was active -- it prints one best-effort note to STDERR after the new
+workflow is saved: `note: workflow <old-instance-id> (<old definition id>)
+is no longer this repository's active workflow; restore it with: zirv
+workflow resume <old-instance-id>`. Stdout/`--json` output is unaffected
+either way.
 
 ### Lifecycle and artifacts
 

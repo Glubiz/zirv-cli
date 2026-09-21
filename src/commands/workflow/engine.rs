@@ -4692,6 +4692,17 @@ fn active_workflow_displaced_note(old_instance_id: &str, old_definition_id: &str
     )
 }
 
+/// Review finding F2: writes `note` to `writer` best-effort. By the time
+/// [`start_workflow`] reaches this, the new workflow is already saved --
+/// `eprintln!`/`crate::output::note` panic on a write error (a closed
+/// stderr, say), which would surface as a spurious failure of an already-
+/// successful start. Ignoring the `Result` here instead keeps this call
+/// site pure passthrough, the same posture `wrap.rs` holds its own
+/// supervision failures to.
+fn best_effort_write_displacement_note(mut writer: impl std::io::Write, note: &str) {
+    let _ = writeln!(writer, "{note}");
+}
+
 /// Starts and persists a workflow from `args` -- the SAME logic `zirv
 /// workflow start` and the native `workflow_start` tool both run, so
 /// "what starting a workflow means" has exactly one implementation (issue
@@ -4860,7 +4871,10 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
             .as_ref()
             .map(|definition| definition.id.clone())
             .unwrap_or_else(|| old.kind.as_str().to_string());
-        crate::output::note(active_workflow_displaced_note(&old.id, &old_definition_id));
+        best_effort_write_displacement_note(
+            std::io::stderr(),
+            &active_workflow_displaced_note(&old.id, &old_definition_id),
+        );
     }
     let mut event =
         super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::WorkflowStarted);
@@ -8385,6 +8399,26 @@ mod tests {
             note.contains("zirv workflow resume abc-123"),
             "must point at the exact resume command: {note}"
         );
+    }
+
+    /// Review finding F2: a write failure (a closed stderr, say) must never
+    /// panic -- the new workflow this note is ABOUT is already saved by the
+    /// time it's printed, so a failure here must degrade silently rather
+    /// than turning an already-successful start into a reported failure.
+    #[test]
+    fn best_effort_write_displacement_note_never_panics_on_a_failing_writer() {
+        struct AlwaysErrors;
+        impl std::io::Write for AlwaysErrors {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("closed"))
+            }
+        }
+        // Must not panic; a `writeln!`/`eprintln!`-shaped implementation
+        // that propagated the error with `.unwrap()`/`.expect()` would.
+        best_effort_write_displacement_note(AlwaysErrors, "note: irrelevant");
     }
 
     /// Workflow-trigger-determinism item 5: starting a second workflow for

@@ -611,20 +611,22 @@ fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
         // login crash") ONLY when that word is either the task's very last
         // token, or is directly followed by one of for/to/in/on -- a bare
         // mention of the word as an ordinary noun phrase ("Add a bugfix
-        // changelog section") must stay Feature.
+        // changelog section") must stay Feature. Review finding F8: EVERY
+        // fix/bugfix/hotfix token in the window is checked, not just the
+        // first -- "Implement a fix/hotfix for startup" must still trigger
+        // on "hotfix" even though the earlier "fix" alone doesn't qualify.
         let window_end = (start + 4).min(tokens.len());
-        let fix_word_index = tokens[start + 1..window_end]
-            .iter()
-            .position(|token| matches!(*token, "fix" | "bugfix" | "hotfix"))
-            .map(|offset| start + 1 + offset);
-        if let Some(index) = fix_word_index {
-            let is_last_token = index == tokens.len() - 1;
-            let followed_by_preposition = tokens
-                .get(index + 1)
-                .is_some_and(|next| matches!(*next, "for" | "to" | "in" | "on"));
-            if is_last_token || followed_by_preposition {
-                return Some(Intent::Bugfix);
+        let triggers_bugfix = (start + 1..window_end).any(|index| {
+            matches!(tokens[index], "fix" | "bugfix" | "hotfix") && {
+                let is_last_token = index == tokens.len() - 1;
+                let followed_by_preposition = tokens
+                    .get(index + 1)
+                    .is_some_and(|next| matches!(*next, "for" | "to" | "in" | "on"));
+                is_last_token || followed_by_preposition
             }
+        });
+        if triggers_bugfix {
+            return Some(Intent::Bugfix);
         }
         return Some(Intent::Feature);
     }
@@ -1073,6 +1075,11 @@ mod tests {
             // mention stays Feature.
             ("Add a bugfix changelog section", Intent::Feature),
             ("Add a hotfix for the login crash", Intent::Bugfix),
+            // Review finding F8: every fix/bugfix/hotfix token in the
+            // window is checked, not just the first -- the leading "fix"
+            // alone doesn't qualify (next token "hotfix" isn't a
+            // preposition), but "hotfix" does (followed by "for").
+            ("Implement a fix/hotfix for startup", Intent::Bugfix),
             // "try" is deliberately NOT a lead word -- it falls through to
             // tier 2, where "fix" still wins.
             ("Try to fix the login bug", Intent::Bugfix),

@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use super::classify::{Classification, Intent, WorkDomain};
 use super::definition::EffectClass;
 use super::engine::WorkflowKind;
-use super::registry::WorkflowRegistry;
+use super::registry::{WorkflowRegistry, WorkflowSource};
 
 /// A pack clears the floor only with at least one substantive signal (a
 /// matched trigger phrase, or a matching `domains` tag) -- not merely an
@@ -193,6 +193,16 @@ fn effects_compatible_with_legacy_intent(intent: Intent, effects: EffectClass) -
 /// mirror `select_definition`'s own step 2/4 exactly, restricted to this
 /// smaller, gated candidate pool. `None` when no specialised pack qualifies,
 /// so the caller falls back to the plain direct mapping.
+///
+/// Trust boundary (review finding F1): a repository-provided pack
+/// (`WorkflowSource::Repository`) is untrusted and may only ADD a
+/// non-colliding id (see `registry.rs`'s own widening refusal) -- it must
+/// never REFINE a legacy intent's own built-in pack out from under it, since
+/// that would let an untrusted trigger/`effects` pairing silently drop the
+/// gates a trusted built-in bugfix/feature pack enforces. Only `BuiltIn` and
+/// `OperatorGlobal` packs are eligible here; a repository pack still wins
+/// outright for `Intent::Other` via `select_definition`'s ordinary scoring
+/// (step 2), which this function is never involved in.
 fn refine_legacy_selection(
     classification: &Classification,
     registry: &WorkflowRegistry,
@@ -207,10 +217,14 @@ fn refine_legacy_selection(
         .list()
         // Neither the fallback pack nor any of the five legacy kind packs
         // (this intent's own included) ever compete here -- only a
-        // genuinely SPECIALISED pack may displace a legacy default.
+        // genuinely SPECIALISED pack may displace a legacy default. A
+        // repository-layer pack is untrusted and never competes here either
+        // (see this function's own doc comment) -- only `BuiltIn`/
+        // `OperatorGlobal` packs are.
         .filter(|pack| {
             pack.definition.id != ADAPTIVE_WORK_ID
                 && WorkflowKind::from_pack_id(&pack.definition.id).is_none()
+                && pack.source != WorkflowSource::Repository
         })
         .filter_map(|pack| {
             let (score, reasons, trigger_hit) = score_pack(
@@ -704,6 +718,86 @@ present_as = "summary"
                 .iter()
                 .any(|(id, _)| id == "a-more-effects"),
             "the losing tied pack must still be recorded as an alternative"
+        );
+    }
+
+    fn write_fixture_with_trigger(dir: &std::path::Path, id: &str, effects: &str, trigger: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.toml")),
+            format!(
+                r#"
+schema_version = 1
+id = "{id}"
+version = 1
+title = "{id}"
+description = "fixture"
+domains = ["testing"]
+triggers = ["{trigger}"]
+effects = "{effects}"
+
+[[steps]]
+id = "only"
+title = "Only"
+phase = "implement"
+skills = ["implement"]
+condition = "always"
+
+[failure]
+escalate_to = "human"
+
+[completion]
+present_as = "summary"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Review finding F1 (trust boundary): a repository-provided pack is
+    /// untrusted and may only ADD a non-colliding id -- it must never
+    /// refine a legacy intent's own built-in pack out from under it, even
+    /// with a broad trigger ("fix") and a compatible `effects`. The
+    /// IDENTICAL pack at a trusted layer (operator-global) DOES refine,
+    /// proving the gate is about provenance, not the pack's own content.
+    #[test]
+    fn a_repository_layer_pack_never_refines_a_legacy_intent_but_a_trusted_layer_pack_does() {
+        let skills_repo = tempdir().unwrap();
+        let skills = SkillRegistry::load(skills_repo.path(), None, false, false).unwrap();
+
+        let untrusted_repo = tempdir().unwrap();
+        let untrusted_dir = untrusted_repo.path().join(".zirv/workflows");
+        std::fs::create_dir_all(&untrusted_dir).unwrap();
+        write_fixture_with_trigger(&untrusted_dir, "repo-bugfix-like", "repository", "fix");
+        let untrusted_registry =
+            WorkflowRegistry::load(untrusted_repo.path(), None, true, true, &skills).unwrap();
+        let untrusted_selection = select_definition(
+            &classification(Intent::Bugfix),
+            &untrusted_registry,
+            "fix the crash",
+        );
+        assert_eq!(
+            untrusted_selection.definition_id, "bugfix",
+            "an untrusted repository pack must never refine a legacy intent: {:?}",
+            untrusted_selection.reasons
+        );
+
+        let home = tempdir().unwrap();
+        let home_dir = home.path().join(".zirv/workflows");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        write_fixture_with_trigger(&home_dir, "repo-bugfix-like", "repository", "fix");
+        let trusted_repo = tempdir().unwrap();
+        let trusted_registry =
+            WorkflowRegistry::load(trusted_repo.path(), Some(home.path()), true, false, &skills)
+                .unwrap();
+        let trusted_selection = select_definition(
+            &classification(Intent::Bugfix),
+            &trusted_registry,
+            "fix the crash",
+        );
+        assert_eq!(
+            trusted_selection.definition_id, "repo-bugfix-like",
+            "an operator-global (trusted) pack must still refine: {:?}",
+            trusted_selection.reasons
         );
     }
 
