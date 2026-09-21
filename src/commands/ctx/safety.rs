@@ -1980,7 +1980,7 @@ fn envelope_write_targets_confined(
 /// [`envelope::WorkerEnvelope::locked`], the tightest possible grant,
 /// consistent with `agent::resolve_parent_envelope`'s own fail-closed
 /// handling of the identical case.
-fn parse_envelope_env(env: EnvLookup<'_>) -> Option<envelope::WorkerEnvelope> {
+pub(crate) fn parse_envelope_env(env: EnvLookup<'_>) -> Option<envelope::WorkerEnvelope> {
     let raw = env(super::agent::ENVELOPE_ENV)?;
     if raw.trim().is_empty() {
         return None;

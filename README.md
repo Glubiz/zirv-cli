@@ -3548,6 +3548,7 @@ configuration so a host's working directory cannot select the wrong project.
 | `worker_status` | Optional `id`, `cursor`, `limit` | Repository-scoped delegation/report records with recorded phase, attempt, exit code where available, report outcome and truncation. Worker IDs sort lexicographically; follow `next_cursor`. |
 | `result_read` | `id`, optional `offset`, `revision`, `max_bytes` | A page of the persisted worker result JSON, including report text, structured result, validation errors and undeclared changes. Use an ID from `worker_status`. |
 | `inbox_read` | Optional `cursor`, `limit`, `max_bytes` | Unread message previews for the launch-bound recipient, with sender labels, truncation and `next_cursor`. Never consumes, acknowledges, claims, expires or retries delivery. |
+| `self` | `{}` | THIS worker's own delegation envelope (decoded through the same `parse_envelope_env` the enforcement path uses), its bound task card claim, its declared result contract, and its parent delegation handle. Requires a session bound at launch; refuses otherwise. Never accepts a session id. Each field is absent, not fabricated, when it does not apply. |
 | `skill_list` | Optional `query`, `phase`, `limit` | Every registered skill as a metadata-only digest (never instruction text) with no query; with a query, the best-matching skills ranked by the deterministic activation scorer, each with `score` and `reasons`. |
 | `skill_load` | `id` (accepts `id@version`) | The skill's dependency-ordered instruction stack, content hash, and resource list. Refused before any text is returned if this session's capability report does not support the skill's required capabilities or integrations; a repository-sourced skill is marked untrusted data. Records one activation-journal entry on success. |
 | `skill_read_resource` | `id`, `path` | One bundle resource body (reference doc, script or asset) by its bundle-relative path. |
@@ -3597,6 +3598,18 @@ undirected mail addressed to `any` in this repository is visible. With a binding
 existing directed delivery envelopes can locate that recipient's mail across
 mailbox directories; unrelated broadcast mail stays repository-scoped.
 
+`self` reuses the identical binding: it reads the SAME `Reader` a bound
+`--session`/`ZIRV_CTX_SESSION` resolves, and refuses outright when unbound --
+there is no repository-wide fallback the way `inbox_read` has, because there
+is no meaningful "self" without one. Its envelope comes from decoding this
+server process's own inherited `ZIRV_ENVELOPE` (absent for a root,
+non-delegated session); its task card is this session's own claim in the
+repository's task store; its result contract is this session's own declared
+`ZIRV_CTX_RESULT_SCHEMA`/`ZIRV_CTX_RESULT_WORKDIR`; its parent is the
+delegation record naming this session as the worker. The token figure shown
+is the envelope's ceiling, not remaining spend -- live usage lives in the
+supervising process, not this stateless server.
+
 **New Claude Code and Codex sessions launched through Zirv register this bridge
 automatically.** This includes chat/wrap, dashboard panes, headless workers,
 loop cycles and their supervised restarts. No `.mcp.json` or manual server
@@ -3611,7 +3624,7 @@ name is reserved for this automatic entry during the launch. No project or
 user host settings are edited. On Windows, Zirv writes Claude's generated JSON
 under the private state directory's `mcp-launch/` to keep JSON off shell-shim
 command lines; users do not create or maintain that file.
-Claude launches also pre-approve the bridge's ten named read-only tools so
+Claude launches also pre-approve the bridge's eleven named read-only tools so
 headless `dontAsk` sessions can use them. Native deny/ask rules and the server's
 current policy gates still apply; other servers receive no added permissions.
 
@@ -3688,6 +3701,7 @@ ordinary zirv CLI for that repository before starting the host.
 | Artifact IDs | Resolved in this repository's existing artifact registry. Payload access uses a directory capability to reject traversal and symlink escapes; arbitrary file paths are not tool arguments. |
 | Worker results | IDs resolve inside the operator-owned result store. Canonical repository provenance or a matching scoped delegation authorizes each read; unscoped legacy filenames grant nothing. Directory capabilities reject report traversal and symlink escapes. |
 | Inbox recipient | Operator launch configuration/inherited supervisor identity selects a registered session in this repository. Agent and mailbox come from that record, never tool arguments. The binding is not an OS authentication boundary. |
+| `self` scope | Reads only the bound session's own inherited env (`ZIRV_ENVELOPE`/`ZIRV_CTX_RESULT_SCHEMA`/`ZIRV_CTX_RESULT_WORKDIR`) and this repository's own task/delegation records filtered to that exact session id. Refuses outright when unbound; never accepts a session id as an argument. |
 | Mail policy and receipts | Current `mail.enabled` and delivery budgets apply to every read. Existing expiry and fan-out visibility rules are reused without receipt or mailbox mutations. Sender labels remain claims. |
 | Returned text | Memory provenance is retained; artifacts, worker reports, mail and shared facts are labeled untrusted information, never operator instructions. |
 | OS account and local state | Operator-owned state is trusted as with the CLI. This local service does not isolate mutually hostile processes that already share filesystem access under the same account. |
