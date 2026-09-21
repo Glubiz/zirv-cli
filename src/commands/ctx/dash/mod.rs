@@ -4802,23 +4802,60 @@ fn resolve_selection_range(
     normalize_selection(a, b)
 }
 
-/// Pure: whether newly processed child output on `output_pane_short` must
-/// cancel `selection`.
+/// The exact text `sel` currently resolves to on `screen` -- the same
+/// `resolve_selection_range` + `contents_between` pair the release-time copy
+/// already runs (see that call site). Reading this once before a pane's
+/// output is drained and again after is how the call site of
+/// `output_cancels_selection` tells "this pane produced output" apart from
+/// "output landed on the rows this selection actually covers", without a
+/// full-screen diff -- the cost is proportional to the selection's own
+/// height, not the screen's.
+///
+/// `None` when any part of `sel` is off-screen right now: `resolve_selection_
+/// range` CLAMPS such a selection to the visible grid, so a snapshot of it
+/// would compare only the visible part and silently ignore changes to the
+/// rest. `translate_selection` keeps the true (unclamped) rows for exactly
+/// the case where the operator scrolls that part back into view later, and a
+/// copy then would take whatever now sits at those coordinates -- so an
+/// off-screen selection must fall back to the unconditional cancel this
+/// comparison exists to avoid, rather than be compared on a partial view.
+fn selection_snapshot(screen: &vt100::Screen, sel: &Selection) -> Option<String> {
+    let (rows, cols) = screen.size();
+    let fully_visible = [sel.anchor.0, sel.end.0]
+        .iter()
+        .all(|row| *row >= 0 && *row < i64::from(rows));
+    if !fully_visible {
+        return None;
+    }
+    let (start, end) = resolve_selection_range(sel, rows, cols);
+    Some(screen.contents_between(start.0, start.1, end.0, end.1))
+}
+
+/// Pure: whether newly processed child output on `output_pane_short` is even
+/// a CANDIDATE for cancelling `selection` -- the pane-identity half of the
+/// check. The call site pairs a `true` here with `selection_snapshot`,
+/// before and after the drain, to decide for real.
 ///
 /// The unifying invariant behind this and `resize_cancels_selection` is that
 /// a `Selection`'s `(row, col)` coordinates only stay meaningful while the
 /// pane's *visible content* is static -- the reason a scroll no longer
 /// cancels (`translate_selection` keeps it exact instead) is precisely that
 /// a scroll does not change what any given row's content IS, only which row
-/// it is currently drawn at. New output has no such invariant to lean on:
-/// new rows scroll the old ones up under the very coordinates a selection is
-/// still using, and a release after that would copy whatever text now
-/// happens to sit there, not what the operator dragged over. Any output at
-/// all on the selected pane cancels it: telling "the screen changed" apart
-/// from "bytes arrived but repainted the exact same content" would need a
-/// full-screen diff for a benefit no operator would notice, while the cost
-/// of a false cancel here is at most a selection the operator can just
-/// redraw. Output on a *different* pane leaves the selection alone.
+/// it is currently drawn at. New output has no such invariant to lean on in
+/// general: new rows scroll the old ones up under the very coordinates a
+/// selection is still using, and a release after that would copy whatever
+/// text now happens to sit there, not what the operator dragged over.
+///
+/// A busy pane -- a streaming response, a prompt redrawing its own status
+/// line -- produces output on nearly every tick, though, almost always far
+/// from whatever is actually selected. Cancelling on every one of those
+/// ticks regardless left a drag that spans more than a single tick unusable
+/// on exactly the panes an operator most wants to copy from: the highlight
+/// would not survive past the tick it started in. Comparing the selection's
+/// own rows before and after (`selection_snapshot`, at the call site) costs
+/// only as much as the selection is tall, so paying it is no longer the
+/// full-screen diff this used to not be worth. Output on a *different* pane
+/// leaves the selection alone regardless.
 fn output_cancels_selection(selection: &Selection, output_pane_short: &str) -> bool {
     selection.pane_short == output_pane_short
 }
@@ -11863,6 +11900,18 @@ fn run_dashboard_inner(
                 previous_tick,
             );
         }
+        // Read before the drain below can touch it, so the loop over
+        // `produced_output` can tell "this pane produced output" apart from
+        // "output landed on the rows this selection actually covers" --
+        // `output_cancels_selection`'s own doc comment on why that
+        // distinction now matters. Stable across the drain: `reap_ended_panes`
+        // (which could shift indices) does not run until later this tick.
+        let selection_before = selection.as_ref().and_then(|sel| {
+            panes
+                .iter()
+                .find(|pane| pane.short() == sel.pane_short)
+                .and_then(|pane| selection_snapshot(pane.screen(), sel))
+        });
         // Issue #330: ONE `DRAIN_BUDGET_BYTES` for the whole tick, focused
         // pane first and the rest round-robin behind it -- not that much per
         // pane, which with eight streaming workers put up to 2 MiB of vt100
@@ -11884,11 +11933,20 @@ fn run_dashboard_inner(
             // place, under a selection's stale `(row, col)` coordinates --
             // `translate_selection` never sees this, since the scrollback
             // offset itself does not move while the pane sits at its live
-            // view. See `output_cancels_selection`.
+            // view. See `output_cancels_selection`. Only cancels for real,
+            // though, when the selection's own rows actually came out
+            // different -- `selection_before` is `None` here whenever there
+            // was nothing selected on this pane to begin with, which
+            // `unchanged` treats the same as "did change" (nothing to keep).
             if let Some(sel) = selection.as_ref()
                 && output_cancels_selection(sel, panes[idx].short())
             {
-                selection = None;
+                let unchanged = selection_before.as_ref().is_some_and(|before| {
+                    selection_snapshot(panes[idx].screen(), sel).as_ref() == Some(before)
+                });
+                if !unchanged {
+                    selection = None;
+                }
             }
         }
         for pane in panes.iter_mut() {
@@ -15427,6 +15485,70 @@ mod tests {
         assert!(
             !output_cancels_selection(&sel, "bbb22222"),
             "output on a different pane leaves this selection alone"
+        );
+    }
+
+    /// The call site's own reason `output_cancels_selection` returning
+    /// `true` no longer means an automatic cancel: a busy pane that keeps
+    /// producing output far from the selected rows (a streaming response
+    /// below it, a status line above it) must not wipe out a selection that
+    /// spans more than one tick, which is exactly what happened before this
+    /// -- the highlight only ever survived the tick it started in.
+    #[test]
+    fn selection_snapshot_is_unchanged_when_new_output_lands_outside_the_selected_rows() {
+        let mut parser = vt100::Parser::new(5, 10, 0);
+        parser.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
+        let sel = selection_at((0, 0), (1, 4));
+        let before = selection_snapshot(parser.screen(), &sel);
+        assert_eq!(before.as_deref(), Some("line1\nline"));
+
+        // New output lands on row 4, well below the selected rows 0..1 --
+        // short enough not to overflow the 10-column grid and trigger a
+        // genuine scroll, which would legitimately invalidate row 0 too.
+        parser.process(b"\x1b[5;1Hlin5x");
+        let after = selection_snapshot(parser.screen(), &sel);
+        assert_eq!(
+            before, after,
+            "output outside the selection's own rows must not change its snapshot"
+        );
+    }
+
+    /// The other half: output that actually rewrites a row the selection
+    /// covers -- the case `output_cancels_selection`'s cancel exists for --
+    /// still changes the snapshot, so the call site still cancels it.
+    #[test]
+    fn selection_snapshot_changes_when_new_output_overwrites_a_selected_row() {
+        let mut parser = vt100::Parser::new(5, 10, 0);
+        parser.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
+        let sel = selection_at((0, 0), (1, 4));
+        let before = selection_snapshot(parser.screen(), &sel);
+
+        // New output overwrites row 1, inside the selected range.
+        parser.process(b"\x1b[2;1Hchanged!!!");
+        let after = selection_snapshot(parser.screen(), &sel);
+        assert_ne!(
+            before, after,
+            "output that rewrites a selected row must change its snapshot"
+        );
+    }
+
+    /// Review finding: a selection scrolled out of view still resolves --
+    /// `resolve_selection_range` clamps it to the visible grid -- so
+    /// comparing snapshots of it would compare only the sliver still on
+    /// screen and keep a selection whose real rows had been overwritten.
+    /// Off-screen must read as "cannot tell", which the call site turns back
+    /// into the unconditional cancel.
+    #[test]
+    fn a_selection_scrolled_off_screen_has_no_snapshot_to_compare() {
+        let mut parser = vt100::Parser::new(5, 10, 0);
+        parser.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
+        assert!(
+            selection_snapshot(parser.screen(), &selection_at((-1, 0), (1, 4))).is_none(),
+            "a selection reaching above the visible grid cannot be compared"
+        );
+        assert!(
+            selection_snapshot(parser.screen(), &selection_at((0, 0), (5, 4))).is_none(),
+            "a selection reaching below the visible grid cannot be compared"
         );
     }
 

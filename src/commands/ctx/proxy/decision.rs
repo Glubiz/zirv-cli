@@ -475,6 +475,7 @@ pub fn baseline(
         created_at: 0,
     };
     apply_security_risk_floor(&mut decision);
+    apply_orchestration_request_complexity_floor(&mut decision, request);
     finalize_derived_fields(&mut decision, cfg);
     decision
 }
@@ -497,6 +498,171 @@ fn apply_security_risk_floor(decision: &mut ProxyDecision) {
         decision
             .reasons
             .push("risk: raised to high because the request names a security surface".to_string());
+    }
+}
+
+/// How far back of `text` a negation is allowed to reach and still be read
+/// as negating a phrase that follows it. Four words covers the ordinary
+/// forms ("do not parallelize", "no need to parallelize this") without
+/// letting an unrelated "not" earlier in a long sentence silence a genuine
+/// request two clauses later.
+const NEGATION_LOOKBEHIND_WORDS: usize = 4;
+
+/// Pure: whether `phrase` occurs in `text` as something the request ASKS
+/// for, rather than something it rules out.
+///
+/// Review finding: matching a bare substring escalated "do not parallelize
+/// this" and "no need to spawn workers" exactly as if they had asked for a
+/// team. Only the few words immediately before an occurrence are examined,
+/// and only for the ordinary negating words -- this is a floor over
+/// operator-authored text, so the cost of missing an exotic negation is one
+/// seat too many, never one too few.
+fn phrase_is_asserted(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(at, _)| {
+        let preceding = &text[..at];
+        !preceding
+            .split_whitespace()
+            .rev()
+            .take(NEGATION_LOOKBEHIND_WORDS)
+            .any(|word| {
+                matches!(
+                    word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\''),
+                    "not" | "don't" | "dont" | "no" | "never" | "avoid" | "without" | "skip"
+                )
+            })
+    })
+}
+
+/// Pure: whether `text` names harness `name` in its own prose, rather than
+/// inside a path or URL.
+///
+/// Review finding: tokenizing the whole request on every non-alphanumeric
+/// character turned `src/codex/client.rs` into a bare `codex` token, so
+/// "fix the delegate method in src/codex/client.rs" -- one file, one method,
+/// no team -- floored to `Substantial`. Any whitespace-delimited word
+/// carrying a `/` is a path or a URL, never prose naming a harness to
+/// delegate to, so it is dropped before the finer tokenization that finds
+/// the name itself.
+fn names_harness_in_prose(text: &str, name: &str) -> bool {
+    prose_words(text).any(|token| token == name)
+}
+
+/// Pure: the words of `text` that are prose, in order -- every
+/// whitespace-delimited word carrying a `/` dropped as a path or a URL, the
+/// rest split on punctuation so `codex,` and `(codex)` still read as
+/// `codex`.
+fn prose_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split_whitespace()
+        .filter(|word| !word.contains('/'))
+        .flat_map(|word| word.split(|c: char| !c.is_alphanumeric() && c != '-'))
+        .filter(|token| !token.is_empty())
+}
+
+/// Words that mean work is being handed off when they stand next to the name
+/// of another harness. Each is worthless on its own -- "handle" is half of
+/// "signal handler" and "split" is what a function does to a string -- so
+/// they only count within [`DELEGATION_CUE_DISTANCE_WORDS`] of the name.
+const DELEGATION_CUES: &[&str] = &[
+    "delegate",
+    "delegates",
+    "delegated",
+    "delegating",
+    "handle",
+    "handles",
+    "split",
+    "splitting",
+    "across",
+    "between",
+    "offload",
+    "assign",
+];
+
+/// How many prose words may separate a delegation cue from the harness name
+/// it hands work to. Six spans the ordinary phrasings ("split this across
+/// claude and codex") without letting a cue at the other end of a paragraph
+/// pair up with an unrelated mention.
+const DELEGATION_CUE_DISTANCE_WORDS: usize = 6;
+
+/// Pure: whether `text` hands part of the work to harness `name`.
+///
+/// Review finding: matching only "delegate"-shaped wording missed the
+/// ordinary ways of asking ("have codex handle the frontend part", "split
+/// this across claude and codex"), so a request for a team got one seat.
+/// Pairing a cue anywhere in the request with a name anywhere else is the
+/// opposite mistake, hence the proximity window. It is still deliberately
+/// generous -- a cue that happens to stand near an incidental mention floors
+/// the request -- because the failure this floor exists to prevent is one
+/// seat too few, and the deciders that can actually read intent are exactly
+/// what is unavailable when it runs.
+fn delegates_work_to_harness(text: &str, name: &str) -> bool {
+    let words: Vec<&str> = prose_words(text).collect();
+    words
+        .iter()
+        .enumerate()
+        .filter(|(_, word)| **word == name)
+        .any(|(at, _)| {
+            let from = at.saturating_sub(DELEGATION_CUE_DISTANCE_WORDS);
+            let to = (at + DELEGATION_CUE_DISTANCE_WORDS + 1).min(words.len());
+            words[from..to]
+                .iter()
+                .any(|word| DELEGATION_CUES.contains(word))
+        })
+}
+
+/// An explicit request for parallel or delegated multi-agent work is itself
+/// a coordination requirement, even when intake has no diff to measure and
+/// every model decider is unavailable. Without this floor, the text-only
+/// deterministic baseline classifies such requests as `Trivial`, so a Jev
+/// authentication failure followed by a helper timeout silently collapses
+/// the requested team to one cheap seat. The one place this rule lives,
+/// called from the tail of both [`baseline`] and [`merge`].
+fn apply_orchestration_request_complexity_floor(decision: &mut ProxyDecision, request: &str) {
+    let text = request.to_ascii_lowercase();
+    let explicitly_parallel = [
+        "parallelize",
+        "parallelise",
+        "in parallel",
+        "parallel agents",
+        "parallel workers",
+    ]
+    .iter()
+    .any(|signal| phrase_is_asserted(&text, signal));
+    let explicitly_multi_agent = [
+        "multiple agents",
+        "multiple workers",
+        "multiple harnesses",
+        "spawn agents",
+        "spawn workers",
+    ]
+    .iter()
+    .any(|signal| phrase_is_asserted(&text, signal));
+    // A request that hands work to another harness by name: "have codex
+    // handle the frontend part", "split this across claude and codex".
+    let delegates_to_another_harness = adapters::ADAPTERS.iter().any(|(name, _)| {
+        *name != decision.orchestrator.harness && delegates_work_to_harness(&text, name)
+    });
+    // ...or that says a share of the work goes elsewhere and names the
+    // harness somewhere else in the sentence: "use codex (sol / astra) for
+    // some of the work".
+    let hands_off_a_share = ["some of the work", "part of the work", "split the work"]
+        .iter()
+        .any(|signal| phrase_is_asserted(&text, signal));
+    let names_another_harness = adapters::ADAPTERS.iter().any(|(name, _)| {
+        *name != decision.orchestrator.harness && names_harness_in_prose(&text, name)
+    });
+
+    if decision.complexity < Complexity::Substantial
+        && (explicitly_parallel
+            || explicitly_multi_agent
+            || delegates_to_another_harness
+            || (hands_off_a_share && names_another_harness))
+    {
+        decision.complexity = Complexity::Substantial;
+        decision.validation.independent_test = true;
+        decision.reasons.push(
+            "complexity: raised to substantial because the request explicitly asks for parallel or delegated multi-agent work"
+                .to_string(),
+        );
     }
 }
 
@@ -1098,6 +1264,7 @@ pub fn merge(
     decision.validation.independent_test |= recomputed_validation.independent_test;
     decision.validation.security_review |= recomputed_validation.security_review;
     apply_security_risk_floor(&mut decision);
+    apply_orchestration_request_complexity_floor(&mut decision, request);
     finalize_derived_fields(&mut decision, cfg);
 
     decision
@@ -1688,6 +1855,123 @@ mod tests {
         assert!(raised.validation.independent_review);
     }
 
+    #[test]
+    fn explicit_parallel_delegation_floors_baseline_and_merge_to_orchestrated() {
+        let request = concat!(
+            "We need to add a way of creating / adding short links to sms' within the marketing ",
+            "backoffice. We have some existing logic regarding short links in the monolith at ",
+            "the moment, but i dont know how this works. Linear card: ",
+            "https://linear.app/cego/issue/MARKAU-131/undersog-hvordan-vi-skal-gore-i-forhold-til-shortlinks-til-bla-smser. ",
+            "Parallelize as much of the work as possible, and use codex (sol / astra) for some ",
+            "of the work."
+        );
+        let classification = classify_request(request);
+        assert_eq!(classification.complexity, Complexity::Trivial);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let roster = Roster {
+            harnesses: Vec::new(),
+            registry: None,
+        };
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.complexity, Complexity::Substantial);
+        assert_eq!(decision.execution, ExecutionMode::Orchestrated);
+        assert_eq!(decision.seat_role, SeatRole::Orchestrator);
+        assert!(decision.validation.independent_test);
+        assert!(decision.reasons.iter().any(|reason| {
+            reason.contains("request explicitly asks for parallel or delegated multi-agent work")
+        }));
+
+        let mut unfloored_baseline = sample_decision();
+        unfloored_baseline.complexity = Complexity::Trivial;
+        unfloored_baseline.execution = ExecutionMode::Direct;
+        unfloored_baseline.seat_role = SeatRole::Single;
+        unfloored_baseline.validation = ValidationProfile::default();
+        let merged = merge(&cfg, &unfloored_baseline, request, &Answers::new(), 0.5);
+        assert_eq!(merged.complexity, Complexity::Substantial);
+        assert_eq!(merged.execution, ExecutionMode::Orchestrated);
+        assert_eq!(merged.seat_role, SeatRole::Orchestrator);
+        assert!(merged.validation.independent_test);
+    }
+
+    fn floored_complexity(request: &str) -> Complexity {
+        let mut decision = sample_decision();
+        decision.complexity = Complexity::Trivial;
+        apply_orchestration_request_complexity_floor(&mut decision, request);
+        decision.complexity
+    }
+
+    /// Review finding: the floor matched its signals as bare substrings, so
+    /// a request that explicitly RULES OUT a team read as one asking for
+    /// it -- the one direction a floor over the operator's own words must
+    /// never get wrong, since it cannot be lowered again afterwards.
+    #[test]
+    fn wording_that_rules_out_a_team_does_not_floor_to_substantial() {
+        for request in [
+            "Do not parallelize this, it is a one-line typo fix.",
+            "No need to spawn workers for this one.",
+            "Fix the retry loop without multiple agents.",
+        ] {
+            assert_eq!(
+                floored_complexity(request),
+                Complexity::Trivial,
+                "negated wording must not floor: {request}"
+            );
+        }
+        assert_eq!(
+            floored_complexity("Parallelize the migration as much as possible."),
+            Complexity::Substantial,
+            "the same signal, asserted, still floors"
+        );
+    }
+
+    /// Review finding: tokenizing the whole request on punctuation turned the
+    /// `codex` in a path or a URL into a harness the request was supposedly
+    /// delegating to, so a one-method fix in one file asked for a team.
+    #[test]
+    fn a_harness_named_only_inside_a_path_or_url_is_not_a_delegation() {
+        for request in [
+            "Fix the delegate method in src/codex/client.rs.",
+            "Split the work described in https://github.com/openai/codex/issues/12.",
+        ] {
+            assert_eq!(
+                floored_complexity(request),
+                Complexity::Trivial,
+                "a path or URL is not prose naming a harness: {request}"
+            );
+        }
+    }
+
+    /// Review finding: only "delegate"-shaped wording counted, so the
+    /// ordinary ways of handing work to another harness by name landed a
+    /// single cheap seat.
+    #[test]
+    fn handing_work_to_another_harness_by_name_floors_to_substantial() {
+        for request in [
+            "Have codex handle the frontend part while you take the API.",
+            "Split this across claude and codex.",
+            "Delegate the schema migration to codex.",
+            "Use codex for some of the work.",
+        ] {
+            assert_eq!(
+                floored_complexity(request),
+                Complexity::Substantial,
+                "delegation to a named harness must floor: {request}"
+            );
+        }
+    }
+
+    /// The orchestrator's own harness is not another seat: naming it is how
+    /// a request refers to the session it is already talking to.
+    #[test]
+    fn naming_only_the_orchestrators_own_harness_is_not_a_delegation() {
+        assert_eq!(
+            floored_complexity("Have claude handle the rename in one pass."),
+            Complexity::Trivial
+        );
+    }
+
     /// Issue #537 battery finding: a sensitive-surface risk floor must also
     /// floor execution, so a one-line auth change can never route as
     /// `Direct` on wording or diff size alone.
@@ -1769,6 +2053,7 @@ mod tests {
         );
         assert_eq!(plain_decision.risk, RiskBand::Low);
         assert_eq!(plain_decision.execution, ExecutionMode::Direct);
+        assert_eq!(plain_decision.seat_role, SeatRole::Single);
     }
 
     /// Issue #537 fix: a feature branch can carry thousands of lines that
