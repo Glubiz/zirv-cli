@@ -1762,75 +1762,71 @@ pub fn prompt_output(
 fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let payload = HookPayload::parse(stdin).unwrap_or_default();
     let repo = payload.repo();
-    let cfg = match super::config::CtxConfig::load(&repo, env) {
-        Ok(cfg) => cfg,
-        Err(_) => {
-            writeln!(
-                w,
-                "{}",
-                serde_json::json!({
-                    "decision": "block",
-                    "reason": "zirv could not load sensitive-data policy; refusing prompt"
-                })
-            )?;
-            return Ok(0);
-        }
-    };
-    let prompt = serde_json::from_str::<serde_json::Value>(stdin)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("prompt")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let mut options = match hook_obfuscation_options(&cfg) {
-        Ok(options) => options,
-        Err(_) => {
-            writeln!(
-                w,
-                "{}",
-                serde_json::json!({
-                    "decision": "block",
-                    "reason": "zirv could not load sensitive-data literals; refusing prompt"
-                })
-            )?;
-            return Ok(0);
-        }
-    };
-    options.mode = super::obfuscate::Mode::Flag;
-    let mut vault = super::obfuscate::Vault::default();
-    let (_, findings) =
-        super::obfuscate::obfuscate(&prompt, &mut vault, &options, "user_prompt_submit");
-    if !findings.is_empty() {
-        let kinds = finding_kinds(&findings);
-        if let Ok(state) = StateDir::resolve(env) {
-            let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
-            let _ = log::append(
-                &state,
-                &log::Decision {
-                    ts: now_secs(),
-                    session: &session,
-                    verb: "hook",
-                    verdict: "n/a",
-                    score: 0,
-                    action: "obfuscate-prompt-flag",
-                    detail: &kinds,
-                    observed_at: None,
-                },
-            );
-        }
-        if cfg.obfuscate.prompt == super::config::ObfuscatePrompt::Block {
-            let _ = writeln!(
-                w,
-                "{}",
-                serde_json::json!({
-                    "decision": "block",
-                    "reason": format!("zirv blocked sensitive values in the prompt ({kinds}); remove them or set obfuscate.prompt = \"flag\"")
-                })
-            );
-            return Ok(0);
+    // Issue #466: a config-load failure must not block the prompt or lose
+    // the adoption nudge/attention tracking below -- that was this event's
+    // whole behavior before sensitive-data masking existed, and masking is
+    // opt-in (`obfuscate.mode` defaults to `off`), so an unrelated config
+    // problem elsewhere can never regress it. `cfg` falls back to defaults
+    // (`obfuscate.mode == Off`), exactly like this handler's own pre-#466
+    // `.ok()` fallback for the adoption marker.
+    let cfg = super::config::CtxConfig::load(&repo, env).unwrap_or_default();
+    if cfg.obfuscate.mode != super::config::ObfuscateMode::Off {
+        let prompt = serde_json::from_str::<serde_json::Value>(stdin)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let mut options = match hook_obfuscation_options(&cfg) {
+            Ok(options) => options,
+            Err(_) => {
+                writeln!(
+                    w,
+                    "{}",
+                    serde_json::json!({
+                        "decision": "block",
+                        "reason": "zirv could not load sensitive-data literals; refusing prompt"
+                    })
+                )?;
+                return Ok(0);
+            }
+        };
+        options.mode = super::obfuscate::Mode::Flag;
+        let mut vault = super::obfuscate::Vault::default();
+        let (_, findings) =
+            super::obfuscate::obfuscate(&prompt, &mut vault, &options, "user_prompt_submit");
+        if !findings.is_empty() {
+            let kinds = finding_kinds(&findings);
+            if let Ok(state) = StateDir::resolve(env) {
+                let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
+                let _ = log::append(
+                    &state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session: &session,
+                        verb: "hook",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "obfuscate-prompt-flag",
+                        detail: &kinds,
+                        observed_at: None,
+                    },
+                );
+            }
+            if cfg.obfuscate.prompt == super::config::ObfuscatePrompt::Block {
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    serde_json::json!({
+                        "decision": "block",
+                        "reason": format!("zirv blocked sensitive values in the prompt ({kinds}); remove them or set obfuscate.prompt = \"flag\"")
+                    })
+                );
+                return Ok(0);
+            }
         }
     }
 
@@ -10467,8 +10463,14 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("state");
         let repo = tempfile::tempdir().expect("repo");
         let state_root = state_dir.path().display().to_string();
-        let env =
-            |key: &str| (key == crate::commands::ctx::state::STATE_ENV).then(|| state_root.clone());
+        // Issue #466: masking is opt-in (`obfuscate.mode` defaults to
+        // `off`); this test is exercising the masking behavior itself, so
+        // it opts in explicitly rather than relying on the default.
+        let env = |key: &str| match key {
+            crate::commands::ctx::state::STATE_ENV => Some(state_root.clone()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".to_string()),
+            _ => None,
+        };
         let stdin = serde_json::json!({
             "session_id": "s1", "tool_use_id": "t1", "cwd": repo.path(),
             "tool_name": "Read", "tool_input": {"file_path":"notes.txt"},
@@ -10514,8 +10516,14 @@ mod tests {
         )
         .expect("seed vault");
         let state_root = state.root().display().to_string();
-        let env =
-            |key: &str| (key == crate::commands::ctx::state::STATE_ENV).then(|| state_root.clone());
+        // Issue #466: masking is opt-in (`obfuscate.mode` defaults to
+        // `off`); this test is exercising rehydration itself, so it opts in
+        // explicitly rather than relying on the default.
+        let env = |key: &str| match key {
+            crate::commands::ctx::state::STATE_ENV => Some(state_root.clone()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".to_string()),
+            _ => None,
+        };
         let stdin = serde_json::json!({
             "session_id":"s1", "cwd":repo.path(), "tool_name":"Bash",
             "tool_input":{
@@ -10544,9 +10552,12 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let repo = tempfile::tempdir().expect("repo");
         std::fs::create_dir_all(home.path().join(".zirv")).expect("config dir");
+        // Issue #466: masking is opt-in (`obfuscate.mode` defaults to
+        // `off`, which this handler now skips entirely); this test is
+        // exercising the block decision, so it opts in explicitly.
         std::fs::write(
             home.path().join(".zirv/ctx.toml"),
-            "[obfuscate]\nprompt = \"block\"\n",
+            "[obfuscate]\nmode = \"obfuscate\"\nprompt = \"block\"\n",
         )
         .expect("config");
         let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);

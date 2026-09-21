@@ -727,6 +727,47 @@ pub(crate) fn render_verification(outcome: Option<&VerificationOutcome>) -> Stri
     }
 }
 
+/// Issue #466: `structural()` copies raw transcript text no model has ever
+/// filtered -- unlike a distilled `Handoff` (safe by construction: the
+/// distiller model never saw anything but placeholders, see
+/// `helper_answer`), this is the one Handoff-producing path with nothing
+/// between the raw transcript and a fresh prompt a restart, resume, or
+/// handover preview goes on to inject. `task`/`done`/`remaining` are the
+/// only fields `structural()` ever fills with transcript-derived text (the
+/// others are fixed strings or plain paths); each goes through the same
+/// `protect_text` boundary every other zirv-composed prompt does.
+///
+/// `structural()` promises to never fail (a restart always has something to
+/// stand on), so a masking failure (state dir or literals file unreadable)
+/// does not propagate -- fail CLOSED instead: the field is replaced with a
+/// fixed notice rather than risking the raw text protection could not cover.
+fn protect_structural_fields(mut handoff: Handoff) -> Handoff {
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let env = super::config::env_from_process();
+    let protect = |text: &mut String| {
+        if text.is_empty() {
+            return;
+        }
+        *text = match super::obfuscate_store::protect_text_with_env(
+            &repo,
+            text,
+            "handoff_structural",
+            &env,
+        ) {
+            Ok((protected, _)) => protected,
+            Err(_) => {
+                "(withheld: sensitive-data masking failed for this mechanically extracted text)"
+                    .to_string()
+            }
+        };
+    };
+    protect(&mut handoff.task);
+    for item in handoff.done.iter_mut().chain(handoff.remaining.iter_mut()) {
+        protect(item);
+    }
+    handoff
+}
+
 /// Mechanical extraction used when the distiller is unavailable or unusable.
 /// Never fails and never returns something unusable.
 pub fn structural(ctx: &StructuralContext) -> Handoff {
@@ -798,7 +839,7 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         })
         .collect();
 
-    Handoff {
+    protect_structural_fields(Handoff {
         task,
         constraints: Vec::new(),
         done,
@@ -810,7 +851,7 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         files_read: ctx.files_read.clone(),
         files_modified,
         gotchas: vec!["This handoff was extracted mechanically, so it may be incomplete.".to_string()],
-    }
+    })
 }
 
 pub const DISTILL_PROMPT_VERSION: &str = "v3";
