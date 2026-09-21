@@ -405,6 +405,13 @@ fn run_with<W: Write>(
     }
     let mut request = request_for(&cli.verb, env)?;
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    request.title = crate::commands::ctx::obfuscate_store::protect_text_with_env(
+        &repo,
+        &request.title,
+        "github_report_title",
+        env,
+    )?
+    .0;
     request.body = crate::commands::ctx::obfuscate_store::protect_text_with_env(
         &repo,
         &request.body,
@@ -611,6 +618,39 @@ mod tests {
             "https://github.com/Glubiz/zirv-cli/issues/999\n"
         );
         assert_eq!(captured.borrow().as_ref().expect("request").title, "Broken");
+    }
+
+    #[test]
+    fn report_masks_a_sensitive_title_before_creating_the_issue() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let state_path = state.path().join("state").display().to_string();
+        let secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+        let parsed = cli(&["zirv report", "bug", &format!("Failure with {secret}")]);
+        let captured = RefCell::new(None);
+        let env = |key: &str| match key {
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".to_string()),
+            crate::commands::ctx::state::STATE_ENV => Some(state_path.clone()),
+            _ => None,
+        };
+        let mut output = Vec::new();
+
+        run_with(
+            &parsed,
+            &mut output,
+            None,
+            &env,
+            &|| Some("token".to_string()),
+            &|_, request| {
+                captured.replace(Some(request.clone()));
+                Ok("https://github.com/Glubiz/zirv-cli/issues/999".to_string())
+            },
+        )
+        .expect("run");
+
+        let captured = captured.borrow();
+        let title = &captured.as_ref().expect("request").title;
+        assert!(!title.contains(secret), "raw title escaped: {title}");
+        assert!(title.contains("ZIRV_SECRET_GITHUB_TOKEN_1"));
     }
 
     #[test]
