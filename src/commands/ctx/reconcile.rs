@@ -28,18 +28,55 @@
 //!
 //! `--dry-run` performs zero writes. Three of the five resources below have
 //! a pure decision usable without mutating (task, reservation, permit -- see
-//! `permit::dead_records`'s own doc comment) or a check that is inherently
-//! read-only (group). The other two do not: `sessions::list_with_retention`
-//! sweeps orphan marker/endpoint/socket/screening files as an unavoidable
-//! side effect of listing, and `worktree::gc`'s proof step shells out to git
-//! per candidate and then writes the registry either way (`Kept` as well as
-//! `Removed`). Rather than reimplement either sweep's own decision a second
-//! time here (forbidden -- see this module's own doc comment above),
-//! worktree still reports its dead-owner CANDIDATES via the cheap,
-//! non-mutating pre-filter `gc` already applies before ever probing
-//! (`worktree::gc_candidates`), and sessions is reported as not inspectable
-//! in `--dry-run` at all.
+//! `permit::dead_records`'s own doc comment). The other two do not:
+//! `sessions::list`/`list_with_retention` sweeps a stale registry record plus
+//! four kinds of orphan file (socket paths, endpoints, markers, screening
+//! summaries) as an unavoidable side effect of LISTING -- so `--dry-run`
+//! must never call it, directly or transitively -- and `worktree::gc`'s
+//! proof step shells out to git per candidate and then writes the registry
+//! either way (`Kept` as well as `Removed`). Rather than reimplement either
+//! sweep's own decision a second time here (forbidden -- see this module's
+//! own doc comment above), worktree still reports its dead-owner CANDIDATES
+//! via the cheap, non-mutating pre-filter `gc` already applies before ever
+//! probing (`worktree::gc_candidates`), and sessions is reported as not
+//! inspectable in `--dry-run` at all.
+//!
+//! The group check needs a session's liveness too (`group::is_abandoned`'s
+//! `claimant_alive`), but has a non-sweeping way to answer that:
+//! `sessions::short_is_live` reads one record straight off disk
+//! (`sessions::load_record`) and applies the pure pid+start-time probe
+//! (`sessions::record_is_alive`) with no listing and no sweep, so `--dry-run`
+//! uses that. The LIVE pass instead takes exactly ONE `sessions::list` (the
+//! whole point of level-triggered: healing sessions IS one of this pass's
+//! own resources) and shares that single snapshot between the group check
+//! and the session report, mirroring `status.rs`'s `group_header`/
+//! `group_tree_lines`, which build one `live_shorts` set per render rather
+//! than re-querying liveness per group.
+//!
+//! **Closing a group is deliberately conservative, and today that means
+//! coordinator-liveness alone.** `group::is_abandoned` only ever looks at
+//! the claimed sub-orchestrator; it says nothing about whether a live child
+//! this group admitted is still doing work. Checked (Grepped `status.rs`,
+//! `dash/mod.rs`, `sessions::Record`, `log::DelegationRow`, `reservation::
+//! Reservation`) for any ON-DISK record that attributes a still-running
+//! session to its work group: none exists. `dash::Pane::work_group_id` is
+//! the only place that link is ever held, and it lives purely in a live
+//! dashboard process's own memory -- gone the moment that process exits, and
+//! never visible to a separate `zirv ctx reconcile` invocation reading state
+//! off disk. So this closes an abandoned group on coordinator death alone,
+//! same as `status.rs` already flags "ABANDONED" on. The operator-visible
+//! consequence: a still-running child of a dead coordinator can no longer
+//! admit nested children once its group is closed (`group::admit_child`
+//! refuses a closed group outright) -- called out in the text output, the
+//! group section's own `note`, and in `README.md`.
+//!
+//! Work groups are also machine-wide, unlike every other resource here:
+//! `<state>/groups` carries no repository dimension at all (a group can
+//! outlive, and is never scoped to, any one checkout), the same way permits
+//! and reservations are machine-wide pools rather than per-repo state. The
+//! text output labels the group line accordingly.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -47,6 +84,15 @@ use serde::Serialize;
 
 use super::state::{self, StateDir};
 use super::{CtxResult, group, permit, reservation, sessions, task, worktree};
+
+/// Issue #720 review: the operator-visible cost of closing a group on
+/// coordinator liveness alone, with no on-disk attribution of a live child
+/// to its group (this module's own doc comment explains why none exists
+/// today). Shared by the group resource's own `note` and its text-output
+/// line, so the two can never say something different.
+const GROUP_ATTRIBUTION_CAVEAT: &str = "closes on coordinator liveness alone -- no on-disk \
+     record attributes a live session to its work group, so a still-running child of a dead \
+     coordinator can no longer admit nested children once its group is closed";
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct ReconcileArgs {
@@ -97,6 +143,20 @@ impl ResourceReport {
         report.error = Some(error.to_string());
         report
     }
+
+    /// Issue #720 review (item 2): a partial-failure report -- every id
+    /// actually healed BEFORE and AFTER the failing item is kept, unlike
+    /// [`failed`], which is only for a resource with no per-item ids to
+    /// preserve at all (`task`'s single locked pass).
+    fn healed_with_error(
+        resource: &'static str,
+        ids: Vec<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        let mut report = Self::healed(resource, ids);
+        report.error = Some(error.into());
+        report
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -126,9 +186,19 @@ fn reconcile_tasks(state: &StateDir, repo_slug: &str, now: u64, dry_run: bool) -
 /// by `reservation::is_owner_alive` -- both already-`pub`/exposed pure reads,
 /// no lock and no write; the live pass takes each provider's ledger lock in
 /// turn via `prune_dead_locked`.
+///
+/// Issue #720 review (item 2): one provider's ledger failing to lock/save
+/// must not discard ids another provider already healed, or skip providers
+/// still to come -- every provider is attempted, in SORTED order (so the
+/// output is deterministic run to run), and every error is collected rather
+/// than aborting on the first one.
 fn reconcile_reservations(state: &StateDir, dry_run: bool) -> ResourceReport {
+    let mut providers = reservation::known_providers(state);
+    providers.sort();
+
     let mut ids = Vec::new();
-    for provider in reservation::known_providers(state) {
+    let mut errors = Vec::new();
+    for provider in providers {
         if dry_run {
             ids.extend(
                 reservation::entries(state, &provider)
@@ -140,10 +210,14 @@ fn reconcile_reservations(state: &StateDir, dry_run: bool) -> ResourceReport {
         }
         match reservation::prune_dead_locked(state, &provider) {
             Ok(dead) => ids.extend(dead.into_iter().map(|entry| entry.id)),
-            Err(e) => return ResourceReport::failed("reservation", e),
+            Err(e) => errors.push(format!("{provider}: {e}")),
         }
     }
-    ResourceReport::healed("reservation", ids)
+    if errors.is_empty() {
+        ResourceReport::healed("reservation", ids)
+    } else {
+        ResourceReport::healed_with_error("reservation", ids, errors.join("; "))
+    }
 }
 
 /// Dead-owner heavy/writer permit sweep, both pools. `permit::dead_records`
@@ -168,28 +242,61 @@ fn reconcile_permits(state: &StateDir, dry_run: bool) -> ResourceReport {
 /// Closes every open work group whose claimed sub-orchestrator is confirmed
 /// dead (issue #720 acceptance: closes an abandoned work group with a dead
 /// coordinator and no live dashboard) -- the one resource with no automatic
-/// reclaim anywhere else in this codebase. `group::is_abandoned` and `group::
-/// short_id_is_alive` are the exact facts `status.rs` already prints
-/// "ABANDONED" from; `group::close` is the same idempotent close `zirv ctx
-/// group close` and `agent::run_with`'s own auto-close both call.
-fn reconcile_groups(state: &StateDir, now: u64, dry_run: bool) -> ResourceReport {
+/// reclaim anywhere else in this codebase. `group::is_abandoned` is the same
+/// decision `status.rs` already prints "ABANDONED" from; `group::close` is
+/// the same idempotent close `zirv ctx group close` and `agent::run_with`'s
+/// own auto-close both call. See this module's own doc comment for why
+/// closing stays conservative on coordinator liveness alone
+/// ([`GROUP_ATTRIBUTION_CAVEAT`]), and for why groups are machine-wide.
+///
+/// Liveness comes from `live_shorts` (`Some` in live mode: ONE `sessions::
+/// list` snapshot taken once for the whole pass, per this module's own doc
+/// comment) when given; `None` (`--dry-run`) falls back to `sessions::
+/// short_is_live`'s own non-sweeping direct read, so a dry run never reaches
+/// `sessions::list`/`list_with_retention`'s sweep.
+///
+/// Issue #720 review (item 2): one group failing to close must not discard
+/// ids already healed, or skip groups still to come -- every open,
+/// abandoned group is attempted, in SORTED id order (deterministic output),
+/// and every error is collected rather than aborting on the first one.
+fn reconcile_groups(
+    state: &StateDir,
+    now: u64,
+    dry_run: bool,
+    live_shorts: Option<&BTreeSet<String>>,
+) -> ResourceReport {
+    let mut groups = group::list(state);
+    groups.sort_by(|a, b| a.work_group_id.cmp(&b.work_group_id));
+
     let mut ids = Vec::new();
-    for wg in group::list(state) {
+    let mut errors = Vec::new();
+    for wg in groups {
         if wg.closed_at.is_some() {
             continue;
         }
         let Some(sub) = wg.sub_orchestrator_session.clone() else {
             continue;
         };
-        if !group::is_abandoned(&wg, group::short_id_is_alive(state, &sub)) {
+        let alive = match live_shorts {
+            Some(shorts) => shorts.contains(&sub),
+            None => sessions::short_is_live(state, &sub),
+        };
+        if !group::is_abandoned(&wg, alive) {
             continue;
         }
         if !dry_run && let Err(e) = group::close(state, &wg.work_group_id, now) {
-            return ResourceReport::failed("group", e);
+            errors.push(format!("{}: {e}", wg.work_group_id));
+            continue;
         }
         ids.push(wg.work_group_id.clone());
     }
-    ResourceReport::healed("group", ids)
+    let mut report = if errors.is_empty() {
+        ResourceReport::healed("group", ids)
+    } else {
+        ResourceReport::healed_with_error("group", ids, errors.join("; "))
+    };
+    report.note = Some(GROUP_ATTRIBUTION_CAVEAT.to_string());
+    report
 }
 
 /// `--dry-run`: reports `worktree::gc_candidates` (the same dead-owner
@@ -228,16 +335,24 @@ fn reconcile_worktrees(state: &StateDir, repo: &Path, dry_run: bool) -> Resource
     ResourceReport::healed("worktree", ids)
 }
 
-/// `sessions::list_with_retention` sweeps four kinds of orphan file (socket
-/// paths, endpoints, markers, screening summaries) plus the stale registry
-/// record itself, all as an unavoidable side effect of listing (its own doc
-/// comment) -- there is no separate pure decision to preview without
-/// mutating, and reimplementing that decision a second time here is exactly
-/// the "new sweep semantics" this module's own doc comment forbids. Reported
-/// as not inspectable in `--dry-run` rather than skipped silently, so an
-/// operator reading the output knows this resource was not zero, just
+/// `sessions::list`/`list_with_retention` sweeps four kinds of orphan file
+/// (socket paths, endpoints, markers, screening summaries) plus the stale
+/// registry record itself, all as an unavoidable side effect of LISTING
+/// (its own doc comment) -- there is no separate pure decision to preview
+/// without mutating, and reimplementing that decision a second time here is
+/// exactly the "new sweep semantics" this module's own doc comment forbids.
+/// Reported as not inspectable in `--dry-run` rather than skipped silently,
+/// so an operator reading the output knows this resource was not zero, just
 /// unchecked.
-fn reconcile_sessions(state: &StateDir, dry_run: bool) -> ResourceReport {
+///
+/// Live mode takes no `sessions::list` call of its own: `snapshot` is the
+/// ONE call `run` already made for the whole pass (shared with
+/// `reconcile_groups`'s own liveness check), so listing sessions here never
+/// costs a second sweep.
+fn reconcile_sessions(
+    dry_run: bool,
+    snapshot: Option<&[(sessions::Record, sessions::Liveness)]>,
+) -> ResourceReport {
     if dry_run {
         return ResourceReport::not_inspectable(
             "session",
@@ -245,10 +360,11 @@ fn reconcile_sessions(state: &StateDir, dry_run: bool) -> ResourceReport {
              unavoidable side effect of listing",
         );
     }
-    let ids: Vec<String> = sessions::list(state)
-        .into_iter()
+    let ids: Vec<String> = snapshot
+        .unwrap_or(&[])
+        .iter()
         .filter(|(_, liveness)| *liveness == sessions::Liveness::Stale)
-        .map(|(record, _)| record.short)
+        .map(|(record, _)| record.short.clone())
         .collect();
     ResourceReport::healed("session", ids)
 }
@@ -260,13 +376,33 @@ pub fn run<W: Write>(args: &ReconcileArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let repo_slug = state::repo_slug(&repo);
 
+    // Issue #720 review (item 1): `--dry-run` must never reach `sessions::
+    // list`/`list_with_retention` (its sweep is an unavoidable side effect
+    // of listing -- see `reconcile_sessions`'s own doc comment). The live
+    // pass takes exactly ONE snapshot for the whole reconcile pass and
+    // shares it between `reconcile_groups`'s coordinator-liveness check and
+    // `reconcile_sessions`'s own stale-record report, mirroring `status.rs`'s
+    // `group_header`/`group_tree_lines`' single `live_shorts` set per render.
+    let session_snapshot = if args.dry_run {
+        None
+    } else {
+        Some(sessions::list(&state))
+    };
+    let live_shorts: Option<BTreeSet<String>> = session_snapshot.as_ref().map(|records| {
+        records
+            .iter()
+            .filter(|(_, liveness)| *liveness == sessions::Liveness::Live)
+            .map(|(record, _)| record.short.clone())
+            .collect()
+    });
+
     let resources = vec![
         reconcile_tasks(&state, &repo_slug, now, args.dry_run),
         reconcile_reservations(&state, args.dry_run),
         reconcile_permits(&state, args.dry_run),
-        reconcile_groups(&state, now, args.dry_run),
+        reconcile_groups(&state, now, args.dry_run, live_shorts.as_ref()),
         reconcile_worktrees(&state, &repo, args.dry_run),
-        reconcile_sessions(&state, args.dry_run),
+        reconcile_sessions(args.dry_run, session_snapshot.as_deref()),
     ];
     let any_failed = resources.iter().any(|r| r.error.is_some());
 
@@ -278,19 +414,29 @@ pub fn run<W: Write>(args: &ReconcileArgs, w: &mut W) -> CtxResult<i32> {
         writeln!(w, "{}", serde_json::to_string(&report)?)?;
     } else {
         for r in &resources {
-            if let Some(e) = &r.error {
-                writeln!(w, "{}: FAILED: {e}", r.resource)?;
-                continue;
-            }
+            // Issue #720 review (item 4): groups are machine-wide (`<state>/
+            // groups` carries no repo dimension), unlike every other
+            // resource this pass touches -- labeled here so the text output
+            // does not imply the same repo scoping task/worktree actually
+            // have.
+            let label = if r.resource == "group" {
+                "group (machine-wide)"
+            } else {
+                r.resource
+            };
             let ids = if r.ids.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", r.ids.join(", "))
             };
-            match &r.note {
-                Some(note) => writeln!(w, "{}: {}{ids} -- {note}", r.resource, r.healed)?,
-                None => writeln!(w, "{}: {}{ids}", r.resource, r.healed)?,
+            write!(w, "{label}: {}{ids}", r.healed)?;
+            if let Some(note) = &r.note {
+                write!(w, " -- {note}")?;
             }
+            if let Some(e) = &r.error {
+                write!(w, " -- ERROR: {e}")?;
+            }
+            writeln!(w)?;
         }
     }
     Ok(if any_failed { 1 } else { 0 })
@@ -410,15 +556,70 @@ mod tests {
         assert_eq!(reservation::entries(&state, "claude").len(), 1);
     }
 
-    /// Issue #720 acceptance: closes an abandoned work group -- a dead
-    /// coordinator and no live dashboard -- without any `zirv ctx group
-    /// close` call.
+    /// Issue #720 review (item 2): one provider's ledger failing to lock/save
+    /// must not discard an id another provider already healed. `claude`
+    /// sorts before `codex`, so this also proves the SORTED iteration order:
+    /// `claude` (which heals) always runs before `codex` (whose lock is
+    /// forced to fail).
     #[test]
-    fn reconcile_closes_an_abandoned_group_with_a_dead_coordinator() {
+    fn reconcile_reservations_keeps_healed_ids_when_one_provider_errors() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = state_dir(tmp.path());
-        let wg = group::WorkGroup {
-            work_group_id: "wg-1".to_string(),
+        let dead_pid = super::super::testenv::dead_pid();
+
+        let ledger = reservation::Ledger {
+            schema_version: 1,
+            entries: vec![reservation::Reservation {
+                id: "dead-1".to_string(),
+                session: "sess-dead".to_string(),
+                pid: dead_pid,
+                pid_start_time: None,
+                tokens: 9_999,
+                created_at: 1_700_000_000,
+            }],
+        };
+        state::create_private_dir_all(&state.reservations()).expect("mkdir");
+        state::write_private(
+            &state.reservations().join("claude.json"),
+            &serde_json::to_string_pretty(&ledger).expect("serialize"),
+        )
+        .expect("seed claude ledger");
+
+        // A second, otherwise-empty ledger -- so `known_providers` actually
+        // discovers "codex" at all (it only recognises a provider from its
+        // own `<slug>.json` ledger file).
+        state::write_private(
+            &state.reservations().join("codex.json"),
+            &serde_json::to_string_pretty(&reservation::Ledger::default()).expect("serialize"),
+        )
+        .expect("seed empty codex ledger");
+
+        // Force `codex`'s own `prune_dead_locked` to fail the same way the
+        // group test above forces a `close` to fail: a DIRECTORY sitting at
+        // the exact path its lock file would open.
+        std::fs::create_dir_all(state.reservations().join("codex.lock")).expect("mkdir codex.lock");
+
+        let report = reconcile_reservations(&state, false);
+        assert_eq!(
+            report.ids,
+            vec!["dead-1".to_string()],
+            "claude's dead-owner entry must still be reported healed"
+        );
+        assert!(report.error.is_some(), "codex's failure must be reported");
+        assert!(
+            report.error.as_ref().unwrap().contains("codex"),
+            "the error must name which provider failed: {:?}",
+            report.error
+        );
+        assert!(
+            reservation::entries(&state, "claude").is_empty(),
+            "claude's dead-owner entry was actually removed"
+        );
+    }
+
+    fn sample_group(id: &str, sub_orchestrator_session: Option<&str>) -> group::WorkGroup {
+        group::WorkGroup {
+            work_group_id: id.to_string(),
             parent_session_id: "sess-parent".to_string(),
             scope: "batch".to_string(),
             child_limit: 3,
@@ -430,46 +631,50 @@ mod tests {
             created_at: 1_000,
             closed_at: None,
             admitted_children: 1,
-            sub_orchestrator_session: Some("dead-short".to_string()),
-        };
-        group::create(&state, &wg).expect("create group");
+            sub_orchestrator_session: sub_orchestrator_session.map(str::to_string),
+        }
+    }
 
-        let report = reconcile_groups(&state, 2_000, false);
+    /// Issue #720 acceptance: closes an abandoned work group -- a dead
+    /// coordinator and no live dashboard -- without any `zirv ctx group
+    /// close` call. `live_shorts` is the empty set, standing in for "the one
+    /// `sessions::list` snapshot `run` takes for a live pass" naming nobody
+    /// alive.
+    #[test]
+    fn reconcile_closes_an_abandoned_group_with_a_dead_coordinator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_dir(tmp.path());
+        group::create(&state, &sample_group("wg-1", Some("dead-short"))).expect("create group");
+
+        let live_shorts = BTreeSet::new();
+        let report = reconcile_groups(&state, 2_000, false, Some(&live_shorts));
         assert_eq!(report.healed, 1);
         assert_eq!(report.ids, vec!["wg-1".to_string()]);
+        assert!(
+            report
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("attribut")),
+            "the group report must always carry the attribution caveat: {:?}",
+            report.note
+        );
         let closed = group::load(&state, "wg-1")
             .expect("load io")
             .expect("group exists");
         assert_eq!(closed.closed_at, Some(2_000));
     }
 
-    /// A group whose claimed coordinator IS alive must never be closed.
+    /// A group with no claimed sub-orchestrator at all must never be closed
+    /// (`is_abandoned` requires a claim before it can ever fire), which is
+    /// the common case this pass must leave alone.
     #[test]
-    fn reconcile_never_closes_a_group_whose_coordinator_is_alive() {
+    fn reconcile_never_closes_a_group_with_no_claimed_coordinator() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = state_dir(tmp.path());
-        // A group with no claimed sub-orchestrator at all is the "alive"
-        // stand-in here (`is_abandoned` requires a claim before it can ever
-        // fire -- see its own doc comment), which is the common case this
-        // pass must leave alone.
-        let wg = group::WorkGroup {
-            work_group_id: "wg-1".to_string(),
-            parent_session_id: "sess-parent".to_string(),
-            scope: "batch".to_string(),
-            child_limit: 3,
-            token_budget: None,
-            spent_tokens: 0,
-            reserved_tokens: 0,
-            deadline_secs: None,
-            completion_contract: "report by mail".to_string(),
-            created_at: 1_000,
-            closed_at: None,
-            admitted_children: 0,
-            sub_orchestrator_session: None,
-        };
-        group::create(&state, &wg).expect("create group");
+        group::create(&state, &sample_group("wg-1", None)).expect("create group");
 
-        let report = reconcile_groups(&state, 2_000, false);
+        let live_shorts = BTreeSet::new();
+        let report = reconcile_groups(&state, 2_000, false, Some(&live_shorts));
         assert_eq!(report.healed, 0);
         let untouched = group::load(&state, "wg-1")
             .expect("load io")
@@ -477,9 +682,83 @@ mod tests {
         assert!(untouched.closed_at.is_none());
     }
 
-    /// Issue #720 acceptance: `--dry-run` reports every finding with zero
-    /// mutation -- every state file this pass could touch is byte-identical
-    /// before and after.
+    /// A group whose claimed coordinator IS alive (present in the live pass's
+    /// own `live_shorts` snapshot) must never be closed.
+    #[test]
+    fn reconcile_never_closes_a_group_whose_coordinator_is_alive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_dir(tmp.path());
+        group::create(&state, &sample_group("wg-1", Some("live-short"))).expect("create group");
+
+        let live_shorts: BTreeSet<String> = ["live-short".to_string()].into_iter().collect();
+        let report = reconcile_groups(&state, 2_000, false, Some(&live_shorts));
+        assert_eq!(report.healed, 0);
+        let untouched = group::load(&state, "wg-1")
+            .expect("load io")
+            .expect("group exists");
+        assert!(untouched.closed_at.is_none());
+    }
+
+    /// Issue #720 review (item 2): one group failing to close must not
+    /// discard an id another group already healed, and iteration is in
+    /// sorted `work_group_id` order so `wg-a` (which heals) always runs
+    /// before `wg-b` (whose close is forced to fail).
+    #[test]
+    fn reconcile_groups_keeps_healed_ids_when_one_group_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_dir(tmp.path());
+        group::create(&state, &sample_group("wg-a", Some("dead-short-a"))).expect("create wg-a");
+        group::create(&state, &sample_group("wg-b", Some("dead-short-b"))).expect("create wg-b");
+
+        // Force `wg-b`'s own `close` to fail: pre-create a DIRECTORY at the
+        // exact path its lock file would open -- `group::open_lock_file`'s
+        // `OpenOptions::new().write(true)` on an existing directory fails on
+        // every platform this runs on.
+        std::fs::create_dir_all(state.groups().join("wg-b.lock")).expect("mkdir wg-b.lock");
+
+        let live_shorts = BTreeSet::new();
+        let report = reconcile_groups(&state, 2_000, false, Some(&live_shorts));
+        assert_eq!(
+            report.ids,
+            vec!["wg-a".to_string()],
+            "wg-a must still be reported healed"
+        );
+        assert!(report.error.is_some(), "wg-b's failure must be reported");
+        assert!(
+            report.error.as_ref().unwrap().contains("wg-b"),
+            "the error must name which group failed: {:?}",
+            report.error
+        );
+
+        assert!(
+            group::load(&state, "wg-a")
+                .expect("load io")
+                .expect("exists")
+                .closed_at
+                .is_some(),
+            "wg-a was actually closed"
+        );
+        assert!(
+            group::load(&state, "wg-b")
+                .expect("load io")
+                .expect("exists")
+                .closed_at
+                .is_none(),
+            "wg-b's failed close must leave it open"
+        );
+    }
+
+    /// Issue #720 acceptance, strengthened by review item 1: `--dry-run`
+    /// reports every finding with zero mutation -- the WHOLE state dir tree
+    /// (every file, including names) is byte-identical before and after.
+    /// The original version of this test seeded no stale session artefacts,
+    /// so it never actually exercised the one sweep review found
+    /// `reconcile_groups` was silently triggering: `group::short_id_is_alive`
+    /// -> `sessions::list` -> `list_with_retention`, which deletes a stale
+    /// registry record and orphan `.nudge`/`.sock`/`.screening` files as a
+    /// side effect of merely being CALLED, dry run or not. This seeds a
+    /// stale session record AND an orphan `.nudge` marker specifically to
+    /// catch that class of regression again.
     #[test]
     fn dry_run_reports_findings_with_zero_mutation() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -526,22 +805,25 @@ mod tests {
         .expect("claimed");
 
         // An abandoned work group.
-        let wg = group::WorkGroup {
-            work_group_id: "wg-1".to_string(),
-            parent_session_id: "sess-parent".to_string(),
-            scope: "batch".to_string(),
-            child_limit: 3,
-            token_budget: None,
-            spent_tokens: 0,
-            reserved_tokens: 0,
-            deadline_secs: None,
-            completion_contract: "report by mail".to_string(),
-            created_at: 1_000,
-            closed_at: None,
-            admitted_children: 1,
-            sub_orchestrator_session: Some("dead-short".to_string()),
-        };
-        group::create(&state, &wg).expect("create group");
+        group::create(&state, &sample_group("wg-1", Some("dead-short"))).expect("create group");
+
+        // A stale session record: no live process, and no `in_flight`
+        // witness, so `list_with_retention` would sweep it from disk on
+        // sight (`Liveness::Stale`'s own arm).
+        let mut stale = sessions::Record::new("stale-sess", "claude", &repo, sessions::Verb::Wrap);
+        stale.pid = dead_pid;
+        let stale_short = stale.short.clone();
+        state::create_private_dir_all(&state.sessions()).expect("mkdir sessions");
+        state::write_private(
+            &state.sessions().join(format!("{stale_short}.json")),
+            &serde_json::to_string_pretty(&stale).expect("serialize"),
+        )
+        .expect("seed stale session record");
+
+        // An orphan `.nudge` marker with no matching record (live or not) at
+        // all -- `sweep_orphaned_markers`'s own target.
+        let orphan_marker = state.sessions().join("orphan-short.nudge");
+        std::fs::write(&orphan_marker, b"orphan").expect("seed orphan marker");
 
         let snapshot = |root: &Path| -> Vec<(std::path::PathBuf, Vec<u8>)> {
             let mut files = Vec::new();
@@ -574,9 +856,9 @@ mod tests {
             reconcile_tasks(&state, &repo_slug, 1_000 + 900 + 1, true),
             reconcile_reservations(&state, true),
             reconcile_permits(&state, true),
-            reconcile_groups(&state, 2_000, true),
+            reconcile_groups(&state, 2_000, true, None),
             reconcile_worktrees(&state, &repo, true),
-            reconcile_sessions(&state, true),
+            reconcile_sessions(true, None),
         ];
 
         // Every affected resource still reports the finding.
@@ -588,7 +870,11 @@ mod tests {
         );
 
         let after = snapshot(tmp.path());
-        assert_eq!(before, after, "--dry-run must never mutate any state file");
+        assert_eq!(
+            before, after,
+            "--dry-run must never mutate any state file, including a stale \
+             session record or an orphan marker"
+        );
 
         // And the live decisions are unaffected by having run in dry-run
         // first.
@@ -604,6 +890,17 @@ mod tests {
                 .closed_at
                 .is_none(),
             "dry-run must not have closed the group"
+        );
+        assert!(
+            state
+                .sessions()
+                .join(format!("{stale_short}.json"))
+                .is_file(),
+            "the stale session record must still be on disk"
+        );
+        assert!(
+            orphan_marker.is_file(),
+            "the orphan marker must still be on disk"
         );
     }
 
