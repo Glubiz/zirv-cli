@@ -69,7 +69,7 @@ pub fn is_shared_placeholder_path(repo: &Path, path: &Path) -> bool {
 
 pub fn summary(state_root: &Path, repo: &Path) -> Option<VaultSummary> {
     let path = vault_path(state_root, repo);
-    with_vault(&path, |vault| {
+    with_vault_readonly(&path, |vault| {
         let kinds = vault
             .entries()
             .iter()
@@ -202,6 +202,19 @@ pub fn with_vault<T>(
     Ok(result)
 }
 
+/// Read-only counterpart to [`with_vault`] for callers that never allocate a
+/// placeholder or otherwise change vault contents: no lock, no directory
+/// creation, no save, so an absent vault stays absent (`zirv ctx status` and
+/// `zirv ctx obfuscate list`/`reveal` must not conjure an empty vault file
+/// just by looking).
+pub fn with_vault_readonly<T>(
+    path: &Path,
+    read: impl FnOnce(&Vault) -> CtxResult<T>,
+) -> CtxResult<T> {
+    let vault = load(path)?;
+    read(&vault)
+}
+
 pub fn obfuscate_text(
     state_root: &Path,
     repo: &Path,
@@ -296,7 +309,7 @@ pub fn run<W: Write>(args: &ObfuscateArgs, writer: &mut W) -> CtxResult<i32> {
 
     let (action, detail) = match &args.command {
         ObfuscateCommand::List => {
-            let rows = with_vault(&path, |vault| {
+            let rows = with_vault_readonly(&path, |vault| {
                 let mut rows: BTreeMap<(String, String, String), usize> = BTreeMap::new();
                 for entry in vault.entries() {
                     *rows
@@ -316,7 +329,7 @@ pub fn run<W: Write>(args: &ObfuscateArgs, writer: &mut W) -> CtxResult<i32> {
         }
         ObfuscateCommand::Reveal { placeholder } => {
             let canonical = placeholder.split('@').next().unwrap_or(placeholder);
-            let value = with_vault(&path, |vault| {
+            let value = with_vault_readonly(&path, |vault| {
                 vault
                     .entries()
                     .iter()
@@ -331,6 +344,9 @@ pub fn run<W: Write>(args: &ObfuscateArgs, writer: &mut W) -> CtxResult<i32> {
             )
         }
         ObfuscateCommand::Purge => {
+            if let Some(parent) = path.parent() {
+                super::state::create_private_dir_all(parent)?;
+            }
             let _lock = acquire_lock(&path)?;
             match std::fs::remove_file(&path) {
                 Ok(()) => writeln!(writer, "purged repository obfuscation vault")?,

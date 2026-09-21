@@ -947,6 +947,10 @@ to the section that documents it in depth.
   session-start), audits recorded decisions, and checks or heals the
   installed hook entries against their baseline. See [Hook
   registration (Claude Code)](#hook-registration-claude-code).
+- **Sensitive-data masking** — `obfuscate` (`list`/`reveal`/`scan`/`purge`)
+  inspects, reveals, audits and clears the per-repository placeholder vault
+  that keeps credentials and personal data out of model and remote traffic.
+  See [What leaves this device](#what-leaves-this-device).
 
 ### Development workflow commands
 
