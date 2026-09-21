@@ -843,4 +843,111 @@ model='deepseek-v4-pro'
         assert_eq!(error.class, FailureClass::Entitlement);
         assert_eq!(error.scope.kind, FailureScopeKind::Account);
     }
+
+    // Issue #466: `obfuscate_for_egress` is the final native egress
+    // boundary -- the actual outbound request to a real AI vendor -- and
+    // had no dedicated test proving it actually masks a `ProviderRequest`
+    // before it would be sent.
+    fn secret_bearing_request() -> ProviderRequest {
+        ProviderRequest {
+            model: "claude-sonnet-5".to_string(),
+            system: vec![
+                "contact jane@company.dk about ghp_abcdefghijklmnopqrstuvwxyz123456".to_string(),
+            ],
+            messages: vec![ProviderMessage {
+                role: ProviderMessageRole::User,
+                content: vec![
+                    ProviderContent::Text {
+                        text: "use ghp_abcdefghijklmnopqrstuvwxyz123456".to_string(),
+                    },
+                    ProviderContent::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({
+                            "command": "echo ghp_abcdefghijklmnopqrstuvwxyz123456"
+                        }),
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 1024,
+            stop_sequences: vec!["ghp_abcdefghijklmnopqrstuvwxyz123456".to_string()],
+            thinking: ThinkingConfig::Default,
+            effort: None,
+            cache: CacheMode::Disabled,
+        }
+    }
+
+    #[test]
+    fn obfuscate_for_egress_masks_system_messages_tool_input_and_stop_sequences() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let options = crate::commands::ctx::obfuscate::Options::default();
+        let mut request = secret_bearing_request();
+
+        request
+            .obfuscate_for_egress(state.path(), repo.path(), &options, "test")
+            .expect("mask");
+
+        let rendered = serde_json::to_string(&request).expect("serialize");
+        assert!(
+            !rendered.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("jane@company.dk"), "{rendered}");
+        assert!(
+            rendered.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{rendered}"
+        );
+        assert_eq!(request.stop_sequences[0], "ZIRV_SECRET_GITHUB_TOKEN_1");
+    }
+
+    #[test]
+    fn obfuscate_for_egress_refuses_signed_thinking_that_carries_a_finding() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let options = crate::commands::ctx::obfuscate::Options::default();
+        let mut request = ProviderRequest {
+            model: "claude-sonnet-5".to_string(),
+            system: Vec::new(),
+            messages: vec![ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: vec![ProviderContent::Thinking {
+                    thinking: "the key is ghp_abcdefghijklmnopqrstuvwxyz123456".to_string(),
+                    signature: super::super::OpaqueProviderData::new(
+                        serde_json::json!({"type":"reasoning","id":"rs_1"}),
+                    ),
+                }],
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 1024,
+            stop_sequences: Vec::new(),
+            thinking: ThinkingConfig::Default,
+            effort: None,
+            cache: CacheMode::Disabled,
+        };
+
+        let error = request
+            .obfuscate_for_egress(state.path(), repo.path(), &options, "test")
+            .unwrap_err();
+        assert!(error.to_string().contains("signed thinking"), "{error}");
+    }
+
+    #[test]
+    fn obfuscate_for_egress_is_byte_identical_when_mode_is_off() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let options = crate::commands::ctx::obfuscate::Options {
+            mode: crate::commands::ctx::obfuscate::Mode::Off,
+            ..Default::default()
+        };
+        let original = secret_bearing_request();
+        let mut request = original.clone();
+
+        request
+            .obfuscate_for_egress(state.path(), repo.path(), &options, "test")
+            .expect("mask");
+
+        assert_eq!(request, original);
+    }
 }
