@@ -506,6 +506,27 @@ fn hash_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn encoded_request(
+    state: &impl Serialize,
+    questions: &[Question],
+    model: &str,
+) -> Result<(String, String), JevError> {
+    let request = build_request(state, questions, model);
+    let payload = serde_json::to_string(&request)
+        .map_err(|error| JevError::Transport(format!("failed to encode request: {error}")))?;
+    let cache_key = hash_hex(payload.as_bytes());
+    Ok((payload, cache_key))
+}
+
+#[cfg(test)]
+pub(crate) fn cache_key_for(
+    state: &impl Serialize,
+    questions: &[Question],
+    model: &str,
+) -> Result<String, JevError> {
+    encoded_request(state, questions, model).map(|(_, cache_key)| cache_key)
+}
+
 /// `Some(entry)` for a cache file that parses and is younger than
 /// `ttl_secs`; `None` for anything else -- missing, corrupt/unparseable
 /// (treated as a miss, never a hard error), or expired. Never deletes an
@@ -570,10 +591,7 @@ pub(crate) fn ask(
     state: &impl Serialize,
     questions: &[Question],
 ) -> Result<(Answers, Usage, bool), JevError> {
-    let request = build_request(state, questions, &cfg.model);
-    let payload = serde_json::to_string(&request)
-        .map_err(|error| JevError::Transport(format!("failed to encode request: {error}")))?;
-    let cache_key = hash_hex(payload.as_bytes());
+    let (payload, cache_key) = encoded_request(state, questions, &cfg.model)?;
     let cache_path = state_dir
         .join(JEV_CACHE_DIR)
         .join(format!("{cache_key}.json"));

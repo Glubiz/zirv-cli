@@ -89,6 +89,7 @@ criterion).
 | `ctx mcp` | shared | scoped read-only MCP bridge for wrapped hosts; does not start a native session |
 | `ctx measure` | N18 (#487) | transcript-derived proportionality/health metrics with a committed baseline |
 | `ctx nudge` | N10 (#479) | pane-typing surface; the runtime-neutral equivalent for a native worker is `delegation::send`, which queues rather than types at an open dialog |
+| `ctx obfuscate` | shared | reads/audits the per-repository placeholder vault (`list`/`reveal`/`scan`/`purge`); both runtimes mask through the same `obfuscate`/`obfuscate_store` functions, `runtime::native` and `provider::adapter` included |
 | `ctx objective` | N09 (#478) |  |
 | `ctx optimize` | N15 (#484) |  |
 | `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |

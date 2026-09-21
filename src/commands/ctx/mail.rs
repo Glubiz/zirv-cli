@@ -2041,6 +2041,7 @@ pub fn run_send_with<W: Write>(
             body.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
         }
     }
+    body = super::obfuscate_store::protect_text(&state, repo, &cfg, &body, "mail_send")?.0;
     let to_agent = args.to.clone().unwrap_or_else(|| "any".to_string());
     let mut targets = Vec::new();
     let mut notify = Vec::new();

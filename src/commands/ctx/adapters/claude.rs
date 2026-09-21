@@ -1725,6 +1725,12 @@ fn launch_settings_value(
                     "command": "zirv ctx safety check"
                 }]
             }, {
+                "matcher": super::super::hook::REHYDRATION_TOOLS.join("|"),
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
+                }]
+            }, {
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
                 "hooks": [{
                     "type": "command",
@@ -1744,7 +1750,7 @@ fn launch_settings_value(
             // `Bash|PowerShell` PreToolUse entry above: nothing here can
             // touch a permission decision.
             "PostToolUse": [{
-                "matcher": "Bash",
+                "matcher": ".*",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook posttool"
@@ -4209,24 +4215,39 @@ mod tests {
             settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx safety check"))
         );
-        // Issue #334: the orchestrator-write guard and the expensive-seat
-        // guard are separate `PreToolUse` entries, both running `zirv ctx
-        // hook pretool` -- the former attested on every launch instead of
-        // depending on a one-time `zirv setup apply`.
+        // Issue #466: the rehydration hook is the second `PreToolUse` entry,
+        // matching every tool a device action can rehydrate placeholders
+        // for (shell, write and lookup tools), also running `zirv
+        // ctx hook pretool` -- the same command decides both this and the
+        // orchestrator-write guard below from the payload it receives.
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/1/matcher"),
-            Some(&serde_json::json!("Edit|Write|MultiEdit|NotebookEdit"))
+            Some(&serde_json::json!(
+                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob"
+            ))
         );
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/1/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx hook pretool"))
         );
+        // Issue #334: the orchestrator-write guard and the expensive-seat
+        // guard are separate `PreToolUse` entries, both running `zirv ctx
+        // hook pretool` -- the former attested on every launch instead of
+        // depending on a one-time `zirv setup apply`.
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/2/matcher"),
-            Some(&serde_json::json!("Agent|Task"))
+            Some(&serde_json::json!("Edit|Write|MultiEdit|NotebookEdit"))
         );
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/2/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx hook pretool"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/3/matcher"),
+            Some(&serde_json::json!("Agent|Task"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/3/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx hook pretool"))
         );
         assert!(
@@ -4379,6 +4400,70 @@ mod tests {
     }
 
     #[test]
+    fn launch_settings_rehydrate_lookup_tools_and_audit_misses() {
+        let settings = test_launch_settings();
+        let matcher = settings["hooks"]["PreToolUse"][1]["matcher"]
+            .as_str()
+            .expect("matcher");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tempfile::tempdir().expect("state");
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let (masked, _) = crate::commands::ctx::obfuscate_store::obfuscate_text(
+            state.root(),
+            repo.path(),
+            secret,
+            &crate::commands::ctx::obfuscate::Options::default(),
+            "test",
+        )
+        .expect("seed vault");
+        let env = |key: &str| match key {
+            crate::commands::ctx::state::STATE_ENV => Some(state.root().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        for (tool, field) in [
+            ("Read", "file_path"),
+            ("Grep", "pattern"),
+            ("Glob", "pattern"),
+        ] {
+            assert!(
+                matcher.split('|').any(|name| name == tool),
+                "missing {tool}: {matcher}"
+            );
+            for placeholder in [&masked, "ZIRV_SECRET_GITHUB_TOKEN_999"] {
+                let stdin = serde_json::json!({
+                    "cwd": repo.path(), "tool_name": tool,
+                    "tool_input": {field: placeholder},
+                })
+                .to_string();
+                let mut out = Vec::new();
+                crate::commands::ctx::hook::run_pretool_for_agent(&mut out, &stdin, &env, None)
+                    .expect("hook");
+                let envelope: serde_json::Value = serde_json::from_slice(&out).expect("decision");
+                if placeholder == masked {
+                    assert_eq!(
+                        envelope["hookSpecificOutput"]["updatedInput"][field],
+                        secret
+                    );
+                } else {
+                    assert_eq!(envelope["hookSpecificOutput"]["permissionDecision"], "deny");
+                }
+            }
+        }
+        assert_eq!(
+            crate::commands::ctx::log::read_decisions(&state)
+                .iter()
+                .filter(|row| row.action == "obfuscate-rehydration-miss")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     fn launch_settings_observe_permission_events_without_changing_pretooluse() {
         let settings = test_launch_settings();
         // Issue #334 added the two guard entries below; wiring the
@@ -4393,6 +4478,12 @@ mod tests {
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx safety check"
+                }]
+            }, {
+                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
                 }]
             }, {
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
@@ -4418,17 +4509,17 @@ mod tests {
         assert_eq!(settings["hooks"]["PermissionDenied"], observer);
     }
 
-    /// Issue #326: the compact-output hook is wired as its own `PostToolUse`
-    /// entry on `Bash`, synchronously (no `"background": true`) -- a
-    /// background hook's `updatedToolOutput` would arrive after claude had
-    /// already been handed the original result.
+    /// Issues #326 and #466: the compact/obfuscation hook covers every tool
+    /// synchronously (no `"background": true`) -- a background hook's
+    /// `updatedToolOutput` would arrive after Claude had already been handed
+    /// the original result.
     #[test]
     fn launch_settings_wire_the_compact_output_hook_on_post_tool_use() {
         let settings = test_launch_settings();
         assert_eq!(
             settings["hooks"]["PostToolUse"],
             serde_json::json!([{
-                "matcher": "Bash",
+                "matcher": ".*",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook posttool"

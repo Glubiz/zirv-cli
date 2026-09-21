@@ -947,6 +947,10 @@ to the section that documents it in depth.
   session-start), audits recorded decisions, and checks or heals the
   installed hook entries against their baseline. See [Hook
   registration (Claude Code)](#hook-registration-claude-code).
+- **Sensitive-data masking** — `obfuscate` (`list`/`reveal`/`scan`/`purge`)
+  inspects, reveals, audits and clears the per-repository placeholder vault
+  that keeps credentials and personal data out of model and remote traffic.
+  See [What leaves this device](#what-leaves-this-device).
 
 ### Development workflow commands
 
@@ -2101,6 +2105,56 @@ deltas automatically. Telemetry excludes prompts, source code, diffs, command
 output, and model responses by construction.
 
 ## Context Management (zirv ctx)
+
+### What leaves this device
+
+Zirv can mask credential and personal-data values before text it controls is
+sent to a model or another remote service. This is opt-in and off by default;
+the operator turns it on with `[obfuscate] mode = "obfuscate"` in
+`~/.zirv/ctx.toml` (never a repository checkout -- see `REPO_FORBIDDEN`
+below). Once enabled, masking is deterministic and on-device: repeated values
+become the same typed placeholder (for example `ZIRV_SECRET_GITHUB_PAT_1` or
+`ZIRV_PII_EMAIL_2@example.org`) in every session and worker for that
+repository. The plaintext mapping remains in an operator-owned, mode-0600
+vault under the Zirv state directory. It is not encrypted at rest.
+
+| Surface | Treatment once `obfuscate.mode` is enabled |
+|---|---|
+| Native direct-provider and official-harness requests | The final provider request boundary masks system text, messages, tool inputs/results, tool descriptions and schemas. Signed thinking with a finding fails closed. |
+| Claude Code tool results | `PostToolUse` masks all JSON string values before they return to model context. |
+| Claude Code Bash, Write, Edit, MultiEdit and NotebookEdit actions | `PreToolUse` rehydrates placeholders immediately before the local action. Writes to `.zirv/memory/` and `.zirv/work/` deliberately retain placeholders. Unknown placeholders fail closed. |
+| Handoff and memory-harvest helper prompts | Masked before the helper model subprocess is launched. |
+| Memory, mail, worker briefs, task text, workflow artifacts and configured system prompts | Masked before persistence or prompt composition; placeholders remain stable across relays. |
+| `zirv report` issue bodies | Masked before the GitHub API request and never rehydrated remotely. |
+| Operator text entered through `UserPromptSubmit` | Findings are flagged and logged by default, or the prompt is blocked when `prompt = "block"`; the hook protocol cannot rewrite this event. |
+
+The guarantee is limited to Zirv-controlled boundaries. Zirv cannot inspect a
+harness's private API implementation, model responses, traffic from plugins or
+MCP servers that bypass Zirv, or content transformed into an encoding the
+detectors do not recognise. Names and street addresses require an operator
+literal or pattern. For Claude Code, typed prompts can be flagged or blocked
+but cannot be rewritten. These boundaries are why the native harness applies
+the transformation to the complete provider request, while the meta harness
+uses both prompt composition and lifecycle hooks.
+
+```toml
+[obfuscate]
+mode = "obfuscate"          # off (default) | flag | obfuscate
+entropy = "flag"            # flag | obfuscate
+prompt = "flag"             # flag | block
+email_domain = "keep"       # keep | mask
+allow = ["fixture@example.com"]
+literals_file = "~/.zirv/obfuscate-literals.txt"
+patterns = [{ kind = "customer_id", regex = "CUST-[0-9]{8}" }]
+```
+
+`zirv ctx obfuscate list` reports kinds, counts and first-seen surfaces without
+values; `reveal <placeholder>` prints one value locally and records the audit
+action; `scan [transcript]` detects without storing; and `purge` deletes the
+repository vault. `zirv ctx status` reports vault counts and rehydration misses.
+Repository configuration may only narrow this posture by masking email domains
+or adding patterns; it cannot disable masking, replace the operator's literals
+file, or add allow-list entries.
 
 `zirv ctx` watches Claude Code sessions for context rot and intervenes before
 quality drops: it advises, compacts early, or restarts the session with a
@@ -3518,6 +3572,10 @@ keep only your own.
 | Native release availability | fixed in the binary | no flag, configuration, environment variable or Cargo feature can enable native execution |
 | `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
 | `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
+| `ZIRV_CTX_OBFUSCATE_MODE` | operator environment | selects `off`, `flag` or `obfuscate`; no repository equivalent |
+| `ZIRV_CTX_OBFUSCATE_ENTROPY` | operator environment | selects whether heuristic entropy findings are flagged or masked |
+| `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |
+| `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
 
 Every native instruction file inside the repository checkout — `ZIRV.md`
 (root, `.zirv/` fallback, or nested), `AGENTS.md`, `CLAUDE.md`, and the
@@ -3538,7 +3596,8 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
-`handover`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
+`handover`, `obfuscate.mode`, `obfuscate.entropy`, `obfuscate.prompt`,
+`obfuscate.allow`, `obfuscate.literals_file`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
 `score.model_context_tokens`); doing so is an error
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
@@ -3761,6 +3820,11 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.review` | `ZIRV_CTX_JEV_REVIEW` |
 | `jev.gates` | `ZIRV_CTX_JEV_GATES` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
+| `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
+| `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
+| `obfuscate.prompt` | `ZIRV_CTX_OBFUSCATE_PROMPT` |
+| `obfuscate.allow` | `~/.zirv/ctx.toml` only |
+| `obfuscate.literals_file` | `~/.zirv/ctx.toml` only |
 | `capabilities` | `ZIRV_CTX_CAPABILITIES` |
 | `runtime` | `ZIRV_CTX_RUNTIME` |
 

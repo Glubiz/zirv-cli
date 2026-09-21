@@ -315,6 +315,13 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
             "commands/ctx/session/native.rs",
         ],
     ),
+    // Issue #466: `<state>/obfuscate/<slug>.jsonl` is the per-repository
+    // placeholder vault -- one JSONL file, exactly like `worktrees` above.
+    (
+        "obfuscate",
+        SlugEntry::File("", ".jsonl"),
+        &["commands/ctx/obfuscate_store.rs"],
+    ),
 ];
 
 // The existence check is only a fast path: another process can create the

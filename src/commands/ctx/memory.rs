@@ -3107,7 +3107,11 @@ fn write_durable(
 ) -> CtxResult<usize> {
     let mut written = 0usize;
     for (key, body) in accepted {
-        if let Some(existing) = get_scoped(MemoryScope::Shared, repo, state, slug, cfg, key)?
+        let key =
+            super::obfuscate_store::protect_text(state, repo, cfg, key, "memory_harvest_key")?.0;
+        let body =
+            super::obfuscate_store::protect_text(state, repo, cfg, body, "memory_harvest_body")?.0;
+        if let Some(existing) = get_scoped(MemoryScope::Shared, repo, state, slug, cfg, &key)?
             && existing.source == "explicit"
         {
             let _ = super::log::append(
@@ -3131,7 +3135,7 @@ fn write_durable(
             written: now,
             verified: now,
             source: "harvest".to_string(),
-            body: body.clone(),
+            body,
             importance: None,
             confidence: None,
             tags: Vec::new(),
@@ -3986,6 +3990,8 @@ pub fn run_remember_with<W: Write>(
         ""
     };
     let bank_label = ctx_scope_label(scope);
+    let protected_key =
+        super::obfuscate_store::protect_text(&state, repo, &cfg, &args.key, "memory_key")?.0;
 
     match resolve_remember(args, stdin)? {
         RememberIntent::VerifyOnly => {
@@ -3997,13 +4003,13 @@ pub fn run_remember_with<W: Write>(
                 // to private so an entry remembered before a session id was
                 // ever set (or from a plain terminal) keeps verifying.
                 let id = session_id.as_deref().unwrap_or_default();
-                if verify_session(&state, &slug, id, &args.key)? {
+                if verify_session(&state, &slug, id, &protected_key)? {
                     true
                 } else {
-                    verify_scoped(MemoryScope::Private, repo, &state, &slug, &args.key)?
+                    verify_scoped(MemoryScope::Private, repo, &state, &slug, &protected_key)?
                 }
             } else {
-                verify_scoped(verify_scope, repo, &state, &slug, &args.key)?
+                verify_scoped(verify_scope, repo, &state, &slug, &protected_key)?
             };
             if verified {
                 writeln!(
@@ -4032,17 +4038,62 @@ pub fn run_remember_with<W: Write>(
             {
                 eprintln!("{warning}");
             }
+            let body =
+                super::obfuscate_store::protect_text(&state, repo, &cfg, &body, "memory_remember")?
+                    .0;
+            let importance = args
+                .importance
+                .as_deref()
+                .map(|value| {
+                    super::obfuscate_store::protect_text(
+                        &state,
+                        repo,
+                        &cfg,
+                        value,
+                        "memory_metadata",
+                    )
+                    .map(|protected| protected.0)
+                })
+                .transpose()?;
+            let confidence = args
+                .confidence
+                .as_deref()
+                .map(|value| {
+                    super::obfuscate_store::protect_text(
+                        &state,
+                        repo,
+                        &cfg,
+                        value,
+                        "memory_metadata",
+                    )
+                    .map(|protected| protected.0)
+                })
+                .transpose()?;
+            let tags = args
+                .tags
+                .iter()
+                .map(|value| {
+                    super::obfuscate_store::protect_text(
+                        &state,
+                        repo,
+                        &cfg,
+                        value,
+                        "memory_metadata",
+                    )
+                    .map(|protected| protected.0)
+                })
+                .collect::<CtxResult<Vec<_>>>()?;
             let now = now_secs();
             let entry = Entry {
-                key: args.key.clone(),
+                key: protected_key.clone(),
                 written_by: identity_or_unknown(env, AGENT_ENV),
                 written: now,
                 verified: now,
                 source: "explicit".to_string(),
                 body,
-                importance: args.importance.clone(),
-                confidence: args.confidence.clone(),
-                tags: args.tags.clone(),
+                importance,
+                confidence,
+                tags,
                 // Deliberately unwritable, unlike importance/confidence/tags
                 // above: a path signal is inert until issue #44 wires it up
                 // (see retrieval.rs's module doc), so no `--path` flag
@@ -4065,9 +4116,9 @@ pub fn run_remember_with<W: Write>(
                         &state,
                         &slug,
                         session_id.as_deref().unwrap_or_default(),
-                        &args.key,
+                        &protected_key,
                     )?,
-                    _ => get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?,
+                    _ => get_scoped(scope, repo, &state, &slug, &cfg, &protected_key)?,
                 };
                 check_if_unchanged(existing.as_ref(), expected)
                     .map_err(|e| format!("zirv ctx remember: {e}"))?;

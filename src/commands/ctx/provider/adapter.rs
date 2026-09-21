@@ -82,7 +82,7 @@ pub enum ThinkingConfig {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProviderRequest {
     pub model: String,
     pub system: Vec<String>,
@@ -130,6 +130,144 @@ impl ProviderRequest {
             effort: None,
             cache: CacheMode::Disabled,
         }
+    }
+
+    /// Final native egress boundary. Every string Zirv composes for either a
+    /// direct API adapter or an official-harness execution adapter is masked
+    /// here under one vault transaction. Provider-signed thinking cannot be
+    /// rewritten without invalidating its signature, so a finding there
+    /// fails closed instead of sending or corrupting it.
+    pub fn obfuscate_for_egress(
+        &mut self,
+        state_root: &std::path::Path,
+        repo: &std::path::Path,
+        options: &crate::commands::ctx::obfuscate::Options,
+        surface: &str,
+    ) -> crate::commands::ctx::CtxResult<()> {
+        if options.mode == crate::commands::ctx::obfuscate::Mode::Off {
+            return Ok(());
+        }
+        let mut candidate = self.clone();
+        let audit_detail = crate::commands::ctx::obfuscate_store::with_vault(
+            &crate::commands::ctx::obfuscate_store::vault_path(state_root, repo),
+            |vault| {
+                let mut audit_options = options.clone();
+                audit_options.mode = crate::commands::ctx::obfuscate::Mode::Flag;
+                let serialized = serde_json::to_string(&candidate)?;
+                let (_, audit_findings) = crate::commands::ctx::obfuscate::obfuscate(
+                    &serialized,
+                    vault,
+                    &audit_options,
+                    surface,
+                );
+                for text in &mut candidate.system {
+                    *text = mask(text, vault, options, surface);
+                }
+                for message in &mut candidate.messages {
+                    for content in &mut message.content {
+                        match content {
+                            ProviderContent::Text { text }
+                            | ProviderContent::ToolResult { content: text, .. }
+                            | ProviderContent::Refusal { text } => {
+                                *text = mask(text, vault, options, surface);
+                            }
+                            ProviderContent::ToolUse { input, .. } => {
+                                mask_json(input, vault, options, surface);
+                            }
+                            ProviderContent::Thinking { thinking, .. } => {
+                                let mut detect = options.clone();
+                                detect.mode = crate::commands::ctx::obfuscate::Mode::Flag;
+                                let (_, findings) = crate::commands::ctx::obfuscate::obfuscate(
+                                    thinking, vault, &detect, surface,
+                                );
+                                if !findings.is_empty() {
+                                    return Err("refusing native request: sensitive data appears in provider-signed thinking and cannot be rewritten safely".into());
+                                }
+                            }
+                            ProviderContent::RedactedThinking { .. } => {}
+                        }
+                    }
+                }
+                for tool in &mut candidate.tools {
+                    tool.description = mask(&tool.description, vault, options, surface);
+                    mask_json(&mut tool.input_schema, vault, options, surface);
+                }
+                for stop in &mut candidate.stop_sequences {
+                    *stop = mask(stop, vault, options, surface);
+                }
+                let audit_detail = if !audit_findings.is_empty() {
+                    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+                    for finding in &audit_findings {
+                        *counts.entry(&finding.kind).or_default() += 1;
+                    }
+                    let detail = counts
+                        .into_iter()
+                        .map(|(kind, count)| format!("{kind}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    candidate.system.push(format!(
+                        "[zirv sensitive values were detected at the egress boundary: {}]",
+                        detail
+                    ));
+                    Some(detail)
+                } else {
+                    None
+                };
+                Ok(audit_detail)
+            },
+        )?;
+        if let Some(detail) = audit_detail {
+            let state = crate::commands::ctx::state::StateDir::from_path(state_root.to_path_buf());
+            let _ = crate::commands::ctx::log::append(
+                &state,
+                &crate::commands::ctx::log::Decision {
+                    ts: crate::commands::ctx::state::now_secs(),
+                    session: "native",
+                    verb: "provider",
+                    verdict: "audit",
+                    score: 0,
+                    action: "obfuscate-surface",
+                    detail: &format!("{surface}: {detail}"),
+                    observed_at: None,
+                },
+            );
+        }
+        *self = candidate;
+        Ok(())
+    }
+}
+
+fn mask(
+    text: &str,
+    vault: &mut crate::commands::ctx::obfuscate::Vault,
+    options: &crate::commands::ctx::obfuscate::Options,
+    surface: &str,
+) -> String {
+    crate::commands::ctx::obfuscate::obfuscate(text, vault, options, surface).0
+}
+
+fn mask_json(
+    value: &mut serde_json::Value,
+    vault: &mut crate::commands::ctx::obfuscate::Vault,
+    options: &crate::commands::ctx::obfuscate::Options,
+    surface: &str,
+) {
+    match value {
+        serde_json::Value::String(text) => *text = mask(text, vault, options, surface),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                mask_json(value, vault, options, surface);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let original = std::mem::take(values);
+            for (key, mut value) in original {
+                let key = mask(&key, vault, options, surface);
+                mask_json(&mut value, vault, options, surface);
+                values.insert(key, value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -704,5 +842,112 @@ model='deepseek-v4-pro'
         .unwrap_err();
         assert_eq!(error.class, FailureClass::Entitlement);
         assert_eq!(error.scope.kind, FailureScopeKind::Account);
+    }
+
+    // Issue #466: `obfuscate_for_egress` is the final native egress
+    // boundary -- the actual outbound request to a real AI vendor -- and
+    // had no dedicated test proving it actually masks a `ProviderRequest`
+    // before it would be sent.
+    fn secret_bearing_request() -> ProviderRequest {
+        ProviderRequest {
+            model: "claude-sonnet-5".to_string(),
+            system: vec![
+                "contact jane@company.dk about ghp_abcdefghijklmnopqrstuvwxyz123456".to_string(),
+            ],
+            messages: vec![ProviderMessage {
+                role: ProviderMessageRole::User,
+                content: vec![
+                    ProviderContent::Text {
+                        text: "use ghp_abcdefghijklmnopqrstuvwxyz123456".to_string(),
+                    },
+                    ProviderContent::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({
+                            "command": "echo ghp_abcdefghijklmnopqrstuvwxyz123456"
+                        }),
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 1024,
+            stop_sequences: vec!["ghp_abcdefghijklmnopqrstuvwxyz123456".to_string()],
+            thinking: ThinkingConfig::Default,
+            effort: None,
+            cache: CacheMode::Disabled,
+        }
+    }
+
+    #[test]
+    fn obfuscate_for_egress_masks_system_messages_tool_input_and_stop_sequences() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let options = crate::commands::ctx::obfuscate::Options::default();
+        let mut request = secret_bearing_request();
+
+        request
+            .obfuscate_for_egress(state.path(), repo.path(), &options, "test")
+            .expect("mask");
+
+        let rendered = serde_json::to_string(&request).expect("serialize");
+        assert!(
+            !rendered.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("jane@company.dk"), "{rendered}");
+        assert!(
+            rendered.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{rendered}"
+        );
+        assert_eq!(request.stop_sequences[0], "ZIRV_SECRET_GITHUB_TOKEN_1");
+    }
+
+    #[test]
+    fn obfuscate_for_egress_refuses_signed_thinking_that_carries_a_finding() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let options = crate::commands::ctx::obfuscate::Options::default();
+        let mut request = ProviderRequest {
+            model: "claude-sonnet-5".to_string(),
+            system: Vec::new(),
+            messages: vec![ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: vec![ProviderContent::Thinking {
+                    thinking: "the key is ghp_abcdefghijklmnopqrstuvwxyz123456".to_string(),
+                    signature: super::super::OpaqueProviderData::new(
+                        serde_json::json!({"type":"reasoning","id":"rs_1"}),
+                    ),
+                }],
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 1024,
+            stop_sequences: Vec::new(),
+            thinking: ThinkingConfig::Default,
+            effort: None,
+            cache: CacheMode::Disabled,
+        };
+
+        let error = request
+            .obfuscate_for_egress(state.path(), repo.path(), &options, "test")
+            .unwrap_err();
+        assert!(error.to_string().contains("signed thinking"), "{error}");
+    }
+
+    #[test]
+    fn obfuscate_for_egress_is_byte_identical_when_mode_is_off() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let options = crate::commands::ctx::obfuscate::Options {
+            mode: crate::commands::ctx::obfuscate::Mode::Off,
+            ..Default::default()
+        };
+        let original = secret_bearing_request();
+        let mut request = original.clone();
+
+        request
+            .obfuscate_for_egress(state.path(), repo.path(), &options, "test")
+            .expect("mask");
+
+        assert_eq!(request, original);
     }
 }

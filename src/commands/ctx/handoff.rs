@@ -727,6 +727,63 @@ pub(crate) fn render_verification(outcome: Option<&VerificationOutcome>) -> Stri
     }
 }
 
+/// Issue #466: `structural()` copies raw transcript text no model has ever
+/// filtered -- unlike a distilled `Handoff` (safe by construction: the
+/// distiller model never saw anything but placeholders, see
+/// `helper_answer`), this is the one Handoff-producing path with nothing
+/// between the raw transcript and a fresh prompt a restart, resume, or
+/// handover preview goes on to inject. Every field `structural()` fills from
+/// transcript data -- task, progress, verification details, and file paths --
+/// goes through the same `protect_text` boundary every other zirv-composed
+/// prompt does.
+///
+/// `structural()` promises to never fail (a restart always has something to
+/// stand on), so a masking failure (state dir or literals file unreadable)
+/// does not propagate -- fail CLOSED instead: the field is replaced with a
+/// fixed notice rather than risking the raw text protection could not cover.
+fn protect_structural_fields(handoff: Handoff) -> Handoff {
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let env = super::config::env_from_process();
+    protect_structural_fields_with_env(handoff, &repo, &env)
+}
+
+fn protect_structural_fields_with_env(
+    mut handoff: Handoff,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Handoff {
+    let protect = |text: &mut String| {
+        if text.is_empty() {
+            return;
+        }
+        *text = match super::obfuscate_store::protect_text_with_env(
+            repo,
+            text,
+            "handoff_structural",
+            env,
+        ) {
+            Ok((protected, _)) => protected,
+            Err(_) => {
+                "(withheld: sensitive-data masking failed for this mechanically extracted text)"
+                    .to_string()
+            }
+        };
+    };
+    protect(&mut handoff.task);
+    protect(&mut handoff.verification);
+    for item in handoff.done.iter_mut().chain(handoff.remaining.iter_mut()) {
+        protect(item);
+    }
+    for path in handoff
+        .files_read
+        .iter_mut()
+        .chain(handoff.files_modified.iter_mut())
+    {
+        protect(path);
+    }
+    handoff
+}
+
 /// Mechanical extraction used when the distiller is unavailable or unusable.
 /// Never fails and never returns something unusable.
 pub fn structural(ctx: &StructuralContext) -> Handoff {
@@ -798,7 +855,7 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         })
         .collect();
 
-    Handoff {
+    protect_structural_fields(Handoff {
         task,
         constraints: Vec::new(),
         done,
@@ -810,7 +867,7 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         files_read: ctx.files_read.clone(),
         files_modified,
         gotchas: vec!["This handoff was extracted mechanically, so it may be incomplete.".to_string()],
-    }
+    })
 }
 
 pub const DISTILL_PROMPT_VERSION: &str = "v3";
@@ -1149,11 +1206,13 @@ pub fn helper_answer(
 
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let env = super::config::env_from_process();
+    let (protected_prompt, _) =
+        super::obfuscate_store::protect_text_with_env(&repo, prompt, "helper_model_input", &env)?;
     if helper::available(&repo, role, None, &env) {
         match helper::run(
             &HelperRequest {
                 repo: &repo,
-                prompt,
+                prompt: &protected_prompt,
                 role,
                 route: None,
                 // A helper answers from the prompt it was handed. No tools at
@@ -1172,7 +1231,7 @@ pub fn helper_answer(
             }
         }
     }
-    run_model(adapter, model, prompt, timeout)
+    run_model(adapter, model, &protected_prompt, timeout)
 }
 
 /// Runs one fresh model call through the resolved coding harness and returns
@@ -3132,6 +3191,48 @@ mod tests {
         assert!(handoff.verification.contains("FAILED"));
         assert!(handoff.verification.contains("assertion failed"));
         assert!(handoff.verification.contains("left: 40, right: 70"));
+    }
+
+    #[test]
+    fn structural_protection_masks_verification_and_file_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        let state = temp.path().join("state").display().to_string();
+        let env = |key: &str| match key {
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".to_string()),
+            super::super::state::STATE_ENV => Some(state.clone()),
+            _ => None,
+        };
+        let secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+        let verification = render_verification(Some(&VerificationOutcome {
+            command: "cargo test owner@example.com".to_string(),
+            status: VerificationStatus::Failed,
+            error_excerpt: vec![format!("provider rejected {secret}")],
+        }));
+        let handoff = protect_structural_fields_with_env(
+            Handoff {
+                verification,
+                files_read: vec![format!("logs/{secret}.txt")],
+                files_modified: vec!["reports/owner@example.com.txt".to_string()],
+                ..Handoff::default()
+            },
+            &repo,
+            &env,
+        );
+
+        assert!(!handoff.verification.contains(secret));
+        assert!(!handoff.verification.contains("owner@example.com"));
+        assert!(handoff.verification.contains("ZIRV_SECRET_GITHUB_TOKEN_1"));
+        assert!(
+            handoff
+                .verification
+                .contains("ZIRV_PII_EMAIL_1@example.com")
+        );
+        assert!(!handoff.files_read[0].contains(secret));
+        assert!(handoff.files_read[0].contains("ZIRV_SECRET_GITHUB_TOKEN_1"));
+        assert!(!handoff.files_modified[0].contains("owner@example.com"));
+        assert!(handoff.files_modified[0].contains("ZIRV_PII_EMAIL_"));
     }
 
     /// Review finding F1: a multiline command (with an embedded heading,

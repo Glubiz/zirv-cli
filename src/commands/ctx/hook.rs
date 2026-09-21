@@ -133,6 +133,23 @@ impl HookPayload {
     }
 }
 
+fn hook_obfuscation_options(cfg: &CtxConfig) -> CtxResult<super::obfuscate::Options> {
+    let home = crate::utils::home_dir()?;
+    super::obfuscate_store::options_from_config(&cfg.obfuscate, &home)
+}
+
+fn finding_kinds(findings: &[super::obfuscate::Finding]) -> String {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for finding in findings {
+        *counts.entry(&finding.kind).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| format!("{kind}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
 
 /// The short id issue #349's [`super::attention`] observations are filed
@@ -1742,6 +1759,100 @@ pub fn prompt_output(
     .to_string()
 }
 
+fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let payload = HookPayload::parse(stdin).unwrap_or_default();
+    let repo = payload.repo();
+    // Issue #466: a config-load failure must not block the prompt or lose
+    // the adoption nudge/attention tracking below -- that was this event's
+    // whole behavior before sensitive-data masking existed, and masking is
+    // opt-in (`obfuscate.mode` defaults to `off`), so an unrelated config
+    // problem elsewhere can never regress it. `cfg` falls back to defaults
+    // (`obfuscate.mode == Off`), exactly like this handler's own pre-#466
+    // `.ok()` fallback for the adoption marker.
+    let cfg = super::config::CtxConfig::load(&repo, env).unwrap_or_default();
+    if cfg.obfuscate.mode != super::config::ObfuscateMode::Off {
+        let prompt = serde_json::from_str::<serde_json::Value>(stdin)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let mut options = match hook_obfuscation_options(&cfg) {
+            Ok(options) => options,
+            Err(_) => {
+                writeln!(
+                    w,
+                    "{}",
+                    serde_json::json!({
+                        "decision": "block",
+                        "reason": "zirv could not load sensitive-data literals; refusing prompt"
+                    })
+                )?;
+                return Ok(0);
+            }
+        };
+        options.mode = super::obfuscate::Mode::Flag;
+        let mut vault = super::obfuscate::Vault::default();
+        let (_, findings) =
+            super::obfuscate::obfuscate(&prompt, &mut vault, &options, "user_prompt_submit");
+        if !findings.is_empty() {
+            let kinds = finding_kinds(&findings);
+            if let Ok(state) = StateDir::resolve(env) {
+                let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
+                let _ = log::append(
+                    &state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session: &session,
+                        verb: "hook",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "obfuscate-prompt-flag",
+                        detail: &kinds,
+                        observed_at: None,
+                    },
+                );
+            }
+            if cfg.obfuscate.prompt == super::config::ObfuscatePrompt::Block {
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    serde_json::json!({
+                        "decision": "block",
+                        "reason": format!("zirv blocked sensitive values in the prompt ({kinds}); remove them or set obfuscate.prompt = \"flag\"")
+                    })
+                );
+                return Ok(0);
+            }
+        }
+    }
+
+    let adoption_nudge = prompt_adoption_nudge(&repo, &cfg, env);
+    let output = prompt_output(&cfg.score.marker, adoption_nudge.as_deref(), &repo, env);
+    if !output.is_empty() {
+        let _ = writeln!(w, "{output}");
+    }
+    if let Ok(state) = StateDir::resolve(env) {
+        let session_id = env(SESSION_ENV).unwrap_or_default();
+        let _ = super::attention::record(
+            &state,
+            &attention_short(env, &session_id),
+            super::attention::Observation::new(
+                super::attention::Authority::AdapterHook,
+                "user prompt submitted",
+                100,
+                now_secs(),
+            )
+            .with_lifecycle(super::attention::Lifecycle::Working),
+            now_secs(),
+        );
+    }
+    Ok(0)
+}
+
 /// PreCompact cannot add instructions to a compaction (verified against the
 /// hook reference), so all this can do is say so. Focus instructions ride
 /// along with wrap's injected `/compact <focus>` command instead.
@@ -2927,6 +3038,144 @@ pub(crate) fn posttool_output(summary: &str, interrupted: bool) -> String {
     .to_string()
 }
 
+fn posttool_value_output(value: serde_json::Value) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedToolOutput": value
+        }
+    })
+    .to_string()
+}
+
+fn withhold_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = "[zirv withheld sensitive tool output: obfuscation vault unavailable]".into()
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(withhold_strings),
+        serde_json::Value::Object(values) => {
+            values.values_mut().for_each(withhold_strings);
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn json_needs_obfuscation(value: &serde_json::Value, options: &super::obfuscate::Options) -> bool {
+    match value {
+        serde_json::Value::String(text) => super::obfuscate::obfuscate(
+            text,
+            &mut super::obfuscate::Vault::default(),
+            options,
+            "claude_post_tool_use",
+        )
+        .1
+        .iter()
+        .any(|finding| finding.replaced),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_needs_obfuscation(value, options)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_needs_obfuscation(value, options)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+fn label_sensitive_json(value: &mut serde_json::Value, kinds: &str) {
+    let notice = format!("[zirv sensitive data detected: {kinds}]");
+    match value {
+        serde_json::Value::String(text) => {
+            text.push('\n');
+            text.push_str(&notice);
+        }
+        serde_json::Value::Array(values) => values.push(serde_json::Value::String(notice)),
+        serde_json::Value::Object(values) => {
+            values.insert(
+                "zirv_sensitive_data_notice".to_string(),
+                serde_json::Value::String(notice),
+            );
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde_json::Value> {
+    let mut raw = serde_json::from_str::<serde_json::Value>(stdin).ok()?;
+    let original = raw.get("tool_response")?.clone();
+    let cwd = raw
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    if cfg.obfuscate.mode == super::config::ObfuscateMode::Off {
+        return None;
+    }
+    let options = match hook_obfuscation_options(&cfg) {
+        Ok(options) => options,
+        Err(_) => {
+            let mut response = original;
+            withhold_strings(&mut response);
+            return Some(response);
+        }
+    };
+    let mut response = original.clone();
+    let findings = match StateDir::resolve(env) {
+        Ok(state) => super::obfuscate_store::obfuscate_json(
+            state.root(),
+            &cwd,
+            &mut response,
+            &options,
+            "claude_post_tool_use",
+        ),
+        Err(error) => Err(error),
+    };
+    let findings = match findings {
+        Ok(findings) => findings,
+        Err(_) => {
+            if json_needs_obfuscation(&original, &options) {
+                withhold_strings(&mut response);
+                return Some(response);
+            }
+            return None;
+        }
+    };
+    if !findings.is_empty() {
+        let detail = finding_kinds(&findings);
+        if !findings.iter().any(|finding| finding.replaced) {
+            label_sensitive_json(&mut response, &detail);
+        }
+        raw["tool_response"] = response.clone();
+        if let Ok(state) = StateDir::resolve(env) {
+            let session = raw
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session,
+                    verb: "hook",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "obfuscate-tool-output",
+                    detail: &detail,
+                    observed_at: None,
+                },
+            );
+        }
+        if response != original {
+            return Some(response);
+        }
+    }
+    None
+}
+
 /// The compact-output hook (issue #326). Replaces a large `Bash` tool result
 /// with a summary of it, after storing the original verbatim under the state
 /// dir so `zirv ctx output show <id>` can hand any of it back.
@@ -2947,6 +3196,13 @@ pub(crate) fn posttool_output(summary: &str, interrupted: bool) -> String {
 /// much this hook has actually saved without re-deriving it from the raw
 /// output-capture files.
 pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    // Runs before the Bash-specific parser below: Read/Grep/Glob and custom
+    // tool results have different schemas, but their `tool_response` value
+    // can still be replaced byte-for-byte after recursively masking strings.
+    if let Some(masked) = obfuscated_posttool_response(stdin, env) {
+        let _ = writeln!(w, "{}", posttool_value_output(masked));
+        return Ok(0);
+    }
     let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
         return Ok(0);
     };
@@ -3248,40 +3504,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
     let env = env_from_process();
     match &args.event {
         HookEvent::Stop => run_stop(w, &read_stdin(), &env),
-        HookEvent::Prompt => {
-            let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let cfg = super::config::CtxConfig::load(&repo, &env).ok();
-            let marker = cfg
-                .as_ref()
-                .map(|cfg| cfg.score.marker.clone())
-                .unwrap_or_else(|| super::config::DEFAULT_MARKER.to_string());
-            let adoption_nudge = cfg
-                .as_ref()
-                .and_then(|cfg| prompt_adoption_nudge(&repo, cfg, &env));
-            let output = prompt_output(&marker, adoption_nudge.as_deref(), &repo, &env);
-            if !output.is_empty() {
-                let _ = writeln!(w, "{output}");
-            }
-            // Issue #349: a fresh user prompt is the clearest possible
-            // `Working` signal -- the operator just handed the agent
-            // something to do.
-            if let Ok(state) = StateDir::resolve(&env) {
-                let session_id = env(SESSION_ENV).unwrap_or_default();
-                let _ = super::attention::record(
-                    &state,
-                    &attention_short(&env, &session_id),
-                    super::attention::Observation::new(
-                        super::attention::Authority::AdapterHook,
-                        "user prompt submitted",
-                        100,
-                        now_secs(),
-                    )
-                    .with_lifecycle(super::attention::Lifecycle::Working),
-                    now_secs(),
-                );
-            }
-            Ok(0)
-        }
+        HookEvent::Prompt => run_prompt(w, &read_stdin(), &env),
         HookEvent::PreCompact => run_pre_compact(w, &read_stdin(), &env),
         HookEvent::Pretool { agent } => {
             run_pretool_for_agent(w, &read_stdin(), &env, agent.as_deref())
@@ -3327,13 +3550,13 @@ pub fn run_pretool_for_agent<W: Write>(
     agent: Option<&str>,
 ) -> CtxResult<i32> {
     match agent {
-        None | Some("claude") => run_pretool(w, stdin, env),
+        None | Some("claude") => run_pretool_with_rehydration(w, stdin, env),
         Some(name) => {
             let Some(projected) = super::hook_project::project_pretool(name, stdin) else {
                 return Ok(0);
             };
             let mut buf: Vec<u8> = Vec::new();
-            let code = run_pretool(&mut buf, &projected, env)?;
+            let code = run_pretool_with_rehydration(&mut buf, &projected, env)?;
             let claude_envelope = String::from_utf8(buf)
                 .ok()
                 .map(|text| text.trim().to_string())
@@ -3346,6 +3569,210 @@ pub fn run_pretool_for_agent<W: Write>(
             Ok(code)
         }
     }
+}
+
+// Issue #466: model-dispatch tools must never receive local vault values.
+pub(crate) const REHYDRATION_TOOLS: &[&str] = &[
+    "Bash",
+    "PowerShell",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "Read",
+    "Grep",
+    "Glob",
+];
+
+fn run_pretool_with_rehydration<W: Write>(
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(stdin) else {
+        return run_pretool(w, stdin, env);
+    };
+    let tool = raw
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !REHYDRATION_TOOLS.contains(&tool.as_str()) {
+        return run_pretool(w, stdin, env);
+    }
+    let cwd = raw
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    if cfg.obfuscate.mode == super::config::ObfuscateMode::Off {
+        return run_pretool(w, stdin, env);
+    }
+    let Some(original_input) = raw.get("tool_input").cloned() else {
+        return run_pretool(w, stdin, env);
+    };
+    if shared_placeholder_artifact(&raw, &cwd) {
+        return run_pretool(w, stdin, env);
+    }
+    let had_placeholder = super::obfuscate::contains_placeholder(&original_input.to_string());
+    let Ok(state) = StateDir::resolve(env) else {
+        if had_placeholder {
+            let _ = writeln!(
+                w,
+                "{}",
+                pretool_output(
+                    "zirv refused the tool call because its placeholder vault is unavailable"
+                )
+            );
+            return Ok(0);
+        }
+        return run_pretool(w, stdin, env);
+    };
+    let mut rehydrated = original_input.clone();
+    if let Err(error) = super::obfuscate_store::rehydrate_json(state.root(), &cwd, &mut rehydrated)
+    {
+        if had_placeholder {
+            let session =
+                env(super::adapters::SESSION_ENV).unwrap_or_else(|| "unknown".to_string());
+            let _ = super::log::append(
+                &state,
+                &super::log::Decision {
+                    ts: super::state::now_secs(),
+                    session: &session,
+                    verb: "pretool",
+                    verdict: "blocked",
+                    score: 0,
+                    action: "obfuscate-rehydration-miss",
+                    detail: "placeholder could not be resolved locally",
+                    observed_at: None,
+                },
+            );
+            let _ = writeln!(
+                w,
+                "{}",
+                pretool_output(&format!(
+                    "zirv refused the tool call because its placeholder vault could not be read: {error}"
+                ))
+            );
+            return Ok(0);
+        }
+        return run_pretool(w, stdin, env);
+    }
+    if rehydrated == original_input {
+        return run_pretool(w, stdin, env);
+    }
+    raw["tool_input"] = rehydrated.clone();
+    let prepared = raw.to_string();
+    let mut inner = Vec::new();
+    let code = run_pretool(&mut inner, &prepared, env)?;
+    let existing = String::from_utf8(inner).unwrap_or_default();
+    let trimmed = existing.trim();
+    let mut envelope = if trimmed.is_empty() {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse"
+            }
+        })
+    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        value
+    } else {
+        let _ = write!(w, "{existing}");
+        return Ok(code);
+    };
+    if envelope
+        .pointer("/hookSpecificOutput/permissionDecision")
+        .and_then(serde_json::Value::as_str)
+        == Some("deny")
+    {
+        let _ = writeln!(w, "{envelope}");
+        return Ok(code);
+    }
+    if let Some(overrides) = envelope
+        .pointer("/hookSpecificOutput/updatedInput")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        && let Some(target) = rehydrated.as_object_mut()
+    {
+        for (key, value) in overrides {
+            target.insert(key, value);
+        }
+    }
+    if matches!(tool.as_str(), "Bash" | "PowerShell") {
+        // Issue #466: parallel safety hooks saw placeholders, not this final command.
+        raw["tool_input"] = rehydrated.clone();
+        let verdict = CtxConfig::load(&cwd, env).and_then(|cfg| {
+            super::safety::run_check_hook_with_verdict(
+                &cfg,
+                &mut std::io::sink(),
+                &raw.to_string(),
+                env,
+            )
+        });
+        match verdict {
+            Ok(Some(super::safety::Verdict::Allow)) => {
+                if envelope
+                    .pointer("/hookSpecificOutput/permissionDecision")
+                    .is_none()
+                {
+                    envelope["hookSpecificOutput"]["permissionDecision"] = "allow".into();
+                }
+            }
+            Ok(Some(super::safety::Verdict::Ask)) => {
+                envelope["hookSpecificOutput"]["permissionDecision"] = "ask".into();
+                envelope["hookSpecificOutput"]["permissionDecisionReason"] =
+                    "zirv safety requires approval of the rehydrated command".into();
+            }
+            Ok(Some(super::safety::Verdict::Deny)) | Ok(None) | Err(_) => {
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    pretool_output("zirv safety refused the rehydrated command")
+                );
+                return Ok(code);
+            }
+        }
+    }
+    envelope["hookSpecificOutput"]["updatedInput"] = rehydrated;
+    let _ = writeln!(w, "{envelope}");
+    Ok(code)
+}
+
+fn shared_placeholder_artifact(payload: &serde_json::Value, cwd: &Path) -> bool {
+    let tool = payload
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let Some(input) = payload.get("tool_input") else {
+        return false;
+    };
+    if matches!(tool, "Bash" | "PowerShell") {
+        // Issue #466: a shell write carries no structured path field, so every
+        // token the command mentions is tested as one against the same shared
+        // -artifact rule the structured tools use. Deliberately conservative:
+        // a mention is enough to keep the placeholder unexpanded.
+        return input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| {
+                command
+                    .split(|c: char| c.is_whitespace() || "<>|;&()'\"`".contains(c))
+                    .filter(|token| !token.is_empty())
+                    .any(|token| {
+                        super::obfuscate_store::is_shared_placeholder_path(cwd, Path::new(token))
+                    })
+            });
+    }
+    if !matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+        return false;
+    }
+    ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
+        .map(Path::new)
+        .any(|path| super::obfuscate_store::is_shared_placeholder_path(cwd, path))
 }
 
 /// `posttool`'s own body for every agent. `None`/`Some("claude")` is the
@@ -10113,5 +10540,328 @@ mod tests {
             "blocked family must be named: {text}"
         );
         assert!(text.contains("compacted"), "{text}");
+    }
+
+    #[test]
+    fn posttool_masks_generic_nested_output_before_the_model_sees_it() {
+        let state_dir = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let state_root = state_dir.path().display().to_string();
+        // Issue #466: masking is opt-in (`obfuscate.mode` defaults to
+        // `off`); this test is exercising the masking behavior itself, so
+        // it opts in explicitly rather than relying on the default.
+        let env = |key: &str| match key {
+            crate::commands::ctx::state::STATE_ENV => Some(state_root.clone()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".to_string()),
+            _ => None,
+        };
+        let stdin = serde_json::json!({
+            "session_id": "s1", "tool_use_id": "t1", "cwd": repo.path(),
+            "tool_name": "Read", "tool_input": {"file_path":"notes.txt"},
+            "tool_response": {
+                "content": [{"type":"text","text":"owner jane@company.dk token ghp_abcdefghijklmnopqrstuvwxyz123456"}],
+                "metadata": {"source":"notes.txt"}
+            }
+        }).to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &env).expect("hook");
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("replacement");
+        let rendered = value.to_string();
+        assert!(!rendered.contains("jane@company.dk"), "{rendered}");
+        assert!(
+            !rendered.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("ZIRV_PII_EMAIL_1@company.dk"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("ZIRV_SECRET_GITHUB_TOKEN_1"),
+            "{rendered}"
+        );
+        assert_eq!(
+            value["hookSpecificOutput"]["updatedToolOutput"]["metadata"]["source"],
+            "notes.txt"
+        );
+    }
+
+    #[test]
+    fn pretool_keeps_subagent_prompt_placeholders_intact() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let (masked, _) = super::super::obfuscate_store::obfuscate_text(
+            state.path(),
+            repo.path(),
+            secret,
+            &super::super::obfuscate::Options::default(),
+            "test",
+        )
+        .expect("seed vault");
+        assert_eq!(masked, "ZIRV_SECRET_GITHUB_TOKEN_1");
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        for tool in ["Agent", "Task", "WebFetch"] {
+            let input = serde_json::json!({"prompt": format!("use {masked}")});
+            let stdin = serde_json::json!({
+                "cwd": repo.path(), "tool_name": tool, "tool_input": input,
+            });
+            let mut out = Vec::new();
+            run_pretool_for_agent(&mut out, &stdin.to_string(), &env, None).expect("hook");
+            let envelope = serde_json::from_slice::<serde_json::Value>(&out).unwrap_or_default();
+            let effective = envelope
+                .pointer("/hookSpecificOutput/updatedInput")
+                .unwrap_or(&input);
+            assert_eq!(effective, &input, "{tool}");
+            assert!(!String::from_utf8_lossy(&out).contains(secret), "{tool}");
+        }
+    }
+
+    #[test]
+    fn pretool_checks_safety_after_rehydrating_the_command() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let command = "rm -rf /";
+        let options = super::super::obfuscate::Options {
+            literals: vec![command.into()],
+            ..Default::default()
+        };
+        let (masked, _) = super::super::obfuscate_store::obfuscate_text(
+            state.path(),
+            repo.path(),
+            command,
+            &options,
+            "test",
+        )
+        .expect("seed vault");
+        for tool in ["Bash", "PowerShell"] {
+            for (mode, deny, expected) in [
+                ("default", false, "ask"),
+                ("dontAsk", false, "ask"),
+                ("default", true, "deny"),
+            ] {
+                let env = |key: &str| match key {
+                    super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+                    "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+                    "ZIRV_CTX_SAFETY_DENY" if deny => Some("rm *".into()),
+                    _ => None,
+                };
+                let stdin = serde_json::json!({
+                    "cwd": repo.path(), "tool_name": tool, "permission_mode": mode,
+                    "tool_input": {"command": masked},
+                })
+                .to_string();
+                let mut out = Vec::new();
+                run_pretool_for_agent(&mut out, &stdin, &env, None).expect("hook");
+                let envelope: serde_json::Value = serde_json::from_slice(&out).expect("decision");
+                assert_eq!(
+                    envelope["hookSpecificOutput"]["permissionDecision"], expected,
+                    "{tool} {mode}: {envelope}"
+                );
+                if expected == "ask" {
+                    assert_eq!(
+                        envelope["hookSpecificOutput"]["updatedInput"]["command"],
+                        command
+                    );
+                } else {
+                    assert!(envelope["hookSpecificOutput"]["updatedInput"].is_null());
+                }
+                assert!(
+                    !envelope["hookSpecificOutput"]["permissionDecisionReason"]
+                        .to_string()
+                        .contains(command)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posttool_withholding_preserves_the_bash_output_schema() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::NamedTempFile::new().expect("unavailable state directory");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        let stdin = serde_json::json!({
+            "cwd": repo.path(), "tool_name": "Bash", "tool_input": {"command": "echo token"},
+            "tool_response": {"stdout": "ghp_abcdefghijklmnopqrstuvwxyz123456", "stderr": "details", "interrupted": true, "isImage": false},
+        }).to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &env).expect("hook");
+        let envelope: serde_json::Value = serde_json::from_slice(&out).expect("replacement");
+        let output = &envelope["hookSpecificOutput"]["updatedToolOutput"];
+        assert_eq!(output.as_object().expect("object").len(), 4);
+        for key in ["stdout", "stderr"] {
+            assert!(
+                output[key]
+                    .as_str()
+                    .expect("schema string")
+                    .contains("withheld")
+            );
+        }
+        assert_eq!(output["interrupted"], true);
+        assert_eq!(output["isImage"], false);
+        assert!(!output.to_string().contains("ghp_"));
+    }
+
+    #[test]
+    fn posttool_vault_failure_scans_anchored_patterns_in_nested_strings() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir(home.path().join(".zirv")).expect("config directory");
+        std::fs::write(home.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"obfuscate\"\n[[obfuscate.patterns]]\nkind = \"CUSTOMER\"\nregex = '^CUST-[0-9]{8}$'\n",
+        ).expect("config");
+        let state = tempfile::NamedTempFile::new().expect("unavailable state directory");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = |key: &str| {
+            (key == super::super::state::STATE_ENV).then(|| state.path().display().to_string())
+        };
+        let stdin = serde_json::json!({
+            "cwd": repo.path(), "tool_name": "Read", "tool_input": {"file_path": "notes.txt"},
+            "tool_response": {"results": [{"stdout": "CUST-12345678", "count": 1}]},
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &env).expect("hook");
+        let envelope: serde_json::Value = serde_json::from_slice(&out).expect("replacement");
+        let output = &envelope["hookSpecificOutput"]["updatedToolOutput"];
+        assert!(
+            output["results"][0]["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("withheld")
+        );
+        assert_eq!(output["results"][0]["count"], 1);
+        assert!(!output.to_string().contains("CUST-12345678"));
+    }
+
+    #[test]
+    fn pretool_keeps_placeholders_in_shell_writes_to_shared_artifacts() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let (masked, _) = super::super::obfuscate_store::obfuscate_text(
+            state.path(),
+            repo.path(),
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            &super::super::obfuscate::Options::default(),
+            "test",
+        )
+        .expect("seed vault");
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        for tool in ["Bash", "PowerShell"] {
+            for path in [
+                ".zirv/memory/example.md",
+                "'.zirv/work/task/output.md'",
+                ".zirv\\memory\\example.md",
+            ] {
+                let input = serde_json::json!({"command": format!("printf %s {masked} > {path}")});
+                let stdin =
+                    serde_json::json!({"cwd": repo.path(), "tool_name": tool, "tool_input": input})
+                        .to_string();
+                let mut out = Vec::new();
+                run_pretool_for_agent(&mut out, &stdin, &env, None).expect("hook");
+                let envelope =
+                    serde_json::from_slice::<serde_json::Value>(&out).unwrap_or_default();
+                assert_eq!(
+                    envelope
+                        .pointer("/hookSpecificOutput/updatedInput")
+                        .unwrap_or(&input),
+                    &input,
+                    "{tool}: {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pretool_rehydrates_nested_json_and_merges_the_complete_input() {
+        let state_dir = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let (masked, _) = super::super::obfuscate_store::obfuscate_text(
+            state.root(),
+            repo.path(),
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            &super::super::obfuscate::Options::default(),
+            "test",
+        )
+        .expect("seed vault");
+        let state_root = state.root().display().to_string();
+        // Issue #466: masking is opt-in (`obfuscate.mode` defaults to
+        // `off`); this test is exercising rehydration itself, so it opts in
+        // explicitly rather than relying on the default.
+        let env = |key: &str| match key {
+            crate::commands::ctx::state::STATE_ENV => Some(state_root.clone()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".to_string()),
+            _ => None,
+        };
+        let stdin = serde_json::json!({
+            "session_id":"s1", "cwd":repo.path(), "tool_name":"Bash",
+            "tool_input":{
+                "command":format!("printf %s {masked}"), "timeout":1234,
+                "nested":{"value":masked}
+            }
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_pretool_for_agent(&mut out, &stdin, &env, None).expect("hook");
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("rewrite");
+        let input = &value["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(input["timeout"], 1234);
+        assert_eq!(
+            input["nested"]["value"],
+            "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        );
+        assert_eq!(
+            input["command"],
+            "printf %s ghp_abcdefghijklmnopqrstuvwxyz123456"
+        );
+    }
+
+    #[test]
+    fn user_prompt_block_names_only_detected_kinds() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("config dir");
+        // Issue #466: masking is opt-in (`obfuscate.mode` defaults to
+        // `off`, which this handler now skips entirely); this test is
+        // exercising the block decision, so it opts in explicitly.
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"obfuscate\"\nprompt = \"block\"\n",
+        )
+        .expect("config");
+        let _guard = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let stdin = serde_json::json!({
+            "session_id":"s1", "cwd":repo.path(),
+            "prompt":"use ghp_abcdefghijklmnopqrstuvwxyz123456"
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_prompt(&mut out, &stdin, &|_| None).expect("hook");
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("block");
+        assert_eq!(value["decision"], "block");
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(reason.contains("GITHUB_TOKEN:1"), "{reason}");
+        assert!(!reason.contains("ghp_"), "{reason}");
     }
 }

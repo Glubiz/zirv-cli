@@ -1611,12 +1611,27 @@ pub trait AgentAdapter: std::fmt::Debug {
             manifest.role,
             manifest.instructions.trim()
         );
+        let env = super::config::env_from_process();
+        let system_prompt = super::obfuscate_store::protect_text_with_env(
+            &task.repo,
+            &system_prompt,
+            "workflow_agent_system_prompt",
+            &env,
+        )?
+        .0;
+        let task_prompt = super::obfuscate_store::protect_text_with_env(
+            &task.repo,
+            &task.prompt,
+            "workflow_agent_task_prompt",
+            &env,
+        )?
+        .0;
         extra.extend(self.system_prompt_args(&system_prompt));
         if manifest.read_only {
             extend_read_only_args(self, &mut extra, LaunchMode::Headless);
         }
         let session = SessionId::new_v4();
-        let mut command = self.headless_cmd(&task.prompt, &session, &extra);
+        let mut command = self.headless_cmd(&task_prompt, &session, &extra);
         command.current_dir(&task.repo);
         Ok(command)
     }

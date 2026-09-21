@@ -1655,14 +1655,19 @@ fn relaunch_command(
     session: &str,
 ) -> std::process::Command {
     let mut args = extra.to_vec();
-    let prompt = super::prompt::interactive_handoff_prompt(
-        adapter,
-        &[],
-        &mut args,
-        &restart_prompt(handoff, screen_thresholds),
-        state,
-        session,
-    );
+    let raw_prompt = restart_prompt(handoff, screen_thresholds);
+    let env = super::config::env_from_process();
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let prompt = super::obfuscate_store::protect_text_with_env(
+        &repo,
+        &raw_prompt,
+        "interactive_restart_prompt",
+        &env,
+    )
+    .map(|protected| protected.0)
+    .unwrap_or_default();
+    let prompt =
+        super::prompt::interactive_handoff_prompt(adapter, &[], &mut args, &prompt, state, session);
     adapter.interactive_cmd(Some(&prompt), &args)
 }
 
@@ -2024,7 +2029,7 @@ pub fn run_with(
     // The wrapped command's own argv may already carry the adapter's
     // system-prompt flag; merge it in rather than letting `prompt_args` below
     // silently override it with a second occurrence.
-    let (launch_command, composed) = super::prompt::merge_command_line_prompt(
+    let (launch_command, mut composed) = super::prompt::merge_command_line_prompt(
         adapter.as_ref(),
         &args.command,
         compiled.composed,
@@ -2032,6 +2037,13 @@ pub fn run_with(
         role,
         &cfg.prompt,
     );
+    composed = super::obfuscate_store::protect_composed(
+        &state_dir,
+        repo,
+        &cfg,
+        composed,
+        "wrap_orchestrator_prompt",
+    )?;
     let prompt_args = super::prompt::injection_args_for_session(
         adapter.as_ref(),
         &launch_command,

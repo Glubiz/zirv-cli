@@ -156,6 +156,15 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx worktree finalize",
     "zirv ctx task list",
     "zirv ctx task show",
+    // Issue #466: `list`/`reveal` only load the vault (`with_vault_readonly`,
+    // no lock, no save, no directory creation) and append a bookkeeping
+    // decision-log row, the same "internal record" class `zirv ctx proxy`'s
+    // own comment above already covers. `scan` never touches the persisted
+    // vault at all (`Vault::default()`), only reads the given transcript/
+    // session/stdin.
+    "zirv ctx obfuscate list",
+    "zirv ctx obfuscate reveal",
+    "zirv ctx obfuscate scan",
     "zirv memory status",
     "zirv memory list",
     "zirv memory recall",
@@ -289,6 +298,8 @@ const MUTATING: &[&str] = &[
     "zirv ctx task archive",
     "zirv ctx swarm",
     "zirv ctx measure baseline",
+    // Issue #466: deletes the repository's local placeholder vault file.
+    "zirv ctx obfuscate purge",
     "zirv memory init",
     "zirv memory remember",
     "zirv memory forget",

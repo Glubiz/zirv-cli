@@ -2051,6 +2051,128 @@ pub struct ScreenConfig {
     pub repetition_dominance_pct: f64,
 }
 
+/// Secret and personal-data treatment applied before Zirv-controlled text
+/// crosses a model or network boundary. Opt-in: `off` is the default, and
+/// only the operator (never a repository checkout) can turn it on (see
+/// `REPO_FORBIDDEN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObfuscateMode {
+    #[default]
+    Off,
+    Flag,
+    Obfuscate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObfuscateEntropy {
+    #[default]
+    Flag,
+    Obfuscate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObfuscatePrompt {
+    #[default]
+    Flag,
+    Block,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObfuscateEmailDomain {
+    #[default]
+    Keep,
+    Mask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObfuscatePatternConfig {
+    pub kind: String,
+    pub regex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObfuscateConfig {
+    pub mode: ObfuscateMode,
+    pub entropy: ObfuscateEntropy,
+    pub prompt: ObfuscatePrompt,
+    pub email_domain: ObfuscateEmailDomain,
+    pub patterns: Vec<ObfuscatePatternConfig>,
+    pub literals_file: Option<String>,
+    pub allow: Vec<String>,
+    #[serde(skip)]
+    pub(crate) operator_load_failed: bool,
+}
+
+impl ObfuscateConfig {
+    fn load_operator_only(env: EnvLookup<'_>) -> CtxResult<Self> {
+        let text = match std::fs::read_to_string(operator_path()?) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut operator: toml::Table = toml::from_str(&text)?;
+        let mut merged = toml::Table::new();
+        if let Some(value) = operator.remove("obfuscate") {
+            merged.insert("obfuscate".into(), value);
+        }
+        for (var, path, kind) in ENV_MAP {
+            if path.first() == Some(&"obfuscate")
+                && let Some(raw) = env(var)
+            {
+                insert_path(&mut merged, path, env_value(&raw, *kind)?);
+            }
+        }
+        match merged.remove("obfuscate") {
+            Some(value) => Ok(value.try_into()?),
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn fail_closed() -> Self {
+        // Issue #466: option loading must fail when the operator policy is unreadable.
+        Self {
+            mode: ObfuscateMode::Obfuscate,
+            prompt: ObfuscatePrompt::Block,
+            operator_load_failed: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn options(&self, literals: Vec<String>) -> super::obfuscate::Options {
+        super::obfuscate::Options {
+            mode: match self.mode {
+                ObfuscateMode::Off => super::obfuscate::Mode::Off,
+                ObfuscateMode::Flag => super::obfuscate::Mode::Flag,
+                ObfuscateMode::Obfuscate => super::obfuscate::Mode::Obfuscate,
+            },
+            entropy: match self.entropy {
+                ObfuscateEntropy::Flag => super::obfuscate::EntropyMode::Flag,
+                ObfuscateEntropy::Obfuscate => super::obfuscate::EntropyMode::Obfuscate,
+            },
+            email_domain: match self.email_domain {
+                ObfuscateEmailDomain::Keep => super::obfuscate::EmailDomain::Keep,
+                ObfuscateEmailDomain::Mask => super::obfuscate::EmailDomain::Mask,
+            },
+            patterns: self
+                .patterns
+                .iter()
+                .map(|pattern| super::obfuscate::OperatorPattern {
+                    kind: pattern.kind.clone(),
+                    regex: pattern.regex.clone(),
+                })
+                .collect(),
+            literals,
+            allow: self.allow.clone(),
+        }
+    }
+}
+
 impl Default for ScreenConfig {
     fn default() -> Self {
         let defaults = super::screen::Thresholds::default();
@@ -2807,6 +2929,7 @@ pub struct CtxConfig {
     pub sandbox: SandboxConfig,
     pub objective: ObjectiveConfig,
     pub screen: ScreenConfig,
+    pub obfuscate: ObfuscateConfig,
     pub task: TaskConfig,
     /// Issue #537 seam: the harness proxy's decision core (`zirv ctx proxy`,
     /// `proxy::decide`). The whole table is `REPO_FORBIDDEN`; see
@@ -2899,6 +3022,26 @@ enum EnvKind {
 const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ("ZIRV_CTX_AGENT", &["agent"], EnvKind::Str),
     ("ZIRV_CTX_AGENT_BIN", &["agent_bin"], EnvKind::Str),
+    (
+        "ZIRV_CTX_OBFUSCATE_MODE",
+        &["obfuscate", "mode"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_OBFUSCATE_ENTROPY",
+        &["obfuscate", "entropy"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_OBFUSCATE_PROMPT",
+        &["obfuscate", "prompt"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN",
+        &["obfuscate", "email_domain"],
+        EnvKind::Str,
+    ),
     ("ZIRV_CTX_WINDOW", &["score", "window"], EnvKind::Int),
     ("ZIRV_CTX_MIN_TURNS", &["score", "min_turns"], EnvKind::Int),
     (
@@ -4208,6 +4351,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // AGENT` and `--agent` all still choose the agent same as before -- only
     // a repo checkout may not.
     (&["agent"], "ZIRV_CTX_AGENT"),
+    (&["obfuscate", "mode"], "ZIRV_CTX_OBFUSCATE_MODE"),
+    (&["obfuscate", "entropy"], "ZIRV_CTX_OBFUSCATE_ENTROPY"),
+    (&["obfuscate", "prompt"], "ZIRV_CTX_OBFUSCATE_PROMPT"),
+    (&["obfuscate", "allow"], "~/.zirv/ctx.toml only"),
+    (&["obfuscate", "literals_file"], "~/.zirv/ctx.toml only"),
+    // A repository may request `mask` below, but never force the operator's
+    // `mask` back to `keep`. `load` lifts and folds this key separately.
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
     (&["handoff", "model"], "ZIRV_CTX_MODEL"),
     (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
@@ -5392,6 +5542,8 @@ impl CtxConfig {
             "screen",
             "repetition_dominance_pct",
         ));
+        let home_obfuscate_email_domain = take_nested(&mut merged, "obfuscate", "email_domain");
+        let home_obfuscate_patterns = take_nested(&mut merged, "obfuscate", "patterns");
         // `supervise.heavy_command_patterns` gets the identical treatment as
         // `sandbox.extra_deny` above, for the identical reason: the field's
         // own doc comment promises a repo layer may only ADD patterns, never
@@ -5565,6 +5717,8 @@ impl CtxConfig {
             "screen",
             "repetition_dominance_pct",
         ));
+        let repo_obfuscate_email_domain = take_nested(&mut repo_layer, "obfuscate", "email_domain");
+        let repo_obfuscate_patterns = take_nested(&mut repo_layer, "obfuscate", "patterns");
         let repo_heavy_patterns = string_array(take_nested(
             &mut repo_layer,
             "supervise",
@@ -5632,6 +5786,42 @@ impl CtxConfig {
             "workflow.deploy.minimum_tier",
         )?;
         merge(&mut merged, repo_layer);
+
+        // A repo may only tighten email handling to `mask`. `keep` never
+        // overrides an operator's `mask`. Pattern tables are additive so a
+        // checkout cannot discard an operator detector by replacing its
+        // array during the ordinary deep merge.
+        let home_masks_email = matches!(
+            home_obfuscate_email_domain.as_ref(),
+            Some(toml::Value::String(value)) if value == "mask"
+        );
+        let repo_masks_email = matches!(
+            repo_obfuscate_email_domain.as_ref(),
+            Some(toml::Value::String(value)) if value == "mask"
+        );
+        insert_path(
+            &mut merged,
+            &["obfuscate", "email_domain"],
+            toml::Value::String(if home_masks_email || repo_masks_email {
+                "mask".to_string()
+            } else {
+                "keep".to_string()
+            }),
+        );
+        let mut patterns = match home_obfuscate_patterns {
+            Some(toml::Value::Array(values)) => values,
+            _ => Vec::new(),
+        };
+        if let Some(toml::Value::Array(values)) = repo_obfuscate_patterns {
+            patterns.extend(values);
+        }
+        if !patterns.is_empty() {
+            insert_path(
+                &mut merged,
+                &["obfuscate", "patterns"],
+                toml::Value::Array(patterns),
+            );
+        }
 
         let default_deploy = WorkflowDeployConfig::default();
         let declared_minimum = home_deploy_minimum.max(repo_deploy_minimum);
@@ -6655,6 +6845,8 @@ pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
     let mut cfg = CtxConfig {
         agents: crate::settings::AgentGate::load_operator_only(env),
         policy: super::policy::EffectivePolicy::fail_closed(),
+        obfuscate: ObfuscateConfig::load_operator_only(env)
+            .unwrap_or_else(|_| ObfuscateConfig::fail_closed()),
         ..CtxConfig::default()
     };
     cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
@@ -9679,6 +9871,61 @@ mod tests {
     /// load-bearing (the context compiler attaches it to every session), the
     /// shared config-load-failure fallback must not hand back the widest
     /// possible policy.
+    #[test]
+    fn degrade_to_operator_only_withholds_when_operator_obfuscation_is_unreadable() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir(home.path().join(".zirv")).expect("config directory");
+        for text in ["[obfuscate", "[obfuscate]\nmode = 42\n"] {
+            std::fs::write(home.path().join(".zirv/ctx.toml"), text).expect("operator config");
+            let cfg = degrade_to_operator_only(&|_| None);
+            assert_eq!(cfg.obfuscate.mode, ObfuscateMode::Obfuscate);
+            assert!(
+                super::super::obfuscate_store::options_from_config(&cfg.obfuscate, home.path())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn degrade_to_operator_only_preserves_obfuscation_after_repo_rejection() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir(home.path().join(".zirv")).expect("home config directory");
+        std::fs::create_dir(repo.path().join(".zirv")).expect("repo config directory");
+        std::fs::write(home.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"obfuscate\"\nprompt = \"block\"\nemail_domain = \"mask\"\n[[obfuscate.patterns]]\nkind = \"CUSTOMER\"\nregex = '^CUST-[0-9]{8}$'\n",
+        ).expect("operator config");
+        let expected = CtxConfig::load(repo.path(), &|_| None)
+            .expect("operator config")
+            .obfuscate;
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"off\"\n",
+        )
+        .expect("repo config");
+        let error = CtxConfig::load(repo.path(), &|_| None).expect_err("forbidden key");
+        assert!(is_repo_forbidden(error.as_ref()), "{error}");
+        assert_eq!(degrade_to_operator_only(&|_| None).obfuscate, expected);
+        let env = env_map(&[("ZIRV_CTX_OBFUSCATE_ENTROPY", "obfuscate")]);
+        let degraded = degrade_to_operator_only(&|key| env.get(key).cloned());
+        assert_eq!(degraded.obfuscate.entropy, ObfuscateEntropy::Obfuscate);
+        assert_eq!(degraded.obfuscate.mode, ObfuscateMode::Obfuscate);
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"off\"\n",
+        )
+        .expect("operator config");
+        let env = env_map(&[("ZIRV_CTX_OBFUSCATE_MODE", "obfuscate")]);
+        assert_eq!(
+            degrade_to_operator_only(&|key| env.get(key).cloned())
+                .obfuscate
+                .mode,
+            ObfuscateMode::Obfuscate
+        );
+    }
+
     #[test]
     fn degrade_to_operator_only_fails_closed_on_policy_not_open() {
         let empty = env_map(&[]);

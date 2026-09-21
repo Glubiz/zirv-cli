@@ -40,6 +40,12 @@ pub(crate) const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
     "zirv ctx safety check",
 );
 
+pub(crate) const CLAUDE_REHYDRATE_HOOK: (&str, Option<&str>, &str) = (
+    "PreToolUse",
+    Some("Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"),
+    "zirv ctx hook pretool",
+);
+
 /// Issue #244's handoff-reinjection hook, matched on `source` values
 /// `resume|clear`. Claude-only, same reasoning as `CLAUDE_SAFETY_HOOK`
 /// above: codex has no verified `SessionStart` event at all (see
@@ -52,9 +58,10 @@ pub(crate) const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
     "zirv ctx hook session-start",
 );
 
-/// Issue #326's compact-output hook: `zirv ctx hook posttool`, matched on
-/// `Bash` results. Claude-only, same reasoning as `CLAUDE_SAFETY_HOOK` above
-/// and one step stronger -- it depends on claude's documented `PostToolUse`
+/// PostToolUse masking and compact-output hook. `.*` is deliberate: the
+/// schema-preserving masker handles every tool result, while optional output
+/// compaction remains Bash-only inside `hook::run_posttool`. This hook depends
+/// on Claude's documented `PostToolUse`
 /// `hookSpecificOutput.updatedToolOutput` contract (a replacement value that
 /// does not match the tool's own output schema is ignored and the original is
 /// used), and codex has no equivalent event, so wiring it into
@@ -62,7 +69,7 @@ pub(crate) const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
 /// Registered synchronously, never as a background hook: a replacement that
 /// arrives after the result has reached the model replaces nothing.
 pub(crate) const CLAUDE_COMPACT_OUTPUT_HOOK: (&str, Option<&str>, &str) =
-    ("PostToolUse", Some("Bash"), "zirv ctx hook posttool");
+    ("PostToolUse", Some(".*"), "zirv ctx hook posttool");
 
 /// Change 5d: `PermissionRequest`/`PermissionDenied` -> `zirv ctx hook
 /// permission`, mirroring `ClaudeAdapter`'s own launch-time settings shape
@@ -86,8 +93,9 @@ pub(crate) const CLAUDE_PERMISSION_DENIED_HOOK: (&str, Option<&str>, &str) =
 
 /// Every claude-only hook (`install_claude_integration`), never wired into
 /// `install_codex_hooks`.
-pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 5] = [
+pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 6] = [
     CLAUDE_SAFETY_HOOK,
+    CLAUDE_REHYDRATE_HOOK,
     CLAUDE_SESSION_START_HOOK,
     CLAUDE_COMPACT_OUTPUT_HOOK,
     CLAUDE_PERMISSION_REQUEST_HOOK,

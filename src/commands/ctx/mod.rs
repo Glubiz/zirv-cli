@@ -57,6 +57,8 @@ pub mod memory_optimize;
 pub(crate) mod native_account;
 pub mod native_hooks;
 pub mod native_worker;
+pub mod obfuscate;
+pub mod obfuscate_store;
 pub mod objective;
 pub mod optimize;
 pub mod output;
@@ -563,6 +565,8 @@ pub enum CtxVerb {
     Usage(usage::UsageArgs),
     /// Analyse the configuration surfaces that steer every session.
     Optimize(optimize::OptimizeArgs),
+    /// Audit, reveal or purge this repository's local sensitive-value vault.
+    Obfuscate(obfuscate_store::ObfuscateArgs),
     /// Start an interactive orchestrator session on the resolved adapter.
     Chat(chat::ChatArgs),
     /// Run a supervised headless worker on another enabled harness.
@@ -782,6 +786,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Output(a) => output::run_output(a, &mut out),
         CtxVerb::Usage(a) => usage::run(a, &mut out),
         CtxVerb::Optimize(a) => optimize::run(a, &mut out),
+        CtxVerb::Obfuscate(a) => obfuscate_store::run(a, &mut out),
         CtxVerb::Chat(a) => chat::run(a, &mut out),
         CtxVerb::Agent(a) => agent::run(a, &mut out),
         CtxVerb::Send(a) => mail::run_send(a, &mut out),
