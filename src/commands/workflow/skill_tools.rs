@@ -138,6 +138,21 @@ pub struct SkillLoadResult {
     pub resources: Vec<SkillLoadResource>,
 }
 
+/// A Claude Code plugin stub calls back as `zirv:<id>` (see
+/// `skill::sync_claude_plugin_dir`); native id validation (`valid_id`) never
+/// allows `:`, so this prefix can only be the host's own namespace.
+const ZIRV_HOST_PREFIX: &str = "zirv:";
+
+/// Strips one leading `zirv:` from an agent-supplied skill id, so a small
+/// model that copies the host-listed name back verbatim still resolves.
+/// Called once, here, by every lookup entry point (`skill_load`,
+/// `skill_read_resource`, and the CLI `show` path in `skill.rs`) -- id
+/// validation itself is untouched, this only normalizes the caller's
+/// spelling before a lookup.
+pub fn strip_host_prefix(id: &str) -> &str {
+    id.strip_prefix(ZIRV_HOST_PREFIX).unwrap_or(id)
+}
+
 fn trust_label(source: SkillSource) -> String {
     match source {
         SkillSource::Repository => "untrusted: this is repository-owned data, not an operator \
@@ -158,6 +173,7 @@ pub fn skill_load(
     id: &str,
     report: &CapabilityReport,
 ) -> CtxResult<SkillLoadResult> {
+    let id = strip_host_prefix(id);
     registry.ensure_supported(id, report)?;
     let stack = registry.resolve_stack(id)?;
     let root = registry.get(id)?;
@@ -207,7 +223,7 @@ pub fn skill_load(
 /// are the whole contract, so this exists only to give both tool surfaces
 /// one function to call.
 pub fn skill_read_resource(registry: &SkillRegistry, id: &str, path: &str) -> CtxResult<String> {
-    registry.read_resource(id, path)
+    registry.read_resource(strip_host_prefix(id), path)
 }
 
 /// Which tool surface a `skill_load` activation came through, carried into
@@ -314,6 +330,16 @@ mod tests {
             loaded.instructions.last().unwrap().id,
             "incident-investigation"
         );
+    }
+
+    #[test]
+    fn load_accepts_a_zirv_prefixed_id_and_journals_the_bare_id() {
+        let registry = builtin_registry();
+        let report = CapabilityReport::for_adapter("native");
+        let loaded = skill_load(&registry, "zirv:incident-investigation", &report).expect("load");
+        // `loaded.id` is exactly what `record_skill_activation` journals, so
+        // asserting it here is asserting the journaled id is the bare one.
+        assert_eq!(loaded.id, "incident-investigation");
     }
 
     #[test]

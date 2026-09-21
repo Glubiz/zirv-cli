@@ -1439,6 +1439,110 @@ pub fn export_bundle(skill: &RegisteredSkill, out_dir: &Path) -> CtxResult<PathB
     Ok(bundle_dir)
 }
 
+/// The plugin id Claude Code sees zirv's stubs under: each one resolves as
+/// `zirv:<skill id>` to the host's own `Skill` tool.
+const CLAUDE_PLUGIN_NAME: &str = "zirv";
+
+/// A repository skill's description is repository-authored, untrusted text
+/// (see [`SkillSource::Repository`]'s own doc comment) -- registering it with
+/// the host would hand that text to Claude's own skill-selection surface.
+/// Only a built-in or operator-layer skill, with implicit activation on, is
+/// safe to expose as a native stub; everything else stays reachable through
+/// `zirv skill list`/`show` alone.
+fn host_registerable(skill: &RegisteredSkill) -> bool {
+    matches!(
+        skill.source,
+        SkillSource::BuiltIn | SkillSource::OperatorGlobal
+    ) && skill.manifest.implicit_activation
+}
+
+#[derive(Serialize)]
+struct ClaudePluginManifest<'a> {
+    name: &'a str,
+    description: &'a str,
+    version: &'a str,
+}
+
+/// A stub never carries zirv's own instructions -- the operator's design
+/// rule is "zirv provides skills, the agent chooses" -- only a pointer at the
+/// journaled, refusal-checked load path.
+fn render_claude_plugin_skill_md(id: &str, description: &str) -> CtxResult<String> {
+    let frontmatter = BundleFrontmatter {
+        name: id.to_string(),
+        description: description.to_string(),
+        compatibility: None,
+        metadata: BTreeMap::new(),
+    };
+    let frontmatter_yaml = serde_yaml_ng::to_string(&frontmatter)
+        .map_err(|err| format!("cannot render plugin SKILL.md frontmatter: {err}"))?;
+    let mut document = String::from("---\n");
+    document.push_str(&frontmatter_yaml);
+    if !document.ends_with('\n') {
+        document.push('\n');
+    }
+    document.push_str("---\n\n");
+    document.push_str(&format!(
+        "Run `zirv skill load {id}` in a shell now and follow the instructions it prints. \
+         If it refuses, report the refusal; do not improvise around it.\n"
+    ));
+    Ok(document)
+}
+
+/// Writes `contents` to `path` only when absent or different, so a launch
+/// that finds nothing changed touches no mtimes.
+fn write_if_changed(path: &Path, contents: &str) -> CtxResult<()> {
+    if std::fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
+        return Ok(());
+    }
+    std::fs::write(path, contents)?;
+    Ok(())
+}
+
+/// Idempotently syncs a Claude Code plugin directory under `dir`: a
+/// `.claude-plugin/plugin.json` plus one stub `skills/<id>/SKILL.md` per
+/// [`host_registerable`] skill in `registry`. A skill dropped from that set
+/// since the last sync has its stub directory removed.
+pub fn sync_claude_plugin_dir(
+    registry: &SkillRegistry,
+    dir: &Path,
+    plugin_version: &str,
+) -> CtxResult<()> {
+    let plugin_dir = dir.join(".claude-plugin");
+    std::fs::create_dir_all(&plugin_dir)?;
+    let manifest = ClaudePluginManifest {
+        name: CLAUDE_PLUGIN_NAME,
+        description: "zirv skill library",
+        version: plugin_version,
+    };
+    let mut manifest_json = serde_json::to_string_pretty(&manifest)?;
+    manifest_json.push('\n');
+    write_if_changed(&plugin_dir.join("plugin.json"), &manifest_json)?;
+
+    let skills_dir = dir.join("skills");
+    std::fs::create_dir_all(&skills_dir)?;
+    let mut desired = BTreeSet::new();
+    for skill in registry.list().filter(|skill| host_registerable(skill)) {
+        desired.insert(skill.manifest.id.clone());
+        let stub_dir = skills_dir.join(&skill.manifest.id);
+        std::fs::create_dir_all(&stub_dir)?;
+        let document =
+            render_claude_plugin_skill_md(&skill.manifest.id, &skill.manifest.description)?;
+        write_if_changed(&stub_dir.join("SKILL.md"), &document)?;
+    }
+
+    for entry in std::fs::read_dir(&skills_dir)?.flatten() {
+        let stale = entry.path().is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !desired.contains(name));
+        if stale {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Mirrors the small, fixed SkillManifest schema at call sites.
 fn manifest(
     id: &str,
@@ -1598,7 +1702,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "brainstorm",
             "Brainstorm intent",
-            "Interactively question the operator to turn a raw task into a reviewable intent artifact.",
+            "Question the operator interactively to turn a raw idea into a reviewable intent with requirements and non-goals. Use when the request is vague and the operator is available to answer. Not for working without back-and-forth -- that is `write-intent`.",
             &["idea", "intent", "brainstorm", "requirements"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[],
@@ -1611,7 +1715,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "write-intent",
             "Write intent autonomously",
-            "Turn a raw task into an explicit, reviewable intent artifact without operator back-and-forth.",
+            "Turn a raw task into an explicit intent -- goal, requirements, non-goals, assumptions -- without asking the operator anything. Use when a request must be pinned down autonomously before work starts. Not for interactive questioning -- that is `brainstorm`.",
             &["idea", "intent", "requirements", "autonomous"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[],
@@ -1624,7 +1728,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "write-plan",
             "Write implementation plan",
-            "Produce a durable, dependency-ordered plan artifact with exact verification per task.",
+            "Produce a durable written implementation plan -- dependency-ordered tasks, each with its exact verification. Use once a design is accepted and an implementation plan is needed. Not for executing it -- that is `execute-plan`.",
             &["plan", "writing plan", "implementation plan"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[],
@@ -1637,7 +1741,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "worktree",
             "Worktree isolation",
-            "Use a linked worktree when substantial independent implementation needs isolation.",
+            "Set up a linked git worktree so substantial or parallel implementation gets an isolated checkout. Use when work needs isolation from the main checkout or several implementations proceed at once.",
             &["worktree", "isolation", "parallel implementation"],
             &[Cap::GitWorktree],
             &[Cap::RepoRead],
@@ -1650,7 +1754,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "execute-plan",
             "Execute accepted plan",
-            "Execute an accepted plan task-by-task with a resume-safe evidence ledger.",
+            "Carry out an already accepted plan task by task, keeping an evidence ledger so the work can stop and resume safely. Use when a plan exists and the job is to execute or resume it. Not for producing the plan -- that is `write-plan`.",
             &["execute plan", "implementation", "resume"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[Cap::TestRun],
@@ -1663,7 +1767,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "finish-branch",
             "Finish development branch",
-            "Prepare a verified development branch for the repository's deploy-tier decision.",
+            "Prepare a verified development branch for integration -- clean history, passing checks, pull request -- and stop at the repository's deploy decision. Use when the work is done and the branch needs to be wrapped up or a pull request opened.",
             &["finish branch", "pull request", "merge"],
             &[Cap::RepoRead],
             &[Cap::ShellExec, Cap::TestRun, Cap::NetworkAccess],
@@ -1676,7 +1780,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "design",
             "Design",
-            "Clarify intent and choose a proportional design.",
+            "Clarify what is being asked and choose a design proportional to it, fitting the existing architecture, before any code is written. Use when a feature or change has more than one reasonable shape. Not for critiquing an existing proposal -- that is `design-review`.",
             &["feature", "architecture", "design"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[],
@@ -1689,7 +1793,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
         manifest(
             "frontend-craft",
             "Frontend craft floor",
-            "A non-negotiable quality floor for intentional, product-specific interfaces.",
+            "The quality floor for any product interface work: intentional, product-specific, complete in its states, never generic. Use alongside every frontend or UI task, whatever its phase.",
             &["frontend", "ui", "visual", "component", "responsive"],
             &[Cap::RepoRead],
             &[Cap::ArtifactRender, Cap::BrowserOpen],
@@ -1724,7 +1828,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "frontend-design",
             "Frontend design",
-            "Autonomously establish a product-specific visual and interaction direction.",
+            "Establish a product-specific visual and interaction direction without waiting for the operator. Use when a new interface or screen needs its look and behaviour decided. Not for building it -- that is `frontend-implement`.",
             &["frontend", "ui", "design", "visual direction"],
             &[Cap::RepoRead],
             &[Cap::ArtifactRender, Cap::BrowserOpen],
@@ -1737,7 +1841,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "frontend-plan",
             "Frontend plan",
-            "Plan coherent UI work across structure, states, responsiveness, and evidence.",
+            "Plan UI work across structure, states, responsiveness, and the evidence that will prove it. Use before a multi-step frontend change. Not for non-UI planning -- that is `plan`.",
             &["frontend", "ui", "plan"],
             &[Cap::RepoRead],
             &[Cap::ArtifactRender],
@@ -1750,7 +1854,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "frontend-implement",
             "Frontend implementation",
-            "Implement intentional interfaces with complete states and responsive behavior.",
+            "Build an interface component or page with every state covered -- loading, empty, error -- and responsive behaviour. Use when writing or changing frontend or UI code. Not for deciding the visual direction -- that is `frontend-design`.",
             &["frontend", "ui", "component", "responsive"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[Cap::TestRun, Cap::ArtifactRender, Cap::BrowserOpen],
@@ -1763,7 +1867,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "frontend-debug",
             "Frontend debugging",
-            "Reproduce visual and interaction defects at the state and viewport where they occur.",
+            "Reproduce a visual or interaction defect at the exact state and viewport where it occurs before touching code. Use for a UI bug -- layout breaks, wrong states, broken interactions. Not for non-UI failures -- that is `systematic-debugging`.",
             &["frontend", "ui", "visual bug", "interaction bug"],
             &[Cap::RepoRead],
             &[
@@ -1781,7 +1885,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "frontend-test",
             "Frontend testing",
-            "Verify behavior, accessibility, states, and layout with proportional evidence.",
+            "Test an interface for behaviour, accessibility, state coverage, and layout with proportional evidence. Use when writing or running tests for frontend or UI work. Not for the final completion proof -- that is `frontend-verify`.",
             &["frontend", "ui", "test", "accessibility"],
             &[Cap::TestRun],
             &[Cap::RepoRead, Cap::ArtifactRender, Cap::BrowserOpen],
@@ -1794,7 +1898,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "frontend-review",
             "Frontend review",
-            "Review rendered product quality independently from implementation intent.",
+            "Review the rendered interface as a user would see it, independent of what the implementer intended. Use to review or QA a finished UI change. Not for reviewing the code diff -- that is `review`.",
             &["frontend", "ui", "review", "visual qa"],
             &[Cap::RepoRead],
             &[Cap::AgentSpawn, Cap::ArtifactRender, Cap::BrowserOpen],
@@ -1807,7 +1911,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "frontend-verify",
             "Frontend verification",
-            "Require fresh behavioral and visual proof for the final frontend change.",
+            "Prove a finished frontend change with fresh behavioural and rendered evidence before calling it complete. Use as the last step of UI work. Not for choosing which tests to write -- that is `frontend-test`.",
             &["frontend", "ui", "verify", "complete"],
             &[Cap::TestRun],
             &[Cap::RepoRead, Cap::ArtifactRender, Cap::BrowserOpen],
@@ -1820,7 +1924,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "plan",
             "Plan",
-            "Turn substantial work into ordered executable units.",
+            "Break substantial or architectural work into ordered units that can each be executed and verified. Use when a change is too large to do in one step and needs sizing and sequencing. Not for the durable written plan document -- that is `write-plan`.",
             &["plan", "substantial", "architectural"],
             &[Cap::RepoRead],
             &[],
@@ -1833,7 +1937,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "implement",
             "Implement",
-            "Make scoped changes with continuous evidence.",
+            "Make a scoped code change -- feature, bugfix, or refactor -- in small steps, checking evidence as you go and touching only what the task needs. Use whenever you are about to write or change code. Not for a failure whose cause is unknown -- that is `systematic-debugging`.",
             &["feature", "bugfix", "refactor"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[Cap::TestRun],
@@ -1846,7 +1950,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "systematic-debugging",
             "Systematic debugging",
-            "Reproduce and isolate a failure before changing code.",
+            "Reproduce and isolate a failure before changing any code, so the fix addresses the root cause and not the symptom. Use for any bug, failing test, or unexpected behaviour whose cause is not yet known.",
             &["bug", "failure", "debug"],
             &[Cap::RepoRead],
             &[Cap::ShellExec, Cap::TestRun, Cap::RepoWrite],
@@ -1859,7 +1963,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "testing",
             "Testing",
-            "Select proportional deterministic verification.",
+            "Choose the deterministic checks that would actually catch a mistake in this change and run them in proportion to its risk. Use when deciding what to test or how to check a change. Not for the final completion proof -- that is `verify`.",
             &["test", "verify"],
             &[Cap::TestRun],
             &[Cap::RepoRead],
@@ -1872,7 +1976,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "tdd",
             "Test-driven development",
-            "Use a focused red, green, refactor loop when it adds value.",
+            "Write the failing test first, make it pass, then refactor -- a focused red, green, refactor loop. Use when adding a regression test for a bug or building behaviour test-first. Not for choosing which existing checks to run -- that is `testing`.",
             &["tdd", "regression"],
             &[Cap::TestRun, Cap::RepoWrite],
             &[Cap::RepoRead],
@@ -1885,7 +1989,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "review",
             "Review",
-            "Review the requirement and diff with independent evidence.",
+            "Review a diff against its requirement from an independent seat and report only concrete findings -- correctness, security, data loss, missing tests -- each with a failure scenario. Use for any code review. Not for a design document -- that is `design-review`.",
             &["review", "risk"],
             &[Cap::RepoRead],
             &[Cap::AgentSpawn],
@@ -1898,7 +2002,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "verify",
             "Verify",
-            "Require fresh completion evidence.",
+            "Confirm finished work with fresh evidence -- rerun the checks now, read the results -- before anything is called complete. Use as the last step before reporting a task done. Not for choosing which checks exist -- that is `testing`.",
             &["complete", "verify"],
             &[Cap::TestRun],
             &[Cap::RepoRead],
@@ -1911,7 +2015,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "delegate",
             "Delegate",
-            "Create bounded, isolated worker briefs.",
+            "Write a bounded, self-contained brief for a worker -- goal, constraints, paths, output format -- so handed-off work comes back usable. Use whenever a task is handed to a subagent or another session. Not for splitting work into concurrent lanes -- that is `parallelize`.",
             &["delegate", "worker"],
             &[Cap::AgentSpawn],
             &[Cap::RepoRead],
@@ -1924,7 +2028,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "parallelize",
             "Parallelize",
-            "Run independent work concurrently without overlapping ownership.",
+            "Split independent tasks into concurrent lanes with non-overlapping ownership so they cannot collide. Use when several tasks have no dependencies on each other and could run at once. Not for writing a single worker's brief -- that is `delegate`.",
             &["parallel", "independent"],
             &[Cap::AgentSpawn],
             &[Cap::GitWorktree],
@@ -2165,9 +2269,10 @@ fn run_list(args: &SkillListArgs, writer: &mut impl Write) -> CtxResult<i32> {
 fn run_show(args: &SkillShowArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let registry = registry(args.repo.as_deref(), args.built_in_only)?;
     report_warnings(&registry);
-    let skill = registry.get(&args.id)?;
+    let id = skill_tools::strip_host_prefix(&args.id);
+    let skill = registry.get(id)?;
     let dependency_order: Vec<&str> = registry
-        .resolve_stack(&args.id)?
+        .resolve_stack(id)?
         .into_iter()
         .map(|skill| skill.manifest.id.as_str())
         .collect();
@@ -2178,7 +2283,7 @@ fn run_show(args: &SkillShowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         .map(|adapter| CapabilityReport::for_repo(adapter, &repo))
         .transpose()?;
     if let Some(report) = &capability_report {
-        registry.ensure_supported(&args.id, report)?;
+        registry.ensure_supported(id, report)?;
     }
     if args.json {
         serde_json::to_writer_pretty(
@@ -2238,7 +2343,7 @@ fn run_export(args: &SkillExportArgs, writer: &mut impl Write) -> CtxResult<i32>
 fn run_read(args: &SkillReadArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let registry = registry(args.repo.as_deref(), args.built_in_only)?;
     report_warnings(&registry);
-    let text = registry.read_resource(&args.id, &args.path)?;
+    let text = skill_tools::skill_read_resource(&registry, &args.id, &args.path)?;
     writeln!(writer, "{text}")?;
     Ok(0)
 }
@@ -3324,6 +3429,89 @@ mod tests {
         let text = std::fs::read_to_string(bundle_dir.join("SKILL.md")).unwrap();
         let reloaded = parse_skill_md(&text, "roundtrip").unwrap();
         assert_eq!(reloaded, skill.manifest);
+    }
+
+    #[test]
+    fn claude_plugin_stub_points_at_zirv_skill_load_and_names_the_plugin() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let out = tempdir().unwrap();
+        sync_claude_plugin_dir(&registry, out.path(), "9.9.9").unwrap();
+
+        let manifest_json =
+            std::fs::read_to_string(out.path().join(".claude-plugin/plugin.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+        assert_eq!(manifest["name"], "zirv");
+        assert_eq!(manifest["version"], "9.9.9");
+
+        let stub = std::fs::read_to_string(out.path().join("skills/design/SKILL.md")).unwrap();
+        let (frontmatter_text, body) = stub.split_once("---\n\n").expect("stub has a body");
+        let frontmatter: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(frontmatter_text.trim_start_matches("---\n")).unwrap();
+        assert_eq!(frontmatter["name"], "design");
+        assert_eq!(
+            frontmatter["description"],
+            registry.get("design").unwrap().manifest.description
+        );
+        assert_eq!(
+            body,
+            "Run `zirv skill load design` in a shell now and follow the instructions it \
+             prints. If it refuses, report the refusal; do not improvise around it.\n"
+        );
+    }
+
+    #[test]
+    fn repository_sourced_skills_are_never_registered_with_the_host() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let project = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&project).unwrap();
+        write(
+            &project.join("extra.yaml"),
+            "schema_version: 1\nid: extra\nversion: 1\nname: Extra\ndescription: added\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: added by the repo\n",
+        );
+        let registry = SkillRegistry::load(repo.path(), Some(home.path()), true, true).unwrap();
+        assert_eq!(
+            registry.get("extra").unwrap().source,
+            SkillSource::Repository
+        );
+
+        let out = tempdir().unwrap();
+        sync_claude_plugin_dir(&registry, out.path(), "1.0.0").unwrap();
+        assert!(!out.path().join("skills/extra").exists());
+        assert!(
+            out.path().join("skills/design").exists(),
+            "a built-in still registers"
+        );
+    }
+
+    #[test]
+    fn sync_is_idempotent_and_removes_stale_skill_directories() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let global = home.path().join(".zirv/skills");
+        std::fs::create_dir_all(&global).unwrap();
+        write(
+            &global.join("extra.yaml"),
+            "schema_version: 1\nid: extra-op\nversion: 1\nname: Extra\ndescription: an operator skill\ncontext_budget_bytes: 64\nphases: [implement]\ninstructions: added by the operator\n",
+        );
+        let registry = SkillRegistry::load(repo.path(), Some(home.path()), true, false).unwrap();
+        let out = tempdir().unwrap();
+        sync_claude_plugin_dir(&registry, out.path(), "1.0.0").unwrap();
+        let stub_path = out.path().join("skills/extra-op/SKILL.md");
+        assert!(stub_path.exists());
+        let first = std::fs::read_to_string(&stub_path).unwrap();
+
+        // Re-running against the identical registry changes nothing.
+        sync_claude_plugin_dir(&registry, out.path(), "1.0.0").unwrap();
+        assert_eq!(std::fs::read_to_string(&stub_path).unwrap(), first);
+
+        // Dropping the operator skill and re-syncing removes its stub.
+        std::fs::remove_file(global.join("extra.yaml")).unwrap();
+        let registry = SkillRegistry::load(repo.path(), Some(home.path()), true, false).unwrap();
+        sync_claude_plugin_dir(&registry, out.path(), "1.0.0").unwrap();
+        assert!(!out.path().join("skills/extra-op").exists());
+        assert!(out.path().join("skills/design").exists());
     }
 
     #[cfg(unix)]

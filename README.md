@@ -2129,6 +2129,16 @@ pre-issue-#539 full-manifest `--json` shape. `zirv skill export <id> --dir
 body on demand, refusing a `..`/absolute escape the same way the registry's
 own loader does.
 
+On Claude Code, zirv also registers its built-in and operator-global skills
+(implicit-activation ones only) as native Claude Code skills, namespaced
+`zirv:<id>`, through a session-scoped plugin directory generated under
+zirv's state dir. Each registered skill is a stub that points the agent at
+`zirv skill load <id>`, so refusal handling and activation journaling are
+unchanged from the shell-invoked path; the agent still chooses whether to
+use it. Repository skills are never registered with the host -- their
+descriptions are repository-authored, untrusted text -- and stay reachable
+through the standing skill index only.
+
 Use `zirv workflow review package <id>` for a compact diff/test review input,
 `zirv artifact render <path>` for stable static artifact references, and
 `zirv workflow stats` for local bounded telemetry. Review results are persisted
