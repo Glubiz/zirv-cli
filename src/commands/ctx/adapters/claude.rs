@@ -4215,24 +4215,39 @@ mod tests {
             settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx safety check"))
         );
-        // Issue #334: the orchestrator-write guard and the expensive-seat
-        // guard are separate `PreToolUse` entries, both running `zirv ctx
-        // hook pretool` -- the former attested on every launch instead of
-        // depending on a one-time `zirv setup apply`.
+        // Issue #466: the rehydration hook is a third `PreToolUse` entry,
+        // matching every tool a device action can rehydrate placeholders
+        // for (Bash/PowerShell plus the write tools), also running `zirv
+        // ctx hook pretool` -- the same command decides both this and the
+        // orchestrator-write guard below from the payload it receives.
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/1/matcher"),
-            Some(&serde_json::json!("Edit|Write|MultiEdit|NotebookEdit"))
+            Some(&serde_json::json!(
+                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"
+            ))
         );
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/1/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx hook pretool"))
         );
+        // Issue #334: the orchestrator-write guard and the expensive-seat
+        // guard are separate `PreToolUse` entries, both running `zirv ctx
+        // hook pretool` -- the former attested on every launch instead of
+        // depending on a one-time `zirv setup apply`.
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/2/matcher"),
-            Some(&serde_json::json!("Agent|Task"))
+            Some(&serde_json::json!("Edit|Write|MultiEdit|NotebookEdit"))
         );
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/2/hooks/0/command"),
+            Some(&serde_json::json!("zirv ctx hook pretool"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/3/matcher"),
+            Some(&serde_json::json!("Agent|Task"))
+        );
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/3/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx hook pretool"))
         );
         assert!(
@@ -4399,6 +4414,12 @@ mod tests {
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx safety check"
+                }]
+            }, {
+                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
                 }]
             }, {
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
