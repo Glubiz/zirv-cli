@@ -345,6 +345,12 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 /// uncollapsed, non-diffed report), so the flags this bullet used to spell
 /// out are already the default a bare invocation gets.
 ///
+/// v19: the lifecycle bullet no longer tells the session to guess a
+/// `<kind>` -- `zirv workflow start --task "<summary>"` with the id omitted
+/// now selects the pack deterministically from the summary (specialised
+/// packs included), so the default is the id-less form; a registry id from
+/// `zirv workflow list` is named only to force a specific one.
+///
 /// The literal header the derived harness/orchestration roster
 /// (`PromptSource::Harnesses`) starts with -- named, like `CONTEXT_LAYER_
 /// HEADER` and the workflow/memory headers, so `compile.rs`'s `CompiledContext::
@@ -417,7 +423,7 @@ pub fn orchestrator_write_lines(posture: OrchestratorWrites, hook_enforced: bool
 }
 
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v18)
+zirv meta-harness (v19)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
@@ -440,9 +446,9 @@ Persist what the next session needs with `zirv ctx remember`; retrieve it with `
 recall`. Repo scripts (`zirv <script>`, listed by `zirv help`) are the preferred way to build, \
 test, and commit.
 - Lifecycle in proportion: a trivial or bounded change needs no `zirv workflow`. Start one for \
-substantial work -- `zirv workflow start <kind> --task \"<summary>\"` with kind feature, \
-bugfix, refactor, spike, or review -- then follow `zirv workflow status` and the work \
-artifacts for the active step, because this text does not refresh mid-session.
+substantial work -- `zirv workflow start --task \"<summary>\"` picks the pack for you; name a \
+`zirv workflow list` id to force one -- then follow `zirv workflow status` and its artifacts, \
+because this text does not refresh mid-session.
 - Design direction is the operator's call: for a UI redesign, a visual or interaction overhaul, \
 or any task where look or interaction is the point, audit the current state, present \
 representative target designs, and wait for explicit approval before implementing. Autonomous \
@@ -492,9 +498,9 @@ Persist what the next session needs with `zirv ctx remember`; retrieve it with `
 recall`. Repo scripts (`zirv <script>`, listed by `zirv help`) are the preferred way to build, \
 test, and commit.
 - Lifecycle in proportion: a trivial or bounded change needs no `zirv workflow`. Start one for \
-substantial work -- `zirv workflow start <kind> --task \"<summary>\"` with kind feature, \
-bugfix, refactor, spike, or review -- then follow `zirv workflow status` and the work \
-artifacts for the active step, because this text does not refresh mid-session.
+substantial work -- `zirv workflow start --task \"<summary>\"` picks the pack for you; name a \
+`zirv workflow list` id to force one -- then follow `zirv workflow status` and its artifacts, \
+because this text does not refresh mid-session.
 - Design direction is the operator's call: for a UI redesign, a visual or interaction overhaul, \
 or any task where look or interaction is the point, audit the current state, present \
 representative target designs, and wait for explicit approval before implementing. Autonomous \
@@ -542,9 +548,9 @@ mail is already waiting -- run `zirv ctx inbox` (never `--peek`) right away. Ste
 with `zirv ctx send --to-session <short>` or `zirv ctx nudge`; an undirected send is claimed by \
 exactly one, `--all` fans out to every live session. Persist durable facts with `zirv ctx \
 remember`/`recall`, and prefer repo scripts (`zirv <script>`) for build, test, and commit.
-- Substantial work starts `zirv workflow start <kind> --task \"<summary>\"` (feature, bugfix, \
-refactor, spike, or review); trivial or bounded needs none. Follow `zirv workflow status` for \
-the active step.
+- Substantial work starts `zirv workflow start --task \"<summary>\"` (auto-picks the pack; \
+`zirv workflow list` id forces one); trivial or bounded needs none. Follow `zirv workflow \
+status`.
 - Design direction is the operator's call: for a UI redesign, a visual or interaction overhaul, \
 or any task where look or interaction is the point, audit the current state, present \
 representative target designs, and wait for explicit approval before implementing. Autonomous \
@@ -5579,7 +5585,7 @@ mod tests {
             composed.text
         );
         assert!(
-            !composed.text.contains("zirv meta-harness (v18)"),
+            !composed.text.contains("zirv meta-harness (v19)"),
             "must not carry the verbose header too:\n{}",
             composed.text
         );
@@ -5634,7 +5640,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v18)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v19)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -5694,7 +5700,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v18)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v19)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -5732,7 +5738,7 @@ mod tests {
     #[test]
     fn the_harness_layer_names_workdir_for_cross_repo_delegation() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v18)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v19)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -5787,7 +5793,7 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v18)"),
+            HARNESS_PROMPT.contains("(v19)"),
             "a changed instruction layer must bump its own version token"
         );
     }
