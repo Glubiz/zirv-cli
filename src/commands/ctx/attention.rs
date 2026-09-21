@@ -44,6 +44,7 @@
 //! as they found it.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -753,6 +754,26 @@ fn same_generation(
     current.pid == pinned_pid && current.start_time == pinned_started_at
 }
 
+/// The bounded, doubling-interval mechanics `wait` and `watch` (issue #724)
+/// share: `tick` does its own reads and printing (it owns `w`) and returns
+/// the exit code the moment it has one; `Ok(None)` means "still pending, poll
+/// again". Pulled out of `run_wait_with` so `watch` adds only WHAT each tick
+/// checks and prints, never a second copy of this interval/timeout
+/// bookkeeping.
+fn poll_loop(
+    sleep_fn: &dyn Fn(Duration),
+    mut tick: impl FnMut() -> CtxResult<Option<i32>>,
+) -> CtxResult<i32> {
+    let mut interval = WAIT_POLL_START;
+    loop {
+        if let Some(code) = tick()? {
+            return Ok(code);
+        }
+        sleep_fn(interval);
+        interval = next_poll_interval(interval);
+    }
+}
+
 /// Resolves `args.session` once, pins `(pid, started_at)`, then polls the
 /// persisted attention file at a bounded, doubling interval until the
 /// projection matches `args.until`. Exit 0 on match, 2 on timeout, 3 if the
@@ -777,11 +798,10 @@ pub fn run_wait_with<W: Write>(
     let short = resolved.short.clone();
 
     let start = now_fn();
-    let mut interval = WAIT_POLL_START;
-    loop {
+    poll_loop(sleep_fn, || -> CtxResult<Option<i32>> {
         let Some(current) = super::sessions::load_record(&state, &short) else {
             writeln!(w, "zirv ctx wait: {short}: registry entry disappeared")?;
-            return Ok(3);
+            return Ok(Some(3));
         };
         if !same_generation(pinned_pid, pinned_started_at, &current) {
             writeln!(
@@ -789,7 +809,7 @@ pub fn run_wait_with<W: Write>(
                 "zirv ctx wait: {short}: the pinned process was replaced by a new one reusing \
                  its identity; not waiting on it"
             )?;
-            return Ok(3);
+            return Ok(Some(3));
         }
         let status = load(&state, &short);
         let projection = project(&status);
@@ -800,7 +820,7 @@ pub fn run_wait_with<W: Write>(
                 projection.label(),
                 reason(&status)
             )?;
-            return Ok(0);
+            return Ok(Some(0));
         }
         if now_fn().saturating_sub(start) >= args.timeout_secs {
             writeln!(
@@ -811,16 +831,237 @@ pub fn run_wait_with<W: Write>(
                 args.until,
                 projection.label()
             )?;
-            return Ok(2);
+            return Ok(Some(2));
         }
-        sleep_fn(interval);
-        interval = next_poll_interval(interval);
-    }
+        Ok(None)
+    })
 }
 
 pub fn run_wait<W: Write>(args: &WaitArgs, w: &mut W) -> CtxResult<i32> {
     let env = super::config::env_from_process();
     run_wait_with(args, w, &env, &super::state::now_secs, &std::thread::sleep)
+}
+
+// ---------------------------------------------------------------------
+// Verb: `zirv ctx watch` (issue #724)
+// ---------------------------------------------------------------------
+
+/// A session's terminal-for-`watch` projections -- the counterpart to
+/// `delegation::Phase::is_terminal()` for the other kind of target `watch`
+/// accepts. `watch` (unlike `wait`) names no `--until`: it streams every
+/// transition it observes and stops at whichever of these it reaches first,
+/// because a caller polling for observability wants "this session is done",
+/// not one specific one of the three ways "done" can look.
+fn projection_is_terminal(projection: Projection) -> bool {
+    matches!(
+        projection,
+        Projection::DoneUnread | Projection::IdleSeen | Projection::Failed
+    )
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WatchArgs {
+    /// Short id (or a unique prefix of one) of a session, or a delegation id
+    /// in this repository, to watch until it reaches a terminal state.
+    pub target: String,
+    /// Resume cursor: skip transitions already reported through this
+    /// revision. Neither backing store (`SessionStatus`, `delegation::
+    /// Record`) keeps a history, only the CURRENT revision -- so this
+    /// guarantees a resumed watch never re-prints a transition it already
+    /// saw and always sees the latest state, never a replay of every
+    /// intermediate transition that happened while nobody was watching.
+    #[arg(long)]
+    pub since: Option<u64>,
+    /// Give up and exit 2 after this many seconds.
+    #[arg(long, default_value_t = 600)]
+    pub timeout_secs: u64,
+    /// Machine-readable output: one `{revision, phase, at}` object per line,
+    /// never a single terminal blob.
+    #[arg(long)]
+    pub json: bool,
+    /// Repository a delegation id is resolved against, when `target` does
+    /// not match a live session. Defaults to the current directory, the same
+    /// fallback `zirv ctx doctor --repo`/`zirv ctx mcp serve --repo` use.
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+}
+
+/// Writes one observed transition, in whichever shape `args.json` asks for.
+fn emit_watch_line<W: Write>(
+    w: &mut W,
+    json: bool,
+    label: &str,
+    revision: u64,
+    phase: &str,
+    at: u64,
+) -> CtxResult<()> {
+    if json {
+        let line = serde_json::to_string(&serde_json::json!({
+            "revision": revision,
+            "phase": phase,
+            "at": at,
+        }))?;
+        writeln!(w, "{line}")?;
+    } else {
+        writeln!(
+            w,
+            "zirv ctx watch: {label}: revision {revision} -> {phase} (at {at})"
+        )?;
+    }
+    Ok(())
+}
+
+/// Resolves `args.target` as a live session first, falling back to a
+/// delegation id in the current repository when no live session matches --
+/// the same "whichever the id matches" resolution the issue proposes.
+pub fn run_watch_with<W: Write>(
+    args: &WatchArgs,
+    w: &mut W,
+    env: EnvLookup<'_>,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+) -> CtxResult<i32> {
+    let state = super::state::StateDir::resolve(env)?;
+    match super::sessions::resolve_prefix(&state, &args.target) {
+        Ok(resolved) => run_watch_session(args, w, &state, resolved, now_fn, sleep_fn),
+        Err(err @ super::sessions::ResolveError::Ambiguous(_)) => Err(format!(
+            "zirv ctx watch: {}",
+            super::sessions::resolve_error_with_diagnostics(&err, &state, env)
+        )
+        .into()),
+        Err(super::sessions::ResolveError::NotFound { .. }) => {
+            let repo = match &args.repo {
+                Some(repo) => repo.clone(),
+                None => std::env::current_dir()?,
+            };
+            if super::delegation::load(&state, &repo, &args.target).is_none() {
+                return Err(format!(
+                    "zirv ctx watch: {:?} matches neither a live session nor a delegation in \
+                     this repository",
+                    args.target
+                )
+                .into());
+            }
+            run_watch_delegation(args, w, &state, &repo, now_fn, sleep_fn)
+        }
+    }
+}
+
+/// The session half of [`run_watch_with`]: pins `(pid, started_at)` exactly
+/// as `run_wait_with` does and reuses [`same_generation`] unchanged, but
+/// prints every DISTINCT `SessionStatus::revision` observed since `--since`
+/// (or since watch started, when it is absent) instead of only the final one.
+fn run_watch_session<W: Write>(
+    args: &WatchArgs,
+    w: &mut W,
+    state: &super::state::StateDir,
+    resolved: super::sessions::Record,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+) -> CtxResult<i32> {
+    let pinned_pid = resolved.pid;
+    let pinned_started_at = resolved.start_time;
+    let short = resolved.short.clone();
+    let mut seen = args.since;
+
+    let start = now_fn();
+    poll_loop(sleep_fn, || -> CtxResult<Option<i32>> {
+        let Some(current) = super::sessions::load_record(state, &short) else {
+            writeln!(w, "zirv ctx watch: {short}: registry entry disappeared")?;
+            return Ok(Some(3));
+        };
+        if !same_generation(pinned_pid, pinned_started_at, &current) {
+            writeln!(
+                w,
+                "zirv ctx watch: {short}: the pinned process was replaced by a new one reusing \
+                 its identity; not watching it"
+            )?;
+            return Ok(Some(3));
+        }
+        let status = load(state, &short);
+        let projection = project(&status);
+        if seen.is_none_or(|s| status.revision > s) {
+            emit_watch_line(
+                w,
+                args.json,
+                &short,
+                status.revision,
+                projection.label(),
+                status.last_transition,
+            )?;
+            seen = Some(status.revision);
+        }
+        if projection_is_terminal(projection) {
+            return Ok(Some(0));
+        }
+        if now_fn().saturating_sub(start) >= args.timeout_secs {
+            writeln!(
+                w,
+                "zirv ctx watch: {short}: timed out after {}s (currently {})",
+                args.timeout_secs,
+                projection.label()
+            )?;
+            return Ok(Some(2));
+        }
+        Ok(None)
+    })
+}
+
+/// The delegation half of [`run_watch_with`]: no process to pin (a delegation
+/// has no pid of its own), so "gone" means the record file itself
+/// disappeared rather than a generation mismatch. Prints every DISTINCT
+/// `delegation::Record::revision` observed since `--since`, and stops the
+/// moment `Phase::is_terminal()` holds.
+fn run_watch_delegation<W: Write>(
+    args: &WatchArgs,
+    w: &mut W,
+    state: &super::state::StateDir,
+    repo: &std::path::Path,
+    now_fn: &dyn Fn() -> u64,
+    sleep_fn: &dyn Fn(Duration),
+) -> CtxResult<i32> {
+    let mut seen = args.since;
+    let start = now_fn();
+    poll_loop(sleep_fn, || -> CtxResult<Option<i32>> {
+        let Some(record) = super::delegation::load(state, repo, &args.target) else {
+            writeln!(
+                w,
+                "zirv ctx watch: {}: delegation record disappeared",
+                args.target
+            )?;
+            return Ok(Some(3));
+        };
+        if seen.is_none_or(|s| record.revision > s) {
+            emit_watch_line(
+                w,
+                args.json,
+                &args.target,
+                record.revision,
+                record.phase.as_str(),
+                record.updated_at,
+            )?;
+            seen = Some(record.revision);
+        }
+        if record.phase.is_terminal() {
+            return Ok(Some(0));
+        }
+        if now_fn().saturating_sub(start) >= args.timeout_secs {
+            writeln!(
+                w,
+                "zirv ctx watch: {}: timed out after {}s (currently {})",
+                args.target,
+                args.timeout_secs,
+                record.phase.as_str()
+            )?;
+            return Ok(Some(2));
+        }
+        Ok(None)
+    })
+}
+
+pub fn run_watch<W: Write>(args: &WatchArgs, w: &mut W) -> CtxResult<i32> {
+    let env = super::config::env_from_process();
+    run_watch_with(args, w, &env, &super::state::now_secs, &std::thread::sleep)
 }
 
 // ---------------------------------------------------------------------
@@ -941,6 +1182,7 @@ fn persist(state: &super::state::StateDir, short: &str, status: &SessionStatus) 
 
 #[cfg(test)]
 mod tests {
+    use super::super::delegation;
     use super::*;
 
     fn obs(authority: Authority, now: u64) -> Observation {
@@ -1706,5 +1948,310 @@ mod tests {
             interval, WAIT_POLL_MAX,
             "must cap rather than keep doubling"
         );
+    }
+
+    // -- `zirv ctx watch` (issue #724) ---------------------------------------
+
+    fn test_repo() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zirv-attention-watch-repo-{}-{}",
+            std::process::id(),
+            now_for_test()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn delegation_handle(delegation: &str) -> delegation::WorkerHandle {
+        delegation::WorkerHandle {
+            delegation: delegation.to_string(),
+            attempt: 1,
+            runtime: super::super::runtime::RuntimeKind::Native,
+            worker_session: format!("{delegation}-session"),
+            short: format!("{delegation}short"),
+            role: "worker".to_string(),
+            task: None,
+            group: None,
+            objective: None,
+            workdir: std::path::PathBuf::from("."),
+            manifest: None,
+            plan_override: false,
+        }
+    }
+
+    /// Writes a delegation record directly at a given `phase`/`revision`,
+    /// bypassing `record_launch`/`publish_terminal` -- this store only ever
+    /// keeps its CURRENT value, so a test simulating several transitions in
+    /// one watch has no way to seed a real history and instead overwrites
+    /// this same file between polls, exactly like `write_test_record` does
+    /// for the session registry above.
+    fn write_delegation_record(
+        state: &super::super::state::StateDir,
+        repo: &std::path::Path,
+        delegation: &str,
+        phase: delegation::Phase,
+        revision: u64,
+        updated_at: u64,
+    ) {
+        let record = delegation::Record {
+            schema_version: delegation::SCHEMA_VERSION,
+            repository: Some(repo.to_path_buf()),
+            handle: delegation_handle(delegation),
+            parent_session: None,
+            phase,
+            revision,
+            launched_at: 0,
+            updated_at,
+            exit_code: None,
+            result_path: None,
+            summary: None,
+            published: Vec::new(),
+            consumed: Vec::new(),
+            queued: Vec::new(),
+            reservation: None,
+            write_claim: None,
+            cancel_requested: false,
+            unknown_tool_outcomes: Vec::new(),
+            attempts: Vec::new(),
+        };
+        delegation::save(state, repo, &record).unwrap();
+    }
+
+    #[test]
+    fn watch_prints_one_line_per_recorded_delegation_phase_change() {
+        let (dir, state) = test_state();
+        let repo = test_repo();
+        let delegation = "wdeleg1";
+        write_delegation_record(
+            &state,
+            &repo,
+            delegation,
+            delegation::Phase::Launched,
+            0,
+            10,
+        );
+
+        let args = WatchArgs {
+            target: delegation.to_string(),
+            since: None,
+            timeout_secs: 5,
+            json: false,
+            repo: Some(repo.clone()),
+        };
+        let env = env_with_state(&dir);
+        let mut out = Vec::new();
+
+        // Two further phase changes are written as the watcher "sleeps"
+        // between polls -- the only way a test can simulate a store that
+        // never keeps more than its CURRENT value.
+        let step = std::cell::Cell::new(0u32);
+        let sleep_fn = |_: Duration| {
+            match step.get() {
+                0 => write_delegation_record(
+                    &state,
+                    &repo,
+                    delegation,
+                    delegation::Phase::Running,
+                    1,
+                    20,
+                ),
+                1 => write_delegation_record(
+                    &state,
+                    &repo,
+                    delegation,
+                    delegation::Phase::Completed,
+                    2,
+                    30,
+                ),
+                _ => {}
+            }
+            step.set(step.get() + 1);
+        };
+
+        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &sleep_fn).unwrap();
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "three recorded phase changes must yield three distinct watch lines: {text}"
+        );
+        assert!(lines[0].contains("revision 0 -> launched"), "{text}");
+        assert!(lines[1].contains("revision 1 -> running"), "{text}");
+        assert!(lines[2].contains("revision 2 -> completed"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn watch_since_skips_already_reported_delegation_revisions() {
+        let (dir, state) = test_state();
+        let repo = test_repo();
+        let delegation = "wdeleg2";
+        write_delegation_record(&state, &repo, delegation, delegation::Phase::Running, 1, 20);
+
+        let args = WatchArgs {
+            target: delegation.to_string(),
+            since: Some(1),
+            timeout_secs: 5,
+            json: false,
+            repo: Some(repo.clone()),
+        };
+        let env = env_with_state(&dir);
+        let mut out = Vec::new();
+        let sleep_fn = |_: Duration| {
+            write_delegation_record(
+                &state,
+                &repo,
+                delegation,
+                delegation::Phase::Completed,
+                2,
+                30,
+            );
+        };
+
+        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &sleep_fn).unwrap();
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "revision 1 was already reported through --since 1 and must not repeat: {text}"
+        );
+        assert!(lines[0].contains("revision 2 -> completed"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn watch_json_emits_one_object_per_line_never_a_terminal_blob() {
+        let (dir, state) = test_state();
+        let repo = test_repo();
+        let delegation = "wdeleg3";
+        write_delegation_record(
+            &state,
+            &repo,
+            delegation,
+            delegation::Phase::Completed,
+            0,
+            42,
+        );
+
+        let args = WatchArgs {
+            target: delegation.to_string(),
+            since: None,
+            timeout_secs: 5,
+            json: true,
+            repo: Some(repo.clone()),
+        };
+        let env = env_with_state(&dir);
+        let mut out = Vec::new();
+        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &|_| {}).unwrap();
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(lines[0]).expect("valid json line");
+        assert_eq!(value["revision"], 0);
+        assert_eq!(value["phase"], "completed");
+        assert_eq!(value["at"], 42);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn watch_session_streams_the_transition_into_a_terminal_projection() {
+        let (dir, state) = test_state();
+        let short = "wsess0001";
+        write_test_record(&state, short, std::process::id(), None);
+        record(
+            &state,
+            short,
+            Observation::new(Authority::AdapterHook, "turn started", 90, 1)
+                .with_lifecycle(Lifecycle::Working),
+            1,
+        );
+
+        let args = WatchArgs {
+            target: short.to_string(),
+            since: None,
+            timeout_secs: 5,
+            json: false,
+            repo: None,
+        };
+        let env = env_with_state(&dir);
+        let mut out = Vec::new();
+        let settled = std::cell::Cell::new(false);
+        let sleep_fn = |_: Duration| {
+            if !settled.get() {
+                record(
+                    &state,
+                    short,
+                    Observation::new(Authority::AdapterHook, "finished", 90, 2)
+                        .with_lifecycle(Lifecycle::Settled),
+                    2,
+                );
+                settled.set(true);
+            }
+        };
+        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &sleep_fn).unwrap();
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the Working start and the Settled transition must each print once: {text}"
+        );
+        assert!(lines[1].contains("done-unread"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_session_exits_3_when_the_pinned_process_is_replaced() {
+        let (dir, state) = test_state();
+        let short = "wsess0002";
+        write_test_record(&state, short, std::process::id(), Some(111));
+        record(
+            &state,
+            short,
+            Observation::new(Authority::AdapterHook, "turn started", 90, 1)
+                .with_lifecycle(Lifecycle::Working),
+            1,
+        );
+
+        let args = WatchArgs {
+            target: short.to_string(),
+            since: None,
+            timeout_secs: 5,
+            json: false,
+            repo: None,
+        };
+        let env = env_with_state(&dir);
+        let swapped = std::cell::Cell::new(false);
+        let sleep_fn = |_: Duration| {
+            if !swapped.get() {
+                write_test_record(&state, short, std::process::id(), Some(222));
+                swapped.set(true);
+            }
+        };
+        let mut out = Vec::new();
+        let code = run_watch_with(
+            &args,
+            &mut out,
+            &env,
+            &super::super::state::now_secs,
+            &sleep_fn,
+        )
+        .unwrap();
+        assert_eq!(code, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

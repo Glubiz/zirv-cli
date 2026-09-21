@@ -547,6 +547,11 @@ pub enum CtxVerb {
     /// Block until a session's attention projection matches, or time out
     /// (issue #349).
     Wait(attention::WaitArgs),
+    /// Block on a session or a delegation until it reaches a terminal state,
+    /// streaming one line per distinct transition observed along the way;
+    /// `--since <revision>` resumes without re-printing what an earlier
+    /// `watch` already reported (issue #724).
+    Watch(attention::WatchArgs),
     /// Stateless loop runner: a fresh headless session per cycle.
     #[command(name = "loop")]
     Loop(run_loop::LoopArgs),
@@ -779,6 +784,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Status(a) => status::run(a, &mut out),
         CtxVerb::ExplainStatus(a) => attention::run_explain_status(a, &mut out),
         CtxVerb::Wait(a) => attention::run_wait(a, &mut out),
+        CtxVerb::Watch(a) => attention::run_watch(a, &mut out),
         CtxVerb::Loop(a) => run_loop::run(a, &mut out),
         CtxVerb::Exec(a) => exec::run(a, &mut out),
         CtxVerb::Wrap(a) => wrap::run(a, &mut out),

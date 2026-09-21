@@ -884,9 +884,16 @@ to the section that documents it in depth.
   [Verbs](#verbs) and [Cross-harness fallback and
   handover](#cross-harness-fallback-and-handover).
 - **Status and attention** — `status`, `explain-status`, and `wait` report
-  or block on a session's composed attention projection; `snapshot` prints a
-  redacted, capped diagnostic summary. See [Verbs](#verbs) and [Signals and
-  verdicts](#signals-and-verdicts).
+  or block on a session's composed attention projection; `watch <session-or-
+  delegation> [--json] [--since <revision>]` blocks on a session OR a
+  `zirv agent` delegation id until it reaches a terminal state, printing one
+  line per distinct revision observed along the way instead of only the
+  final one; `--since` resumes without re-printing a revision an earlier
+  `watch` already reported — since neither store keeps a history, only its
+  current value, a resumed watch never replays every intermediate transition
+  that happened while nobody was watching, only the ones it happens to catch
+  plus the latest state; `snapshot` prints a redacted, capped diagnostic
+  summary. See [Verbs](#verbs) and [Signals and verdicts](#signals-and-verdicts).
 - **Mail and nudges** — `send`/`inbox` leave and read short notes between
   live sessions on this machine, and `nudge` wakes one early with a message;
   `kill` terminates a registered session outright. See [Sending mail between
