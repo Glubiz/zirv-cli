@@ -243,6 +243,25 @@ pub struct AgentArgs {
     /// respawn_decision` instead of ever marking it `Done` silently.
     #[arg(long)]
     pub task: Option<String>,
+    /// Issue #725: a YAML file describing this delegation declaratively,
+    /// instead of the long flag list above -- `brief`/`task`/`group`/
+    /// `workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/
+    /// `no_network`/`result` (`agent_manifest::apply`, the one place this
+    /// is resolved, called at the very top of `run_with` before anything
+    /// else reads `args`). UNTRUSTED input, exactly like any other
+    /// repo-owned surface: resolved into these same `AgentArgs` fields and
+    /// nothing else, then validated through the unchanged existing gates
+    /// below -- it can never grant more than the same flags typed on the
+    /// CLI could. A field both the manifest and an explicit CLI flag name
+    /// is a hard error when they disagree, except the narrowing-capable
+    /// fields (`no_network`, `budget_tokens`, `max_tool_calls`,
+    /// `path_scope`, read-only `mode`), where the stricter value always
+    /// wins regardless of source. Relative paths inside the manifest
+    /// (`workdir`, `result.schema`, `path_scope`) resolve against the
+    /// manifest file's own directory. No `agent: <AgentManifest id>`
+    /// field: see `agent_manifest`'s own doc comment for why v1 drops it.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
     /// Issue #452: print a machine-readable delegation receipt instead of
     /// the human lines -- see [`DelegationReceipt`]. Exit codes are
     /// unchanged; this only changes what reaches stdout.
@@ -315,6 +334,7 @@ impl Default for AgentArgs {
             no_network: false,
             depth: None,
             task: None,
+            manifest: None,
             json: false,
             runtime: super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
@@ -3718,6 +3738,13 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    // Issue #725: resolved before anything else below reads a field
+    // `--manifest` can touch -- see `agent_manifest`'s own doc comment for
+    // the trust-boundary rules this merge follows. A no-op when
+    // `args.manifest` is `None`, exactly today's behavior.
+    let mut owned_args = args.clone();
+    super::agent_manifest::apply(&mut owned_args)?;
+    let args = &owned_args;
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
     // Issue #479 (roadmap N10): resolved first, and an unknown value is a
@@ -7786,6 +7813,7 @@ mod tests {
             no_network: false,
             depth: None,
             task: None,
+            manifest: None,
             json: false,
             runtime: super::super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
