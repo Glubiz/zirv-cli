@@ -2432,7 +2432,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
 | `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
-| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` reports coming soon and refuses to start (also `zirv agent`) |
+| `zirv ctx agent <name> <prompt> [--worktree] [--workspace <name>]` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; a selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`) |
 | `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
@@ -2444,6 +2444,50 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the five advisory gates, the credential env var name and presence (never the value), the endpoint and model, and why it is or is not active — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+
+#### Declarative worker workspaces
+
+The harness runtime can prepare a repeatable worker environment before the
+worker receives its first turn. Declare one or more `[[workspace]]` entries in
+`.zirv/ctx.toml`, then select one explicitly:
+
+```toml
+[[workspace]]
+name = "backend"
+git = [
+  { repo = "https://github.com/example/api-contracts.git", branch = "main", dir = "deps/api-contracts" },
+]
+mcp_servers = ["linear"]
+skills = [{ id = "systematic-debugging" }]
+setup = ["cargo fetch", "cargo build --workspace"]
+```
+
+```console
+zirv ctx agent claude "implement the API change" --worktree --workspace backend
+```
+
+With `--worktree`, extra repositories and setup commands run inside the fresh
+linked worktree. Without it, the explicit `--workdir` or current checkout is
+the workspace root. Repositories are cloned in declaration order and setup
+commands run sequentially after every clone is ready. A failed clone or setup
+command aborts the delegation; the worker never starts. Existing clone
+directories are accepted only when their `origin` and current branch match the
+declaration.
+
+`mcp_servers` contains names only—never commands, endpoints, or secrets. Zirv
+checks the final routed harness's own MCP configuration (including Claude
+`--mcp-config`/`.mcp.json` and Codex `mcp_servers` configuration) and refuses
+the delegation if any name is absent. `skills` are resolved through the normal
+`SkillRegistry`, including version pins and dependencies, and are attached as
+labelled instructions that grant no authority. A non-empty workspace skill
+list overrides an agent manifest's default skills; an empty list preserves the
+manifest defaults.
+
+Workspace arrays from the operator and repository layers are additive. Names
+must be unique, unknown fields are rejected, git destinations must be relative
+children outside `.zirv`, and the repository layer cannot replace an
+operator-defined workspace. A repository workspace remains inert until the
+operator (or an already-authorized delegating seat) selects it by name.
 
 ### Runtime backends
 
@@ -3795,6 +3839,7 @@ keep only your own.
 | Native release availability | fixed in the binary | no flag, configuration, environment variable or Cargo feature can enable native execution |
 | `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
 | `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
+| `[[workspace]]` in `.zirv/ctx.toml` | repo-owned, untrusted and inert until an operator explicitly selects it with `zirv ctx agent --workspace <name>` | additive-only across layers; cannot replace an operator workspace, grant capabilities, define MCP credentials, or launch anything before the selected adapter's MCP/skill requirements and synchronous materialization gate pass |
 | `ZIRV_CTX_OBFUSCATE_MODE` | operator environment | selects `off`, `flag` or `obfuscate`; no repository equivalent |
 | `ZIRV_CTX_OBFUSCATE_ENTROPY` | operator environment | selects whether heuristic entropy findings are flagged or masked |
 | `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |

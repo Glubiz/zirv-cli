@@ -161,6 +161,14 @@ pub struct AgentArgs {
     /// so has no tree to isolate.
     #[arg(long, default_value_t = false)]
     pub worktree: bool,
+    /// Materialize a named `[[workspace]]` from `.zirv/ctx.toml` before the
+    /// harness worker launches. The selected workspace may declare extra git
+    /// repositories, required MCP server names, skills, and ordered setup
+    /// commands. All are strict pre-launch gates. With `--worktree`, they are
+    /// materialized inside the fresh linked tree; otherwise the current
+    /// checkout (or explicit `--workdir`) is the workspace root.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Attach the repo's accepted workflow artifact for this stage to the
     /// worker's task prompt: resolves `--workflow` (or the repo's own
     /// active workflow when unstated), reads its accepted intent/spec/plan
@@ -306,6 +314,7 @@ impl Default for AgentArgs {
             workdir: None,
             mode: WorkerMode::Writing,
             worktree: false,
+            workspace: None,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -3727,6 +3736,9 @@ pub fn run_with<W: Write>(
     // same-harness refusal, `adapters::select`, cross-harness rerouting --
     // is meaningless for a native worker, whose `<name>` is a provider route.
     let native = resolve_runtime(args)? == super::runtime::RuntimeKind::Native;
+    if native && args.workspace.is_some() {
+        return Err("--workspace is available only for the harness runtime".into());
+    }
     if !native && let Some(message) = same_harness_refusal(args, env) {
         return Err(message.into());
     }
@@ -3753,6 +3765,19 @@ pub fn run_with<W: Write>(
     // (every headless delegation itself, and any interactive session not yet
     // wired to a seat by task 5).
     super::seat::fence(&state)?;
+    // Workspace selection must be resolved and its skill references checked
+    // before worktree allocation. A bad name or stale skill therefore cannot
+    // leave even a clean temporary tree behind. The same loaded config is
+    // reused by all later routing and spawn gates.
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
+    let selected_workspace = args
+        .workspace
+        .as_deref()
+        .map(|name| super::workspace::resolve(&cfg.workspace, name))
+        .transpose()?;
+    if let Some(workspace) = selected_workspace {
+        super::workspace::validate_skills(workspace, repo)?;
+    }
     // Issue #228: validated and canonicalised before anything else in this
     // delegation runs -- a bad `--workdir` must fail loudly, up front, not
     // surface as a confusing sandbox error deep inside a harness's own
@@ -3794,6 +3819,10 @@ pub fn run_with<W: Write>(
         },
     );
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
+    let prompt = match selected_workspace {
+        Some(workspace) => super::workspace::attach_skills(workspace, repo, prompt)?,
+        None => prompt,
+    };
 
     // Issue #250: no `--workdir` means the worker stays confined to `repo`
     // (see `effective_launch_repo`) -- a non-fatal nudge toward `--workdir`
@@ -3815,16 +3844,6 @@ pub fn run_with<W: Write>(
     {
         writeln!(w, "{hint}")?;
     }
-
-    // Loaded here rather than after the dashboard-join attempt below (its
-    // former position): the spawn gate needs `cfg.pace` before either fork
-    // of this delegation -- a pane spawn and an inline supervised run -- is
-    // chosen, and `try_join_dashboard` is the fork point between them.
-    // `exec::run_with` still loads its own copy internally on the inline path
-    // (the same pattern `chat.rs` already uses ahead of `wrap::run_with`),
-    // so this remains one extra read of the same layered config rather than
-    // a new code path.
-    let cfg = CtxConfig::load_for_launch(repo, env)?;
 
     // Issue #262: this session's OWN delegation envelope (root, when
     // `ENVELOPE_ENV` is absent), read before any routing/spawn decision --
@@ -4115,6 +4134,58 @@ pub fn run_with<W: Write>(
         eprintln!("zirv ctx agent: {}", automatic_route_message(&route, seat));
         route_applied = Some(route);
     }
+
+    // The route is final before workspace validation: MCP requirements must
+    // be checked against the adapter that will actually launch, not merely
+    // the originally requested harness. Materialization remains ahead of the
+    // dashboard/headless fork, so neither path can spawn early. A workspace
+    // writing into an existing checkout takes a short-lived writer permit;
+    // a fresh `--worktree` is already unique to this delegation.
+    let _workspace_ready = if let Some(workspace) = selected_workspace {
+        let adapter = adapters::select(Some(&routed_args.name), &[], &cfg)?;
+        let root = effective_launch_repo(routed_args.workdir.as_deref(), repo);
+        let flags = headless_worker_flags(&cfg, &routed_args, adapter.as_ref());
+        let materialization_permit = if !args.worktree && workspace.requires_write() {
+            let tree = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let identity = super::seat::env_seat_identity();
+            let fence = identity
+                .as_ref()
+                .map(|(short, generation)| permit::SeatFence {
+                    short,
+                    generation: *generation,
+                });
+            Some(
+                permit::acquire_writer(
+                    &state,
+                    cfg.supervise.max_writers,
+                    &format!("workspace {}: {}", workspace.name, routed_args.name),
+                    &tree,
+                    fence,
+                )
+                .map_err(|refusal| {
+                    permit::describe_writer_refusal(
+                        &refusal,
+                        &state,
+                        cfg.supervise.max_writers,
+                        &tree,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let ready = super::workspace::materialize(
+            workspace,
+            &root,
+            adapter.as_ref(),
+            &flags,
+            env,
+        )?;
+        drop(materialization_permit);
+        Some(ready)
+    } else {
+        None
+    };
 
     // Issue #358 (T9): usage headroom is a ranking signal for
     // `route_new_delegation` above, never a reason to refuse or delay a
@@ -7778,6 +7849,7 @@ mod tests {
             workdir: None,
             mode: WorkerMode::Writing,
             worktree: false,
+            workspace: None,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -8916,6 +8988,48 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// Issue #716: a workspace's MCP list is a hard dependency checked after
+    /// final adapter resolution and before either dashboard or headless spawn.
+    /// The Claude adapter's readiness probe may invoke the fake binary with
+    /// `--help`; a real worker invocation is the one carrying `--session-id`,
+    /// and none may occur when the named server is absent.
+    #[test]
+    fn workspace_missing_mcp_server_refuses_before_worker_spawn() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[[workspace]]\nname = \"needs-linear\"\nmcp_servers = [\"linear\"]\n",
+        )
+        .expect("workspace config");
+        let argv_log = tmp.path().join("argv.log");
+        unsafe {
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+
+        let env = base_env(&tmp.path().join("state"));
+        let args = AgentArgs {
+            workspace: Some("needs-linear".into()),
+            ..args_for("claude", "go")
+        };
+        let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect_err("missing MCP server must refuse");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+
+        assert!(error.to_string().contains("no configured MCP server(s): linear"));
+        let invocations = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        assert!(
+            invocations.lines().all(|line| !line.contains("--session-id")),
+            "the worker launched despite the missing MCP dependency: {invocations}"
+        );
     }
 
     /// Review finding (2026-09), finding 2a: `is_agent_managed_worktree`

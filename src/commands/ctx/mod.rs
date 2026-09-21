@@ -119,6 +119,7 @@ pub(crate) mod testrun;
 pub mod transcript_source;
 pub mod usage;
 pub mod window;
+pub mod workspace;
 pub mod worktree;
 pub mod wrap;
 

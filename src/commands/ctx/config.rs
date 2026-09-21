@@ -2901,6 +2901,12 @@ pub struct CapabilityEffectsConfig {
 pub struct CtxConfig {
     pub agent: Option<String>,
     pub agent_bin: Option<String>,
+    /// Explicitly selected harness-worker environments. Both the operator and
+    /// repository layers may add entries, but neither layer replaces the
+    /// other's list; duplicate names are rejected after the additive fold.
+    /// Repository entries are inert until an operator passes
+    /// `zirv ctx agent --workspace <name>`.
+    pub workspace: Vec<super::workspace::WorkspaceConfig>,
     pub score: ScoreConfig,
     pub wrap: WrapConfig,
     pub supervise: SuperviseConfig,
@@ -3903,6 +3909,24 @@ fn merge(base: &mut toml::Table, over: toml::Table) {
                 base.insert(key, value);
             }
         }
+    }
+}
+
+/// Add two array-valued trust layers without allowing the later repository
+/// layer to replace the operator's entries. A malformed value is preserved
+/// so the real `CtxConfig` deserializer still reports its exact type error.
+fn combine_additive_array(
+    home: Option<toml::Value>,
+    repo: Option<toml::Value>,
+) -> Option<toml::Value> {
+    match (home, repo) {
+        (None, value) | (value, None) => value,
+        (Some(toml::Value::Array(mut home)), Some(toml::Value::Array(repo))) => {
+            home.extend(repo);
+            Some(toml::Value::Array(home))
+        }
+        (Some(toml::Value::Array(_)), Some(repo_invalid)) => Some(repo_invalid),
+        (Some(home_invalid), Some(_)) => Some(home_invalid),
     }
 }
 
@@ -5394,7 +5418,7 @@ pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
     let mut table: toml::Table = toml::from_str(text)?;
     super::policy::resolve(table.remove(POLICY_SECTION), None, &|_| None)?;
     super::safety::resolve(table.remove(SAFETY_SECTION), None, &|_| None)?;
-    let _: CtxConfig = toml::Value::Table(table).try_into().map_err(|e| {
+    let cfg: CtxConfig = toml::Value::Table(table).try_into().map_err(|e| {
         let error_msg = e.to_string();
         // For operator validation, we can't track full provenance, but we can still
         // improve the message for common cases
@@ -5412,6 +5436,8 @@ pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
         let msg: Box<dyn std::error::Error> = format!("invalid ctx config: {}", error_msg).into();
         msg
     })?;
+    super::workspace::validate_catalogue(&cfg.workspace)
+        .map_err(|error| format!("invalid ctx config: {error}"))?;
     Ok(())
 }
 
@@ -5471,6 +5497,11 @@ impl CtxConfig {
         // the identical reason -- see `super::safety`'s module doc and the
         // `safety` field's own doc comment.
         let home_safety = merged.remove(SAFETY_SECTION);
+        // `[[workspace]]` is additive across trust layers. An ordinary TOML
+        // deep merge would replace the operator's entire array with the
+        // repository's array; lift both and append below instead. A duplicate
+        // name remains a loud validation error, never an override.
+        let home_workspaces = merged.remove("workspace");
         // `sandbox.extra_deny` gets the identical treatment, one level
         // deeper: a repo checkout may *add* deny entries (narrowing is
         // always safe), but the ordinary merge would let its array replace
@@ -5687,6 +5718,7 @@ impl CtxConfig {
         // silently dropped by this lift -- see `super::safety::resolve`'s
         // own doc comment for the defense-in-depth half of this guarantee.
         let repo_safety = repo_layer.remove(SAFETY_SECTION);
+        let repo_workspaces = repo_layer.remove("workspace");
         let repo_extra_deny = string_array(take_nested(&mut repo_layer, "sandbox", "extra_deny"));
         let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
         let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
@@ -5815,6 +5847,10 @@ impl CtxConfig {
             "workflow.deploy.minimum_tier",
         )?;
         merge(&mut merged, repo_layer);
+
+        if let Some(workspaces) = combine_additive_array(home_workspaces, repo_workspaces) {
+            merged.insert("workspace".to_string(), workspaces);
+        }
 
         // A repo may only tighten email handling to `mask`. `keep` never
         // overrides an operator's `mask`. Pattern tables are additive so a
@@ -6328,6 +6364,8 @@ impl CtxConfig {
                 format_config_error(&error_msg, &key_origins).into();
             add_config_error_prefix(msg)
         })?;
+        super::workspace::validate_catalogue(&cfg.workspace)
+            .map_err(add_config_error_prefix)?;
 
         // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
         // over here, once the full config (both layers, narrowing and env
@@ -13757,5 +13795,75 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&config_path, Permissions::from_mode(0o644));
         }
+    }
+
+    #[test]
+    fn workspace_tables_parse_from_repo_config() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            r#"[[workspace]]
+name = "dev"
+mcp_servers = ["linear"]
+skills = [{ id = "systematic-debugging", version = 1 }]
+setup = ["cargo fetch"]
+git = [{ repo = "https://example.test/docs.git", branch = "main", dir = "deps/docs" }]
+"#,
+        )
+        .expect("write");
+
+        let cfg = CtxConfig::load(repo.path(), &|_| None).expect("workspace config");
+        assert_eq!(cfg.workspace.len(), 1);
+        assert_eq!(cfg.workspace[0].name, "dev");
+        assert_eq!(cfg.workspace[0].git[0].dir, PathBuf::from("deps/docs"));
+    }
+
+    #[test]
+    fn workspace_layers_are_additive_and_duplicate_names_are_rejected() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir home");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[[workspace]]\nname = \"operator\"\n",
+        )
+        .expect("home config");
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir repo");
+        let repo_config = repo.path().join(".zirv/ctx.toml");
+        std::fs::write(&repo_config, "[[workspace]]\nname = \"project\"\n")
+            .expect("repo config");
+
+        let cfg = CtxConfig::load(repo.path(), &|_| None).expect("additive workspaces");
+        assert_eq!(
+            cfg.workspace
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>(),
+            ["operator", "project"]
+        );
+
+        std::fs::write(&repo_config, "[[workspace]]\nname = \"operator\"\n")
+            .expect("duplicate repo config");
+        let error = CtxConfig::load(repo.path(), &|_| None).expect_err("duplicate name");
+        assert!(error.to_string().contains("duplicate workspace name 'operator'"));
+    }
+
+    #[test]
+    fn workspace_unknown_fields_are_rejected() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[[workspace]]\nname = \"dev\"\nunknown = true\n",
+        )
+        .expect("write");
+        let error = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown field");
+        assert!(error.to_string().contains("unknown field `unknown`"), "{error}");
     }
 }
