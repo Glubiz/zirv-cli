@@ -2108,15 +2108,17 @@ output, and model responses by construction.
 
 ### What leaves this device
 
-Zirv masks credential and personal-data values before text it controls is sent
-to a model or another remote service. The default is deterministic, on-device
-obfuscation: repeated values become the same typed placeholder (for example
-`ZIRV_SECRET_GITHUB_PAT_1` or `ZIRV_PII_EMAIL_2@example.org`) in every session
-and worker for that repository. The plaintext mapping remains in an
-operator-owned, mode-0600 vault under the Zirv state directory. It is not
-encrypted at rest.
+Zirv can mask credential and personal-data values before text it controls is
+sent to a model or another remote service. This is opt-in and off by default;
+the operator turns it on with `[obfuscate] mode = "obfuscate"` in
+`~/.zirv/ctx.toml` (never a repository checkout -- see `REPO_FORBIDDEN`
+below). Once enabled, masking is deterministic and on-device: repeated values
+become the same typed placeholder (for example `ZIRV_SECRET_GITHUB_PAT_1` or
+`ZIRV_PII_EMAIL_2@example.org`) in every session and worker for that
+repository. The plaintext mapping remains in an operator-owned, mode-0600
+vault under the Zirv state directory. It is not encrypted at rest.
 
-| Surface | Default treatment |
+| Surface | Treatment once `obfuscate.mode` is enabled |
 |---|---|
 | Native direct-provider and official-harness requests | The final provider request boundary masks system text, messages, tool inputs/results, tool descriptions and schemas. Signed thinking with a finding fails closed. |
 | Claude Code tool results | `PostToolUse` masks all JSON string values before they return to model context. |
@@ -2137,7 +2139,7 @@ uses both prompt composition and lifecycle hooks.
 
 ```toml
 [obfuscate]
-mode = "obfuscate"          # off | flag | obfuscate
+mode = "obfuscate"          # off (default) | flag | obfuscate
 entropy = "flag"            # flag | obfuscate
 prompt = "flag"             # flag | block
 email_domain = "keep"       # keep | mask
@@ -3818,6 +3820,11 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.review` | `ZIRV_CTX_JEV_REVIEW` |
 | `jev.gates` | `ZIRV_CTX_JEV_GATES` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
+| `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
+| `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
+| `obfuscate.prompt` | `ZIRV_CTX_OBFUSCATE_PROMPT` |
+| `obfuscate.allow` | `~/.zirv/ctx.toml` only |
+| `obfuscate.literals_file` | `~/.zirv/ctx.toml` only |
 | `capabilities` | `ZIRV_CTX_CAPABILITIES` |
 | `runtime` | `ZIRV_CTX_RUNTIME` |
 

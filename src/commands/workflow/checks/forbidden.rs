@@ -66,6 +66,11 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     // Its three timing knobs (`open_after_failures`, `window_secs`,
     // `cooldown_secs`) are `REPO_FORBIDDEN` outright.
     "fallback.health.enabled",
+    // Issue #466: a repo may request `mask` (narrower: strips the retained
+    // domain hint), never force the operator's `mask` back to `keep`. See
+    // config.rs's fold right beside `obfuscate.literals_file`'s own
+    // `REPO_FORBIDDEN` row.
+    "obfuscate.email_domain",
     // `chat.model` is deliberately not `REPO_FORBIDDEN` (see [[Untrusted
     // Configuration]] / README.md's own trust-boundary intro): the one model
     // key a repo may set at all, because a wrong model choice costs money,

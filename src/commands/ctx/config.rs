@@ -2052,14 +2052,15 @@ pub struct ScreenConfig {
 }
 
 /// Secret and personal-data treatment applied before Zirv-controlled text
-/// crosses a model or network boundary. The default is protective; `off` and
-/// all allow-list entries are operator-only (see `REPO_FORBIDDEN`).
+/// crosses a model or network boundary. Opt-in: `off` is the default, and
+/// only the operator (never a repository checkout) can turn it on (see
+/// `REPO_FORBIDDEN`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ObfuscateMode {
+    #[default]
     Off,
     Flag,
-    #[default]
     Obfuscate,
 }
 
