@@ -345,12 +345,11 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 /// uncollapsed, non-diffed report), so the flags this bullet used to spell
 /// out are already the default a bare invocation gets.
 ///
-/// v19 (workflow-trigger-determinism): the lifecycle bullet no longer tells
-/// the session to guess a `<kind>` -- `zirv workflow start --task
-/// "<summary>"` with the id omitted now selects the pack deterministically
-/// from the summary (specialised packs included), so the default is the
-/// id-less form; a registry id from `zirv workflow list` is named only to
-/// force a specific one.
+/// v19: the lifecycle bullet no longer tells the session to guess a
+/// `<kind>` -- `zirv workflow start --task "<summary>"` with the id omitted
+/// now selects the pack deterministically from the summary (specialised
+/// packs included), so the default is the id-less form; a registry id from
+/// `zirv workflow list` is named only to force a specific one.
 ///
 /// The literal header the derived harness/orchestration roster
 /// (`PromptSource::Harnesses`) starts with -- named, like `CONTEXT_LAYER_

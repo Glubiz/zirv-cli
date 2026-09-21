@@ -67,9 +67,9 @@ pub(crate) fn word_tokens_ordered(text: &str) -> Vec<&str> {
 }
 
 /// Whether `objective_word` is `trigger_word`, or `trigger_word` with a
-/// trailing plural `s`/`es` -- workflow-trigger-determinism: the objective's
-/// token aligned with a multi-word trigger's LAST word may be a plural
-/// mention of it ("outages" hits the trigger word "outage").
+/// trailing plural `s`/`es` -- the objective's token aligned with a
+/// multi-word trigger's LAST word may be a plural mention of it ("outages"
+/// hits the trigger word "outage").
 fn objective_word_matches_trigger_word(objective_word: &str, trigger_word: &str) -> bool {
     objective_word == trigger_word
         || matches!(
@@ -79,9 +79,9 @@ fn objective_word_matches_trigger_word(objective_word: &str, trigger_word: &str)
 }
 
 /// Whether `trigger`'s own whole-word token sequence appears CONTIGUOUSLY in
-/// `objective_tokens` -- workflow-trigger-determinism: a plain `contains`
-/// substring check let a short trigger like "retro" false-positive inside an
-/// unrelated word ("Retrofit"). Every token but the sequence's last must
+/// `objective_tokens` -- a plain `contains` substring check let a short
+/// trigger like "retro" false-positive inside an unrelated word
+/// ("Retrofit"). Every token but the sequence's last must
 /// match exactly; the last may also match a trailing-plural objective token
 /// (see [`objective_word_matches_trigger_word`]).
 fn trigger_matches(trigger: &str, objective_tokens: &[&str]) -> bool {
@@ -194,7 +194,7 @@ fn effects_compatible_with_legacy_intent(intent: Intent, effects: EffectClass) -
 /// smaller, gated candidate pool. `None` when no specialised pack qualifies,
 /// so the caller falls back to the plain direct mapping.
 ///
-/// Trust boundary (review finding F1): a repository-provided pack
+/// Review finding, trust boundary: a repository-provided pack
 /// (`WorkflowSource::Repository`) is untrusted and may only ADD a
 /// non-colliding id (see `registry.rs`'s own widening refusal) -- it must
 /// never REFINE a legacy intent's own built-in pack out from under it, since
@@ -291,8 +291,7 @@ fn refine_legacy_selection(
 }
 
 /// Selects which registered pack should run for `classification`/
-/// `objective` (the raw task text) -- issue #542 chunk 3b, refined for
-/// workflow-trigger-determinism.
+/// `objective` (the raw task text) -- issue #542 chunk 3b.
 ///
 /// 1. A classified software-development intent (`feature`/`bugfix`/
 ///    `refactor`/`spike`/`review`) selects its own legacy kind pack by
@@ -448,8 +447,8 @@ mod tests {
         assert!(selection.alternatives.is_empty());
     }
 
-    /// Workflow-trigger-determinism: a trigger phrase matches on WHOLE-WORD
-    /// token sequences, never `contains` -- "retro" (a `pm-retrospective`
+    /// A trigger phrase matches on WHOLE-WORD token sequences, never
+    /// `contains` -- "retro" (a `pm-retrospective`
     /// trigger) must not fire inside "Retrofit". With no pack qualifying,
     /// this `Other`-intent objective falls all the way back to
     /// `adaptive-work`, exactly as the acceptance matrix expects.
@@ -468,9 +467,9 @@ mod tests {
         );
     }
 
-    /// Workflow-trigger-determinism: the objective's token aligned with a
-    /// trigger's LAST word may carry a trailing plural `s`/`es` -- "outages"
-    /// still hits the single-word trigger "outage".
+    /// The objective's token aligned with a trigger's LAST word may carry a
+    /// trailing plural `s`/`es` -- "outages" still hits the single-word
+    /// trigger "outage".
     #[test]
     fn a_trigger_s_last_word_matches_a_trailing_plural_in_the_objective() {
         assert!(trigger_matches(
@@ -753,7 +752,7 @@ present_as = "summary"
         .unwrap();
     }
 
-    /// Review finding F1 (trust boundary): a repository-provided pack is
+    /// Review finding, trust boundary: a repository-provided pack is
     /// untrusted and may only ADD a non-colliding id -- it must never
     /// refine a legacy intent's own built-in pack out from under it, even
     /// with a broad trigger ("fix") and a compatible `effects`. The

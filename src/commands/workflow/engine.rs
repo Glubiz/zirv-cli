@@ -4680,11 +4680,11 @@ pub struct StartOutcome {
 
 /// The one-line note [`start_workflow`] prints to STDERR when starting a new
 /// workflow silently changes which workflow this repository's active
-/// pointer names -- workflow-trigger-determinism item 5. Multiple workflows
-/// per repository are legitimate (`zirv workflow resume` restores any of
-/// them), so `start_workflow` never refuses the start; it only says what
-/// moved and how to get it back. A pure fn so its exact wording is
-/// unit-testable without capturing real process stderr.
+/// pointer names. Multiple workflows per repository are legitimate
+/// (`zirv workflow resume` restores any of them), so `start_workflow` never
+/// refuses the start; it only says what moved and how to get it back. A
+/// pure fn so its exact wording is unit-testable without capturing real
+/// process stderr.
 fn active_workflow_displaced_note(old_instance_id: &str, old_definition_id: &str) -> String {
     format!(
         "note: workflow {old_instance_id} ({old_definition_id}) is no longer this repository's \
@@ -4692,7 +4692,7 @@ fn active_workflow_displaced_note(old_instance_id: &str, old_definition_id: &str
     )
 }
 
-/// Review finding F2: writes `note` to `writer` best-effort. By the time
+/// Review finding: writes `note` to `writer` best-effort. By the time
 /// [`start_workflow`] reaches this, the new workflow is already saved --
 /// `eprintln!`/`crate::output::note` panic on a write error (a closed
 /// stderr, say), which would surface as a spurious failure of an already-
@@ -4725,11 +4725,11 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     let inherited_agent = session_identity().map(|(_, adapter)| adapter);
     let selected_agent = args.agent.clone().or(inherited_agent);
 
-    // Workflow-trigger-determinism: registry ids are validated lowercase at
-    // load (`definition::valid_id`), so an explicit id is matched case-
-    // insensitively by lowercasing it here once, before it feeds
-    // `WorkflowKind::from_pack_id` or `registry.get` -- `zirv workflow start
-    // Bugfix` must resolve exactly like `zirv workflow start bugfix`.
+    // Registry ids are validated lowercase at load (`definition::valid_id`),
+    // so an explicit id is matched case-insensitively by lowercasing it
+    // here once, before it feeds `WorkflowKind::from_pack_id` or
+    // `registry.get` -- `zirv workflow start Bugfix` must resolve exactly
+    // like `zirv workflow start bugfix`.
     let requested_id = args.id.as_deref().map(str::to_ascii_lowercase);
 
     // Issue #542 chunk 3b: an explicit id always wins outright, no
@@ -4821,11 +4821,11 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
                 .map_err(|_| format!("step '{}': unknown agent role '{role}'", step.id))?;
         }
     }
-    // Workflow-trigger-determinism item 5: read the CURRENT active pointer
-    // before it gets overwritten below, so a start that silently displaces a
-    // still-running workflow can be reported after the fact -- multiple
-    // workflows per repository are legitimate (`zirv workflow resume`
-    // restores any of them), so this never refuses the start itself.
+    // Read the CURRENT active pointer before it gets overwritten below, so
+    // a start that silently displaces a still-running workflow can be
+    // reported after the fact -- multiple workflows per repository are
+    // legitimate (`zirv workflow resume` restores any of them), so this
+    // never refuses the start itself.
     let previously_active = load_active(state_dir, &repo).ok().flatten();
     let mut state = WorkflowState::start_from_pack(
         repo,
@@ -4915,10 +4915,10 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let repo = resolve_repo(args.repo.as_deref())?;
             let registry = load_workflow_registry(&repo, args.built_in_only)?;
             report_registry_warnings(&registry);
-            // Workflow-trigger-determinism: same case-insensitive id match
-            // as `workflow start` -- registry ids are validated lowercase
-            // at load, so `zirv workflow show Bugfix` must resolve like
-            // `zirv workflow show bugfix`.
+            // Same case-insensitive id match as `workflow start` --
+            // registry ids are validated lowercase at load, so `zirv
+            // workflow show Bugfix` must resolve like `zirv workflow show
+            // bugfix`.
             let workflow = registry.get(&args.id.to_ascii_lowercase())?;
             if args.json {
                 serde_json::to_writer_pretty(&mut *writer, workflow)?;
@@ -8319,10 +8319,9 @@ mod tests {
         );
     }
 
-    /// Workflow-trigger-determinism item 4: an explicit id is matched
-    /// case-insensitively -- `zirv workflow start Bugfix` must resolve
-    /// exactly like `zirv workflow start bugfix` rather than exiting 2
-    /// "unknown workflow 'Bugfix'".
+    /// An explicit id is matched case-insensitively -- `zirv workflow start
+    /// Bugfix` must resolve exactly like `zirv workflow start bugfix`
+    /// rather than exiting 2 "unknown workflow 'Bugfix'".
     #[test]
     fn start_resolves_an_explicit_id_case_insensitively() {
         let repo = tempdir().unwrap();
@@ -8363,8 +8362,8 @@ mod tests {
         );
     }
 
-    /// Workflow-trigger-determinism item 5: `zirv workflow show` resolves
-    /// its id the same case-insensitive way as `start`.
+    /// `zirv workflow show` resolves its id the same case-insensitive way
+    /// as `start`.
     #[test]
     fn show_resolves_an_explicit_id_case_insensitively() {
         let repo = tempdir().unwrap();
@@ -8384,11 +8383,10 @@ mod tests {
         assert_eq!(workflow.definition.id, "bugfix");
     }
 
-    /// Workflow-trigger-determinism item 5: the exact wording of the note
-    /// `start_workflow` prints to STDERR when a start silently displaces a
-    /// different, still-running workflow as this repository's active one.
-    /// A pure fn, so the wording is checked directly rather than by
-    /// capturing real process STDERR.
+    /// The exact wording of the note `start_workflow` prints to STDERR when
+    /// a start silently displaces a different, still-running workflow as
+    /// this repository's active one. A pure fn, so the wording is checked
+    /// directly rather than by capturing real process STDERR.
     #[test]
     fn active_workflow_displaced_note_names_both_ids_and_the_resume_command() {
         let note = active_workflow_displaced_note("abc-123", "feature");
@@ -8401,7 +8399,7 @@ mod tests {
         );
     }
 
-    /// Review finding F2: a write failure (a closed stderr, say) must never
+    /// Review finding: a write failure (a closed stderr, say) must never
     /// panic -- the new workflow this note is ABOUT is already saved by the
     /// time it's printed, so a failure here must degrade silently rather
     /// than turning an already-successful start into a reported failure.
@@ -8421,10 +8419,10 @@ mod tests {
         best_effort_write_displacement_note(AlwaysErrors, "note: irrelevant");
     }
 
-    /// Workflow-trigger-determinism item 5: starting a second workflow for
-    /// the same repository while an earlier one is still `Running` must
-    /// NOT refuse -- multiple workflows per repository are legitimate, and
-    /// `zirv workflow resume` restores the displaced one. This only proves
+    /// Starting a second workflow for the same repository while an earlier
+    /// one is still `Running` must NOT refuse -- multiple workflows per
+    /// repository are legitimate, and `zirv workflow resume` restores the
+    /// displaced one. This only proves
     /// the non-refusal and that the active pointer now names the new run;
     /// the note text itself is covered by
     /// `active_workflow_displaced_note_names_both_ids_and_the_resume_command`

@@ -123,13 +123,11 @@ pub fn nudge_due(
 }
 
 /// The nudge message itself. There is no task text at the point a nudge
-/// fires, so it never guesses a workflow kind (workflow-trigger-
-/// determinism, replacing the old always-`feature`-in-practice
-/// `hook::classified_kind`): the printed command omits the id entirely --
-/// `zirv workflow start` with no id selects deterministically from the task
-/// once the operator supplies one. Under [`AdoptionPolicy::Enforce`] an
-/// extra sentence names the delegation gate this policy also applies
-/// (`ctx::agent::run_with`).
+/// fires, so it never guesses a workflow kind: the printed command omits
+/// the id entirely -- `zirv workflow start` with no id selects
+/// deterministically from the task once the operator supplies one. Under
+/// [`AdoptionPolicy::Enforce`] an extra sentence names the delegation gate
+/// this policy also applies (`ctx::agent::run_with`).
 ///
 /// Wrapper behaviour redesign (2026-09-01): the wording is now proportional
 /// -- it names a workflow as something to start "if it spans several areas
@@ -276,10 +274,9 @@ mod tests {
         assert!(nudge_due(AdoptionPolicy::Nudge, true, false, 25, Some(12)));
     }
 
-    /// Workflow-trigger-determinism: the nudge names no kind (there is no
-    /// task text yet to classify one from) -- just the counts and an
-    /// id-less `zirv workflow start`, which selects deterministically once
-    /// the operator supplies `--task`.
+    /// The nudge names no kind (there is no task text yet to classify one
+    /// from) -- just the counts and an id-less `zirv workflow start`, which
+    /// selects deterministically once the operator supplies `--task`.
     #[test]
     fn nudge_text_names_no_kind_and_reports_the_counts() {
         let s = AdoptionSignals {

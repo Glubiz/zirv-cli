@@ -611,7 +611,7 @@ fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
         // login crash") ONLY when that word is either the task's very last
         // token, or is directly followed by one of for/to/in/on -- a bare
         // mention of the word as an ordinary noun phrase ("Add a bugfix
-        // changelog section") must stay Feature. Review finding F8: EVERY
+        // changelog section") must stay Feature. Review finding: EVERY
         // fix/bugfix/hotfix token in the window is checked, not just the
         // first -- "Implement a fix/hotfix for startup" must still trigger
         // on "hotfix" even though the earlier "fix" alone doesn't qualify.
@@ -666,10 +666,10 @@ fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
 }
 
 /// Deterministic intent classification from `task` (already lowercased by
-/// [`classify`]) -- workflow-trigger-determinism: whole-word tokens only,
-/// never a substring match ("prefix" no longer contains "fix", "explorer"
-/// no longer contains "explore"). Tier 1 reads the task's own leading verb,
-/// once leading filler is skipped -- the strongest, most literal signal of
+/// [`classify`]). Whole-word tokens only, never a substring match ("prefix"
+/// no longer contains "fix", "explorer" no longer contains "explore").
+/// Tier 1 reads the task's own leading verb, once leading filler is
+/// skipped -- the strongest, most literal signal of
 /// what is being asked. Tier 2, reached only when tier 1 found no leading
 /// verb, falls back to a whole-word scan anywhere in the task, in a fixed
 /// priority order. An empty or entirely-filler task matches neither tier and
@@ -1025,11 +1025,10 @@ mod tests {
         assert_eq!(classify(&value).unwrap(), classify(&value).unwrap());
     }
 
-    /// Workflow-trigger-determinism: `infer_intent` matches WHOLE words
-    /// only, never a substring, and reads the task's leading verb before
-    /// falling back to a scan of the rest of the words. Table-driven over
-    /// the cases the old substring matcher got wrong plus the tiering rules
-    /// themselves.
+    /// `infer_intent` matches WHOLE words only, never a substring, and reads
+    /// the task's leading verb before falling back to a scan of the rest of
+    /// the words. Table-driven over the cases the old substring matcher got
+    /// wrong plus the tiering rules themselves.
     #[test]
     fn infer_intent_matches_whole_words_leading_verb_first() {
         let cases: &[(&str, Intent)] = &[
@@ -1075,7 +1074,7 @@ mod tests {
             // mention stays Feature.
             ("Add a bugfix changelog section", Intent::Feature),
             ("Add a hotfix for the login crash", Intent::Bugfix),
-            // Review finding F8: every fix/bugfix/hotfix token in the
+            // Review finding: every fix/bugfix/hotfix token in the
             // window is checked, not just the first -- the leading "fix"
             // alone doesn't qualify (next token "hotfix" isn't a
             // preposition), but "hotfix" does (followed by "for").

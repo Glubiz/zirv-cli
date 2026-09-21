@@ -685,11 +685,11 @@ const WORKFLOW_VERB_ARTICLE_ID: &[(&str, &str)] = &[
 
 /// Negation words that aren't themselves a contraction of an auxiliary verb
 /// -- [`is_negation_word`]'s other arms generalise every "n't" form instead
-/// of listing them (review finding F4).
+/// of listing them.
 const NEGATION_WORDS: &[&str] = &["not", "no", "never", "avoid", "without", "skip"];
 
-/// Auxiliary/modal stems whose "n't" contraction is a negator, checked
-/// against a word with a trailing "nt" stripped -- review finding F4:
+/// Review finding: auxiliary/modal stems whose "n't" contraction is a
+/// negator, checked against a word with a trailing "nt" stripped --
 /// generalises "dont"/"cant"/"wont"/"isnt"/"doesnt"/"shouldnt"/... (typed
 /// with no apostrophe at all) from this one small list of STEMS, rather
 /// than needing an entry for every contracted FORM.
@@ -699,7 +699,7 @@ const NEGATION_AUX_STEMS: &[&str] = &[
 ];
 
 /// Whether `word` (already lowercased, a whole raw word -- see
-/// [`clause_words`]) negates what follows. Review finding F4: rather than
+/// [`clause_words`]) negates what follows. Review finding: rather than
 /// listing every negating stem, this generalises "any `<word>n't` is a
 /// negator" -- covers the straight apostrophe, the curly one (`\u{2019}`,
 /// U+2019), and the same contraction typed with no apostrophe at all
@@ -721,8 +721,8 @@ fn is_negation_word(word: &str) -> bool {
 /// The same [`NEGATION_LOOKBEHIND_WORDS`] distance [`phrase_is_asserted`]
 /// uses, applied to [`clause_words`] rather than a raw-text byte offset --
 /// [`explicit_workflow_requests`]'s id-bearing templates have a
-/// variable-width slot a literal substring search can't express. Scoped to
-/// ONE CLAUSE's own words (review finding F7): the caller never passes a
+/// variable-width slot a literal substring search can't express. Review
+/// finding: scoped to ONE CLAUSE's own words -- the caller never passes a
 /// window that could reach across a clause boundary into another one.
 fn words_negate_before(words: &[String], before: usize) -> bool {
     words[before.saturating_sub(NEGATION_LOOKBEHIND_WORDS)..before]
@@ -730,29 +730,98 @@ fn words_negate_before(words: &[String], before: usize) -> bool {
         .any(|word| is_negation_word(word))
 }
 
-/// Splits `text` into clauses at `,`/`;`/`:`, a newline, or a sentence-
-/// ending `.`/`!`/`?` immediately followed by whitespace or the end of the
-/// text. Review finding F7: negation lookback must never cross a clause
+/// Review finding: a period ending one of these (compared case-
+/// insensitively) closes an abbreviation, not a sentence -- "e.g."/"i.e."/
+/// "etc." and the rest never end a clause, even immediately before a
+/// workflow request.
+const KNOWN_ABBREVIATIONS: &[&str] = &["e.g", "i.e", "etc", "vs", "cf", "approx"];
+
+fn ends_with_known_abbreviation(word: &str) -> bool {
+    KNOWN_ABBREVIATIONS
+        .iter()
+        .any(|abbreviation| word.eq_ignore_ascii_case(abbreviation))
+}
+
+/// The raw whitespace-delimited word ending at byte offset `end_byte` in
+/// `text` -- from just after the nearest preceding whitespace character (or
+/// the start of `text`) up to `end_byte`. [`split_into_clauses`] reads the
+/// word a candidate sentence-ending period completes with this, so it can
+/// tell a real sentence end ("Upgraded to v1.2.") from an abbreviation
+/// ("e.g.").
+fn word_ending_at(text: &str, end_byte: usize) -> &str {
+    let word_start = text[..end_byte]
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| c.is_whitespace())
+        .map(|(pos, c)| pos + c.len_utf8())
+        .unwrap_or(0);
+    &text[word_start..end_byte]
+}
+
+/// Splits `text` into clauses at `,`/`;`/`:`, a newline, a RUN of one or
+/// more `.`/`!`/`?` immediately followed by whitespace or the end of the
+/// text, or a run of two or more `-` or an em/en dash (`\u{2013}`/
+/// `\u{2014}`) anywhere, whitespace or not. Review finding: consuming the
+/// WHOLE punctuation run keeps "workflow..." from leaving any of the dots
+/// glued to the word before it, and the dash rule keeps "workflow--let me
+/// know" separated even with no surrounding whitespace at all.
+/// [`explicit_workflow_requests`] matches and negates within one clause's
+/// own words at a time, so negation lookback never crosses a clause
 /// boundary ("fix the bug, do not refactor; start a bugfix workflow" must
-/// still fire on the third clause) -- [`explicit_workflow_requests`] matches
-/// and negates within one clause's own words at a time. A `.` NOT followed
-/// by whitespace/end -- as in a registered id like "sre.postmortem" -- is
-/// never a boundary, so a dotted id survives intact inside its clause.
+/// still fire on the third clause). A single `.` NOT followed by
+/// whitespace/end -- as in a registered id like "sre.postmortem" -- is never
+/// a boundary candidate at all, and one that IS followed by whitespace but
+/// ends a known abbreviation (see [`ends_with_known_abbreviation`]) is
+/// still not a boundary, so a negation before it stays in scope.
 fn split_into_clauses(text: &str) -> Vec<&str> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut clauses = Vec::new();
     let mut start = 0usize;
-    for (idx, &(byte_pos, ch)) in chars.iter().enumerate() {
-        let is_boundary = match ch {
-            ',' | ';' | ':' | '\n' => true,
-            '.' | '!' | '?' => chars
-                .get(idx + 1)
-                .is_none_or(|&(_, next)| next.is_whitespace()),
-            _ => false,
-        };
-        if is_boundary {
-            clauses.push(&text[start..byte_pos]);
-            start = byte_pos + ch.len_utf8();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (byte_pos, ch) = chars[i];
+        match ch {
+            ',' | ';' | ':' | '\n' => {
+                clauses.push(&text[start..byte_pos]);
+                start = byte_pos + ch.len_utf8();
+                i += 1;
+            }
+            '.' | '!' | '?' => {
+                let mut run_end = i;
+                while run_end < chars.len() && matches!(chars[run_end].1, '.' | '!' | '?') {
+                    run_end += 1;
+                }
+                let run_end_byte = chars.get(run_end).map_or(text.len(), |&(pos, _)| pos);
+                let followed_by_whitespace_or_end = chars
+                    .get(run_end)
+                    .is_none_or(|&(_, next)| next.is_whitespace());
+                let is_abbreviation = ch == '.'
+                    && run_end == i + 1
+                    && ends_with_known_abbreviation(word_ending_at(text, byte_pos));
+                if followed_by_whitespace_or_end && !is_abbreviation {
+                    clauses.push(&text[start..byte_pos]);
+                    start = run_end_byte;
+                    i = run_end;
+                } else {
+                    i += 1;
+                }
+            }
+            '-' if chars.get(i + 1).map(|&(_, next)| next) == Some('-') => {
+                let mut run_end = i;
+                while run_end < chars.len() && chars[run_end].1 == '-' {
+                    run_end += 1;
+                }
+                let run_end_byte = chars.get(run_end).map_or(text.len(), |&(pos, _)| pos);
+                clauses.push(&text[start..byte_pos]);
+                start = run_end_byte;
+                i = run_end;
+            }
+            '\u{2013}' | '\u{2014}' => {
+                clauses.push(&text[start..byte_pos]);
+                start = byte_pos + ch.len_utf8();
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     clauses.push(&text[start..]);
@@ -760,18 +829,19 @@ fn split_into_clauses(text: &str) -> Vec<&str> {
 }
 
 /// Raw whitespace-delimited words for one clause, lowercased and trimmed of
-/// leading/trailing characters that are neither alphanumeric nor one of
-/// `.`/`_`/`-` (backticks, quotes, and ordinary punctuation). Review finding
-/// F5: unlike `prose_words` (used elsewhere in this module, and which also
-/// SPLITS on `.`/`_`), this keeps each whitespace-delimited word WHOLE, so
-/// the exact raw word adjacent to "workflow" -- a registered id like
-/// `sre.postmortem`/`team_review` included -- can be looked up in the
-/// registry unmodified.
+/// leading/trailing non-alphanumeric characters -- backticks, quotes,
+/// ordinary punctuation, and any stray `.`/`-`/`_` a clause boundary left
+/// glued to a word's edge. Review finding: unlike `prose_words` (used
+/// elsewhere in this module), this keeps each whitespace-delimited word
+/// WHOLE apart from that edge trim, so the exact raw word adjacent to
+/// "workflow" -- a registered id like `sre.postmortem`/`team_review`
+/// included, since `.`/`-`/`_` INTERIOR to a word are never trimmed -- can
+/// be looked up in the registry unmodified.
 fn clause_words(clause: &str) -> Vec<String> {
     clause
         .split_whitespace()
         .map(|word| {
-            word.trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '.' | '_' | '-'))
+            word.trim_matches(|c: char| !c.is_alphanumeric())
                 .to_ascii_lowercase()
         })
         .filter(|word| !word.is_empty())
@@ -779,7 +849,7 @@ fn clause_words(clause: &str) -> Vec<String> {
 }
 
 /// Every explicit, asserted workflow-request match within one clause's own
-/// words -- review finding F6: scans the WHOLE clause rather than returning
+/// words. Review finding: scans the WHOLE clause rather than returning
 /// at the first match. `None` per match with no id slot ("start a
 /// workflow"), `Some(word)` with the raw word found in an id-bearing slot
 /// (`<id> workflow`, or `workflow start <id>`) -- that word need not itself
@@ -835,33 +905,47 @@ fn clause_matches(clause: &str) -> Vec<Option<String>> {
     matches
 }
 
-/// The explanatory/interrogative lead words [`explicit_workflow_requests`]
-/// suppresses on -- review finding F3: "Explain what `zirv workflow start
-/// bugfix` does" and "How do I start a workflow for a refactor?" describe
-/// or ask about starting a workflow, they don't assert one. Deliberately
-/// excludes can/could/would/will/please: "Can you start a bugfix workflow
-/// for the login crash?" is still a request and must still fire.
-const EXPLANATORY_LEAD_WORDS: &[&str] = &[
-    "explain", "describe", "what", "how", "why", "when", "where", "which", "does", "is",
-];
+/// Lead words that unconditionally mark a request as explanatory, whatever
+/// follows -- "Explain what `zirv workflow start bugfix` does" describes,
+/// it doesn't assert.
+const EXPLANATORY_LEAD_WORDS: &[&str] = &["explain", "describe"];
 
-/// Whether `request_lower` (already lowercased) opens with one of
-/// [`EXPLANATORY_LEAD_WORDS`] -- checked once, against the WHOLE request's
-/// own first word, never per clause.
+/// Interrogative lead words that mark a request as explanatory only when
+/// the request is actually a question (see [`is_explanatory_request`]).
+/// Review finding: a leading "what"/"is"/... does not by itself mean the
+/// request only describes or asks -- "What I need: start a bugfix workflow
+/// for the login crash" and "Is broken -- start a bugfix workflow" both
+/// assert one, and must still fire.
+const INTERROGATIVE_LEAD_WORDS: &[&str] =
+    &["what", "how", "why", "when", "where", "which", "does", "is"];
+
+/// Whether `request_lower` (already lowercased) is explanatory or
+/// interrogative -- checked once, against the WHOLE request's own first
+/// word, never per clause. `true` when the first word is one of
+/// [`EXPLANATORY_LEAD_WORDS`] outright, or one of
+/// [`INTERROGATIVE_LEAD_WORDS`] AND the request (trimmed) ends with `?`.
+/// "How do I start a workflow for a refactor?" is suppressed this way;
+/// "Can you start a bugfix workflow for the login crash?" is not --
+/// can/could/would/will/please are deliberately excluded from both lists,
+/// so a polite request still fires.
 fn is_explanatory_request(request_lower: &str) -> bool {
-    request_lower
+    let Some(first_word) = request_lower
         .split_whitespace()
         .next()
         .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
-        .is_some_and(|word| EXPLANATORY_LEAD_WORDS.contains(&word))
+    else {
+        return false;
+    };
+    EXPLANATORY_LEAD_WORDS.contains(&first_word)
+        || (INTERROGATIVE_LEAD_WORDS.contains(&first_word)
+            && request_lower.trim_end().ends_with('?'))
 }
 
 /// Every explicit, assertively-requested workflow match in `request_lower`
-/// (already lowercased) -- workflow-trigger-determinism item 2, revised for
-/// review findings F3/F4/F6/F7. Empty when the request's own first word is
-/// explanatory/interrogative (F3), or when no clause has an asserted match
-/// at all. Otherwise, [`split_into_clauses`] (F7) keeps negation lookback
-/// from crossing a clause boundary, and [`clause_matches`] (F6) scans every
+/// (already lowercased). Empty when the request's own first word is
+/// explanatory/interrogative, or when no clause has an asserted match
+/// at all. Otherwise, [`split_into_clauses`] keeps negation lookback
+/// from crossing a clause boundary, and [`clause_matches`] scans every
 /// match in every clause rather than stopping at the first -- in the
 /// returned order, the FIRST entry naming a REGISTERED pack id is what
 /// [`apply_explicit_workflow_request_floor`]/[`explicit_registered_workflow_id`]
@@ -887,9 +971,9 @@ fn explicit_workflow_requests(request_lower: &str) -> Vec<Option<String>> {
 /// request doesn't assert an explicit workflow request at all, or none of
 /// its matches name a word that is actually a registered pack id -- both
 /// are for [`apply_explicit_workflow_request_floor`] to fall through to
-/// `selection::select_definition` for, not this function's concern. Per
-/// review finding F6, the FIRST (leftmost) match naming a registered id
-/// wins when several matches exist.
+/// `selection::select_definition` for, not this function's concern. The
+/// FIRST (leftmost) match naming a registered id wins when several matches
+/// exist.
 fn explicit_registered_workflow_id(request: &str, roster: &Roster) -> Option<String> {
     let registry = roster.registry.as_ref()?;
     explicit_workflow_requests(&request.to_ascii_lowercase())
@@ -898,12 +982,11 @@ fn explicit_registered_workflow_id(request: &str, roster: &Roster) -> Option<Str
         .find(|candidate| registry.get(candidate).is_ok())
 }
 
-/// Workflow-trigger-determinism item 2: an operator who explicitly asks for
-/// a workflow gets one even when every model decider is off or unavailable
-/// -- `classify_request`'s deliberately text-only baseline (issue #537)
-/// otherwise classifies most such requests `Trivial`, and a `Trivial`
-/// baseline never sets `workflow` at all (see [`baseline`]'s own early
-/// `match classification.complexity`).
+/// An operator who explicitly asks for a workflow gets one even when every
+/// model decider is off or unavailable -- `classify_request`'s deliberately
+/// text-only baseline (issue #537) otherwise classifies most such requests
+/// `Trivial`, and a `Trivial` baseline never sets `workflow` at all (see
+/// [`baseline`]'s own early `match classification.complexity`).
 ///
 /// Fires only when [`explicit_workflow_requests`] finds at least one match.
 /// When it does: `complexity` is raised to at least `Bounded` (never
@@ -1501,10 +1584,10 @@ pub fn merge(
         if !answer.decisive(min_confidence, min_margin) {
             record_not_decisive("workflow", answer, None);
         } else if let AnswerValue::Choice(value) = &answer.value {
-            // Workflow-trigger-determinism item 2: an operator-named,
-            // REGISTERED workflow id (baseline already carries it, via
-            // `apply_explicit_workflow_request_floor`) survives even a
-            // decisive model answer -- the operator said it in words. A
+            // An operator-named, REGISTERED workflow id (baseline already
+            // carries it, via `apply_explicit_workflow_request_floor`)
+            // survives even a decisive model answer -- the operator said it
+            // in words. A
             // baseline id `select_definition` merely guessed at is still
             // fair game for a confident model answer to replace, as today.
             if explicit_registered_workflow_id(request, roster).is_none() {
@@ -2425,11 +2508,10 @@ mod tests {
         (repo, roster)
     }
 
-    /// Workflow-trigger-determinism item 2: a REGISTERED pack id named
-    /// adjacent to "workflow" wins outright, with no selection scoring at
-    /// all -- and the deliberately text-only baseline (issue #537) is
-    /// raised off `Trivial` so the workflow this sets survives
-    /// `apply_direct_execution_workflow_rule`.
+    /// A REGISTERED pack id named adjacent to "workflow" wins outright,
+    /// with no selection scoring at all -- and the deliberately text-only
+    /// baseline (issue #537) is raised off `Trivial` so the workflow this
+    /// sets survives `apply_direct_execution_workflow_rule`.
     #[test]
     fn baseline_sets_a_named_registered_workflow_id_outright() {
         let (repo, roster) = roster_with_builtin_registry();
@@ -2451,8 +2533,8 @@ mod tests {
     }
 
     /// A hyphenated registered id (`sre-postmortem`) is matched as a single
-    /// word -- `clause_words` keeps hyphens (and dots/underscores, see
-    /// review finding F5), so it never gets split.
+    /// word -- `clause_words` keeps hyphens (and dots/underscores) that are
+    /// interior to a word, so it never gets split.
     #[test]
     fn baseline_matches_a_hyphenated_registered_workflow_id() {
         let (repo, roster) = roster_with_builtin_registry();
@@ -2588,7 +2670,7 @@ mod tests {
         assert_eq!(merged.workflow.as_deref(), Some("bugfix"));
     }
 
-    /// Review finding F3: an explanatory or interrogative framing must
+    /// Review finding: an explanatory or interrogative framing must
     /// never fire the floor, even when the sentence names both "workflow"
     /// and a registered id -- it describes or asks, it doesn't request.
     /// can/could/would/will/please are deliberately NOT explanatory: a
@@ -2613,7 +2695,7 @@ mod tests {
         );
     }
 
-    /// Review finding F4: a negation contraction suppresses the floor
+    /// Review finding: a negation contraction suppresses the floor
     /// regardless of spelling -- a straight apostrophe, the curly one
     /// (U+2019), and typed with no apostrophe at all.
     #[test]
@@ -2631,7 +2713,7 @@ mod tests {
         }
     }
 
-    /// Review finding F5: the id slot is read from the RAW whitespace-
+    /// Review finding: the id slot is read from the RAW whitespace-
     /// delimited word next to "workflow", not a `prose_words` token --
     /// `prose_words` splits on `.`/`_`, which would otherwise break a
     /// registered id like `sre.postmortem`/`team_review` into two tokens
@@ -2710,7 +2792,7 @@ present_as = "summary"
         );
     }
 
-    /// Review finding F6: the matcher scans EVERY clause rather than
+    /// Review finding: the matcher scans EVERY clause rather than
     /// stopping at the first match, and a registered named id anywhere
     /// wins over an earlier unnamed match.
     #[test]
@@ -2728,7 +2810,7 @@ present_as = "summary"
         assert_eq!(decision.workflow.as_deref(), Some("review"));
     }
 
-    /// Review finding F7: negation lookback must never cross a clause
+    /// Review finding: negation lookback must never cross a clause
     /// boundary -- the "not" in "do not refactor" belongs to its own
     /// clause and must not suppress the assertion in the clause after it.
     #[test]
@@ -2739,6 +2821,127 @@ present_as = "summary"
         let classification = classify_request(request);
         let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
         assert_eq!(decision.workflow.as_deref(), Some("bugfix"));
+    }
+
+    /// Review finding: glued trailing punctuation must never hide the word
+    /// "workflow" -- an ellipsis run and a double hyphen both leave a clean
+    /// clause boundary, and a registered id with interior punctuation
+    /// (`sre-postmortem`) still resolves once its clause is split out.
+    #[test]
+    fn glued_trailing_punctuation_never_hides_the_word_workflow() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+
+        let ellipsis_request = "Maybe we should start a workflow... for tidying my notes";
+        let ellipsis_classification = classify_request(ellipsis_request);
+        let ellipsis_decision = baseline(
+            &cfg,
+            repo.path(),
+            ellipsis_request,
+            &ellipsis_classification,
+            &roster,
+        );
+        assert_eq!(
+            ellipsis_decision.workflow.as_deref(),
+            Some("adaptive-work"),
+            "an ellipsis must not swallow the word workflow"
+        );
+
+        let dash_request = "start a workflow--let me know";
+        let dash_classification = classify_request(dash_request);
+        let dash_decision = baseline(
+            &cfg,
+            repo.path(),
+            dash_request,
+            &dash_classification,
+            &roster,
+        );
+        assert!(
+            dash_decision.workflow.is_some(),
+            "a double hyphen with no surrounding whitespace must still split"
+        );
+
+        let hyphenated_id_request = "start the sre-postmortem workflow for last night's outage";
+        let hyphenated_id_classification = classify_request(hyphenated_id_request);
+        let hyphenated_id_decision = baseline(
+            &cfg,
+            repo.path(),
+            hyphenated_id_request,
+            &hyphenated_id_classification,
+            &roster,
+        );
+        assert_eq!(
+            hyphenated_id_decision.workflow.as_deref(),
+            Some("sre-postmortem"),
+            "a single interior hyphen in a registered id must survive"
+        );
+    }
+
+    /// Review finding: a leading interrogative word alone must not veto the
+    /// whole request -- only an ACTUAL question (ending in `?`) is
+    /// suppressed; a statement that merely starts with "what"/"is" still
+    /// fires.
+    #[test]
+    fn an_interrogative_lead_word_only_suppresses_an_actual_question() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+
+        let question = "How do I start a workflow for a refactor?";
+        assert!(
+            explicit_workflow_requests(&question.to_ascii_lowercase()).is_empty(),
+            "a real question must stay suppressed"
+        );
+
+        for statement in [
+            "What I need: start a bugfix workflow for the login crash",
+            "Is broken -- start a bugfix workflow",
+        ] {
+            let classification = classify_request(statement);
+            let decision = baseline(&cfg, repo.path(), statement, &classification, &roster);
+            assert_eq!(
+                decision.workflow.as_deref(),
+                Some("bugfix"),
+                "{statement:?} is a statement, not a question, and must fire"
+            );
+        }
+    }
+
+    /// Review finding: an abbreviation's period is never a clause boundary
+    /// (so a negation before it stays in scope), but an ordinary sentence-
+    /// ending period -- even right after a version-shaped token -- still is.
+    #[test]
+    fn an_abbreviation_period_is_not_a_boundary_but_a_version_period_is() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+
+        let abbreviation_request = "we shouldn't just e.g. start a workflow for typos";
+        let abbreviation_classification = classify_request(abbreviation_request);
+        let abbreviation_decision = baseline(
+            &cfg,
+            repo.path(),
+            abbreviation_request,
+            &abbreviation_classification,
+            &roster,
+        );
+        assert_eq!(
+            abbreviation_decision.workflow, None,
+            "the negation before \"e.g.\" must still reach the request after it"
+        );
+
+        let version_request = "Upgraded to v1.2. Start a bugfix workflow for the crash";
+        let version_classification = classify_request(version_request);
+        let version_decision = baseline(
+            &cfg,
+            repo.path(),
+            version_request,
+            &version_classification,
+            &roster,
+        );
+        assert_eq!(
+            version_decision.workflow.as_deref(),
+            Some("bugfix"),
+            "a version-shaped token's period is a real sentence end"
+        );
     }
 
     fn floored_complexity(request: &str) -> Complexity {
