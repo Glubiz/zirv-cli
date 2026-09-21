@@ -2292,11 +2292,14 @@ through the scorer, plus negative tasks that must rank nothing -- exhaustive
 and identical on every run, but only proof of the scorer's own matching, not
 that a model follows a loaded skill's instructions. Live activation was
 checked by hand, one natural task per skill (51 tasks), on the smallest
-Claude and Codex models, each free to choose: Codex loaded the expected
+Claude and Codex models, each free to choose. Codex loaded the expected
 skill on 46 and was correctly refused on the 5 needing an absent
-integration; Claude loaded 42, was correctly refused on the same 5, did
-three small tasks without a skill, and once chose the operator's own
-installed review skill instead. Live evals against other providers, or
+integration, in two consecutive full passes. Claude, in one full pass,
+loaded 37 and was correctly refused on the same 5; of its 9 misses, 3 loaded
+on an immediate re-run (run-to-run variance), 2 chose one of the operator's
+own installed skills instead, 3 were small tasks it simply did, and 1 asked
+it to execute a plan the test repository did not contain. Live evals
+against other providers, or
 larger models in either family, are not automated and were not run.
 
 Use `zirv workflow review package <id>` for a compact diff/test review input,
