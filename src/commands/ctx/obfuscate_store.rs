@@ -88,6 +88,11 @@ pub fn options_from_config(
     config: &super::config::ObfuscateConfig,
     home: &Path,
 ) -> CtxResult<Options> {
+    if config.operator_load_failed {
+        return Err(
+            "operator obfuscation config could not be loaded; refusing model egress".into(),
+        );
+    }
     let literals = match config.literals_file.as_deref() {
         None => Vec::new(),
         Some(path) => {

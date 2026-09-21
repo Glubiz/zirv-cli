@@ -8723,15 +8723,25 @@ fn run_check_hook_mode_with_env<W: Write>(
     stdin: &str,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    run_check_hook_with_verdict(cfg, w, stdin, env).map(|_| 0)
+}
+
+/// Issue #466: rehydration needs the verdict even when headless hook output is silent.
+pub(crate) fn run_check_hook_with_verdict<W: Write>(
+    cfg: &CtxConfig,
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+) -> CtxResult<Option<Verdict>> {
     let Some(payload) = HookToolPayload::parse(stdin) else {
-        return Ok(0);
+        return Ok(None);
     };
     if !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell") {
-        return Ok(0);
+        return Ok(None);
     }
     let command = payload.tool_input.command.trim();
     if command.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
     // An explicit interactive signal, not the absence of `"dontAsk"`: only
     // the values claude documents as a human-attended session prove someone
@@ -9148,7 +9158,7 @@ fn run_check_hook_mode_with_env<W: Write>(
         writeln!(w, "{output}")?;
     }
     audit_hook_decision(&payload, command, mode, &outcome, &evidence, env);
-    Ok(0)
+    Ok(Some(outcome.verdict))
 }
 
 /// Change 5a: programs whose first non-flag argument is a genuine

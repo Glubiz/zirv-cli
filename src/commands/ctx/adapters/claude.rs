@@ -1725,7 +1725,7 @@ fn launch_settings_value(
                     "command": "zirv ctx safety check"
                 }]
             }, {
-                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                "matcher": super::super::hook::REHYDRATION_TOOLS.join("|"),
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook pretool"
@@ -4215,15 +4215,15 @@ mod tests {
             settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx safety check"))
         );
-        // Issue #466: the rehydration hook is a third `PreToolUse` entry,
+        // Issue #466: the rehydration hook is the second `PreToolUse` entry,
         // matching every tool a device action can rehydrate placeholders
-        // for (Bash/PowerShell plus the write tools), also running `zirv
+        // for (shell, write and lookup tools), also running `zirv
         // ctx hook pretool` -- the same command decides both this and the
         // orchestrator-write guard below from the payload it receives.
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/1/matcher"),
             Some(&serde_json::json!(
-                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"
+                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob"
             ))
         );
         assert_eq!(
@@ -4400,6 +4400,70 @@ mod tests {
     }
 
     #[test]
+    fn launch_settings_rehydrate_lookup_tools_and_audit_misses() {
+        let settings = test_launch_settings();
+        let matcher = settings["hooks"]["PreToolUse"][1]["matcher"]
+            .as_str()
+            .expect("matcher");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tempfile::tempdir().expect("state");
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_dir.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let (masked, _) = crate::commands::ctx::obfuscate_store::obfuscate_text(
+            state.root(),
+            repo.path(),
+            secret,
+            &crate::commands::ctx::obfuscate::Options::default(),
+            "test",
+        )
+        .expect("seed vault");
+        let env = |key: &str| match key {
+            crate::commands::ctx::state::STATE_ENV => Some(state.root().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        for (tool, field) in [
+            ("Read", "file_path"),
+            ("Grep", "pattern"),
+            ("Glob", "pattern"),
+        ] {
+            assert!(
+                matcher.split('|').any(|name| name == tool),
+                "missing {tool}: {matcher}"
+            );
+            for placeholder in [&masked, "ZIRV_SECRET_GITHUB_TOKEN_999"] {
+                let stdin = serde_json::json!({
+                    "cwd": repo.path(), "tool_name": tool,
+                    "tool_input": {field: placeholder},
+                })
+                .to_string();
+                let mut out = Vec::new();
+                crate::commands::ctx::hook::run_pretool_for_agent(&mut out, &stdin, &env, None)
+                    .expect("hook");
+                let envelope: serde_json::Value = serde_json::from_slice(&out).expect("decision");
+                if placeholder == masked {
+                    assert_eq!(
+                        envelope["hookSpecificOutput"]["updatedInput"][field],
+                        secret
+                    );
+                } else {
+                    assert_eq!(envelope["hookSpecificOutput"]["permissionDecision"], "deny");
+                }
+            }
+        }
+        assert_eq!(
+            crate::commands::ctx::log::read_decisions(&state)
+                .iter()
+                .filter(|row| row.action == "obfuscate-rehydration-miss")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     fn launch_settings_observe_permission_events_without_changing_pretooluse() {
         let settings = test_launch_settings();
         // Issue #334 added the two guard entries below; wiring the
@@ -4416,7 +4480,7 @@ mod tests {
                     "command": "zirv ctx safety check"
                 }]
             }, {
-                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook pretool"

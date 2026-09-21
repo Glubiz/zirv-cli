@@ -3055,13 +3055,32 @@ fn withhold_strings(value: &mut serde_json::Value) {
         }
         serde_json::Value::Array(values) => values.iter_mut().for_each(withhold_strings),
         serde_json::Value::Object(values) => {
-            let original = std::mem::take(values);
-            for (index, (_, mut value)) in original.into_iter().enumerate() {
-                withhold_strings(&mut value);
-                values.insert(format!("zirv_withheld_key_{index}"), value);
-            }
+            values.values_mut().for_each(withhold_strings);
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn json_needs_obfuscation(value: &serde_json::Value, options: &super::obfuscate::Options) -> bool {
+    match value {
+        serde_json::Value::String(text) => super::obfuscate::obfuscate(
+            text,
+            &mut super::obfuscate::Vault::default(),
+            options,
+            "claude_post_tool_use",
+        )
+        .1
+        .iter()
+        .any(|finding| finding.replaced),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_needs_obfuscation(value, options)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_needs_obfuscation(value, options)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
     }
 }
 
@@ -3118,14 +3137,7 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
     let findings = match findings {
         Ok(findings) => findings,
         Err(_) => {
-            let mut vault = super::obfuscate::Vault::default();
-            let (_, findings) = super::obfuscate::obfuscate(
-                &original.to_string(),
-                &mut vault,
-                &options,
-                "claude_post_tool_use",
-            );
-            if findings.iter().any(|finding| finding.replaced) {
+            if json_needs_obfuscation(&original, &options) {
                 withhold_strings(&mut response);
                 return Some(response);
             }
@@ -3559,6 +3571,19 @@ pub fn run_pretool_for_agent<W: Write>(
     }
 }
 
+// Issue #466: model-dispatch tools must never receive local vault values.
+pub(crate) const REHYDRATION_TOOLS: &[&str] = &[
+    "Bash",
+    "PowerShell",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "Read",
+    "Grep",
+    "Glob",
+];
+
 fn run_pretool_with_rehydration<W: Write>(
     w: &mut W,
     stdin: &str,
@@ -3567,6 +3592,14 @@ fn run_pretool_with_rehydration<W: Write>(
     let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(stdin) else {
         return run_pretool(w, stdin, env);
     };
+    let tool = raw
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !REHYDRATION_TOOLS.contains(&tool.as_str()) {
+        return run_pretool(w, stdin, env);
+    }
     let cwd = raw
         .get("cwd")
         .and_then(serde_json::Value::as_str)
@@ -3640,8 +3673,7 @@ fn run_pretool_with_rehydration<W: Write>(
     let mut envelope = if trimmed.is_empty() {
         serde_json::json!({
             "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow"
+                "hookEventName": "PreToolUse"
             }
         })
     } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -3668,6 +3700,41 @@ fn run_pretool_with_rehydration<W: Write>(
             target.insert(key, value);
         }
     }
+    if matches!(tool.as_str(), "Bash" | "PowerShell") {
+        // Issue #466: parallel safety hooks saw placeholders, not this final command.
+        raw["tool_input"] = rehydrated.clone();
+        let verdict = CtxConfig::load(&cwd, env).and_then(|cfg| {
+            super::safety::run_check_hook_with_verdict(
+                &cfg,
+                &mut std::io::sink(),
+                &raw.to_string(),
+                env,
+            )
+        });
+        match verdict {
+            Ok(Some(super::safety::Verdict::Allow)) => {
+                if envelope
+                    .pointer("/hookSpecificOutput/permissionDecision")
+                    .is_none()
+                {
+                    envelope["hookSpecificOutput"]["permissionDecision"] = "allow".into();
+                }
+            }
+            Ok(Some(super::safety::Verdict::Ask)) => {
+                envelope["hookSpecificOutput"]["permissionDecision"] = "ask".into();
+                envelope["hookSpecificOutput"]["permissionDecisionReason"] =
+                    "zirv safety requires approval of the rehydrated command".into();
+            }
+            Ok(Some(super::safety::Verdict::Deny)) | Ok(None) | Err(_) => {
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    pretool_output("zirv safety refused the rehydrated command")
+                );
+                return Ok(code);
+            }
+        }
+    }
     envelope["hookSpecificOutput"]["updatedInput"] = rehydrated;
     let _ = writeln!(w, "{envelope}");
     Ok(code)
@@ -3678,12 +3745,29 @@ fn shared_placeholder_artifact(payload: &serde_json::Value, cwd: &Path) -> bool 
         .get("tool_name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if !matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
-        return false;
-    }
     let Some(input) = payload.get("tool_input") else {
         return false;
     };
+    if matches!(tool, "Bash" | "PowerShell") {
+        // Issue #466: a shell write carries no structured path field, so every
+        // token the command mentions is tested as one against the same shared
+        // -artifact rule the structured tools use. Deliberately conservative:
+        // a mention is enough to keep the placeholder unexpanded.
+        return input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| {
+                command
+                    .split(|c: char| c.is_whitespace() || "<>|;&()'\"`".contains(c))
+                    .filter(|token| !token.is_empty())
+                    .any(|token| {
+                        super::obfuscate_store::is_shared_placeholder_path(cwd, Path::new(token))
+                    })
+            });
+    }
+    if !matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+        return false;
+    }
     ["file_path", "notebook_path"]
         .iter()
         .filter_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
@@ -10500,6 +10584,212 @@ mod tests {
             value["hookSpecificOutput"]["updatedToolOutput"]["metadata"]["source"],
             "notes.txt"
         );
+    }
+
+    #[test]
+    fn pretool_keeps_subagent_prompt_placeholders_intact() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let (masked, _) = super::super::obfuscate_store::obfuscate_text(
+            state.path(),
+            repo.path(),
+            secret,
+            &super::super::obfuscate::Options::default(),
+            "test",
+        )
+        .expect("seed vault");
+        assert_eq!(masked, "ZIRV_SECRET_GITHUB_TOKEN_1");
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        for tool in ["Agent", "Task", "WebFetch"] {
+            let input = serde_json::json!({"prompt": format!("use {masked}")});
+            let stdin = serde_json::json!({
+                "cwd": repo.path(), "tool_name": tool, "tool_input": input,
+            });
+            let mut out = Vec::new();
+            run_pretool_for_agent(&mut out, &stdin.to_string(), &env, None).expect("hook");
+            let envelope = serde_json::from_slice::<serde_json::Value>(&out).unwrap_or_default();
+            let effective = envelope
+                .pointer("/hookSpecificOutput/updatedInput")
+                .unwrap_or(&input);
+            assert_eq!(effective, &input, "{tool}");
+            assert!(!String::from_utf8_lossy(&out).contains(secret), "{tool}");
+        }
+    }
+
+    #[test]
+    fn pretool_checks_safety_after_rehydrating_the_command() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let command = "rm -rf /";
+        let options = super::super::obfuscate::Options {
+            literals: vec![command.into()],
+            ..Default::default()
+        };
+        let (masked, _) = super::super::obfuscate_store::obfuscate_text(
+            state.path(),
+            repo.path(),
+            command,
+            &options,
+            "test",
+        )
+        .expect("seed vault");
+        for tool in ["Bash", "PowerShell"] {
+            for (mode, deny, expected) in [
+                ("default", false, "ask"),
+                ("dontAsk", false, "ask"),
+                ("default", true, "deny"),
+            ] {
+                let env = |key: &str| match key {
+                    super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+                    "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+                    "ZIRV_CTX_SAFETY_DENY" if deny => Some("rm *".into()),
+                    _ => None,
+                };
+                let stdin = serde_json::json!({
+                    "cwd": repo.path(), "tool_name": tool, "permission_mode": mode,
+                    "tool_input": {"command": masked},
+                })
+                .to_string();
+                let mut out = Vec::new();
+                run_pretool_for_agent(&mut out, &stdin, &env, None).expect("hook");
+                let envelope: serde_json::Value = serde_json::from_slice(&out).expect("decision");
+                assert_eq!(
+                    envelope["hookSpecificOutput"]["permissionDecision"], expected,
+                    "{tool} {mode}: {envelope}"
+                );
+                if expected == "ask" {
+                    assert_eq!(
+                        envelope["hookSpecificOutput"]["updatedInput"]["command"],
+                        command
+                    );
+                } else {
+                    assert!(envelope["hookSpecificOutput"]["updatedInput"].is_null());
+                }
+                assert!(
+                    !envelope["hookSpecificOutput"]["permissionDecisionReason"]
+                        .to_string()
+                        .contains(command)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posttool_withholding_preserves_the_bash_output_schema() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::NamedTempFile::new().expect("unavailable state directory");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        let stdin = serde_json::json!({
+            "cwd": repo.path(), "tool_name": "Bash", "tool_input": {"command": "echo token"},
+            "tool_response": {"stdout": "ghp_abcdefghijklmnopqrstuvwxyz123456", "stderr": "details", "interrupted": true, "isImage": false},
+        }).to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &env).expect("hook");
+        let envelope: serde_json::Value = serde_json::from_slice(&out).expect("replacement");
+        let output = &envelope["hookSpecificOutput"]["updatedToolOutput"];
+        assert_eq!(output.as_object().expect("object").len(), 4);
+        for key in ["stdout", "stderr"] {
+            assert!(
+                output[key]
+                    .as_str()
+                    .expect("schema string")
+                    .contains("withheld")
+            );
+        }
+        assert_eq!(output["interrupted"], true);
+        assert_eq!(output["isImage"], false);
+        assert!(!output.to_string().contains("ghp_"));
+    }
+
+    #[test]
+    fn posttool_vault_failure_scans_anchored_patterns_in_nested_strings() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir(home.path().join(".zirv")).expect("config directory");
+        std::fs::write(home.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"obfuscate\"\n[[obfuscate.patterns]]\nkind = \"CUSTOMER\"\nregex = '^CUST-[0-9]{8}$'\n",
+        ).expect("config");
+        let state = tempfile::NamedTempFile::new().expect("unavailable state directory");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = |key: &str| {
+            (key == super::super::state::STATE_ENV).then(|| state.path().display().to_string())
+        };
+        let stdin = serde_json::json!({
+            "cwd": repo.path(), "tool_name": "Read", "tool_input": {"file_path": "notes.txt"},
+            "tool_response": {"results": [{"stdout": "CUST-12345678", "count": 1}]},
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &env).expect("hook");
+        let envelope: serde_json::Value = serde_json::from_slice(&out).expect("replacement");
+        let output = &envelope["hookSpecificOutput"]["updatedToolOutput"];
+        assert!(
+            output["results"][0]["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("withheld")
+        );
+        assert_eq!(output["results"][0]["count"], 1);
+        assert!(!output.to_string().contains("CUST-12345678"));
+    }
+
+    #[test]
+    fn pretool_keeps_placeholders_in_shell_writes_to_shared_artifacts() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let (masked, _) = super::super::obfuscate_store::obfuscate_text(
+            state.path(),
+            repo.path(),
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            &super::super::obfuscate::Options::default(),
+            "test",
+        )
+        .expect("seed vault");
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state.path().display().to_string()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".into()),
+            _ => None,
+        };
+        for tool in ["Bash", "PowerShell"] {
+            for path in [
+                ".zirv/memory/example.md",
+                "'.zirv/work/task/output.md'",
+                ".zirv\\memory\\example.md",
+            ] {
+                let input = serde_json::json!({"command": format!("printf %s {masked} > {path}")});
+                let stdin =
+                    serde_json::json!({"cwd": repo.path(), "tool_name": tool, "tool_input": input})
+                        .to_string();
+                let mut out = Vec::new();
+                run_pretool_for_agent(&mut out, &stdin, &env, None).expect("hook");
+                let envelope =
+                    serde_json::from_slice::<serde_json::Value>(&out).unwrap_or_default();
+                assert_eq!(
+                    envelope
+                        .pointer("/hookSpecificOutput/updatedInput")
+                        .unwrap_or(&input),
+                    &input,
+                    "{tool}: {path}"
+                );
+            }
+        }
     }
 
     #[test]

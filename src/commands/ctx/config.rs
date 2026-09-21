@@ -2105,9 +2105,45 @@ pub struct ObfuscateConfig {
     pub patterns: Vec<ObfuscatePatternConfig>,
     pub literals_file: Option<String>,
     pub allow: Vec<String>,
+    #[serde(skip)]
+    pub(crate) operator_load_failed: bool,
 }
 
 impl ObfuscateConfig {
+    fn load_operator_only(env: EnvLookup<'_>) -> CtxResult<Self> {
+        let text = match std::fs::read_to_string(operator_path()?) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut operator: toml::Table = toml::from_str(&text)?;
+        let mut merged = toml::Table::new();
+        if let Some(value) = operator.remove("obfuscate") {
+            merged.insert("obfuscate".into(), value);
+        }
+        for (var, path, kind) in ENV_MAP {
+            if path.first() == Some(&"obfuscate")
+                && let Some(raw) = env(var)
+            {
+                insert_path(&mut merged, path, env_value(&raw, *kind)?);
+            }
+        }
+        match merged.remove("obfuscate") {
+            Some(value) => Ok(value.try_into()?),
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn fail_closed() -> Self {
+        // Issue #466: option loading must fail when the operator policy is unreadable.
+        Self {
+            mode: ObfuscateMode::Obfuscate,
+            prompt: ObfuscatePrompt::Block,
+            operator_load_failed: true,
+            ..Self::default()
+        }
+    }
+
     pub fn options(&self, literals: Vec<String>) -> super::obfuscate::Options {
         super::obfuscate::Options {
             mode: match self.mode {
@@ -6809,6 +6845,8 @@ pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
     let mut cfg = CtxConfig {
         agents: crate::settings::AgentGate::load_operator_only(env),
         policy: super::policy::EffectivePolicy::fail_closed(),
+        obfuscate: ObfuscateConfig::load_operator_only(env)
+            .unwrap_or_else(|_| ObfuscateConfig::fail_closed()),
         ..CtxConfig::default()
     };
     cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
@@ -9833,6 +9871,61 @@ mod tests {
     /// load-bearing (the context compiler attaches it to every session), the
     /// shared config-load-failure fallback must not hand back the widest
     /// possible policy.
+    #[test]
+    fn degrade_to_operator_only_withholds_when_operator_obfuscation_is_unreadable() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir(home.path().join(".zirv")).expect("config directory");
+        for text in ["[obfuscate", "[obfuscate]\nmode = 42\n"] {
+            std::fs::write(home.path().join(".zirv/ctx.toml"), text).expect("operator config");
+            let cfg = degrade_to_operator_only(&|_| None);
+            assert_eq!(cfg.obfuscate.mode, ObfuscateMode::Obfuscate);
+            assert!(
+                super::super::obfuscate_store::options_from_config(&cfg.obfuscate, home.path())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn degrade_to_operator_only_preserves_obfuscation_after_repo_rejection() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir(home.path().join(".zirv")).expect("home config directory");
+        std::fs::create_dir(repo.path().join(".zirv")).expect("repo config directory");
+        std::fs::write(home.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"obfuscate\"\nprompt = \"block\"\nemail_domain = \"mask\"\n[[obfuscate.patterns]]\nkind = \"CUSTOMER\"\nregex = '^CUST-[0-9]{8}$'\n",
+        ).expect("operator config");
+        let expected = CtxConfig::load(repo.path(), &|_| None)
+            .expect("operator config")
+            .obfuscate;
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"off\"\n",
+        )
+        .expect("repo config");
+        let error = CtxConfig::load(repo.path(), &|_| None).expect_err("forbidden key");
+        assert!(is_repo_forbidden(error.as_ref()), "{error}");
+        assert_eq!(degrade_to_operator_only(&|_| None).obfuscate, expected);
+        let env = env_map(&[("ZIRV_CTX_OBFUSCATE_ENTROPY", "obfuscate")]);
+        let degraded = degrade_to_operator_only(&|key| env.get(key).cloned());
+        assert_eq!(degraded.obfuscate.entropy, ObfuscateEntropy::Obfuscate);
+        assert_eq!(degraded.obfuscate.mode, ObfuscateMode::Obfuscate);
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[obfuscate]\nmode = \"off\"\n",
+        )
+        .expect("operator config");
+        let env = env_map(&[("ZIRV_CTX_OBFUSCATE_MODE", "obfuscate")]);
+        assert_eq!(
+            degrade_to_operator_only(&|key| env.get(key).cloned())
+                .obfuscate
+                .mode,
+            ObfuscateMode::Obfuscate
+        );
+    }
+
     #[test]
     fn degrade_to_operator_only_fails_closed_on_policy_not_open() {
         let empty = env_map(&[]);
