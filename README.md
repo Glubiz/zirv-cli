@@ -264,13 +264,17 @@ notices still print normally.
   yet — check `zirv ctx inbox` later for the worker's own report),
   `launch_failed` (refused, or the worker process never started at all —
   see `reason`), `exited_no_report` (the process exited but no final
-  assistant text could be extracted — treat the task as unverified),
+  assistant text could be extracted — treat the task as unverified; a
+  post-mortem record still lands at `result_path`, with an empty report),
   `reported` (final text extracted, no `--result-schema`/`--result-kind`
   contract declared), `reported_validated` (a declared contract was
   satisfied), `reported_contract_failed` (a declared contract failed even
   after the one bounded retry — see `errors`).
-- **`result_path`** — where the worker's full report was persisted, when
-  one was (see [Sending mail between sessions](#sending-mail-between-sessions)
+- **`result_path`** — where the worker's own record was persisted, when
+  one was; `exited_no_report` always gets one too (`outcome:
+  "exited_no_report"`, no report text) so a clean exit with nothing usable
+  is never left with no durable trace (see
+  [Sending mail between sessions](#sending-mail-between-sessions)
   below for the file's own shape).
 
 Only `zirv ctx agent`/`zirv agent` (a one-shot delegation) has `--json` today
@@ -3568,8 +3572,10 @@ files, so callers should restart pagination if they change between reads.
 Worker listings default to 16 records (maximum 64). `id` selects one exact
 worker and cannot be combined with `cursor`. Ordinary harness reports have no
 delegation phase or exit code unless a corresponding durable delegation exists;
-those fields remain null. Report outcomes such as `reported`, `validated` and
-`contract_failed` describe stored evidence, not process liveness or task correctness.
+those fields remain null. Report outcomes such as `reported`, `validated`,
+`contract_failed` and `exited_no_report` (a clean exit with no extractable
+report -- still a durable record, just with no report text) describe stored
+evidence, not process liveness or task correctness.
 Unreadable, oversized or unscoped reports are omitted from listings; an explicit
 `result_read` returns an error. Reports written before repository provenance was
 recorded require a matching scoped delegation reference, never just a filename.

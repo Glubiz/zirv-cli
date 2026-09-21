@@ -1094,6 +1094,48 @@ mod tests {
         assert_eq!(data["undeclared_changes"][0], "extra.rs");
     }
 
+    /// Issue #722: a worker that exited clean with no extractable report now
+    /// gets a durable `delegation-results/<id>.json` too (`outcome:
+    /// "exited_no_report"`, `report: null`) -- the exposed reader path is
+    /// `worker_status`'s existing `report_outcome` field (already read
+    /// structurally off `DelegationResultRecord::outcome`, never off
+    /// `record.summary`) and `result_read`, which used to have "nothing to
+    /// page" for this worker because no file existed at all.
+    #[test]
+    fn worker_status_and_result_read_surface_an_exited_no_report_worker() {
+        let f = Fixture::new();
+        super::super::agent::write_delegation_result(
+            &f.scope.state,
+            &f.scope.repo,
+            "worker01",
+            "codex",
+            "exited_no_report",
+            &None,
+            &[],
+            &[],
+            None,
+            false,
+        );
+
+        let status = f
+            .scope
+            .call("worker_status", json!({"id":"worker01"}))
+            .unwrap();
+        assert_eq!(
+            status["data"]["workers"][0]["report_outcome"],
+            "exited_no_report"
+        );
+        assert_eq!(status["data"]["workers"][0]["report_available"], true);
+
+        let page = f
+            .scope
+            .call("result_read", json!({"id":"worker01"}))
+            .unwrap();
+        let data: Value = serde_json::from_str(page["data"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(data["outcome"], "exited_no_report");
+        assert!(data["report"].is_null());
+    }
+
     #[test]
     fn report_pages_require_matching_revision_and_round_trip_utf8() {
         let f = Fixture::new();
