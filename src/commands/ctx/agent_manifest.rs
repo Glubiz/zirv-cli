@@ -15,7 +15,16 @@
 //! Merge rule, when both the CLI and the manifest set the same field:
 //! - Narrowing-capable fields (`no_network`, `budget_tokens`,
 //!   `max_tool_calls`, `path_scope`, read-only `mode`) -- the STRICTER
-//!   value wins regardless of which side set it.
+//!   value wins regardless of which side set it. For `path_scope`
+//!   specifically, "stricter" means one side's coverage is provably
+//!   contained in the other's (`envelope::PathScope::is_subset_of`,
+//!   reused rather than a new path matcher); when neither side's coverage
+//!   is provably contained in the other's -- disjoint or only partially
+//!   overlapping -- this is a hard error naming both scopes, NEVER an
+//!   empty result: an empty `path_scope` means "unset" downstream
+//!   (`envelope::WorkerEnvelope::requested`), so silently narrowing two
+//!   disjoint requests to nothing would actually WIDEN the delegation to
+//!   the parent's entire grant.
 //! - Plain identity fields (`brief`/the positional prompt, `task`, `group`,
 //!   `workdir`, the result contract) -- an explicit CLI value that DIFFERS
 //!   from the manifest's is a hard error naming both values. Equal values
@@ -48,6 +57,7 @@ use serde::Deserialize;
 
 use super::CtxResult;
 use super::agent::AgentArgs;
+use super::envelope::PathScope;
 use super::permit::WorkerMode;
 
 /// Mirrors `workflow/definition.rs::MAX_DEFINITION_BYTES` / `workflow/
@@ -194,7 +204,7 @@ fn merge(args: &mut AgentArgs, manifest: DelegationManifest, manifest_dir: &Path
             .map(|value| resolve_path(manifest_dir, value))
             .collect();
         let cli = std::mem::take(&mut args.path_scope);
-        args.path_scope = stricter_path_scope(cli, resolved);
+        args.path_scope = stricter_path_scope(cli, resolved)?;
     }
 
     Ok(())
@@ -280,26 +290,67 @@ fn stricter_ceiling<T: Ord + Copy>(cli: Option<T>, manifest: Option<T>) -> Optio
 
 /// `Vec::new()` on either side means "unstated" (there is no way to spell
 /// an explicit, empty `--path-scope` -- it is a repeatable flag), so an
-/// empty side always defers to the other. When both narrow explicitly, the
-/// strictest defensible outcome is whichever set the other actually
-/// contains, or their intersection when neither does -- always at least as
-/// narrow as either input alone.
-fn stricter_path_scope(cli: Vec<PathBuf>, manifest: Vec<PathBuf>) -> Vec<PathBuf> {
+/// empty side always defers to the other and this function NEVER returns
+/// an empty result unless BOTH inputs were empty: downstream, an empty
+/// `path_scope` means "unset" to `envelope::WorkerEnvelope::requested`,
+/// which then falls back to the PARENT's own entire `paths` grant for a
+/// writing worker -- so two narrowing requests merging into `Vec::new()`
+/// here would silently WIDEN the delegation to the parent's whole grant,
+/// exactly the trust-boundary violation this module exists to prevent.
+///
+/// When both sides narrow explicitly, this reuses `envelope::PathScope::
+/// is_subset_of` (prefix containment on normalized path text) rather than
+/// a new path matcher: whichever side's coverage is entirely contained in
+/// the other's is the narrower and wins, in EITHER direction -- a CLI
+/// `--path-scope /repo/src` against a manifest `path_scope: [/repo/src/
+/// ctx]`, or the reverse, both yield `/repo/src/ctx`. When neither side's
+/// coverage is entirely contained in the other's -- genuinely disjoint
+/// (`/repo/src` vs. `/repo/docs`), or only partially overlapping, or a
+/// nested-but-not-identical pair `is_subset_of` cannot prove one way or
+/// the other -- there is no result that is provably a subset of BOTH
+/// inputs, so this is refused outright, naming both scopes, rather than
+/// silently narrowed to a guess or widened to their union: refusing is
+/// safe, widening is not.
+fn stricter_path_scope(cli: Vec<PathBuf>, manifest: Vec<PathBuf>) -> CtxResult<Vec<PathBuf>> {
     if cli.is_empty() {
-        return manifest;
+        return Ok(manifest);
     }
     if manifest.is_empty() {
-        return cli;
+        return Ok(cli);
     }
-    if manifest.iter().all(|path| cli.contains(path)) {
-        return manifest;
+    if covers(&cli, &manifest) {
+        return Ok(manifest);
     }
-    if cli.iter().all(|path| manifest.contains(path)) {
-        return cli;
+    if covers(&manifest, &cli) {
+        return Ok(cli);
     }
-    cli.into_iter()
-        .filter(|path| manifest.contains(path))
-        .collect()
+    Err(format!(
+        "--path-scope ({}) is disjoint from --manifest path_scope ({}); a manifest can only \
+         narrow an existing scope, never widen it or replace it with an unrelated one",
+        display_paths(&cli),
+        display_paths(&manifest),
+    )
+    .into())
+}
+
+/// Whether every path in `narrower` is contained -- prefix containment via
+/// `PathScope::is_subset_of` -- by at least one path in `wider`, i.e.
+/// `narrower`'s whole coverage is a subset of `wider`'s.
+fn covers(wider: &[PathBuf], narrower: &[PathBuf]) -> bool {
+    narrower.iter().all(|n| {
+        let n_scope = PathScope::new(n.display().to_string());
+        wider
+            .iter()
+            .any(|w| n_scope.is_subset_of(&PathScope::new(w.display().to_string())))
+    })
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -546,25 +597,73 @@ mod tests {
         assert_eq!(from_cli.mode, WorkerMode::ReadOnly);
     }
 
-    /// `path_scope`: when only one side narrows, that side wins outright;
-    /// when both narrow to genuinely different sets, the intersection is
-    /// the strictest defensible outcome.
+    /// `path_scope`, both empty: the result is empty -- the only case in
+    /// which `stricter_path_scope` may ever return `Vec::new()`.
     #[test]
-    fn path_scope_narrows_to_the_intersection_when_both_sides_disagree() {
-        let cli = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b")];
-        let manifest = vec![PathBuf::from("/repo/b"), PathBuf::from("/repo/c")];
+    fn path_scope_stays_empty_when_both_sides_are_unstated() {
         assert_eq!(
-            stricter_path_scope(cli, manifest),
-            vec![PathBuf::from("/repo/b")]
+            stricter_path_scope(Vec::new(), Vec::new()).expect("both unstated is never an error"),
+            Vec::<PathBuf>::new()
         );
+    }
+
+    /// `path_scope`, one side empty (both directions): the side that
+    /// narrowed is used completely unchanged -- not intersected, not
+    /// touched.
+    #[test]
+    fn path_scope_uses_the_only_side_that_narrowed_in_either_direction() {
         assert_eq!(
-            stricter_path_scope(Vec::new(), vec![PathBuf::from("/repo/a")]),
+            stricter_path_scope(Vec::new(), vec![PathBuf::from("/repo/a")])
+                .expect("manifest-only narrowing is never an error"),
             vec![PathBuf::from("/repo/a")]
         );
         assert_eq!(
-            stricter_path_scope(vec![PathBuf::from("/repo/a")], Vec::new()),
+            stricter_path_scope(vec![PathBuf::from("/repo/a")], Vec::new())
+                .expect("cli-only narrowing is never an error"),
             vec![PathBuf::from("/repo/a")]
         );
+    }
+
+    /// `path_scope`, prefix containment in both directions: reuses
+    /// `envelope::PathScope::is_subset_of` rather than plain element
+    /// equality, so a CLI `/repo/src` against a manifest `/repo/src/ctx`
+    /// (or the reverse) both yield the narrower `/repo/src/ctx` -- the
+    /// review finding this fix addresses.
+    #[test]
+    fn path_scope_takes_the_narrower_of_a_nested_pair_in_either_direction() {
+        assert_eq!(
+            stricter_path_scope(
+                vec![PathBuf::from("/repo/src")],
+                vec![PathBuf::from("/repo/src/ctx")],
+            )
+            .expect("a nested pair is never disjoint"),
+            vec![PathBuf::from("/repo/src/ctx")]
+        );
+        assert_eq!(
+            stricter_path_scope(
+                vec![PathBuf::from("/repo/src/ctx")],
+                vec![PathBuf::from("/repo/src")],
+            )
+            .expect("a nested pair is never disjoint"),
+            vec![PathBuf::from("/repo/src/ctx")]
+        );
+    }
+
+    /// `path_scope`, disjoint: the review-found trust-boundary defect this
+    /// fix addresses. Two non-empty, non-overlapping scopes must be a hard
+    /// error naming both -- returning `Vec::new()` would mean "unset" to
+    /// `envelope::WorkerEnvelope::requested`, widening a writing worker to
+    /// the PARENT's entire grant instead of narrowing it.
+    #[test]
+    fn disjoint_path_scopes_are_a_hard_error_naming_both() {
+        let error = stricter_path_scope(
+            vec![PathBuf::from("/repo/src")],
+            vec![PathBuf::from("/repo/docs")],
+        )
+        .expect_err("disjoint scopes must never silently resolve to an empty (= unset) result");
+        let message = error.to_string();
+        assert!(message.contains("/repo/src"), "got {message}");
+        assert!(message.contains("/repo/docs"), "got {message}");
     }
 
     #[test]
