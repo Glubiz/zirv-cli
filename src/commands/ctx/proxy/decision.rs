@@ -1112,8 +1112,10 @@ fn risk_from_index(index: f64) -> RiskBand {
 /// comment for why margin, not confidence alone, is what catches the
 /// 2026-09-18 replay's instability) resolves complexity/risk to the higher of
 /// its two most probable levels, or keeps the baseline if no pair is
-/// parseable, with a reason recorded; complexity/risk only ever rise
-/// (`max(model, baseline)`); every other
+/// parseable; complexity/risk only ever rise, so that resolved level is taken
+/// only when it is above the baseline. The recorded reason names the outcome
+/// that actually happened (`resolved upward to <label>` or `kept baseline`),
+/// never the level a `max` discarded. Every other
 /// ASKED field (`intent`, `workflow`, a domain tag) is replaced/added outright
 /// when decisive. Existence checks against the live roster (a workflow id, a
 /// harness/model pair) are deferred to [`validate`], which runs right after
@@ -1180,14 +1182,17 @@ pub fn merge(
 
     if let Some(answer) = answers.get("complexity") {
         if !answer.decisive(min_confidence, min_margin) {
-            let resolved = answer.cautious_score().map(complexity_from_index);
-            if let Some(complexity) = resolved {
-                decision.complexity = decision.complexity.max(complexity);
+            let raised = answer
+                .cautious_score()
+                .map(complexity_from_index)
+                .filter(|resolved| *resolved > decision.complexity);
+            if let Some(complexity) = raised {
+                decision.complexity = complexity;
             }
             record_not_decisive(
                 "complexity",
                 answer,
-                resolved.map(|value| format!("{value:?}").to_lowercase()),
+                raised.map(|value| format!("{value:?}").to_lowercase()),
             );
         } else if let AnswerValue::Score(value) = answer.value {
             decision.complexity = decision.complexity.max(complexity_from_index(value));
@@ -1196,14 +1201,17 @@ pub fn merge(
 
     if let Some(answer) = answers.get("risk") {
         if !answer.decisive(min_confidence, min_margin) {
-            let resolved = answer.cautious_score().map(risk_from_index);
-            if let Some(risk) = resolved {
-                decision.risk = decision.risk.max(risk);
+            let raised = answer
+                .cautious_score()
+                .map(risk_from_index)
+                .filter(|resolved| *resolved > decision.risk);
+            if let Some(risk) = raised {
+                decision.risk = risk;
             }
             record_not_decisive(
                 "risk",
                 answer,
-                resolved.map(|value| format!("{value:?}").to_lowercase()),
+                raised.map(|value| format!("{value:?}").to_lowercase()),
             );
         } else if let AnswerValue::Score(value) = answer.value {
             decision.risk = decision.risk.max(risk_from_index(value));
@@ -1582,8 +1590,9 @@ mod tests {
             merged
                 .reasons
                 .iter()
-                .any(|reason| reason.ends_with("resolved upward to bounded")),
-            "{:?}",
+                .any(|reason| reason.starts_with("complexity: margin ")
+                    && reason.ends_with("kept baseline")),
+            "a resolution the baseline outranks must not claim it raised the field: {:?}",
             merged.reasons
         );
     }
