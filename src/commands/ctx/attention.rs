@@ -862,7 +862,10 @@ fn projection_is_terminal(projection: Projection) -> bool {
 #[derive(Debug, clap::Args)]
 pub struct WatchArgs {
     /// Short id (or a unique prefix of one) of a session, or a delegation id
-    /// in this repository, to watch until it reaches a terminal state.
+    /// in this repository, to watch until it reaches a terminal state. An
+    /// exact delegation id is resolved even when `target` is also an
+    /// ambiguous or unmatched session prefix; when `target` names both an
+    /// unambiguous live session AND a delegation, the session wins.
     pub target: String,
     /// Resume cursor: skip transitions already reported through this
     /// revision. Neither backing store (`SessionStatus`, `delegation::
@@ -912,37 +915,51 @@ fn emit_watch_line<W: Write>(
 }
 
 /// Resolves `args.target` as a live session first, falling back to a
-/// delegation id in the current repository when no live session matches --
-/// the same "whichever the id matches" resolution the issue proposes.
-pub fn run_watch_with<W: Write>(
+/// delegation id in the current repository when no session matches OR the
+/// session prefix is merely ambiguous -- an exact delegation id must never be
+/// shadowed by an ambiguous or unmatched session prefix. When `target` is
+/// itself an unambiguous live session id AND a delegation id, the session
+/// wins (`resolve_prefix` only returns `Ok` for exactly one candidate, so
+/// this is the one case delegation is never even consulted).
+///
+/// `diag` receives every diagnostic that is not itself streamed transition
+/// data -- "gone", "replaced" and "timed out" -- in BOTH text and `--json`
+/// mode, so a `--json` consumer's stdout is never anything but valid
+/// `{revision, phase, at}` lines. `w` and `diag` are ordinary parameters
+/// (not `std::io::stderr()` reached directly) so a test can capture each
+/// separately, mirroring `chat::run_with`'s own `stderr: &mut E` parameter.
+pub fn run_watch_with<W: Write, D: Write>(
     args: &WatchArgs,
     w: &mut W,
+    diag: &mut D,
     env: EnvLookup<'_>,
     now_fn: &dyn Fn() -> u64,
     sleep_fn: &dyn Fn(Duration),
 ) -> CtxResult<i32> {
     let state = super::state::StateDir::resolve(env)?;
     match super::sessions::resolve_prefix(&state, &args.target) {
-        Ok(resolved) => run_watch_session(args, w, &state, resolved, now_fn, sleep_fn),
-        Err(err @ super::sessions::ResolveError::Ambiguous(_)) => Err(format!(
-            "zirv ctx watch: {}",
-            super::sessions::resolve_error_with_diagnostics(&err, &state, env)
-        )
-        .into()),
-        Err(super::sessions::ResolveError::NotFound { .. }) => {
+        Ok(resolved) => run_watch_session(args, w, diag, &state, resolved, now_fn, sleep_fn),
+        Err(err) => {
             let repo = match &args.repo {
                 Some(repo) => repo.clone(),
                 None => std::env::current_dir()?,
             };
-            if super::delegation::load(&state, &repo, &args.target).is_none() {
-                return Err(format!(
+            if super::delegation::load(&state, &repo, &args.target).is_some() {
+                return run_watch_delegation(args, w, diag, &state, &repo, now_fn, sleep_fn);
+            }
+            match &err {
+                super::sessions::ResolveError::Ambiguous(_) => Err(format!(
+                    "zirv ctx watch: {}",
+                    super::sessions::resolve_error_with_diagnostics(&err, &state, env)
+                )
+                .into()),
+                super::sessions::ResolveError::NotFound { .. } => Err(format!(
                     "zirv ctx watch: {:?} matches neither a live session nor a delegation in \
                      this repository",
                     args.target
                 )
-                .into());
+                .into()),
             }
-            run_watch_delegation(args, w, &state, &repo, now_fn, sleep_fn)
         }
     }
 }
@@ -951,9 +968,10 @@ pub fn run_watch_with<W: Write>(
 /// as `run_wait_with` does and reuses [`same_generation`] unchanged, but
 /// prints every DISTINCT `SessionStatus::revision` observed since `--since`
 /// (or since watch started, when it is absent) instead of only the final one.
-fn run_watch_session<W: Write>(
+fn run_watch_session<W: Write, D: Write>(
     args: &WatchArgs,
     w: &mut W,
+    diag: &mut D,
     state: &super::state::StateDir,
     resolved: super::sessions::Record,
     now_fn: &dyn Fn() -> u64,
@@ -967,12 +985,12 @@ fn run_watch_session<W: Write>(
     let start = now_fn();
     poll_loop(sleep_fn, || -> CtxResult<Option<i32>> {
         let Some(current) = super::sessions::load_record(state, &short) else {
-            writeln!(w, "zirv ctx watch: {short}: registry entry disappeared")?;
+            writeln!(diag, "zirv ctx watch: {short}: registry entry disappeared")?;
             return Ok(Some(3));
         };
         if !same_generation(pinned_pid, pinned_started_at, &current) {
             writeln!(
-                w,
+                diag,
                 "zirv ctx watch: {short}: the pinned process was replaced by a new one reusing \
                  its identity; not watching it"
             )?;
@@ -996,7 +1014,7 @@ fn run_watch_session<W: Write>(
         }
         if now_fn().saturating_sub(start) >= args.timeout_secs {
             writeln!(
-                w,
+                diag,
                 "zirv ctx watch: {short}: timed out after {}s (currently {})",
                 args.timeout_secs,
                 projection.label()
@@ -1012,9 +1030,10 @@ fn run_watch_session<W: Write>(
 /// disappeared rather than a generation mismatch. Prints every DISTINCT
 /// `delegation::Record::revision` observed since `--since`, and stops the
 /// moment `Phase::is_terminal()` holds.
-fn run_watch_delegation<W: Write>(
+fn run_watch_delegation<W: Write, D: Write>(
     args: &WatchArgs,
     w: &mut W,
+    diag: &mut D,
     state: &super::state::StateDir,
     repo: &std::path::Path,
     now_fn: &dyn Fn() -> u64,
@@ -1025,7 +1044,7 @@ fn run_watch_delegation<W: Write>(
     poll_loop(sleep_fn, || -> CtxResult<Option<i32>> {
         let Some(record) = super::delegation::load(state, repo, &args.target) else {
             writeln!(
-                w,
+                diag,
                 "zirv ctx watch: {}: delegation record disappeared",
                 args.target
             )?;
@@ -1047,7 +1066,7 @@ fn run_watch_delegation<W: Write>(
         }
         if now_fn().saturating_sub(start) >= args.timeout_secs {
             writeln!(
-                w,
+                diag,
                 "zirv ctx watch: {}: timed out after {}s (currently {})",
                 args.target,
                 args.timeout_secs,
@@ -1061,7 +1080,14 @@ fn run_watch_delegation<W: Write>(
 
 pub fn run_watch<W: Write>(args: &WatchArgs, w: &mut W) -> CtxResult<i32> {
     let env = super::config::env_from_process();
-    run_watch_with(args, w, &env, &super::state::now_secs, &std::thread::sleep)
+    run_watch_with(
+        args,
+        w,
+        &mut std::io::stderr(),
+        &env,
+        &super::state::now_secs,
+        &std::thread::sleep,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -2068,7 +2094,8 @@ mod tests {
             step.set(step.get() + 1);
         };
 
-        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &sleep_fn).unwrap();
+        let mut diag = Vec::new();
+        let code = run_watch_with(&args, &mut out, &mut diag, &env, &|| 1000, &sleep_fn).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -2080,6 +2107,10 @@ mod tests {
         assert!(lines[0].contains("revision 0 -> launched"), "{text}");
         assert!(lines[1].contains("revision 1 -> running"), "{text}");
         assert!(lines[2].contains("revision 2 -> completed"), "{text}");
+        assert!(
+            diag.is_empty(),
+            "no diagnostic is expected on the happy path"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2112,7 +2143,8 @@ mod tests {
             );
         };
 
-        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &sleep_fn).unwrap();
+        let mut diag = Vec::new();
+        let code = run_watch_with(&args, &mut out, &mut diag, &env, &|| 1000, &sleep_fn).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -2122,6 +2154,10 @@ mod tests {
             "revision 1 was already reported through --since 1 and must not repeat: {text}"
         );
         assert!(lines[0].contains("revision 2 -> completed"), "{text}");
+        assert!(
+            diag.is_empty(),
+            "no diagnostic is expected on the happy path"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2150,7 +2186,8 @@ mod tests {
         };
         let env = env_with_state(&dir);
         let mut out = Vec::new();
-        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &|_| {}).unwrap();
+        let mut diag = Vec::new();
+        let code = run_watch_with(&args, &mut out, &mut diag, &env, &|| 1000, &|_| {}).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
@@ -2159,6 +2196,90 @@ mod tests {
         assert_eq!(value["revision"], 0);
         assert_eq!(value["phase"], "completed");
         assert_eq!(value["at"], 42);
+        assert!(
+            diag.is_empty(),
+            "no diagnostic is expected on the happy path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn watch_json_timeout_diagnostic_goes_to_stderr_not_stdout() {
+        let (dir, state) = test_state();
+        let repo = test_repo();
+        let delegation = "wdeleg4";
+        write_delegation_record(&state, &repo, delegation, delegation::Phase::Running, 0, 5);
+
+        let args = WatchArgs {
+            target: delegation.to_string(),
+            since: None,
+            timeout_secs: 1,
+            json: true,
+            repo: Some(repo.clone()),
+        };
+        let env = env_with_state(&dir);
+        let mut out = Vec::new();
+        let mut diag = Vec::new();
+        // A fake clock that jumps straight past the 1s timeout on its second
+        // read, mirroring `wait_times_out_when_the_projection_never_matches`.
+        let clock = std::cell::Cell::new(0u64);
+        let now_fn = || {
+            let v = clock.get();
+            clock.set(v + 2);
+            v
+        };
+        let code = run_watch_with(&args, &mut out, &mut diag, &env, &now_fn, &|_| {}).unwrap();
+        assert_eq!(code, 2);
+
+        let stdout_text = String::from_utf8(out).unwrap();
+        for line in stdout_text.lines().filter(|l| !l.is_empty()) {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "every stdout line under --json must be valid JSON, got: {line:?}"
+            );
+        }
+        let diag_text = String::from_utf8(diag).unwrap();
+        assert!(
+            diag_text.contains("timed out"),
+            "the timeout diagnostic must land on the diagnostics writer: {diag_text}"
+        );
+        assert!(
+            !stdout_text.contains("timed out"),
+            "the timeout diagnostic must never reach stdout: {stdout_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn watch_exact_delegation_id_resolves_despite_an_ambiguous_session_prefix() {
+        let (dir, state) = test_state();
+        let repo = test_repo();
+        // Two live sessions whose short ids both start with "amb" -- an
+        // ambiguous PREFIX match on its own.
+        write_test_record(&state, "amb1111", std::process::id(), None);
+        write_test_record(&state, "amb2222", std::process::id(), None);
+        // The exact delegation id "amb" must still resolve rather than being
+        // shadowed by that ambiguous session prefix (issue #724 review).
+        write_delegation_record(&state, &repo, "amb", delegation::Phase::Completed, 0, 5);
+
+        let args = WatchArgs {
+            target: "amb".to_string(),
+            since: None,
+            timeout_secs: 5,
+            json: false,
+            repo: Some(repo.clone()),
+        };
+        let env = env_with_state(&dir);
+        let mut out = Vec::new();
+        let mut diag = Vec::new();
+        let code = run_watch_with(&args, &mut out, &mut diag, &env, &|| 1000, &|_| {}).unwrap();
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("revision 0 -> completed"), "{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2199,7 +2320,8 @@ mod tests {
                 settled.set(true);
             }
         };
-        let code = run_watch_with(&args, &mut out, &env, &|| 1000, &sleep_fn).unwrap();
+        let mut diag = Vec::new();
+        let code = run_watch_with(&args, &mut out, &mut diag, &env, &|| 1000, &sleep_fn).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -2209,6 +2331,10 @@ mod tests {
             "the Working start and the Settled transition must each print once: {text}"
         );
         assert!(lines[1].contains("done-unread"), "{text}");
+        assert!(
+            diag.is_empty(),
+            "no diagnostic is expected on the happy path"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2230,7 +2356,7 @@ mod tests {
             target: short.to_string(),
             since: None,
             timeout_secs: 5,
-            json: false,
+            json: true,
             repo: None,
         };
         let env = env_with_state(&dir);
@@ -2242,15 +2368,33 @@ mod tests {
             }
         };
         let mut out = Vec::new();
+        let mut diag = Vec::new();
         let code = run_watch_with(
             &args,
             &mut out,
+            &mut diag,
             &env,
             &super::super::state::now_secs,
             &sleep_fn,
         )
         .unwrap();
         assert_eq!(code, 3);
+
+        // The one transition observed before the swap is valid JSON; the
+        // "replaced" diagnostic that follows must never join it on stdout.
+        let stdout_text = String::from_utf8(out).unwrap();
+        for line in stdout_text.lines().filter(|l| !l.is_empty()) {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "every stdout line under --json must be valid JSON, got: {line:?}"
+            );
+        }
+        assert!(!stdout_text.contains("replaced"), "{stdout_text}");
+        let diag_text = String::from_utf8(diag).unwrap();
+        assert!(
+            diag_text.contains("replaced"),
+            "the replaced diagnostic must land on the diagnostics writer: {diag_text}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

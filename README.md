@@ -896,7 +896,14 @@ to the section that documents it in depth.
   `watch` already reported — since neither store keeps a history, only its
   current value, a resumed watch never replays every intermediate transition
   that happened while nobody was watching, only the ones it happens to catch
-  plus the latest state; `snapshot` prints a redacted, capped diagnostic
+  plus the latest state. Stdout is transition data only, in both text and
+  `--json` mode — "gone"/"replaced"/"timed out" are diagnostics, not
+  transitions, and always go to stderr instead, so a `--json` consumer's
+  stdout is never anything but valid `{revision, phase, at}` lines. An exact
+  delegation id resolves even when it is also an ambiguous or unmatched
+  session prefix; when it names both an unambiguous session and a
+  delegation, the session wins. `snapshot` prints a redacted, capped
+  diagnostic
   summary. See [Verbs](#verbs) and [Signals and verdicts](#signals-and-verdicts).
 - **Mail and nudges** — `send`/`inbox` leave and read short notes between
   live sessions on this machine, and `nudge` wakes one early with a message;
