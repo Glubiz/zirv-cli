@@ -4678,6 +4678,31 @@ pub struct StartOutcome {
     pub work_dir_gitignored: bool,
 }
 
+/// The one-line note [`start_workflow`] prints to STDERR when starting a new
+/// workflow silently changes which workflow this repository's active
+/// pointer names. Multiple workflows per repository are legitimate
+/// (`zirv workflow resume` restores any of them), so `start_workflow` never
+/// refuses the start; it only says what moved and how to get it back. A
+/// pure fn so its exact wording is unit-testable without capturing real
+/// process stderr.
+fn active_workflow_displaced_note(old_instance_id: &str, old_definition_id: &str) -> String {
+    format!(
+        "note: workflow {old_instance_id} ({old_definition_id}) is no longer this repository's \
+         active workflow; restore it with: zirv workflow resume {old_instance_id}"
+    )
+}
+
+/// Review finding: writes `note` to `writer` best-effort. By the time
+/// [`start_workflow`] reaches this, the new workflow is already saved --
+/// `eprintln!`/`crate::output::note` panic on a write error (a closed
+/// stderr, say), which would surface as a spurious failure of an already-
+/// successful start. Ignoring the `Result` here instead keeps this call
+/// site pure passthrough, the same posture `wrap.rs` holds its own
+/// supervision failures to.
+fn best_effort_write_displacement_note(mut writer: impl std::io::Write, note: &str) {
+    let _ = writeln!(writer, "{note}");
+}
+
 /// Starts and persists a workflow from `args` -- the SAME logic `zirv
 /// workflow start` and the native `workflow_start` tool both run, so
 /// "what starting a workflow means" has exactly one implementation (issue
@@ -4685,7 +4710,10 @@ pub struct StartOutcome {
 /// what advances a step is a second definition of done" rule for the
 /// native workflow tools. Pure of `writer`/output formatting: the caller
 /// decides how to render [`StartOutcome`] (CLI text/JSON, or a tool's JSON
-/// result).
+/// result) -- except for one STDERR note when the start displaces a
+/// different, still-running workflow as this repository's active one (see
+/// [`active_workflow_displaced_note`]); stdout/`--json` output is unaffected
+/// either way.
 pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<StartOutcome> {
     let repo = resolve_repo(args.repo.as_deref())?;
     // Issue #542 chunk 3a decision 4: any registry id executes through this
@@ -4697,12 +4725,19 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     let inherited_agent = session_identity().map(|(_, adapter)| adapter);
     let selected_agent = args.agent.clone().or(inherited_agent);
 
+    // Registry ids are validated lowercase at load (`definition::valid_id`),
+    // so an explicit id is matched case-insensitively by lowercasing it
+    // here once, before it feeds `WorkflowKind::from_pack_id` or
+    // `registry.get` -- `zirv workflow start Bugfix` must resolve exactly
+    // like `zirv workflow start bugfix`.
+    let requested_id = args.id.as_deref().map(str::to_ascii_lowercase);
+
     // Issue #542 chunk 3b: an explicit id always wins outright, no
     // selection performed at all. Omitting it classifies first (intent
     // inferred naturally, never forced to an explicit id's kind) and runs
     // `select_definition` against that classification and the raw `--task`
     // objective text.
-    let explicit_kind_hint = args.id.as_deref().and_then(WorkflowKind::from_pack_id);
+    let explicit_kind_hint = requested_id.as_deref().and_then(WorkflowKind::from_pack_id);
     let classify_args = classify::ClassifyArgs {
         task: args.task.clone(),
         paths: args.paths.clone(),
@@ -4716,7 +4751,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
         json: false,
     };
     let classification = classify::from_args(&classify_args)?;
-    let selection = if args.id.is_none() {
+    let selection = if requested_id.is_none() {
         Some(super::selection::select_definition(
             &classification,
             &registry,
@@ -4725,7 +4760,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     } else {
         None
     };
-    let resolved_id = match &args.id {
+    let resolved_id = match &requested_id {
         Some(id) => id.clone(),
         None => selection
             .as_ref()
@@ -4786,6 +4821,12 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
                 .map_err(|_| format!("step '{}': unknown agent role '{role}'", step.id))?;
         }
     }
+    // Read the CURRENT active pointer before it gets overwritten below, so
+    // a start that silently displaces a still-running workflow can be
+    // reported after the fact -- multiple workflows per repository are
+    // legitimate (`zirv workflow resume` restores any of them), so this
+    // never refuses the start itself.
+    let previously_active = load_active(state_dir, &repo).ok().flatten();
     let mut state = WorkflowState::start_from_pack(
         repo,
         args.task.clone(),
@@ -4818,6 +4859,23 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     ensure_current_artifact_template(&state)?;
     let work_dir_gitignored = work_dir_is_gitignored(&state.repo);
     save(state_dir, &state, true)?;
+    if let Some(old) = previously_active
+        && old.id != state.id
+        && matches!(
+            old.status,
+            WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+        )
+    {
+        let old_definition_id = old
+            .definition
+            .as_ref()
+            .map(|definition| definition.id.clone())
+            .unwrap_or_else(|| old.kind.as_str().to_string());
+        best_effort_write_displacement_note(
+            std::io::stderr(),
+            &active_workflow_displaced_note(&old.id, &old_definition_id),
+        );
+    }
     let mut event =
         super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::WorkflowStarted);
     event.workflow_id = Some(state.id.clone());
@@ -4857,7 +4915,11 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             let repo = resolve_repo(args.repo.as_deref())?;
             let registry = load_workflow_registry(&repo, args.built_in_only)?;
             report_registry_warnings(&registry);
-            let workflow = registry.get(&args.id)?;
+            // Same case-insensitive id match as `workflow start` --
+            // registry ids are validated lowercase at load, so `zirv
+            // workflow show Bugfix` must resolve like `zirv workflow show
+            // bugfix`.
+            let workflow = registry.get(&args.id.to_ascii_lowercase())?;
             if args.json {
                 serde_json::to_writer_pretty(&mut *writer, workflow)?;
                 writeln!(writer)?;
@@ -8255,6 +8317,182 @@ mod tests {
                 .iter()
                 .any(|step| step.skill == "frontend-implement")
         );
+    }
+
+    /// An explicit id is matched case-insensitively -- `zirv workflow start
+    /// Bugfix` must resolve exactly like `zirv workflow start bugfix`
+    /// rather than exiting 2 "unknown workflow 'Bugfix'".
+    #[test]
+    fn start_resolves_an_explicit_id_case_insensitively() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Start(StartArgs {
+                id: Some("Bugfix".into()),
+                task: "fix a database retry bug".into(),
+                agent: None,
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+                paths: vec![PathBuf::from("src/commands/ctx/safety.rs")],
+                changed_lines: Some(40),
+                tests_changed: true,
+                complexity: None,
+                risk: None,
+                branch: None,
+                frontend_root: None,
+                brainstorm: false,
+                no_brainstorm: false,
+                profile: None,
+                json: false,
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).expect("'Bugfix' must resolve like 'bugfix'");
+
+        let state_dir = resolve_state().unwrap();
+        let state = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(state.kind, WorkflowKind::Bugfix);
+        assert_eq!(
+            state.definition.as_ref().map(|d| d.id.as_str()),
+            Some("bugfix")
+        );
+    }
+
+    /// `zirv workflow show` resolves its id the same case-insensitive way
+    /// as `start`.
+    #[test]
+    fn show_resolves_an_explicit_id_case_insensitively() {
+        let repo = tempdir().unwrap();
+        let registry = load_workflow_registry(repo.path(), true).unwrap();
+        let workflow = registry.get("bugfix").unwrap();
+        let args = ShowArgs {
+            id: "BUGFIX".into(),
+            json: false,
+            built_in_only: true,
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let full_args = WorkflowArgs {
+            command: WorkflowSubcommand::Show(args),
+        };
+        let mut out = Vec::new();
+        run(&full_args, &mut out).expect("'BUGFIX' must resolve like 'bugfix'");
+        assert_eq!(workflow.definition.id, "bugfix");
+    }
+
+    /// The exact wording of the note `start_workflow` prints to STDERR when
+    /// a start silently displaces a different, still-running workflow as
+    /// this repository's active one. A pure fn, so the wording is checked
+    /// directly rather than by capturing real process STDERR.
+    #[test]
+    fn active_workflow_displaced_note_names_both_ids_and_the_resume_command() {
+        let note = active_workflow_displaced_note("abc-123", "feature");
+        assert!(note.starts_with("note: "), "{note}");
+        assert!(note.contains("abc-123"), "{note}");
+        assert!(note.contains("(feature)"), "{note}");
+        assert!(
+            note.contains("zirv workflow resume abc-123"),
+            "must point at the exact resume command: {note}"
+        );
+    }
+
+    /// Review finding: a write failure (a closed stderr, say) must never
+    /// panic -- the new workflow this note is ABOUT is already saved by the
+    /// time it's printed, so a failure here must degrade silently rather
+    /// than turning an already-successful start into a reported failure.
+    #[test]
+    fn best_effort_write_displacement_note_never_panics_on_a_failing_writer() {
+        struct AlwaysErrors;
+        impl std::io::Write for AlwaysErrors {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("closed"))
+            }
+        }
+        // Must not panic; a `writeln!`/`eprintln!`-shaped implementation
+        // that propagated the error with `.unwrap()`/`.expect()` would.
+        best_effort_write_displacement_note(AlwaysErrors, "note: irrelevant");
+    }
+
+    /// Starting a second workflow for the same repository while an earlier
+    /// one is still `Running` must NOT refuse -- multiple workflows per
+    /// repository are legitimate, and `zirv workflow resume` restores the
+    /// displaced one. This only proves
+    /// the non-refusal and that the active pointer now names the new run;
+    /// the note text itself is covered by
+    /// `active_workflow_displaced_note_names_both_ids_and_the_resume_command`
+    /// since real process STDERR isn't capturable through this seam.
+    #[test]
+    fn starting_a_second_workflow_never_refuses_and_moves_the_active_pointer() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let start_args = |id: &str, task: &str| StartArgs {
+            id: Some(id.to_string()),
+            task: task.to_string(),
+            agent: None,
+            built_in_only: true,
+            repo: Some(repo.path().to_path_buf()),
+            paths: vec![PathBuf::from("src/commands/ctx/safety.rs")],
+            changed_lines: Some(40),
+            tests_changed: true,
+            complexity: None,
+            risk: None,
+            branch: None,
+            frontend_root: None,
+            brainstorm: false,
+            no_brainstorm: false,
+            profile: None,
+            json: false,
+        };
+
+        let mut out = Vec::new();
+        run(
+            &WorkflowArgs {
+                command: WorkflowSubcommand::Start(start_args("bugfix", "fix the first thing")),
+            },
+            &mut out,
+        )
+        .unwrap();
+        let state_dir = resolve_state().unwrap();
+        let first = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert!(
+            matches!(
+                first.status,
+                WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+            ),
+            "the first workflow must still be non-terminal: {:?}",
+            first.status
+        );
+
+        let mut out2 = Vec::new();
+        let result = run(
+            &WorkflowArgs {
+                command: WorkflowSubcommand::Start(start_args("feature", "add the second thing")),
+            },
+            &mut out2,
+        );
+        assert!(
+            result.is_ok(),
+            "a second workflow for the same repo must never be refused: {result:?}"
+        );
+
+        let second = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.kind, WorkflowKind::Feature);
+
+        // The first workflow's own state is untouched -- still non-terminal,
+        // still loadable, `resume`-able exactly as the note says.
+        let reloaded_first = load(&state_dir, repo.path(), &first.id).unwrap();
+        assert_eq!(reloaded_first.status, first.status);
     }
 
     /// #255 recovery path (ii): `workflow reclassify` forces a persisted

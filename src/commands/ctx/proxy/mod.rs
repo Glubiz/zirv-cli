@@ -179,8 +179,14 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
             questions,
         ) {
             Ok((answers, model_usage)) => {
-                result =
-                    decision::merge(cfg, &baseline, request, &answers, cfg.proxy.min_confidence);
+                result = decision::merge(
+                    cfg,
+                    &baseline,
+                    request,
+                    &answers,
+                    cfg.proxy.min_confidence,
+                    &roster,
+                );
                 winner = Decider::Typesafe;
                 usage = Some(model_usage);
                 ran_model = true;
@@ -198,8 +204,14 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     {
         match try_helper(cfg, questions) {
             Ok(answers) => {
-                result =
-                    decision::merge(cfg, &baseline, request, &answers, cfg.proxy.min_confidence);
+                result = decision::merge(
+                    cfg,
+                    &baseline,
+                    request,
+                    &answers,
+                    cfg.proxy.min_confidence,
+                    &roster,
+                );
                 winner = Decider::Helper;
             }
             Err(reason) => fallbacks.push(reason),

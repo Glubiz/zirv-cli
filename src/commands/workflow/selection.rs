@@ -12,10 +12,10 @@
 
 use std::collections::BTreeSet;
 
-use super::classify::{Classification, WorkDomain};
+use super::classify::{Classification, Intent, WorkDomain};
 use super::definition::EffectClass;
 use super::engine::WorkflowKind;
-use super::registry::WorkflowRegistry;
+use super::registry::{WorkflowRegistry, WorkflowSource};
 
 /// A pack clears the floor only with at least one substantive signal (a
 /// matched trigger phrase, or a matching `domains` tag) -- not merely an
@@ -25,6 +25,13 @@ const SELECTION_FLOOR: u32 = 2;
 const TRIGGER_MATCH_SCORE: u32 = 3;
 const DOMAIN_TAG_IN_OBJECTIVE_SCORE: u32 = 2;
 const WORK_DOMAIN_ALIGNMENT_SCORE: u32 = 1;
+/// The score a legacy intent's direct pack mapping would carry if it were
+/// run through [`score_pack`] like everything else -- it isn't (see
+/// [`select_definition`]), so a specialised pack that displaces it needs
+/// SOME score to record it by in `Selection::alternatives`. `10` is exactly
+/// the value that yields the same `confidence: 1.0` the direct mapping
+/// itself reports.
+const LEGACY_DIRECT_SCORE: u32 = 10;
 
 /// The generic fallback pack's own id -- never a real competitor in the
 /// scored pool (see [`select_definition`]'s doc comment on why), always the
@@ -48,15 +55,57 @@ pub struct Selection {
     pub alternatives: Vec<(String, u32)>,
 }
 
-/// Issue #542 review finding 16: `objective_lower` split into whole word
-/// tokens (any non-alphanumeric byte is a separator), so a domain tag only
-/// matches a WHOLE word in the objective text -- plain substring containment
-/// let short tags false-positive inside unrelated words ("data" inside
-/// "database", "pm" inside "shipment").
-fn word_tokens(text: &str) -> BTreeSet<&str> {
+/// Whole-word tokens in **appearance order**, duplicates kept -- shared with
+/// `classify.rs`'s `infer_intent`, which needs position (the leading word,
+/// windows of a few following tokens) rather than only set membership.
+/// `word_tokens` below is this module's own deduplicated, sorted view of the
+/// same split rule.
+pub(crate) fn word_tokens_ordered(text: &str) -> Vec<&str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect()
+}
+
+/// Whether `objective_word` is `trigger_word`, or `trigger_word` with a
+/// trailing plural `s`/`es` -- the objective's token aligned with a
+/// multi-word trigger's LAST word may be a plural mention of it ("outages"
+/// hits the trigger word "outage").
+fn objective_word_matches_trigger_word(objective_word: &str, trigger_word: &str) -> bool {
+    objective_word == trigger_word
+        || matches!(
+            objective_word.strip_prefix(trigger_word),
+            Some("s") | Some("es")
+        )
+}
+
+/// Whether `trigger`'s own whole-word token sequence appears CONTIGUOUSLY in
+/// `objective_tokens` -- a plain `contains` substring check let a short
+/// trigger like "retro" false-positive inside an unrelated word
+/// ("Retrofit"). Every token but the sequence's last must
+/// match exactly; the last may also match a trailing-plural objective token
+/// (see [`objective_word_matches_trigger_word`]).
+fn trigger_matches(trigger: &str, objective_tokens: &[&str]) -> bool {
+    let trigger_lower = trigger.to_lowercase();
+    let trigger_tokens = word_tokens_ordered(&trigger_lower);
+    let Some(last) = trigger_tokens.len().checked_sub(1) else {
+        return false;
+    };
+    if trigger_tokens.len() > objective_tokens.len() {
+        return false;
+    }
+    objective_tokens
+        .windows(trigger_tokens.len())
+        .any(|window| {
+            window.iter().zip(trigger_tokens.iter()).enumerate().all(
+                |(i, (objective_word, trigger_word))| {
+                    if i == last {
+                        objective_word_matches_trigger_word(objective_word, trigger_word)
+                    } else {
+                        objective_word == trigger_word
+                    }
+                },
+            )
+        })
 }
 
 fn work_domain_tag(domain: WorkDomain) -> &'static str {
@@ -67,20 +116,25 @@ fn work_domain_tag(domain: WorkDomain) -> &'static str {
 }
 
 /// One candidate pack's deterministic score against `classification` and
-/// `objective`, plus the human-readable reasons behind it. `0` (empty
-/// reasons) when nothing matched at all.
+/// `objective`, the human-readable reasons behind it, and whether at least
+/// one of its own trigger phrases actually hit (`0`/empty reasons when
+/// nothing matched at all). The trigger-hit flag is a substantive signal
+/// distinct from the score itself -- a domain-tag or work-domain point alone
+/// can produce a positive score with no trigger hit at all, and
+/// [`refine_legacy_selection`] cares specifically about the latter.
 fn score_pack(
     domains: &[String],
     triggers: &[String],
     classification: &Classification,
     objective_lower: &str,
-) -> (u32, Vec<String>) {
+) -> (u32, Vec<String>, bool) {
     let mut score = 0u32;
     let mut reasons = Vec::new();
+    let objective_tokens = word_tokens_ordered(objective_lower);
 
     let mut trigger_hits = 0u32;
     for trigger in triggers {
-        if !trigger.trim().is_empty() && objective_lower.contains(&trigger.to_lowercase()) {
+        if !trigger.trim().is_empty() && trigger_matches(trigger, &objective_tokens) {
             trigger_hits += 1;
         }
     }
@@ -91,7 +145,7 @@ fn score_pack(
         ));
     }
 
-    let objective_words = word_tokens(objective_lower);
+    let objective_words: BTreeSet<&str> = objective_tokens.iter().copied().collect();
     let mut domain_hits = 0u32;
     for domain in domains {
         if !domain.trim().is_empty() && objective_words.contains(domain.as_str()) {
@@ -111,19 +165,149 @@ fn score_pack(
         reasons.push(format!("classified work domain aligns with '{tag}'"));
     }
 
-    (score, reasons)
+    (score, reasons, trigger_hits > 0)
+}
+
+/// Whether a specialised pack's declared `effects` may replace `intent`'s
+/// own legacy pack in [`refine_legacy_selection`]. `Refactor` is handled by
+/// that function's own early return and never reaches here; `Other` has no
+/// legacy pack to refine and never calls this either.
+fn effects_compatible_with_legacy_intent(intent: Intent, effects: EffectClass) -> bool {
+    match intent {
+        Intent::Feature | Intent::Bugfix => {
+            matches!(effects, EffectClass::Repository | EffectClass::External)
+        }
+        Intent::Review => matches!(effects, EffectClass::None),
+        Intent::Spike => true,
+        Intent::Refactor | Intent::Other => false,
+    }
+}
+
+/// A legacy-mapped intent (`Feature`/`Bugfix`/`Spike`/`Review`; `Refactor`
+/// never reaches here) still selects its own kind pack by default, but a
+/// more specialised registered pack may take over when it BOTH actually
+/// matched one of its own trigger phrases in the objective (a domain-tag or
+/// work-domain-alignment point alone never qualifies) AND its declared
+/// `effects` fits what that intent is allowed to touch -- see
+/// [`effects_compatible_with_legacy_intent`]. Scoring and the tie-break
+/// mirror `select_definition`'s own step 2/4 exactly, restricted to this
+/// smaller, gated candidate pool. `None` when no specialised pack qualifies,
+/// so the caller falls back to the plain direct mapping.
+///
+/// Review finding, trust boundary: a repository-provided pack
+/// (`WorkflowSource::Repository`) is untrusted and may only ADD a
+/// non-colliding id (see `registry.rs`'s own widening refusal) -- it must
+/// never REFINE a legacy intent's own built-in pack out from under it, since
+/// that would let an untrusted trigger/`effects` pairing silently drop the
+/// gates a trusted built-in bugfix/feature pack enforces. Only `BuiltIn` and
+/// `OperatorGlobal` packs are eligible here; a repository pack still wins
+/// outright for `Intent::Other` via `select_definition`'s ordinary scoring
+/// (step 2), which this function is never involved in.
+fn refine_legacy_selection(
+    classification: &Classification,
+    registry: &WorkflowRegistry,
+    objective_lower: &str,
+    legacy_id: &str,
+) -> Option<Selection> {
+    if classification.intent == Intent::Refactor {
+        return None;
+    }
+
+    let mut candidates: Vec<(String, u32, Vec<String>, EffectClass)> = registry
+        .list()
+        // Neither the fallback pack nor any of the five legacy kind packs
+        // (this intent's own included) ever compete here -- only a
+        // genuinely SPECIALISED pack may displace a legacy default. A
+        // repository-layer pack is untrusted and never competes here either
+        // (see this function's own doc comment) -- only `BuiltIn`/
+        // `OperatorGlobal` packs are.
+        .filter(|pack| {
+            pack.definition.id != ADAPTIVE_WORK_ID
+                && WorkflowKind::from_pack_id(&pack.definition.id).is_none()
+                && pack.source != WorkflowSource::Repository
+        })
+        .filter_map(|pack| {
+            let (score, reasons, trigger_hit) = score_pack(
+                &pack.definition.domains,
+                &pack.definition.triggers,
+                classification,
+                objective_lower,
+            );
+            if !trigger_hit
+                || !effects_compatible_with_legacy_intent(
+                    classification.intent,
+                    pack.definition.effects,
+                )
+            {
+                return None;
+            }
+            Some((
+                pack.definition.id.clone(),
+                score,
+                reasons,
+                pack.definition.effects,
+            ))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.3.cmp(&b.3)).then(a.0.cmp(&b.0)));
+
+    let (winner_id, winner_score, winner_reasons, _) = candidates[0].clone();
+    let tied = candidates
+        .iter()
+        .take_while(|(_, score, _, _)| *score == winner_score)
+        .count();
+
+    let mut reasons = winner_reasons;
+    reasons.push(format!(
+        "specialised pack '{winner_id}' replaces the classified {:?} intent's own '{legacy_id}' \
+         pack: its trigger phrase matched the objective",
+        classification.intent
+    ));
+    if tied > 1 {
+        reasons.push(format!(
+            "tied with {} other specialised pack(s) at score {winner_score}; broken toward fewer \
+             external effects, then alphabetically",
+            tied - 1
+        ));
+    }
+
+    let mut alternatives: Vec<(String, u32)> = candidates
+        .iter()
+        .skip(1)
+        .map(|(id, score, _, _)| (id.clone(), *score))
+        .collect();
+    alternatives.push((legacy_id.to_string(), LEGACY_DIRECT_SCORE));
+
+    Some(Selection {
+        definition_id: winner_id,
+        confidence: (f64::from(winner_score) / 10.0).min(1.0),
+        reasons,
+        alternatives,
+    })
 }
 
 /// Selects which registered pack should run for `classification`/
 /// `objective` (the raw task text) -- issue #542 chunk 3b.
 ///
 /// 1. A classified software-development intent (`feature`/`bugfix`/
-///    `refactor`/`spike`/`review`) selects its own legacy kind pack
-///    OUTRIGHT when that id is registered, with no scoring at all -- today's
-///    behavior is exactly unchanged. `Intent::Other` is the only intent that
-///    reaches step 2 (no existing intent value describes a project-
+///    `refactor`/`spike`/`review`) selects its own legacy kind pack by
+///    DEFAULT when that id is registered. A more SPECIALISED pack may
+///    replace it (see [`refine_legacy_selection`]) when it actually matched
+///    one of its own trigger phrases in the objective -- a domain-tag or
+///    work-domain-alignment point alone never qualifies -- and its declared
+///    `effects` fits the intent: `Feature`/`Bugfix` need `Repository` or
+///    `External`, `Review` needs `None`, `Spike` accepts any effects, and
+///    `Refactor` is never displaced. When no specialised pack qualifies,
+///    behavior is exactly the old direct mapping (confidence `1.0`).
+///    `Intent::Other` has no legacy kind counterpart, so it always reaches
+///    step 2 below (no existing intent value describes a project-
 ///    management/data/architecture/devops task, so this is also the only
-///    path those new packs are ever chosen through).
+///    path those new packs are ever chosen through when their objective
+///    doesn't also match one of the five kinds above).
 /// 2. Every OTHER registered pack (excluding [`ADAPTIVE_WORK_ID`] itself,
 ///    which never competes) is scored via [`score_pack`]. A pack that
 ///    clears [`SELECTION_FLOOR`] is eligible.
@@ -138,11 +322,19 @@ pub fn select_definition(
     registry: &WorkflowRegistry,
     objective: &str,
 ) -> Selection {
+    let objective_lower = objective.to_lowercase();
+
     if let Some(kind) = WorkflowKind::from_intent(classification.intent)
         && registry.get(kind.as_str()).is_ok()
     {
+        let legacy_id = kind.as_str().to_string();
+        if let Some(refined) =
+            refine_legacy_selection(classification, registry, &objective_lower, &legacy_id)
+        {
+            return refined;
+        }
         return Selection {
-            definition_id: kind.as_str().to_string(),
+            definition_id: legacy_id,
             confidence: 1.0,
             reasons: vec![format!(
                 "classified intent {:?} maps directly to the '{}' pack",
@@ -153,12 +345,11 @@ pub fn select_definition(
         };
     }
 
-    let objective_lower = objective.to_lowercase();
     let mut scored: Vec<(String, u32, Vec<String>, EffectClass)> = registry
         .list()
         .filter(|pack| pack.definition.id != ADAPTIVE_WORK_ID)
         .map(|pack| {
-            let (score, reasons) = score_pack(
+            let (score, reasons, _trigger_hit) = score_pack(
                 &pack.definition.domains,
                 &pack.definition.triggers,
                 classification,
@@ -254,6 +445,134 @@ mod tests {
         assert_eq!(selection.definition_id, "bugfix");
         assert_eq!(selection.confidence, 1.0);
         assert!(selection.alternatives.is_empty());
+    }
+
+    /// A trigger phrase matches on WHOLE-WORD token sequences, never
+    /// `contains` -- "retro" (a `pm-retrospective`
+    /// trigger) must not fire inside "Retrofit". With no pack qualifying,
+    /// this `Other`-intent objective falls all the way back to
+    /// `adaptive-work`, exactly as the acceptance matrix expects.
+    #[test]
+    fn a_whole_word_trigger_never_matches_inside_an_unrelated_word() {
+        let registry = registry();
+        let selection = select_definition(
+            &classification(Intent::Other),
+            &registry,
+            "Retrofit the old importer docs",
+        );
+        assert_eq!(
+            selection.definition_id, ADAPTIVE_WORK_ID,
+            "{:?}",
+            selection.reasons
+        );
+    }
+
+    /// The objective's token aligned with a trigger's LAST word may carry a
+    /// trailing plural `s`/`es` -- "outages" still hits the single-word
+    /// trigger "outage".
+    #[test]
+    fn a_trigger_s_last_word_matches_a_trailing_plural_in_the_objective() {
+        assert!(trigger_matches(
+            "outage",
+            &["the", "outages", "piled", "up"]
+        ));
+        assert!(!trigger_matches("outage", &["outaged"]));
+    }
+
+    /// Effect-compatibility arm: `Bugfix` needs `Repository`/`External`,
+    /// which `security-remediation` (effects = repository) satisfies.
+    #[test]
+    fn bugfix_with_a_security_trigger_selects_security_remediation() {
+        let registry = registry();
+        let selection = select_definition(
+            &classification(Intent::Bugfix),
+            &registry,
+            "Fix the security vulnerability in the auth module",
+        );
+        assert_eq!(
+            selection.definition_id, "security-remediation",
+            "{:?}",
+            selection.reasons
+        );
+        assert!(
+            selection.alternatives.iter().any(|(id, _)| id == "bugfix"),
+            "the displaced legacy pack must still be recorded: {:?}",
+            selection.alternatives
+        );
+    }
+
+    /// Effect-compatibility arm: `Feature` also needs `Repository`/
+    /// `External`, which `pm-status-report` (effects = none) does NOT
+    /// satisfy -- its trigger still matches, but the legacy `feature` pack
+    /// stands.
+    #[test]
+    fn feature_with_a_status_report_trigger_stays_feature() {
+        let registry = registry();
+        let selection = select_definition(
+            &classification(Intent::Feature),
+            &registry,
+            "Add a status report page to the dashboard",
+        );
+        assert_eq!(
+            selection.definition_id, "feature",
+            "{:?}",
+            selection.reasons
+        );
+        assert_eq!(selection.confidence, 1.0);
+    }
+
+    /// Effect-compatibility arm: `Review` needs `None`, which
+    /// `architecture-design-review` (effects = none) satisfies.
+    #[test]
+    fn review_with_a_design_review_trigger_selects_architecture_design_review() {
+        let registry = registry();
+        let selection = select_definition(
+            &classification(Intent::Review),
+            &registry,
+            "Review the design of the new queue",
+        );
+        assert_eq!(
+            selection.definition_id, "architecture-design-review",
+            "{:?}",
+            selection.reasons
+        );
+    }
+
+    /// `Refactor` is never displaced, even though `devops-ci-cd-change`'s
+    /// own "build pipeline" trigger matches and its effects (repository)
+    /// would otherwise qualify under the Feature/Bugfix rule.
+    #[test]
+    fn refactor_is_never_displaced_by_a_specialised_pack() {
+        let registry = registry();
+        let selection = select_definition(
+            &classification(Intent::Refactor),
+            &registry,
+            "Refactor the build pipeline scripts",
+        );
+        assert_eq!(
+            selection.definition_id, "refactor",
+            "{:?}",
+            selection.reasons
+        );
+        assert_eq!(selection.confidence, 1.0);
+        assert!(selection.alternatives.is_empty());
+    }
+
+    /// Effect-compatibility arm: `Spike` accepts ANY effects, so
+    /// `sre-incident-triage` (effects = none) still qualifies.
+    #[test]
+    fn spike_with_an_outage_trigger_selects_sre_incident_triage() {
+        let registry = registry();
+        let selection = select_definition(
+            &classification(Intent::Spike),
+            &registry,
+            "Investigate the outage in checkout",
+        );
+        assert_eq!(
+            selection.definition_id, "sre-incident-triage",
+            "{:?}",
+            selection.reasons
+        );
     }
 
     #[test]
@@ -398,6 +717,86 @@ present_as = "summary"
                 .iter()
                 .any(|(id, _)| id == "a-more-effects"),
             "the losing tied pack must still be recorded as an alternative"
+        );
+    }
+
+    fn write_fixture_with_trigger(dir: &std::path::Path, id: &str, effects: &str, trigger: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.toml")),
+            format!(
+                r#"
+schema_version = 1
+id = "{id}"
+version = 1
+title = "{id}"
+description = "fixture"
+domains = ["testing"]
+triggers = ["{trigger}"]
+effects = "{effects}"
+
+[[steps]]
+id = "only"
+title = "Only"
+phase = "implement"
+skills = ["implement"]
+condition = "always"
+
+[failure]
+escalate_to = "human"
+
+[completion]
+present_as = "summary"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Review finding, trust boundary: a repository-provided pack is
+    /// untrusted and may only ADD a non-colliding id -- it must never
+    /// refine a legacy intent's own built-in pack out from under it, even
+    /// with a broad trigger ("fix") and a compatible `effects`. The
+    /// IDENTICAL pack at a trusted layer (operator-global) DOES refine,
+    /// proving the gate is about provenance, not the pack's own content.
+    #[test]
+    fn a_repository_layer_pack_never_refines_a_legacy_intent_but_a_trusted_layer_pack_does() {
+        let skills_repo = tempdir().unwrap();
+        let skills = SkillRegistry::load(skills_repo.path(), None, false, false).unwrap();
+
+        let untrusted_repo = tempdir().unwrap();
+        let untrusted_dir = untrusted_repo.path().join(".zirv/workflows");
+        std::fs::create_dir_all(&untrusted_dir).unwrap();
+        write_fixture_with_trigger(&untrusted_dir, "repo-bugfix-like", "repository", "fix");
+        let untrusted_registry =
+            WorkflowRegistry::load(untrusted_repo.path(), None, true, true, &skills).unwrap();
+        let untrusted_selection = select_definition(
+            &classification(Intent::Bugfix),
+            &untrusted_registry,
+            "fix the crash",
+        );
+        assert_eq!(
+            untrusted_selection.definition_id, "bugfix",
+            "an untrusted repository pack must never refine a legacy intent: {:?}",
+            untrusted_selection.reasons
+        );
+
+        let home = tempdir().unwrap();
+        let home_dir = home.path().join(".zirv/workflows");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        write_fixture_with_trigger(&home_dir, "repo-bugfix-like", "repository", "fix");
+        let trusted_repo = tempdir().unwrap();
+        let trusted_registry =
+            WorkflowRegistry::load(trusted_repo.path(), Some(home.path()), true, false, &skills)
+                .unwrap();
+        let trusted_selection = select_definition(
+            &classification(Intent::Bugfix),
+            &trusted_registry,
+            "fix the crash",
+        );
+        assert_eq!(
+            trusted_selection.definition_id, "repo-bugfix-like",
+            "an operator-global (trusted) pack must still refine: {:?}",
+            trusted_selection.reasons
         );
     }
 

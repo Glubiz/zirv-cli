@@ -2393,8 +2393,9 @@ fn run_read(args: &SkillReadArgs, writer: &mut impl Write) -> CtxResult<i32> {
 /// unchanged -- `workflow::dispatch` already prints an `Err` to stderr and
 /// exits non-zero for every other subcommand here, so this needs no special
 /// handling to satisfy "prints the refusal to stderr and exits non-zero" --
-/// and, since `record_skill_activation` is only ever reached below a
-/// successful load, a refusal is guaranteed to record nothing.
+/// and, since `record_skill_activation`/`record_shell_skill_load` are only
+/// ever reached below a successful load, a refusal is guaranteed to record
+/// nothing either way.
 fn run_load(args: &SkillLoadArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let registry = registry(args.repo.as_deref(), args.built_in_only)?;
     report_warnings(&registry);
@@ -2415,6 +2416,13 @@ fn run_load(args: &SkillLoadArgs, writer: &mut impl Write) -> CtxResult<i32> {
     if let Ok(state) = StateDir::resolve(&|key| std::env::var(key).ok()) {
         let _ = skill_tools::record_skill_activation(&state, &repo, &loaded, SkillLoadSurface::Cli);
     }
+    // This shell invocation is the PRIMARY skill-load path (the standing
+    // skill index and the pretool dispatch pointer both tell an agent to run
+    // exactly this command), and the transcript-based skill nudge can never
+    // see it on its own -- see `hook::record_shell_skill_load`'s own doc
+    // comment. Best-effort, same rule as the activation-journal write just
+    // above.
+    crate::commands::ctx::hook::record_shell_skill_load(&|key| std::env::var(key).ok());
     Ok(0)
 }
 
@@ -3798,6 +3806,25 @@ mod tests {
         )])
     }
 
+    /// The same seam as [`state_dir_guard`], plus explicit control of
+    /// `ZIRV_CTX_SESSION` (`adapters::SESSION_ENV`) -- `None` clears it rather
+    /// than merely not setting it, since this test process may itself be
+    /// running under a real zirv-supervised session that already has one, and
+    /// `record_shell_skill_load` reads the real process environment exactly
+    /// like `record_skill_activation` does.
+    fn state_and_session_guard(
+        root: &Path,
+        session: Option<&str>,
+    ) -> crate::commands::ctx::testenv::VarGuard {
+        crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "ZIRV_CTX_STATE_DIR",
+                Some(root.to_str().expect("utf-8 tempdir path")),
+            ),
+            ("ZIRV_CTX_SESSION", session),
+        ])
+    }
+
     fn load_args(id: &str, repo: &Path) -> SkillArgs {
         SkillArgs {
             command: SkillCommand::Load(SkillLoadArgs {
@@ -3852,6 +3879,77 @@ mod tests {
             Some(skill.content_hash.as_str())
         );
         assert_eq!(events[0].skill_surface.as_deref(), Some("cli"));
+    }
+
+    /// A successful `zirv skill load` from a session carrying
+    /// `ZIRV_CTX_SESSION` bumps that session's own
+    /// `AdoptionRecord::shell_skill_loads` by one -- the other side of the
+    /// gap `signals_cannot_see_a_shell_invoked_skill_load_only_the_tool_name`
+    /// (`adoption.rs`) documents: the transcript scan can never see this, so
+    /// the CLI itself has to say so directly.
+    #[test]
+    fn run_load_with_a_session_env_bumps_the_shell_skill_load_counter() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let session = "sess-shell-load";
+        let _vars = state_and_session_guard(state_root.path(), Some(session));
+
+        let mut out = Vec::new();
+        assert_eq!(
+            run(&load_args("incident-investigation", repo.path()), &mut out).unwrap(),
+            0
+        );
+
+        let state = StateDir::resolve(&|key| std::env::var(key).ok()).expect("state dir");
+        let path = crate::commands::ctx::hook::adoption_record_path(&state, session);
+        let record = crate::commands::ctx::hook::load_adoption_record(&path);
+        assert_eq!(record.shell_skill_loads, 1, "{record:?}");
+    }
+
+    /// With no `ZIRV_CTX_SESSION` at all (an unsupervised `zirv skill load`),
+    /// no adoption record is written for
+    /// anything -- `record_shell_skill_load` returns before ever resolving a
+    /// state directory or a path.
+    #[test]
+    fn run_load_with_no_session_env_writes_no_adoption_record() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let _vars = state_and_session_guard(state_root.path(), None);
+
+        let mut out = Vec::new();
+        assert_eq!(
+            run(&load_args("incident-investigation", repo.path()), &mut out).unwrap(),
+            0
+        );
+
+        let state = StateDir::resolve(&|key| std::env::var(key).ok()).expect("state dir");
+        let adoption_dir = state.adoption();
+        assert!(
+            std::fs::read_dir(&adoption_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+            "no session env means no adoption record should exist at all"
+        );
+    }
+
+    /// An unknown skill id refuses (via `skill_tools::skill_load`'s own `?`)
+    /// before `run_load` ever reaches its `record_shell_skill_load` call, so
+    /// no bump happens -- only a SUCCESSFUL load counts.
+    #[test]
+    fn run_load_of_an_unknown_skill_id_does_not_bump_the_shell_skill_load_counter() {
+        let repo = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let session = "sess-unknown-id";
+        let _vars = state_and_session_guard(state_root.path(), Some(session));
+
+        let mut out = Vec::new();
+        run(&load_args("does-not-exist-at-all", repo.path()), &mut out)
+            .expect_err("an unknown id must refuse");
+
+        let state = StateDir::resolve(&|key| std::env::var(key).ok()).expect("state dir");
+        let path = crate::commands::ctx::hook::adoption_record_path(&state, session);
+        let record = crate::commands::ctx::hook::load_adoption_record(&path);
+        assert_eq!(record.shell_skill_loads, 0, "{record:?}");
     }
 
     /// Issue #539 chunk G: a skill whose required integration is unavailable

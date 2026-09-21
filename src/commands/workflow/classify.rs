@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::ctx::CtxResult;
 
+use super::selection::word_tokens_ordered;
+
 const MAX_TASK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -428,29 +430,262 @@ fn add_path_signal(
     true
 }
 
-fn infer_intent(task: &str) -> Intent {
-    if ["bug", "fix", "failure", "broken", "regression"]
-        .iter()
-        .any(|word| task.contains(word))
-    {
-        Intent::Bugfix
-    } else if task.contains("refactor") || task.contains("cleanup") {
-        Intent::Refactor
-    } else if ["spike", "prototype", "explore", "research"]
-        .iter()
-        .any(|word| task.contains(word))
-    {
-        Intent::Spike
-    } else if task.contains("review") || task.contains("audit") {
-        Intent::Review
-    } else if ["add", "implement", "feature", "build"]
-        .iter()
-        .any(|word| task.contains(word))
-    {
-        Intent::Feature
-    } else {
-        Intent::Other
+/// Leading tokens skipped when looking for the task's leading verb (tier 1
+/// of [`infer_intent`]) -- politeness/hedging words that carry no intent
+/// signal of their own ("Please can you fix the crash" must still see "fix"
+/// as the lead).
+const LEADING_FILLER: &[&str] = &[
+    "please", "can", "could", "would", "you", "we", "i", "need", "needs", "want", "like", "to",
+    "should", "must", "let", "lets", "s", "us", "kindly", "just", "help", "me", "go", "ahead",
+    "and",
+];
+
+const BUGFIX_LEAD: &[&str] = &[
+    "fix",
+    "fixes",
+    "fixing",
+    "bug",
+    "bugfix",
+    "hotfix",
+    "regression",
+    "repair",
+    "resolve",
+    "debug",
+    "crash",
+    "patch",
+];
+const REFACTOR_LEAD: &[&str] = &[
+    "refactor",
+    "refactoring",
+    "cleanup",
+    "rename",
+    "extract",
+    "simplify",
+    "restructure",
+    "reorganize",
+    "reorganise",
+    "deduplicate",
+    "dedupe",
+    "consolidate",
+    "tidy",
+    "split",
+];
+const SPIKE_LEAD: &[&str] = &[
+    "spike",
+    "prototype",
+    "explore",
+    "research",
+    "investigate",
+    "evaluate",
+    "experiment",
+    "poc",
+];
+const REVIEW_LEAD: &[&str] = &["review", "audit"];
+const FEATURE_LEAD: &[&str] = &[
+    "add",
+    "adds",
+    "adding",
+    "implement",
+    "build",
+    "create",
+    "introduce",
+    "support",
+    "enable",
+    "allow",
+    "improve",
+    "enhance",
+    "extend",
+    "feat",
+];
+
+const BUGFIX_ANYWHERE: &[&str] = &[
+    "fix",
+    "fixes",
+    "fixed",
+    "bug",
+    "bugs",
+    "bugfix",
+    "hotfix",
+    "broken",
+    "breaks",
+    "broke",
+    "regression",
+    "crash",
+    "crashes",
+    "crashing",
+    "panic",
+    "panics",
+    "fails",
+    "failing",
+    "failure",
+    "failures",
+    "error",
+    "errors",
+    "cannot",
+    "exception",
+    "exceptions",
+    "leak",
+    "leaks",
+    "wrong",
+    "incorrect",
+    "flaky",
+    "hang",
+    "hangs",
+    "deadlock",
+    "corrupt",
+    "corrupted",
+];
+const REFACTOR_ANYWHERE: &[&str] = &[
+    "refactor",
+    "refactoring",
+    "cleanup",
+    "duplication",
+    "deduplicate",
+];
+const SPIKE_ANYWHERE: &[&str] = &[
+    "spike",
+    "prototype",
+    "research",
+    "feasibility",
+    "feasible",
+    "poc",
+    "exploring",
+];
+const REVIEW_ANYWHERE: &[&str] = &["review", "reviews", "reviewing", "audit", "auditing"];
+const FEATURE_ANYWHERE: &[&str] = &[
+    "add",
+    "implement",
+    "implementing",
+    "feature",
+    "introduce",
+    "create",
+];
+
+/// Tier 1 of [`infer_intent`]: the task's leading verb, once leading filler
+/// is skipped, starting at `tokens[start]`. `None` when the leading token
+/// matches none of the lead word lists, so the caller falls back to tier 2.
+fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
+    let lead = tokens[start];
+
+    if BUGFIX_LEAD.contains(&lead) {
+        return Some(Intent::Bugfix);
     }
+    // The bigram "clean up" (refactor lead) before the single-word refactor
+    // list, so "up" never needs its own entry there.
+    if lead == "clean" && tokens.get(start + 1) == Some(&"up") {
+        return Some(Intent::Refactor);
+    }
+    if REFACTOR_LEAD.contains(&lead) {
+        return Some(Intent::Refactor);
+    }
+    // The phrase "proof of concept" (spike lead) before the single-word
+    // spike list, for the same reason.
+    if lead == "proof"
+        && tokens.get(start + 1) == Some(&"of")
+        && tokens.get(start + 2) == Some(&"concept")
+    {
+        return Some(Intent::Spike);
+    }
+    if lead == "investigate" {
+        // Adjustment (b): "investigate" alone is Bugfix when a tier-2
+        // bugfix word appears anywhere in the task ("Investigate why the
+        // scheduler crashes"), else Spike ("Investigate whether we can drop
+        // the tokio dependency").
+        return Some(
+            if tokens.iter().any(|token| BUGFIX_ANYWHERE.contains(token)) {
+                Intent::Bugfix
+            } else {
+                Intent::Spike
+            },
+        );
+    }
+    if SPIKE_LEAD.contains(&lead) {
+        return Some(Intent::Spike);
+    }
+    if REVIEW_LEAD.contains(&lead) {
+        return Some(Intent::Review);
+    }
+    if FEATURE_LEAD.contains(&lead) {
+        // Adjustment (a), narrowed: a feature lead followed within the next
+        // 3 tokens by fix/bugfix/hotfix is Bugfix ("Implement a fix for the
+        // login crash") ONLY when that word is either the task's very last
+        // token, or is directly followed by one of for/to/in/on -- a bare
+        // mention of the word as an ordinary noun phrase ("Add a bugfix
+        // changelog section") must stay Feature. Review finding: EVERY
+        // fix/bugfix/hotfix token in the window is checked, not just the
+        // first -- "Implement a fix/hotfix for startup" must still trigger
+        // on "hotfix" even though the earlier "fix" alone doesn't qualify.
+        let window_end = (start + 4).min(tokens.len());
+        let triggers_bugfix = (start + 1..window_end).any(|index| {
+            matches!(tokens[index], "fix" | "bugfix" | "hotfix") && {
+                let is_last_token = index == tokens.len() - 1;
+                let followed_by_preposition = tokens
+                    .get(index + 1)
+                    .is_some_and(|next| matches!(*next, "for" | "to" | "in" | "on"));
+                is_last_token || followed_by_preposition
+            }
+        });
+        if triggers_bugfix {
+            return Some(Intent::Bugfix);
+        }
+        return Some(Intent::Feature);
+    }
+    None
+}
+
+/// Tier 2 of [`infer_intent`]: a whole-word scan anywhere in the task, in a
+/// fixed priority order, only reached when tier 1 found no leading verb.
+fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
+    let has_does_nothing = tokens.windows(2).any(|pair| pair == ["does", "nothing"]);
+    if has_does_nothing || tokens.iter().any(|token| BUGFIX_ANYWHERE.contains(token)) {
+        return Some(Intent::Bugfix);
+    }
+    let has_clean_up = tokens.windows(2).any(|pair| pair == ["clean", "up"]);
+    let has_dead_code = tokens.windows(2).any(|pair| pair == ["dead", "code"]);
+    if has_clean_up || has_dead_code || tokens.iter().any(|token| REFACTOR_ANYWHERE.contains(token))
+    {
+        return Some(Intent::Refactor);
+    }
+    let has_proof_of_concept = tokens
+        .windows(3)
+        .any(|triple| triple == ["proof", "of", "concept"]);
+    let has_try_out = tokens.windows(2).any(|pair| pair == ["try", "out"]);
+    if has_proof_of_concept
+        || has_try_out
+        || tokens.iter().any(|token| SPIKE_ANYWHERE.contains(token))
+    {
+        return Some(Intent::Spike);
+    }
+    if tokens.iter().any(|token| REVIEW_ANYWHERE.contains(token)) {
+        return Some(Intent::Review);
+    }
+    if tokens.iter().any(|token| FEATURE_ANYWHERE.contains(token)) {
+        return Some(Intent::Feature);
+    }
+    None
+}
+
+/// Deterministic intent classification from `task` (already lowercased by
+/// [`classify`]). Whole-word tokens only, never a substring match ("prefix"
+/// no longer contains "fix", "explorer" no longer contains "explore").
+/// Tier 1 reads the task's own leading verb, once leading filler is
+/// skipped -- the strongest, most literal signal of
+/// what is being asked. Tier 2, reached only when tier 1 found no leading
+/// verb, falls back to a whole-word scan anywhere in the task, in a fixed
+/// priority order. An empty or entirely-filler task matches neither tier and
+/// is [`Intent::Other`].
+fn infer_intent(task: &str) -> Intent {
+    let tokens = word_tokens_ordered(task);
+
+    if let Some(start) = tokens
+        .iter()
+        .position(|token| !LEADING_FILLER.contains(token))
+        && let Some(intent) = leading_intent(&tokens, start)
+    {
+        return intent;
+    }
+
+    tier2_intent(&tokens).unwrap_or(Intent::Other)
 }
 
 fn infer_complexity(files: usize, lines: usize, paths: &[PathBuf]) -> Complexity {
@@ -788,6 +1023,88 @@ mod tests {
     fn identical_inputs_produce_identical_classification() {
         let value = input(&["src/lib.rs"], 12);
         assert_eq!(classify(&value).unwrap(), classify(&value).unwrap());
+    }
+
+    /// `infer_intent` matches WHOLE words only, never a substring, and reads
+    /// the task's leading verb before falling back to a scan of the rest of
+    /// the words. Table-driven over the cases the old substring matcher got
+    /// wrong plus the tiering rules themselves.
+    #[test]
+    fn infer_intent_matches_whole_words_leading_verb_first() {
+        let cases: &[(&str, Intent)] = &[
+            // Substring traps the old `contains` matcher fell into.
+            ("Add a prefix option to the log formatter", Intent::Feature),
+            ("Add a suffix to generated file names", Intent::Feature),
+            ("Add test fixtures for the parser", Intent::Feature),
+            ("Address the duplication in the adapters", Intent::Refactor),
+            ("padding looks off", Intent::Other),
+            ("Add an explorer view for files", Intent::Feature),
+            ("Implement a debug flag", Intent::Feature),
+            // Leading verb wins over a later keyword.
+            ("add a review command to the CLI", Intent::Feature),
+            ("review the fix for the bug", Intent::Review),
+            ("refactor the bug tracker", Intent::Refactor),
+            ("fix the refactor that broke imports", Intent::Bugfix),
+            // Filler skipping.
+            ("Please add a --verbose flag", Intent::Feature),
+            ("We need to implement SSO login", Intent::Feature),
+            // Conventional-commit prefixes.
+            ("feat: add shell completions", Intent::Feature),
+            ("fix(ctx): stop repeated permission prompts", Intent::Bugfix),
+            ("BUGFIX: wrong timezone in reports", Intent::Bugfix),
+            // Symptom-only reports, no leading verb at all.
+            ("the build fails on windows", Intent::Bugfix),
+            ("login is broken on Safari", Intent::Bugfix),
+            // A feature lead immediately followed by "fix".
+            ("Implement a fix for the login crash", Intent::Bugfix),
+            // Both `investigate` branches.
+            (
+                "Investigate why the scheduler crashes on startup",
+                Intent::Bugfix,
+            ),
+            (
+                "Investigate whether we can drop the tokio dependency",
+                Intent::Spike,
+            ),
+            // "clean up" bigram.
+            ("Clean up the adapters module", Intent::Refactor),
+            // Adjustment (a), narrowed: a feature lead's nearby fix/bugfix/
+            // hotfix word only flips to Bugfix when it is the task's last
+            // token or is directly followed by for/to/in/on -- a bare noun
+            // mention stays Feature.
+            ("Add a bugfix changelog section", Intent::Feature),
+            ("Add a hotfix for the login crash", Intent::Bugfix),
+            // Review finding: every fix/bugfix/hotfix token in the
+            // window is checked, not just the first -- the leading "fix"
+            // alone doesn't qualify (next token "hotfix" isn't a
+            // preposition), but "hotfix" does (followed by "for").
+            ("Implement a fix/hotfix for startup", Intent::Bugfix),
+            // "try" is deliberately NOT a lead word -- it falls through to
+            // tier 2, where "fix" still wins.
+            ("Try to fix the login bug", Intent::Bugfix),
+            // "try out" bigram (tier 2 only).
+            ("Try out the new clap derive API", Intent::Spike),
+            // Bugfix tier-2 symptom words and the "does nothing" phrase.
+            ("Null pointer exception when saving a draft", Intent::Bugfix),
+            ("The export button does nothing", Intent::Bugfix),
+            ("Memory leak in the websocket handler", Intent::Bugfix),
+            ("Wrong total shown in the cart", Intent::Bugfix),
+            ("Patch the off-by-one in pagination", Intent::Bugfix),
+            // "dead code" bigram (refactor tier 2).
+            ("Remove dead code from the scheduler", Intent::Refactor),
+            // "feasible" (spike tier 2).
+            ("Is it feasible to stream tool output?", Intent::Spike),
+            // No signal at all.
+            ("", Intent::Other),
+        ];
+        for (task, expected) in cases {
+            let lowered = task.to_ascii_lowercase();
+            assert_eq!(
+                infer_intent(&lowered),
+                *expected,
+                "task {task:?} should classify as {expected:?}"
+            );
+        }
     }
 
     /// Issue #541 chunk C, decision 3: the team compiler needs the REAL

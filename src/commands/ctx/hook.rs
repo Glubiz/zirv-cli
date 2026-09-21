@@ -12,8 +12,10 @@ use super::state::{StateDir, now_secs, repo_slug};
 use super::supervise::Watcher;
 use super::{CtxResult, log, score, signal};
 use crate::commands::workflow::adoption::{self, AdoptionPolicy, AdoptionSignals};
+#[cfg(test)]
+use crate::commands::workflow::classify;
 use crate::commands::workflow::skill::WorkflowPhase;
-use crate::commands::workflow::{classify, engine, telemetry, verification};
+use crate::commands::workflow::{engine, telemetry, verification};
 
 #[derive(Debug, clap::Args)]
 pub struct HookArgs {
@@ -949,6 +951,25 @@ fn cfg_or_operator_only_gate(repo: &Path, env: EnvLookup<'_>) -> CtxConfig {
 /// since the last one -- the same append-only-cost property `score.rs`'s own
 /// incremental checkpoint has, kept as a separate small fold here rather than
 /// widening that (separately versioned, heavily depended-on) schema.
+///
+/// `skill_loads` is the identical kind of cumulative count as
+/// `edit_like_calls` (folded the same way, in the same pass), and
+/// `last_skill_nudged_turn` is the skill nudge's own cadence field, kept
+/// separate from `last_nudged_turn` so the workflow-adoption nudge and the
+/// skill nudge never suppress each other. Both are `#[serde(default)]`: a
+/// record persisted before this change simply reads back as "no loads seen,
+/// never nudged yet", never a parse failure.
+///
+/// `shell_skill_loads` counts a shell-invoked `zirv skill load` -- the
+/// PRIMARY load path (the standing skill index and the subagent skill pointer
+/// both tell an agent to run it from a shell),
+/// which `adoption::signals`'s transcript scan can never see (see that
+/// module's own doc comment). Bumped ONLY by [`record_shell_skill_load`],
+/// NEVER by [`fold_adoption_delta`]: it is not transcript-derived at all, so
+/// a restarted transcript must never reset it the way
+/// `edit_like_calls`/`skill_loads` are reset. A lower bound, not an exact
+/// count: the bump is an unlocked read-modify-write, so two concurrent loads
+/// may record one -- harmless, since the nudge only tests for zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AdoptionRecord {
     pub(crate) substantial: bool,
@@ -963,6 +984,12 @@ pub(crate) struct AdoptionRecord {
     offset: u64,
     #[serde(default)]
     consumed: u64,
+    #[serde(default)]
+    pub(crate) skill_loads: usize,
+    #[serde(default)]
+    last_skill_nudged_turn: Option<usize>,
+    #[serde(default)]
+    pub(crate) shell_skill_loads: usize,
 }
 
 /// One file per session id, named after a hash of it (mirrors `score.rs`'s
@@ -1019,9 +1046,10 @@ pub(crate) fn save_adoption_record(path: &Path, record: &AdoptionRecord) {
 }
 
 /// Folds only the transcript bytes appended since `record`'s own resume
-/// position into its cumulative `edit_like_calls`. A restarted transcript
-/// (compaction, rewrite) restarts the fold from zero, the same rule
-/// `RotState` applies to the score itself.
+/// position into its cumulative `edit_like_calls`/`skill_loads` (the
+/// identical fold, extended to the second count). A restarted transcript
+/// (compaction, rewrite) restarts both from zero, the same rule `RotState`
+/// applies to the score itself.
 fn fold_adoption_delta(
     record: &mut AdoptionRecord,
     transcript: &Path,
@@ -1036,35 +1064,38 @@ fn fold_adoption_delta(
     };
     if appended.restarted {
         record.edit_like_calls = 0;
+        record.skill_loads = 0;
     }
-    record.edit_like_calls +=
-        adoption::signals(&adapter.parse_events(&appended.lines)).edit_like_calls;
+    let delta = adoption::signals(&adapter.parse_events(&appended.lines));
+    record.edit_like_calls += delta.edit_like_calls;
+    record.skill_loads += delta.skill_loads;
     let (offset, consumed) = watcher.position();
     record.offset = offset;
     record.consumed = consumed;
 }
 
-/// The workflow kind named in a nudge's `zirv workflow start <kind>`, from
-/// the same git-diff classifier `zirv workflow classify` runs -- only ever
-/// called once a nudge is actually due, since it shells out to `git`. Any
-/// failure (no git, no diff, classification error) falls back to `feature`.
+/// Best-effort bump of the CURRENT session's shell-invoked skill-load count.
+/// `zirv skill load` is the primary load path, but `adoption::signals` only
+/// ever sees a shell tool call's NAME, never its command text, so a shell
+/// load is invisible to the skill nudge's transcript scan. `skill::run_load`
+/// runs inside the wrapped session's shell and inherits `SESSION_ENV`, so it
+/// calls this once after a successful load. `shell_skill_loads` is not
+/// transcript-derived, so `fold_adoption_delta` never touches or resets it.
 ///
-/// `pub(crate)`: also used by `agent::run_with`'s enforce-policy refusal
-/// message (issue #223 §E), which names the same kind for the same reason.
-pub(crate) fn classified_kind(repo: &Path) -> String {
-    classify::git_change_input(repo, String::new())
-        .and_then(|input| classify::classify(&input))
-        .map(|classification| {
-            match classification.intent {
-                classify::Intent::Bugfix => "bugfix",
-                classify::Intent::Refactor => "refactor",
-                classify::Intent::Spike => "spike",
-                classify::Intent::Review => "review",
-                classify::Intent::Feature | classify::Intent::Other => "feature",
-            }
-            .to_string()
-        })
-        .unwrap_or_else(|_| "feature".to_string())
+/// No `SESSION_ENV` (an unsupervised load), no state directory, or an
+/// unreadable record are silently ignored; returning nothing keeps `zirv
+/// skill load`'s own output and exit code unaffected by construction.
+pub(crate) fn record_shell_skill_load(env: EnvLookup<'_>) {
+    let Some(session) = env(SESSION_ENV).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let path = adoption_record_path(&state, &session);
+    let mut record = load_adoption_record(&path);
+    record.shell_skill_loads += 1;
+    save_adoption_record(&path, &record);
 }
 
 /// Workflow-adoption detection and Stop-hook nudge text, in one pass.
@@ -1081,6 +1112,21 @@ pub(crate) fn classified_kind(repo: &Path) -> String {
 /// delegated worker" signal already wired into a spawned child's own process
 /// env today -- `telemetry::TelemetryEvent::parent_session_id` exists as a
 /// field but nothing in this codebase populates it yet.
+///
+/// The skill nudge (`adoption::skill_nudge_due`/
+/// `skill_nudge_text`) rides the SAME transcript scan and the SAME
+/// delegated-worker exemption above -- it is computed after both early
+/// returns, so it is silent under `workflow.adoption == Off` (the fold never
+/// runs, so `record.substantial`/`skill_loads` never update -- deliberately
+/// NOT a second, independent gate on the skill nudge itself: see
+/// `AdoptionPolicy`'s own doc comment on what this key governs) and for a
+/// delegated worker, for the identical reason the workflow nudge is. Unlike
+/// the workflow nudge, it is NOT further gated on `workflow.adoption >=
+/// AdoptionPolicy::Nudge` (an `Advise`-level operator still gets it) and NOT
+/// gated on `workflow_active` (a workflow being active does not mean a skill
+/// was ever loaded) -- only on `cfg.prompt.skill_index`, the same switch that
+/// turns off the standing skill-index system-prompt layer and the Change-A
+/// dispatch pointer.
 fn adoption_stop_nudge(
     state: &StateDir,
     repo: &Path,
@@ -1110,6 +1156,7 @@ fn adoption_stop_nudge(
     let signals = AdoptionSignals {
         edit_like_calls: record.edit_like_calls,
         turns: record.turns,
+        skill_loads: record.skill_loads,
     };
     record.substantial = adoption::is_substantial(&signals);
     record.workflow_active = engine::load_active(state, repo).ok().flatten().is_some();
@@ -1149,17 +1196,35 @@ fn adoption_stop_nudge(
         // here instead.
         record.substantial && !record.workflow_active && record.last_nudged_turn.is_none()
     };
-    let text = due.then(|| {
+    let workflow_text = due.then(|| {
         record.last_nudged_turn = Some(record.turns);
-        adoption::nudge_text(
-            &signals,
-            Some(&classified_kind(repo)),
-            cfg.workflow.adoption,
-        )
+        adoption::nudge_text(&signals, cfg.workflow.adoption)
+    });
+
+    // Own gate (`prompt.skill_index`), own due check, own cadence field --
+    // see this function's own doc comment.
+    // "zero loads" sums the transcript-derived count with the shell-invoked
+    // one (`AdoptionRecord::shell_skill_loads`, bumped only by
+    // `record_shell_skill_load`) -- `skill_nudge_due` itself stays pure and
+    // unaware of where a load count came from.
+    let skill_text = (cfg.prompt.skill_index
+        && adoption::skill_nudge_due(
+            record.substantial,
+            record.skill_loads + record.shell_skill_loads,
+            record.turns,
+            record.last_skill_nudged_turn,
+        ))
+    .then(|| {
+        record.last_skill_nudged_turn = Some(record.turns);
+        adoption::skill_nudge_text(&signals)
     });
 
     save_adoption_record(&path, &record);
-    text
+    let combined = [workflow_text, skill_text]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    (!combined.is_empty()).then(|| combined.join("\n"))
 }
 
 /// Issue #293: records ONE `TurnLatencySampled` sample for this scoring
@@ -2336,10 +2401,16 @@ fn omitted_model_on_generic_type(seat: &str, tool_name: &str, input: &PreToolInp
 /// `model` inserted or overwritten -- never a bare `{"model": ...}`, which
 /// would launch the dispatch with no `prompt`, no `subagent_type` and no
 /// `description` at all.
+///
+/// (issue #539 chunk F) also appends [`SKILL_POINTER_NOTE`] to the same
+/// `updatedInput.prompt`, when eligible ([`append_skill_pointer`]) -- the
+/// single `updatedInput` this envelope carries has to speak for both rewrites
+/// at once, since claude only ever reads one.
 fn pretool_dispatch_tier_output(
     original_tool_input: &serde_json::Value,
     model: &str,
     note: &str,
+    cfg: &CtxConfig,
 ) -> String {
     let mut updated_input = original_tool_input.clone();
     match updated_input.as_object_mut() {
@@ -2354,6 +2425,7 @@ fn pretool_dispatch_tier_output(
         // safer fallback than propagating a non-object `updatedInput`.
         None => updated_input = serde_json::json!({ "model": model }),
     }
+    append_skill_pointer(&mut updated_input, cfg);
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -2431,6 +2503,7 @@ fn dispatch_tier_advise(
             "zirv: model {alias} chosen for this dispatch (tier {tier_label}, {:.2})",
             answer.confidence
         ),
+        cfg,
     ))
 }
 
@@ -2451,6 +2524,102 @@ fn dispatch_tier_override(
     let state = StateDir::resolve(env).ok()?;
     let tool_input = raw_tool_input(stdin);
     dispatch_tier_advise(&cfg, &state, seat, payload, &tool_input)
+}
+
+// -- PreToolUse: the subagent skill-library pointer (issue #539 chunk F
+// derivative) --------------------------------------------------------------
+
+/// Appended to an allowed `Agent`/`Task` dispatch's `prompt`, once, when
+/// eligible ([`append_skill_pointer`]). Field evidence: a subagent never
+/// inherits its parent's system prompt (and therefore never sees
+/// `prompt::SKILL_INDEX_HEADER`/`skill_index_text`), so nothing today tells a
+/// dispatched worker the skill library exists at all.
+///
+/// This is the library's EXISTENCE and the loading commands, never a
+/// pre-selected skill -- issue #539 chunk F's standing operator decision
+/// (`skill_activation.rs`'s own doc comment) is that zirv may make a skill's
+/// existence deterministic but never the choice to use one, so this text
+/// names no skill id and calls no scorer. ASCII only, no em dashes: every
+/// other hook-adjacent string in this crate is held to that same rule.
+const SKILL_POINTER_NOTE: &str = "\n\n[zirv skills] This session's harness provides task skills \
+(method and failure modes per task type). If you have a shell: before starting, run `zirv skill \
+list --match \"<your task in a few words>\"`, run `zirv skill load <id>` for any that fits, and \
+name the skills you loaded in your report.";
+
+/// Whether [`SKILL_POINTER_NOTE`] should ride along with `prompt`: gated by
+/// `cfg.prompt.skill_index` (the same switch that turns off the standing
+/// skill-index system-prompt layer, `prompt::skill_index_text` -- `false`
+/// means an operator wants no zirv-authored skill mention at all, standing
+/// layer or per-dispatch pointer alike), and skipped when `prompt` already
+/// mentions "zirv skill" (any casing) -- a parent that already briefed skills explicitly,
+/// or a re-entrant hook -- so the pointer is never doubled.
+fn wants_skill_pointer(cfg: &CtxConfig, prompt: &str) -> bool {
+    cfg.prompt.skill_index && !prompt.to_ascii_lowercase().contains("zirv skill")
+}
+
+/// Appends [`SKILL_POINTER_NOTE`] to `tool_input`'s own `prompt` field IN
+/// PLACE, when eligible, and reports whether it did. `tool_input` must
+/// already be a JSON object carrying a string `prompt` -- anything else (not
+/// an object, no `prompt`, or a non-string `prompt`) is left completely
+/// untouched, which is exactly the subagent skill pointer's own scope: never
+/// fire for a payload that is not a genuine dispatch with real task text.
+fn append_skill_pointer(tool_input: &mut serde_json::Value, cfg: &CtxConfig) -> bool {
+    let Some(object) = tool_input.as_object_mut() else {
+        return false;
+    };
+    let Some(serde_json::Value::String(prompt)) = object.get("prompt") else {
+        return false;
+    };
+    if !wants_skill_pointer(cfg, prompt) {
+        return false;
+    }
+    let mut updated = prompt.clone();
+    updated.push_str(SKILL_POINTER_NOTE);
+    object.insert("prompt".to_string(), serde_json::Value::String(updated));
+    true
+}
+
+/// The plain `allow` envelope for a dispatch this hook never had anything
+/// else to say about: `updatedInput` is the original `tool_input` with
+/// [`SKILL_POINTER_NOTE`] appended to `prompt`, and nothing else -- no
+/// `additionalContext`, mirroring [`pretool_dispatch_tier_output`]'s own
+/// shape minus the note claude has no model rewrite to explain.
+fn pretool_pointer_output(updated_input: serde_json::Value) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": updated_input
+        }
+    })
+    .to_string()
+}
+
+/// The production wrapper for the plain (no model-rewrite) case: an
+/// `Agent`/`Task` dispatch [`pretool_decision`] already allowed outright (or
+/// never even reached, on a seat that guard does not gate at all), so this
+/// hook printed nothing at all before the subagent skill pointer. Resolves
+/// `cfg` from `env`/`payload.cwd` exactly as [`dispatch_tier_override`]
+/// resolves its own, then appends the pointer when [`append_skill_pointer`]
+/// says to. `None` -- meaning stay silent -- on a session with no
+/// `SESSION_ENV` at all (gated the same way [`prompt_adoption_nudge`] gates
+/// on it -- a non-empty value is the one signal common to every seat role
+/// zirv supervises, unlike `SEAT_MODEL_ENV`, which only an orchestrator
+/// carries), any non-dispatch tool, an unresolvable cwd, or an ineligible
+/// prompt.
+fn skill_pointer_override(
+    payload: &PreToolPayload,
+    stdin: &str,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    env(SESSION_ENV).filter(|session| !session.is_empty())?;
+    if !super::lifecycle::SUBAGENT_TOOLS.contains(&payload.tool_name.as_str()) {
+        return None;
+    }
+    let cwd = resolved_cwd(payload)?;
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    let mut tool_input = raw_tool_input(stdin);
+    append_skill_pointer(&mut tool_input, &cfg).then(|| pretool_pointer_output(tool_input))
 }
 
 // -- PreToolUse: the orchestrator-write guard (issues #328/#334) -----------
@@ -2851,7 +3020,7 @@ fn run_pretool_bash_rewrite<W: Write>(
     Ok(0)
 }
 
-/// Runs three independent guards against the same payload: the expensive-seat
+/// Runs four independent guards against the same payload: the expensive-seat
 /// subagent guard above (gated on `SEAT_MODEL_ENV`) and the orchestrator-
 /// write guard below (gated on `SEAT_ROLE_ENV`, issue #334) -- an
 /// orchestrator seat launched on a cheap model still carries no
@@ -2860,10 +3029,15 @@ fn run_pretool_bash_rewrite<W: Write>(
 /// the second guard cannot be nested inside the first's own early return.
 /// The third, issue #406's reuse probe (`reuse_advice`), is gated on nothing
 /// at all -- every seat that writes a file gets it -- and is advisory only:
-/// it can add a note to an `allow` envelope and can never deny.
+/// it can add a note to an `allow` envelope and can never deny. The fourth,
+/// [`skill_pointer_override`] (issue #539 chunk F), is gated on
+/// `SESSION_ENV` -- broader than the first guard's `SEAT_MODEL_ENV` -- and,
+/// like the third, is advisory only: it never denies, and a dispatch the
+/// first guard already denied or rewrote never reaches it (both those paths
+/// already returned).
 ///
-/// Fails open on every path: no seat env, an unparseable payload, a tool
-/// no guard knows anything about, an unresolvable `cwd`, and any internal
+/// Fails open on every path: no seat/session env, an unparseable payload, a
+/// tool no guard knows anything about, an unresolvable `cwd`, and any internal
 /// error all exit 0 with nothing on stdout, which claude reads as "no
 /// decision, use the normal permission flow". Nothing here may `unwrap`,
 /// `expect` or return `Err` -- the release profile is `panic = "abort"`, and
@@ -2895,6 +3069,21 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
             return Ok(0);
         }
         let _ = writeln!(w, "{}", pretool_output(&reason));
+        return Ok(0);
+    }
+
+    // The subagent skill pointer (issue #539 chunk F): gated on
+    // `SESSION_ENV` -- set for every seat role zirv supervises, not only an
+    // orchestrator's own `SEAT_MODEL_ENV` -- so a Single or worker seat
+    // dispatching a native subagent gets the same pointer an orchestrator
+    // seat does; see `skill_pointer_override`'s own doc comment. A dispatch
+    // the guard above already DENIED already returned before reaching here;
+    // one it already REWRITES also already returned, with the pointer
+    // composed into that same `updatedInput` (`pretool_dispatch_tier_
+    // output`'s own call to `append_skill_pointer`) -- so this is only ever
+    // reached for a dispatch nothing above had anything to say about.
+    if let Some(output) = skill_pointer_override(&payload, stdin, env) {
+        let _ = writeln!(w, "{output}");
         return Ok(0);
     }
 
@@ -3511,12 +3700,21 @@ pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> Ctx
 /// per-session record `adoption_stop_nudge` already maintains and re-checks
 /// `zirv workflow start`/`resume` live, since a workflow can start in another
 /// pane between one Stop and the next prompt. `None` on any doubt at all: no
-/// session identity, no record, not substantial, a workflow already active,
-/// or simply not due yet.
+/// session identity, no record, not substantial, or neither nudge is due.
+///
+/// The skill nudge is computed alongside the workflow one, sharing the
+/// same delegated-worker exemption, session/record lookup and
+/// `record.substantial` gate, but -- exactly like `adoption_stop_nudge`'s
+/// own copy -- is NOT gated on `cfg.workflow.adoption >= AdoptionPolicy::
+/// Nudge` (the workflow nudge's own top-level gate, moved down into its own
+/// branch below so it no longer shortcuts the whole function) or on
+/// `workflow_active`, only on `cfg.prompt.skill_index`. In practice a
+/// workflow-adoption policy of `Off` still reads as "no skill nudge either",
+/// the same way `adoption_stop_nudge` documents: the Stop hook never folds
+/// fresh transcript bytes while `Off`, so `record.substantial` has nothing
+/// new to say -- this function only ever RE-READS that record, never
+/// re-scans it.
 fn prompt_adoption_nudge(repo: &Path, cfg: &CtxConfig, env: EnvLookup<'_>) -> Option<String> {
-    if cfg.workflow.adoption < AdoptionPolicy::Nudge {
-        return None;
-    }
     if env(super::agent::WORK_GROUP_ENV)
         .filter(|v| !v.is_empty())
         .is_some()
@@ -3530,30 +3728,59 @@ fn prompt_adoption_nudge(repo: &Path, cfg: &CtxConfig, env: EnvLookup<'_>) -> Op
     if !record.substantial {
         return None;
     }
-    // Live re-check: a workflow may have started in another pane since the
-    // last Stop hook wrote this record.
-    let workflow_active_now = engine::load_active(&state, repo).ok().flatten().is_some();
-    if !adoption::nudge_due(
-        cfg.workflow.adoption,
-        record.substantial,
-        workflow_active_now,
-        record.turns,
-        record.last_nudged_turn,
-    ) {
-        return None;
-    }
     let signals = AdoptionSignals {
         edit_like_calls: record.edit_like_calls,
         turns: record.turns,
+        skill_loads: record.skill_loads,
     };
-    let text = adoption::nudge_text(
-        &signals,
-        Some(&classified_kind(repo)),
-        cfg.workflow.adoption,
-    );
-    record.last_nudged_turn = Some(record.turns);
+
+    let workflow_text = (cfg.workflow.adoption >= AdoptionPolicy::Nudge)
+        .then(|| {
+            // Live re-check: a workflow may have started in another pane
+            // since the last Stop hook wrote this record.
+            let workflow_active_now = engine::load_active(&state, repo).ok().flatten().is_some();
+            adoption::nudge_due(
+                cfg.workflow.adoption,
+                record.substantial,
+                workflow_active_now,
+                record.turns,
+                record.last_nudged_turn,
+            )
+            .then(|| {
+                record.last_nudged_turn = Some(record.turns);
+                adoption::nudge_text(&signals, cfg.workflow.adoption)
+            })
+        })
+        .flatten();
+
+    // Explicit rather than incidental -- under `off` the Stop hook never
+    // rescans the transcript (`adoption_stop_nudge`'s own early return), so a
+    // persisted `substantial: true` record can go stale instead of ever
+    // becoming false again. This function only re-reads that record, so
+    // without this check a stale one would still fire the skill nudge here
+    // even after an operator turned workflow adoption off.
+    let skill_text = (cfg.workflow.adoption != AdoptionPolicy::Off
+        && cfg.prompt.skill_index
+        && adoption::skill_nudge_due(
+            record.substantial,
+            record.skill_loads + record.shell_skill_loads,
+            record.turns,
+            record.last_skill_nudged_turn,
+        ))
+    .then(|| {
+        record.last_skill_nudged_turn = Some(record.turns);
+        adoption::skill_nudge_text(&signals)
+    });
+
+    if workflow_text.is_none() && skill_text.is_none() {
+        return None;
+    }
     save_adoption_record(&path, &record);
-    Some(text)
+    let combined = [workflow_text, skill_text]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Some(combined.join("\n"))
 }
 
 pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
@@ -5702,6 +5929,13 @@ mod tests {
         .expect("save active workflow");
         let mut cfg = CtxConfig::default();
         cfg.workflow.adoption = AdoptionPolicy::Nudge;
+        // This test is about the WORKFLOW nudge's own active-workflow
+        // suppression, not the skill nudge: that one fires independent of
+        // `workflow_active` by design (skills matter inside a workflow too),
+        // so it would otherwise also produce text here (zero skill loads,
+        // substantial work) and make this assertion meaningless. Disabling it
+        // keeps the assertion about what this test actually covers.
+        cfg.prompt.skill_index = false;
 
         let text = adoption_stop_nudge(
             &state,
@@ -5788,6 +6022,179 @@ mod tests {
             .filter(|e| e.kind == telemetry::TelemetryKind::AdoptionRecovered)
             .count();
         assert_eq!(recovered, 1, "recovery must be recorded exactly once");
+    }
+
+    /// Appends `turns` more claude-shaped turns to a transcript
+    /// `transcript_with_edits` already built, no edit-like tool calls in any
+    /// of them, and a native `skill_load` tool_use in the LAST one when
+    /// `with_skill_load` is true. Fixture for proving `fold_adoption_delta`
+    /// really counts a skill-load tool call from a real transcript fold, not
+    /// just the pure `adoption::signals` unit test.
+    fn append_turns(path: &std::path::Path, turns: usize, with_skill_load: bool) {
+        let mut text = std::fs::read_to_string(path).expect("read");
+        for i in 0..turns {
+            text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
+            let mut content = "{\"type\":\"text\",\"text\":\"ok\"}".to_string();
+            if with_skill_load && i + 1 == turns {
+                content.push_str(
+                    ",{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"skill_load\",\"input\":{}}",
+                );
+            }
+            text.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{content}],\"usage\":{{\"input_tokens\":100}}}}}}\n"
+            ));
+        }
+        std::fs::write(path, text).expect("write");
+    }
+
+    /// Substantial work with zero skill loads fires the skill nudge; once a
+    /// native/MCP `skill_load` tool call actually appears in the transcript,
+    /// the same cadence that would otherwise still be due (turn 18 >= the
+    /// first fire's turn 12, plus `NUDGE_EVERY_TURNS`) stays silent instead
+    /// -- proving `record.skill_loads` is really folded from the transcript,
+    /// not merely
+    /// checked in the pure unit.
+    #[test]
+    fn adoption_stop_nudge_skill_nudge_fires_then_falls_silent_once_a_load_is_folded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
+        let cfg = CtxConfig::default();
+        assert_eq!(cfg.workflow.adoption, AdoptionPolicy::Nudge);
+
+        let first = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-skill-nudge",
+            &cfg,
+            &score_with_turns(12),
+            &transcript,
+            &|_| None,
+        )
+        .expect("substantial with zero loads must nudge");
+        assert!(
+            first.contains(
+                "[zirv skills] substantial work (12 edit calls over 12 turns) and no zirv \
+                 skill loaded this session"
+            ),
+            "{first}"
+        );
+
+        // Six more turns, no new edits, a `skill_load` tool call in the last
+        // one -- cadence alone (turn 18 >= 12 + 5) would still say due.
+        append_turns(&transcript, 6, true);
+        let second = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-skill-nudge",
+            &cfg,
+            &score_with_turns(18),
+            &transcript,
+            &|_| None,
+        )
+        .unwrap_or_default();
+        assert!(
+            !second.contains("[zirv skills]"),
+            "a folded skill load must silence the skill nudge: {second}"
+        );
+    }
+
+    /// `prompt.skill_index = false` turns the skill nudge off entirely,
+    /// independent of everything else about the session being substantial
+    /// with zero loads.
+    #[test]
+    fn adoption_stop_nudge_skill_nudge_is_off_when_skill_index_is_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
+        let mut cfg = CtxConfig::default();
+        cfg.prompt.skill_index = false;
+
+        let text = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-skill-off",
+            &cfg,
+            &score_with_turns(12),
+            &transcript,
+            &|_| None,
+        )
+        .unwrap_or_default();
+        assert!(
+            !text.contains("[zirv skills]"),
+            "skill_index=false must turn the skill nudge off: {text}"
+        );
+    }
+
+    /// `shell_skill_loads` (bumped only by `record_shell_skill_load`, tested
+    /// at `skill.rs`'s own seam) sums with the transcript-derived `skill_loads`
+    /// for the skill nudge's own "zero loads" check -- a shell-recorded load
+    /// silences the nudge exactly like a native/MCP tool-call load does.
+    #[test]
+    fn adoption_stop_nudge_skill_nudge_is_silent_after_a_shell_recorded_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
+        let cfg = CtxConfig::default();
+
+        // Simulate `zirv skill load` already having run once from this same
+        // session's own shell, exactly as `record_shell_skill_load` does.
+        let path = adoption_record_path(&state, "sess-shell-nudge");
+        save_adoption_record(
+            &path,
+            &AdoptionRecord {
+                shell_skill_loads: 1,
+                ..Default::default()
+            },
+        );
+
+        let text = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-shell-nudge",
+            &cfg,
+            &score_with_turns(12),
+            &transcript,
+            &|_| None,
+        )
+        .unwrap_or_default();
+        assert!(
+            !text.contains("[zirv skills]"),
+            "a shell-recorded load must silence the skill nudge: {text}"
+        );
+    }
+
+    /// `shell_skill_loads` is not transcript-derived at all, so a restarted
+    /// transcript -- which resets `edit_like_calls`/`skill_loads` to zero --
+    /// must leave it untouched.
+    #[test]
+    fn fold_adoption_delta_never_touches_shell_skill_loads_even_on_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_with_edits(dir.path(), 3, 3);
+        let mut record = AdoptionRecord {
+            shell_skill_loads: 4,
+            ..Default::default()
+        };
+        let cfg = CtxConfig::default();
+        let adapter =
+            adapters::select_for_identity(cfg.agent.as_deref(), &[], &cfg).expect("adapter");
+
+        fold_adoption_delta(&mut record, &transcript, adapter.as_ref());
+        assert_eq!(record.shell_skill_loads, 4, "first fold must not touch it");
+        assert_eq!(record.edit_like_calls, 3);
+
+        // A shorter file at the same path is exactly what `Watcher::
+        // read_appended` reads as a restart (`len < self.offset`).
+        let restarted = transcript_with_edits(dir.path(), 1, 1);
+        fold_adoption_delta(&mut record, &restarted, adapter.as_ref());
+        assert_eq!(record.edit_like_calls, 1, "a restart does reset this one");
+        assert_eq!(
+            record.shell_skill_loads, 4,
+            "a transcript restart must never reset the shell-load counter"
+        );
     }
 
     /// Issue #293: `record_speed_sample` writes exactly one
@@ -5901,6 +6308,63 @@ mod tests {
         assert_eq!(
             after, None,
             "a workflow started in another pane must suppress the nudge"
+        );
+    }
+
+    /// The skill nudge rides `prompt_adoption_nudge` exactly like it rides
+    /// `adoption_stop_nudge` -- fires once substantial with zero loads, silent
+    /// once the persisted record already shows one. The record is re-seeded
+    /// fresh (cadence fields cleared) between the two reads so this is purely
+    /// about `skill_loads`, not cadence.
+    #[test]
+    fn prompt_adoption_nudge_fires_the_skill_nudge_and_falls_silent_once_a_load_is_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let session = "sess-prompt-skill";
+        let path = adoption_record_path(&state, session);
+        save_adoption_record(
+            &path,
+            &AdoptionRecord {
+                substantial: true,
+                edit_like_calls: 7,
+                turns: 9,
+                ..Default::default()
+            },
+        );
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(SESSION_ENV.to_string(), session.to_string())].into();
+        let state_env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned().or_else(|| state_env.get(k).cloned());
+
+        let with_zero_loads = prompt_adoption_nudge(repo.path(), &cfg, &lookup)
+            .expect("substantial with zero loads must nudge");
+        assert!(
+            with_zero_loads.contains("[zirv skills]"),
+            "{with_zero_loads}"
+        );
+
+        // A load already recorded (as if a Stop call folded one in between)
+        // must silence it.
+        save_adoption_record(
+            &path,
+            &AdoptionRecord {
+                substantial: true,
+                edit_like_calls: 7,
+                turns: 9,
+                skill_loads: 1,
+                ..Default::default()
+            },
+        );
+        let with_a_load = prompt_adoption_nudge(repo.path(), &cfg, &lookup).unwrap_or_default();
+        assert!(
+            !with_a_load.contains("[zirv skills]"),
+            "a recorded load must silence the skill nudge: {with_a_load}"
         );
     }
 
@@ -7350,6 +7814,54 @@ mod tests {
         assert!(context.contains("standard"), "{context}");
     }
 
+    /// The subagent skill pointer composes with Jev's own model rewrite: the
+    /// single `updatedInput` this envelope carries has to speak for both --
+    /// the right-sized `model` AND the skill pointer appended to `prompt` --
+    /// since claude only ever reads one `updatedInput` per hook call.
+    /// `additionalContext` keeps saying only what Jev picked.
+    #[test]
+    fn dispatch_tier_advise_composes_the_model_rewrite_with_the_skill_pointer() {
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "score", "score": 1.0,
+                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
+                     "probabilities": {"0": 0.1, "1": 0.8, "2": 0.1}, "confidence": 0.8}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_STANDARD_WITH_POINTER";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        let output = output.expect("a confident standard answer must allow");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["model"], "sonnet");
+        assert_eq!(
+            updated["prompt"].as_str().expect("prompt string"),
+            format!("implement the feature{SKILL_POINTER_NOTE}")
+        );
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        assert!(context.contains("sonnet"), "{context}");
+        assert!(
+            !context.contains("zirv skills"),
+            "the pointer rides updatedInput.prompt, not additionalContext: {context}"
+        );
+    }
+
     /// The identical `standard` answer at 0.5 -- below `DISPATCH_TIER_FLOOR`
     /// (0.6) -- must fall through so the caller denies exactly as today.
     #[test]
@@ -7538,7 +8050,11 @@ mod tests {
         unsafe {
             std::env::set_var(credential_env, "secret");
         }
-        let cfg = jev_test_cfg(url, credential_env);
+        let mut cfg = jev_test_cfg(url, credential_env);
+        // This test is about field preservation, not the subagent skill
+        // pointer (covered separately) -- turning the pointer off keeps its
+        // exact-equality `prompt` assertion below meaningful.
+        cfg.prompt.skill_index = false;
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
@@ -7775,12 +8291,20 @@ mod tests {
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
+    // (issue #539 chunk F): this used to assert plain silence for an allowed
+    // dispatch -- see `run_pretool_allows_a_cheap_dispatch_with_the_skill_
+    // pointer_appended` below, which covers the same scenario now that this
+    // path appends the skill-library pointer.
+
     #[test]
-    fn run_pretool_allows_a_cheap_dispatch_with_no_output_at_all() {
-        let env: std::collections::HashMap<String, String> = [(
-            crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
-            "fable".to_string(),
-        )]
+    fn run_pretool_allows_a_cheap_dispatch_with_the_skill_pointer_appended() {
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
+                "fable".to_string(),
+            ),
+            (SESSION_ENV.to_string(), "zirv-sess-pointer".to_string()),
+        ]
         .into();
         let mut out = Vec::new();
         let code = run_pretool(
@@ -7793,9 +8317,178 @@ mod tests {
         )
         .expect("never errors");
         assert_eq!(code, 0);
-        assert!(out.is_empty(), "no json means no decision: {out:?}");
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert!(
+            parsed["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none()
+        );
+        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["subagent_type"], "general-purpose");
+        assert_eq!(updated["model"], "sonnet");
+        assert_eq!(
+            updated["prompt"].as_str().expect("prompt string"),
+            format!("do the thing{SKILL_POINTER_NOTE}")
+        );
     }
 
+    /// Idempotency: a parent that already briefed skills explicitly (or a
+    /// re-entrant hook that already appended the note once) must not get it
+    /// doubled.
+    #[test]
+    fn wants_skill_pointer_is_off_when_the_prompt_already_mentions_zirv_skill() {
+        let cfg = CtxConfig::default();
+        assert!(!wants_skill_pointer(
+            &cfg,
+            "before you start, run zirv skill list --match \"...\""
+        ));
+        assert!(!wants_skill_pointer(
+            &cfg,
+            "See the Zirv Skill index first."
+        ));
+    }
+
+    /// `prompt.skill_index = false` turns off both the standing skill-index
+    /// system-prompt layer (`prompt::skill_index_text`) and this per-dispatch
+    /// pointer -- an operator who wants no zirv-authored skill mention at all
+    /// gets exactly that.
+    #[test]
+    fn wants_skill_pointer_is_off_when_skill_index_is_disabled() {
+        let mut cfg = CtxConfig::default();
+        cfg.prompt.skill_index = false;
+        assert!(!wants_skill_pointer(&cfg, "implement the feature"));
+    }
+
+    /// `append_skill_pointer` must never fire for a payload that is not a
+    /// genuine dispatch: no `prompt` key at all, a `prompt` of the wrong JSON
+    /// type, or a `tool_input` that is not even an object -- all schema
+    /// drift, not a real dispatch.
+    #[test]
+    fn append_skill_pointer_ignores_a_missing_or_non_string_prompt() {
+        let cfg = CtxConfig::default();
+        let mut no_prompt = serde_json::json!({"subagent_type": "general-purpose"});
+        assert!(!append_skill_pointer(&mut no_prompt, &cfg));
+        assert_eq!(
+            no_prompt,
+            serde_json::json!({"subagent_type": "general-purpose"})
+        );
+
+        let mut wrong_type = serde_json::json!({"prompt": 42});
+        assert!(!append_skill_pointer(&mut wrong_type, &cfg));
+        assert_eq!(wrong_type, serde_json::json!({"prompt": 42}));
+
+        let mut not_an_object = serde_json::json!("do the thing");
+        assert!(!append_skill_pointer(&mut not_an_object, &cfg));
+        assert_eq!(not_an_object, serde_json::json!("do the thing"));
+    }
+
+    /// `run_pretool` never fires the pointer for a tool that is not
+    /// `Agent`/`Task`, even if its `tool_input` happens to carry a `prompt`
+    /// key -- `skill_pointer_override`'s own `SUBAGENT_TOOLS` gate excludes
+    /// it before `append_skill_pointer` is ever reached.
+    #[test]
+    fn run_pretool_never_fires_the_pointer_for_a_non_subagent_tool() {
+        let env: std::collections::HashMap<String, String> = [(
+            SESSION_ENV.to_string(),
+            "zirv-sess-non-subagent".to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin("Read", serde_json::json!({"prompt": "do the thing"})),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "Read is not a subagent dispatch: {out:?}");
+    }
+
+    /// A dispatch with no `prompt` at all is schema drift, not a real
+    /// dispatch (`PreToolInput::prompt`'s own doc comment) -- the pointer
+    /// must not fire for it either.
+    #[test]
+    fn run_pretool_never_fires_the_pointer_when_the_dispatch_has_no_prompt() {
+        let env: std::collections::HashMap<String, String> =
+            [(SESSION_ENV.to_string(), "zirv-sess-no-prompt".to_string())].into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({"subagent_type": "general-purpose"}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "no prompt means no dispatch: {out:?}");
+    }
+
+    /// A prompt that already mentions "zirv skill" (a parent that briefed
+    /// skills explicitly) must not get the pointer appended a second time,
+    /// even though this dispatch is otherwise allowed outright.
+    #[test]
+    fn run_pretool_never_doubles_the_pointer_when_the_prompt_already_mentions_it() {
+        let env: std::collections::HashMap<String, String> = [(
+            SESSION_ENV.to_string(),
+            "zirv-sess-already-briefed".to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({
+                    "subagent_type": "general-purpose",
+                    "model": "sonnet",
+                    "prompt": "before starting, run zirv skill list --match \"...\""
+                }),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "already briefed on skills: {out:?}");
+    }
+
+    /// A Single/worker seat -- `SESSION_ENV` set, `SEAT_MODEL_ENV` absent
+    /// (that env is orchestrator-only) -- gets the same pointer an
+    /// orchestrator seat does. The whole `SEAT_MODEL_ENV` block is skipped
+    /// entirely for this session, so `skill_pointer_override` is reached
+    /// unconditionally on `pretool_decision` never even running.
+    #[test]
+    fn run_pretool_appends_the_pointer_for_a_single_or_worker_seat_with_no_seat_model_env() {
+        let env: std::collections::HashMap<String, String> =
+            [(SESSION_ENV.to_string(), "zirv-sess-single".to_string())].into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Task",
+                serde_json::json!({"subagent_type": "general-purpose", "prompt": "review the diff"}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedInput"]["prompt"]
+                .as_str()
+                .expect("prompt string"),
+            format!("review the diff{SKILL_POINTER_NOTE}")
+        );
+    }
+
+    /// With neither `SEAT_MODEL_ENV` nor `SESSION_ENV` set at all, the hook
+    /// stays completely silent -- a non-zirv session is never made worse, and
+    /// the pointer's own gate (`SESSION_ENV`) never fires on an absent value.
     #[test]
     fn run_pretool_exits_zero_and_silent_without_the_seat_env() {
         let mut out = Vec::new();
@@ -7807,6 +8500,29 @@ mod tests {
         .expect("never errors");
         assert_eq!(code, 0);
         assert!(out.is_empty(), "a non-zirv session is never made worse");
+    }
+
+    /// An empty `SESSION_ENV` value must read exactly like an absent one --
+    /// `skill_pointer_override`'s own filter, not just `Option::is_some()`.
+    #[test]
+    fn run_pretool_treats_an_empty_session_env_as_absent() {
+        let env: std::collections::HashMap<String, String> =
+            [(SESSION_ENV.to_string(), String::new())].into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({"subagent_type": "general-purpose", "prompt": "do the thing"}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "an empty session id is not a real session: {out:?}"
+        );
     }
 
     #[test]

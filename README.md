@@ -1788,18 +1788,30 @@ own versioned built-ins may ever reach for it.
 **How a workflow is chosen.** `zirv workflow start` without an id runs
 `selection::select_definition` deterministically against the resolved
 classification and `--task` text -- no model call. A pack scores by matching
-`--task` text against its `triggers` (3 points each), a `domains` tag
-appearing in the task text (2 points), and the classified work-domain
-aligning with a `domains` entry (1 point); scores below a floor are dropped,
-and the highest-scoring survivor wins, ties broken toward fewer external
-effects and then alphabetically by id -- both the score and the tie-break are
-recorded in `Selection::reasons`/`alternatives` and printed alongside the
-started workflow (`--json` adds a `selection` object; `workflow classify
---json` adds the same field as a preview with no side effect). A legacy
-intent (`Feature`/`BugFix`/`Refactor`/`Spike`/`Review`) that classification
-already produces with high confidence selects that kind's pack outright,
-skipping scoring entirely, so the five pre-#542 workflows keep their exact
-historical selection behavior. Nothing above the floor selects
+`--task` text against its `triggers` (3 points each, as whole-word token
+sequences -- "retro" never matches inside "Retrofit", and the objective's
+token aligned with a trigger's last word may carry a trailing plural
+`s`/`es`), a `domains` tag appearing in the task text (2 points), and the
+classified work-domain aligning with a `domains` entry (1 point); scores
+below a floor are dropped, and the highest-scoring survivor wins, ties broken
+toward fewer external effects and then alphabetically by id -- both the score
+and the tie-break are recorded in `Selection::reasons`/`alternatives` and
+printed alongside the started workflow (`--json` adds a `selection` object;
+`workflow classify --json` adds the same field as a preview with no side
+effect). A legacy intent (`Feature`/`BugFix`/`Refactor`/`Spike`/`Review`)
+that classification already produces with high confidence selects that
+kind's pack by DEFAULT, skipping scoring entirely -- unless a more
+specialised pack actually matched one of its own trigger phrases in the task
+text AND declares `effects` compatible with that intent (`Feature`/`Bugfix`
+need `repository` or `external`, `Review` needs `none`, `Spike` accepts any
+effects, `Refactor` is never displaced), in which case the specialised pack
+replaces it and both packs are recorded in `reasons`/`alternatives`. Only a
+`built-in` or `operator-global` pack (the registry's own LAYER, shown by
+`zirv workflow list`) may ever refine a legacy intent this way -- a
+`repository`-layer pack is untrusted and may only ADD a non-colliding id
+(see the three layers above), so it never displaces a legacy kind's own
+pack this way; it can still be chosen outright the ordinary way, for
+`Intent::Other`. Nothing above the floor selects
 `adaptive-work`, a small five-step (understand/plan/execute/validate/present)
 fallback pack with no domain/trigger tags of its own (so it never competes
 for another pack's task) that prunes itself down to three steps
@@ -1807,11 +1819,24 @@ for another pack's task) that prunes itself down to three steps
 (`zirv workflow start <id> --task ...`, or the native `/workflow <id> <task>`
 slash command) always wins outright with no selection performed at all, and
 that choice survives `resume`/`reclassify` as the pinned `definition` on the
-running state. A bounded model tie-break for a close, ambiguous score is
-deferred -- the deterministic algorithm's every decision is already
-explainable from `reasons` alone, which a model call would only obscure for
-the near-certain-floor cases it would actually apply to; see the design note
-for the full reasoning.
+running state -- matched case-insensitively (`zirv workflow start Bugfix`
+resolves exactly like `bugfix`; `zirv workflow show` the same way), since
+registry ids are themselves always lowercase. A bounded model tie-break for
+a close, ambiguous score is deferred -- the deterministic algorithm's every
+decision is already explainable from `reasons` alone, which a model call
+would only obscure for the near-certain-floor cases it would actually apply
+to; see the design note for the full reasoning.
+
+`zirv workflow start` never refuses because another workflow is already
+active for this repository -- multiple workflows per repository are
+legitimate, and `zirv workflow resume <id>` restores any of them. When the
+new start silently changes which workflow this repository's active pointer
+names -- a DIFFERENT, still-running (`Running`/`AwaitingApproval`) workflow
+was active -- it prints one best-effort note to STDERR after the new
+workflow is saved: `note: workflow <old-instance-id> (<old definition id>)
+is no longer this repository's active workflow; restore it with: zirv
+workflow resume <old-instance-id>`. Stdout/`--json` output is unaffected
+either way.
 
 ### Lifecycle and artifacts
 
@@ -1936,7 +1961,7 @@ running workflow's resolved tier only ever ratchets upward:
 `[workflow] adoption = "off" | "advise" | "nudge" | "enforce"` in
 `~/.zirv/ctx.toml` (`ZIRV_CTX_WORKFLOW_ADOPTION` for the final override) is
 operator-only and detects a session that has done "substantial" edit work --
-at least 5 edit-like tool calls, or at least 1 edit-like call over 12 turns --
+at least 12 edit-like tool calls, or at least 1 edit-like call over 25 turns --
 with no active `zirv workflow`:
 
 | Level | Behavior |
@@ -1945,6 +1970,31 @@ with no active `zirv workflow`:
 | `advise` | A one-time nudge rides the Stop hook's `systemMessage` once substantial work is detected. |
 | `nudge` (default) | The same nudge, repeated every 5 turns while the session stays substantial with no active workflow, and also surfaced on the next prompt (`UserPromptSubmit`) if a workflow still has not started. |
 | `enforce` | The `nudge` behavior, plus `zirv agent` (`ctx::agent::run_with`) refuses to dispatch for a session recorded as substantial with no active workflow, until one is started. |
+
+The same transcript scan that detects substantial work also counts skill
+loads, for a sibling "no skill loaded" nudge that rides the identical Stop
+and prompt hooks (`[zirv skills] substantial work (<n> edit calls over <m>
+turns) and no zirv skill loaded this session. Check the skill index: zirv
+skill list --match "<task>" then zirv skill load <id>.`). It fires once a
+session is substantial with zero skill loads, on its own 5-turn cadence
+(never suppressing, or suppressed by, the workflow nudge above), and falls
+silent the moment a load is seen. It needs `workflow.adoption` at `advise` or
+above (at `off` the transcript is never rescanned for either signal, so
+neither nudge has anything fresh to fire on) and `prompt.skill_index = true`
+-- otherwise it is independent of `workflow.adoption`'s level and of whether
+a workflow is active: skills matter either way.
+
+A load is counted two ways, because `zirv skill load <id>` run from a shell
+is the PRIMARY path (the standing skill index header and the pretool
+dispatch pointer above both tell an agent to run exactly that): a native/MCP
+`skill_load` tool call (including a host-namespaced one such as
+`mcp__zirv__skill_load`) is picked up by the same transcript scan that counts
+edit-like calls, from the tool's own NAME; a shell-invoked `zirv skill load`
+cannot be seen that way at all (no adapter's transcript parser exposes a
+shell command's own argument text, only the tool name `Bash`/`PowerShell`),
+so the CLI counts itself instead -- a successful load (never a refused or
+unknown id) bumps the calling session's own record directly, keyed off the
+same `SESSION_ENV` the hooks use, whenever one is set.
 
 ### Agent registry
 
@@ -2157,6 +2207,26 @@ unchanged from the shell-invoked path; the agent still chooses whether to
 use it. Repository skills are never registered with the host -- their
 descriptions are repository-authored, untrusted text -- and stay reachable
 through the standing skill index only.
+
+A dispatched Claude Code subagent (the `Agent`/`Task` tool) never inherits its
+parent's system prompt, so the standing skill index above never reaches it.
+`zirv ctx hook pretool` closes that gap: for any zirv-supervised session
+(gated on `SESSION_ENV`, so an orchestrator, sub-orchestrator, worker, or
+single seat all get it alike -- not only an orchestrator's own narrower
+`SEAT_MODEL_ENV`), an allowed `Agent`/`Task` dispatch gets a short,
+existence-only pointer appended to its own `prompt` (via `updatedInput`,
+composed into the same rewrite as the orchestrator-only dispatch-tier model
+right-sizing when both apply) -- it names `zirv skill list --match
+"<task>"`/`zirv skill load <id>` and asks the subagent to name what it loaded
+in its own report, never a specific skill id. A dispatch the expensive-seat
+guard denies never gets it either (that guard's own deny already returned).
+Gated by the same `prompt.skill_index`, and skipped whenever the dispatch's
+`prompt` already mentions `zirv skill` (any casing), so a parent that already
+briefed skills explicitly (or a re-entrant hook) never gets it appended twice.
+The envelope carries `permissionDecision: "allow"`, the same shape as the
+dispatch-tier and `Bash` rewrites. Per Claude Code's hooks guide a hook `allow`
+skips only the interactive prompt for a call no rule matches -- your own
+`permissions.deny`/`ask` rules for `Agent`/`Task` still apply.
 
 ### The skill library
 
