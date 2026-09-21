@@ -4810,10 +4810,25 @@ fn resolve_selection_range(
 /// "output landed on the rows this selection actually covers", without a
 /// full-screen diff -- the cost is proportional to the selection's own
 /// height, not the screen's.
-fn selection_snapshot(screen: &vt100::Screen, sel: &Selection) -> String {
+///
+/// `None` when any part of `sel` is off-screen right now: `resolve_selection_
+/// range` CLAMPS such a selection to the visible grid, so a snapshot of it
+/// would compare only the visible part and silently ignore changes to the
+/// rest. `translate_selection` keeps the true (unclamped) rows for exactly
+/// the case where the operator scrolls that part back into view later, and a
+/// copy then would take whatever now sits at those coordinates -- so an
+/// off-screen selection must fall back to the unconditional cancel this
+/// comparison exists to avoid, rather than be compared on a partial view.
+fn selection_snapshot(screen: &vt100::Screen, sel: &Selection) -> Option<String> {
     let (rows, cols) = screen.size();
+    let fully_visible = [sel.anchor.0, sel.end.0]
+        .iter()
+        .all(|row| *row >= 0 && *row < i64::from(rows));
+    if !fully_visible {
+        return None;
+    }
     let (start, end) = resolve_selection_range(sel, rows, cols);
-    screen.contents_between(start.0, start.1, end.0, end.1)
+    Some(screen.contents_between(start.0, start.1, end.0, end.1))
 }
 
 /// Pure: whether newly processed child output on `output_pane_short` is even
@@ -11859,7 +11874,7 @@ fn run_dashboard_inner(
             panes
                 .iter()
                 .find(|pane| pane.short() == sel.pane_short)
-                .map(|pane| selection_snapshot(pane.screen(), sel))
+                .and_then(|pane| selection_snapshot(pane.screen(), sel))
         });
         // Issue #330: ONE `DRAIN_BUDGET_BYTES` for the whole tick, focused
         // pane first and the rest round-robin behind it -- not that much per
@@ -11890,9 +11905,9 @@ fn run_dashboard_inner(
             if let Some(sel) = selection.as_ref()
                 && output_cancels_selection(sel, panes[idx].short())
             {
-                let unchanged = selection_before
-                    .as_ref()
-                    .is_some_and(|before| *before == selection_snapshot(panes[idx].screen(), sel));
+                let unchanged = selection_before.as_ref().is_some_and(|before| {
+                    selection_snapshot(panes[idx].screen(), sel).as_ref() == Some(before)
+                });
                 if !unchanged {
                     selection = None;
                 }
@@ -15449,7 +15464,7 @@ mod tests {
         parser.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
         let sel = selection_at((0, 0), (1, 4));
         let before = selection_snapshot(parser.screen(), &sel);
-        assert_eq!(before, "line1\nline");
+        assert_eq!(before.as_deref(), Some("line1\nline"));
 
         // New output lands on row 4, well below the selected rows 0..1 --
         // short enough not to overflow the 10-column grid and trigger a
@@ -15478,6 +15493,26 @@ mod tests {
         assert_ne!(
             before, after,
             "output that rewrites a selected row must change its snapshot"
+        );
+    }
+
+    /// Review finding: a selection scrolled out of view still resolves --
+    /// `resolve_selection_range` clamps it to the visible grid -- so
+    /// comparing snapshots of it would compare only the sliver still on
+    /// screen and keep a selection whose real rows had been overwritten.
+    /// Off-screen must read as "cannot tell", which the call site turns back
+    /// into the unconditional cancel.
+    #[test]
+    fn a_selection_scrolled_off_screen_has_no_snapshot_to_compare() {
+        let mut parser = vt100::Parser::new(5, 10, 0);
+        parser.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
+        assert!(
+            selection_snapshot(parser.screen(), &selection_at((-1, 0), (1, 4))).is_none(),
+            "a selection reaching above the visible grid cannot be compared"
+        );
+        assert!(
+            selection_snapshot(parser.screen(), &selection_at((0, 0), (5, 4))).is_none(),
+            "a selection reaching below the visible grid cannot be compared"
         );
     }
 

@@ -10,10 +10,11 @@
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
 
-use crossterm::cursor::MoveToColumn;
+use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
+use unicode_width::UnicodeWidthChar;
 
 use super::adapters::{self, AgentAdapter, DefaultOrigin};
 use super::chrome::{self, BannerFacts, ChromeCaps, HarnessRule};
@@ -382,6 +383,26 @@ impl EditLine {
         self.chars.iter().collect()
     }
 
+    /// How many terminal cells the first `upto` codepoints occupy -- NOT how
+    /// many codepoints they are. A CJK ideograph or a wide emoji occupies two
+    /// cells and a combining mark occupies none, so cursor positioning that
+    /// counted codepoints (as this did before review) put the cursor in the
+    /// wrong column the moment the line held either. `None` from
+    /// `UnicodeWidthChar::width` means a control character, which this editor
+    /// never inserts (`apply_key` only ever inserts what `KeyCode::Char`
+    /// carries, and the control chords are matched out before it).
+    fn cells_upto(&self, upto: usize) -> usize {
+        self.chars[..upto.min(self.chars.len())]
+            .iter()
+            .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
+            .sum()
+    }
+
+    /// Terminal cells the whole line occupies.
+    fn cells(&self) -> usize {
+        self.cells_upto(self.chars.len())
+    }
+
     fn insert(&mut self, c: char) {
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
@@ -450,11 +471,23 @@ enum EditAction {
 }
 
 /// Pure: what pressing `code` (with `modifiers`) does to `line`.
+///
+/// Ctrl+D only ends input on an EMPTY line. A canonical-mode tty delivers
+/// whatever is already typed when `VEOF` arrives mid-line rather than
+/// throwing it away (confirmed on a real pty during review), so treating
+/// every Ctrl+D as end-of-input -- as this did before review -- silently
+/// discarded a line the operator had finished typing but not yet sent.
 fn apply_key(line: &mut EditLine, code: KeyCode, modifiers: KeyModifiers) -> EditAction {
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match code {
             KeyCode::Char('c' | 'C') => EditAction::Cancel,
-            KeyCode::Char('d' | 'D') => EditAction::Eof,
+            KeyCode::Char('d' | 'D') => {
+                if line.chars.is_empty() {
+                    EditAction::Eof
+                } else {
+                    EditAction::Submit
+                }
+            }
             _ => EditAction::Ignored,
         };
     }
@@ -479,20 +512,75 @@ fn apply_key(line: &mut EditLine, code: KeyCode, modifiers: KeyModifiers) -> Edi
     }
 }
 
-/// Redraws `line` at the terminal's current row: return to column 0, erase
-/// whatever was there, print the text, then move the cursor back to `line`'s
-/// own edit point. A full redraw on every keystroke rather than an
-/// incremental one -- a task description is short enough that the extra
-/// bytes this costs are not worth the bookkeeping an incremental redraw
-/// (tracking exactly which cells changed) would need.
-fn redraw_edit_line(out: &mut impl Write, line: &EditLine) -> io::Result<()> {
+/// Pure: where a point `cursor_cells` cells into a line sits, as `(row, col)`
+/// relative to the row the line started on, when the terminal is `width`
+/// columns wide. Split out of [`redraw_edit_line`] so the wrapping arithmetic
+/// -- the part review found wrong, and the part no terminal is needed to
+/// check -- is unit-tested directly. `width` of 0 is treated as 1: a
+/// zero-width terminal would divide by zero, and one column is the smallest
+/// layout that still makes sense to draw into.
+fn edit_line_layout(cursor_cells: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    (cursor_cells / width, cursor_cells % width)
+}
+
+/// Redraws `line`, which may occupy more than one terminal row once it is
+/// longer than the terminal is wide.
+///
+/// `previous_cursor_row` is how many rows below the line's own first row the
+/// cursor was left on by the last redraw -- the only state this needs, and
+/// the fix for what review found: the old version issued a bare
+/// `MoveToColumn(0)` + `Clear(CurrentLine)`, which on a wrapped line returns
+/// to the start of whichever row the cursor happens to be on and clears only
+/// that row, so every further keystroke reprinted the whole line one row
+/// further down. Moving up by the tracked row count first anchors the redraw
+/// back at the line's own first row, and `FromCursorDown` then clears every
+/// row the previous render used.
+///
+/// Deliberately relative (move up from wherever the cursor is) rather than
+/// absolute (remember the origin row from `cursor::position()`): when the
+/// content grows past the bottom of the screen the terminal scrolls, which
+/// moves an absolute origin row out from under itself but leaves every
+/// relative move still correct.
+///
+/// Returns the cursor's new row offset, for the next call to pass back in.
+fn redraw_edit_line(
+    out: &mut impl Write,
+    line: &EditLine,
+    previous_cursor_row: usize,
+    width: u16,
+) -> io::Result<usize> {
+    let cells = line.cells();
+    let cursor_cells = line.cells_upto(line.cursor);
+    let (cursor_row, cursor_col) = edit_line_layout(cursor_cells, usize::from(width));
+
+    if previous_cursor_row > 0 {
+        crossterm::execute!(out, MoveUp(previous_cursor_row as u16))?;
+    }
     crossterm::execute!(
         out,
         MoveToColumn(0),
-        Clear(ClearType::CurrentLine),
-        Print(line.text()),
-        MoveToColumn(line.cursor as u16)
-    )
+        Clear(ClearType::FromCursorDown),
+        Print(line.text())
+    )?;
+    // A line that ends exactly on a row boundary leaves the cursor somewhere
+    // terminals disagree about -- at the end of the row just filled (deferred
+    // wrap, the common behaviour) or at the start of the next one. Printing
+    // one space forces the wrap to have happened either way, and erasing it
+    // again leaves the screen as if it never did, so the arithmetic below has
+    // exactly one cursor position to reason about.
+    let width_cells = usize::from(width.max(1));
+    if cells > 0 && cells.is_multiple_of(width_cells) {
+        crossterm::execute!(out, Print(" "), Clear(ClearType::UntilNewLine))?;
+    }
+    // The cursor is now on the line's last row; step back up to the row the
+    // edit point is on and into its column.
+    let last_row = cells / width_cells;
+    if last_row > cursor_row {
+        crossterm::execute!(out, MoveUp((last_row - cursor_row) as u16))?;
+    }
+    crossterm::execute!(out, MoveToColumn(cursor_col as u16))?;
+    Ok(cursor_row)
 }
 
 /// What one call to [`read_edited_line`] produced: a submitted line, or
@@ -529,6 +617,10 @@ fn read_edited_line() -> io::Result<LineOutcome> {
     enable_raw_mode()?;
     let mut term = io::stderr();
     let mut line = EditLine::default();
+    // How far below the line's own first row the cursor was left by the last
+    // redraw -- see `redraw_edit_line`, which needs it to anchor a wrapped
+    // line's redraw back at the row it started on.
+    let mut cursor_row = 0usize;
     let outcome = loop {
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -541,8 +633,14 @@ fn read_edited_line() -> io::Result<LineOutcome> {
                         std::process::exit(130);
                     }
                     EditAction::Edited => {
-                        if let Err(e) = redraw_edit_line(&mut term, &line) {
-                            break Err(e);
+                        // A terminal that cannot report its width still gets a
+                        // usable editor: 80 columns is the conventional
+                        // fallback, and the only cost of guessing it wrong is
+                        // the wrapped-line redraw this width feeds.
+                        let width = crossterm::terminal::size().map_or(80, |(cols, _)| cols);
+                        match redraw_edit_line(&mut term, &line, cursor_row, width) {
+                            Ok(row) => cursor_row = row,
+                            Err(e) => break Err(e),
                         }
                     }
                     EditAction::Ignored => {}
@@ -554,6 +652,18 @@ fn read_edited_line() -> io::Result<LineOutcome> {
     };
     let _ = disable_raw_mode();
     if outcome.is_ok() {
+        // From wherever the edit point was, drop past the LAST row the line
+        // occupies before ending it, so a wrapped line's tail is not
+        // overwritten by whatever prints next.
+        let width = usize::from(
+            crossterm::terminal::size()
+                .map_or(80u16, |(cols, _)| cols)
+                .max(1),
+        );
+        let last_row = line.cells() / width;
+        if last_row > cursor_row {
+            let _ = crossterm::execute!(term, MoveDown((last_row - cursor_row) as u16));
+        }
         let _ = writeln!(term);
     }
     outcome
@@ -614,7 +724,12 @@ impl Read for EditedStdin {
 /// cursor-movement codes correctly, so it keeps today's append-only
 /// behaviour rather than risking a garbled prompt.
 fn intake_reader(stdin_is_tty: bool, vt_ok: bool) -> Box<dyn BufRead> {
-    if stdin_is_tty && vt_ok {
+    // `io::stderr()` is where `read_edited_line` echoes what is typed, so its
+    // OWN tty-ness is what decides whether the operator can see the editor at
+    // all -- gating on stdin/stdout alone (as this did before review) left
+    // `2>file` with a live raw-mode editor echoing into the file and nothing
+    // on screen.
+    if stdin_is_tty && vt_ok && io::stderr().is_terminal() {
         Box::new(io::BufReader::new(EditedStdin::new()))
     } else {
         Box::new(io::stdin().lock())
@@ -1991,6 +2106,23 @@ mod tests {
         );
     }
 
+    /// Review finding: Ctrl+D mapped to `Eof` unconditionally, so the chord
+    /// that ends input on an empty prompt silently threw away a request the
+    /// operator had already typed. Canonical mode only ever sends `VEOF` on
+    /// an empty line; with text present the terminal submits it instead.
+    #[test]
+    fn ctrl_d_on_a_typed_line_submits_it_instead_of_discarding_it() {
+        let mut line = EditLine::default();
+        for c in "ship it".chars() {
+            line.insert(c);
+        }
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Char('d'), KeyModifiers::CONTROL),
+            EditAction::Submit
+        );
+        assert_eq!(line.text(), "ship it", "the typed request survives intact");
+    }
+
     #[test]
     fn enter_submits_without_touching_the_line() {
         let mut line = EditLine::default();
@@ -2001,6 +2133,46 @@ mod tests {
             EditAction::Submit
         );
         assert_eq!(line.text(), "hi", "submitting must not mutate the buffer");
+    }
+
+    /// Review finding: the redraw put the cursor at `MoveToColumn(cursor)`
+    /// using the codepoint index, so a request longer than the terminal is
+    /// wide left the cursor on the wrong row entirely -- and every edit after
+    /// that painted over the wrong line.
+    #[test]
+    fn the_cursor_wraps_onto_the_row_its_own_cell_count_puts_it_on() {
+        assert_eq!(edit_line_layout(0, 20), (0, 0));
+        assert_eq!(edit_line_layout(19, 20), (0, 19));
+        assert_eq!(
+            edit_line_layout(20, 20),
+            (1, 0),
+            "the cell just past the last column belongs to the next row"
+        );
+        assert_eq!(edit_line_layout(45, 20), (2, 5));
+        assert_eq!(
+            edit_line_layout(3, 0),
+            (3, 0),
+            "a zero width is treated as one column rather than dividing by zero"
+        );
+    }
+
+    /// The other half of the same finding: cells, not codepoints. A CJK
+    /// glyph takes two columns and a combining mark takes none, so counting
+    /// `chars` put the cursor a whole row out on any non-ASCII request.
+    #[test]
+    fn cursor_position_counts_display_cells_not_codepoints() {
+        let mut line = EditLine::default();
+        for c in "日本".chars() {
+            line.insert(c);
+        }
+        assert_eq!(line.chars.len(), 2);
+        assert_eq!(line.cells(), 4, "each CJK glyph occupies two columns");
+        assert_eq!(line.cells_upto(1), 2);
+        assert_eq!(
+            edit_line_layout(line.cells(), 3),
+            (1, 1),
+            "four cells in a three-column terminal wrap onto the second row"
+        );
     }
 
     fn handoff() -> Handoff {
