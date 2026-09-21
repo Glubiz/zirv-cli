@@ -2999,6 +2999,17 @@ fn try_join_dashboard<W: Write>(
     if targets.is_empty() {
         return Dispatch::Inline { no_dashboard: true };
     }
+    if args.workspace.is_some()
+        && super::workspace::uses_launch_scoped_mcp_config(&args.name, &args.flags)
+    {
+        eprintln!(
+            "zirv ctx agent: workspace MCP configuration comes from launch-only adapter flags; \
+             running inline so the validated configuration reaches the worker"
+        );
+        return Dispatch::Inline {
+            no_dashboard: false,
+        };
+    }
     // A model pin is the one trailing flag a pane can carry across the
     // untrusted request channel -- it travels in `SpawnRequest::model` and
     // the pane re-checks it before building its own argv (`dash::mod::

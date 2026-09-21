@@ -60,7 +60,7 @@ impl WorkspaceConfig {
             .into());
         }
 
-        let mut dirs = HashSet::new();
+        let mut dirs: Vec<PathBuf> = Vec::new();
         for git in &self.git {
             if git.repo.trim().is_empty() || git.repo.chars().any(char::is_control) {
                 return Err(format!(
@@ -80,22 +80,27 @@ impl WorkspaceConfig {
                 .into());
             }
             validate_relative_dir(&self.name, &git.dir)?;
-            if !dirs.insert(git.dir.clone()) {
+            if let Some(existing) = dirs
+                .iter()
+                .find(|existing| existing.starts_with(&git.dir) || git.dir.starts_with(existing))
+            {
                 return Err(format!(
-                    "workspace '{}': git dir '{}' is declared more than once",
+                    "workspace '{}': git dirs '{}' and '{}' overlap",
                     self.name,
+                    existing.display(),
                     git.dir.display()
                 )
                 .into());
             }
+            dirs.push(git.dir.clone());
         }
 
         let mut servers = HashSet::new();
         for server in &self.mcp_servers {
-            if !valid_name(server) {
+            if server.trim().is_empty() || server.chars().any(char::is_control) {
                 return Err(format!(
-                    "workspace '{}': MCP server '{}' must match [a-z0-9][a-z0-9._-]*",
-                    self.name, server
+                    "workspace '{}': MCP server names must not be empty or contain control characters",
+                    self.name
                 )
                 .into());
             }
@@ -188,7 +193,7 @@ pub fn effective_skill_refs<'a>(
 /// skill-loading path is introduced.
 pub fn validate_skills(workspace: &WorkspaceConfig, repo: &Path) -> CtxResult<()> {
     let registry = SkillRegistry::load_for_repo(repo, dirs::home_dir().as_deref(), true)?;
-    for requested in &workspace.skills {
+    for requested in effective_skill_refs(Some(workspace), &[]) {
         let requested = skill_request(requested);
         let skill = registry
             .get(&requested)
@@ -211,13 +216,14 @@ pub fn attach_skills(
     repo: &Path,
     prompt: String,
 ) -> CtxResult<String> {
-    if workspace.skills.is_empty() {
+    let requested_skills = effective_skill_refs(Some(workspace), &[]);
+    if requested_skills.is_empty() {
         return Ok(prompt);
     }
     let registry = SkillRegistry::load_for_repo(repo, dirs::home_dir().as_deref(), true)?;
     let mut seen = BTreeSet::new();
     let mut rendered = String::new();
-    for requested in &workspace.skills {
+    for requested in requested_skills {
         let requested = skill_request(requested);
         let root = registry
             .get(&requested)
@@ -308,6 +314,10 @@ fn clone_repositories(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()>
             })?;
         }
         let output = std::process::Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .arg("clone")
             .arg("--single-branch")
             .arg("--branch")
@@ -430,6 +440,42 @@ pub(crate) fn configured_mcp_servers(
             "workspace MCP validation is not implemented for adapter '{other}'; refusing delegation rather than assuming the server exists"
         )
         .into()),
+    }
+}
+
+/// Whether MCP discovery for this invocation depends on launch-only adapter
+/// flags. Dashboard request files deliberately discard arbitrary trailing
+/// flags at their untrusted boundary, so a delegation using one of these
+/// overrides must stay inline; otherwise the pre-launch check could approve
+/// a server configuration the eventual pane child never receives.
+pub(crate) fn uses_launch_scoped_mcp_config(adapter: &str, flags: &[String]) -> bool {
+    match adapter {
+        "claude" => {
+            flags.iter().any(|flag| {
+                flag == "--mcp-config"
+                    || flag.starts_with("--mcp-config=")
+                    || flag == "--strict-mcp-config"
+            })
+        }
+        "codex" => {
+            let mut index = 0;
+            while index < flags.len() {
+                let value = if flags[index] == "-c" || flags[index] == "--config" {
+                    index += 1;
+                    flags.get(index).map(String::as_str)
+                } else {
+                    flags[index]
+                        .strip_prefix("--config=")
+                        .or_else(|| flags[index].strip_prefix("-c="))
+                };
+                if value.is_some_and(|value| value.trim_start().starts_with("mcp_servers.")) {
+                    return true;
+                }
+                index += 1;
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -654,6 +700,41 @@ unknown = true
 git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra = true }]
 "#;
         assert!(toml::from_str::<WorkspaceConfig>(nested).is_err());
+    }
+
+    #[test]
+    fn overlapping_git_destinations_are_rejected() {
+        let mut config = workspace();
+        config.git = vec![
+            WorkspaceGit {
+                repo: "https://example.test/one".into(),
+                branch: "main".into(),
+                dir: "deps".into(),
+            },
+            WorkspaceGit {
+                repo: "https://example.test/two".into(),
+                branch: "main".into(),
+                dir: "deps/two".into(),
+            },
+        ];
+        let error = config.validate().expect_err("overlapping destinations");
+        assert!(error.to_string().contains("git dirs 'deps' and 'deps/two' overlap"));
+    }
+
+    #[test]
+    fn launch_scoped_mcp_flags_are_identified_for_dashboard_safety() {
+        assert!(uses_launch_scoped_mcp_config(
+            "claude",
+            &["--mcp-config=config.json".into()]
+        ));
+        assert!(uses_launch_scoped_mcp_config(
+            "codex",
+            &["-c".into(), "mcp_servers.docs.command='docs'".into()]
+        ));
+        assert!(!uses_launch_scoped_mcp_config(
+            "codex",
+            &["--model=gpt-5".into()]
+        ));
     }
 
     #[test]
