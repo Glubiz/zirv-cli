@@ -20,7 +20,7 @@ Nextest isolates tests per process; `--no-fail-fast` is mandatory -- diff sorted
 ## Module map
 
 - `src/main.rs`, `src/input.rs`: raw-argv built-ins, clap, script lookup; `src/commands/`: create, init, help, version, setup, report.
-- `src/commands/workflow/`: skills/agents, engine/classify/deploy/maintain, review, artifacts/telemetry. `src/script_runner/`: script, command (`${var}`), command_types, options. `src/utils.rs`: parsing/shortcuts/reserved names. `src/settings.rs`: `.zirv/.settings.toml` agent gate.
+- `src/commands/workflow/`: skills/agents (portable bundle catalogue), engine/classify/deploy/maintain, review, artifacts/telemetry. `src/script_runner/`: script, command (`${var}`), command_types, options. `src/utils.rs`: parsing/shortcuts/reserved names. `src/settings.rs`: `.zirv/.settings.toml` agent gate.
 - `src/commands/ctx/`: config/state/log, event+rot+score, adapters/{claude,codex}, run_loop/exec/wrap supervisors, pace/usage, prompt/compile/context/memory, mail/sessions/safety, chat/agent, dash/. See `src/commands/ctx/README.md` for the supervisor and session-tracking disambiguation.
 
 ## Conventions

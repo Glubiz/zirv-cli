@@ -1937,7 +1937,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "implement",
             "Implement",
-            "Make a scoped code change -- feature, bugfix, or refactor -- in small steps, checking evidence as you go and touching only what the task needs. Use whenever you are about to write or change code. Not for a failure whose cause is unknown -- that is `systematic-debugging`.",
+            "Use whenever you are about to write or change code -- a feature, bugfix, or refactor, however small. Keeps the change scoped, made in small steps with evidence checked as you go, touching only what the task needs. Not for a failure whose cause is unknown -- that is `systematic-debugging`.",
             &["feature", "bugfix", "refactor"],
             &[Cap::RepoRead, Cap::RepoWrite],
             &[Cap::TestRun],
@@ -1976,7 +1976,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "tdd",
             "Test-driven development",
-            "Write the failing test first, make it pass, then refactor -- a focused red, green, refactor loop. Use when adding a regression test for a bug or building behaviour test-first. Not for choosing which existing checks to run -- that is `testing`.",
+            "Use when asked for a regression test, a test-first change, or TDD. Write the failing test first, make it pass, then refactor -- a focused red, green, refactor loop. Not for choosing which existing checks to run -- that is `testing`.",
             &["tdd", "regression"],
             &[Cap::TestRun, Cap::RepoWrite],
             &[Cap::RepoRead],
@@ -2002,7 +2002,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "verify",
             "Verify",
-            "Confirm finished work with fresh evidence -- rerun the checks now, read the results -- before anything is called complete. Use as the last step before reporting a task done. Not for choosing which checks exist -- that is `testing`.",
+            "Use before reporting any task done or confirming work is complete. Confirm finished work with fresh evidence -- rerun the checks now, read the results -- rather than trusting earlier runs. Not for choosing which checks exist -- that is `testing`.",
             &["complete", "verify"],
             &[Cap::TestRun],
             &[Cap::RepoRead],
@@ -2028,7 +2028,7 @@ Inspect the built result, not the implementation story. Review all captures toge
         manifest(
             "parallelize",
             "Parallelize",
-            "Split independent tasks into concurrent lanes with non-overlapping ownership so they cannot collide. Use when several tasks have no dependencies on each other and could run at once. Not for writing a single worker's brief -- that is `delegate`.",
+            "Use before running several tasks at once or fanning work out to workers. Split independent tasks into concurrent lanes with non-overlapping ownership so they cannot collide. Not for writing a single worker's brief -- that is `delegate`.",
             &["parallel", "independent"],
             &[Cap::AgentSpawn],
             &[Cap::GitWorktree],

@@ -1,6 +1,6 @@
 ---
 name: technical-documentation
-description: Write documentation for a specific reader arriving with a specific task -- the contract and failure modes rather than the implementation, with every example one that actually runs. Use for reference docs, guides, or API documentation. Not for a decision's rationale -- that is `adr-authoring`.
+description: Use when writing or updating documentation -- a README, reference docs, a guide, or API documentation. Write for a specific reader arriving with a specific task -- the contract and failure modes rather than the implementation, with every example one that actually runs. Not for a decision's rationale -- that is `adr-authoring`.
 metadata:
   x-zirv-schema-version: "1"
   x-zirv-id: technical-documentation
