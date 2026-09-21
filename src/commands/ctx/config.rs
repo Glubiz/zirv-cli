@@ -13864,6 +13864,6 @@ git = [{ repo = "https://example.test/docs.git", branch = "main", dir = "deps/do
         )
         .expect("write");
         let error = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown field");
-        assert!(error.to_string().contains("unknown field `unknown`"), "{error}");
+        assert!(error.to_string().contains("unknown key `unknown`"), "{error}");
     }
 }

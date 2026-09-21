@@ -3786,7 +3786,7 @@ pub fn run_with<W: Write>(
         .map(|name| super::workspace::resolve(&cfg.workspace, name))
         .transpose()?;
     if let Some(workspace) = selected_workspace {
-        super::workspace::validate_skills(workspace, repo)?;
+        super::workspace::validate_skills(workspace, repo, env)?;
     }
     // Issue #228: validated and canonicalised before anything else in this
     // delegation runs -- a bad `--workdir` must fail loudly, up front, not
@@ -3830,7 +3830,7 @@ pub fn run_with<W: Write>(
     );
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
     let prompt = match selected_workspace {
-        Some(workspace) => super::workspace::attach_skills(workspace, repo, prompt)?,
+        Some(workspace) => super::workspace::attach_skills(workspace, repo, prompt, env)?,
         None => prompt,
     };
 

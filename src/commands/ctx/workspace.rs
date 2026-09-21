@@ -191,8 +191,13 @@ pub fn effective_skill_refs<'a>(
 /// Resolve every selected skill before a worktree is allocated. The same
 /// registry is used later to render the instruction bodies, so no parallel
 /// skill-loading path is introduced.
-pub fn validate_skills(workspace: &WorkspaceConfig, repo: &Path) -> CtxResult<()> {
-    let registry = SkillRegistry::load_for_repo(repo, dirs::home_dir().as_deref(), true)?;
+pub fn validate_skills(
+    workspace: &WorkspaceConfig,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> CtxResult<()> {
+    let home = home_dir(env);
+    let registry = SkillRegistry::load_for_repo(repo, home.as_deref(), true)?;
     for requested in effective_skill_refs(Some(workspace), &[]) {
         let requested = skill_request(requested);
         let skill = registry
@@ -215,12 +220,14 @@ pub fn attach_skills(
     workspace: &WorkspaceConfig,
     repo: &Path,
     prompt: String,
+    env: EnvLookup<'_>,
 ) -> CtxResult<String> {
     let requested_skills = effective_skill_refs(Some(workspace), &[]);
     if requested_skills.is_empty() {
         return Ok(prompt);
     }
-    let registry = SkillRegistry::load_for_repo(repo, dirs::home_dir().as_deref(), true)?;
+    let home = home_dir(env);
+    let registry = SkillRegistry::load_for_repo(repo, home.as_deref(), true)?;
     let mut seen = BTreeSet::new();
     let mut rendered = String::new();
     for requested in requested_skills {
@@ -318,6 +325,7 @@ fn clone_repositories(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()>
             .env_remove("GIT_COMMON_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .arg("clone")
             .arg("--single-branch")
             .arg("--branch")
