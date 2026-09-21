@@ -1110,8 +1110,10 @@ fn risk_from_index(index: f64) -> RiskBand {
 /// [`Answer::decisive`] (either its confidence is below `min_confidence`, or
 /// its margin is below `cfg.proxy.min_margin` -- see that method's own doc
 /// comment for why margin, not confidence alone, is what catches the
-/// 2026-09-18 replay's instability) is discarded, with a reason recorded;
-/// complexity/risk only ever rise (`max(model, baseline)`); every other
+/// 2026-09-18 replay's instability) resolves complexity/risk to the higher of
+/// its two most probable levels, or keeps the baseline if no pair is
+/// parseable, with a reason recorded; complexity/risk only ever rise
+/// (`max(model, baseline)`); every other
 /// ASKED field (`intent`, `workflow`, a domain tag) is replaced/added outright
 /// when decisive. Existence checks against the live roster (a workflow id, a
 /// harness/model pair) are deferred to [`validate`], which runs right after
@@ -1146,20 +1148,19 @@ pub fn merge(
         .map(|(id, answer)| (id.clone(), answer.confidence))
         .collect();
 
-    // Mirrors the pre-existing low-confidence reason for that failure mode
-    // exactly (`"{id}: confidence {:.2} < {:.2}, kept baseline"`), and adds a
-    // matching one for a confident-but-thin-margin answer -- the case
-    // `Answer::decisive`'s own doc comment cites, an answer whose label the
-    // model would likely flip on an identical re-ask.
-    let mut record_not_decisive = |id: &str, answer: &Answer| {
+    let mut record_not_decisive = |id: &str, answer: &Answer, resolved: Option<String>| {
+        let outcome = resolved.map_or_else(
+            || "kept baseline".to_string(),
+            |label| format!("resolved upward to {label}"),
+        );
         let reason = if answer.confidence < min_confidence {
             format!(
-                "{id}: confidence {:.2} < {:.2}, kept baseline",
+                "{id}: confidence {:.2} < {:.2}, {outcome}",
                 answer.confidence, min_confidence
             )
         } else {
             format!(
-                "{id}: margin {:.2} < {:.2}, kept baseline",
+                "{id}: margin {:.2} < {:.2}, {outcome}",
                 answer.margin(),
                 min_margin
             )
@@ -1169,7 +1170,7 @@ pub fn merge(
 
     if let Some(answer) = answers.get("intent") {
         if !answer.decisive(min_confidence, min_margin) {
-            record_not_decisive("intent", answer);
+            record_not_decisive("intent", answer, None);
         } else if let AnswerValue::Choice(value) = &answer.value
             && let Some(intent) = parse_intent(value)
         {
@@ -1179,7 +1180,15 @@ pub fn merge(
 
     if let Some(answer) = answers.get("complexity") {
         if !answer.decisive(min_confidence, min_margin) {
-            record_not_decisive("complexity", answer);
+            let resolved = answer.cautious_score().map(complexity_from_index);
+            if let Some(complexity) = resolved {
+                decision.complexity = decision.complexity.max(complexity);
+            }
+            record_not_decisive(
+                "complexity",
+                answer,
+                resolved.map(|value| format!("{value:?}").to_lowercase()),
+            );
         } else if let AnswerValue::Score(value) = answer.value {
             decision.complexity = decision.complexity.max(complexity_from_index(value));
         }
@@ -1187,7 +1196,15 @@ pub fn merge(
 
     if let Some(answer) = answers.get("risk") {
         if !answer.decisive(min_confidence, min_margin) {
-            record_not_decisive("risk", answer);
+            let resolved = answer.cautious_score().map(risk_from_index);
+            if let Some(risk) = resolved {
+                decision.risk = decision.risk.max(risk);
+            }
+            record_not_decisive(
+                "risk",
+                answer,
+                resolved.map(|value| format!("{value:?}").to_lowercase()),
+            );
         } else if let AnswerValue::Score(value) = answer.value {
             decision.risk = decision.risk.max(risk_from_index(value));
         }
@@ -1195,7 +1212,7 @@ pub fn merge(
 
     if let Some(answer) = answers.get("workflow") {
         if !answer.decisive(min_confidence, min_margin) {
-            record_not_decisive("workflow", answer);
+            record_not_decisive("workflow", answer, None);
         } else if let AnswerValue::Choice(value) = &answer.value {
             decision.workflow = if value == "none" {
                 None
@@ -1224,7 +1241,7 @@ pub fn merge(
     // adds that domain; nothing ever removes one. A confident-but-thin-margin
     // `true` answer now falls back to "not added" (the deterministic
     // baseline never has a domain tag of its own), recorded the same way a
-    // discarded intent/complexity/risk/workflow answer is. `security`'s own
+    // discarded intent/workflow answer is. `security`'s own
     // tag sets the same validation flags the keyword-based `ExecutionProfile
     // ::derive` detection sets below, so `apply_security_risk_floor` floors
     // risk/execution the same way regardless of which detector caught it.
@@ -1234,7 +1251,7 @@ pub fn merge(
             && value >= 0.5
         {
             if !answer.decisive(min_confidence, min_margin) {
-                record_not_decisive(id, answer);
+                record_not_decisive(id, answer, None);
             } else if !decision.domains.iter().any(|domain| domain == id) {
                 decision.domains.push(id.to_string());
             }
@@ -1453,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn a_low_confidence_answer_keeps_the_baseline_and_records_a_reason() {
+    fn a_low_confidence_score_without_parseable_indices_keeps_the_baseline() {
         let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let ans = answers(&[("risk", AnswerValue::Score(3.0), 0.2)]);
@@ -1469,13 +1486,8 @@ mod tests {
         );
     }
 
-    /// Jev determinism fix: a `risk` answer with a confidence at or above the
-    /// floor, but a thin margin (0.51/0.49) between its own top and
-    /// runner-up probability, must ALSO keep the baseline -- confidence
-    /// alone is not enough, and the recorded reason names the margin, not
-    /// the confidence, since confidence itself cleared its own floor.
     #[test]
-    fn a_thin_margin_answer_keeps_the_baseline_and_records_a_margin_reason() {
+    fn a_thin_margin_risk_answer_resolves_upward_and_records_a_margin_reason() {
         let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let mut ans = Answers::new();
@@ -1491,15 +1503,113 @@ mod tests {
             },
         );
         let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
-        assert_eq!(
-            merged.risk, baseline.risk,
-            "a thin margin must keep the baseline despite high confidence"
-        );
+        assert_eq!(merged.risk, RiskBand::Critical);
         assert!(
             merged
                 .reasons
                 .iter()
-                .any(|reason| reason.starts_with("risk: margin 0.02 < ")),
+                .any(|reason| reason.starts_with("risk: margin 0.02 < ")
+                    && reason.contains("resolved upward to critical")),
+            "{:?}",
+            merged.reasons
+        );
+    }
+
+    #[test]
+    fn the_production_complexity_near_tie_selects_a_frontier_orchestrator() {
+        let cfg = CtxConfig::default();
+        let mut baseline = sample_decision();
+        baseline.complexity = Complexity::Trivial;
+        baseline.risk = RiskBand::Low;
+        baseline.execution = ExecutionMode::Direct;
+        baseline.seat_tier = SeatTier::Cheap;
+        baseline.orchestrator.model = "haiku".to_string();
+        let ans = Answers::from([(
+            "complexity".to_string(),
+            Answer {
+                value: AnswerValue::Score(1.0),
+                confidence: 0.57,
+                probabilities: BTreeMap::from([
+                    ("0".to_string(), 0.0_f32),
+                    ("1".to_string(), 0.57_f32),
+                    ("2".to_string(), 0.43_f32),
+                    ("3".to_string(), 0.0_f32),
+                ]),
+            },
+        )]);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "Do an exhaustive investigation of why some contacts received emails and sms one day too late on the ortto journey; check Kibana and the kafka topic",
+            &ans,
+            0.5,
+        );
+        assert_eq!(merged.complexity, Complexity::Substantial);
+        assert_eq!(merged.execution, ExecutionMode::Orchestrated);
+        assert_eq!(merged.seat_role, SeatRole::Orchestrator);
+        assert_eq!(merged.seat_tier, SeatTier::Frontier);
+        assert_eq!(merged.orchestrator.model, "fable");
+        assert!(
+            merged
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("complexity: margin 0.14 < ")
+                    && reason.ends_with("resolved upward to substantial")),
+            "{:?}",
+            merged.reasons
+        );
+    }
+
+    #[test]
+    fn a_thin_margin_lower_complexity_never_lowers_the_baseline() {
+        let cfg = CtxConfig::default();
+        let mut baseline = sample_decision();
+        baseline.complexity = Complexity::Substantial;
+        let ans = Answers::from([(
+            "complexity".to_string(),
+            Answer {
+                value: AnswerValue::Score(0.0),
+                confidence: 0.5,
+                probabilities: BTreeMap::from([
+                    ("0".to_string(), 0.5_f32),
+                    ("1".to_string(), 0.5_f32),
+                ]),
+            },
+        )]);
+        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        assert_eq!(merged.complexity, Complexity::Substantial);
+        assert!(
+            merged
+                .reasons
+                .iter()
+                .any(|reason| reason.ends_with("resolved upward to bounded")),
+            "{:?}",
+            merged.reasons
+        );
+    }
+
+    #[test]
+    fn a_low_confidence_complexity_answer_resolves_upward_and_records_a_reason() {
+        let cfg = CtxConfig::default();
+        let baseline = sample_decision();
+        let ans = Answers::from([(
+            "complexity".to_string(),
+            Answer {
+                value: AnswerValue::Score(1.0),
+                confidence: 0.45,
+                probabilities: BTreeMap::from([
+                    ("0".to_string(), 0.1_f32),
+                    ("1".to_string(), 0.45_f32),
+                    ("2".to_string(), 0.4_f32),
+                    ("3".to_string(), 0.05_f32),
+                ]),
+            },
+        )]);
+        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        assert_eq!(merged.complexity, Complexity::Substantial);
+        assert!(
+            merged.reasons.iter().any(|reason| reason
+                == "complexity: confidence 0.45 < 0.50, resolved upward to substantial"),
             "{:?}",
             merged.reasons
         );

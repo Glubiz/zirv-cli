@@ -399,8 +399,14 @@ and six additive domain tags (`security`, `data`, `docs_only`, `devops`,
 `architecture`, `frontend`) — never `execution`, seat tier or worker tier
 directly: a live battery found those unreliable, and any many-option seat/
 tier question never cleared the confidence floor. A field whose model answer
-is not *decisive* keeps the baseline value instead, with a recorded reason:
-decisive means BOTH its confidence is at or above `min_confidence` AND its
+is not *decisive* keeps the baseline value instead, with a recorded reason,
+except `complexity`/`risk`: these resolve to the higher of the two most
+probable levels when their indices are parseable, still floored by the
+baseline. This keeps a near-tie deterministic whichever level wins and
+avoids the 2026-09-21 case, when an exhaustive multi-system investigation
+landed on a single haiku seat because a bounded/substantial near-tie fell
+to the text-only baseline. A model answer is
+decisive when BOTH its confidence is at or above `min_confidence` AND its
 margin (the gap between its top and runner-up probability; for a yes/no
 question, distance from the maximally uncertain 0.5, doubled) is at or above
 `min_margin`. A completed 2026-09-18 measurement (497 live calls across the

@@ -244,6 +244,29 @@ impl Answer {
         }
     }
 
+    /// The higher of a Score answer's two most probable level indices, with
+    /// probability ties broken toward the higher level; `None` for other
+    /// answer kinds or fewer than two parseable indices. Resolving a near-tie
+    /// upward keeps the same result whichever of the pair is the argmax,
+    /// preserving determinism while letting monotonic fields rise cautiously.
+    pub(crate) fn cautious_score(&self) -> Option<f64> {
+        if !matches!(self.value, AnswerValue::Score(_)) {
+            return None;
+        }
+        let mut levels: Vec<(u32, f32)> = self
+            .probabilities
+            .iter()
+            .filter_map(|(level, probability)| {
+                level.parse().ok().map(|level| (level, *probability))
+            })
+            .collect();
+        if levels.len() < 2 {
+            return None;
+        }
+        levels.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        Some(f64::from(levels[0].0.max(levels[1].0)))
+    }
+
     /// Whether this answer clears BOTH floors a caller wants before acting on
     /// it, rather than falling back to its own deterministic path: the
     /// reported `confidence` at or above `min_confidence`, AND `margin` at or
@@ -1879,6 +1902,73 @@ pub(crate) mod tests {
             probabilities: BTreeMap::new(),
         };
         assert_eq!(none.margin(), 0.0);
+    }
+
+    #[test]
+    fn cautious_score_returns_the_higher_of_the_two_most_probable_levels() {
+        for (value, bounded, substantial) in [(1.0, 0.57, 0.43), (2.0, 0.43, 0.57)] {
+            let answer = Answer {
+                value: AnswerValue::Score(value),
+                confidence: 0.57,
+                probabilities: BTreeMap::from([
+                    ("0".to_string(), 0.0_f32),
+                    ("1".to_string(), bounded),
+                    ("2".to_string(), substantial),
+                    ("3".to_string(), 0.0_f32),
+                ]),
+            };
+            assert_eq!(answer.cautious_score(), Some(2.0));
+        }
+    }
+
+    #[test]
+    fn cautious_score_breaks_probability_ties_upward() {
+        for probabilities in [
+            BTreeMap::from([("1".to_string(), 0.5_f32), ("2".to_string(), 0.5_f32)]),
+            BTreeMap::from([
+                ("0".to_string(), 0.6_f32),
+                ("1".to_string(), 0.2_f32),
+                ("2".to_string(), 0.2_f32),
+            ]),
+        ] {
+            let answer = Answer {
+                value: AnswerValue::Score(1.0),
+                confidence: 0.5,
+                probabilities,
+            };
+            assert_eq!(answer.cautious_score(), Some(2.0));
+        }
+    }
+
+    #[test]
+    fn cautious_score_is_none_with_fewer_than_two_parseable_indices() {
+        for probabilities in [
+            BTreeMap::new(),
+            BTreeMap::from([("1".to_string(), 1.0_f32)]),
+            BTreeMap::from([("1".to_string(), 0.5_f32), ("other".to_string(), 0.5_f32)]),
+        ] {
+            let answer = Answer {
+                value: AnswerValue::Score(1.0),
+                confidence: 0.5,
+                probabilities,
+            };
+            assert_eq!(answer.cautious_score(), None);
+        }
+    }
+
+    #[test]
+    fn cautious_score_is_none_for_choice_and_noul() {
+        for value in [AnswerValue::Choice("1".to_string()), AnswerValue::Noul(0.5)] {
+            let answer = Answer {
+                value,
+                confidence: 0.5,
+                probabilities: BTreeMap::from([
+                    ("1".to_string(), 0.5_f32),
+                    ("2".to_string(), 0.5_f32),
+                ]),
+            };
+            assert_eq!(answer.cautious_score(), None);
+        }
     }
 
     #[test]
