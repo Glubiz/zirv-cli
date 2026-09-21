@@ -229,25 +229,81 @@ fn web_url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Program-family for a shell command string: `argv[0]` plus the first
+/// Program-family for the first executable shell segment, skipping quoted
+/// assignments and structural keywords: `argv[0]` plus the first
 /// non-flag argument that cannot itself carry a credential (a token
 /// starting with `-` such as `-pSECRET`, or one containing `:`/`@`/`=` such
-/// as `user:pass@host` or `KEY=val`). Empty input yields an empty string --
+/// as `user:pass@host` or `KEY=val`). `cd`, `export`, and `printf` have data
+/// operands, not subcommands; `source`/`.` names only the script basename.
+/// A loop with no executable body falls back to its keyword.
+/// Empty input yields an empty string --
 /// callers with a more specific fallback (e.g. the tool name) apply it
 /// themselves. Shared by [`permission_family`]'s `Bash`/`PowerShell` branch
 /// and `safety::audit_hook_decision`'s own `family` field on the
 /// safety-decision record (Change 5a) -- both need the identical
 /// "never leak an argument" rule, so it exists exactly once.
 pub(crate) fn command_family(command: &str) -> String {
-    let mut tokens = command.split_whitespace();
-    let program = tokens.next().unwrap_or("");
-    let subcommand =
-        tokens.find(|token| !token.starts_with('-') && !token.contains([':', '@', '=']));
-    match (program, subcommand) {
-        ("", _) => String::new(),
-        (program, Some(subcommand)) => format!("{program} {subcommand}"),
-        (program, None) => program.to_string(),
+    let mut keyword = String::new();
+    for segment in super::safety::split_segments(command) {
+        let quoted = super::safety::tokenize_quoted(&segment.chars().collect::<Vec<_>>());
+        let mut tokens = quoted.iter().map(|token| token.text.as_str());
+        let program = loop {
+            let Some(token) = tokens.next() else {
+                break None;
+            };
+            if super::safety::is_shell_identifier_assignment(token) {
+                continue;
+            }
+            if matches!(token, "for" | "select" | "case") {
+                keyword = token.to_string();
+                break None;
+            }
+            if matches!(
+                token,
+                "while"
+                    | "until"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "elif"
+                    | "do"
+                    | "time"
+                    | "!"
+                    | "{"
+                    | "("
+                    | "fi"
+                    | "done"
+                    | "esac"
+                    | "}"
+                    | ")"
+            ) {
+                if keyword.is_empty() {
+                    keyword = token.to_string();
+                }
+                continue;
+            }
+            break Some(token);
+        };
+        let Some(program) = program else {
+            continue;
+        };
+        if matches!(program, "cd" | "export" | "printf") {
+            return program.to_string();
+        }
+        let subcommand =
+            tokens.find(|token| !token.starts_with('-') && !token.contains([':', '@', '=']));
+        if matches!(program, "source" | ".") {
+            return subcommand
+                .and_then(|path| Path::new(path.trim_matches(['\'', '"'])).file_name())
+                .map(|name| format!("source {}", name.to_string_lossy()))
+                .unwrap_or_else(|| "source".to_string());
+        }
+        return match subcommand {
+            Some(subcommand) => format!("{program} {subcommand}"),
+            None => program.to_string(),
+        };
     }
+    keyword
 }
 
 fn permission_family(payload: &PermissionHookPayload) -> (String, Option<String>) {
@@ -6782,6 +6838,62 @@ mod tests {
             "printf"
         );
         assert_eq!(command_family(""), "");
+    }
+
+    #[test]
+    fn command_family_skips_assignments_and_shell_structure() {
+        for (command, expected) in [
+            ("xcrun simctl list", "xcrun simctl"),
+            (
+                "BM=~/claude-code/backoffice-marketing; for d in a b; do printf '%s\\n' \"$d\"; done",
+                "printf",
+            ),
+            (
+                r#"for h in 6aaa503b 65d88e6f; do printf "%s -> " "$h"; date -u -r $((0x$h)) "+%Y-%m-%d %H:%M:%S UTC"; done"#,
+                "printf",
+            ),
+            (
+                r#"zirv ctx wait 62de9de3 --until done 2>&1 | tail -3; echo "wait-exit=$?""#,
+                "zirv ctx",
+            ),
+            (
+                "source /private/tmp/claude-501/scratchpad/kbn.sh; kbn_file a1",
+                "source kbn.sh",
+            ),
+            (
+                "cd /Users/jonathansolskov/Documents/Privat/zirv-fitness-tracking",
+                "cd",
+            ),
+            ("export FOO=1", "export"),
+            (
+                r#"S=/private/tmp/scratchpad; P="/Users/j/Library/Application Support/zirv/ctx"; ZIRV_CTX_FALLBACK=false zirv agent codex - --workdir repo -- --model gpt-6-astra < $S/r.md > $S/o.out 2> $S/e.err; echo "exit=$?"; cat $S/o.out"#,
+                "zirv agent",
+            ),
+            (
+                r#"OUT="/private/tmp/gates-fix"; WT="repo/wt-jev-tier"; cargo fmt --manifest-path "$WT/Cargo.toml" -- --check > "$OUT/01-fmt.log" 2>&1; echo "FMT_EXIT=$?" | tee -a "$OUT/exit-codes.txt""#,
+                "cargo fmt",
+            ),
+            ("W=.claude/worktrees/wt-jev-tier; git status", "git status"),
+            (
+                r#"S='space ; secret'; P="other ; secret" git status"#,
+                "git status",
+            ),
+            (r#". "/private/tmp/a dir/kbn.sh""#, "source kbn.sh"),
+            ("for h in a b", "for"),
+            ("select h in a b; do git status; done", "git status"),
+            ("case $x in", "case"),
+            ("while git status; do echo ok; done", "git status"),
+            ("until git status; do echo ok; done", "git status"),
+            ("if git status; then echo ok; fi", "git status"),
+            ("then git status", "git status"),
+            ("else git status", "git status"),
+            ("elif git status", "git status"),
+            ("do git status", "git status"),
+            ("time ! { ( git status; ) }", "git status"),
+            ("TOKEN='secret value; still secret'", ""),
+        ] {
+            assert_eq!(command_family(command), expected, "{command}");
+        }
     }
 
     #[test]

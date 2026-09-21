@@ -3779,6 +3779,7 @@ keep only your own.
 
 | Surface | Trust | Narrowing? |
 |---|---|---|
+| Scratchpad roots and shell/query exceptions | trusted harness environment and built-in classification | no repository setting can expand the roots or bypass an explicit ask/deny rule |
 | Native release availability | fixed in the binary | no flag, configuration, environment variable or Cargo feature can enable native execution |
 | `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
 | `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
@@ -5643,12 +5644,19 @@ sql = "on"                       # operator-only, REPO-FORBIDDEN
 Rules are glob patterns (`*` matches any run of characters); a command is
 matched deny-first, then ask, then allow, first match wins within a
 category. Unmatched commands use `interactive_default` for an interactive
-launch and `default` for a headless one. With SQL classification on, one
+launch and `default` for a headless one. The Claude hook treats every non-empty
+permission mode except `dontAsk` as interactive, including `auto` and
+`bypassPermissions`; an empty or missing mode is headless.
+`ZIRV_CTX_LAUNCH_MODE=interactive` overrides either case to interactive.
+With SQL classification on, one
 provably read-only `SELECT`/`EXPLAIN`/`SHOW` through a recognized client runs
 silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
 input asks conservatively.
 
 With the default `interactive_default = "allow"`, the hook answers "allow" for commands no rule matches and suppresses the harness's own permission prompt, so enabling the hook widens what runs without a prompt; set `[safety] interactive_default = "ask"` in `~/.zirv/ctx.toml` to keep the harness's prompt for unmatched commands.
+
+Same-command literal variable assignments are resolved when judging scratchpad-confined writes and redirects under the hook payload's cwd on an unsandboxed retry. A variable must have a single literal assignment in a simple command list; functions, traps, shell-variable mutations and ambiguous expansions disable resolution. Unresolved targets still require approval on a retry. A `CLAUDE_CODE_TMPDIR` already ending in `claude-<uid>` is used as-is; on macOS, scratchpad roots include both `/tmp/...` and `/private/tmp/...` spellings.
+Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`) are read-only for the network classifier and retry screen when every request URL matches a query route and any body is inline. File/stdin uploads, dynamic bodies, client config files, unknown query options and non-query routes disqualify this exception; explicit ask/deny rules still apply.
 
 The analyzer evaluates the most restrictive result across quote-aware compound
 segments (`;`, `&`, `&&`, `||`, pipes and newlines), nested
