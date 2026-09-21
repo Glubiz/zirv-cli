@@ -393,7 +393,7 @@ pub fn latest_for_repo(state_dir: &Path, repo: &Path) -> Option<ProxyDecision> {
 
 /// Reads a request from `reader`: every line up to (not including) the
 /// first blank line or EOF. `None` when nothing but whitespace was read.
-pub fn read_request(reader: &mut impl BufRead) -> Option<String> {
+pub fn read_request(reader: &mut (impl BufRead + ?Sized)) -> Option<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     loop {

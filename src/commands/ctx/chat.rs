@@ -7,8 +7,13 @@
 //! allowed to hear about delegating to other harnesses (`zirv ctx send`,
 //! `zirv ctx inbox`, `zirv ctx agent`).
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
+
+use crossterm::cursor::MoveToColumn;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::Print;
+use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 
 use super::adapters::{self, AgentAdapter, DefaultOrigin};
 use super::chrome::{self, BannerFacts, ChromeCaps, HarnessRule};
@@ -362,6 +367,260 @@ enum ProxyIntakeOutcome {
     },
 }
 
+/// One line of text under construction by the operator, tracked as
+/// codepoints with an interior edit point (`cursor`, a codepoint index into
+/// `chars`) rather than only ever appending at the end. See
+/// [`read_edited_line`]'s own doc comment for why this exists at all.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct EditLine {
+    chars: Vec<char>,
+    cursor: usize,
+}
+
+impl EditLine {
+    fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    fn insert(&mut self, c: char) {
+        self.chars.insert(self.cursor, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        self.cursor -= 1;
+        self.chars.remove(self.cursor);
+        true
+    }
+
+    fn delete_forward(&mut self) -> bool {
+        if self.cursor >= self.chars.len() {
+            return false;
+        }
+        self.chars.remove(self.cursor);
+        true
+    }
+
+    fn move_left(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        self.cursor -= 1;
+        true
+    }
+
+    fn move_right(&mut self) -> bool {
+        if self.cursor >= self.chars.len() {
+            return false;
+        }
+        self.cursor += 1;
+        true
+    }
+
+    fn move_home(&mut self) -> bool {
+        let moved = self.cursor != 0;
+        self.cursor = 0;
+        moved
+    }
+
+    fn move_end(&mut self) -> bool {
+        let moved = self.cursor != self.chars.len();
+        self.cursor = self.chars.len();
+        moved
+    }
+}
+
+/// What one raw key does to an [`EditLine`] in progress -- pure so the
+/// mapping from a key to an edit is unit-tested without a real terminal.
+/// `Eof`/`Cancel` exist because raw mode (needed to see Left/Right at all --
+/// a canonical-mode tty has no concept of them beyond their raw escape
+/// bytes) disables `ICANON`/`ISIG` along with it, which otherwise silently
+/// takes Ctrl+D's end-of-input and Ctrl+C's interrupt away too; see
+/// [`read_edited_line`]'s own doc comment for how each is put back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditAction {
+    Edited,
+    Submit,
+    Eof,
+    Cancel,
+    Ignored,
+}
+
+/// Pure: what pressing `code` (with `modifiers`) does to `line`.
+fn apply_key(line: &mut EditLine, code: KeyCode, modifiers: KeyModifiers) -> EditAction {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return match code {
+            KeyCode::Char('c' | 'C') => EditAction::Cancel,
+            KeyCode::Char('d' | 'D') => EditAction::Eof,
+            _ => EditAction::Ignored,
+        };
+    }
+    let edited = match code {
+        KeyCode::Enter => return EditAction::Submit,
+        KeyCode::Char(c) => {
+            line.insert(c);
+            true
+        }
+        KeyCode::Backspace => line.backspace(),
+        KeyCode::Delete => line.delete_forward(),
+        KeyCode::Left => line.move_left(),
+        KeyCode::Right => line.move_right(),
+        KeyCode::Home => line.move_home(),
+        KeyCode::End => line.move_end(),
+        _ => false,
+    };
+    if edited {
+        EditAction::Edited
+    } else {
+        EditAction::Ignored
+    }
+}
+
+/// Redraws `line` at the terminal's current row: return to column 0, erase
+/// whatever was there, print the text, then move the cursor back to `line`'s
+/// own edit point. A full redraw on every keystroke rather than an
+/// incremental one -- a task description is short enough that the extra
+/// bytes this costs are not worth the bookkeeping an incremental redraw
+/// (tracking exactly which cells changed) would need.
+fn redraw_edit_line(out: &mut impl Write, line: &EditLine) -> io::Result<()> {
+    crossterm::execute!(
+        out,
+        MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        Print(line.text()),
+        MoveToColumn(line.cursor as u16)
+    )
+}
+
+/// What one call to [`read_edited_line`] produced: a submitted line, or
+/// end of input (Ctrl+D) -- Ctrl+C exits the process directly (see that
+/// function's own doc comment) rather than surfacing as a third variant
+/// here, so every caller of this type only ever has these two to handle,
+/// same as a plain `read_line`'s `Some`/`None`.
+enum LineOutcome {
+    Line(String),
+    Eof,
+}
+
+/// Reads one line from the operator with a real, relocatable cursor --
+/// Left/Right/Home/End actually move the edit point, and Backspace/Delete
+/// act on wherever it is -- instead of what bare canonical-mode
+/// `stdin().read_line()` gives: appending is the only edit there is, since
+/// the tty's own line discipline has no notion of an interior cursor at all
+/// (an arrow key's raw escape bytes just get inserted as literal text, or
+/// swallowed by whatever the terminal makes of them). That was reported as
+/// the harness-proxy intake prompt being stuck in "insert mode".
+///
+/// Needs raw mode to see Left/Right as `KeyCode`s at all, which as a side
+/// effect disables `ISIG`/`ICANON`, so this hand-restores what those
+/// otherwise gave for free: a bare Ctrl+C would otherwise do nothing
+/// (silently swallowed instead of raising `SIGINT`), so it exits the
+/// process itself with 130 (128 + `SIGINT`, the conventional code an
+/// interrupted process reports) -- the same outward result canonical mode's
+/// own signal delivery always had here. A bare Ctrl+D would otherwise be
+/// read back as a literal `KeyCode::Char('d')` instead of ending input, so
+/// it maps to [`LineOutcome::Eof`] by hand instead. Raw mode is always
+/// disabled again before returning, on every exit path including an I/O
+/// error, so a failure here can never leave the terminal stuck in it.
+fn read_edited_line() -> io::Result<LineOutcome> {
+    enable_raw_mode()?;
+    let mut term = io::stderr();
+    let mut line = EditLine::default();
+    let outcome = loop {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                match apply_key(&mut line, key.code, key.modifiers) {
+                    EditAction::Submit => break Ok(LineOutcome::Line(line.text())),
+                    EditAction::Eof => break Ok(LineOutcome::Eof),
+                    EditAction::Cancel => {
+                        let _ = disable_raw_mode();
+                        let _ = writeln!(term);
+                        std::process::exit(130);
+                    }
+                    EditAction::Edited => {
+                        if let Err(e) = redraw_edit_line(&mut term, &line) {
+                            break Err(e);
+                        }
+                    }
+                    EditAction::Ignored => {}
+                }
+            }
+            Ok(_) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = disable_raw_mode();
+    if outcome.is_ok() {
+        let _ = writeln!(term);
+    }
+    outcome
+}
+
+/// A `Read` source, meant to be wrapped in a `BufReader` (which then
+/// satisfies the `BufRead` [`proxy_intake`] takes), that serves each line
+/// from [`read_edited_line`] instead of raw stdin bytes. `proxy::
+/// read_request`'s own multi-line-until-blank-or-EOF loop does not change at
+/// all -- only where its bytes come from.
+struct EditedStdin {
+    pending: Vec<u8>,
+    pos: usize,
+    eof: bool,
+}
+
+impl EditedStdin {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            pos: 0,
+            eof: false,
+        }
+    }
+}
+
+impl Read for EditedStdin {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.pending.len() {
+            if self.eof {
+                return Ok(0);
+            }
+            self.pending.clear();
+            self.pos = 0;
+            match read_edited_line()? {
+                LineOutcome::Line(text) => {
+                    self.pending.extend_from_slice(text.as_bytes());
+                    self.pending.push(b'\n');
+                }
+                LineOutcome::Eof => {
+                    self.eof = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let n = buf.len().min(self.pending.len() - self.pos);
+        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// The `reader` a real, interactive `proxy_intake` call reads the task
+/// description from: [`EditedStdin`] (real cursor editing) when stdin is a
+/// terminal capable of rendering the raw-mode escape codes that needs
+/// (`vt_ok`), plain stdin otherwise -- an older Windows console without VT
+/// processing enabled cannot be assumed to render `redraw_edit_line`'s
+/// cursor-movement codes correctly, so it keeps today's append-only
+/// behaviour rather than risking a garbled prompt.
+fn intake_reader(stdin_is_tty: bool, vt_ok: bool) -> Box<dyn BufRead> {
+    if stdin_is_tty && vt_ok {
+        Box::new(io::BufReader::new(EditedStdin::new()))
+    } else {
+        Box::new(io::stdin().lock())
+    }
+}
+
 /// The harness proxy's intake step (issue #537 T2), evaluated before any
 /// dashboard/TUI or `wrap` launch and before `resolve_adapter`. Pure of the
 /// real terminal/stdin: `stdin_is_tty` and `reader` are both passed in
@@ -384,7 +643,7 @@ fn proxy_intake<E: Write>(
     repo: &Path,
     args: &ChatArgs,
     stdin_is_tty: bool,
-    reader: &mut impl BufRead,
+    reader: &mut dyn BufRead,
     stderr: &mut E,
 ) -> CtxResult<ProxyIntakeOutcome> {
     if args.simple || args.resume {
@@ -488,7 +747,7 @@ fn maybe_clarify<E: Write>(
     repo: &Path,
     decision: ProxyDecision,
     request: String,
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + ?Sized),
     stderr: &mut E,
 ) -> CtxResult<(ProxyDecision, String)> {
     if decision.needs_clarification < proxy::CLARIFY_THRESHOLD
@@ -779,7 +1038,7 @@ fn run_native_chat<E: Write>(
         repo,
         args,
         stdin_is_tty,
-        &mut std::io::stdin().lock(),
+        &mut *intake_reader(stdin_is_tty, vt_ok),
         stderr,
     )?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
@@ -977,7 +1236,7 @@ pub fn run_with<W: Write, E: Write>(
         repo,
         args,
         stdin_is_tty,
-        &mut std::io::stdin().lock(),
+        &mut *intake_reader(stdin_is_tty, vt_ok),
         stderr,
     )?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
@@ -1608,6 +1867,141 @@ mod tests {
     use crate::commands::workflow::classify::{Complexity, Intent, RiskBand};
     use crate::commands::workflow::profile::{ExecutionMode, ValidationProfile};
     use std::collections::BTreeMap;
+
+    /// The exact defect the intake prompt was reported as: Left/Right must
+    /// actually relocate the edit point, not just be ignored (which is what
+    /// bare canonical-mode `read_line` effectively does with them) or always
+    /// append at the end regardless of where the cursor visually is.
+    #[test]
+    fn arrow_keys_relocate_the_cursor_instead_of_only_ever_appending() {
+        let mut line = EditLine::default();
+        for c in "hllo".chars() {
+            line.insert(c);
+        }
+        assert_eq!(line.text(), "hllo");
+        assert_eq!(line.cursor, 4);
+
+        // Move left three times to sit right after the "h".
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(line.cursor, 1);
+
+        // Insert at the relocated cursor, not at the end.
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Char('e'), KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(line.text(), "hello");
+        assert_eq!(line.cursor, 2);
+
+        // Right moves back toward the end.
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Right, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(line.cursor, 3);
+    }
+
+    #[test]
+    fn cursor_movement_is_a_no_op_and_ignored_at_either_edge() {
+        let mut line = EditLine::default();
+        line.insert('a');
+        line.insert('b');
+        line.cursor = 0;
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
+            EditAction::Ignored,
+            "already at column 0 -- nothing to move left into"
+        );
+        line.cursor = line.chars.len();
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Right, KeyModifiers::NONE),
+            EditAction::Ignored,
+            "already past the last char -- nothing to move right into"
+        );
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Home, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(line.cursor, 0);
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Home, KeyModifiers::NONE),
+            EditAction::Ignored,
+            "already at column 0"
+        );
+        assert_eq!(
+            apply_key(&mut line, KeyCode::End, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(line.cursor, 2);
+    }
+
+    #[test]
+    fn backspace_and_delete_act_on_the_cursor_not_the_end_of_the_line() {
+        let mut line = EditLine::default();
+        for c in "abcd".chars() {
+            line.insert(c);
+        }
+        line.cursor = 2; // between 'b' and 'c'
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Backspace, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(line.text(), "acd", "erases 'b', the char before the cursor");
+        assert_eq!(line.cursor, 1);
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Delete, KeyModifiers::NONE),
+            EditAction::Edited
+        );
+        assert_eq!(
+            line.text(),
+            "ad",
+            "erases 'c', the char at/after the cursor"
+        );
+        assert_eq!(line.cursor, 1);
+    }
+
+    /// Raw mode's own cost: `ISIG`/`ICANON` going away silently takes
+    /// Ctrl+C's interrupt and Ctrl+D's end-of-input with them unless mapped
+    /// back explicitly, which is what `EditAction::Cancel`/`Eof` are for.
+    #[test]
+    fn ctrl_c_and_ctrl_d_map_to_cancel_and_eof_not_a_literal_character() {
+        let mut line = EditLine::default();
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            EditAction::Cancel
+        );
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Char('d'), KeyModifiers::CONTROL),
+            EditAction::Eof
+        );
+        assert!(
+            line.chars.is_empty(),
+            "neither control chord ever gets typed into the line itself"
+        );
+    }
+
+    #[test]
+    fn enter_submits_without_touching_the_line() {
+        let mut line = EditLine::default();
+        line.insert('h');
+        line.insert('i');
+        assert_eq!(
+            apply_key(&mut line, KeyCode::Enter, KeyModifiers::NONE),
+            EditAction::Submit
+        );
+        assert_eq!(line.text(), "hi", "submitting must not mutate the buffer");
+    }
 
     fn handoff() -> Handoff {
         Handoff {
