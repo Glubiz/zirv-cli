@@ -82,7 +82,7 @@ pub enum ThinkingConfig {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProviderRequest {
     pub model: String,
     pub system: Vec<String>,
@@ -144,10 +144,22 @@ impl ProviderRequest {
         options: &crate::commands::ctx::obfuscate::Options,
         surface: &str,
     ) -> crate::commands::ctx::CtxResult<()> {
+        if options.mode == crate::commands::ctx::obfuscate::Mode::Off {
+            return Ok(());
+        }
         let mut candidate = self.clone();
-        crate::commands::ctx::obfuscate_store::with_vault(
+        let audit_detail = crate::commands::ctx::obfuscate_store::with_vault(
             &crate::commands::ctx::obfuscate_store::vault_path(state_root, repo),
             |vault| {
+                let mut audit_options = options.clone();
+                audit_options.mode = crate::commands::ctx::obfuscate::Mode::Flag;
+                let serialized = serde_json::to_string(&candidate)?;
+                let (_, audit_findings) = crate::commands::ctx::obfuscate::obfuscate(
+                    &serialized,
+                    vault,
+                    &audit_options,
+                    surface,
+                );
                 for text in &mut candidate.system {
                     *text = mask(text, vault, options, surface);
                 }
@@ -180,9 +192,46 @@ impl ProviderRequest {
                     tool.description = mask(&tool.description, vault, options, surface);
                     mask_json(&mut tool.input_schema, vault, options, surface);
                 }
-                Ok(())
+                for stop in &mut candidate.stop_sequences {
+                    *stop = mask(stop, vault, options, surface);
+                }
+                let audit_detail = if !audit_findings.is_empty() {
+                    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+                    for finding in &audit_findings {
+                        *counts.entry(&finding.kind).or_default() += 1;
+                    }
+                    let detail = counts
+                        .into_iter()
+                        .map(|(kind, count)| format!("{kind}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    candidate.system.push(format!(
+                        "[zirv sensitive values were detected at the egress boundary: {}]",
+                        detail
+                    ));
+                    Some(detail)
+                } else {
+                    None
+                };
+                Ok(audit_detail)
             },
         )?;
+        if let Some(detail) = audit_detail {
+            let state = crate::commands::ctx::state::StateDir::from_path(state_root.to_path_buf());
+            let _ = crate::commands::ctx::log::append(
+                &state,
+                &crate::commands::ctx::log::Decision {
+                    ts: crate::commands::ctx::state::now_secs(),
+                    session: "native",
+                    verb: "provider",
+                    verdict: "audit",
+                    score: 0,
+                    action: "obfuscate-surface",
+                    detail: &format!("{surface}: {detail}"),
+                    observed_at: None,
+                },
+            );
+        }
         *self = candidate;
         Ok(())
     }
@@ -211,8 +260,11 @@ fn mask_json(
             }
         }
         serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                mask_json(value, vault, options, surface);
+            let original = std::mem::take(values);
+            for (key, mut value) in original {
+                let key = mask(&key, vault, options, surface);
+                mask_json(&mut value, vault, options, surface);
+                values.insert(key, value);
             }
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}

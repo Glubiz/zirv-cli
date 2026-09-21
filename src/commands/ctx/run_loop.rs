@@ -348,7 +348,7 @@ pub(crate) fn run_with_clock<W: Write>(
         } else {
             composed
         };
-        let (user_extra, composed) = super::prompt::merge_command_line_prompt(
+        let (user_extra, mut composed) = super::prompt::merge_command_line_prompt(
             adapter.as_ref(),
             &args.extra,
             composed,
@@ -356,6 +356,13 @@ pub(crate) fn run_with_clock<W: Write>(
             super::prompt::PromptRole::Worker,
             &cfg.prompt,
         );
+        composed = super::obfuscate_store::protect_composed(
+            &state,
+            repo,
+            &cfg,
+            composed,
+            "loop_composed_prompt",
+        )?;
 
         match session_guard.as_mut() {
             Some(guard) => guard.refresh_session(session.as_str()),
@@ -475,6 +482,14 @@ pub(crate) fn run_with_clock<W: Write>(
             cfg.mail.max_delivered_bytes,
             parent_short.as_deref(),
         );
+        let prompt = super::obfuscate_store::protect_text(
+            &state,
+            repo,
+            &cfg,
+            &prompt,
+            "loop_task_prompt",
+        )?
+        .0;
 
         // FIX B: on a Windows npm `.cmd` shim launch, cmd.exe reparses the
         // downstream argv, so the prompt is delivered on stdin instead of as

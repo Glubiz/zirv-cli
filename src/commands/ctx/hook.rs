@@ -133,11 +133,9 @@ impl HookPayload {
     }
 }
 
-fn hook_obfuscation_options(cfg: &CtxConfig) -> super::obfuscate::Options {
-    crate::utils::home_dir()
-        .ok()
-        .and_then(|home| super::obfuscate_store::options_from_config(&cfg.obfuscate, &home).ok())
-        .unwrap_or_else(|| cfg.obfuscate.options(Vec::new()))
+fn hook_obfuscation_options(cfg: &CtxConfig) -> CtxResult<super::obfuscate::Options> {
+    let home = crate::utils::home_dir()?;
+    super::obfuscate_store::options_from_config(&cfg.obfuscate, &home)
 }
 
 fn finding_kinds(findings: &[super::obfuscate::Finding]) -> String {
@@ -1760,7 +1758,20 @@ pub fn prompt_output(
 fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let payload = HookPayload::parse(stdin).unwrap_or_default();
     let repo = payload.repo();
-    let cfg = super::config::CtxConfig::load(&repo, env).unwrap_or_default();
+    let cfg = match super::config::CtxConfig::load(&repo, env) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            writeln!(
+                w,
+                "{}",
+                serde_json::json!({
+                    "decision": "block",
+                    "reason": "zirv could not load sensitive-data policy; refusing prompt"
+                })
+            )?;
+            return Ok(0);
+        }
+    };
     let prompt = serde_json::from_str::<serde_json::Value>(stdin)
         .ok()
         .and_then(|value| {
@@ -1770,7 +1781,20 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let mut options = hook_obfuscation_options(&cfg);
+    let mut options = match hook_obfuscation_options(&cfg) {
+        Ok(options) => options,
+        Err(_) => {
+            writeln!(
+                w,
+                "{}",
+                serde_json::json!({
+                    "decision": "block",
+                    "reason": "zirv could not load sensitive-data literals; refusing prompt"
+                })
+            )?;
+            return Ok(0);
+        }
+    };
     options.mode = super::obfuscate::Mode::Flag;
     let mut vault = super::obfuscate::Vault::default();
     let (_, findings) =
@@ -3030,7 +3054,31 @@ fn withhold_strings(value: &mut serde_json::Value) {
             *text = "[zirv withheld sensitive tool output: obfuscation vault unavailable]".into()
         }
         serde_json::Value::Array(values) => values.iter_mut().for_each(withhold_strings),
-        serde_json::Value::Object(values) => values.values_mut().for_each(withhold_strings),
+        serde_json::Value::Object(values) => {
+            let original = std::mem::take(values);
+            for (index, (_, mut value)) in original.into_iter().enumerate() {
+                withhold_strings(&mut value);
+                values.insert(format!("zirv_withheld_key_{index}"), value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn label_sensitive_json(value: &mut serde_json::Value, kinds: &str) {
+    let notice = format!("[zirv sensitive data detected: {kinds}]");
+    match value {
+        serde_json::Value::String(text) => {
+            text.push('\n');
+            text.push_str(&notice);
+        }
+        serde_json::Value::Array(values) => values.push(serde_json::Value::String(notice)),
+        serde_json::Value::Object(values) => {
+            values.insert(
+                "zirv_sensitive_data_notice".to_string(),
+                serde_json::Value::String(notice),
+            );
+        }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
@@ -3048,7 +3096,14 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
     if cfg.obfuscate.mode == super::config::ObfuscateMode::Off {
         return None;
     }
-    let options = hook_obfuscation_options(&cfg);
+    let options = match hook_obfuscation_options(&cfg) {
+        Ok(options) => options,
+        Err(_) => {
+            let mut response = original;
+            withhold_strings(&mut response);
+            return Some(response);
+        }
+    };
     let mut response = original.clone();
     let findings = match StateDir::resolve(env) {
         Ok(state) => super::obfuscate_store::obfuscate_json(
@@ -3077,14 +3132,17 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
             return None;
         }
     };
-    if findings.iter().any(|finding| finding.replaced) && response != original {
+    if !findings.is_empty() {
+        let detail = finding_kinds(&findings);
+        if !findings.iter().any(|finding| finding.replaced) {
+            label_sensitive_json(&mut response, &detail);
+        }
         raw["tool_response"] = response.clone();
         if let Ok(state) = StateDir::resolve(env) {
             let session = raw
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            let detail = finding_kinds(&findings);
             let _ = log::append(
                 &state,
                 &log::Decision {
@@ -3099,7 +3157,9 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
                 },
             );
         }
-        return Some(response);
+        if response != original {
+            return Some(response);
+        }
     }
     None
 }
@@ -3521,6 +3581,9 @@ fn run_pretool_with_rehydration<W: Write>(
     let Some(original_input) = raw.get("tool_input").cloned() else {
         return run_pretool(w, stdin, env);
     };
+    if shared_placeholder_artifact(&raw, &cwd) {
+        return run_pretool(w, stdin, env);
+    }
     let had_placeholder = super::obfuscate::contains_placeholder(&original_input.to_string());
     let Ok(state) = StateDir::resolve(env) else {
         if had_placeholder {
@@ -3539,6 +3602,21 @@ fn run_pretool_with_rehydration<W: Write>(
     if let Err(error) = super::obfuscate_store::rehydrate_json(state.root(), &cwd, &mut rehydrated)
     {
         if had_placeholder {
+            let session =
+                env(super::adapters::SESSION_ENV).unwrap_or_else(|| "unknown".to_string());
+            let _ = super::log::append(
+                &state,
+                &super::log::Decision {
+                    ts: super::state::now_secs(),
+                    session: &session,
+                    verb: "pretool",
+                    verdict: "blocked",
+                    score: 0,
+                    action: "obfuscate-rehydration-miss",
+                    detail: "placeholder could not be resolved locally",
+                    observed_at: None,
+                },
+            );
             let _ = writeln!(
                 w,
                 "{}",
@@ -3593,6 +3671,24 @@ fn run_pretool_with_rehydration<W: Write>(
     envelope["hookSpecificOutput"]["updatedInput"] = rehydrated;
     let _ = writeln!(w, "{envelope}");
     Ok(code)
+}
+
+fn shared_placeholder_artifact(payload: &serde_json::Value, cwd: &Path) -> bool {
+    let tool = payload
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+        return false;
+    }
+    let Some(input) = payload.get("tool_input") else {
+        return false;
+    };
+    ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
+        .map(Path::new)
+        .any(|path| super::obfuscate_store::is_shared_placeholder_path(cwd, path))
 }
 
 /// `posttool`'s own body for every agent. `None`/`Some("claude")` is the

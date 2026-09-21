@@ -330,7 +330,7 @@ fn candidates(text: &str, options: &Options) -> Vec<Candidate> {
             }
         }
     }
-    if let Ok(regex) = Regex::new(r"(?:\b\d[ -]?){12,18}\d\b") {
+    if let Ok(regex) = Regex::new(r"\b\d(?:[ -]?\d){11,17}\d\b") {
         for matched in regex.find_iter(text) {
             if valid_card(matched.as_str()) {
                 found.push(candidate(
@@ -643,15 +643,20 @@ mod tests {
     #[test]
     fn flag_and_off_modes_preserve_bytes() {
         let source = "jane@company.dk";
-        let mut flag = Options::default();
-        flag.mode = Mode::Flag;
+        let flag = Options {
+            mode: Mode::Flag,
+            ..Options::default()
+        };
         let mut vault = Vault::default();
         let (flagged, findings) = obfuscate(source, &mut vault, &flag, "prompt");
         assert_eq!(flagged, source);
         assert_eq!(findings.len(), 1);
         assert!(!findings[0].replaced);
-        flag.mode = Mode::Off;
-        let (off, findings) = obfuscate(source, &mut vault, &flag, "prompt");
+        let off_options = Options {
+            mode: Mode::Off,
+            ..Options::default()
+        };
+        let (off, findings) = obfuscate(source, &mut vault, &off_options, "prompt");
         assert_eq!(off, source);
         assert!(findings.is_empty());
     }

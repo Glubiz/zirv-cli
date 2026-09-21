@@ -4214,6 +4214,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["obfuscate", "entropy"], "ZIRV_CTX_OBFUSCATE_ENTROPY"),
     (&["obfuscate", "prompt"], "ZIRV_CTX_OBFUSCATE_PROMPT"),
     (&["obfuscate", "allow"], "~/.zirv/ctx.toml only"),
+    (&["obfuscate", "literals_file"], "~/.zirv/ctx.toml only"),
     // A repository may request `mask` below, but never force the operator's
     // `mask` back to `keep`. `load` lifts and folds this key separately.
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),

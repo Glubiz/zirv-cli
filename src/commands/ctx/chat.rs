@@ -206,7 +206,13 @@ fn orchestrator_initial_prompt(
     let base = initial_prompt.unwrap_or_default();
     let text =
         super::prompt::task_prompt_with_composed_fallback(&base, false, compiled.composed.as_ref());
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        super::obfuscate_store::protect_text(state, repo, cfg, &text, "chat_initial_prompt")
+            .ok()
+            .map(|protected| protected.0)
+    }
 }
 
 /// The explicit `--agent`, else the configured default, else the registry's
@@ -1250,7 +1256,7 @@ pub(crate) fn dash_orchestrator_pane(
     // Issue #537 (T2a): the harness proxy's own bounded layer, when an
     // active decision took over this launch -- a no-op otherwise.
     let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
-    let (mut argv, composed) = super::prompt::merge_command_line_prompt(
+    let (mut argv, mut composed) = super::prompt::merge_command_line_prompt(
         adapter,
         &launch.argv,
         compiled.composed,
@@ -1258,6 +1264,13 @@ pub(crate) fn dash_orchestrator_pane(
         launch.role,
         &cfg.prompt,
     );
+    composed = super::obfuscate_store::protect_composed(
+        state,
+        repo,
+        cfg,
+        composed,
+        "chat_orchestrator_prompt",
+    )?;
     let prompt_args = super::prompt::injection_args_for_session(
         adapter,
         &argv,

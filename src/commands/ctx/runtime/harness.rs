@@ -126,9 +126,17 @@ impl RuntimeBackend for HarnessBackend {
 
     fn start(&mut self, spec: &SessionSpec) -> CtxResult<SessionHandle> {
         let session_id = SessionId::new_v4();
+        let env = super::super::config::env_from_process();
+        let prompt = super::super::obfuscate_store::protect_text_with_env(
+            &spec.cwd,
+            &spec.prompt,
+            "harness_session_prompt",
+            &env,
+        )?
+        .0;
         let mut command = self
             .adapter
-            .headless_cmd(&spec.prompt, &session_id, &spec.extra_args);
+            .headless_cmd(&prompt, &session_id, &spec.extra_args);
         command.current_dir(&spec.cwd);
         let (child, _tap, guard) = supervise::spawn_tapped(command, None)?;
         let logical_id = session_id.as_str().to_string();

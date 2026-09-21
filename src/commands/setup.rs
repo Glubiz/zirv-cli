@@ -40,6 +40,12 @@ pub(crate) const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
     "zirv ctx safety check",
 );
 
+pub(crate) const CLAUDE_REHYDRATE_HOOK: (&str, Option<&str>, &str) = (
+    "PreToolUse",
+    Some("Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"),
+    "zirv ctx hook pretool",
+);
+
 /// Issue #244's handoff-reinjection hook, matched on `source` values
 /// `resume|clear`. Claude-only, same reasoning as `CLAUDE_SAFETY_HOOK`
 /// above: codex has no verified `SessionStart` event at all (see
@@ -87,8 +93,9 @@ pub(crate) const CLAUDE_PERMISSION_DENIED_HOOK: (&str, Option<&str>, &str) =
 
 /// Every claude-only hook (`install_claude_integration`), never wired into
 /// `install_codex_hooks`.
-pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 5] = [
+pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 6] = [
     CLAUDE_SAFETY_HOOK,
+    CLAUDE_REHYDRATE_HOOK,
     CLAUDE_SESSION_START_HOOK,
     CLAUDE_COMPACT_OUTPUT_HOOK,
     CLAUDE_PERMISSION_REQUEST_HOOK,

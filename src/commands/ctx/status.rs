@@ -1358,6 +1358,17 @@ fn render_report<W: Write>(
         Ok(cfg) => {
             writeln!(w, "\n{}", describe_chat(cfg, colour))?;
             writeln!(w, "{}", describe_proxy(cfg, state.root(), repo, colour))?;
+            if let Some(summary) = super::obfuscate_store::summary(state.root(), repo) {
+                let misses = log::read_recent_decisions(&state)
+                    .iter()
+                    .filter(|row| row.action == "obfuscate-rehydration-miss")
+                    .count();
+                writeln!(
+                    w,
+                    "obfuscation: {} values / {} kinds · rehydration misses {}",
+                    summary.values, summary.kinds, misses
+                )?;
+            }
             for layer in &cfg.unparsable_layers {
                 writeln!(
                     w,

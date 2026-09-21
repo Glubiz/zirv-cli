@@ -1721,6 +1721,12 @@ fn launch_settings_value(
                     "command": "zirv ctx safety check"
                 }]
             }, {
+                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook pretool"
+                }]
+            }, {
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
                 "hooks": [{
                     "type": "command",

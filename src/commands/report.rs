@@ -403,7 +403,15 @@ fn run_with<W: Write>(
         writeln!(writer, "{}", path.display())?;
         return Ok(0);
     }
-    let request = request_for(&cli.verb, env)?;
+    let mut request = request_for(&cli.verb, env)?;
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    request.body = crate::commands::ctx::obfuscate_store::protect_text_with_env(
+        &repo,
+        &request.body,
+        "github_report_body",
+        env,
+    )?
+    .0;
     let token = resolve_token(home, env, cli_token)?;
     let url = issue_creator(&token, &request)?;
     writeln!(writer, "{url}")?;
