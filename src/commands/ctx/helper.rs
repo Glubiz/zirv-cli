@@ -558,6 +558,8 @@ mod tests {
                 phase: Default::default(),
                 visited: Vec::new(),
                 last_rollover_at: None,
+                rollover_failures: 0,
+                failed_rollover_observed_at: None,
                 pending: None,
                 displaced: None,
                 created_at: 1,

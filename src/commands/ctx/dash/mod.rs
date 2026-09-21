@@ -3891,6 +3891,12 @@ struct PaneSuccessorLauncher<'a> {
 }
 
 impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
+    fn defers_settlement(&self) -> bool {
+        self.req.generation.is_some()
+            && !self.pane.is_native()
+            && self.req.successor_runtime() == super::runtime::RuntimeKind::Harness
+    }
+
     fn launch(
         &mut self,
         plan: &super::rollover_runtime::SuccessorPlan,
@@ -4023,7 +4029,17 @@ fn handover_pane(
 ) -> bool {
     let (old_agent_name, context_session) = match context {
         Some((agent, session)) => (agent.to_string(), session.to_string()),
-        None => (pane.agent().to_string(), pane.session_id().to_string()),
+        None => {
+            let conversation = sessions::native_conversation(
+                state,
+                pane.short(),
+                pane.agent(),
+                pane.session_id(),
+                runtime::RuntimeKind::Harness,
+            )
+            .unwrap_or_else(|| pane.session_id().to_string());
+            (pane.agent().to_string(), conversation)
+        }
     };
     let Ok(old_adapter) = adapters::select(Some(&old_agent_name), &[], cfg) else {
         let reason = format!("could not resolve the outgoing agent '{old_agent_name}'");
@@ -4046,6 +4062,22 @@ fn handover_pane(
     });
     let jsonl = std::fs::read_to_string(&transcript_path).unwrap_or_default();
     let ctx = old_adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+    if let Some(generation) = req.generation
+        && ctx.user_messages.is_empty()
+        && !pane.is_native()
+    {
+        let reason = "no user task found in the source transcript; original session retained";
+        super::rollover::fail(
+            state,
+            "dash",
+            pane.short(),
+            generation,
+            reason,
+            super::state::now_secs(),
+        );
+        push_error(errors, format!("handover: {reason}"));
+        return false;
+    }
     let distiller_model =
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), old_adapter.as_ref());
     let previous = handoff::latest_for_repo(state, repo)
@@ -4237,6 +4269,28 @@ fn settle_pending_rollover(
         *pending = None;
         return;
     };
+    if pane.has_pending_handover() {
+        let (readiness, reason) = pane.poll_handover(Duration::from_secs(cfg.handoff.timeout_secs));
+        let now = super::state::now_secs();
+        match readiness {
+            super::rollover::Readiness::Waiting => return,
+            super::rollover::Readiness::Ready => {
+                if let Err(error) = pane.commit_handover(repo, generation) {
+                    push_error(errors, format!("rollover failed: {error}"));
+                }
+            }
+            super::rollover::Readiness::Dead | super::rollover::Readiness::TimedOut => {
+                pane.cancel_handover();
+                super::rollover::fail(state, "dash", &short, generation, &reason, now);
+                push_error(
+                    errors,
+                    format!("rollover failed -- original session kept running: {reason}"),
+                );
+            }
+        }
+        *pending = None;
+        return;
+    }
     let pane_state = pane.state();
     let readiness = super::rollover::successor_readiness(
         !matches!(pane_state, PaneState::Ended(_)),
@@ -25151,7 +25205,8 @@ mod tests {
         );
 
         let codex = super::super::adapters::codex::CodexAdapter::new(None)
-            .with_on_request_approval_forced(true);
+            .with_on_request_approval_forced(true)
+            .with_auto_review_forced(false);
         let codex_extra = worker_pane_extra_args(
             &req,
             &cfg,

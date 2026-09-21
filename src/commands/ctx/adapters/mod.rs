@@ -5106,6 +5106,7 @@ mod tests {
 
         let codex = codex::CodexAdapter::new(None)
             .with_on_request_approval_forced(true)
+            .with_auto_review_forced(false)
             .with_exec_ask_for_approval_forced(true);
         let interactive = policy_launch_args(&cfg, &codex, &[], LaunchMode::Interactive);
         let headless = policy_launch_args(&cfg, &codex, &[], LaunchMode::Headless);

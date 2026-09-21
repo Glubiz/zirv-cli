@@ -1122,6 +1122,50 @@ fn resolve_rollout(sessions_root: &Path, started_ms: u64, cwd: &Path) -> Option<
     candidates.into_iter().next().map(|(_, _, path)| path)
 }
 
+/// Readiness for a staged successor. A quiet TUI may be a login or trust
+/// prompt, so require an actual completed assistant reply from its new rollout.
+/// Do not read or overwrite the source seat's transcript pin.
+pub(crate) fn successor_answered(
+    cwd: &Path,
+    started_ms: u64,
+    receipt: &str,
+    pinned: &mut Option<PathBuf>,
+) -> bool {
+    let adapter = CodexAdapter::new(None);
+    let answered = |path: &Path| {
+        let Some(jsonl) = std::fs::File::open(path).ok().and_then(|file| {
+            let mut text = String::new();
+            file.take(1024 * 1024)
+                .read_to_string(&mut text)
+                .ok()
+                .map(|_| text)
+        }) else {
+            return false;
+        };
+        adapter.parse_events(&jsonl).iter().any(|event| {
+            matches!(event, NormalizedEvent::AssistantFinal { text, .. } if text.contains(receipt))
+        })
+    };
+    if let Some(path) = pinned {
+        return answered(path);
+    }
+    let root = adapter.home_dir().join(".codex/sessions");
+    let mut files = Vec::new();
+    collect_rollouts(&root, &mut files);
+    // Concurrent dashboards can start Codex in the same directory. Only the
+    // reply echoing this transaction's receipt can establish readiness.
+    for path in files {
+        if rollout_session_meta(&path).is_some_and(|(started, recorded, _)| {
+            started >= started_ms && recorded.is_some_and(|recorded| Path::new(&recorded) == cwd)
+        }) && answered(&path)
+        {
+            *pinned = Some(path);
+            return true;
+        }
+    }
+    false
+}
+
 /// `value` rendered as a quoted TOML string, for embedding inside a `-c
 /// key=["..."]`-style config-override argv token (`extra_writable_root_
 /// args`, `approval_suppression_args`'s sibling for path values rather than
@@ -1647,7 +1691,7 @@ impl AgentAdapter for CodexAdapter {
              are also denied, which is what actually makes this hold";
         // 2026-08-24: the interactive posture pins `--ask-for-approval
         // on-request` when the installed binary's own `--help` documents it,
-        // plus `--approve-for-me` when independently advertised.
+        // or its `--approve-for-me` preset when independently advertised.
         // Degraded, never Enforced, and the wording has to carry two facts an
         // operator would otherwise assume wrongly: what actually contains the
         // damage here is the SANDBOX, not a command classifier; and codex
@@ -1657,7 +1701,8 @@ impl AgentAdapter for CodexAdapter {
         // harness the way they are onto claude.
         const APPROVAL_ASK_INTERACTIVE: &str = "-a, --ask-for-approval on-request paired with --sandbox workspace-write, probed \
              live against the installed codex-cli's own --help before it is used; when separately \
-             advertised, --approve-for-me routes those boundary requests through codex's native \
+             advertised, the standalone --approve-for-me preset supplies that sandbox and routes \
+             boundary requests through codex's native \
              security reviewer: the sandbox is what contains damage, and codex has no per-command \
              mechanism to receive zirv's [safety] classification, so approval granularity here is \
              codex's own rather than zirv's";
@@ -1827,14 +1872,16 @@ impl AgentAdapter for CodexAdapter {
         } else {
             "never"
         };
+        // This preset already selects workspace-write and automatic approval
+        // review. Codex rejects either explicit policy flag alongside it (#710).
+        if interactive_approval && self.auto_review_supported() {
+            return vec!["--approve-for-me".to_string()];
+        }
         let mut args = vec!["--sandbox".to_string(), "workspace-write".to_string()];
         // ISSUE #134: `--ask-for-approval` (or its `-c approval_policy=`
         // fallback on an unsupporting `codex exec`) via the shared helper --
         // see `approval_suppression_args`'s own doc comment.
         args.extend(self.approval_suppression_args(mode, approval));
-        if interactive_approval && self.auto_review_supported() {
-            args.push("--approve-for-me".to_string());
-        }
         args
     }
 
@@ -4053,19 +4100,58 @@ mod tests {
             &Default::default(),
             super::super::LaunchMode::Interactive,
         );
-        assert_eq!(
-            args,
-            vec![
-                "--sandbox".to_string(),
-                "workspace-write".to_string(),
-                "--ask-for-approval".to_string(),
-                "on-request".to_string(),
-                "--approve-for-me".to_string(),
-            ]
-        );
+        assert_eq!(args, vec!["--approve-for-me".to_string()]);
         assert!(
             !args.iter().any(|a| a == "untrusted"),
             "untrusted is the noisy polarity this task exists to avoid: {args:?}"
+        );
+    }
+
+    /// Codex 0.155.1's clap conflicts, verified without --help (help exits
+    /// before clap validates conflicts). Exercise the launch-policy seam used
+    /// by resolve_swap_launch, not only the adapter's individual flags.
+    #[test]
+    fn rollover_argv_obeys_codex_cli_policy_conflicts() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[arg(long, conflicts_with = "approve_for_me")]
+            sandbox: Option<String>,
+            #[arg(long, conflicts_with = "approve_for_me")]
+            ask_for_approval: Option<String>,
+            #[arg(long)]
+            approve_for_me: bool,
+            prompt: Option<String>,
+        }
+        for supported in [false, true] {
+            let adapter = CodexAdapter::new(None)
+                .with_on_request_approval_forced(true)
+                .with_auto_review_forced(supported);
+            let extra = super::super::policy_launch_args(
+                &Default::default(),
+                &adapter,
+                &[],
+                super::super::LaunchMode::Interactive,
+            );
+            let command = adapter.interactive_cmd(Some("Acknowledge the handoff only."), &extra);
+            let argv = std::iter::once(std::ffi::OsString::from("codex"))
+                .chain(command.get_args().map(std::ffi::OsStr::to_os_string));
+            let parsed = Cli::try_parse_from(argv)
+                .expect("successor argv must pass Codex's conflict checks");
+            assert_eq!(parsed.approve_for_me, supported);
+        }
+        assert!(
+            Cli::try_parse_from(["codex", "--approve-for-me", "--sandbox", "workspace-write"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "codex",
+                "--approve-for-me",
+                "--ask-for-approval",
+                "on-request"
+            ])
+            .is_err()
         );
     }
 
@@ -4160,13 +4246,17 @@ mod tests {
     /// is present and the sandbox is never removed, exactly the assertion
     /// shape this test's own name promises: safe without the forcing seam.
     #[test]
-    fn every_codex_posture_keeps_the_explicit_workspace_sandbox_pair() {
+    fn every_codex_posture_keeps_the_workspace_sandbox_without_conflicting_flags() {
         let adapter = CodexAdapter::new(None);
         for mode in [
             super::super::LaunchMode::Interactive,
             super::super::LaunchMode::Headless,
         ] {
             let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            if args == ["--approve-for-me"] {
+                assert!(mode.is_interactive());
+                continue;
+            }
             assert!(args.len() >= 4, "got {args:?}");
             assert_eq!(
                 &args[0..2],

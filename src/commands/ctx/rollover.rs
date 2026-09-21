@@ -440,6 +440,15 @@ pub fn evaluate(
     let source_headroom_pct =
         fresh.and_then(|_| source.and_then(|p| allocator::projected_headroom(p, cfg, 0)));
     let source_observed_at = fresh.map(|window| window.observed_at).unwrap_or(now);
+    if seat::failure_backoff_active(
+        &current,
+        cfg,
+        now,
+        source_observed_at,
+        fresh.map(|window| window.resets_at),
+    ) {
+        return Evaluation::Skip("failed rollover backoff; original session retained".to_string());
+    }
     let source_hard_blocked =
         confirmed_block.is_some() || (fresh.is_some() && source.is_some_and(|p| p.hard_refused));
     // Issue #455 (finding 5): deliberately NARROWER than
@@ -2055,17 +2064,14 @@ mod tests {
         assert!(
             matches!(
                 evaluate_now(&state, &cfg, true, blocked),
-                Evaluation::Park { .. }
+                Evaluation::Skip(reason) if reason.contains("backoff")
             ),
-            "the only candidate already failed against this evidence, so the seat parks"
+            "the failed attempt retains the source and waits for backoff plus new evidence"
         );
-        // Issue #440's second contract: a handover that could not complete
-        // leaves the source waiting out its own window, never torn down.
         let seat = seat::load(&state, SHORT).expect("seat");
-        let seat::Phase::Parked { until, .. } = seat.phase else {
-            panic!("the source must be parked until its limit resets, got {seat:?}");
-        };
-        assert_eq!(until, NOW + 3_600);
+        assert_eq!(seat.phase, seat::Phase::Idle);
+        assert_eq!(seat.rollover_failures, 1);
+        assert_eq!(seat.last_rollover_at, Some(NOW));
         assert_eq!(seat.agent, "claude", "the source still holds its own seat");
     }
 
