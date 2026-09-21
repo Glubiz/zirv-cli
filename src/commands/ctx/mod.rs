@@ -81,6 +81,7 @@ pub mod prompt;
 pub mod provider;
 pub mod provider_cmd;
 pub mod proxy;
+pub mod reconcile;
 pub mod reservation;
 pub mod result_schema;
 pub mod resume;
@@ -633,6 +634,12 @@ pub enum CtxVerb {
     /// worktrees (issue #319): proof-required reclaim, so nothing is ever
     /// removed without affirmative evidence it carries no unrecoverable work.
     Worktree(worktree::WorktreeArgs),
+    /// One level-triggered pass over every opportunistic sweep this crate
+    /// already runs (stuck task claims, dead-owner permits/reservations,
+    /// worktree GC) plus the one resource with no automatic reclaim at all,
+    /// an abandoned work group (issue #720). `--dry-run` mutates nothing;
+    /// `--json` prints one object per resource kind.
+    Reconcile(reconcile::ReconcileArgs),
     /// Durable task cards for delegated work: create/list/show/claim/
     /// heartbeat/complete/block/unblock/comment/archive (issue #317).
     Task(task::TaskArgs),
@@ -816,6 +823,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
         CtxVerb::Search(a) => search::run(a, &mut out),
         CtxVerb::Worktree(a) => worktree::run(a, &mut out),
+        CtxVerb::Reconcile(a) => reconcile::run(a, &mut out),
         CtxVerb::Task(a) => task::run(a, &mut out),
         CtxVerb::Swarm(a) => task::run_swarm(a, &mut out),
         CtxVerb::Measure(a) => measure::run(a, &mut out),
@@ -1333,6 +1341,31 @@ mod tests {
                 assert_eq!(a.workers, 3);
             }
             other => panic!("expected Swarm, got {other:?}"),
+        }
+    }
+
+    /// Issue #720: `zirv ctx reconcile` parses with `--dry-run`/`--json`
+    /// both unset by default, and with both flags together.
+    #[test]
+    fn reconcile_verb_parses_with_and_without_its_flags() {
+        let cli =
+            CtxCli::try_parse_from(["zirv ctx", "reconcile"]).expect("reconcile should parse");
+        match cli.verb {
+            CtxVerb::Reconcile(a) => {
+                assert!(!a.dry_run);
+                assert!(!a.json);
+            }
+            other => panic!("expected Reconcile, got {other:?}"),
+        }
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "reconcile", "--dry-run", "--json"])
+            .expect("reconcile --dry-run --json should parse");
+        match cli.verb {
+            CtxVerb::Reconcile(a) => {
+                assert!(a.dry_run);
+                assert!(a.json);
+            }
+            other => panic!("expected Reconcile, got {other:?}"),
         }
     }
 

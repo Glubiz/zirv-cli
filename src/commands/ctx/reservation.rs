@@ -140,7 +140,7 @@ fn save(state: &StateDir, provider: &str, ledger: &Ledger) -> CtxResult<()> {
 /// reservation outstanding forever. `sessions::record_is_alive`'s own
 /// comparison is reused rather than reimplemented, so the tolerance stays
 /// one constant.
-fn is_owner_alive(entry: &Reservation) -> bool {
+pub(crate) fn is_owner_alive(entry: &Reservation) -> bool {
     owner_is_alive_with(entry, sessions::process_start_secs(entry.pid))
 }
 
@@ -336,11 +336,52 @@ pub fn active_count(state: &StateDir, provider: &str) -> u32 {
 /// Every reservation currently on disk for `provider`, unfiltered by
 /// liveness -- for `status`-style callers that want to show a dead-owner
 /// entry too (an operator diagnosing why a slot has not yet freed) rather
-/// than only the subset [`outstanding`] counts. Not yet called from any
-/// non-test code, the same forward-declared shape as [`outstanding`].
-#[allow(dead_code)]
+/// than only the subset [`outstanding`] counts.
 pub fn entries(state: &StateDir, provider: &str) -> Vec<Reservation> {
     load(state, provider).entries
+}
+
+/// Every provider this machine currently has a ledger file for, named by the
+/// slug its filename already carries. Issue #720 (the state-reconcile pass):
+/// every other function here takes one caller-known `provider` at a time;
+/// this is the one place that needs to walk all of them in a single sweep. A
+/// missing reservations directory reads as "no providers", the same as a
+/// missing ledger already reads as an empty one ([`load`]'s own doc comment).
+pub(crate) fn known_providers(state: &StateDir) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(state.reservations()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            path.file_stem().map(|s| s.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// Issue #720 (the state-reconcile pass): prunes every dead-owner entry from
+/// `provider`'s ledger under the SAME lock every mutation above already
+/// takes, reusing [`is_owner_alive`]'s own decision and [`prune_dead`]'s own
+/// removal -- no new liveness rule. Returns the reservations that were
+/// actually removed (empty, and nothing written, when none were dead).
+pub(crate) fn prune_dead_locked(state: &StateDir, provider: &str) -> CtxResult<Vec<Reservation>> {
+    let _lock = lock_ledger(state, provider)?;
+    let mut ledger = load(state, provider);
+    let dead: Vec<Reservation> = ledger
+        .entries
+        .iter()
+        .filter(|entry| !is_owner_alive(entry))
+        .cloned()
+        .collect();
+    if !dead.is_empty() {
+        prune_dead(&mut ledger);
+        save(state, provider, &ledger)?;
+    }
+    Ok(dead)
 }
 
 #[cfg(test)]
@@ -475,6 +516,70 @@ mod tests {
         let remaining = entries(&state, "claude");
         assert_eq!(remaining.len(), 1, "the dead entry is gone after a write");
         assert_eq!(remaining[0].session, "sess-live");
+    }
+
+    /// Issue #720 acceptance: `prune_dead_locked` frees a dead-owner
+    /// reservation with no pending `reserve`/`settle`/`release` call against
+    /// it -- unlike the test above, nothing else ever touches this ledger --
+    /// while a reservation whose owner is genuinely alive is left completely
+    /// untouched.
+    #[test]
+    fn prune_dead_locked_frees_a_dead_owner_reservation_and_leaves_a_live_one_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dead_pid = super::super::testenv::dead_pid();
+        let live_pid = std::process::id();
+
+        {
+            let _lock = lock_ledger(&state, "claude").expect("lock");
+            let mut ledger = load(&state, "claude");
+            ledger.entries.push(Reservation {
+                id: "dead-1".to_string(),
+                session: "sess-dead".to_string(),
+                pid: dead_pid,
+                pid_start_time: None,
+                tokens: 9_999,
+                created_at: 1_700_000_000,
+            });
+            ledger.entries.push(Reservation {
+                id: "live-1".to_string(),
+                session: "sess-live".to_string(),
+                pid: live_pid,
+                pid_start_time: None,
+                tokens: 10,
+                created_at: 1_700_000_000,
+            });
+            save(&state, "claude", &ledger).expect("seed both entries");
+        }
+
+        let freed = prune_dead_locked(&state, "claude").expect("prune_dead_locked io");
+        assert_eq!(freed.len(), 1);
+        assert_eq!(freed[0].id, "dead-1");
+
+        let remaining = entries(&state, "claude");
+        assert_eq!(remaining.len(), 1, "only the dead owner's entry is removed");
+        assert_eq!(remaining[0].id, "live-1");
+
+        // Idempotent: nothing left to free on a second pass.
+        assert!(
+            prune_dead_locked(&state, "claude")
+                .expect("second pass io")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn known_providers_names_every_ledger_file_on_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(known_providers(&state).is_empty(), "nothing reserved yet");
+
+        reserve(&state, "claude", "sess-a", 10, 1_700_000_000).expect("reserve claude");
+        reserve(&state, "codex", "sess-b", 20, 1_700_000_000).expect("reserve codex");
+
+        let mut providers = known_providers(&state);
+        providers.sort();
+        assert_eq!(providers, vec!["claude".to_string(), "codex".to_string()]);
     }
 
     #[test]
