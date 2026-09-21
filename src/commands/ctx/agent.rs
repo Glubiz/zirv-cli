@@ -3662,11 +3662,10 @@ fn adoption_enforcement_refusal(
     {
         return None;
     }
-    let kind = super::hook::classified_kind(repo);
     Some(format!(
         "zirv agent: held by workflow.adoption = enforce -- this session has done substantial \
          work ({} edit calls over {} turns) with no active zirv workflow. Start one first: zirv \
-         workflow start {kind} --task \"<summary>\"",
+         workflow start --task \"<summary>\"",
         record.edit_like_calls, record.turns
     ))
 }

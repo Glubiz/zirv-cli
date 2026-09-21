@@ -12,8 +12,10 @@ use super::state::{StateDir, now_secs, repo_slug};
 use super::supervise::Watcher;
 use super::{CtxResult, log, score, signal};
 use crate::commands::workflow::adoption::{self, AdoptionPolicy, AdoptionSignals};
+#[cfg(test)]
+use crate::commands::workflow::classify;
 use crate::commands::workflow::skill::WorkflowPhase;
-use crate::commands::workflow::{classify, engine, telemetry, verification};
+use crate::commands::workflow::{engine, telemetry, verification};
 
 #[derive(Debug, clap::Args)]
 pub struct HookArgs {
@@ -1044,29 +1046,6 @@ fn fold_adoption_delta(
     record.consumed = consumed;
 }
 
-/// The workflow kind named in a nudge's `zirv workflow start <kind>`, from
-/// the same git-diff classifier `zirv workflow classify` runs -- only ever
-/// called once a nudge is actually due, since it shells out to `git`. Any
-/// failure (no git, no diff, classification error) falls back to `feature`.
-///
-/// `pub(crate)`: also used by `agent::run_with`'s enforce-policy refusal
-/// message (issue #223 §E), which names the same kind for the same reason.
-pub(crate) fn classified_kind(repo: &Path) -> String {
-    classify::git_change_input(repo, String::new())
-        .and_then(|input| classify::classify(&input))
-        .map(|classification| {
-            match classification.intent {
-                classify::Intent::Bugfix => "bugfix",
-                classify::Intent::Refactor => "refactor",
-                classify::Intent::Spike => "spike",
-                classify::Intent::Review => "review",
-                classify::Intent::Feature | classify::Intent::Other => "feature",
-            }
-            .to_string()
-        })
-        .unwrap_or_else(|_| "feature".to_string())
-}
-
 /// Workflow-adoption detection and Stop-hook nudge text, in one pass.
 /// `None` whenever nothing should be added to the hook's own output -- the
 /// policy is `off`, this session is a delegated worker, or no nudge is due --
@@ -1151,11 +1130,7 @@ fn adoption_stop_nudge(
     };
     let text = due.then(|| {
         record.last_nudged_turn = Some(record.turns);
-        adoption::nudge_text(
-            &signals,
-            Some(&classified_kind(repo)),
-            cfg.workflow.adoption,
-        )
+        adoption::nudge_text(&signals, cfg.workflow.adoption)
     });
 
     save_adoption_record(&path, &record);
@@ -3546,11 +3521,7 @@ fn prompt_adoption_nudge(repo: &Path, cfg: &CtxConfig, env: EnvLookup<'_>) -> Op
         edit_like_calls: record.edit_like_calls,
         turns: record.turns,
     };
-    let text = adoption::nudge_text(
-        &signals,
-        Some(&classified_kind(repo)),
-        cfg.workflow.adoption,
-    );
+    let text = adoption::nudge_text(&signals, cfg.workflow.adoption);
     record.last_nudged_turn = Some(record.turns);
     save_adoption_record(&path, &record);
     Some(text)

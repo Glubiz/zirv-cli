@@ -1788,18 +1788,25 @@ own versioned built-ins may ever reach for it.
 **How a workflow is chosen.** `zirv workflow start` without an id runs
 `selection::select_definition` deterministically against the resolved
 classification and `--task` text -- no model call. A pack scores by matching
-`--task` text against its `triggers` (3 points each), a `domains` tag
-appearing in the task text (2 points), and the classified work-domain
-aligning with a `domains` entry (1 point); scores below a floor are dropped,
-and the highest-scoring survivor wins, ties broken toward fewer external
-effects and then alphabetically by id -- both the score and the tie-break are
-recorded in `Selection::reasons`/`alternatives` and printed alongside the
-started workflow (`--json` adds a `selection` object; `workflow classify
---json` adds the same field as a preview with no side effect). A legacy
-intent (`Feature`/`BugFix`/`Refactor`/`Spike`/`Review`) that classification
-already produces with high confidence selects that kind's pack outright,
-skipping scoring entirely, so the five pre-#542 workflows keep their exact
-historical selection behavior. Nothing above the floor selects
+`--task` text against its `triggers` (3 points each, as whole-word token
+sequences -- "retro" never matches inside "Retrofit", and the objective's
+token aligned with a trigger's last word may carry a trailing plural
+`s`/`es`), a `domains` tag appearing in the task text (2 points), and the
+classified work-domain aligning with a `domains` entry (1 point); scores
+below a floor are dropped, and the highest-scoring survivor wins, ties broken
+toward fewer external effects and then alphabetically by id -- both the score
+and the tie-break are recorded in `Selection::reasons`/`alternatives` and
+printed alongside the started workflow (`--json` adds a `selection` object;
+`workflow classify --json` adds the same field as a preview with no side
+effect). A legacy intent (`Feature`/`BugFix`/`Refactor`/`Spike`/`Review`)
+that classification already produces with high confidence selects that
+kind's pack by DEFAULT, skipping scoring entirely -- unless a more
+specialised pack actually matched one of its own trigger phrases in the task
+text AND declares `effects` compatible with that intent (`Feature`/`Bugfix`
+need `repository` or `external`, `Review` needs `none`, `Spike` accepts any
+effects, `Refactor` is never displaced), in which case the specialised pack
+replaces it and both packs are recorded in `reasons`/`alternatives`. Nothing
+above the floor selects
 `adaptive-work`, a small five-step (understand/plan/execute/validate/present)
 fallback pack with no domain/trigger tags of its own (so it never competes
 for another pack's task) that prunes itself down to three steps

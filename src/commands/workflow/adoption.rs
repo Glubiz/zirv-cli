@@ -122,9 +122,13 @@ pub fn nudge_due(
     }
 }
 
-/// The nudge message itself. `kind` is the classified workflow kind (`None`
-/// falls back to `"feature"`); under [`AdoptionPolicy::Enforce`] an extra
-/// sentence names the delegation gate this policy also applies
+/// The nudge message itself. There is no task text at the point a nudge
+/// fires, so it never guesses a workflow kind (workflow-trigger-
+/// determinism, replacing the old always-`feature`-in-practice
+/// `hook::classified_kind`): the printed command omits the id entirely --
+/// `zirv workflow start` with no id selects deterministically from the task
+/// once the operator supplies one. Under [`AdoptionPolicy::Enforce`] an
+/// extra sentence names the delegation gate this policy also applies
 /// (`ctx::agent::run_with`).
 ///
 /// Wrapper behaviour redesign (2026-09-01): the wording is now proportional
@@ -132,12 +136,11 @@ pub fn nudge_due(
 /// or carries real risk" and says outright that a bounded change may finish
 /// without one, rather than unconditionally telling the session to start one
 /// now. See `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
-pub fn nudge_text(signals: &AdoptionSignals, kind: Option<&str>, policy: AdoptionPolicy) -> String {
-    let kind = kind.unwrap_or("feature");
+pub fn nudge_text(signals: &AdoptionSignals, policy: AdoptionPolicy) -> String {
     let mut text = format!(
         "[zirv workflow] this has grown into substantial work ({} edit calls over {} turns) \
          with no active zirv workflow. If it spans several areas or carries real risk, start \
-         one now: zirv workflow start {kind} --task \"<summary>\". A bounded change may finish \
+         one now: zirv workflow start --task \"<summary>\". A bounded change may finish \
          without one.",
         signals.edit_like_calls, signals.turns
     );
@@ -273,26 +276,20 @@ mod tests {
         assert!(nudge_due(AdoptionPolicy::Nudge, true, false, 25, Some(12)));
     }
 
+    /// Workflow-trigger-determinism: the nudge names no kind (there is no
+    /// task text yet to classify one from) -- just the counts and an
+    /// id-less `zirv workflow start`, which selects deterministically once
+    /// the operator supplies `--task`.
     #[test]
-    fn nudge_text_names_the_kind_and_counts() {
+    fn nudge_text_names_no_kind_and_reports_the_counts() {
         let s = AdoptionSignals {
             edit_like_calls: 7,
             turns: 9,
         };
-        let text = nudge_text(&s, Some("bugfix"), AdoptionPolicy::Nudge);
+        let text = nudge_text(&s, AdoptionPolicy::Nudge);
         assert!(text.contains("7 edit calls over 9 turns"), "{text}");
-        assert!(text.contains("zirv workflow start bugfix"), "{text}");
+        assert!(text.contains("zirv workflow start --task"), "{text}");
         assert!(!text.contains("enforce"), "{text}");
-    }
-
-    #[test]
-    fn nudge_text_falls_back_to_feature_when_kind_is_unknown() {
-        let s = AdoptionSignals {
-            edit_like_calls: 5,
-            turns: 5,
-        };
-        let text = nudge_text(&s, None, AdoptionPolicy::Advise);
-        assert!(text.contains("zirv workflow start feature"), "{text}");
     }
 
     #[test]
@@ -330,7 +327,7 @@ mod tests {
             edit_like_calls: 5,
             turns: 5,
         };
-        let text = nudge_text(&s, Some("feature"), AdoptionPolicy::Enforce);
+        let text = nudge_text(&s, AdoptionPolicy::Enforce);
         assert!(text.contains("workflow.adoption = enforce"), "{text}");
         assert!(text.contains("zirv agent delegation is held"), "{text}");
     }
