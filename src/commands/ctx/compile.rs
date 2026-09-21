@@ -260,7 +260,7 @@ impl CompiledContext {
                 // memory, per its own doc comment). Trying all three and
                 // taking whichever literal search actually matches needs no
                 // verbosity threaded through `CompiledContext`: their
-                // distinct headers ("zirv meta-harness (v18)" vs.
+                // distinct headers ("zirv meta-harness (v19)" vs.
                 // "(standard)"/"(minimal)") mean at most one can ever be a
                 // substring of `text`.
                 PromptSource::Harness => [

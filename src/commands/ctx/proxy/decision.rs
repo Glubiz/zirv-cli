@@ -476,6 +476,7 @@ pub fn baseline(
     };
     apply_security_risk_floor(&mut decision);
     apply_orchestration_request_complexity_floor(&mut decision, request);
+    apply_explicit_workflow_request_floor(&mut decision, request, classification, roster);
     finalize_derived_fields(&mut decision, cfg);
     decision
 }
@@ -661,6 +662,156 @@ fn apply_orchestration_request_complexity_floor(decision: &mut ProxyDecision, re
         decision.validation.independent_test = true;
         decision.reasons.push(
             "complexity: raised to substantial because the request explicitly asks for parallel or delegated multi-agent work"
+                .to_string(),
+        );
+    }
+}
+
+/// Governing verb/preposition immediately before a bare "a workflow" --
+/// [`explicit_workflow_request`]'s no-id templates ("start a workflow",
+/// "use a workflow", "through a workflow", "with a workflow").
+const WORKFLOW_VERB_A: &[&str] = &["start", "use", "through", "with"];
+
+/// Governing verb + article immediately before a single id token and then
+/// "workflow" -- [`explicit_workflow_request`]'s id-bearing templates
+/// ("start the/a <id> workflow", "use the <id> workflow", "run the <id>
+/// workflow").
+const WORKFLOW_VERB_ARTICLE_ID: &[(&str, &str)] = &[
+    ("start", "the"),
+    ("start", "a"),
+    ("use", "the"),
+    ("run", "the"),
+];
+
+/// The same negation words [`phrase_is_asserted`] looks back for, plus
+/// "don" alongside "don't"/"dont": [`prose_words`] splits on an apostrophe,
+/// so a contracted negation arrives at [`explicit_workflow_request`] already
+/// split into two tokens.
+const TOKEN_NEGATION_WORDS: &[&str] = &[
+    "not", "don", "don't", "dont", "no", "never", "avoid", "without", "skip",
+];
+
+/// The token-level analog of [`phrase_is_asserted`]'s raw-text lookbehind --
+/// same word list, same [`NEGATION_LOOKBEHIND_WORDS`] distance, but over
+/// [`prose_words`] tokens rather than a byte offset, since
+/// [`explicit_workflow_request`]'s id-bearing templates have a
+/// variable-width slot a literal substring search can't express.
+fn tokens_negate_before(tokens: &[&str], before: usize) -> bool {
+    tokens[before.saturating_sub(NEGATION_LOOKBEHIND_WORDS)..before]
+        .iter()
+        .any(|word| TOKEN_NEGATION_WORDS.contains(word))
+}
+
+/// Whether `request_lower` (already lowercased) explicitly, assertively
+/// requests a workflow -- workflow-trigger-determinism item 2: a request
+/// verb/preposition directly governing the word "workflow", never a bare
+/// mention of the subsystem. `None` when no template matches at all, or the
+/// one that would have is negated ("do not start a workflow", "no workflow
+/// needed"); `Some(None)` when a no-id template matches ("start a
+/// workflow", "run this through a zirv workflow"); `Some(Some(word))` with
+/// the single word token found adjacent to "workflow" in an id-bearing
+/// template (`<id> workflow`, or `workflow start <id>`) -- that word need
+/// not itself be a registered pack id, only the token found there;
+/// [`apply_explicit_workflow_request_floor`] is what falls through to
+/// `selection::select_definition` when it isn't.
+///
+/// Deliberately narrow: "Explain how the workflow engine persists state",
+/// "Fix the bug in the workflow status command", and "Refactor the workflow
+/// registry loader" all mention "workflow" with no governing verb or
+/// preposition directly next to it, so none of them match anything here.
+fn explicit_workflow_request(request_lower: &str) -> Option<Option<String>> {
+    let tokens: Vec<&str> = prose_words(request_lower).collect();
+    for (i, &word) in tokens.iter().enumerate() {
+        if word != "workflow" {
+            continue;
+        }
+        // "<verb> a workflow" / "through a workflow" / "with a workflow".
+        if i >= 2
+            && WORKFLOW_VERB_A.contains(&tokens[i - 2])
+            && tokens[i - 1] == "a"
+            && !tokens_negate_before(&tokens, i - 2)
+        {
+            return Some(None);
+        }
+        // "<verb> the/a <id> workflow" -- the id is tokens[i - 1].
+        if i >= 3
+            && WORKFLOW_VERB_ARTICLE_ID.contains(&(tokens[i - 3], tokens[i - 2]))
+            && !tokens_negate_before(&tokens, i - 3)
+        {
+            return Some(Some(tokens[i - 1].to_string()));
+        }
+        // "run this through a zirv workflow".
+        if i >= 5
+            && tokens[i - 5..i] == ["run", "this", "through", "a", "zirv"]
+            && !tokens_negate_before(&tokens, i - 5)
+        {
+            return Some(None);
+        }
+        // Literal "zirv workflow start", optionally followed by an id
+        // ("workflow start <id>").
+        if i >= 1
+            && tokens[i - 1] == "zirv"
+            && tokens.get(i + 1) == Some(&"start")
+            && !tokens_negate_before(&tokens, i - 1)
+        {
+            return Some(tokens.get(i + 2).map(|id| (*id).to_string()));
+        }
+    }
+    None
+}
+
+/// The registered pack id an operator named adjacent to "workflow" in
+/// `request` (`<id> workflow`, or `workflow start <id>`), when
+/// [`explicit_workflow_request`] fires at all. `None` when the request
+/// doesn't assert an explicit workflow request, names no id in that slot,
+/// or names a word that isn't actually a registered pack id -- each of
+/// those is for [`apply_explicit_workflow_request_floor`] to fall through
+/// to `selection::select_definition` for, not this function's concern.
+fn explicit_registered_workflow_id(request: &str, roster: &Roster) -> Option<String> {
+    let registry = roster.registry.as_ref()?;
+    let named = explicit_workflow_request(&request.to_ascii_lowercase()).flatten()?;
+    registry.get(&named).ok().map(|_| named)
+}
+
+/// Workflow-trigger-determinism item 2: an operator who explicitly asks for
+/// a workflow gets one even when every model decider is off or unavailable
+/// -- `classify_request`'s deliberately text-only baseline (issue #537)
+/// otherwise classifies most such requests `Trivial`, and a `Trivial`
+/// baseline never sets `workflow` at all (see [`baseline`]'s own early
+/// `match classification.complexity`).
+///
+/// Fires only when [`explicit_workflow_request`] matches. When it does:
+/// `complexity` is raised to at least `Bounded` (never lowered) so
+/// [`apply_direct_execution_workflow_rule`] doesn't wipe the `workflow` this
+/// function is about to set right back out, and `workflow` becomes the
+/// REGISTERED pack id named adjacent to "workflow" when there is one
+/// (`explicit_registered_workflow_id`), else whatever
+/// `selection::select_definition` picks for the request text against
+/// `classification`. No registry at all in `roster` leaves `workflow`
+/// untouched either way. The one place this rule lives, called from the
+/// tail of both [`baseline`] and [`merge`], before
+/// [`finalize_derived_fields`] derives `execution` from the (possibly
+/// just-raised) `complexity`.
+fn apply_explicit_workflow_request_floor(
+    decision: &mut ProxyDecision,
+    request: &str,
+    classification: &Classification,
+    roster: &Roster,
+) {
+    let text = request.to_ascii_lowercase();
+    if explicit_workflow_request(&text).is_none() {
+        return;
+    }
+    if let Some(registry) = roster.registry.as_ref() {
+        let resolved = explicit_registered_workflow_id(request, roster).unwrap_or_else(|| {
+            selection::select_definition(classification, registry, request).definition_id
+        });
+        decision.workflow = Some(resolved);
+    }
+    if decision.complexity < Complexity::Bounded {
+        decision.complexity = Complexity::Bounded;
+        decision.reasons.push(
+            "complexity: raised to bounded because the request explicitly asks for a workflow"
                 .to_string(),
         );
     }
@@ -1144,6 +1295,7 @@ pub fn merge(
     request: &str,
     answers: &Answers,
     min_confidence: f32,
+    roster: &Roster,
 ) -> ProxyDecision {
     let min_margin = cfg.proxy.min_margin;
     let mut decision = baseline.clone();
@@ -1224,11 +1376,19 @@ pub fn merge(
         if !answer.decisive(min_confidence, min_margin) {
             record_not_decisive("workflow", answer, None);
         } else if let AnswerValue::Choice(value) = &answer.value {
-            decision.workflow = if value == "none" {
-                None
-            } else {
-                Some(value.clone())
-            };
+            // Workflow-trigger-determinism item 2: an operator-named,
+            // REGISTERED workflow id (baseline already carries it, via
+            // `apply_explicit_workflow_request_floor`) survives even a
+            // decisive model answer -- the operator said it in words. A
+            // baseline id `select_definition` merely guessed at is still
+            // fair game for a confident model answer to replace, as today.
+            if explicit_registered_workflow_id(request, roster).is_none() {
+                decision.workflow = if value == "none" {
+                    None
+                } else {
+                    Some(value.clone())
+                };
+            }
         }
     }
 
@@ -1292,6 +1452,12 @@ pub fn merge(
     decision.validation.security_review |= recomputed_validation.security_review;
     apply_security_risk_floor(&mut decision);
     apply_orchestration_request_complexity_floor(&mut decision, request);
+    apply_explicit_workflow_request_floor(
+        &mut decision,
+        request,
+        &recomputed_classification,
+        roster,
+    );
     finalize_derived_fields(&mut decision, cfg);
 
     decision
@@ -1408,6 +1574,17 @@ mod tests {
         }
     }
 
+    /// A `Roster` with no known harnesses and no loaded registry -- the
+    /// right fixture for any `merge` test that isn't itself exercising
+    /// registry-aware behaviour (`apply_explicit_workflow_request_floor`
+    /// and its merge-survival rule both no-op without a registry).
+    fn empty_roster() -> Roster {
+        Roster {
+            harnesses: Vec::new(),
+            registry: None,
+        }
+    }
+
     fn classification_with(risk: RiskBand, complexity: Complexity) -> Classification {
         Classification {
             intent: Intent::Feature,
@@ -1461,7 +1638,14 @@ mod tests {
         let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let ans = answers(&[("complexity", AnswerValue::Score(3.0), 0.9)]);
-        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "implement the feature",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(merged.complexity, Complexity::Architectural);
     }
 
@@ -1471,7 +1655,14 @@ mod tests {
         let mut baseline = sample_decision();
         baseline.complexity = Complexity::Substantial;
         let ans = answers(&[("complexity", AnswerValue::Score(0.0), 0.95)]);
-        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "implement the feature",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(
             merged.complexity,
             Complexity::Substantial,
@@ -1484,7 +1675,14 @@ mod tests {
         let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let ans = answers(&[("risk", AnswerValue::Score(3.0), 0.2)]);
-        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "implement the feature",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(merged.risk, baseline.risk);
         assert!(
             merged
@@ -1512,7 +1710,14 @@ mod tests {
                 ]),
             },
         );
-        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "implement the feature",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(merged.risk, RiskBand::Critical);
         assert!(
             merged
@@ -1553,6 +1758,7 @@ mod tests {
             "Do an exhaustive investigation of why some contacts received emails and sms one day too late on the ortto journey; check Kibana and the kafka topic",
             &ans,
             0.5,
+            &empty_roster(),
         );
         assert_eq!(merged.complexity, Complexity::Substantial);
         assert_eq!(merged.execution, ExecutionMode::Orchestrated);
@@ -1586,7 +1792,14 @@ mod tests {
                 ]),
             },
         )]);
-        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "implement the feature",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(merged.complexity, Complexity::Substantial);
         assert!(
             merged
@@ -1620,7 +1833,14 @@ mod tests {
                 ]),
             },
         )]);
-        let merged = merge(&cfg, &baseline, "implement the feature", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "implement the feature",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(merged.complexity, baseline.complexity);
         assert!(
             merged
@@ -1644,7 +1864,14 @@ mod tests {
             ("data", AnswerValue::Noul(0.8), 0.8),
             ("docs_only", AnswerValue::Noul(0.1), 0.9),
         ]);
-        let merged = merge(&cfg, &baseline, "rotate the shared token", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "rotate the shared token",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(
             merged.domains,
             vec!["security".to_string(), "data".to_string()]
@@ -1664,7 +1891,14 @@ mod tests {
         baseline.risk = RiskBand::Low;
         baseline.execution = ExecutionMode::Direct;
         let ans = answers(&[("security", AnswerValue::Noul(0.95), 0.95)]);
-        let merged = merge(&cfg, &baseline, "rotate the shared token", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "rotate the shared token",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(merged.domains, vec!["security".to_string()]);
         assert!(merged.validation.security_review);
         assert!(merged.validation.independent_review);
@@ -1686,7 +1920,14 @@ mod tests {
         baseline.risk = RiskBand::Low;
         baseline.execution = ExecutionMode::Direct;
         let ans = answers(&[("security", AnswerValue::Noul(0.55), 0.95)]);
-        let merged = merge(&cfg, &baseline, "rotate the shared token", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "rotate the shared token",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert!(merged.domains.is_empty(), "{:?}", merged.domains);
         assert!(!merged.validation.security_review);
         assert!(!merged.validation.independent_review);
@@ -1713,12 +1954,12 @@ mod tests {
         let cfg = CtxConfig::default();
         let baseline = sample_decision();
         let wide = answers(&[("needs_clarification", AnswerValue::Noul(0.9), 0.9)]);
-        let merged = merge(&cfg, &baseline, "a request", &wide, 0.5);
+        let merged = merge(&cfg, &baseline, "a request", &wide, 0.5, &empty_roster());
         assert_eq!(merged.needs_clarification, 0.9);
         assert!(merged.needs_clarification_decisive);
 
         let thin = answers(&[("needs_clarification", AnswerValue::Noul(0.52), 0.52)]);
-        let merged = merge(&cfg, &baseline, "a request", &thin, 0.5);
+        let merged = merge(&cfg, &baseline, "a request", &thin, 0.5, &empty_roster());
         assert_eq!(
             merged.needs_clarification, 0.52,
             "the raw value is kept regardless of decisiveness"
@@ -1742,7 +1983,7 @@ mod tests {
             AnswerValue::Choice("orchestrated".to_string()),
             0.99,
         )]);
-        let merged = merge(&cfg, &baseline, "fix the typo", &ans, 0.5);
+        let merged = merge(&cfg, &baseline, "fix the typo", &ans, 0.5, &empty_roster());
         assert_eq!(
             merged.execution,
             ExecutionMode::Direct,
@@ -1750,7 +1991,7 @@ mod tests {
         );
 
         let ans = answers(&[("complexity", AnswerValue::Score(3.0), 0.9)]);
-        let merged = merge(&cfg, &baseline, "fix the typo", &ans, 0.5);
+        let merged = merge(&cfg, &baseline, "fix the typo", &ans, 0.5, &empty_roster());
         assert_eq!(merged.complexity, Complexity::Architectural);
         assert_eq!(
             merged.execution,
@@ -1806,7 +2047,7 @@ mod tests {
                 Complexity::Architectural => 3.0,
             };
             let ans = answers(&[("complexity", AnswerValue::Score(index), 0.9)]);
-            let merged = merge(&cfg, &baseline, "a request", &ans, 0.5);
+            let merged = merge(&cfg, &baseline, "a request", &ans, 0.5, &empty_roster());
             assert_eq!(merged.complexity, complexity, "{complexity:?}: complexity");
             assert_eq!(merged.execution, execution, "{complexity:?}: execution");
             assert_eq!(merged.seat_tier, seat_tier, "{complexity:?}: seat_tier");
@@ -1853,7 +2094,14 @@ mod tests {
         baseline.execution = ExecutionMode::Direct;
         baseline.workflow = None;
         let ans = answers(&[("workflow", AnswerValue::Choice("feature".to_string()), 0.79)]);
-        let merged = merge(&cfg, &baseline, "change the background color", &ans, 0.5);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "change the background color",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
         assert_eq!(merged.complexity, Complexity::Trivial);
         assert_eq!(merged.execution, ExecutionMode::Direct);
         assert_eq!(merged.workflow, None, "{:?}", merged);
@@ -1957,6 +2205,7 @@ mod tests {
             sensitive_request,
             &low_risk_answer,
             0.5,
+            &roster,
         );
         assert_eq!(merged.risk, RiskBand::High);
         assert!(merged.validation.security_review);
@@ -1976,7 +2225,14 @@ mod tests {
         assert!(!plain_baseline.validation.security_review);
         assert!(!plain_baseline.validation.independent_review);
         let high_risk_answer = answers(&[("risk", AnswerValue::Score(2.0), 0.9)]);
-        let raised = merge(&cfg, &plain_baseline, plain_request, &high_risk_answer, 0.5);
+        let raised = merge(
+            &cfg,
+            &plain_baseline,
+            plain_request,
+            &high_risk_answer,
+            0.5,
+            &roster,
+        );
         assert_eq!(raised.risk, RiskBand::High);
         assert!(raised.validation.security_review);
         assert!(raised.validation.independent_review);
@@ -2015,11 +2271,195 @@ mod tests {
         unfloored_baseline.execution = ExecutionMode::Direct;
         unfloored_baseline.seat_role = SeatRole::Single;
         unfloored_baseline.validation = ValidationProfile::default();
-        let merged = merge(&cfg, &unfloored_baseline, request, &Answers::new(), 0.5);
+        let merged = merge(
+            &cfg,
+            &unfloored_baseline,
+            request,
+            &Answers::new(),
+            0.5,
+            &roster,
+        );
         assert_eq!(merged.complexity, Complexity::Substantial);
         assert_eq!(merged.execution, ExecutionMode::Orchestrated);
         assert_eq!(merged.seat_role, SeatRole::Orchestrator);
         assert!(merged.validation.independent_test);
+    }
+
+    /// A `Roster` whose registry is the real built-in one (loaded against an
+    /// otherwise-empty repository, so only the built-ins are present) --
+    /// the right fixture for any test that needs `apply_explicit_workflow_
+    /// request_floor`'s registered-id lookup to actually resolve something.
+    fn roster_with_builtin_registry() -> (tempfile::TempDir, Roster) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let roster = Roster::gather(&cfg, repo.path());
+        assert!(
+            roster.registry.is_some(),
+            "built-in packs must always load, even against an empty repo"
+        );
+        (repo, roster)
+    }
+
+    /// Workflow-trigger-determinism item 2: a REGISTERED pack id named
+    /// adjacent to "workflow" wins outright, with no selection scoring at
+    /// all -- and the deliberately text-only baseline (issue #537) is
+    /// raised off `Trivial` so the workflow this sets survives
+    /// `apply_direct_execution_workflow_rule`.
+    #[test]
+    fn baseline_sets_a_named_registered_workflow_id_outright() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        let request = "Start a bugfix workflow for the scheduler crash";
+        let classification = classify_request(request);
+        assert_eq!(classification.complexity, Complexity::Trivial);
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.workflow.as_deref(), Some("bugfix"));
+        assert!(decision.complexity >= Complexity::Bounded);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("explicitly asks for a workflow")),
+            "{:?}",
+            decision.reasons
+        );
+    }
+
+    /// A hyphenated registered id (`sre-postmortem`) is matched as a single
+    /// token -- `prose_words` keeps hyphens, so it never gets split.
+    #[test]
+    fn baseline_matches_a_hyphenated_registered_workflow_id() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        let request = "start the sre-postmortem workflow for last night's outage";
+        let classification = classify_request(request);
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.workflow.as_deref(), Some("sre-postmortem"));
+    }
+
+    /// No id is named adjacent to "workflow" ("use a workflow"), so the
+    /// floor falls through to `selection::select_definition` against the
+    /// SAME request text -- here landing on `security-remediation` via its
+    /// own "security vulnerability" trigger, exactly as `zirv workflow
+    /// start` with no explicit id would.
+    #[test]
+    fn baseline_falls_through_to_selection_when_no_id_is_named() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        let request = "Use a workflow to fix the security vulnerability in auth";
+        let classification = classify_request(request);
+        assert_eq!(classification.intent, Intent::Bugfix);
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.workflow.as_deref(), Some("security-remediation"));
+    }
+
+    /// A word in the id slot that ISN'T actually a registered pack id still
+    /// falls through to selection -- it does not refuse, and it does not
+    /// literally use the unregistered name.
+    #[test]
+    fn baseline_falls_through_to_selection_for_an_unregistered_name() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        let request = "start the launch workflow to add a CSV export";
+        let classification = classify_request(request);
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.workflow.as_deref(), Some("feature"));
+    }
+
+    /// Negation-aware: "do not start a workflow" must never fire the floor,
+    /// so a `Trivial` request stays workflow-less exactly as it does today.
+    #[test]
+    fn baseline_does_not_fire_on_a_negated_workflow_request() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        let request = "do not start a workflow, just rename the flag";
+        let classification = classify_request(request);
+        assert_eq!(classification.complexity, Complexity::Trivial);
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.workflow, None);
+        assert_eq!(decision.complexity, Complexity::Trivial);
+    }
+
+    /// A bare mention of the workflow SUBSYSTEM, with no governing verb or
+    /// preposition directly next to "workflow", must never fire the floor
+    /// either -- otherwise ordinary engineering requests about zirv's own
+    /// workflow code would spuriously gate themselves.
+    #[test]
+    fn baseline_does_not_fire_on_a_mere_mention_of_the_subsystem() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        for request in [
+            "Explain how the workflow engine persists state",
+            "Fix the bug in the workflow status command",
+            "Refactor the workflow registry loader",
+        ] {
+            let classification = classify_request(request);
+            let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+            assert_eq!(decision.workflow, None, "{request:?}");
+            assert_eq!(decision.complexity, Complexity::Trivial, "{request:?}");
+        }
+    }
+
+    /// The complexity floor never LOWERS an already-higher complexity --
+    /// mirrors `apply_orchestration_request_complexity_floor`'s own
+    /// never-lower guarantee.
+    #[test]
+    fn explicit_workflow_request_floor_never_lowers_an_already_substantial_complexity() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let classification = classification_with(RiskBand::Low, Complexity::Substantial);
+        let mut decision = sample_decision();
+        decision.complexity = Complexity::Substantial;
+        apply_explicit_workflow_request_floor(
+            &mut decision,
+            "start a workflow for the migration",
+            &classification,
+            &roster,
+        );
+        assert_eq!(decision.complexity, Complexity::Substantial);
+        let _ = repo; // keeps the registry-backed roster alive for the call above
+    }
+
+    /// Merge-survival rule: an operator-named, REGISTERED workflow id
+    /// (baseline already resolved it) survives even a decisive model
+    /// `workflow` answer naming something else -- they said it in words. A
+    /// selection-derived baseline id is still fair game for the model to
+    /// replace, exactly as before this change.
+    #[test]
+    fn merge_keeps_an_explicitly_named_workflow_over_a_decisive_model_answer() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        let request = "Start a bugfix workflow for the scheduler crash";
+        let classification = classify_request(request);
+        let decision = baseline(&cfg, repo.path(), request, &classification, &roster);
+        assert_eq!(decision.workflow.as_deref(), Some("bugfix"));
+
+        let ans = answers(&[("workflow", AnswerValue::Choice("feature".to_string()), 0.9)]);
+        let merged = merge(&cfg, &decision, request, &ans, 0.5, &roster);
+        assert_eq!(
+            merged.workflow.as_deref(),
+            Some("bugfix"),
+            "an explicitly named registered id must survive a decisive model answer"
+        );
+    }
+
+    /// The counterpart: a selection-derived (not explicitly named) baseline
+    /// workflow is still replaced by a decisive model answer, unchanged
+    /// from before this rule existed.
+    #[test]
+    fn merge_still_replaces_a_selection_derived_workflow_with_a_decisive_model_answer() {
+        let cfg = CtxConfig::default();
+        let mut baseline = sample_decision();
+        baseline.workflow = Some("feature".to_string());
+        let ans = answers(&[("workflow", AnswerValue::Choice("bugfix".to_string()), 0.9)]);
+        let merged = merge(
+            &cfg,
+            &baseline,
+            "implement the feature",
+            &ans,
+            0.5,
+            &empty_roster(),
+        );
+        assert_eq!(merged.workflow.as_deref(), Some("bugfix"));
     }
 
     fn floored_complexity(request: &str) -> Complexity {

@@ -452,6 +452,7 @@ const BUGFIX_LEAD: &[&str] = &[
     "resolve",
     "debug",
     "crash",
+    "patch",
 ];
 const REFACTOR_LEAD: &[&str] = &[
     "refactor",
@@ -521,6 +522,18 @@ const BUGFIX_ANYWHERE: &[&str] = &[
     "error",
     "errors",
     "cannot",
+    "exception",
+    "exceptions",
+    "leak",
+    "leaks",
+    "wrong",
+    "incorrect",
+    "flaky",
+    "hang",
+    "hangs",
+    "deadlock",
+    "corrupt",
+    "corrupted",
 ];
 const REFACTOR_ANYWHERE: &[&str] = &[
     "refactor",
@@ -534,6 +547,7 @@ const SPIKE_ANYWHERE: &[&str] = &[
     "prototype",
     "research",
     "feasibility",
+    "feasible",
     "poc",
     "exploring",
 ];
@@ -592,15 +606,25 @@ fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
         return Some(Intent::Review);
     }
     if FEATURE_LEAD.contains(&lead) {
-        // Adjustment (a): a feature lead followed within the next 3 tokens
-        // by fix/bugfix/hotfix is Bugfix ("Implement a fix for the login
-        // crash").
+        // Adjustment (a), narrowed: a feature lead followed within the next
+        // 3 tokens by fix/bugfix/hotfix is Bugfix ("Implement a fix for the
+        // login crash") ONLY when that word is either the task's very last
+        // token, or is directly followed by one of for/to/in/on -- a bare
+        // mention of the word as an ordinary noun phrase ("Add a bugfix
+        // changelog section") must stay Feature.
         let window_end = (start + 4).min(tokens.len());
-        if tokens[start + 1..window_end]
+        let fix_word_index = tokens[start + 1..window_end]
             .iter()
-            .any(|token| matches!(*token, "fix" | "bugfix" | "hotfix"))
-        {
-            return Some(Intent::Bugfix);
+            .position(|token| matches!(*token, "fix" | "bugfix" | "hotfix"))
+            .map(|offset| start + 1 + offset);
+        if let Some(index) = fix_word_index {
+            let is_last_token = index == tokens.len() - 1;
+            let followed_by_preposition = tokens
+                .get(index + 1)
+                .is_some_and(|next| matches!(*next, "for" | "to" | "in" | "on"));
+            if is_last_token || followed_by_preposition {
+                return Some(Intent::Bugfix);
+            }
         }
         return Some(Intent::Feature);
     }
@@ -610,17 +634,24 @@ fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
 /// Tier 2 of [`infer_intent`]: a whole-word scan anywhere in the task, in a
 /// fixed priority order, only reached when tier 1 found no leading verb.
 fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
-    if tokens.iter().any(|token| BUGFIX_ANYWHERE.contains(token)) {
+    let has_does_nothing = tokens.windows(2).any(|pair| pair == ["does", "nothing"]);
+    if has_does_nothing || tokens.iter().any(|token| BUGFIX_ANYWHERE.contains(token)) {
         return Some(Intent::Bugfix);
     }
     let has_clean_up = tokens.windows(2).any(|pair| pair == ["clean", "up"]);
-    if has_clean_up || tokens.iter().any(|token| REFACTOR_ANYWHERE.contains(token)) {
+    let has_dead_code = tokens.windows(2).any(|pair| pair == ["dead", "code"]);
+    if has_clean_up || has_dead_code || tokens.iter().any(|token| REFACTOR_ANYWHERE.contains(token))
+    {
         return Some(Intent::Refactor);
     }
     let has_proof_of_concept = tokens
         .windows(3)
         .any(|triple| triple == ["proof", "of", "concept"]);
-    if has_proof_of_concept || tokens.iter().any(|token| SPIKE_ANYWHERE.contains(token)) {
+    let has_try_out = tokens.windows(2).any(|pair| pair == ["try", "out"]);
+    if has_proof_of_concept
+        || has_try_out
+        || tokens.iter().any(|token| SPIKE_ANYWHERE.contains(token))
+    {
         return Some(Intent::Spike);
     }
     if tokens.iter().any(|token| REVIEW_ANYWHERE.contains(token)) {
@@ -1036,6 +1067,27 @@ mod tests {
             ),
             // "clean up" bigram.
             ("Clean up the adapters module", Intent::Refactor),
+            // Adjustment (a), narrowed: a feature lead's nearby fix/bugfix/
+            // hotfix word only flips to Bugfix when it is the task's last
+            // token or is directly followed by for/to/in/on -- a bare noun
+            // mention stays Feature.
+            ("Add a bugfix changelog section", Intent::Feature),
+            ("Add a hotfix for the login crash", Intent::Bugfix),
+            // "try" is deliberately NOT a lead word -- it falls through to
+            // tier 2, where "fix" still wins.
+            ("Try to fix the login bug", Intent::Bugfix),
+            // "try out" bigram (tier 2 only).
+            ("Try out the new clap derive API", Intent::Spike),
+            // Bugfix tier-2 symptom words and the "does nothing" phrase.
+            ("Null pointer exception when saving a draft", Intent::Bugfix),
+            ("The export button does nothing", Intent::Bugfix),
+            ("Memory leak in the websocket handler", Intent::Bugfix),
+            ("Wrong total shown in the cart", Intent::Bugfix),
+            ("Patch the off-by-one in pagination", Intent::Bugfix),
+            // "dead code" bigram (refactor tier 2).
+            ("Remove dead code from the scheduler", Intent::Refactor),
+            // "feasible" (spike tier 2).
+            ("Is it feasible to stream tool output?", Intent::Spike),
             // No signal at all.
             ("", Intent::Other),
         ];
