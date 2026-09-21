@@ -4,7 +4,8 @@
 //! belong to `obfuscate_store`.  A vault stores canonical placeholder stems,
 //! so changing the email-domain policy never changes an existing identity.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -156,6 +157,13 @@ struct Candidate {
     entropy_only: bool,
 }
 
+impl Candidate {
+    fn replaces(&self, options: &Options) -> bool {
+        options.mode == Mode::Obfuscate
+            && (!self.entropy_only || options.entropy == EntropyMode::Obfuscate)
+    }
+}
+
 /// Replaces supported values with stable, typed placeholders. No I/O, clock,
 /// environment, or network access occurs here.
 pub fn obfuscate(
@@ -169,31 +177,41 @@ pub fn obfuscate(
     }
 
     let allowed = allowed_ranges(text, &options.allow);
+    let protected: Vec<_> = placeholders(text)
+        .map(|(full, _)| (full.start(), full.end()))
+        .collect();
     let mut candidates = candidates(text, options);
     candidates.retain(|candidate| {
         !allowed
             .iter()
             .any(|(start, end)| candidate.start < *end && candidate.end > *start)
+            && !protected
+                .iter()
+                .any(|(start, end)| candidate.start >= *start && candidate.end <= *end)
     });
+    // Issue #466: flag-only spans must never suppress a replacing detector.
     candidates.sort_by(|a, b| {
-        a.start
-            .cmp(&b.start)
+        b.replaces(options)
+            .cmp(&a.replaces(options))
             .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
+            .then_with(|| a.start.cmp(&b.start))
     });
 
-    let mut selected = Vec::new();
-    let mut occupied_until = 0;
+    let mut selected: BTreeMap<usize, Candidate> = BTreeMap::new();
     for candidate in candidates {
-        if candidate.start >= occupied_until {
-            occupied_until = candidate.end;
-            selected.push(candidate);
+        if selected
+            .range(..candidate.end)
+            .next_back()
+            .is_none_or(|(_, prior)| prior.end <= candidate.start)
+        {
+            selected.entry(candidate.start).or_insert(candidate);
         }
     }
 
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     let mut findings = Vec::with_capacity(selected.len());
-    for candidate in selected {
+    for candidate in selected.into_values() {
         let value = &text[candidate.start..candidate.end];
         let stem = vault.insert(value, &candidate.kind, candidate.class, surface);
         let replacement = if candidate.kind == "EMAIL" && options.email_domain == EmailDomain::Keep
@@ -205,8 +223,7 @@ pub fn obfuscate(
         } else {
             stem.clone()
         };
-        let replace = options.mode == Mode::Obfuscate
-            && (!candidate.entropy_only || options.entropy == EntropyMode::Obfuscate);
+        let replace = candidate.replaces(options);
         output.push_str(&text[cursor..candidate.start]);
         output.push_str(if replace { &replacement } else { value });
         cursor = candidate.end;
@@ -221,21 +238,46 @@ pub fn obfuscate(
     (output, findings)
 }
 
-/// Restores canonical and email-shaped placeholders. Longer placeholders are
-/// handled first so `_1` cannot partially replace `_10`.
+/// Restores whole canonical and email-shaped placeholders in a single pass.
 pub fn rehydrate(text: &str, vault: &Vault) -> String {
-    let mut entries: Vec<_> = vault.entries.iter().collect();
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.placeholder.len()));
-    let mut output = text.to_string();
-    for entry in entries {
-        if entry.kind == "EMAIL"
-            && let Some((_, domain)) = entry.value.rsplit_once('@')
-        {
-            output = output.replace(&format!("{}@{domain}", entry.placeholder), &entry.value);
+    let entries: HashMap<_, _> = vault
+        .entries
+        .iter()
+        .map(|entry| (entry.placeholder.as_str(), entry))
+        .collect();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (full, stem) in placeholders(text) {
+        output.push_str(&text[cursor..full.start()]);
+        if let Some(entry) = entries.get(stem.as_str()) {
+            output.push_str(&entry.value);
+            let suffix = &text[stem.end()..full.end()];
+            let domain = entry.value.rsplit_once('@').map(|(_, domain)| domain);
+            if entry.kind != "EMAIL" || suffix.strip_prefix('@') != domain {
+                output.push_str(suffix);
+            }
+        } else {
+            output.push_str(full.as_str());
         }
-        output = output.replace(&entry.placeholder, &entry.value);
+        cursor = full.end();
     }
+    output.push_str(&text[cursor..]);
     output
+}
+
+fn placeholders(text: &str) -> impl Iterator<Item = (regex::Match<'_>, regex::Match<'_>)> {
+    static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\b(ZIRV_(?:SECRET|PII)_[A-Z0-9](?:[A-Z0-9_]*[A-Z0-9])?_([0-9]+))\b(?:@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z]{2,})+\b)?",
+        )
+        .expect("valid Zirv placeholder regex")
+    });
+    PATTERN.captures_iter(text).filter_map(|captures| {
+        if captures.get(2)?.as_str() == "0" {
+            return None;
+        }
+        Some((captures.get(0)?, captures.get(1)?))
+    })
 }
 
 pub fn contains_placeholder(text: &str) -> bool {
@@ -610,6 +652,162 @@ mod tests {
         assert!(first.contains("ZIRV_PII_EMAIL_1@company.dk"));
         assert!(first.contains("ZIRV_SECRET_GITHUB_TOKEN_1"));
         assert_eq!(rehydrate(&first, &vault), source);
+    }
+
+    #[test]
+    fn credential_masking_takes_precedence_over_overlapping_entropy_flags() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        for (source, expected) in [
+            (format!("TOKEN={token}"), "TOKEN=ZIRV_SECRET_GITHUB_TOKEN_1"),
+            (format!("{token}=tail"), "ZIRV_SECRET_GITHUB_TOKEN_1=tail"),
+        ] {
+            let mut vault = Vault::default();
+            let (masked, findings) = obfuscate(&source, &mut vault, &Options::default(), "test");
+            assert_eq!(masked, expected);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].kind, "GITHUB_TOKEN");
+            assert!(findings[0].replaced);
+            assert_eq!(rehydrate(&masked, &vault), source);
+        }
+    }
+
+    #[test]
+    fn entropy_without_a_credential_match_is_still_flagged() {
+        let source = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let mut vault = Vault::default();
+        let (flagged, findings) = obfuscate(source, &mut vault, &Options::default(), "test");
+        assert_eq!(flagged, source);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, "HIGH_ENTROPY");
+        assert!(!findings[0].replaced);
+    }
+
+    #[test]
+    fn protecting_placeholders_is_idempotent_for_every_kind() {
+        let mut vault = Vault::default();
+        let options = Options::default();
+        let source = "jane@company.dk";
+        let (first, _) = obfuscate(source, &mut vault, &options, "mail");
+        assert_eq!(first, "ZIRV_PII_EMAIL_1@company.dk");
+        let original_vault = vault.clone();
+        let (second, findings) = obfuscate(&first, &mut vault, &options, "prompt");
+        assert_eq!(second, first);
+        assert!(findings.is_empty());
+        assert_eq!(vault, original_vault);
+        assert_eq!(rehydrate(&second, &vault), source);
+
+        let options = Options {
+            entropy: EntropyMode::Obfuscate,
+            patterns: vec![
+                OperatorPattern {
+                    kind: "CUSTOM__KIND".into(),
+                    regex: "private-custom-value".into(),
+                },
+                OperatorPattern {
+                    kind: "PLACEHOLDER_MATCH".into(),
+                    regex: r"\bZIRV_(?:SECRET|PII)_[A-Z0-9_]+\b".into(),
+                },
+            ],
+            literals: vec!["privatevalue".into(), "ZIRV_SECRET_LITERAL_1".into()],
+            ..Options::default()
+        };
+        for source in [
+            "jane@company.dk",
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "010190-1234",
+            "DK5000400440116243",
+            "4242 4242 4242 4242",
+            "+45 12 34 56 78",
+            "privatevalue",
+            "private-custom-value",
+            "abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+            "https://ZIRV_PII_EMAIL_99:password@company.dk",
+        ] {
+            let mut vault = Vault::default();
+            let (first, _) = obfuscate(source, &mut vault, &options, "mail");
+            assert_ne!(first, source);
+            let original_vault = vault.clone();
+            let (second, findings) = obfuscate(&first, &mut vault, &options, "prompt");
+            assert_eq!(second, first);
+            assert!(findings.is_empty());
+            assert_eq!(vault, original_vault);
+            assert_eq!(rehydrate(&second, &vault), source);
+        }
+        for placeholder in ["ZIRV_SECRET_FUTURE_KIND_99", "ZIRV_PII_EMAIL_99@company.dk"] {
+            let mut vault = Vault::default();
+            let (masked, findings) = obfuscate(placeholder, &mut vault, &options, "prompt");
+            assert_eq!(masked, placeholder);
+            assert!(findings.is_empty());
+            assert!(vault.entries().is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_placeholder_index_stays_unresolved_and_blocks_device_action() {
+        let mut vault = Vault::default();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let (known, _) = obfuscate(secret, &mut vault, &Options::default(), "test");
+        assert_eq!(known, "ZIRV_SECRET_GITHUB_TOKEN_1");
+        for unresolved in [
+            "ZIRV_SECRET_GITHUB_TOKEN_10",
+            "ZIRV_SECRET_GITHUB_TOKEN_1suffix",
+            "ZIRV_SECRET_GITHUB_TOKEN_1_0",
+            "prefixZIRV_SECRET_GITHUB_TOKEN_1",
+        ] {
+            let restored = rehydrate(unresolved, &vault);
+            assert_eq!(restored, unresolved);
+            assert!(!restored.contains(secret));
+            assert!(contains_placeholder(&restored));
+        }
+        assert_eq!(
+            rehydrate(&format!("({known}),{known}"), &vault),
+            format!("({secret}),{secret}")
+        );
+
+        let state_dir = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = super::super::state::StateDir::from_root(state_dir.path().to_path_buf());
+        super::super::obfuscate_store::with_vault(
+            &super::super::obfuscate_store::vault_path(state.root(), repo.path()),
+            |stored| {
+                *stored = vault.clone();
+                Ok(())
+            },
+        )
+        .expect("seed vault");
+        let unknown = "ZIRV_SECRET_GITHUB_TOKEN_10";
+        let mut input = serde_json::json!({"command": format!("printf %s {unknown}")});
+        let error =
+            super::super::obfuscate_store::rehydrate_json(state.root(), repo.path(), &mut input)
+                .expect_err("unknown placeholder must refuse the device action");
+        assert_eq!(
+            error.to_string(),
+            "unknown Zirv placeholder; refusing device action"
+        );
+        assert!(!input.to_string().contains(secret));
+        let state_root = state.root().display().to_string();
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state_root.clone()),
+            "ZIRV_CTX_OBFUSCATE_MODE" => Some("obfuscate".to_string()),
+            _ => None,
+        };
+        let stdin = serde_json::json!({
+            "session_id": "s1", "cwd": repo.path(), "tool_name": "Bash",
+            "tool_input": input,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        super::super::hook::run_pretool_for_agent(&mut out, &stdin, &env, None).expect("hook");
+        let output: serde_json::Value = serde_json::from_slice(&out).expect("refusal");
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(!output.to_string().contains(secret));
+        assert!(
+            super::super::log::read_decisions(&state)
+                .iter()
+                .any(|decision| {
+                    decision.action == "obfuscate-rehydration-miss" && decision.verdict == "blocked"
+                })
+        );
     }
 
     #[test]
