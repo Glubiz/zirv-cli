@@ -934,15 +934,31 @@ pub(crate) fn scratchpad_roots_for(
         .replace('\\', "/");
     let normalized_base = normalized_base.trim_end_matches('/');
     let suffix = format!("claude-{uid}");
-    let mut roots = vec![format!("{normalized_base}/{suffix}")];
-    #[cfg(target_os = "macos")]
-    if normalized_base == "/tmp" {
-        roots.push(format!("/private/tmp/{suffix}"));
-    }
+    let mut roots = vec![
+        if normalized_base.rsplit('/').next() == Some(suffix.as_str()) {
+            normalized_base.to_string()
+        } else {
+            format!("{normalized_base}/{suffix}")
+        },
+    ];
     if normalized_temp_dir.rsplit('/').next() == Some(suffix.as_str()) {
         let normalized_temp_dir = normalized_temp_dir.to_string();
         if !roots.contains(&normalized_temp_dir) {
             roots.push(normalized_temp_dir);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for root in roots.clone() {
+        let twin = if root.starts_with("/tmp/") {
+            Some(format!("/private{root}"))
+        } else {
+            root.strip_prefix("/private/tmp/")
+                .map(|tail| format!("/tmp/{tail}"))
+        };
+        if let Some(twin) = twin
+            && !roots.contains(&twin)
+        {
+            roots.push(twin);
         }
     }
     roots
@@ -8377,6 +8393,62 @@ mod tests {
             ),
             vec!["/scratch/claude-501".to_string()]
         );
+    }
+
+    #[test]
+    fn scratchpad_roots_accept_an_already_suffixed_override() {
+        for base in [
+            "/tmp/claude-501",
+            "/private/tmp/claude-501",
+            "/scratch/claude-501/",
+        ] {
+            let roots = scratchpad_roots_for(Path::new(base), Some(501), Some(Path::new(base)));
+            assert!(
+                roots.contains(&base.trim_end_matches('/').to_string()),
+                "{roots:?}"
+            );
+            assert!(
+                roots
+                    .iter()
+                    .all(|root| !root.contains("claude-501/claude-501")),
+                "{roots:?}"
+            );
+            let unique: std::collections::HashSet<_> = roots.iter().collect();
+            assert_eq!(roots.len(), unique.len());
+            let rules = scratchpad_rules_from_roots(&roots);
+            assert!(rules.contains(&format!("Edit({}/**)", doubled_slash_rule_base(base))));
+            #[cfg(target_os = "macos")]
+            if base.contains("/tmp/") {
+                assert!(roots.contains(&"/tmp/claude-501".to_string()), "{roots:?}");
+                assert!(
+                    roots.contains(&"/private/tmp/claude-501".to_string()),
+                    "{roots:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scratchpad_roots_add_tmp_twins_for_nested_bases_and_temp_dir() {
+        for base in ["/tmp/custom", "/private/tmp/custom"] {
+            let roots = scratchpad_roots_for(
+                Path::new("/tmp/other/claude-501"),
+                Some(501),
+                Some(Path::new(base)),
+            );
+            for expected in [
+                "/tmp/custom/claude-501",
+                "/private/tmp/custom/claude-501",
+                "/tmp/other/claude-501",
+                "/private/tmp/other/claude-501",
+            ] {
+                assert!(
+                    roots.iter().any(|root| root == expected),
+                    "{base}: {roots:?}"
+                );
+            }
+        }
     }
 
     // -- the seat role env every launch exports (issues #328/#334) ---------
