@@ -845,7 +845,7 @@ mod tests {
         // built-in ladder.
         assert_eq!(
             resolve_model("codex", "cheap", &cfg).unwrap(),
-            "gpt-5.4-mini"
+            "gpt-5.6-luna"
         );
     }
 
@@ -882,7 +882,7 @@ mod tests {
         assert_eq!(resolve_model("claude", "deep", &cfg).unwrap(), "opus");
         assert_eq!(
             resolve_model("codex", "cheap", &cfg).unwrap(),
-            "gpt-5.4-mini"
+            "gpt-5.6-luna"
         );
         assert_eq!(
             resolve_model("codex", "standard", &cfg).unwrap(),
@@ -904,7 +904,7 @@ mod tests {
             Some("gpt-5.6-sol".to_string())
         );
         assert_eq!(
-            equivalent_model("codex", Some("gpt-5.4-mini"), true, "claude", &cfg),
+            equivalent_model("codex", Some("gpt-5.6-luna"), true, "claude", &cfg),
             Some("haiku".to_string())
         );
     }

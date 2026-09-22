@@ -62,7 +62,7 @@ model = "fable"
 # deep = "opus"                     # Default: unset (built-in ladder default "opus").
 
 # [handover.codex]                  # every key below is REPO-FORBIDDEN (ZIRV_CTX_HANDOVER_CODEX_CHEAP / _STANDARD / _DEEP) -- same, for a codex target.
-# cheap = "gpt-5.4-mini"            # Default: unset (built-in ladder default "gpt-5.4-mini").
+# cheap = "gpt-5.6-luna"            # Default: unset (built-in ladder default "gpt-5.6-luna").
 # standard = "gpt-5.6-terra"        # Default: unset (built-in ladder default "gpt-5.6-terra").
 # deep = "gpt-5.6-sol"              # Default: unset (built-in ladder default "gpt-5.6-sol").
 
@@ -72,7 +72,7 @@ model = "fable"
 # deep = "opus"                     # Default: unset, same reasoning. Zirv never downgrades a Deep seat on its own; this only ever reflects the operator's own explicit choice.
 
 # [model_tiers.codex]               # every key below is REPO-FORBIDDEN (ZIRV_CTX_MODEL_TIERS_CODEX_FAST / _STANDARD / _DEEP) -- same, for a codex harness.
-# fast = "gpt-5.4-mini"             # Default: unset (no model is passed).
+# fast = "gpt-5.6-luna"             # Default: unset (no model is passed).
 # standard = "gpt-5.6-terra"        # Default: unset, same reasoning.
 # deep = "gpt-5.6-sol"              # Default: unset, same reasoning.
 

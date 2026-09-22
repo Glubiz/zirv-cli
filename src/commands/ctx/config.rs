@@ -13614,7 +13614,7 @@ mod tests {
             "[model_tiers.claude]\nfast = \"haiku\"\n",
             "[model_tiers.claude]\nstandard = \"sonnet\"\n",
             "[model_tiers.claude]\ndeep = \"opus\"\n",
-            "[model_tiers.codex]\nfast = \"gpt-5.4-mini\"\n",
+            "[model_tiers.codex]\nfast = \"gpt-5.6-luna\"\n",
             "[model_tiers.codex]\nstandard = \"gpt-5.6-terra\"\n",
             "[model_tiers.codex]\ndeep = \"gpt-5.6-sol\"\n",
         ] {
