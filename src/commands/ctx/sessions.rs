@@ -1448,9 +1448,13 @@ pub enum ResolveError {
     /// prefix. Names every currently known live session, so the caller
     /// learns what it could have typed instead.
     NotFound { existing: Vec<String> },
-    /// More than one live session matches; every candidate is named so the
-    /// caller can disambiguate.
-    Ambiguous(Vec<Record>),
+    /// More than one candidate matches; every candidate's short id is named
+    /// so the caller can disambiguate. Issue #721: shared with
+    /// `resolve_prefix_or_parked`'s own multi-parked-seat case, which has no
+    /// live [`Record`] to name -- only the short id survives a `Seat`, so
+    /// this holds ids rather than full records (`resolve_prefix`'s own
+    /// `Display` text never used anything else from them).
+    Ambiguous(Vec<String>),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -1468,8 +1472,7 @@ impl std::fmt::Display for ResolveError {
                 }
             }
             ResolveError::Ambiguous(candidates) => {
-                let names: Vec<&str> = candidates.iter().map(|r| r.short.as_str()).collect();
-                write!(f, "ambiguous prefix; candidates: {}", names.join(", "))
+                write!(f, "ambiguous prefix; candidates: {}", candidates.join(", "))
             }
         }
     }
@@ -1530,7 +1533,9 @@ pub fn resolve_prefix(state: &StateDir, prefix: &str) -> Result<Record, ResolveE
             existing: live.into_iter().map(|r| r.short).collect(),
         }),
         1 => Ok(matches.into_iter().next().expect("checked len == 1")),
-        _ => Err(ResolveError::Ambiguous(matches)),
+        _ => Err(ResolveError::Ambiguous(
+            matches.into_iter().map(|r| r.short).collect(),
+        )),
     }
 }
 
@@ -1551,19 +1556,24 @@ pub enum Addressed {
 /// [`resolve_prefix`], extended to recognize a ghost-parked seat (issue
 /// #721) instead of reporting it as a bare [`ResolveError::NotFound`].
 /// Every other outcome is untouched and byte-identical to calling
-/// `resolve_prefix` directly: a live match, an ambiguous prefix, and a
-/// prefix that matches neither a live record nor exactly one parked seat all
-/// fall straight through unchanged -- only a `NotFound` whose prefix names
-/// exactly one parked seat is reinterpreted.
+/// `resolve_prefix` directly: a live match, an ambiguous live prefix, and a
+/// prefix that matches neither a live record nor any parked seat all fall
+/// straight through unchanged -- only a `NotFound` whose prefix names one or
+/// more parked seats is reinterpreted: exactly one becomes `Parked`, and two
+/// or more become the identical [`ResolveError::Ambiguous`] a multi-match
+/// among live records already returns, naming each candidate's short id so
+/// the caller can disambiguate.
 pub fn resolve_prefix_or_parked(state: &StateDir, prefix: &str) -> Result<Addressed, ResolveError> {
     match resolve_prefix(state, prefix) {
         Ok(record) => Ok(Addressed::Live(Box::new(record))),
         Err(ResolveError::NotFound { existing }) => {
             let mut parked = super::seat::find_parked_by_prefix(state, prefix);
-            if parked.len() == 1 {
-                Ok(Addressed::Parked(Box::new(parked.remove(0))))
-            } else {
-                Err(ResolveError::NotFound { existing })
+            match parked.len() {
+                0 => Err(ResolveError::NotFound { existing }),
+                1 => Ok(Addressed::Parked(Box::new(parked.remove(0)))),
+                _ => Err(ResolveError::Ambiguous(
+                    parked.into_iter().map(|seat| seat.short).collect(),
+                )),
             }
         }
         Err(other) => Err(other),
@@ -1949,17 +1959,36 @@ pub fn run_nudge_with<W: Write>(
                         .into(),
                 );
             }
-            let super::seat::Phase::Parked { until, reason, .. } = seat.phase.clone() else {
+            let super::seat::Phase::Parked {
+                until,
+                window,
+                reason,
+                ..
+            } = seat.phase.clone()
+            else {
                 unreachable!("resolve_prefix_or_parked only returns Phase::Parked seats");
             };
             let now = super::state::now_secs();
             if until <= now {
-                // Issue #721: see the matching comment in
-                // `mail::run_send_with` -- `on_resume`'s returned handover
-                // request is deliberately discarded, since acting on it
-                // would spawn a successor process from this short-lived
-                // `nudge` invocation.
-                let _ = super::rollover::on_resume(&state, &cfg, "nudge", &seat.short, now, false);
+                // Issue #721 (review finding #1): see the matching comment
+                // in `mail::run_send_with` -- resume the seat directly with
+                // `seat::resume`, never through `rollover::on_resume`,
+                // which can open a fresh `Prepared` transaction onto a
+                // different harness that nothing left alive ever unwinds.
+                let _ = super::seat::resume(&state, &seat.short, now);
+                super::rollover::record(
+                    &state,
+                    &seat.session,
+                    "nudge",
+                    super::rollover::RESUMED,
+                    &super::rollover::PoolEvent {
+                        snapshot_at: now,
+                        binding_window: Some(window),
+                        source_agent: seat.agent.clone(),
+                        reason: "parked window elapsed".to_string(),
+                        ..Default::default()
+                    },
+                );
             } else {
                 writeln!(
                     w,
@@ -3460,9 +3489,8 @@ mod tests {
         match &err {
             ResolveError::Ambiguous(candidates) => {
                 assert_eq!(candidates.len(), 2);
-                let shorts: Vec<&str> = candidates.iter().map(|r| r.short.as_str()).collect();
-                assert!(shorts.contains(&one.short.as_str()), "{shorts:?}");
-                assert!(shorts.contains(&two.short.as_str()), "{shorts:?}");
+                assert!(candidates.contains(&one.short), "{candidates:?}");
+                assert!(candidates.contains(&two.short), "{candidates:?}");
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
@@ -3575,6 +3603,67 @@ mod tests {
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// Issue #721 review finding #2 (MEDIUM): a prefix naming two or more
+    /// ghost-parked seats must not fold into a bare `NotFound` -- it is
+    /// exactly as ambiguous as two live records sharing a prefix, so it
+    /// gets the identical `ResolveError::Ambiguous`, naming each candidate.
+    #[test]
+    fn resolve_prefix_or_parked_is_ambiguous_for_two_ghost_parked_seats_sharing_a_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let now = super::super::state::now_secs();
+        crate::commands::ctx::seat::register(
+            &state,
+            "dupe1111",
+            "dupe-session-1",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        crate::commands::ctx::seat::park(&state, "dupe1111", now + 3600, "5h", "rate limited", now)
+            .expect("park");
+        crate::commands::ctx::seat::register(
+            &state,
+            "dupe2222",
+            "dupe-session-2",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        crate::commands::ctx::seat::park(&state, "dupe2222", now + 3600, "5h", "rate limited", now)
+            .expect("park");
+
+        let err = resolve_prefix_or_parked(&state, "dupe")
+            .expect_err("two parked seats share this prefix");
+        match &err {
+            ResolveError::Ambiguous(candidates) => {
+                assert_eq!(candidates.len(), 2);
+                assert!(
+                    candidates.contains(&"dupe1111".to_string()),
+                    "{candidates:?}"
+                );
+                assert!(
+                    candidates.contains(&"dupe2222".to_string()),
+                    "{candidates:?}"
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dupe1111") && msg.contains("dupe2222"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -3838,6 +3927,137 @@ mod tests {
             nudge_marker_path(&state, &short).is_file(),
             "the wake-up marker exists alongside the payload"
         );
+    }
+
+    /// Issue #721 review finding #3: `run_nudge_with` has no end-to-end
+    /// coverage of the ghost-park paths `resolve_prefix_or_parked` added --
+    /// mirrors `mail::tests::
+    /// send_to_a_ghost_parked_seat_past_its_window_resumes_before_delivering`.
+    /// A due ghost park resumes to `Phase::Idle` before the nudge's payload
+    /// is delivered.
+    #[test]
+    fn nudge_to_a_due_ghost_parked_seat_resumes_before_delivering() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+        let now = super::super::state::now_secs();
+        crate::commands::ctx::seat::register(
+            &state,
+            "duenudg1",
+            "due-nudge-session",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        // Already elapsed: `until` is in the past.
+        crate::commands::ctx::seat::park(
+            &state,
+            "duenudg1",
+            now.saturating_sub(60),
+            "5h",
+            "usage exhausted",
+            now,
+        )
+        .expect("park");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = NudgeArgs {
+            prefix: "duenudg1".to_string(),
+            message: Some("still there?".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect("nudge");
+        assert_eq!(code, 0);
+
+        let seat = crate::commands::ctx::seat::load(&state, "duenudg1").expect("seat exists");
+        assert!(
+            !matches!(seat.phase, crate::commands::ctx::seat::Phase::Parked { .. }),
+            "a due ghost park must be resumed before delivery, got {:?}",
+            seat.phase
+        );
+
+        let slug = super::super::state::repo_slug(&repo);
+        let listed = super::super::mail::list(&state, &slug, None, Some("duenudg1")).expect("list");
+        assert_eq!(listed.len(), 1, "the nudge payload is still delivered");
+        assert_eq!(listed[0].1.body, "still there?");
+    }
+
+    /// A ghost-parked seat whose window has NOT elapsed queues normally,
+    /// reports the park instead of resuming early, and -- unlike the due
+    /// case above -- leaves the seat file byte-identical: nothing about
+    /// this nudge may touch the seat before its own window says so.
+    #[test]
+    fn nudge_to_a_ghost_parked_seat_before_its_window_queues_and_leaves_the_seat_file_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = state_in(&state_dir);
+        let repo = tmp.path().join("repo");
+        let now = super::super::state::now_secs();
+        crate::commands::ctx::seat::register(
+            &state,
+            "notnudg1",
+            "notdue-nudge-session",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        let until = now + 3600;
+        crate::commands::ctx::seat::park(&state, "notnudg1", until, "5h", "usage exhausted", now)
+            .expect("park");
+
+        let seat_path = state.sessions().join("notnudg1.seat.json");
+        let before = std::fs::read(&seat_path).expect("seat file exists");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = NudgeArgs {
+            prefix: "notnudg1".to_string(),
+            message: Some("checking in".to_string()),
+            message_file: None,
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_nudge_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+            .expect("nudge");
+        assert_eq!(code, 0);
+
+        let after = std::fs::read(&seat_path).expect("seat file still exists");
+        assert_eq!(
+            before, after,
+            "a not-yet-due ghost park must leave the seat file byte-identical"
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("is parked until") && printed.contains("usage exhausted"),
+            "must surface the park instead of a bare not-found: {printed}"
+        );
+
+        let slug = super::super::state::repo_slug(&repo);
+        let listed = super::super::mail::list(&state, &slug, None, Some("notnudg1")).expect("list");
+        assert_eq!(listed.len(), 1, "the nudge payload is still queued");
+        assert_eq!(listed[0].1.body, "checking in");
     }
 
     #[test]

@@ -2162,30 +2162,43 @@ pub fn run_send_with<W: Write>(
                 notify.push(*record);
             }
             Ok(sessions::Addressed::Parked(seat)) => {
-                let super::seat::Phase::Parked { until, reason, .. } = seat.phase.clone() else {
+                let super::seat::Phase::Parked {
+                    until,
+                    window,
+                    reason,
+                    ..
+                } = seat.phase.clone()
+                else {
                     unreachable!("resolve_prefix_or_parked only returns Phase::Parked seats");
                 };
                 if until <= created_at {
-                    // Issue #721: the seat's own window has elapsed with
-                    // nobody left to poll it (its wrap/dash process is
-                    // gone) -- call the exact resume path a live poll tick
-                    // would, before delivering. Its returned handover
-                    // request (naming a DIFFERENT harness as the best fit)
-                    // is deliberately discarded: acting on it means
-                    // spawning a successor process, which this short-lived
-                    // `send` invocation must never do -- that is wrap's/
-                    // dash's own supervision loop, not this one. An
-                    // abandoned `Prepared` transaction left behind is
-                    // exactly what `rollover::on_startup`'s crash recovery
-                    // already exists to unwind the next time a supervisor
-                    // registers for this seat.
-                    let _ = super::rollover::on_resume(
+                    // Issue #721 (review finding #1): resume the seat
+                    // directly with `seat::resume`, never through
+                    // `rollover::on_resume`. That path can prefer a
+                    // different harness than the one the seat is sitting on
+                    // and open a fresh `Prepared` transaction onto it via
+                    // `seat::prepare_onto` -- a transaction only
+                    // `rollover::on_startup` ever unwinds, and only when
+                    // that OTHER harness's own supervisor next registers for
+                    // this seat, which a ghost park (its own supervisor
+                    // already gone) has nothing left to do. Calling
+                    // `seat::resume` directly clears `Phase::Parked` to
+                    // `Phase::Idle` without ever touching that machinery, so
+                    // this short-lived `send` invocation can never leave the
+                    // seat wedged in `Prepared` forever.
+                    let _ = super::seat::resume(&state, &seat.short, created_at);
+                    super::rollover::record(
                         &state,
-                        &cfg,
+                        &seat.session,
                         "send",
-                        &seat.short,
-                        created_at,
-                        false,
+                        super::rollover::RESUMED,
+                        &super::rollover::PoolEvent {
+                            snapshot_at: created_at,
+                            binding_window: Some(window),
+                            source_agent: seat.agent.clone(),
+                            reason: "parked window elapsed".to_string(),
+                            ..Default::default()
+                        },
                     );
                 } else {
                     writeln!(
@@ -3583,6 +3596,133 @@ This is part of the body too.\n";
         let listed = list(&state, &slug, None, None).expect("list");
         assert_eq!(listed.len(), 1, "the mail is still delivered");
         assert_eq!(listed[0].1.body, "still there?");
+    }
+
+    /// Issue #721 review finding #1 (CRITICAL): resuming a due ghost park
+    /// must go through `seat::resume` directly, never `rollover::on_resume`
+    /// -- that path can prefer a different harness than the one the seat is
+    /// sitting on and open a fresh `Prepared` transaction onto it
+    /// (`seat::prepare_onto`), which only `rollover::on_startup`'s crash
+    /// recovery unwinds, and only when that OTHER harness's own supervisor
+    /// next registers for this seat. A ghost park's own supervisor is
+    /// already gone, so a `Prepared` seat left behind here would never be
+    /// unwound and would leak forever. Configures usage so "codex" is
+    /// clearly the better harness than the seat's own "claude" -- the same
+    /// recipe `rollover::tests::
+    /// on_resume_moves_to_a_better_harness_and_resumes_in_place_otherwise`
+    /// uses to prove `on_resume` itself prefers "codex" here -- and asserts
+    /// the seat still ends up simply `Phase::Idle`.
+    #[test]
+    fn send_to_a_due_ghost_parked_seat_never_opens_a_handover_even_when_another_harness_is_better()
+    {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            format!(
+                "agent_bin = {:?}\n\
+                 [pace]\nestimator = false\n\
+                 [fallback]\nauto_orchestrator_rollover = true\n\
+                 orchestrator_rollover_headroom_pct = 20.0\n\
+                 min_candidate_headroom_pct = 10.0\n",
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string()
+            ),
+        )
+        .expect("write ctx.toml");
+
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = super::super::state::now_secs();
+        crate::commands::ctx::seat::register(
+            &state,
+            "duepark2",
+            "due-session-2",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        // The seat's own harness ("claude"/"anthropic") is exhausted; the
+        // other configured fallback harness ("codex"/"openai") is wide
+        // open -- if `rollover::on_resume` were still called here, it would
+        // clearly prefer "codex" and open a `Prepared` transaction onto it.
+        crate::commands::ctx::window::store_for(
+            &state,
+            "anthropic",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store anthropic usage");
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 5.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store openai usage");
+        // Already elapsed: `until` is in the past.
+        crate::commands::ctx::seat::park(
+            &state,
+            "duepark2",
+            now.saturating_sub(60),
+            "5h",
+            "usage exhausted",
+            now,
+        )
+        .expect("park");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to_session: Some("duepark2".to_string()),
+            message: Some("still there?".to_string()),
+            ..SendArgs::default()
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+        assert_eq!(code, 0);
+
+        let seat = crate::commands::ctx::seat::load(&state, "duepark2").expect("seat exists");
+        assert!(
+            matches!(seat.phase, crate::commands::ctx::seat::Phase::Idle),
+            "a due ghost park must resume in place, never open a handover onto a better \
+             harness, got {:?}",
+            seat.phase
+        );
     }
 
     /// A ghost-parked seat whose window has NOT elapsed queues normally and

@@ -720,11 +720,16 @@ live session from the listing.
 Addressing a **parked** seat (see "the displaced harness is parked, not
 closed" below) whose own supervisor process has since exited -- a "ghost
 park" -- is recognized instead of reported as a plain unknown id. If its
-park window has already elapsed, `send`/`nudge` resume it (the same path a
-live poll tick would take) before delivering; if the window has not yet
-elapsed, the mail is queued as usual and the reply names the park and its
-reason instead of a bare not-found. Either way mail never resumes a park
-early on its own -- only a window that has already elapsed does.
+park window has already elapsed, `send`/`nudge` resume it in place before
+delivering, clearing the park without ever opening a handover onto a
+different harness -- that stays wrap's/dash's own supervision loop, never a
+short-lived `send`/`nudge` invocation's; if the window has not yet elapsed,
+the mail is queued as usual and the reply names the park and its reason
+instead of a bare not-found. Either way mail never resumes a park early on
+its own -- only a window that has already elapsed does. A ghost-parked
+seat's own repository cannot be recovered from its seat record alone, so its
+mail files under the sender's own repo mailbox, mirroring the undirected
+`--claim-once` fallback.
 
 `zirv ctx nudge <prefix> --message <text>` wakes a live session early instead
 of waiting for it to notice on its own:
