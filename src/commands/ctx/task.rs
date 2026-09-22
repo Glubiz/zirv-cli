@@ -226,24 +226,12 @@ fn events_path(state: &StateDir, repo_slug: &str) -> PathBuf {
     state.tasks().join(repo_slug).join(EVENTS_FILE)
 }
 
-/// One advisory OS lock per repository's event log, mirroring `group.rs`'s
-/// own per-group lock file exactly (same `open_lock_file`, same "leave the
-/// file behind on drop" reasoning) -- reused directly rather than
-/// reimplemented, since the platform-specific locking shape is identical.
-struct TaskLock(std::fs::File);
-
-impl Drop for TaskLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_tasks(state: &StateDir, repo_slug: &str) -> CtxResult<TaskLock> {
+/// One advisory OS lock per repository's event log, shared via `state::
+/// acquire_lock` (issue #728) rather than a hand-rolled guard.
+fn lock_tasks(state: &StateDir, repo_slug: &str) -> CtxResult<super::state::FileLock> {
     let dir = state.tasks().join(repo_slug);
     create_private_dir_all(&dir)?;
-    let file = super::group::open_lock_file(&dir.join(".lock"))?;
-    file.lock()?;
-    Ok(TaskLock(file))
+    super::state::acquire_lock(&dir.join(".lock"))
 }
 
 /// Reads every parseable line in `events.jsonl`, oldest first -- a missing

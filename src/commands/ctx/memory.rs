@@ -17,7 +17,7 @@ use super::CtxResult;
 use super::adapters::AGENT_ENV;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::jev;
-use super::state::{StateDir, now_secs, repo_slug};
+use super::state::{FileLock, StateDir, now_secs, repo_slug};
 
 /// Reserved state-directory slug for the operator-owned machine-wide bank.
 /// Repository slugs contain only ASCII alphanumerics and hyphens, so the
@@ -1094,7 +1094,7 @@ pub(crate) fn upsert_shared_inner(
     entry: &Entry,
     allow_sensitive: bool,
     journal: bool,
-    _lock: &BankLock,
+    _lock: &FileLock,
 ) -> CtxResult<PathBuf> {
     if !MemoryScope::Shared.enabled(cfg) {
         let reason = MemoryScope::Shared.disabled_reason(cfg);
@@ -1318,16 +1318,16 @@ pub fn forget_scoped(
 }
 
 /// `forget_scoped`'s Shared arm, factored out so `rollback` (review round
-/// 2, finding 2) can call it while already holding the SAME `BankLock` it
+/// 2, finding 2) can call it while already holding the SAME bank lock it
 /// acquired for its own check-then-inverse, rather than going through the
 /// public `forget_scoped` (which would try to acquire a second lock on the
-/// same file and deadlock -- `BankLock`'s own doc comment). `_lock` is the
+/// same file and deadlock -- lock_bank's own doc comment). `_lock` is the
 /// same lock-proof parameter every other `_inner`/`_locked` helper takes.
 fn forget_shared_locked(
     repo: &Path,
     state: &StateDir,
     key: &str,
-    _lock: &BankLock,
+    _lock: &FileLock,
 ) -> CtxResult<ForgetOutcome> {
     let Some(path) = shared_canonical_path(repo, key) else {
         return Ok(ForgetOutcome::removed(false));
@@ -1781,16 +1781,16 @@ fn journal_path(state: &StateDir, journal_slug: &str) -> PathBuf {
 
 /// I-3: `journal_slug_for` maps `Private`/`Shared`/`Session` all to the same
 /// `journal_slug` -- one `journal.jsonl` per repository slug shared across
-/// scopes -- but those scopes hold DIFFERENT `BankLock`s (`Private`/
+/// scopes -- but those scopes hold DIFFERENT bank locks (`Private`/
 /// `Session` share `.lock`; `Shared` gets its own `shared.lock`; see
-/// `bank_lock_path`). A caller's `BankLock` therefore never serializes a
+/// `bank_lock_path`). A caller's bank lock therefore never serializes a
 /// `Shared` writer's `append_journal` against a concurrent `Private`
 /// writer's own `append_journal` on the identical file, even though
 /// `prune_journal` is read-all/rewrite-all: two racing appends can each
 /// read the file before the other's line lands, and whichever's
 /// read-modify-write finishes last silently drops the other's record. This
 /// lock is dedicated to the journal file itself, independent of whichever
-/// `BankLock` the caller already holds, so it actually serializes every
+/// bank lock the caller already holds, so it actually serializes every
 /// writer that can touch this one file, regardless of scope.
 fn journal_lock_path(state: &StateDir, journal_slug: &str) -> PathBuf {
     state.memory().join(journal_slug).join("journal.lock")
@@ -1810,7 +1810,7 @@ fn append_journal(
 ) -> CtxResult<()> {
     let dir = state.memory().join(journal_slug);
     super::state::create_private_dir_all(&dir)?;
-    // I-3: held for the whole append+prune, regardless of which BankLock
+    // I-3: held for the whole append+prune, regardless of which bank lock
     // (if any) the caller holds -- see `journal_lock_path`'s doc comment.
     let journal_lock = super::group::open_lock_file(&journal_lock_path(state, journal_slug))?;
     journal_lock.lock()?;
@@ -1919,7 +1919,7 @@ pub fn remember(
 ///
 /// `_lock` (review round 2, finding 1) is never read -- its only job is to
 /// PROVE, at the type level, that the caller already holds this bank's
-/// `BankLock` before any read-decide-write happens here. Every caller
+/// the bank lock before any read-decide-write happens here. Every caller
 /// reachable from outside this module goes through the public `remember`
 /// above, which acquires it; internal callers (`promote`, `rollback`)
 /// already hold the SAME lock for the same reason and pass it through
@@ -1930,7 +1930,7 @@ fn remember_inner(
     entry: &Entry,
     cfg: &CtxConfig,
     journal: bool,
-    _lock: &BankLock,
+    _lock: &FileLock,
 ) -> CtxResult<PathBuf> {
     no_header_newline(&entry.key, "key")?;
     let dir = state.memory().join(slug);
@@ -2057,7 +2057,7 @@ fn forget_inner(
     slug: &str,
     key: &str,
     journal: bool,
-    _lock: &BankLock,
+    _lock: &FileLock,
 ) -> CtxResult<bool> {
     let mut removed = false;
     for (path, entry) in list(state, slug)? {
@@ -2293,7 +2293,7 @@ fn remember_session_inner(
     entry: &Entry,
     cfg: &CtxConfig,
     journal: bool,
-    _lock: &BankLock,
+    _lock: &FileLock,
 ) -> CtxResult<PathBuf> {
     no_header_newline(&entry.key, "key")?;
     let dir = session_dir(state, slug, session_id);
@@ -2367,7 +2367,7 @@ fn forget_session_inner(
     session_id: &str,
     key: &str,
     journal: bool,
-    _lock: &BankLock,
+    _lock: &FileLock,
 ) -> CtxResult<bool> {
     let dir = session_dir(state, slug, session_id);
     let mut removed = false;
@@ -3365,35 +3365,27 @@ pub fn check_if_unchanged(existing: Option<&Entry>, expected: &str) -> CtxResult
     }
 }
 
-/// A held, per-memory-bank advisory OS lock (review round 2, findings 1 and
-/// 3). Acquired ONCE at each PUBLIC write entry point (`remember`, `forget`,
-/// `verify`, `upsert_shared`, `remember_session`, `verify_session`,
-/// `promote`, `rollback`, and the Shared-scope arms of `forget_scoped`/
-/// `verify_scoped`) and threaded down into every `_inner` helper as
-/// `&BankLock`, so a function that already holds the lock never tries to
-/// acquire it a second time: `std::fs::File::lock` is not re-entrant within
-/// one process -- a second lock on a second handle for the same path BLOCKS
-/// (deadlocking the caller against itself on Windows in particular), it
-/// does not silently succeed the way a re-entrant mutex would. This closes
-/// review round 1's residual gap: that round only ever locked the
-/// `--if-unchanged` path, so an ordinary unconditional `remember`/`forget`/
-/// `verify`/`promote` racing an `--if-unchanged` writer still clobbered it --
-/// the conflict check was a check, not a compare-and-swap, without every
-/// writer serializing on the same lock.
-///
-/// Lives entirely in the trusted state dir, never in the repo checkout
-/// (review round 2, finding 3): see `bank_lock_path` for the exact three
-/// paths. Mirrors `group::open_lock_file`/`task::lock_tasks`'s own
-/// advisory-lock shape exactly (same lock-file idiom, same "leave the file
-/// behind on drop" reasoning) rather than reinventing one. `unlock()` on
-/// drop is best-effort, like `GroupLock`'s/`TaskLock`'s own.
-pub(crate) struct BankLock(std::fs::File);
-
-impl Drop for BankLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
+// A held, per-memory-bank advisory OS lock (review round 2, findings 1 and
+// 3). Acquired ONCE at each PUBLIC write entry point (`remember`, `forget`,
+// `verify`, `upsert_shared`, `remember_session`, `verify_session`,
+// `promote`, `rollback`, and the Shared-scope arms of `forget_scoped`/
+// `verify_scoped`) and threaded down into every `_inner` helper as
+// `&FileLock`, so a function that already holds the lock never tries to
+// acquire it a second time: `std::fs::File::lock` is not re-entrant within
+// one process -- a second lock on a second handle for the same path BLOCKS
+// (deadlocking the caller against itself on Windows in particular), it
+// does not silently succeed the way a re-entrant mutex would. This closes
+// review round 1's residual gap: that round only ever locked the
+// `--if-unchanged` path, so an ordinary unconditional `remember`/`forget`/
+// `verify`/`promote` racing an `--if-unchanged` writer still clobbered it --
+// the conflict check was a check, not a compare-and-swap, without every
+// writer serializing on the same lock.
+//
+// Lives entirely in the trusted state dir, never in the repo checkout
+// (review round 2, finding 3): see `bank_lock_path` for the exact three
+// paths. Shares `state::FileLock`/`state::acquire_lock` (issue #728) --
+// the same shared advisory-lock guard `group.rs`/`task.rs` use -- rather
+// than a hand-rolled `BankLock` newtype.
 
 /// The lock file path for `scope`'s bank -- ALWAYS inside the trusted state
 /// dir, never the repo checkout (review round 2, finding 3: the shared
@@ -3414,18 +3406,16 @@ fn bank_lock_path(scope: MemoryScope, state: &StateDir, slug: &str) -> PathBuf {
     }
 }
 
-/// Acquires `scope`'s bank lock (see `BankLock`/`bank_lock_path`'s own doc
-/// comments), creating its parent directory first if it does not exist yet
-/// (a fresh bank with no entries yet still needs somewhere to put the lock
-/// file).
-pub(crate) fn lock_bank(scope: MemoryScope, state: &StateDir, slug: &str) -> CtxResult<BankLock> {
+/// Acquires `scope`'s bank lock (see this section's own doc comment and
+/// `bank_lock_path`'s), creating its parent directory first if it does not
+/// exist yet (a fresh bank with no entries yet still needs somewhere to put
+/// the lock file).
+pub(crate) fn lock_bank(scope: MemoryScope, state: &StateDir, slug: &str) -> CtxResult<FileLock> {
     let path = bank_lock_path(scope, state, slug);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let file = super::group::open_lock_file(&path)?;
-    file.lock()?;
-    Ok(BankLock(file))
+    super::state::acquire_lock(&path)
 }
 
 /// Moves an entry up a tier (issue #295): `zirv memory promote <key>
@@ -4106,7 +4096,7 @@ pub fn run_remember_with<W: Write>(
             // between), so that path takes the lock itself here and calls
             // the `_inner` functions directly -- the public wrappers below
             // would try to acquire a second lock on the same file and
-            // deadlock (`BankLock`'s own doc comment). Without
+            // deadlock (lock_bank's own doc comment). Without
             // `--if-unchanged`, the public wrappers' own internal locking
             // is enough.
             let path = if let Some(expected) = &args.if_unchanged {
@@ -9755,7 +9745,7 @@ This is part of the body too.\n";
 
     /// I-3: `journal_slug_for` files Private/Session AND Shared writers'
     /// journal records under the SAME `journal.jsonl`, but they hold
-    /// DIFFERENT `BankLock`s (`Private`/`Session` share `.lock`; `Shared`
+    /// DIFFERENT bank locks (`Private`/`Session` share `.lock`; `Shared`
     /// gets its own `shared.lock`) -- so nothing serialized a `Shared`
     /// writer's `append_journal` (append, then `prune_journal`'s
     /// read-all/rewrite-all) against a concurrent `Private` writer's own
@@ -10411,7 +10401,7 @@ This is part of the body too.\n";
     /// Finding 2 (review round 1): two concurrent `--if-unchanged`
     /// remembers on the same key must not both succeed. The lock is
     /// exercised directly here (spawning real concurrent processes is out
-    /// of scope for a unit test): holding the exact `BankLock` any writer
+    /// of scope for a unit test): holding the exact bank lock any writer
     /// for this scope would acquire (review round 2's `lock_bank`, not a
     /// directory-specific lock any more -- see `bank_lock_path`) must make
     /// a second, independent handle on the same lock file refuse to lock.

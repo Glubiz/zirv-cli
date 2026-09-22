@@ -736,19 +736,13 @@ fn tree_claim_path(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("tree-{}.json", tree_claim_hash(key)))
 }
 
-struct TreeClaimLock(std::fs::File);
-
-impl Drop for TreeClaimLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_tree_claim(dir: &Path) -> Result<TreeClaimLock, WriterRefusal> {
+/// Shares `state::acquire_lock` (issue #728) rather than a hand-rolled
+/// guard; `WriterRefusal::PoolExhausted` is this module's existing
+/// catch-all for "could not get exclusive access," so any lock failure
+/// maps to it exactly as before.
+fn lock_tree_claim(dir: &Path) -> Result<super::state::FileLock, WriterRefusal> {
     let path = dir.join(".lock");
-    let file = super::group::open_lock_file(&path).map_err(|_| WriterRefusal::PoolExhausted)?;
-    file.lock().map_err(|_| WriterRefusal::PoolExhausted)?;
-    Ok(TreeClaimLock(file))
+    super::state::acquire_lock(&path).map_err(|_| WriterRefusal::PoolExhausted)
 }
 
 /// Review finding (2026-09): makes "is another live writer already holding

@@ -323,27 +323,20 @@ fn lock_path(state: &StateDir, repo: &Path, delegation: &str) -> PathBuf {
     dir(state, repo).join(format!("{delegation}.lock"))
 }
 
-/// One advisory OS lock per delegation record, mirroring `group::lock_group`
-/// exactly (same `open_lock_file`, same per-record granularity, same "leave
-/// the file behind on drop" reasoning). Every read-modify-write below
-/// acquires this BEFORE its own [`load`] and holds it through the matching
-/// [`save`], so two concurrent mutators of the SAME record (`publish_
-/// terminal` racing `interrupt`, or two sweeps) can never lose one's update
-/// to the other's stale-read overwrite -- `task.rs`'s `lock_tasks` gives its
-/// own event log the identical guarantee.
-struct DelegationLock(std::fs::File);
-
-impl Drop for DelegationLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_delegation(state: &StateDir, repo: &Path, delegation: &str) -> CtxResult<DelegationLock> {
+/// One advisory OS lock per delegation record, shared via `state::
+/// acquire_lock` (issue #728) rather than a hand-rolled guard. Every
+/// read-modify-write below acquires this BEFORE its own [`load`] and holds
+/// it through the matching [`save`], so two concurrent mutators of the SAME
+/// record (`publish_terminal` racing `interrupt`, or two sweeps) can never
+/// lose one's update to the other's stale-read overwrite -- `task.rs`'s
+/// `lock_tasks` gives its own event log the identical guarantee.
+fn lock_delegation(
+    state: &StateDir,
+    repo: &Path,
+    delegation: &str,
+) -> CtxResult<super::state::FileLock> {
     create_private_dir_all(&dir(state, repo))?;
-    let file = super::group::open_lock_file(&lock_path(state, repo, delegation))?;
-    file.lock()?;
-    Ok(DelegationLock(file))
+    super::state::acquire_lock(&lock_path(state, repo, delegation))
 }
 
 /// Writes `record` to disk. Mirrors `group::create`'s private-dir-then-

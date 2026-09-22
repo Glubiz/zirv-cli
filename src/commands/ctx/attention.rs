@@ -1109,29 +1109,14 @@ fn lock_path(state: &super::state::StateDir, short: &str) -> std::path::PathBuf 
     state.attention().join(format!("{short}.lock"))
 }
 
-/// One advisory OS lock per attention record, mirroring `group.rs::GroupLock`
-/// and `seat.rs::SeatLock` (same `open_lock_file`, same "leave the file on
-/// disk" rule). Without it the load-compose-persist below is three separate
-/// syscall groups run from the permission hook, the workflow engine and the
-/// dashboard at once, and the last writer silently drops whatever the others
-/// just observed.
-struct AttentionLock(std::fs::File);
-
-impl Drop for AttentionLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 /// `None` when the lock cannot be taken. This ledger's writes are
 /// best-effort by contract (every call site must exit 0 regardless), so a
 /// lock failure degrades to the older unguarded read-modify-write rather
-/// than dropping the observation outright.
-fn lock_status(state: &super::state::StateDir, short: &str) -> Option<AttentionLock> {
+/// than dropping the observation outright. Shares `state::acquire_lock`
+/// (issue #728) rather than hand-rolling its own guard.
+fn lock_status(state: &super::state::StateDir, short: &str) -> Option<super::state::FileLock> {
     let _ = super::state::create_private_dir_all(&state.attention());
-    let file = super::group::open_lock_file(&lock_path(state, short)).ok()?;
-    file.lock().ok()?;
-    Some(AttentionLock(file))
+    super::state::acquire_lock(&lock_path(state, short)).ok()
 }
 
 /// Reads the persisted status for `short`, or a fresh default when the file
