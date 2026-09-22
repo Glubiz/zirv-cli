@@ -3144,6 +3144,75 @@ mod tests {
         );
     }
 
+    /// Issue #723: `status --agents` adds a `delegation_conditions` map
+    /// keyed by delegation id, each value the delegation's typed condition
+    /// labels in recorded order -- alongside (never replacing) the coarse
+    /// phase every other `agents[]` row already carries. Writes a record
+    /// with a non-empty `conditions` vec directly (mirroring
+    /// `attention.rs`'s own `write_delegation_record` seam) so this fails
+    /// if the `delegation_conditions.insert`/`Condition::label` mapping is
+    /// ever removed.
+    #[test]
+    fn agents_json_carries_delegation_conditions_by_id() {
+        use crate::commands::ctx::delegation::{self, Condition, ConditionReason};
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_for(&state_dir);
+        let state = StateDir::from_root(state_dir);
+
+        let handle = delegation::WorkerHandle {
+            delegation: "deleg1".to_string(),
+            attempt: 1,
+            runtime: RuntimeKind::Native,
+            worker_session: "deleg1-session".to_string(),
+            short: "deleg1short".to_string(),
+            role: "worker".to_string(),
+            task: None,
+            group: None,
+            objective: None,
+            workdir: tmp.path().to_path_buf(),
+            manifest: None,
+            plan_override: false,
+        };
+        let mut record =
+            delegation::record_launch(&state, tmp.path(), handle, None, 10).expect("launch");
+        record.conditions.push(Condition {
+            reason: ConditionReason::Launched,
+            at: 11,
+        });
+        delegation::save(&state, tmp.path(), &record).expect("save");
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+                agents: true,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("--agents output must parse as JSON: {e}\ngot: {text}"));
+        assert_eq!(
+            value["delegation_conditions"]["deleg1"],
+            serde_json::json!(["workspace_ready@10", "launched@11"]),
+            "got {text}"
+        );
+    }
+
     /// A repository with one commit, mirroring `verification.rs`'s own
     /// `git_repo()` test helper -- the `gates:` line's own git-backed check
     /// (`latest_is_fresh_and_passing`) needs something real to read.

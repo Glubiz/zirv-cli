@@ -94,9 +94,11 @@ impl Phase {
 /// `Condition.reason` is a free-form string nothing typechecks -- see
 /// this crate's tracking issue for why zirv uses a closed enum instead).
 /// Exhaustively matched on purpose: a new reason is a variant added here,
-/// never a new free-form string. Payload strings (`TaskBlocked`) are the
-/// SAME free text the deciding call site already carries (`task::Block::
-/// reason`), never new prose minted by this module.
+/// never a new free-form string.
+///
+/// Refusals (a blocked task card, an exhausted group) have no variant: both
+/// are decided before a delegation `Record` exists, so there is nothing to
+/// write them to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConditionReason {
@@ -109,16 +111,9 @@ pub enum ConditionReason {
     /// This delegation's `--task` card was claimed before it launched
     /// (`task::claim_locked`, taken by the caller).
     TaskClaimed,
-    /// This delegation's `--task` card is blocked; the payload is
-    /// `task::Block::reason` verbatim, never new prose.
-    TaskBlocked(String),
     /// This delegation's `--group` admitted it within its token budget
     /// (`group::admit_child`).
     BudgetOk,
-    /// This delegation's `--group` refused admission: its token budget or
-    /// deadline is exhausted (`group::admit_child`,
-    /// `group::AdmissionExhausted`).
-    BudgetExhausted,
     /// [`publish_terminal`]: this attempt produced a report/summary.
     Reporting,
     /// A declared `--result-schema`/`--result-kind` contract was satisfied
@@ -142,17 +137,13 @@ pub struct Condition {
 impl Condition {
     /// A compact, stable rendering for a text surface (`worker_status`'s
     /// MCP tool, `zirv ctx status`) that has no business depending on this
-    /// enum's own shape -- `"<reason>@<unix time>"`, with `TaskBlocked`'s
-    /// payload appended after a colon, exactly the free text
-    /// `task::Block::reason` already carries.
+    /// enum's own shape -- `"<reason>@<unix time>"`.
     pub fn label(&self) -> String {
         let reason = match &self.reason {
             ConditionReason::WorkspaceReady => "workspace_ready".to_string(),
             ConditionReason::Launched => "launched".to_string(),
             ConditionReason::TaskClaimed => "task_claimed".to_string(),
-            ConditionReason::TaskBlocked(reason) => format!("task_blocked: {reason}"),
             ConditionReason::BudgetOk => "budget_ok".to_string(),
-            ConditionReason::BudgetExhausted => "budget_exhausted".to_string(),
             ConditionReason::Reporting => "reporting".to_string(),
             ConditionReason::ContractValid => "contract_valid".to_string(),
             ConditionReason::ContractFailed => "contract_failed".to_string(),
@@ -1793,80 +1784,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    /// Acceptance criterion 3: a blocked task card's condition carries the
-    /// SAME text `Card::block.reason` stores, never new prose.
-    #[test]
-    fn a_blocked_tasks_condition_carries_the_cards_own_reason_text() {
-        use crate::commands::ctx::task;
-
-        let card = task::Card {
-            id: "t1".to_string(),
-            repo_slug: "repo".to_string(),
-            title: "title".to_string(),
-            brief: "brief".to_string(),
-            state: task::State::Ready,
-            parents: Vec::new(),
-            claim: None,
-            block: None,
-            comments: Vec::new(),
-            workdir: None,
-            group_id: None,
-            outcome: None,
-            attempts: 0,
-            created_at: 0,
-            updated_at: 0,
-        };
-        let blocked = task::block(&card, "waiting on review", "sess-1", 10).expect("block");
-        let block = blocked.block.expect("block always sets it");
-
-        let condition = Condition {
-            reason: ConditionReason::TaskBlocked(block.reason.clone()),
-            at: 10,
-        };
-        assert_eq!(
-            condition.reason,
-            ConditionReason::TaskBlocked("waiting on review".to_string())
-        );
-        assert_eq!(block.reason, "waiting on review");
-    }
-
-    /// Acceptance criterion 4: an exhausted group produces `BudgetExhausted`
-    /// before any launch attempt is made -- `group::admit_child` refuses
-    /// admission entirely on its own, with no delegation ever recorded.
-    #[test]
-    fn an_exhausted_groups_admission_maps_to_budget_exhausted_before_any_launch() {
-        use crate::commands::ctx::group;
-
-        let (_dir, state, repo, _cfg) = fixture();
-        let exhausted = group::WorkGroup {
-            work_group_id: "g1".to_string(),
-            parent_session_id: "sess-parent".to_string(),
-            scope: "batch".to_string(),
-            child_limit: 3,
-            token_budget: Some(100),
-            spent_tokens: 100,
-            reserved_tokens: 0,
-            deadline_secs: None,
-            completion_contract: "reports by mail".to_string(),
-            created_at: 0,
-            closed_at: None,
-            admitted_children: 0,
-            sub_orchestrator_session: None,
-        };
-        group::create(&state, &exhausted).expect("create group");
-
-        let error = group::admit_child(&state, "g1", 10, None).expect_err("budget is exhausted");
-        assert!(group::is_admission_exhausted(error.as_ref()));
-
-        let condition = Condition {
-            reason: ConditionReason::BudgetExhausted,
-            at: 10,
-        };
-        assert_eq!(condition.reason, ConditionReason::BudgetExhausted);
-        // No delegation was ever launched for this admission attempt.
-        assert!(list(&state, &repo).is_empty());
     }
 
     #[test]
