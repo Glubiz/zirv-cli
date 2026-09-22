@@ -439,9 +439,13 @@ recomputed from the merged complexity and risk, so a raise always
 propagates. `execution`, seat tier, worker tier and seat role then derive
 entirely from that merged `complexity`: Trivial → direct/cheap/single seat,
 Bounded → bounded/standard/single seat, Substantial or Architectural →
-orchestrated/frontier/orchestrator seat — floored upward when risk reaches
+orchestrated/orchestrator seat — floored upward when risk reaches
 High (at least Bounded) or the request names a security surface, and a
-Direct execution always clears any chosen workflow back to none. The
+Direct execution always clears any chosen workflow back to none. An
+orchestrated seat runs the frontier tier only for Architectural complexity
+or High-or-worse risk; a Substantial one stays on the standard tier. When a
+workflow starts, the proxy layer names its id so the seat can run
+`zirv workflow status` and follow the current step. The
 winning decision is then validated against the live roster (an unready
 harness falls back to the baseline harness, its model re-derived for the
 decision's own seat tier; an unknown workflow id falls back to the baseline)
@@ -501,7 +505,7 @@ first prompt when the repo has no workflow already active; and one `zirv ▸`
 line announces the outcome, e.g.:
 
 ```
-zirv ▸ proxy: orchestrated · orchestrator claude/fable (frontier) · workers standard · workflow feature (substantial/medium) · typesafe 0.81
+zirv ▸ proxy: orchestrated · orchestrator claude/sonnet (standard) · workers standard · workflow feature (substantial/medium) · typesafe 0.81
 zirv ▸ proxy: direct · single seat · claude/sonnet (cheap) · no workflow · typesafe 0.75
 ```
 
@@ -2196,8 +2200,11 @@ persists that choice across resume and prompt composition. Repository skills are
 they can request logical capabilities but never grant themselves filesystem,
 shell, network, or other permissions.
 
-Every session that does real work -- worker, single-seat, sub-orchestrator,
-and orchestrator -- carries a standing skill index: one line per
+An orchestrator or sub-orchestrator seat carries a standing skill index; a
+worker or single-seat session instead gets one fixed pointer line (run
+`zirv skill list`, then `zirv skill load <id>`), because a headless worker
+pays the full catalogue on every turn and loads a skill in only a small
+share of runs. The index is one line per
 implicit-activation skill (`- <id>: <first sentence>`, the first sentence of
 the skill's own description, a repository-layer skill marked
 `(repository-untrusted)`), in a stable, task-independent layer so it never
@@ -5886,6 +5893,12 @@ command, remaining arguments, source, paths, tokens, or shell secrets.
 are checked before `allow`); `allow`, both defaults, and `sql` may not. A
 checkout cannot grant itself approval, loosen either launch posture, or turn
 off the conservative SQL narrowing.
+
+A recursive delete whose every target sits inside the OS temp root (or
+`/tmp`, `/var/tmp`) is allowed by the hook even under the shipped `rm -rf`
+ask rule, so an agent can clear its own scratch directory. A headless launch
+still projects the ask set into `--disallowedTools`, which Claude Code
+checks before the hook, so there the delete stays blocked.
 
 Three verbs work with the resolved policy directly:
 
