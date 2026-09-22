@@ -275,8 +275,9 @@ pub struct AgentArgs {
     /// `path_scope`, read-only `mode`), where the stricter value always
     /// wins regardless of source. Relative paths inside the manifest
     /// (`workdir`, `result.schema`, `path_scope`) resolve against the
-    /// manifest file's own directory. No `agent: <AgentManifest id>`
-    /// field: see `agent_manifest`'s own doc comment for why v1 drops it.
+    /// manifest file's own directory. An optional `agent: <AgentManifest
+    /// id>` YAML field supplies skill defaults and capability floors; it has
+    /// no direct CLI spelling.
     #[arg(long)]
     pub manifest: Option<PathBuf>,
     /// Issue #452: print a machine-readable delegation receipt instead of
