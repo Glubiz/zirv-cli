@@ -3818,7 +3818,6 @@ fn goal_bootstrap_envelope(
 }
 
 fn run_goal_bootstrap(
-    goal: &str,
     args: &AgentArgs,
     cfg: &CtxConfig,
     state: &StateDir,
@@ -3827,6 +3826,10 @@ fn run_goal_bootstrap(
     budget_tokens: Option<u64>,
     env: EnvLookup<'_>,
 ) -> CtxResult<()> {
+    let goal = args
+        .goal
+        .as_deref()
+        .ok_or("goal bootstrap called without --goal")?;
     let adapter = adapters::select(Some(&args.name), &[], cfg)?;
     let mut command =
         adapters::policy_launch_args(cfg, adapter.as_ref(), &[], adapters::LaunchMode::Headless);
@@ -5060,9 +5063,8 @@ pub fn run_with<W: Write>(
     // target): only the actual worker launch reads `launch_repo`, computed
     // above (ahead of `command`) rather than here.
 
-    if let Some(goal) = args.goal.as_deref() {
-        if let Err(error) = run_goal_bootstrap(
-            goal,
+    if args.goal.is_some()
+        && let Err(error) = run_goal_bootstrap(
             args,
             &cfg,
             &state,
@@ -5070,37 +5072,37 @@ pub fn run_with<W: Write>(
             &parent_envelope,
             worker_budget.tokens,
             &env,
-        ) {
-            drop(writer_permit);
-            if let Some(id) = &args.group {
-                super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
-            }
-            release_reservation();
-            discard_minted_group();
-            finish_task_card(
-                &state,
-                repo,
-                &cfg,
-                args,
-                super::task::ExitKind::Crash,
-                "goal bootstrap failed",
-                super::state::now_secs(),
-            );
-            if args.json {
-                let receipt = launch_failure_receipt(
-                    args,
-                    model.as_deref(),
-                    Some(&worker_session),
-                    Some(&launch_repo),
-                    Some(2),
-                    error.to_string(),
-                    &capability_warnings,
-                );
-                print_receipt(w, &receipt)?;
-                return Ok(2);
-            }
-            return Err(error);
+        )
+    {
+        drop(writer_permit);
+        if let Some(id) = &args.group {
+            super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
         }
+        release_reservation();
+        discard_minted_group();
+        finish_task_card(
+            &state,
+            repo,
+            &cfg,
+            args,
+            super::task::ExitKind::Crash,
+            "goal bootstrap failed",
+            super::state::now_secs(),
+        );
+        if args.json {
+            let receipt = launch_failure_receipt(
+                args,
+                model.as_deref(),
+                Some(&worker_session),
+                Some(&launch_repo),
+                Some(2),
+                error.to_string(),
+                &capability_warnings,
+            );
+            print_receipt(w, &receipt)?;
+            return Ok(2);
+        }
+        return Err(error);
     }
 
     let exec_args = ExecArgs {

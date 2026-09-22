@@ -228,6 +228,14 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::File("", ".jsonl"),
         &["commands/ctx/worktree.rs"],
     ),
+    // Issue #717: completed workspace setup steps are grouped beneath the
+    // source repository slug, alongside the existing worktree ownership
+    // file but in a directory of per-checkout JSONL files.
+    (
+        "worktrees",
+        SlugEntry::Directory,
+        &["commands/ctx/workspace.rs"],
+    ),
     (
         "objective",
         SlugEntry::File("", ".json"),
@@ -1404,6 +1412,27 @@ mod tests {
             };
             assert_eq!(std::fs::read_to_string(payload).expect("read"), "retained");
         }
+    }
+
+    #[test]
+    fn legacy_workspace_setup_progress_moves_with_its_repository_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp
+            .path()
+            .join("worktrees")
+            .join("legacy")
+            .join("abcd1234-setup.jsonl");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&source, "completed-step").expect("write");
+
+        adopt_legacy_slug_state(tmp.path(), "legacy", "current");
+
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("worktrees/current/abcd1234-setup.jsonl"))
+                .expect("migrated progress"),
+            "completed-step"
+        );
     }
 
     #[test]
