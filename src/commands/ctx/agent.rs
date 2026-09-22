@@ -173,6 +173,10 @@ pub struct AgentArgs {
     /// worker launches. Harness runtime only.
     #[arg(long)]
     pub goal: Option<String>,
+    /// Internal synchronous-dispatch request for callers that must consume
+    /// the completed result before they can continue.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub inline: bool,
     /// Internal result of `--manifest agent:` resolution. This has no CLI
     /// spelling: it is intentionally populated only by the untrusted
     /// delegation-manifest merge, then used for skill defaults.
@@ -345,6 +349,7 @@ impl Default for AgentArgs {
             worktree: false,
             workspace: None,
             goal: None,
+            inline: false,
             manifest_agent: None,
             attach_artifact: None,
             workflow: None,
@@ -3800,6 +3805,48 @@ struct BootstrapCompletion {
     evidence: String,
 }
 
+struct GoalBootstrapError {
+    error: Box<dyn std::error::Error>,
+    usage: Option<TranscriptUsage>,
+    exit_code: Option<i32>,
+}
+
+impl std::fmt::Display for GoalBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::fmt::Debug for GoalBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for GoalBootstrapError {}
+
+impl GoalBootstrapError {
+    fn before_launch(error: impl Into<Box<dyn std::error::Error>>) -> Self {
+        Self {
+            error: error.into(),
+            usage: None,
+            exit_code: None,
+        }
+    }
+
+    fn after_launch(
+        error: impl Into<Box<dyn std::error::Error>>,
+        usage: TranscriptUsage,
+        exit_code: i32,
+    ) -> Self {
+        Self {
+            error: error.into(),
+            usage: Some(usage),
+            exit_code: Some(exit_code),
+        }
+    }
+}
+
 const BOOTSTRAP_SYSTEM_PROMPT: &str = "Prepare only the local development environment needed for the operator goal. Do not edit business logic, delegate, or run `zirv ctx agent`. Report only the environment preparation performed. Your final response must contain JSON: {\"status\":\"Done\",\"evidence\":\"...\"}.";
 
 fn goal_bootstrap_envelope(
@@ -3826,12 +3873,13 @@ fn run_goal_bootstrap(
     parent_envelope: &envelope::WorkerEnvelope,
     budget_tokens: Option<u64>,
     env: EnvLookup<'_>,
-) -> CtxResult<()> {
+) -> Result<TranscriptUsage, GoalBootstrapError> {
     let goal = args
         .goal
         .as_deref()
-        .ok_or("goal bootstrap called without --goal")?;
-    let adapter = adapters::select(Some(&args.name), &[], cfg)?;
+        .ok_or_else(|| GoalBootstrapError::before_launch("goal bootstrap called without --goal"))?;
+    let adapter =
+        adapters::select(Some(&args.name), &[], cfg).map_err(GoalBootstrapError::before_launch)?;
     let mut command =
         adapters::policy_launch_args(cfg, adapter.as_ref(), &[], adapters::LaunchMode::Headless);
     if let Some(model) = adapters::resolve_tiered_model(
@@ -3843,18 +3891,22 @@ fn run_goal_bootstrap(
     }
     let system_prompt_args = adapter.system_prompt_args(BOOTSTRAP_SYSTEM_PROMPT);
     if system_prompt_args.is_empty() {
-        return Err(format!(
+        return Err(GoalBootstrapError::before_launch(format!(
             "goal bootstrap cannot run on adapter '{}': it has no verified system-prompt channel",
             adapter.name()
-        )
-        .into());
+        )));
     }
     command.extend(system_prompt_args);
 
     let session = SessionId::new_v4().to_string();
     let (bootstrap_envelope, principal) =
-        goal_bootstrap_envelope(args, parent_envelope, &session, budget_tokens)
-            .map_err(|error| format!("goal bootstrap envelope refused: {error}"))?;
+        goal_bootstrap_envelope(args, parent_envelope, &session, budget_tokens).map_err(
+            |error| {
+                GoalBootstrapError::before_launch(format!(
+                    "goal bootstrap envelope refused: {error}"
+                ))
+            },
+        )?;
     let envelope_json = envelope::canonical_json(&bootstrap_envelope).ok();
     let envelope_sha256 = envelope::digest(&bootstrap_envelope).ok();
     let parent_session = super::mail::session_identity(env).unwrap_or_default();
@@ -3918,11 +3970,10 @@ fn run_goal_bootstrap(
                     envelope_sha256: envelope_sha256.as_deref(),
                 },
             );
-            return Err(format!(
+            return Err(GoalBootstrapError::before_launch(format!(
                 "goal bootstrap failed to launch: {error}; diagnostic result: {}",
                 path.display()
-            )
-            .into());
+            )));
         }
     };
     let final_session = report
@@ -3977,7 +4028,7 @@ fn run_goal_bootstrap(
     } else {
         "bootstrap-failed"
     };
-    append_execution_segments(
+    let usage = append_execution_segments(
         state,
         &report,
         &parent_session,
@@ -3990,13 +4041,16 @@ fn run_goal_bootstrap(
         envelope_sha256.as_deref(),
     );
     if code != 0 || !valid {
-        return Err(format!(
-            "goal bootstrap refused main worker launch (exit {code}; current explicit Done report with non-empty evidence required); diagnostic result: {}",
-            path.display()
-        )
-        .into());
+        return Err(GoalBootstrapError::after_launch(
+            format!(
+                "goal bootstrap refused main worker launch (exit {code}; current explicit Done report with non-empty evidence required); diagnostic result: {}",
+                path.display()
+            ),
+            usage,
+            code,
+        ));
     }
-    Ok(())
+    Ok(usage)
 }
 
 pub fn run_with<W: Write>(
@@ -4606,10 +4660,10 @@ pub fn run_with<W: Write>(
         eprintln!("{warning}");
     }
 
-    // 2026-09-06: there is no opt-out any more. A delegation is a visible
-    // pane whenever any live dashboard can host it, and the supervised child
-    // runs in this terminal only when none can (`Dispatch::Inline`, which
-    // announces itself). It is never an invisible stdout-captured child.
+    // A normal delegation is a visible pane whenever any live dashboard can
+    // host it. Issue #733's hidden synchronous request lets an internal
+    // caller such as workflow review consume the completed result inline;
+    // `--goal` also stays inline so preparation gates the same main process.
     //
     // Issue #452: under `--json` the human lines `try_join_dashboard` would
     // otherwise print (capability warnings, the spawn-ack line, the workdir
@@ -4620,10 +4674,12 @@ pub fn run_with<W: Write>(
     // structured `AnswerFacts` alongside `Dispatch::Answered` below
     // (`dashboard_answer_receipt`), not from this buffer's text.
     let mut dash_buf: Vec<u8> = Vec::new();
-    let dispatch = if args.goal.is_some() {
-        eprintln!(
-            "zirv ctx agent: --goal preparation runs synchronously; running this delegation inline"
-        );
+    let dispatch = if args.inline || args.goal.is_some() {
+        if args.goal.is_some() {
+            eprintln!(
+                "zirv ctx agent: --goal preparation runs synchronously; running this delegation inline"
+            );
+        }
         Dispatch::Inline {
             no_dashboard: false,
         }
@@ -4922,6 +4978,15 @@ pub fn run_with<W: Write>(
             let _ = super::reservation::release(&state, provider, id);
         }
     };
+    let settle_initial_reservation = |actual| {
+        if let Some(id) = args.group.as_deref() {
+            let _ =
+                super::group::settle_reservation(&state, id, reserved_ceiling.unwrap_or(0), actual);
+        }
+        if let Some(id) = &reservation_id {
+            let _ = super::reservation::settle(&state, provider, id, actual);
+        }
+    };
 
     // Issue #262: this worker's own delegation envelope, computed by
     // narrowing `parent_envelope` against what THIS delegation is asking
@@ -4938,7 +5003,7 @@ pub fn run_with<W: Write>(
         principal.clone(),
         worker_budget.tokens,
     );
-    let child_envelope =
+    let mut child_envelope =
         match envelope::WorkerEnvelope::narrow(&parent_envelope, &requested_envelope) {
             Ok(envelope) => envelope,
             Err(err) => {
@@ -4961,11 +5026,6 @@ pub fn run_with<W: Write>(
                 return Ok(2);
             }
         };
-    let envelope_json = envelope::canonical_json(&child_envelope)
-        .ok()
-        .filter(|s| !s.is_empty());
-    let env = envelope_env(&env, envelope_json, Some(principal.clone()));
-
     // Issue #267: a `writing` worker holds a writer permit for its WHOLE
     // lifetime, refused up front -- before any child ever launches -- when
     // another live writer already holds `launch_repo`'s own tree. A
@@ -5064,30 +5124,92 @@ pub fn run_with<W: Write>(
     // target): only the actual worker launch reads `launch_repo`, computed
     // above (ahead of `command`) rather than here.
 
-    if args.goal.is_some()
-        && let Err(error) = run_goal_bootstrap(
+    let bootstrap_usage = if args.goal.is_some() {
+        match run_goal_bootstrap(
             args,
             &cfg,
             &state,
             &launch_repo,
             &parent_envelope,
-            worker_budget.tokens,
+            child_envelope.token_budget,
             &env,
-        )
-    {
-        drop(writer_permit);
-        if let Some(id) = &args.group {
-            super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+        ) {
+            Ok(usage) => usage,
+            Err(error) => {
+                drop(writer_permit);
+                if let Some(usage) = &error.usage {
+                    settle_initial_reservation(token_spend(usage));
+                } else {
+                    if let Some(id) = &args.group {
+                        super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+                    }
+                    release_reservation();
+                }
+                discard_minted_group();
+                finish_task_card(
+                    &state,
+                    repo,
+                    &cfg,
+                    args,
+                    super::task::ExitKind::Crash,
+                    "goal bootstrap failed",
+                    super::state::now_secs(),
+                );
+                if error.exit_code == Some(exec::EXIT_BUDGET_EXHAUSTED) {
+                    let code = exec::EXIT_BUDGET_EXHAUSTED;
+                    if args.json {
+                        let receipt = launch_failure_receipt(
+                            args,
+                            model.as_deref(),
+                            Some(&worker_session),
+                            Some(&launch_repo),
+                            Some(code),
+                            error.to_string(),
+                            &capability_warnings,
+                        );
+                        print_receipt(w, &receipt)?;
+                    } else {
+                        writeln!(w, "{}: {error}", delegation_outcome(code))?;
+                    }
+                    return Ok(code);
+                }
+                if args.json {
+                    let receipt = launch_failure_receipt(
+                        args,
+                        model.as_deref(),
+                        Some(&worker_session),
+                        Some(&launch_repo),
+                        Some(2),
+                        error.to_string(),
+                        &capability_warnings,
+                    );
+                    print_receipt(w, &receipt)?;
+                    return Ok(2);
+                }
+                return Err(error.into());
+            }
         }
-        release_reservation();
+    } else {
+        TranscriptUsage::default()
+    };
+    let bootstrap_spend = token_spend(&bootstrap_usage);
+    let remaining_budget = child_envelope
+        .token_budget
+        .map(|limit| limit.saturating_sub(bootstrap_spend));
+    if child_envelope.token_budget.is_some() && remaining_budget == Some(0) {
+        drop(writer_permit);
+        settle_initial_reservation(bootstrap_spend);
         discard_minted_group();
+        let code = exec::EXIT_BUDGET_EXHAUSTED;
+        let reason =
+            "goal bootstrap spent the delegation token budget; main worker was not launched";
         finish_task_card(
             &state,
             repo,
             &cfg,
             args,
             super::task::ExitKind::Crash,
-            "goal bootstrap failed",
+            reason,
             super::state::now_secs(),
         );
         if args.json {
@@ -5096,15 +5218,21 @@ pub fn run_with<W: Write>(
                 model.as_deref(),
                 Some(&worker_session),
                 Some(&launch_repo),
-                Some(2),
-                error.to_string(),
+                Some(code),
+                reason.to_string(),
                 &capability_warnings,
             );
             print_receipt(w, &receipt)?;
-            return Ok(2);
+        } else {
+            writeln!(w, "{}: {reason}", delegation_outcome(code))?;
         }
-        return Err(error);
+        return Ok(code);
     }
+    child_envelope.token_budget = remaining_budget;
+    let envelope_json = envelope::canonical_json(&child_envelope)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let env = envelope_env(&env, envelope_json, Some(principal.clone()));
 
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
@@ -5118,7 +5246,7 @@ pub fn run_with<W: Write>(
         prompt: Some(prompt),
         max_restarts: args.max_restarts,
         timeout_secs: args.timeout_secs,
-        budget_tokens: worker_budget.tokens,
+        budget_tokens: remaining_budget,
         max_tool_calls: worker_budget.tool_calls,
         // Not exposed on `zirv ctx agent` (issue #285 scoped `--objective`
         // to `exec`/`loop`): a delegated worker's own repository picks up
@@ -5155,11 +5283,13 @@ pub fn run_with<W: Write>(
         match exec::run_with_report(&exec_args, w, &launch_repo, &env) {
             Ok(result) => result,
             Err(e) => {
-                if let Some(id) = &args.group {
-                    super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
-                }
-                if let Some(reservation_id) = &reservation_id {
-                    let _ = super::reservation::release(&state, provider, reservation_id);
+                if args.goal.is_some() {
+                    settle_initial_reservation(bootstrap_spend);
+                } else {
+                    if let Some(id) = &args.group {
+                        super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+                    }
+                    release_reservation();
                 }
                 // Finding 4: with the admission rolled back the group is pristine
                 // again, so a group this invocation minted for a launch that
@@ -5608,12 +5738,13 @@ pub fn run_with<W: Write>(
             &principal,
             envelope_sha256.as_deref(),
         );
+        let aggregate_spend = bootstrap_spend.saturating_add(token_spend(&total));
         if let Some(id) = args.group.as_deref() {
             let _ = super::group::settle_reservation(
                 &state_dir,
                 id,
                 reserved_ceiling.unwrap_or(0),
-                token_spend(&total),
+                aggregate_spend,
             );
         }
         // Finding #4 (issue #358 review): a mid-run harness-handover
@@ -5631,7 +5762,7 @@ pub fn run_with<W: Write>(
             .map(|(id, provider)| (id.as_str(), *provider))
             .or_else(|| reservation_id.as_deref().map(|id| (id, provider)));
         if let Some((id, provider)) = settle_reservation {
-            let _ = super::reservation::settle(&state_dir, provider, id, token_spend(&total));
+            let _ = super::reservation::settle(&state_dir, provider, id, aggregate_spend);
         }
         let route: Vec<String> = execution_report
             .segments
@@ -8254,6 +8385,7 @@ mod tests {
             worktree: false,
             workspace: None,
             goal: None,
+            inline: false,
             manifest_agent: None,
             attach_artifact: None,
             workflow: None,
@@ -10583,6 +10715,111 @@ mod tests {
     }
 
     #[test]
+    fn goal_bootstrap_spend_reduces_the_main_request_budget_and_group_settlement() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = StateDir::from_root(state_path.clone());
+        create_work_group_with_spend(&state, "wg-goal-cap", 1_000_000, 10);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "bootstrap-ok\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_TURNS", Some("1")),
+        ]);
+        let mut env = base_env(&state_path);
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "main uses only what remains");
+        args.goal = Some("prepare it".into());
+        args.group = Some("wg-goal-cap".into());
+        args.budget_tokens = Some(70_000);
+
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect("budget exhaustion is a structured exit");
+
+        assert_eq!(code, exec::EXIT_BUDGET_EXHAUSTED);
+        let rows = super::super::log::read_delegations(&state, 10);
+        assert_eq!(rows.len(), 2, "bootstrap and main are accounted separately");
+        let bootstrap_spend = rows
+            .iter()
+            .find(|row| row.outcome == "bootstrap-ok")
+            .map(|row| {
+                row.input_tokens
+                    .saturating_add(row.cache_creation_input_tokens)
+                    .saturating_add(row.cache_read_input_tokens)
+                    .saturating_add(row.output_tokens)
+            })
+            .expect("bootstrap row");
+        assert!(
+            bootstrap_spend > 30_000 && bootstrap_spend < 70_000,
+            "the main succeeds under the original request cap but exhausts only the reduced remainder"
+        );
+        let aggregate_spend = rows.iter().fold(0_u64, |total, row| {
+            total
+                .saturating_add(row.input_tokens)
+                .saturating_add(row.cache_creation_input_tokens)
+                .saturating_add(row.cache_read_input_tokens)
+                .saturating_add(row.output_tokens)
+        });
+        assert_eq!(
+            super::super::group::load(&state, "wg-goal-cap")
+                .expect("load")
+                .expect("group")
+                .spent_tokens,
+            10 + aggregate_spend,
+            "one reservation settles bootstrap and main spend together"
+        );
+    }
+
+    #[test]
+    fn a_group_budget_spent_by_goal_bootstrap_never_admits_the_main_worker() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let state = StateDir::from_root(state_path.clone());
+        create_work_group_with_spend(&state, "wg-goal-exhausted", 30_000, 0);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "bootstrap-ok\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_TURNS", Some("1")),
+        ]);
+        let mut env = base_env(&state_path);
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "main must not launch");
+        args.goal = Some("prepare it".into());
+        args.group = Some("wg-goal-exhausted".into());
+
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect("budget exhaustion is a structured exit");
+
+        assert_eq!(code, exec::EXIT_BUDGET_EXHAUSTED);
+        assert_eq!(
+            std::fs::read_to_string(modes).expect("modes"),
+            "healthy\n",
+            "the main worker must not consume its scripted launch"
+        );
+        let rows = super::super::log::read_delegations(&state, 10);
+        assert_eq!(rows.len(), 1, "only bootstrap usage is recorded");
+        let bootstrap_spend = rows[0]
+            .input_tokens
+            .saturating_add(rows[0].cache_creation_input_tokens)
+            .saturating_add(rows[0].cache_read_input_tokens)
+            .saturating_add(rows[0].output_tokens);
+        let group = super::super::group::load(&state, "wg-goal-exhausted")
+            .expect("load")
+            .expect("group");
+        assert_eq!(group.reserved_tokens, 0);
+        assert_eq!(group.spent_tokens, bootstrap_spend);
+    }
+
+    #[test]
     fn goal_bootstrap_is_a_depth_zero_sibling_with_request_floors() {
         let mut parent = envelope::WorkerEnvelope {
             principal: "root/requester".into(),
@@ -10626,10 +10863,14 @@ mod tests {
             ("FAKE_AGENT_MODE_FILE", modes.to_str()),
             ("FAKE_AGENT_ARGV_LOG", argv.to_str()),
         ]);
-        let mut env = base_env(&tmp.path().join("state"));
+        let state_path = tmp.path().join("state");
+        let state = StateDir::from_root(state_path.clone());
+        create_work_group_with_spend(&state, "wg-blocked-bootstrap", 1_000_000, 0);
+        let mut env = base_env(&state_path);
         env.insert("ZIRV_CTX_PACE".into(), "false".into());
         let mut args = args_for("claude", "main must not run");
         args.goal = Some("prepare it".into());
+        args.group = Some("wg-blocked-bootstrap".into());
 
         let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
             env.get(key).cloned()
@@ -10657,7 +10898,6 @@ mod tests {
             1,
             "the failed bootstrap keeps one diagnostic result"
         );
-        let state = StateDir::from_root(tmp.path().join("state"));
         let rows = super::super::log::tail_delegations(&state, 10).expect("ledger");
         assert_eq!(
             rows.len(),
@@ -10665,6 +10905,26 @@ mod tests {
             "main worker must have no ledger row: {rows:?}"
         );
         assert!(rows[0].contains("bootstrap-failed"));
+        let records = super::super::log::read_delegations(&state, 10);
+        let row = records.first().expect("delegation row");
+        let bootstrap_spend = row
+            .input_tokens
+            .saturating_add(row.cache_creation_input_tokens)
+            .saturating_add(row.cache_read_input_tokens)
+            .saturating_add(row.output_tokens);
+        let group = super::super::group::load(&state, "wg-blocked-bootstrap")
+            .expect("load")
+            .expect("group");
+        assert_eq!(group.reserved_tokens, 0);
+        assert_eq!(
+            group.spent_tokens, bootstrap_spend,
+            "rejected bootstrap usage must settle instead of rolling back"
+        );
+        let provider = super::super::adapters::provider_for_agent_name(Some("claude"));
+        assert!(
+            super::super::reservation::entries(&state, provider).is_empty(),
+            "the rejected bootstrap must settle and remove its provider reservation"
+        );
     }
 
     #[test]
@@ -10826,6 +11086,32 @@ mod tests {
             requests.is_empty(),
             "--goal must bypass pane requests: {requests:?}"
         );
+    }
+
+    #[test]
+    fn an_internal_inline_request_completes_without_spawning_a_dashboard_pane() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_AGENT_MODE", Some("healthy"))]);
+        let (requests, mut env) = live_dashboard_dir(tmp.path());
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = joinable_args("claude", "review synchronously");
+        args.inline = true;
+
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect("inline delegation completes");
+
+        assert_eq!(code, 0);
+        let requests: Vec<_> = std::fs::read_dir(requests)
+            .expect("requests")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(requests.is_empty(), "internal inline request: {requests:?}");
     }
 
     #[test]

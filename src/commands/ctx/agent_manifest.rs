@@ -376,6 +376,7 @@ mod tests {
             worktree: false,
             workspace: None,
             goal: None,
+            inline: false,
             manifest_agent: None,
             attach_artifact: None,
             workflow: None,

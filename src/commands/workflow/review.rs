@@ -2765,6 +2765,7 @@ pub(crate) fn reviewer_argv(
             RuntimeKind::Native.as_str().to_string(),
             "--mode".to_string(),
             "read-only".to_string(),
+            "--inline".to_string(),
             "--system-prompt".to_string(),
             system_prompt,
         ];
@@ -2831,9 +2832,9 @@ pub(crate) fn reviewer_argv(
     // load-bearing half is the read-only floor; `--mode read-only` states
     // that as a request field instead, which `dash::worker_pane_extra_args`
     // re-applies server-side from this adapter's own read-only pin. A
-    // pane-fulfilled review is already a first-class outcome here --
-    // `ReviewerRun::dashboard_spawn` records no evidence and waits for the
-    // worker's own report -- so this stays one argv, not two paths.
+    // Issue #733: `--inline` below keeps this caller synchronous so it can
+    // validate and persist completed review evidence even when a dashboard
+    // is live.
     //
     // R1-4: the seat instructions state that the same way -- `--system-
     // prompt`, a zirv flag, which travels on the request as data instead of
@@ -2844,6 +2845,7 @@ pub(crate) fn reviewer_argv(
         "-".to_string(),
         "--mode".to_string(),
         "read-only".to_string(),
+        "--inline".to_string(),
         "--system-prompt".to_string(),
         system_prompt,
     ];
@@ -4325,7 +4327,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            &argv[..7],
+            &argv[..8],
             [
                 "agent",
                 "fast-review",
@@ -4334,14 +4336,15 @@ mod tests {
                 "native",
                 "--mode",
                 "read-only",
+                "--inline",
             ],
             "the route replaces the adapter name and the read-only pin stays: {argv:?}"
         );
-        assert_eq!(argv[7], "--system-prompt");
+        assert_eq!(argv[8], "--system-prompt");
         assert!(
-            argv[8].contains("zirv workflow agent seat: reviewer@"),
+            argv[9].contains("zirv workflow agent seat: reviewer@"),
             "the seat instructions must still travel as data: {}",
-            argv[8]
+            argv[9]
         );
         assert!(
             !argv.iter().any(|argument| argument == "--"),
@@ -4385,13 +4388,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            &claude[..6],
+            &claude[..7],
             [
                 "agent",
                 "claude",
                 "-",
                 "--mode",
                 "read-only",
+                "--inline",
                 "--system-prompt"
             ],
             "2026-09-06: no `--headless` -- the reviewer states its read-only floor and (R1-4) its \
@@ -4399,7 +4403,7 @@ mod tests {
              server-side"
         );
         assert_eq!(
-            claude.get(7).map(String::as_str),
+            claude.get(8).map(String::as_str),
             Some("--"),
             "the seat text is one argv token, and the passthrough separator follows it: {claude:?}"
         );
@@ -4447,13 +4451,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            &codex[..6],
+            &codex[..7],
             [
                 "agent",
                 "codex",
                 "-",
                 "--mode",
                 "read-only",
+                "--inline",
                 "--system-prompt"
             ]
         );
@@ -4572,6 +4577,10 @@ mod tests {
         let CtxVerb::Agent(args) = parsed.verb else {
             panic!("reviewer must delegate an agent")
         };
+        assert!(
+            args.inline,
+            "workflow reviews must request a completed inline run before evidence is recorded"
+        );
         let adapter = adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(true);
         let flags = agent::headless_worker_flags(&CtxConfig::default(), &args, &adapter);
         for composed in [&argv, &flags] {
