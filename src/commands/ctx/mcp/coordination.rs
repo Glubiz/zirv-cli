@@ -2,7 +2,9 @@
 //! repository and inbox authority are fixed by the operator at launch.
 
 use super::*;
-use crate::commands::ctx::{adapters, agent, delegation, mail};
+use crate::commands::ctx::{
+    adapters, agent, delegation, envelope, mail, result_schema, safety, task,
+};
 use sha2::{Digest, Sha256};
 
 // Stored report bodies are capped at 1 MiB before JSON escaping. Allow room
@@ -138,6 +140,146 @@ pub(super) struct InboxResult {
     messages: Vec<InboxMessage>,
     next_cursor: Option<String>,
     consumed: bool,
+}
+
+// -- the `self` tool (issue #726) ----------------------------------------
+//
+// Every value below already exists in-process (this server's own inherited
+// env) or on disk (this repository's own task/delegation stores); this is
+// only the seam that hands it back structured, the same way `session_
+// snapshot` hands back the session registry. No new decode format: the
+// envelope goes through the identical `safety::parse_envelope_env` the
+// launch/enforcement path already uses.
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ToolSetView {
+    edit: bool,
+    shell: bool,
+    network: bool,
+    delegate: bool,
+}
+
+impl From<envelope::ToolSet> for ToolSetView {
+    fn from(tools: envelope::ToolSet) -> Self {
+        Self {
+            edit: tools.edit,
+            shell: tools.shell,
+            network: tools.network,
+            delegate: tools.delegate,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct EnvelopeView {
+    principal: String,
+    paths: Vec<String>,
+    tools: ToolSetView,
+    network: bool,
+    destructive: bool,
+    delegation_depth: u8,
+    expires_at: u64,
+    /// The token CEILING this envelope grants, not remaining spend: live
+    /// transcript usage lives in the supervising process, not this
+    /// stateless server, and is not re-derived here (issue #726).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_budget: Option<u64>,
+}
+
+impl From<&envelope::WorkerEnvelope> for EnvelopeView {
+    fn from(e: &envelope::WorkerEnvelope) -> Self {
+        Self {
+            principal: e.principal.clone(),
+            paths: e.paths.iter().map(|scope| scope.0.clone()).collect(),
+            tools: e.tools.into(),
+            network: e.network,
+            destructive: e.destructive,
+            delegation_depth: e.delegation_depth,
+            expires_at: e.expires_at,
+            token_budget: e.token_budget,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct TaskView {
+    id: String,
+    title: String,
+    brief: String,
+    state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    parents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+    attempts: u32,
+    created_at: u64,
+    updated_at: u64,
+}
+
+impl From<&task::Card> for TaskView {
+    fn from(card: &task::Card) -> Self {
+        Self {
+            id: card.id.clone(),
+            title: card.title.clone(),
+            brief: card.brief.clone(),
+            state: card.state.to_string(),
+            parents: card.parents.clone(),
+            workdir: card.workdir.as_ref().map(|path| path.display().to_string()),
+            group_id: card.group_id.clone(),
+            outcome: card.outcome.clone(),
+            attempts: card.attempts,
+            created_at: card.created_at,
+            updated_at: card.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ResultContractView {
+    /// `Schema::to_canonical_json` -- the same deterministic rendering
+    /// exported into the worker's own env and re-parsed before validating a
+    /// self-report.
+    schema_json: String,
+    /// `render_contract_block` -- the human-readable form a worker's own
+    /// prompt was given at launch.
+    rendered: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workdir: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct ParentView {
+    delegation: String,
+    attempt: u32,
+    runtime: &'static str,
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<String>,
+    workdir: String,
+    /// The orchestrating session that launched this delegation, when the
+    /// durable record carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestrator_session: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct SelfResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    envelope: Option<EnvelopeView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<TaskView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_contract: Option<ResultContractView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<ParentView>,
 }
 
 fn validate_id(id: &str) -> CtxResult<()> {
@@ -457,6 +599,60 @@ impl Scope {
             }
         }
         self.response(result)
+    }
+
+    /// Issue #726: this worker's own envelope/task claim/result contract/
+    /// parent handle -- never another session's. Refuses exactly like a
+    /// missing/foreign `Reader` binding refuses every other bound tool here:
+    /// there is no "self" to report without one.
+    pub(super) fn self_view(&self) -> CtxResult<Value> {
+        let reader = self.reader.as_ref().ok_or(
+            "self requires a session bound at launch (--session or ZIRV_CTX_SESSION); this server was started unbound",
+        )?;
+        let lookup = self.env();
+        let envelope = safety::parse_envelope_env(&lookup).map(|e| EnvelopeView::from(&e));
+        let repo_slug = repo_slug_read_only(&self.repo);
+        let task = task::load_cards(&self.state, &repo_slug)
+            .into_values()
+            .find(|card| {
+                card.claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.session == reader.session)
+            })
+            .map(|card| TaskView::from(&card));
+        let result_contract = lookup(agent::RESULT_SCHEMA_ENV)
+            .filter(|schema_json| !schema_json.is_empty())
+            .map(|schema_json| -> CtxResult<ResultContractView> {
+                let schema = result_schema::Schema::from_json(&schema_json)
+                    .map_err(|e| format!("invalid {}: {e}", agent::RESULT_SCHEMA_ENV))?;
+                Ok(ResultContractView {
+                    schema_json: schema.to_canonical_json(),
+                    rendered: result_schema::render_contract_block(&schema),
+                    workdir: lookup(agent::RESULT_WORKDIR_ENV),
+                })
+            })
+            .transpose()?;
+        let parent = self
+            .scoped_delegations()?
+            .into_iter()
+            .find(|record| record.handle.worker_session == reader.session)
+            .map(|record| ParentView {
+                delegation: record.handle.delegation,
+                attempt: record.handle.attempt,
+                runtime: record.handle.runtime.as_str(),
+                role: record.handle.role,
+                task: record.handle.task,
+                group: record.handle.group,
+                objective: record.handle.objective,
+                workdir: record.handle.workdir.display().to_string(),
+                orchestrator_session: record.parent_session,
+            });
+        self.response(SelfResult {
+            envelope,
+            task,
+            result_contract,
+            parent,
+        })
     }
 }
 

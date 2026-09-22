@@ -212,6 +212,7 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
             "commands/ctx/task.rs",
             "commands/ctx/agent.rs",
             "commands/ctx/native_worker.rs",
+            "commands/ctx/reconcile.rs",
         ],
     ),
     // Issue #479. Delegation records live under `<state>/delegations/<slug>/`;

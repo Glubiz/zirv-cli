@@ -605,6 +605,28 @@ pub fn gc(
     outcomes
 }
 
+/// Issue #720 (the state-reconcile pass): the exact dead-owner filter [`gc`]'s
+/// own loop applies before it ever runs a probe or removes anything, exposed
+/// separately so a `--dry-run` reconcile pass can report which records LOOK
+/// like GC candidates without shelling out to git ([`probe`]) or writing the
+/// registry ([`update_status`]) the way every other branch of [`gc`] does.
+/// Never widens or narrows what `gc` itself would consider -- a record this
+/// returns is not a promise of removal (the proof-required probe still runs,
+/// live, if `gc` is later actually called), only that `gc` would not skip it
+/// outright.
+pub(crate) fn gc_candidates(
+    state: &StateDir,
+    repo: &Path,
+    is_alive: &dyn Fn(u32) -> bool,
+) -> Vec<WorktreeRecord> {
+    let repo_slug = super::state::repo_slug(repo);
+    read_records(state, &repo_slug)
+        .into_iter()
+        .filter(|record| record.status == WorktreeStatus::Active)
+        .filter(|record| record.owner_pid.is_some_and(|pid| !is_alive(pid)))
+        .collect()
+}
+
 /// Pure: the sorted intersection of two `git diff --name-only <base>..<branch>`
 /// outputs -- design item 5's merge-collision hotspot. Advisory only: no
 /// caller acts on this beyond printing it, since there is no automated
@@ -1632,6 +1654,35 @@ mod tests {
             "an unrecorded owner must never be assumed dead"
         );
         assert!(worktree.exists());
+    }
+
+    /// Issue #720: `gc_candidates` applies the exact same predicate as `gc`'s
+    /// own loop -- a live owner is never reported as a candidate -- but never
+    /// probes git or touches the registry, so it stays safe to call from a
+    /// `--dry-run` reconcile pass.
+    #[test]
+    fn gc_candidates_matches_gcs_own_dead_owner_filter_and_never_touches_anything() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, Some(4242));
+
+        assert!(
+            gc_candidates(&state, &repo, &|pid| pid == 4242).is_empty(),
+            "a live owner is never a candidate"
+        );
+        assert!(worktree.exists());
+
+        let candidates = gc_candidates(&state, &repo, &|_pid| false);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, worktree.to_string_lossy());
+        assert!(
+            worktree.exists(),
+            "gc_candidates must never remove anything itself"
+        );
     }
 
     // -- hotspot_files ------------------------------------------------------

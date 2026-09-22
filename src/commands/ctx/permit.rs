@@ -317,7 +317,7 @@ impl HeavyPermit {
 /// module -- [`live_records_in`]'s own sweep and [`claim_tree`]'s tree-claim
 /// sweep -- so the rule can never independently drift between the two
 /// (review finding, 2026-09).
-fn permit_record_is_alive(record: &PermitRecord) -> bool {
+pub(crate) fn permit_record_is_alive(record: &PermitRecord) -> bool {
     permit_record_is_alive_with(
         record,
         sessions::process_start_secs(record.pid),
@@ -539,6 +539,40 @@ fn writer_permits_dir(state: &StateDir) -> PathBuf {
 /// [`live_records`], sweeping dead owners the identical way.
 pub fn live_writer_records(state: &StateDir) -> Vec<PermitRecord> {
     live_records_in(&writer_permits_dir(state))
+}
+
+/// Issue #720 (the state-reconcile pass): every currently-held permit, in
+/// EITHER pool, whose owner is confirmed dead -- the same liveness decision
+/// [`live_records_in`]'s own sweep already applies, exposed WITHOUT removing
+/// anything, so a `--dry-run` reconcile pass can report exactly what a live
+/// pass would sweep from either pool without mutating either one.
+pub(crate) fn dead_records(state: &StateDir) -> Vec<PermitRecord> {
+    dead_records_in(&permits_dir(state))
+        .into_iter()
+        .chain(dead_records_in(&writer_permits_dir(state)))
+        .collect()
+}
+
+/// The read-only core of [`dead_records`]: identical file-reading discipline
+/// to [`live_records_in`] (skip anything that is not a parseable `.json`
+/// record), but never removes a file and never sweeps an unparseable one --
+/// a dry run must never mutate, full stop.
+fn dead_records_in(dir: &Path) -> Vec<PermitRecord> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let record: PermitRecord = serde_json::from_str(&contents).ok()?;
+            (!permit_record_is_alive(&record)).then_some(record)
+        })
+        .collect()
 }
 
 /// Issue #267: pure -- the comparison key for a writer permit's own tree
@@ -1153,6 +1187,39 @@ mod tests {
             "a dead owner's permit does not count"
         );
         assert!(acquire(&state, 1, "cargo build").is_some());
+    }
+
+    /// Issue #720 (the state-reconcile pass): `dead_records` reports the
+    /// SAME dead-owner permit `live_records`'s own sweep would remove, but
+    /// leaves it on disk -- the read-only counterpart a `--dry-run` reconcile
+    /// pass needs. A live-owned permit is never reported, no matter how it
+    /// looks otherwise.
+    #[test]
+    fn dead_records_reports_a_dead_owner_without_removing_it_and_ignores_a_live_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dead_pid = crate::commands::ctx::testenv::dead_pid();
+        // `acquire` itself sweeps dead owners as a side effect (its own doc
+        // comment), so the live permit must be acquired FIRST -- otherwise
+        // its own internal `live_records_in` call would remove the
+        // dead-owner file below before `dead_records` ever saw it.
+        let _live = acquire(&state, 2, "cargo test").expect("live permit granted");
+        write_orphan_permit(&state, "cargo build", dead_pid);
+
+        let dead = dead_records(&state);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].pid, dead_pid);
+
+        // Untouched: the dead-owner file is still on disk, and a live sweep
+        // still finds (and only then removes) it.
+        assert_eq!(
+            std::fs::read_dir(permits_dir(&state))
+                .expect("read permits dir")
+                .count(),
+            2,
+            "dead_records must not remove the dead-owner file"
+        );
+        assert_eq!(live_count(&state), 1, "the live permit is still counted");
     }
 
     /// Finding B5: `pid` on a `PermitRecord` names the script-runner

@@ -1362,6 +1362,55 @@ pub fn claim_locked(
     })
 }
 
+/// Issue #720 (the state-reconcile pass): [`reap_if_stale_pure`]'s own
+/// decision applied to EVERY card in `cards`, not just the one id
+/// [`claim_locked`] reaps in passing -- a stuck `Running` card nobody
+/// happens to retry by its exact id sits forever otherwise (`run_list`
+/// never reaps at all). Returns the ids actually reaped, in `cards`' own
+/// `BTreeMap` order, alongside the events a caller must persist to make it
+/// durable; a caller that only wants the PREVIEW (no persistence) reads the
+/// first element and drops the second.
+fn reap_all_decide(cards: &BTreeMap<String, Card>, now: u64) -> (Vec<String>, Vec<Event>) {
+    let mut events = Vec::new();
+    let mut reaped_ids = Vec::new();
+    for card in cards.values() {
+        let before = events.len();
+        let _ = reap_if_stale_pure(card, now, &mut events);
+        if events.len() > before {
+            reaped_ids.push(card.id.clone());
+        }
+    }
+    (reaped_ids, events)
+}
+
+/// Dry-run preview of [`reap_all_locked`]: the identical decision, against a
+/// fresh load, with nothing appended or written. Safe to call with no lock
+/// held -- it never mutates -- so a `--dry-run` reconcile pass can report
+/// exactly what a live pass would reap without ever taking the task lock.
+pub(crate) fn reap_all_dry(state: &StateDir, repo_slug: &str, now: u64) -> Vec<String> {
+    let cards = load_cards(state, repo_slug);
+    reap_all_decide(&cards, now).0
+}
+
+/// The repo-wide counterpart of [`claim_locked`]'s own reap-in-passing: reaps
+/// every stale `Running` card in `repo_slug` under a SINGLE hold of the task
+/// lock, appending every resulting [`Event::Crash`] as one atomic batch.
+/// Returns the ids actually reaped (empty when nothing was stale, in which
+/// case nothing is written at all).
+pub(crate) fn reap_all_locked(
+    state: &StateDir,
+    repo_slug: &str,
+    now: u64,
+) -> CtxResult<Vec<String>> {
+    let _lock = lock_tasks(state, repo_slug)?;
+    let cards = load_cards(state, repo_slug);
+    let (reaped_ids, events) = reap_all_decide(&cards, now);
+    if !events.is_empty() {
+        write_events_atomic_locked(state, repo_slug, &events)?;
+    }
+    Ok(reaped_ids)
+}
+
 pub fn run_claim<W: Write>(
     state: &StateDir,
     w: &mut W,
@@ -2789,6 +2838,149 @@ mod tests {
             .filter(|e| matches!(e, Event::Claimed { .. }))
             .count();
         assert_eq!(claimed_events, 1, "only the first claim ever wrote Claimed");
+    }
+
+    /// Issue #720 acceptance: `reap_all_locked` heals every stuck `Running`
+    /// card with a dead claimant in ONE pass -- unlike `claim_locked`, which
+    /// only ever reaps the one id being claimed -- while a card whose
+    /// claimant is genuinely alive is left completely untouched, no matter
+    /// how far past its TTL it is (`reap`'s own liveness-only gate).
+    #[test]
+    fn reap_all_locked_heals_every_stale_card_in_one_pass_and_leaves_a_live_claimant_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo_slug = "repo".to_string();
+
+        let dead_pid = super::super::testenv::dead_pid();
+        let live_pid = std::process::id();
+
+        for (id, pid) in [("t1", dead_pid), ("t2", dead_pid), ("t3", live_pid)] {
+            append_event(
+                &state,
+                &repo_slug,
+                &Event::Created {
+                    id: id.to_string(),
+                    repo_slug: repo_slug.clone(),
+                    title: id.to_string(),
+                    brief: "b".to_string(),
+                    parents: Vec::new(),
+                    group_id: None,
+                    workdir: None,
+                    at: 1_000,
+                },
+            )
+            .expect("create");
+            append_event(
+                &state,
+                &repo_slug,
+                &Event::Claimed {
+                    id: id.to_string(),
+                    claim: Claim {
+                        session: "sess-1".to_string(),
+                        pid,
+                        pid_start_time: None,
+                        host: "h".to_string(),
+                        claimed_at: 1_000,
+                        ttl_secs: 900,
+                    },
+                    attempts: 1,
+                    at: 1_000,
+                },
+            )
+            .expect("claimed");
+        }
+
+        // Well past every claim's TTL, and no `claim`/`heartbeat` call for
+        // any of these ids happens anywhere in this test -- the whole point
+        // is that this heals without one.
+        let now = 1_000 + 900 + 1;
+        let reaped = reap_all_locked(&state, &repo_slug, now).expect("reap_all_locked io");
+        assert_eq!(
+            reaped,
+            vec!["t1".to_string(), "t2".to_string()],
+            "both dead-claimant cards are reaped, in id order"
+        );
+
+        let cards = load_cards(&state, &repo_slug);
+        assert_eq!(cards["t1"].state, State::Ready);
+        assert!(cards["t1"].claim.is_none());
+        assert_eq!(cards["t2"].state, State::Ready);
+        assert!(cards["t2"].claim.is_none());
+        assert_eq!(
+            cards["t3"].state,
+            State::Running,
+            "a live claimant is never reaped, no matter how far past its TTL"
+        );
+        assert!(cards["t3"].claim.is_some());
+
+        // Idempotent: a second pass over the now-healed ledger reaps nothing
+        // further.
+        assert!(
+            reap_all_locked(&state, &repo_slug, now)
+                .expect("second pass io")
+                .is_empty()
+        );
+    }
+
+    /// The dry-run preview makes the identical decision as the locked pass,
+    /// without ever taking the lock or writing anything.
+    #[test]
+    fn reap_all_dry_previews_the_same_ids_reap_all_locked_would_reap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let repo_slug = "repo".to_string();
+        let dead_pid = super::super::testenv::dead_pid();
+
+        append_event(
+            &state,
+            &repo_slug,
+            &Event::Created {
+                id: "t1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "t".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1_000,
+            },
+        )
+        .expect("create");
+        append_event(
+            &state,
+            &repo_slug,
+            &Event::Claimed {
+                id: "t1".to_string(),
+                claim: Claim {
+                    session: "sess-1".to_string(),
+                    pid: dead_pid,
+                    pid_start_time: None,
+                    host: "h".to_string(),
+                    claimed_at: 1_000,
+                    ttl_secs: 900,
+                },
+                attempts: 1,
+                at: 1_000,
+            },
+        )
+        .expect("claimed");
+
+        let now = 1_000 + 900 + 1;
+        let events_before = read_events(&state, &repo_slug);
+        assert_eq!(
+            reap_all_dry(&state, &repo_slug, now),
+            vec!["t1".to_string()]
+        );
+        assert_eq!(
+            read_events(&state, &repo_slug),
+            events_before,
+            "the dry-run preview must never append anything"
+        );
+        assert_eq!(
+            load_cards(&state, &repo_slug)["t1"].state,
+            State::Running,
+            "the dry-run preview must never mutate the card"
+        );
     }
 
     #[test]

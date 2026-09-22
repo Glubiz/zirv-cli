@@ -1,23 +1,16 @@
-//! ZCHK-FORBIDDEN-WIDENING: every `ctx.toml` key `config.rs`'s own `ENV_MAP`
-//! table already knows an operator can override is either `REPO_FORBIDDEN`
-//! or on this file's explicit narrow-only allow-list below. A brand new
-//! `ENV_MAP` entry landing without touching either list fails this check --
+//! ZCHK-FORBIDDEN-WIDENING: every `ctx.toml` key enumerated by `config.rs`'s
+//! `ENV_MAP` or `NON_ENV_CONFIG_SURFACES` tables is either repo-forbidden or
+//! on this file's explicit narrow-only allow-list below. A brand new surface
+//! landing without touching either classification fails this check --
 //! today the untrusted-config posture ("repo-owned surfaces may only
 //! NARROW", CLAUDE.md) is a checklist item a reviewer has to remember; this
 //! makes it a check.
 //!
-//! `ENV_MAP` is not a complete enumeration of every key `config.rs` parses --
-//! a handful of list-shaped keys (`workflow.check_env_passthrough`,
-//! `sandbox.extra_allow`, `dash.workdir_roots`, ...) are read via bespoke
-//! comma-separated env parsing instead of `EnvKind`'s scalar dispatch, so
-//! they never appear in `ENV_MAP` at all -- see `config.rs`'s own comment
-//! next to `EnvKind` ("has no list-shaped variant"). Every key this check
-//! actually knows about today is REPO_FORBIDDEN already (checked directly,
-//! not derived from `ENV_MAP`), so this gap does not currently hide
-//! anything; a *future* list-shaped key that is both new and NOT
-//! REPO_FORBIDDEN would not be caught by this check. Per issue #276's own
-//! escape hatch ("if no complete enumeration exists, build one ... and say
-//! so") -- this is that disclosure.
+//! `NON_ENV_CONFIG_SURFACES` is the mandatory companion enumeration for
+//! list/table-shaped surfaces that cannot live in scalar `ENV_MAP`. The
+//! workspace execution fields are the first entries: this prevents a future
+//! executable surface from bypassing the gate merely because it has no env
+//! override.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -27,12 +20,12 @@ use regex::Regex;
 use super::BuiltinCheckResult;
 
 pub const ID: &str = "ZCHK-FORBIDDEN-WIDENING";
-const PROVES: &str = "every ctx.toml key config.rs's own ENV_MAP table enumerates is classified \
-     as REPO_FORBIDDEN or explicitly narrow-only (workflow::checks::forbidden::\
+const PROVES: &str = "every ctx.toml key config.rs explicitly enumerates is classified as \
+     repo-forbidden or explicitly narrow-only (workflow::checks::forbidden::\
      NARROW_ONLY_ALLOWLIST)";
-const FIX: &str = "classify the new key: add its dotted path to config.rs's REPO_FORBIDDEN table \
-     (operator-only -- the default for anything a repo checkout could widen) or, if a repo \
-     checkout setting it can only ever narrow behavior, to \
+const FIX: &str = "classify the new key: add its dotted path to config.rs's REPO_FORBIDDEN (or \
+     ARRAY_REPO_FORBIDDEN for array-of-table fields) -- operator-only is the default for \
+     anything a repo checkout could widen -- or, if it can only narrow behavior, to \
      workflow::checks::forbidden::NARROW_ONLY_ALLOWLIST with a comment saying why";
 const ORIGIN: &str = "untrusted-config posture (CLAUDE.md: repo-owned surfaces may only narrow) \
      was a checklist item, not a check -- issue #276";
@@ -125,6 +118,13 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     // repo may only turn the standing skill index off, never force it back
     // on for an operator who disabled it.
     "prompt.skill_index",
+    // #716: these repository workspace fields are inert requirements. A name
+    // only selects an entry; MCP names can only make launch validation refuse;
+    // skills are labelled untrusted instructions. `workspace.git` and
+    // `workspace.setup` are separately operator-only.
+    "workspace.name",
+    "workspace.mcp_servers",
+    "workspace.skills",
 ];
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
@@ -176,6 +176,22 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
             );
         }
     };
+    let non_env_paths = match extract_table_paths(&source, "const NON_ENV_CONFIG_SURFACES") {
+        Some(paths) if !paths.is_empty() => paths,
+        _ => {
+            return BuiltinCheckResult::inconclusive(
+                ID,
+                PROVES,
+                FIX,
+                ORIGIN,
+                format!(
+                    "could not locate/parse config.rs's NON_ENV_CONFIG_SURFACES table -- its \
+                     shape changed since this check was written ({})",
+                    path.display()
+                ),
+            );
+        }
+    };
     let repo_forbidden_paths = match extract_table_paths(&source, "const REPO_FORBIDDEN") {
         Some(paths) if !paths.is_empty() => paths,
         _ => {
@@ -192,16 +208,39 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
             );
         }
     };
+    let array_forbidden_paths =
+        match extract_table_paths(&source, "const ARRAY_REPO_FORBIDDEN") {
+            Some(paths) if !paths.is_empty() => paths,
+            _ => {
+                return BuiltinCheckResult::inconclusive(
+                    ID,
+                    PROVES,
+                    FIX,
+                    ORIGIN,
+                    format!(
+                        "could not locate/parse config.rs's ARRAY_REPO_FORBIDDEN table -- its \
+                         shape changed since this check was written ({})",
+                        path.display()
+                    ),
+                );
+            }
+        };
 
-    let forbidden_set: BTreeSet<&str> = repo_forbidden_paths.iter().map(String::as_str).collect();
+    let forbidden_set: BTreeSet<&str> = repo_forbidden_paths
+        .iter()
+        .chain(array_forbidden_paths.iter())
+        .map(String::as_str)
+        .collect();
     let allow_set: BTreeSet<&str> = NARROW_ONLY_ALLOWLIST.iter().copied().collect();
+    let all_paths: Vec<&String> = env_map_paths.iter().chain(non_env_paths.iter()).collect();
 
-    let mut unclassified: Vec<String> = env_map_paths
+    let mut unclassified: Vec<String> = all_paths
         .iter()
         .filter(|path| {
-            !is_repo_forbidden(path, &forbidden_set) && !allow_set.contains(path.as_str())
+            let path = path.as_str();
+            !is_repo_forbidden(path, &forbidden_set) && !allow_set.contains(path)
         })
-        .cloned()
+        .map(|path| path.as_str().to_string())
         .collect();
     unclassified.sort();
     unclassified.dedup();
@@ -213,16 +252,18 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
             FIX,
             ORIGIN,
             format!(
-                "{} ENV_MAP keys checked: {} REPO_FORBIDDEN, {} narrow-only allow-listed, 0 \
-                 unclassified",
+                "{} config keys checked ({} ENV_MAP, {} non-env): {} repo-forbidden, {} \
+                 narrow-only allow-listed, 0 unclassified",
+                all_paths.len(),
                 env_map_paths.len(),
-                env_map_paths
+                non_env_paths.len(),
+                all_paths
                     .iter()
-                    .filter(|p| is_repo_forbidden(p, &forbidden_set))
+                    .filter(|path| is_repo_forbidden(path.as_str(), &forbidden_set))
                     .count(),
-                env_map_paths
+                all_paths
                     .iter()
-                    .filter(|p| allow_set.contains(p.as_str()))
+                    .filter(|path| allow_set.contains(path.as_str()))
                     .count(),
             ),
         )
@@ -366,8 +407,16 @@ const ENV_MAP: &[(&str, &[&str], u8)] = &[
     ("ZIRV_CTX_NEW_WIDENING_KEY", &["new", "widening_key"], 0),
 ];
 
+const NON_ENV_CONFIG_SURFACES: &[&[&str]] = &[
+    &["workspace", "git"],
+];
+
 const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent"], "ZIRV_CTX_AGENT"),
+];
+
+const ARRAY_REPO_FORBIDDEN: &[(&[&str], &str)] = &[
+    (&["workspace", "git"], "operator only"),
 ];
 "#,
         );
@@ -391,8 +440,16 @@ const ENV_MAP: &[(&str, &[&str], u8)] = &[
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], 0),
 ];
 
+const NON_ENV_CONFIG_SURFACES: &[&[&str]] = &[
+    &["workspace", "git"],
+];
+
 const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent"], "ZIRV_CTX_AGENT"),
+];
+
+const ARRAY_REPO_FORBIDDEN: &[(&[&str], &str)] = &[
+    (&["workspace", "git"], "operator only"),
 ];
 "#,
         );
@@ -402,6 +459,39 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
             super::super::BuiltinOutcome::Pass,
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn a_new_non_env_surface_with_no_classification_fails() {
+        let repo = tempdir().unwrap();
+        write_config_rs(
+            repo.path(),
+            r#"
+const ENV_MAP: &[(&str, &[&str], u8)] = &[
+    ("ZIRV_CTX_AGENT", &["agent"], 0),
+];
+
+const NON_ENV_CONFIG_SURFACES: &[&[&str]] = &[
+    &["workspace", "git"],
+    &["workspace", "future_exec"],
+];
+
+const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
+    (&["agent"], "ZIRV_CTX_AGENT"),
+];
+
+const ARRAY_REPO_FORBIDDEN: &[(&[&str], &str)] = &[
+    (&["workspace", "git"], "operator only"),
+];
+"#,
+        );
+        let result = run(repo.path());
+        assert_eq!(
+            result.outcome,
+            super::super::BuiltinOutcome::Fail,
+            "{result:?}"
+        );
+        assert!(result.details.contains("workspace.future_exec"), "{result:?}");
     }
 
     #[test]

@@ -547,7 +547,7 @@ pub fn run_create<W: Write>(
 /// already reads. A short id with no matching record at all (its own file
 /// swept, or never written) reads as not-alive -- there is nothing left to
 /// call live.
-fn short_id_is_alive(state: &StateDir, short: &str) -> bool {
+pub(crate) fn short_id_is_alive(state: &StateDir, short: &str) -> bool {
     super::sessions::list(state)
         .into_iter()
         .any(|(record, liveness)| {

@@ -97,6 +97,7 @@ criterion).
 | `ctx provider` | N02 (#471) | `init`, `list`, `check`, official execution `login`/`status`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
 | `ctx proxy` | shared | decide-and-print CRUD (`--json` prints the `ProxyDecision`, never launches) is runtime-neutral; its two model-calling deciders (TypeSafe HTTP, the helper-model chokepoint) are tracked as entry points below |
 | `ctx recall` | N06 (#475) | native `memory_recall` preserves session/private/global/shared precedence |
+| `ctx reconcile` | shared | zero-model state-reconcile pass composing the existing dead-owner sweeps; runtime-neutral |
 | `ctx remember` | N06 (#475) | native `memory_remember` defaults to session scope; shared writes retain policy/writer enforcement |
 | `ctx resume` | N17 (#486) |  |
 | `ctx run` | N05 (#474) | its output store, compaction classifier and heavy permits are reused by `runtime::tools`; native process execution itself stays behind N04 authorization/isolation |
@@ -112,6 +113,7 @@ criterion).
 | `ctx task` | N10 (#479) | the one exclusive-ownership store for work, shared by both runtimes |
 | `ctx usage` | N18 (#487) |  |
 | `ctx wait` | N10 (#479) | bounded wait; the native `wait` tool answers from the same durable delegation record with no model call |
+| `ctx watch` | shared | streams the transitions `ctx wait` polls for, from the same session status and durable delegation record; no model call |
 | `ctx worktree` | shared |  |
 | `ctx wrap` | harness-backend | PTY-supervised interactive session; the example case for this bucket |
 | `frontend` | shared |  |

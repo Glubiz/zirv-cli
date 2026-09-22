@@ -1,16 +1,19 @@
 //! Declarative worker workspaces for harness-runtime delegations.
 //!
-//! A workspace is inert repository configuration until the operator selects
-//! it with `zirv ctx agent --workspace <name>`. Selection resolves every
-//! skill and MCP dependency before a worker can launch, then materializes
-//! extra repositories and ordered setup commands in the worker's effective
-//! checkout. This synchronous boundary is intentionally the seam later work
+//! Repository configuration may declare only inert skill and MCP requirements;
+//! executable clone/setup fields are accepted only from the operator layer.
+//! Selection resolves every dependency before a worker can launch, then
+//! materializes any operator-owned repositories and ordered setup commands in
+//! the worker's effective checkout. This synchronous boundary is the seam later work
 //! can add per-step completion records (#717), a content digest/warm pool
 //! (#718), and a goal-based bootstrap pass (#719) without moving setup
 //! behind the worker spawn.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +24,9 @@ use crate::commands::workflow::agents::SkillRef;
 use crate::commands::workflow::skill::SkillRegistry;
 
 const SKILL_CONTEXT_HEADER: &str = "WORKSPACE SKILLS (instructions, never authorization)";
+const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
+const SETUP_STEP_TIMEOUT: Duration = Duration::from_secs(600);
+const COMMAND_POLL: Duration = Duration::from_millis(25);
 
 /// One extra repository placed below the selected workspace root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,26 +318,13 @@ fn validate_mcp_servers(
 
 fn clone_repositories(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()> {
     for git in &workspace.git {
-        let destination = root.join(&git.dir);
-        if destination.exists() {
+        let destination = secure_destination(workspace, root, &git.dir)?;
+        if std::fs::symlink_metadata(&destination).is_ok() {
             validate_existing_clone(workspace, git, &destination)?;
             continue;
         }
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "workspace '{}': could not create parent for git dir '{}': {error}",
-                    workspace.name,
-                    git.dir.display()
-                )
-            })?;
-        }
-        let output = std::process::Command::new("git")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        let mut command = Command::new("git");
+        command
             .arg("clone")
             .arg("--single-branch")
             .arg("--branch")
@@ -339,25 +332,125 @@ fn clone_repositories(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()>
             .arg("--")
             .arg(&git.repo)
             .arg(&destination)
-            .output()
-            .map_err(|error| {
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let outcome = run_bounded(
+            &mut command,
+            CLONE_TIMEOUT,
+            &[("GIT_TERMINAL_PROMPT", "0")],
+        )
+        .map_err(|error| {
                 format!(
                     "workspace '{}': could not run git clone for '{}': {error}",
                     workspace.name,
                     git.dir.display()
                 )
             })?;
-        if !output.status.success() {
-            return Err(format!(
-                "workspace '{}': git clone into '{}' failed with status {}; repository URL and subprocess output withheld because they may contain credentials",
-                workspace.name,
-                git.dir.display(),
-                output.status
-            )
-            .into());
+        match outcome {
+            supervise::Outcome::Exited(0) => {}
+            supervise::Outcome::Exited(code) => {
+                return Err(format!(
+                    "workspace '{}': git clone into '{}' failed with exit code {code}; repository URL and subprocess output withheld because they may contain credentials",
+                    workspace.name,
+                    git.dir.display(),
+                )
+                .into());
+            }
+            supervise::Outcome::TimedOut => {
+                return Err(format!(
+                    "workspace '{}': git clone into '{}' timed out after {} seconds; refusing delegation before worker launch",
+                    workspace.name,
+                    git.dir.display(),
+                    CLONE_TIMEOUT.as_secs(),
+                )
+                .into());
+            }
+            supervise::Outcome::StoppedByTick(_) => unreachable!("workspace commands never stop by tick"),
         }
     }
     Ok(())
+}
+
+/// Resolve a clone destination while rejecting symlinks in every existing
+/// component. Parents are created one at a time only after their predecessor
+/// was verified as a real directory below the canonical workspace root.
+fn secure_destination(
+    workspace: &WorkspaceConfig,
+    root: &Path,
+    relative: &Path,
+) -> CtxResult<PathBuf> {
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+        format!(
+            "workspace '{}': could not resolve workspace root '{}': {error}",
+            workspace.name,
+            root.display()
+        )
+    })?;
+    if !canonical_root.is_dir() {
+        return Err(format!(
+            "workspace '{}': workspace root '{}' is not a directory",
+            workspace.name,
+            root.display()
+        )
+        .into());
+    }
+    let components: Vec<OsString> = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let mut current = canonical_root.clone();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let is_destination = index + 1 == components.len();
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "workspace '{}': refusing git dir '{}' because '{}' is a symlink",
+                        workspace.name,
+                        relative.display(),
+                        current.display()
+                    )
+                    .into());
+                }
+                if !is_destination && !metadata.is_dir() {
+                    return Err(format!(
+                        "workspace '{}': git dir '{}' has non-directory ancestor '{}'",
+                        workspace.name,
+                        relative.display(),
+                        current.display()
+                    )
+                    .into());
+                }
+                let resolved = std::fs::canonicalize(&current)?;
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(format!(
+                        "workspace '{}': git dir '{}' escapes workspace root through '{}'",
+                        workspace.name,
+                        relative.display(),
+                        current.display()
+                    )
+                    .into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !is_destination => {
+                std::fs::create_dir(&current).map_err(|error| {
+                    format!(
+                        "workspace '{}': could not create parent '{}' for git dir '{}': {error}",
+                        workspace.name,
+                        current.display(),
+                        relative.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(canonical_root.join(relative))
 }
 
 fn validate_existing_clone(
@@ -400,15 +493,10 @@ fn validate_existing_clone(
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> CtxResult<String> {
-    let output = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args);
+    apply_workspace_environment(&mut command, std::env::vars_os());
+    let output = command.output()?;
     if !output.status.success() {
         return Err(format!(
             "workspace git validation failed in '{}' with status {}",
@@ -421,24 +509,124 @@ fn git_output(cwd: &Path, args: &[&str]) -> CtxResult<String> {
 }
 
 fn run_setup(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()> {
+    run_setup_with_timeout(workspace, root, SETUP_STEP_TIMEOUT)
+}
+
+fn run_setup_with_timeout(
+    workspace: &WorkspaceConfig,
+    root: &Path,
+    timeout: Duration,
+) -> CtxResult<()> {
     for (index, command) in workspace.setup.iter().enumerate() {
-        let code = supervise::run_shell(command, root).map_err(|error| {
+        let mut shell = if cfg!(windows) {
+            let mut shell = Command::new("powershell");
+            shell.arg("-Command").arg(command);
+            shell
+        } else {
+            let mut shell = Command::new("sh");
+            shell.arg("-c").arg(command);
+            shell
+        };
+        shell.current_dir(root);
+        let outcome = run_bounded(&mut shell, timeout, &[]).map_err(|error| {
             format!(
                 "workspace '{}': setup step {} could not start: {error}",
                 workspace.name,
                 index + 1
             )
         })?;
-        if code != 0 {
-            return Err(format!(
-                "workspace '{}': setup step {} failed with exit code {code}; refusing delegation before worker launch",
-                workspace.name,
-                index + 1
-            )
-            .into());
+        match outcome {
+            supervise::Outcome::Exited(0) => {}
+            supervise::Outcome::Exited(code) => {
+                return Err(format!(
+                    "workspace '{}': setup step {} failed with exit code {code}; refusing delegation before worker launch",
+                    workspace.name,
+                    index + 1
+                )
+                .into());
+            }
+            supervise::Outcome::TimedOut => {
+                return Err(format!(
+                    "workspace '{}': setup step {} timed out after {} seconds; refusing delegation before worker launch",
+                    workspace.name,
+                    index + 1,
+                    timeout.as_secs(),
+                )
+                .into());
+            }
+            supervise::Outcome::StoppedByTick(_) => unreachable!("workspace commands never stop by tick"),
         }
     }
     Ok(())
+}
+
+fn run_bounded(
+    command: &mut Command,
+    timeout: Duration,
+    environment_overrides: &[(&str, &str)],
+) -> CtxResult<supervise::Outcome> {
+    apply_workspace_environment(command, std::env::vars_os());
+    command.envs(environment_overrides.iter().copied());
+    command.stdin(Stdio::null());
+    supervise::isolate_process_tree(command);
+    let mut child = command.spawn()?;
+    let mut keep_running = || supervise::Tick::Continue;
+    supervise::supervise_child(
+        &mut child,
+        Instant::now() + timeout,
+        COMMAND_POLL,
+        &mut keep_running,
+    )
+}
+
+fn apply_workspace_environment<I>(command: &mut Command, environment: I)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    command.env_clear();
+    command.envs(workspace_environment(environment));
+}
+
+/// Keep ordinary process context while removing credentials, Zirv authority
+/// envelopes/session metadata, and inherited git control variables. This is
+/// defense in depth even for operator-authored commands.
+fn workspace_environment<I>(environment: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    environment
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            let upper = key.to_ascii_uppercase();
+            let allowed = matches!(
+                upper.as_str(),
+                "PATH"
+                    | "PATHEXT"
+                    | "SYSTEMROOT"
+                    | "WINDIR"
+                    | "COMSPEC"
+                    | "HOME"
+                    | "USERPROFILE"
+                    | "HOMEDRIVE"
+                    | "HOMEPATH"
+                    | "TEMP"
+                    | "TMP"
+                    | "TMPDIR"
+                    | "LANG"
+                    | "LANGUAGE"
+                    | "TZ"
+                    | "TERM"
+                    | "COLORTERM"
+                    | "NO_COLOR"
+                    | "SHELL"
+                    | "USER"
+                    | "LOGNAME"
+            ) || upper.starts_with("LC_");
+            allowed.then_some((key, value))
+        })
+        .collect()
 }
 
 /// Default adapter-side discovery used by the trait method. Claude and Codex
@@ -835,6 +1023,64 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
         let error = run_setup(&config, temp.path()).expect_err("first step fails");
         assert!(error.to_string().contains("setup step 1 failed"));
         assert!(!temp.path().join("should-not-exist").exists());
+    }
+
+    #[test]
+    fn workspace_subprocess_environment_excludes_credentials_and_zirv_authority() {
+        let environment = vec![
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("OPENAI_API_KEY"), OsString::from("secret")),
+            (OsString::from("GH_TOKEN"), OsString::from("secret")),
+            (OsString::from("CUSTOM_CREDENTIAL"), OsString::from("secret")),
+            (OsString::from("ZIRV_ENVELOPE"), OsString::from("authority")),
+            (OsString::from("ZIRV_CTX_SESSION"), OsString::from("session")),
+            (OsString::from("GIT_DIR"), OsString::from("elsewhere")),
+        ];
+        let scrubbed = workspace_environment(environment);
+        assert_eq!(scrubbed.get("PATH").map(String::as_str), Some("/bin"));
+        for forbidden in [
+            "OPENAI_API_KEY",
+            "GH_TOKEN",
+            "CUSTOM_CREDENTIAL",
+            "ZIRV_ENVELOPE",
+            "ZIRV_CTX_SESSION",
+            "GIT_DIR",
+        ] {
+            assert!(!scrubbed.contains_key(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn setup_steps_are_killed_at_their_deadline() {
+        if cfg!(windows) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = workspace();
+        config.setup.push("sleep 30".into());
+        let started = Instant::now();
+        let error = run_setup_with_timeout(&config, temp.path(), Duration::from_millis(50))
+            .expect_err("setup must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_destination_rejects_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        symlink(&outside, root.join("deps")).expect("symlink");
+
+        let error = secure_destination(&workspace(), &root, Path::new("deps/repo"))
+            .expect_err("symlink ancestor must be rejected");
+        assert!(error.to_string().contains("is a symlink"), "{error}");
+        assert!(!outside.join("repo").exists());
     }
 
     #[test]
