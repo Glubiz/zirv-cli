@@ -3934,12 +3934,31 @@ mod tests {
     /// mirrors `mail::tests::
     /// send_to_a_ghost_parked_seat_past_its_window_resumes_before_delivering`.
     /// A due ghost park resumes to `Phase::Idle` before the nudge's payload
-    /// is delivered.
+    /// is delivered -- in place, even when another harness is clearly the
+    /// better fit (the same exhausted-vs-open usage recipe as `mail::tests::
+    /// send_to_a_due_ghost_parked_seat_never_opens_a_handover_even_when_another_harness_is_better`),
+    /// so a regression back to `rollover::on_resume` fails here too.
     #[test]
     fn nudge_to_a_due_ghost_parked_seat_resumes_before_delivering() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv").join("ctx.toml"),
+            format!(
+                "agent_bin = {:?}\n\
+                 [pace]\nestimator = false\n\
+                 [fallback]\nauto_orchestrator_rollover = true\n\
+                 orchestrator_rollover_headroom_pct = 20.0\n\
+                 min_candidate_headroom_pct = 10.0\n",
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string()
+            ),
+        )
+        .expect("write ctx.toml");
         let state_dir = tmp.path().join("state");
         let state = state_in(&state_dir);
         let repo = tmp.path().join("repo");
@@ -3956,6 +3975,23 @@ mod tests {
             now,
         )
         .expect("register");
+        for (provider, used_percentage) in [("anthropic", 100.0), ("openai", 5.0)] {
+            crate::commands::ctx::window::store_for(
+                &state,
+                provider,
+                &crate::commands::ctx::window::UsageWindows {
+                    five_hour: Some(crate::commands::ctx::window::Window {
+                        used_percentage,
+                        resets_at: now + 3_600,
+                        observed_at: now,
+                        overage_covered: false,
+                        limit_reached: false,
+                    }),
+                    seven_day: None,
+                },
+            )
+            .expect("store usage");
+        }
         // Already elapsed: `until` is in the past.
         crate::commands::ctx::seat::park(
             &state,
@@ -3984,8 +4020,9 @@ mod tests {
 
         let seat = crate::commands::ctx::seat::load(&state, "duenudg1").expect("seat exists");
         assert!(
-            !matches!(seat.phase, crate::commands::ctx::seat::Phase::Parked { .. }),
-            "a due ghost park must be resumed before delivery, got {:?}",
+            matches!(seat.phase, crate::commands::ctx::seat::Phase::Idle),
+            "a due ghost park must resume in place before delivery, never open a handover, \
+             got {:?}",
             seat.phase
         );
 
