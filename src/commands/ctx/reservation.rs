@@ -93,24 +93,11 @@ fn lock_path(state: &StateDir, provider: &str) -> PathBuf {
         .join(format!("{}.lock", state::provider_slug(provider)))
 }
 
-/// One advisory OS lock per provider ledger, mirroring `group.rs`'s own
-/// per-group lock file exactly (same `open_lock_file`, reused directly
-/// rather than reimplemented, and the same "leave the file behind on drop"
-/// reasoning: deleting it can split two contenders across old and new
-/// inodes, while an unlocked empty file is harmless).
-struct ReservationLock(std::fs::File);
-
-impl Drop for ReservationLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_ledger(state: &StateDir, provider: &str) -> CtxResult<ReservationLock> {
+/// One advisory OS lock per provider ledger, shared via `state::
+/// acquire_lock` (issue #728) rather than a hand-rolled guard.
+fn lock_ledger(state: &StateDir, provider: &str) -> CtxResult<super::state::FileLock> {
     create_private_dir_all(&state.reservations())?;
-    let file = super::group::open_lock_file(&lock_path(state, provider))?;
-    file.lock()?;
-    Ok(ReservationLock(file))
+    super::state::acquire_lock(&lock_path(state, provider))
 }
 
 /// A missing or unparseable file both read as an empty ledger -- a file that

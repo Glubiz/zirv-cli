@@ -658,7 +658,7 @@ pub fn run_remember_with<W: Write>(
     // in between), so that path takes the lock itself and calls
     // `upsert_shared_inner` directly -- the public `upsert_shared_allow_
     // sensitive`/`upsert_scoped` wrappers below would try to acquire a
-    // second lock on the same file and deadlock (`BankLock`'s own doc
+    // second lock on the same file and deadlock (`lock_bank`'s own doc
     // comment). Without `--if-unchanged`, their own internal locking is
     // enough. This call site is Shared only, guaranteed by the `scope !=
     // Shared` return above.

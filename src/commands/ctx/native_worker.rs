@@ -334,6 +334,29 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         writer_permit.is_some().then(|| tree.clone()),
         now,
     )?;
+    // Issue #723: recording, not deciding -- reaching this point already
+    // means `agent::run_with` claimed `--task`'s card (`task::claim_locked`)
+    // and `resolve_worker_budget` admitted `--group`'s child
+    // (`group::admit_child`) before this module was ever called; best
+    // effort, like every other accounting write in this function.
+    if args.task.is_some() {
+        let _ = delegation::record_condition(
+            state,
+            repo,
+            &delegation_id,
+            delegation::ConditionReason::TaskClaimed,
+            now,
+        );
+    }
+    if args.group.is_some() {
+        let _ = delegation::record_condition(
+            state,
+            repo,
+            &delegation_id,
+            delegation::ConditionReason::BudgetOk,
+            now,
+        );
+    }
 
     let mut limits = NativeLimits::default();
     if let Some(max_tool_calls) = worker_budget.tool_calls {
@@ -485,6 +508,20 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
             DelegationState::ReportedContractFailed
         };
         contract_errors = attempts.last().cloned().unwrap_or_default();
+        // Issue #723: recording `result_schema::evaluate`'s own verdict,
+        // just decided above -- best effort, like every other accounting
+        // write in this function.
+        let _ = delegation::record_condition(
+            state,
+            repo,
+            &delegation_id,
+            if validated.is_some() {
+                delegation::ConditionReason::ContractValid
+            } else {
+                delegation::ConditionReason::ContractFailed
+            },
+            super::state::now_secs(),
+        );
     }
 
     let (stored_report, report_truncated) = super::agent::cap_report(status.final_text.as_deref());

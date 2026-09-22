@@ -11,6 +11,22 @@ use super::config::{CtxConfig, EnvLookup, ObfuscateMode};
 use super::obfuscate::{Options, Vault, VaultEntry};
 use super::state::StateDir;
 
+// TODO(#728): unlike every other ctx lock guard, this one deletes the lock
+// file on drop rather than leaving it behind -- but it is NOT the same
+// mechanism as `state::FileLock`/`state::acquire_lock` (an OS advisory lock
+// via `File::lock`/`unlock`) and cannot be swapped for it as-is. `acquire_lock`
+// below opens the lock file with `create_new(true)` and treats "file already
+// exists" as contention, polling with a 120s staleness recovery (`stale`) and
+// a 10s acquire deadline -- the file's ABSENCE is the unlocked state, not an
+// OS-level unlock call. If drop stopped deleting it, every subsequent
+// `acquire_lock` on the same path (including the very next one, e.g. the two
+// back-to-back `with_vault` calls in `store_rejects_corrupt_rows_and_
+// persists_owner_only` below) would see `AlreadyExists`, find the file fresh
+// (not stale for 120s), and burn its whole 10s deadline before failing --
+// turning every vault operation after the first into a guaranteed timeout.
+// Delete-on-drop is therefore load-bearing for this specific existence-based
+// locking scheme; it is not simply an inconsistency with the "leave the file"
+// rule the OS-advisory-lock modules follow.
 struct LockGuard(PathBuf);
 
 #[derive(Debug, clap::Args)]

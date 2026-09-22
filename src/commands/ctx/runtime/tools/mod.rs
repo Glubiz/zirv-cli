@@ -4542,7 +4542,7 @@ mod tests {
                 ResourceClaims::new(&repo, &repo, state.root(), &home, network).expect("claims"),
                 ApprovalMode::Headless,
                 std::sync::Arc::new(FixedPolicy(
-                    PolicySnapshot::new(policy, safety.clone()).expect("policy"),
+                    PolicySnapshot::new(policy.clone(), safety.clone()).expect("policy"),
                 )),
                 std::sync::Arc::new(FixedFence),
                 std::sync::Arc::new(ApprovalAuthority::new()),
@@ -6667,7 +6667,7 @@ mod tests {
                 ),
             ] {
                 let mut fixture = end_to_end_with_network_scope(
-                    policy,
+                    policy.clone(),
                     super::super::mcp::FixtureServer::default(),
                     24,
                     scope,
@@ -6682,7 +6682,11 @@ mod tests {
                 assert!(error.message.contains("not shipped yet"), "{error:?}");
             }
 
-            let mut fixture = end_to_end(policy, super::super::mcp::FixtureServer::default(), 24);
+            let mut fixture = end_to_end(
+                policy.clone(),
+                super::super::mcp::FixtureServer::default(),
+                24,
+            );
             let receipt = fixture.client.execute(tool, arguments, None, None);
             assert_ne!(
                 receipt.error.map(|error| error.code),

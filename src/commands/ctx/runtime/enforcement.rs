@@ -27,6 +27,11 @@ use super::super::adapters::LaunchMode;
 use super::super::config::{CtxConfig, env_from_process};
 use super::super::permit::HeavyPermit;
 use super::super::policy::{Capability, EffectivePolicy, Stance};
+// Issue #727: `NetworkTarget` moved to `policy.rs` (shared with `[policy]
+// network_allowlist`) but re-exported here so every existing
+// `enforcement::NetworkTarget` reference (native.rs, runtime/tools/*) keeps
+// working unchanged.
+pub use super::super::policy::NetworkTarget;
 use super::super::safety::{self, SafetyPolicy, Verdict};
 use super::super::seat;
 use super::{RuntimeKind, SessionHandle};
@@ -72,13 +77,11 @@ pub enum NetworkScope {
     Any,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NetworkTarget {
-    pub scheme: String,
-    pub host: String,
-    pub port: Option<u16>,
-}
-
+/// Issue #727: moved to [`super::super::policy`] so the harness runtime's
+/// `[policy] network_allowlist` and the native broker's own [`NetworkScope`]
+/// share one type instead of two structurally-identical ones drifting apart.
+/// The validating constructor stays here: it returns a [`BrokerError`], which
+/// belongs to this module, not to `policy.rs`.
 impl NetworkTarget {
     pub fn new(scheme: &str, host: &str, port: Option<u16>) -> Result<Self, BrokerError> {
         let scheme = scheme.to_ascii_lowercase();
@@ -2253,6 +2256,7 @@ mod tests {
             outside_repo_fs_write: Stance::Deny,
             shell_exec: Stance::Deny,
             network: Some(Stance::Deny),
+            network_allowlist: Vec::new(),
             approval: Stance::Deny,
             git_push_destructive: Stance::Deny,
             // Read-only tools themselves remain available. The mutation is
@@ -2289,7 +2293,7 @@ mod tests {
             approval: Stance::Allow,
             ..EffectivePolicy::default()
         };
-        let permitted = fixture(policy, ApprovalMode::Headless, true);
+        let permitted = fixture(policy.clone(), ApprovalMode::Headless, true);
         let action = ExecutionAction::WriteFile {
             path: permitted.worktree.join("src/new.rs"),
         };
@@ -2361,7 +2365,7 @@ mod tests {
             approval: Stance::Ask,
             ..EffectivePolicy::default()
         };
-        let fixture = fixture(effective, ApprovalMode::Interactive, true);
+        let fixture = fixture(effective.clone(), ApprovalMode::Interactive, true);
         let first = ExecutionAction::WriteFile {
             path: fixture.worktree.join("one.rs"),
         };
@@ -2423,7 +2427,7 @@ mod tests {
         ));
         *fixture.generation.0.lock().expect("generation lock") = 7;
 
-        let mut changed = effective;
+        let mut changed = effective.clone();
         changed.outside_repo_fs_write = Stance::Deny;
         *fixture.policy.0.lock().expect("policy lock") =
             PolicySnapshot::new(changed, SafetyPolicy::default()).expect("changed policy");

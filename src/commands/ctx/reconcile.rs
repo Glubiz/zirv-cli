@@ -299,28 +299,40 @@ fn reconcile_groups(
     report
 }
 
-/// `--dry-run`: reports `worktree::gc_candidates` (the same dead-owner
-/// pre-filter `gc` applies before ever probing git or writing the registry),
-/// noted as candidates rather than certain removals since the proof-required
-/// probe never runs here. Live: calls `worktree::gc` exactly as `agent.rs`/
-/// `dash/mod.rs` do, never widening what it removes.
-fn reconcile_worktrees(state: &StateDir, repo: &Path, dry_run: bool) -> ResourceReport {
+/// `--dry-run`: reports `worktree::gc_candidates` (the same dead-owner/
+/// expired-idle pre-filter `gc` applies before ever probing git or writing
+/// the registry), noted as candidates rather than certain removals since the
+/// proof-required probe never runs here. Live: calls `worktree::gc` exactly
+/// as `agent.rs`/`dash/mod.rs` do, never widening what it removes.
+///
+/// `idle_ttl_secs` (issue #718, `[worktree] idle_ttl_secs`) is resolved by
+/// the caller, once, from the same layered config every other reconcile
+/// resource reads through `state`/`repo` alone -- `gc`/`gc_candidates` stay
+/// plain, testable functions that never load config themselves.
+fn reconcile_worktrees(
+    state: &StateDir,
+    repo: &Path,
+    dry_run: bool,
+    idle_ttl_secs: u64,
+) -> ResourceReport {
     if dry_run {
-        let ids: Vec<String> = worktree::gc_candidates(state, repo, &sessions::is_alive)
-            .into_iter()
-            .map(|record| record.path)
-            .collect();
+        let ids: Vec<String> =
+            worktree::gc_candidates(state, repo, &sessions::is_alive, idle_ttl_secs)
+                .into_iter()
+                .map(|record| record.path)
+                .collect();
         return if ids.is_empty() {
             ResourceReport::healed("worktree", ids)
         } else {
             ResourceReport::healed_with_note(
                 "worktree",
                 ids,
-                "dead-owner candidate(s); the proof-required GC probe is not run in --dry-run",
+                "dead-owner/expired-idle candidate(s); the proof-required GC probe is not run in \
+                 --dry-run",
             )
         };
     }
-    let ids: Vec<String> = worktree::gc(state, repo, &sessions::is_alive)
+    let ids: Vec<String> = worktree::gc(state, repo, &sessions::is_alive, idle_ttl_secs)
         .into_iter()
         .filter(|(_, outcome)| {
             matches!(
@@ -375,6 +387,13 @@ pub fn run<W: Write>(args: &ReconcileArgs, w: &mut W) -> CtxResult<i32> {
     let now = state::now_secs();
     let repo = std::env::current_dir()?;
     let repo_slug = state::repo_slug(&repo);
+    // Issue #718: `[worktree] idle_ttl_secs` resolved once here, the same
+    // layered config every other reconcile resource is implicitly scoped
+    // through -- a load failure falls back to the built-in default rather
+    // than newly blocking a pass every other resource still completes.
+    let idle_ttl_secs = super::config::CtxConfig::load(&repo, &env)
+        .map(|cfg| cfg.worktree.idle_ttl_secs)
+        .unwrap_or_else(|_| super::config::WorktreeConfig::default().idle_ttl_secs);
 
     // Issue #720 review (item 1): `--dry-run` must never reach `sessions::
     // list`/`list_with_retention` (its sweep is an unavoidable side effect
@@ -401,7 +420,7 @@ pub fn run<W: Write>(args: &ReconcileArgs, w: &mut W) -> CtxResult<i32> {
         reconcile_reservations(&state, args.dry_run),
         reconcile_permits(&state, args.dry_run),
         reconcile_groups(&state, now, args.dry_run, live_shorts.as_ref()),
-        reconcile_worktrees(&state, &repo, args.dry_run),
+        reconcile_worktrees(&state, &repo, args.dry_run, idle_ttl_secs),
         reconcile_sessions(args.dry_run, session_snapshot.as_deref()),
     ];
     let any_failed = resources.iter().any(|r| r.error.is_some());
@@ -857,7 +876,7 @@ mod tests {
             reconcile_reservations(&state, true),
             reconcile_permits(&state, true),
             reconcile_groups(&state, 2_000, true, None),
-            reconcile_worktrees(&state, &repo, true),
+            reconcile_worktrees(&state, &repo, true, 3600),
             reconcile_sessions(true, None),
         ];
 

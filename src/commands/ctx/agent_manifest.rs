@@ -376,6 +376,7 @@ mod tests {
             mode: WorkerMode::Writing,
             worktree: false,
             workspace: None,
+            worktree_reuse: false,
             attach_artifact: None,
             workflow: None,
             task_class: None,

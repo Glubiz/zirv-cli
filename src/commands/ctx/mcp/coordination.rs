@@ -93,6 +93,10 @@ pub(super) struct WorkerSummary {
     id: String,
     delegation: Option<String>,
     phase: Option<String>,
+    /// Issue #723: the typed reasons recorded alongside `phase`, newest
+    /// last, each rendered `"<reason>@<unix time>"` -- empty for a worker
+    /// known only from its report (no delegation record).
+    conditions: Vec<String>,
     attempt: Option<u32>,
     exit_code: Option<i32>,
     updated_at: u64,
@@ -427,6 +431,11 @@ impl Scope {
                     id,
                     delegation: Some(record.handle.delegation.clone()),
                     phase: Some(record.phase.as_str().into()),
+                    conditions: record
+                        .conditions
+                        .iter()
+                        .map(delegation::Condition::label)
+                        .collect(),
                     attempt: Some(record.handle.attempt),
                     exit_code: record.exit_code,
                     updated_at: record.updated_at,
@@ -450,6 +459,7 @@ impl Scope {
                 id,
                 delegation: None,
                 phase: None,
+                conditions: Vec::new(),
                 attempt: None,
                 exit_code: None,
                 updated_at: report.ts,
@@ -671,5 +681,62 @@ mod tests {
         assert!(read_within(root.path(), Path::new("report.json"), 3).is_err());
         std::fs::write(root.path().join("report.json"), [0xff, 0xfe]).unwrap();
         assert!(read_within(root.path(), Path::new("report.json"), 4).is_err());
+    }
+
+    /// Issue #723: `worker_status`'s `WorkerSummary.conditions` carries the
+    /// record's own typed condition labels, in recorded order -- mirroring
+    /// `mcp.rs`'s own `Fixture::new`/`Scope::new` seam so this fails if the
+    /// `record.conditions.iter().map(Condition::label)` line is ever
+    /// removed.
+    #[test]
+    fn worker_status_carries_the_records_typed_condition_labels() {
+        use crate::commands::ctx::runtime::RuntimeKind;
+        use crate::commands::ctx::testenv::HomeGuard;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&home).expect("home");
+        let _home_guard = HomeGuard::set(&home);
+        let env = BTreeMap::from([(
+            "ZIRV_CTX_STATE_DIR".into(),
+            root.path().join("state").display().to_string(),
+        )]);
+        let scope = Scope::new(&repo, env).expect("scope");
+
+        let handle = delegation::WorkerHandle {
+            delegation: "job01".into(),
+            attempt: 1,
+            runtime: RuntimeKind::Native,
+            worker_session: "worker01".into(),
+            short: "worker01".into(),
+            role: "worker".into(),
+            task: None,
+            group: None,
+            objective: None,
+            workdir: scope.repo.clone(),
+            manifest: None,
+            plan_override: false,
+        };
+        let mut record =
+            delegation::record_launch(&scope.state, &scope.repo, handle, None, 1).expect("launch");
+        record.conditions.push(delegation::Condition {
+            reason: delegation::ConditionReason::Launched,
+            at: 2,
+        });
+        delegation::save(&scope.state, &scope.repo, &record).expect("save");
+
+        let result = scope
+            .worker_status(WorkerArgs {
+                id: Some("worker01".into()),
+                ..Default::default()
+            })
+            .expect("worker_status");
+        assert_eq!(
+            result["data"]["workers"][0]["conditions"],
+            serde_json::json!(["workspace_ready@1", "launched@2"]),
+            "got {result}"
+        );
     }
 }

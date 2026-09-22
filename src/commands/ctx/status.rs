@@ -2548,7 +2548,32 @@ fn render_agents_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> C
     let usage = native_ux::build_usage(&view, &billing_label(&cfg, repo));
     let notices = native_ux::NoticeLog::new(native_ux::NOTICE_LOG_CAP);
     let report = native_ux::headless_report(&overview, &usage, &notices, now);
-    let json = serde_json::to_string_pretty(&report)
+    let mut value = serde_json::to_value(&report)
+        .map_err(|e| format!("status --agents: failed to serialize the report: {e}"))?;
+    // Issue #723: an in-flight delegation's typed conditions, alongside
+    // (never replacing) its coarse phase -- keyed by delegation id, the same
+    // id an `agents[].id` row for a worker already carries, so a caller
+    // never has to correlate through anything new.
+    if let Some(object) = value.as_object_mut() {
+        let conditions: std::collections::BTreeMap<String, Vec<String>> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.handle.delegation.clone(),
+                    record
+                        .conditions
+                        .iter()
+                        .map(delegation::Condition::label)
+                        .collect(),
+                )
+            })
+            .collect();
+        object.insert(
+            "delegation_conditions".to_string(),
+            serde_json::to_value(conditions).unwrap_or_default(),
+        );
+    }
+    let json = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("status --agents: failed to serialize the report: {e}"))?;
     writeln!(w, "{json}")?;
     Ok(0)
@@ -3116,6 +3141,75 @@ mod tests {
         assert!(
             !text.contains("state dir:"),
             "--json must never fall through to the text report: {text}"
+        );
+    }
+
+    /// Issue #723: `status --agents` adds a `delegation_conditions` map
+    /// keyed by delegation id, each value the delegation's typed condition
+    /// labels in recorded order -- alongside (never replacing) the coarse
+    /// phase every other `agents[]` row already carries. Writes a record
+    /// with a non-empty `conditions` vec directly (mirroring
+    /// `attention.rs`'s own `write_delegation_record` seam) so this fails
+    /// if the `delegation_conditions.insert`/`Condition::label` mapping is
+    /// ever removed.
+    #[test]
+    fn agents_json_carries_delegation_conditions_by_id() {
+        use crate::commands::ctx::delegation::{self, Condition, ConditionReason};
+        use crate::commands::ctx::runtime::RuntimeKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let env = env_for(&state_dir);
+        let state = StateDir::from_root(state_dir);
+
+        let handle = delegation::WorkerHandle {
+            delegation: "deleg1".to_string(),
+            attempt: 1,
+            runtime: RuntimeKind::Native,
+            worker_session: "deleg1-session".to_string(),
+            short: "deleg1short".to_string(),
+            role: "worker".to_string(),
+            task: None,
+            group: None,
+            objective: None,
+            workdir: tmp.path().to_path_buf(),
+            manifest: None,
+            plan_override: false,
+        };
+        let mut record =
+            delegation::record_launch(&state, tmp.path(), handle, None, 10).expect("launch");
+        record.conditions.push(Condition {
+            reason: ConditionReason::Launched,
+            at: 11,
+        });
+        delegation::save(&state, tmp.path(), &record).expect("save");
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+                agents: true,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("--agents output must parse as JSON: {e}\ngot: {text}"));
+        assert_eq!(
+            value["delegation_conditions"]["deleg1"],
+            serde_json::json!(["workspace_ready@10", "launched@11"]),
+            "got {text}"
         );
     }
 

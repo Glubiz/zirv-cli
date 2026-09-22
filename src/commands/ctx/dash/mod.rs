@@ -3440,7 +3440,13 @@ fn reap_ended_panes(
         // reclaim guard) and nothing else reclaimed it once the pane's
         // child exited. `pane` (and, via its own `Drop`, any writer permit
         // it held) is already gone by this point.
-        if let Some(outcome) = reclaim_pane_worktree(state, repo, &pane_cwd, pane_owns_cwd) {
+        if let Some(outcome) = reclaim_pane_worktree(
+            state,
+            repo,
+            &pane_cwd,
+            pane_owns_cwd,
+            cfg.worktree.idle_pool_max,
+        ) {
             push_error(
                 errors,
                 describe_pane_worktree_reclaim(&pane_short, &pane_cwd, outcome),
@@ -3466,11 +3472,24 @@ fn reclaim_pane_worktree(
     repo: &Path,
     cwd: &Path,
     owns_cwd: bool,
+    idle_pool_max: u32,
 ) -> Option<super::agent::ReclaimOutcome> {
     if !owns_cwd || !super::agent::is_agent_managed_worktree(repo, cwd) {
         return None;
     }
-    Some(super::agent::reclaim_worktree(state, repo, cwd))
+    // Issue #718 review finding (2026-09): threaded from the caller's own
+    // resolved `cfg.worktree.idle_pool_max`, the same way `run_dashboard_
+    // inner` threads `cfg.worktree.idle_ttl_secs` into `worktree::gc` --
+    // a dashboard-hosted pane's own worktree reclaim now honors a repo/
+    // operator override exactly like the headless `zirv ctx agent
+    // --worktree --worktree-reuse` path (`agent::run_with`) already does,
+    // instead of silently falling back to the built-in default.
+    Some(super::agent::reclaim_worktree(
+        state,
+        repo,
+        cwd,
+        idle_pool_max,
+    ))
 }
 
 /// One stderr-bound line describing [`reclaim_pane_worktree`]'s own outcome
@@ -3500,6 +3519,11 @@ fn describe_pane_worktree_reclaim(
         ),
         super::agent::ReclaimOutcome::Failed(reason) => format!(
             "pane '{pane_short}' worktree {} left in place ({reason})",
+            path.display()
+        ),
+        super::agent::ReclaimOutcome::Idled => format!(
+            "pane '{pane_short}' worktree {} idled; kept warm for the next `--worktree-reuse` \
+             allocation with a matching base commit",
             path.display()
         ),
     }
@@ -11297,7 +11321,7 @@ fn run_dashboard_inner(
     // trees this repo's own dead sessions left behind. Best-effort and never
     // fatal to the dashboard itself -- the same never-make-it-worse posture
     // the owner-pid write just below already holds to.
-    let _ = super::worktree::gc(state, repo, &sessions::is_alive);
+    let _ = super::worktree::gc(state, repo, &sessions::is_alive, cfg.worktree.idle_ttl_secs);
 
     // Mutable, and kept current by the `Event::Resize` arm below (F6): the
     // zoom handler resizes every pane against `full`, so a `full` frozen at
@@ -22000,6 +22024,8 @@ mod tests {
                 created_at: 1_700_000_000,
                 status: crate::commands::ctx::worktree::WorktreeStatus::Active,
                 note: None,
+                setup_digest: None,
+                idled_at: None,
             },
         )
         .ok()?;
@@ -22019,7 +22045,7 @@ mod tests {
         let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
-        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true);
+        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true, 4);
         assert_eq!(
             outcome,
             Some(crate::commands::ctx::agent::ReclaimOutcome::Removed)
@@ -22037,7 +22063,7 @@ mod tests {
         };
         std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
 
-        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true);
+        let outcome = reclaim_pane_worktree(&state, &repo, &worktree, true, 4);
         match outcome {
             Some(crate::commands::ctx::agent::ReclaimOutcome::Archived(dest)) => {
                 assert_eq!(
@@ -22062,7 +22088,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
-        assert_eq!(reclaim_pane_worktree(&state, &repo, &repo, true), None);
+        assert_eq!(reclaim_pane_worktree(&state, &repo, &repo, true, 4), None);
     }
 
     /// Review round 3: ownership travels on the spawn request, never on the
@@ -22074,7 +22100,10 @@ mod tests {
         let Some((_root, state, repo, worktree)) = git_repo_with_agent_managed_worktree() else {
             return;
         };
-        assert_eq!(reclaim_pane_worktree(&state, &repo, &worktree, false), None);
+        assert_eq!(
+            reclaim_pane_worktree(&state, &repo, &worktree, false, 4),
+            None
+        );
         assert!(
             worktree.exists(),
             "an operator-named worktree must survive its pane's exit"
