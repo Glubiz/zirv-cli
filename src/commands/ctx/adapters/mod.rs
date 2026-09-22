@@ -2080,6 +2080,31 @@ pub trait AgentAdapter: std::fmt::Debug {
         super::policy::CapabilityDescriptor::advisory_only()
     }
 
+    /// What this adapter can honestly do with a non-empty `[policy]
+    /// network_allowlist` (issue #727), when `Network`'s own resolved
+    /// `stance` is not `Deny` -- `policy::evaluate` calls this INSTEAD of
+    /// [`policy_support`](Self::policy_support) for exactly that
+    /// (capability, stance) pair, because `policy_support`'s own signature
+    /// has no way to see the allowlist itself. Every other capability, and
+    /// `Network` with an empty allowlist, still go through `policy_support`
+    /// unchanged.
+    ///
+    /// Default is [`CapabilityDescriptor::advisory_only`](super::policy::
+    /// CapabilityDescriptor::advisory_only), the same "no verified mechanism"
+    /// answer `policy_support`'s own default gives for `Network` -- an
+    /// adapter with no verified way to scope network by destination is in
+    /// exactly the same honest position whether or not an allowlist was
+    /// configured.
+    fn network_allowlist_support(
+        &self,
+        allowlist: &[super::policy::NetworkTarget],
+        stance: super::policy::Stance,
+        mode: LaunchMode,
+    ) -> super::policy::CapabilityDescriptor {
+        let _ = (allowlist, stance, mode);
+        super::policy::CapabilityDescriptor::advisory_only()
+    }
+
     /// Argv that applies zirv's canonical `[policy]` (`policy::
     /// EffectivePolicy`) to a REAL session launch -- not the honest report
     /// `policy_support`/`policy::evaluate` produce for `zirv context status`,

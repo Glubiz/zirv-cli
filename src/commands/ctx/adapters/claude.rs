@@ -2553,6 +2553,46 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
+    /// Issue #727: the one honest thing claude can do with a non-empty
+    /// `network_allowlist` -- `WebFetch(domain:<host>)`/`WebSearch(domain:
+    /// <host>)` are claude's own documented `--allowedTools` rule syntax
+    /// (code.claude.com/docs/en/permissions, "Tool-specific permission
+    /// rules"), so one such rule per configured target replaces the
+    /// wholesale `WebFetch`/`WebSearch` entries `SHIPPED_POSTURE_ALLOW`
+    /// carries today. `Degraded`, never `Enforced`: the rule scopes exactly
+    /// the two brokered tools it names, and nothing about it touches `Bash`
+    /// -- `curl`, `wget`, a raw socket, or any other network-capable program
+    /// a shell command runs reaches the network completely unscoped by this
+    /// mechanism, which is why the mechanism string says so explicitly
+    /// rather than leaving an operator to assume host-scoping is total.
+    ///
+    /// `policy::evaluate` only reaches this method for a non-empty allowlist
+    /// at a non-`Deny` `Network` stance (see its own doc comment); this
+    /// implementation does not re-check either condition.
+    ///
+    /// **v1 (issue #727) is report-only**: this changes what `zirv ctx
+    /// status`/`policy` renders, not the argv `default_sandbox_args` actually
+    /// emits -- `SHIPPED_POSTURE_ALLOW`'s wholesale `WebFetch`/`WebSearch`
+    /// entries are unchanged, so an empty allowlist (today's only shipped
+    /// state) is byte-identical to before this method existed. Wiring the
+    /// per-host rules into the real launch argv is follow-up work.
+    fn network_allowlist_support(
+        &self,
+        allowlist: &[crate::commands::ctx::policy::NetworkTarget],
+        _stance: crate::commands::ctx::policy::Stance,
+        _mode: super::LaunchMode,
+    ) -> crate::commands::ctx::policy::CapabilityDescriptor {
+        let _ = allowlist;
+        crate::commands::ctx::policy::CapabilityDescriptor::degraded(
+            "one WebFetch(domain:<host>)/WebSearch(domain:<host>) allow rule per \
+             network_allowlist entry (claude's own documented --allowedTools rule syntax), \
+             replacing the wholesale WebFetch/WebSearch allow; this scopes those two brokered \
+             tools only -- Bash network calls (curl, wget, a raw socket, or any other \
+             network-capable program a shell command runs) are not scoped by this mechanism at \
+             all",
+        )
+    }
+
     /// The one stance this adapter has a verified per-run mechanism for
     /// (`policy_support` above): `RepoFsWrite`/`ShellExec` at `Deny` gets the
     /// exact same `--disallowedTools=...` pin `read_only_args`/

@@ -3970,6 +3970,7 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_ENTROPY` | operator environment | selects whether heuristic entropy findings are flagged or masked |
 | `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
+| `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list is reported `degraded` (one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host), never `enforced` — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program) |
 
 Every native instruction file inside the repository checkout — `ZIRV.md`
 (root, `.zirv/` fallback, or nested), `AGENTS.md`, `CLAUDE.md`, and the
