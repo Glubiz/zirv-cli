@@ -2573,16 +2573,23 @@ five minutes and each setup step after ten minutes. Both run with credentials,
 all `ZIRV_*` authority/session variables, and inherited git-control variables
 removed from their environment. Existing clone directories are accepted only
 when their `origin` and current branch match the declaration, and symlinks in
-any destination component are refused.
+any destination component are refused. Because materialization happens before
+the worker harness, executable workspaces require an unexpired writing, shell,
+network, and root-path delegation envelope; Zirv refuses them when it cannot
+enforce a narrower grant.
 
 `mcp_servers` contains names only—never commands, endpoints, or secrets. Zirv
 checks the final routed harness's own MCP configuration (including Claude
 `--mcp-config`/`.mcp.json` and Codex `mcp_servers` configuration) and refuses
-the delegation if any name is absent. `skills` are resolved through the normal
+the delegation if any name is absent. Claude project MCP files and disable
+settings follow the headless launch's normal precedence; Codex project config
+is counted only below a path the operator's user config marks trusted. A
+workspace with MCP requirements runs inline on the validated harness with
+cross-harness fallback disabled for that launch. `skills` are resolved through the normal
 `SkillRegistry`, including version pins and dependencies, and are attached as
-labelled instructions that grant no authority. A non-empty workspace skill
-list overrides an agent manifest's default skills; an empty list preserves the
-manifest defaults.
+labelled instructions that grant no authority. Harness-runtime workspaces use
+only their explicit `skills` list; `AgentManifest` defaults are not part of
+this launch path.
 
 Workspace arrays from the operator and repository layers are additive. Names
 must be unique, unknown fields are rejected, git destinations must be relative

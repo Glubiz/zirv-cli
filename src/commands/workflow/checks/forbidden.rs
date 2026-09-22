@@ -208,23 +208,22 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
             );
         }
     };
-    let array_forbidden_paths =
-        match extract_table_paths(&source, "const ARRAY_REPO_FORBIDDEN") {
-            Some(paths) if !paths.is_empty() => paths,
-            _ => {
-                return BuiltinCheckResult::inconclusive(
-                    ID,
-                    PROVES,
-                    FIX,
-                    ORIGIN,
-                    format!(
-                        "could not locate/parse config.rs's ARRAY_REPO_FORBIDDEN table -- its \
+    let array_forbidden_paths = match extract_table_paths(&source, "const ARRAY_REPO_FORBIDDEN") {
+        Some(paths) if !paths.is_empty() => paths,
+        _ => {
+            return BuiltinCheckResult::inconclusive(
+                ID,
+                PROVES,
+                FIX,
+                ORIGIN,
+                format!(
+                    "could not locate/parse config.rs's ARRAY_REPO_FORBIDDEN table -- its \
                          shape changed since this check was written ({})",
-                        path.display()
-                    ),
-                );
-            }
-        };
+                    path.display()
+                ),
+            );
+        }
+    };
 
     let forbidden_set: BTreeSet<&str> = repo_forbidden_paths
         .iter()
@@ -491,7 +490,10 @@ const ARRAY_REPO_FORBIDDEN: &[(&[&str], &str)] = &[
             super::super::BuiltinOutcome::Fail,
             "{result:?}"
         );
-        assert!(result.details.contains("workspace.future_exec"), "{result:?}");
+        assert!(
+            result.details.contains("workspace.future_exec"),
+            "{result:?}"
+        );
     }
 
     #[test]
