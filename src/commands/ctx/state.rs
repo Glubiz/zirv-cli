@@ -530,6 +530,66 @@ pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Opens (creating if needed) the file backing an advisory OS lock at
+/// `path`. Moved here from `group.rs` (issue #728): every module that hand-
+/// rolls a per-record lock (`group`, `task`, `reservation`, `attention`,
+/// `memory`, `health_store`, `delegation`, `permit`, `seat`) shares this one
+/// opener rather than re-deriving the unix-mode-0600-vs-portable
+/// `OpenOptions` split.
+#[cfg(unix)]
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// One advisory OS lock, shared by every ctx state store instead of each
+/// hand-rolling its own identical newtype-plus-`Drop` (issue #728). The file
+/// intentionally remains after release: deleting a lock path can split two
+/// contenders across old and new inodes, while an unlocked empty file is
+/// harmless and lets the OS release a crashed process's lock automatically.
+pub(crate) struct FileLock(std::fs::File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Opens (creating if needed) and blocking-locks `path`. Callers still do
+/// their own directory creation first -- each store's lock file lives in a
+/// different parent directory.
+pub(crate) fn acquire_lock(path: &Path) -> CtxResult<FileLock> {
+    let file = open_lock_file(path)?;
+    file.lock()?;
+    Ok(FileLock(file))
+}
+
+/// Same as [`acquire_lock`], but non-blocking (`try_lock`): returns an error
+/// immediately on contention instead of waiting. `health_store`'s hot-path
+/// callers must never block on another process's I/O (review round 2,
+/// finding 2).
+pub(crate) fn try_acquire_lock(path: &Path) -> CtxResult<FileLock> {
+    let file = open_lock_file(path)?;
+    file.try_lock()?;
+    Ok(FileLock(file))
+}
+
 /// A unique temp sibling of `target`, in the *same* directory so the `rename`
 /// in `write_private` is a same-filesystem atomic replace. The pid plus a
 /// process-local counter keeps two concurrent writers -- or two writes from

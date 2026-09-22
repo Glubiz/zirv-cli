@@ -18,10 +18,10 @@
 //! same record -- a dashboard pane's `cached_score` and that same pane's own
 //! Stop hook -- and while row identity already stops a double COUNT, an
 //! unlocked read-modify-write still loses whichever write lands second.
-//! Reuses `memory.rs`'s own `BankLock` idiom, right down to borrowing
-//! `group::open_lock_file` (which is `pub(crate)` precisely so a second
-//! lock-file idiom does not have to re-derive the unix-mode-0600-vs-
-//! portable `OpenOptions` split).
+//! Reuses `state::try_acquire_lock`/`state::FileLock` (issue #728), the same
+//! shared advisory-lock guard every other ctx state store uses, so this
+//! module does not have to re-derive the unix-mode-0600-vs-portable
+//! `OpenOptions` split.
 
 use std::path::PathBuf;
 
@@ -74,27 +74,16 @@ fn lock_path(state: &StateDir, key: &RouteKey) -> PathBuf {
     dir(state).join(format!("{}.lock", key.file_stem()))
 }
 
-/// One advisory OS lock per harness record, held across the whole
-/// read-modify-write. Same shape as `memory::BankLock`/`seat::SeatLock`.
-struct HealthLock(std::fs::File);
-
-impl Drop for HealthLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 /// `try_lock`, never `lock` (review round 2, finding 2): this critical
 /// section is reached from `wrap`'s own Stop hook and from both headless
 /// supervisors, and a supervisor may not block on another process's I/O.
 /// A contended lock means a concurrent holder is folding the SAME transcript
 /// rows, so skipping the fold loses nothing -- the same reasoning
-/// `supervise.rs` documents for its own signal handler.
-fn lock_route(state: &StateDir, key: &RouteKey) -> CtxResult<HealthLock> {
+/// `supervise.rs` documents for its own signal handler. Shares `state::
+/// try_acquire_lock` (issue #728) rather than a hand-rolled guard.
+fn lock_route(state: &StateDir, key: &RouteKey) -> CtxResult<super::state::FileLock> {
     super::state::create_private_dir_all(&dir(state))?;
-    let file = super::group::open_lock_file(&lock_path(state, key))?;
-    file.try_lock()?;
-    Ok(HealthLock(file))
+    super::state::try_acquire_lock(&lock_path(state, key))
 }
 
 fn load_record(state: &StateDir, key: &RouteKey, now: u64) -> Option<RouteHealthRecord> {

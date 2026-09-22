@@ -2080,6 +2080,31 @@ pub trait AgentAdapter: std::fmt::Debug {
         super::policy::CapabilityDescriptor::advisory_only()
     }
 
+    /// What this adapter can honestly do with a non-empty `[policy]
+    /// network_allowlist` (issue #727), when `Network`'s own resolved
+    /// `stance` is not `Deny` -- `policy::evaluate` calls this INSTEAD of
+    /// [`policy_support`](Self::policy_support) for exactly that
+    /// (capability, stance) pair, because `policy_support`'s own signature
+    /// has no way to see the allowlist itself. Every other capability, and
+    /// `Network` with an empty allowlist, still go through `policy_support`
+    /// unchanged.
+    ///
+    /// Default is [`CapabilityDescriptor::advisory_only`](super::policy::
+    /// CapabilityDescriptor::advisory_only), the same "no verified mechanism"
+    /// answer `policy_support`'s own default gives for `Network` -- an
+    /// adapter with no verified way to scope network by destination is in
+    /// exactly the same honest position whether or not an allowlist was
+    /// configured.
+    fn network_allowlist_support(
+        &self,
+        allowlist: &[super::policy::NetworkTarget],
+        stance: super::policy::Stance,
+        mode: LaunchMode,
+    ) -> super::policy::CapabilityDescriptor {
+        let _ = (allowlist, stance, mode);
+        super::policy::CapabilityDescriptor::advisory_only()
+    }
+
     /// Argv that applies zirv's canonical `[policy]` (`policy::
     /// EffectivePolicy`) to a REAL session launch -- not the honest report
     /// `policy_support`/`policy::evaluate` produce for `zirv context status`,
@@ -2169,13 +2194,24 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// identical_to_the_pre_safety_shipped_default` in `claude.rs`. Codex
     /// has no per-command mechanism to receive either parameter and ignores
     /// both.
+    ///
+    /// `network_allowlist` (issue #727 round 2): the resolved `[policy]
+    /// network_allowlist` (`EffectivePolicy::network_allowlist`), passed so
+    /// an adapter that can honestly scope network access by destination may
+    /// do so in the REAL launch argv, not only in `network_allowlist_
+    /// support`'s report. Empty (today's shipped default, and every caller
+    /// that has no policy in scope) must leave this method's argv byte-
+    /// identical to before this parameter existed -- claude's own
+    /// implementation only branches on it when non-empty. Codex has no
+    /// per-destination mechanism and ignores it, same as `sandbox`/`safety`.
     fn default_sandbox_args(
         &self,
         sandbox: &super::config::SandboxConfig,
         safety: &super::safety::SafetyPolicy,
+        network_allowlist: &[super::policy::NetworkTarget],
         mode: LaunchMode,
     ) -> Vec<String> {
-        let _ = (sandbox, safety, mode);
+        let _ = (sandbox, safety, network_allowlist, mode);
         Vec::new()
     }
 
@@ -4129,7 +4165,12 @@ pub fn policy_launch_args_for_surface(
     // Neither CLI option accepts a second occurrence from the baseline.
     let policy_supplies_sandbox = adapter.name() == "codex" && flags_pin_policy(&policy);
     let mut out = if cfg.sandbox.enabled && !policy_supplies_sandbox {
-        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety, approval_mode)
+        adapter.default_sandbox_args(
+            &cfg.sandbox,
+            &cfg.safety,
+            &cfg.policy.network_allowlist,
+            approval_mode,
+        )
     } else {
         Vec::new()
     };
@@ -5375,6 +5416,7 @@ mod tests {
                 let sandbox_args = adapter.default_sandbox_args(
                     &resolved_cfg.sandbox,
                     &resolved_cfg.safety,
+                    &[],
                     LaunchMode::Headless,
                 );
                 if !sandbox_args.is_empty() {

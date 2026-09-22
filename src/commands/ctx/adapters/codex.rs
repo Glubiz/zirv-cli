@@ -1862,9 +1862,14 @@ impl AgentAdapter for CodexAdapter {
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
+        network_allowlist: &[crate::commands::ctx::policy::NetworkTarget],
         mode: super::LaunchMode,
     ) -> Vec<String> {
-        let _ = (sandbox, safety);
+        // Issue #727 round 2: no per-destination mechanism was verified on
+        // the installed codex CLI, so this is ignored exactly like
+        // `sandbox`/`safety` above -- `policy_support`'s own `Network` arm
+        // already reports the honest gap.
+        let _ = (sandbox, safety, network_allowlist);
         let interactive_approval = mode.is_interactive() && self.on_request_approval_supported();
         let approval = if interactive_approval {
             "on-request"
@@ -4085,6 +4090,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         assert_eq!(args, vec!["--approve-for-me".to_string()]);
@@ -4159,7 +4165,8 @@ mod tests {
             let adapter = CodexAdapter::new(None)
                 .with_on_request_approval_forced(true)
                 .with_auto_review_forced(supported);
-            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            let args =
+                adapter.default_sandbox_args(&Default::default(), &Default::default(), &[], mode);
             assert_eq!(
                 args.iter().any(|arg| arg == "--approve-for-me"),
                 expected,
@@ -4181,6 +4188,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         assert_eq!(
@@ -4207,6 +4215,7 @@ mod tests {
             let args = adapter.default_sandbox_args(
                 &Default::default(),
                 &Default::default(),
+                &[],
                 super::super::LaunchMode::Headless,
             );
             assert_eq!(
@@ -4239,7 +4248,8 @@ mod tests {
             super::super::LaunchMode::Interactive,
             super::super::LaunchMode::Headless,
         ] {
-            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            let args =
+                adapter.default_sandbox_args(&Default::default(), &Default::default(), &[], mode);
             if args == ["--approve-for-me"] {
                 assert!(mode.is_interactive());
                 continue;
@@ -4275,6 +4285,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &safety,
+            &[],
             super::super::LaunchMode::Interactive,
         );
         assert!(
@@ -4295,6 +4306,7 @@ mod tests {
             adapter.default_sandbox_args(
                 &Default::default(),
                 &Default::default(),
+                &[],
                 super::super::LaunchMode::Headless,
             ),
             vec![
@@ -4319,6 +4331,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         assert_eq!(
@@ -4346,6 +4359,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         assert_eq!(
@@ -4366,6 +4380,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         assert!(

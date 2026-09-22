@@ -378,6 +378,7 @@ mod tests {
             goal: None,
             inline: false,
             manifest_agent: None,
+            worktree_reuse: false,
             attach_artifact: None,
             workflow: None,
             task_class: None,

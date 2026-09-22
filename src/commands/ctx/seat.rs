@@ -14,9 +14,9 @@
 //! `adopt_child_pid`, `stamp_in_flight`/`clear_in_flight`), and folding seat
 //! state into it would mean every one of those unrelated writes could race a
 //! rollover transaction. A dedicated file with its own lock
-//! (`<short>.seat.lock`, the same OS-advisory-lock idiom `group.rs::
-//! GroupLock` already uses over `<id>.lock`) makes that impossible by
-//! construction.
+//! (`<short>.seat.lock`, the same OS-advisory-lock idiom `group.rs` already
+//! uses over `<id>.lock`, both sharing `state::FileLock`) makes that
+//! impossible by construction.
 //!
 //! This module only ever writes the seat record and decides, purely, when a
 //! rollover should happen -- it never spawns a process, swaps an adapter, or
@@ -243,29 +243,17 @@ fn lock_path(state: &StateDir, short: &str) -> PathBuf {
     state.sessions().join(format!("{short}.seat.lock"))
 }
 
-/// One advisory OS lock per seat record, mirroring `group.rs::GroupLock`
-/// exactly (including that reuse: `super::group::open_lock_file` is
-/// `pub(crate)` precisely so a second lock-file idiom in this crate does not
-/// have to re-derive the unix-mode-0600-vs-portable `OpenOptions` split).
-struct SeatLock(std::fs::File);
-
-impl Drop for SeatLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_seat(state: &StateDir, short: &str) -> CtxResult<SeatLock> {
+/// One advisory OS lock per seat record, shared via `state::acquire_lock`
+/// (issue #728) rather than a hand-rolled guard.
+fn lock_seat(state: &StateDir, short: &str) -> CtxResult<super::state::FileLock> {
     super::state::create_private_dir_all(&state.sessions())?;
-    let file = super::group::open_lock_file(&lock_path(state, short))?;
-    file.lock()?;
-    Ok(SeatLock(file))
+    super::state::acquire_lock(&lock_path(state, short))
 }
 
 /// Holds the seat lock after validating one generation. Mutations performed
 /// while this value is alive cannot race a rollover commit.
 pub(crate) struct GenerationGuard {
-    _lock: SeatLock,
+    _lock: super::state::FileLock,
 }
 
 pub(crate) fn lock_generation(
@@ -725,6 +713,27 @@ pub fn park(
     seat.updated_at = now;
     store(state, &seat)?;
     Ok(seat)
+}
+
+/// Every parked seat (`Phase::Parked`) whose short id starts with `prefix` --
+/// mirrors `sessions::resolve_prefix`'s own prefix contract, but over the
+/// seat registry rather than the live session registry, so a "ghost park" (a
+/// parked seat whose owning session record `rollover::forget` already
+/// removed) can be recognized by `send`/`nudge` addressing (issue #721).
+pub fn find_parked_by_prefix(state: &StateDir, prefix: &str) -> Vec<Seat> {
+    let Ok(entries) = std::fs::read_dir(state.sessions()) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let short = name.to_str()?.strip_suffix(".seat.json")?.to_string();
+            short.starts_with(prefix).then_some(short)
+        })
+        .filter_map(|short| load(state, &short))
+        .filter(|seat| matches!(seat.phase, Phase::Parked { .. }))
+        .collect()
 }
 
 /// Returns a parked seat to [`Phase::Idle`]. A no-op success (not an error)

@@ -10,7 +10,7 @@
 //! failing the whole read.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -82,45 +82,14 @@ fn lock_path(state: &StateDir, id: &str) -> PathBuf {
     state.groups().join(format!("{id}.lock"))
 }
 
-#[cfg(unix)]
-pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)
-}
+/// Re-exported for callers that still spell it `group::open_lock_file`
+/// (issue #728 moved the shared opener to `state.rs`, alongside the rest of
+/// the advisory-lock machinery it now shares with every other store).
+pub(crate) use super::state::open_lock_file;
 
-#[cfg(not(unix))]
-pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-}
-
-/// One advisory OS lock per group record. The file intentionally remains
-/// after release: deleting a lock path can split two contenders across old
-/// and new inodes, while an unlocked empty file is harmless and lets the OS
-/// release a crashed process's lock automatically.
-struct GroupLock(std::fs::File);
-
-impl Drop for GroupLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_group(state: &StateDir, id: &str) -> CtxResult<GroupLock> {
+fn lock_group(state: &StateDir, id: &str) -> CtxResult<super::state::FileLock> {
     create_private_dir_all(&state.groups())?;
-    let file = open_lock_file(&lock_path(state, id))?;
-    file.lock()?;
-    Ok(GroupLock(file))
+    super::state::acquire_lock(&lock_path(state, id))
 }
 
 /// Writes a group's record. Matches `sessions::write_record`'s own

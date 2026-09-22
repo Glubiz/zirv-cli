@@ -112,6 +112,10 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "supervise.poll_ms",
     "worker.deny_network", // narrow-only fold: repo may only turn network OFF.
     "worker.max_depth",    // narrow-only fold: repo may only lower the depth cap.
+    // Issue #718: min-fold like `worker.max_depth` -- a repo may only shrink
+    // the warm worktree pool or expire it sooner.
+    "worktree.idle_pool_max",
+    "worktree.idle_ttl_secs",
     "wrap.debounce_ms",
     "wrap.inject_timeout_ms",
     // Issue #539 fix round: narrow-only fold (`narrow_skill_index_bool`) --

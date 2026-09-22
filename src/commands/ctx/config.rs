@@ -2010,6 +2010,33 @@ impl Default for WorkerConfig {
     }
 }
 
+/// Issue #718: the warm-worktree pool `zirv ctx agent --worktree
+/// --worktree-reuse` draws from -- how many `Idle` trees this repo may keep
+/// on disk at once, and how long one may sit unclaimed before `zirv ctx
+/// worktree`'s startup GC/`zirv ctx reconcile` retire it through the same
+/// proof-required `prune_one` every other removal already goes through.
+///
+/// Both keys go through the identical T9 repo-narrowing fold `worker.
+/// max_depth`/`diagnostics.timeout_secs` already use
+/// (`narrow_worktree_idle_pool_max`/`narrow_worktree_idle_ttl_secs` below):
+/// a repo checkout may only shrink the pool or shorten the TTL, never grow
+/// or lengthen either past the operator's own value.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorktreeConfig {
+    pub idle_pool_max: u32,
+    pub idle_ttl_secs: u64,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            idle_pool_max: 4,
+            idle_ttl_secs: 3600,
+        }
+    }
+}
+
 /// Issue #314: the completion-judge policy for an objective-driven `zirv ctx
 /// loop` run -- see `judge.rs`'s own module doc for the deterministic-gates-
 /// then-cheap-model-verdict shape this configures.
@@ -2938,6 +2965,9 @@ pub struct CtxConfig {
     pub chat: ChatConfig,
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
+    /// Issue #718: the warm-worktree pool `--worktree --worktree-reuse`
+    /// draws from. See [`WorktreeConfig`].
+    pub worktree: WorktreeConfig,
     pub handover: HandoverConfig,
     /// Issue #699's cost-routing lever: the operator's `[model_tiers.
     /// <adapter>]` map from a workflow seat's declared `ModelTier` to a
@@ -3722,6 +3752,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_WORKTREE_IDLE_POOL_MAX",
+        &["worktree", "idle_pool_max"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_WORKTREE_IDLE_TTL_SECS",
+        &["worktree", "idle_ttl_secs"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP",
         &["handover", "claude", "cheap"],
         EnvKind::Str,
@@ -4293,6 +4333,20 @@ fn narrow_worker_max_depth(home: u8, repo: Option<u8>) -> u8 {
 /// another repo layer) has denied it.
 fn narrow_worker_deny_network(home: bool, repo: Option<bool>) -> bool {
     home.max(repo.unwrap_or(false))
+}
+
+/// Issue #718: the repo-narrowing fold for `worktree.idle_pool_max` -- lower
+/// is stricter (a smaller warm pool), the `u32` mirror of `narrow_max_
+/// nudges`.
+fn narrow_worktree_idle_pool_max(home: u32, repo: Option<u32>) -> u32 {
+    home.min(repo.unwrap_or(u32::MAX))
+}
+
+/// Issue #718: the repo-narrowing fold for `worktree.idle_ttl_secs` -- lower
+/// is stricter (an idle tree is retired sooner), the identical shape as
+/// `narrow_loop_backoff_ceiling_secs`.
+fn narrow_worktree_idle_ttl_secs(home: u64, repo: Option<u64>) -> u64 {
+    home.min(repo.unwrap_or(u64::MAX))
 }
 
 /// Issue #314: the repo-narrowing fold for `objective.gates` -- the exact
@@ -5654,6 +5708,14 @@ impl CtxConfig {
         // ever reach this merge.
         let home_worker_max_depth = integer_at(take_nested(&mut merged, "worker", "max_depth"));
         let home_worker_deny_network = bool_at(take_nested(&mut merged, "worker", "deny_network"));
+        // Issue #718: `worktree.idle_pool_max`/`worktree.idle_ttl_secs` get
+        // the identical lift-before-merge treatment -- see
+        // `narrow_worktree_idle_pool_max`/`narrow_worktree_idle_ttl_secs`
+        // below for each field's strict direction.
+        let home_worktree_idle_pool_max =
+            integer_at(take_nested(&mut merged, "worktree", "idle_pool_max"));
+        let home_worktree_idle_ttl_secs =
+            integer_at(take_nested(&mut merged, "worktree", "idle_ttl_secs"));
         // Issue #314: `objective.gates`/`max_cycles_without_progress`/`judge`
         // get the identical lift-before-merge treatment -- see
         // `narrow_objective_gates`/`narrow_max_cycles_without_progress`/
@@ -5836,6 +5898,10 @@ impl CtxConfig {
         let repo_worker_max_depth = integer_at(take_nested(&mut repo_layer, "worker", "max_depth"));
         let repo_worker_deny_network =
             bool_at(take_nested(&mut repo_layer, "worker", "deny_network"));
+        let repo_worktree_idle_pool_max =
+            integer_at(take_nested(&mut repo_layer, "worktree", "idle_pool_max"));
+        let repo_worktree_idle_ttl_secs =
+            integer_at(take_nested(&mut repo_layer, "worktree", "idle_ttl_secs"));
         let repo_objective_gates =
             string_array_at(take_nested(&mut repo_layer, "objective", "gates"));
         let repo_objective_max_cycles = integer_at(take_nested(
@@ -6195,6 +6261,37 @@ impl CtxConfig {
                 home_worker_deny_network.unwrap_or(default_worker.deny_network),
                 repo_worker_deny_network,
             )),
+        );
+
+        let default_worktree = WorktreeConfig::default();
+        let home_worktree_idle_pool_max_value = home_worktree_idle_pool_max
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default_worktree.idle_pool_max);
+        let repo_worktree_idle_pool_max_value =
+            repo_worktree_idle_pool_max.and_then(|v| u32::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["worktree", "idle_pool_max"],
+            toml::Value::Integer(i64::from(narrow_worktree_idle_pool_max(
+                home_worktree_idle_pool_max_value,
+                repo_worktree_idle_pool_max_value,
+            ))),
+        );
+        let home_worktree_idle_ttl_secs_value = home_worktree_idle_ttl_secs
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(default_worktree.idle_ttl_secs);
+        let repo_worktree_idle_ttl_secs_value =
+            repo_worktree_idle_ttl_secs.and_then(|v| u64::try_from(v).ok());
+        insert_path(
+            &mut merged,
+            &["worktree", "idle_ttl_secs"],
+            toml::Value::Integer(
+                i64::try_from(narrow_worktree_idle_ttl_secs(
+                    home_worktree_idle_ttl_secs_value,
+                    repo_worktree_idle_ttl_secs_value,
+                ))
+                .unwrap_or(i64::MAX),
+            ),
         );
 
         let default_objective = ObjectiveConfig::default();
@@ -9226,6 +9323,68 @@ mod tests {
         );
     }
 
+    /// Issue #718: the fold rule itself, the same no-config-file, no-
+    /// `CtxConfig::load` shape as the worker/diagnostics folds above.
+    #[test]
+    fn the_worktree_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // idle_pool_max: home 4 / repo 1 -> 1 (repo may shrink the pool).
+        assert_eq!(narrow_worktree_idle_pool_max(4, Some(1)), 1);
+        // idle_pool_max: home 1 / repo 4 -> 1 (repo may not grow it).
+        assert_eq!(narrow_worktree_idle_pool_max(1, Some(4)), 1);
+        assert_eq!(narrow_worktree_idle_pool_max(4, None), 4);
+
+        // idle_ttl_secs: the identical shape, one level up in width.
+        assert_eq!(narrow_worktree_idle_ttl_secs(3600, Some(60)), 60);
+        assert_eq!(narrow_worktree_idle_ttl_secs(3600, Some(7200)), 3600);
+        assert_eq!(narrow_worktree_idle_ttl_secs(3600, None), 3600);
+    }
+
+    /// Issue #718: the full `CtxConfig::load` integration -- a repo-layer
+    /// `worktree.idle_pool_max`/`worktree.idle_ttl_secs` may only tighten
+    /// what the operator's own `~/.zirv/ctx.toml` allows, never loosen it.
+    #[test]
+    fn a_repo_layer_may_only_narrow_worktree_idle_pool_max_and_idle_ttl_secs() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[worktree]\nidle_pool_max = 4\nidle_ttl_secs = 3600\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[worktree]\nidle_pool_max = 1\nidle_ttl_secs = 60\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.worktree.idle_pool_max, 1, "a repo may shrink the pool");
+        assert_eq!(cfg.worktree.idle_ttl_secs, 60, "a repo may shorten the TTL");
+
+        // The other direction: a repo trying to WIDEN either key is ignored.
+        let repo_widen = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo_widen.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo_widen.path().join(".zirv/ctx.toml"),
+            "[worktree]\nidle_pool_max = 50\nidle_ttl_secs = 7200\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo_widen.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.worktree.idle_pool_max, 4,
+            "a repo may not grow the pool above the operator's own cap"
+        );
+        assert_eq!(
+            cfg.worktree.idle_ttl_secs, 3600,
+            "a repo may not lengthen the TTL above the operator's own ceiling"
+        );
+    }
+
     /// Issue #314: the fold rules themselves, the same no-config-file, no-
     /// `CtxConfig::load` shape as `the_worker_narrowing_fold_rule_favours_
     /// the_stricter_layer_either_direction`.
@@ -9771,6 +9930,13 @@ mod tests {
                 .contains("worker.bootstrap_timeout_secs must be greater than 0"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn worktree_config_defaults_to_a_small_bounded_pool() {
+        let worktree = WorktreeConfig::default();
+        assert_eq!(worktree.idle_pool_max, 4);
+        assert_eq!(worktree.idle_ttl_secs, 3600);
     }
 
     #[test]
@@ -11226,6 +11392,7 @@ mod tests {
                 .default_sandbox_args(
                     &Default::default(),
                     &Default::default(),
+                    &[],
                     super::super::adapters::LaunchMode::Headless,
                 )
                 .iter()
@@ -11737,6 +11904,7 @@ mod tests {
         let args = claude.default_sandbox_args(
             &cfg.sandbox,
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Headless,
         );
         let allow_arg = args
@@ -12609,6 +12777,8 @@ mod tests {
         ("worker", "default_read_only"),
         ("worker", "max_depth"),
         ("worker", "deny_network"),
+        ("worktree", "idle_pool_max"),
+        ("worktree", "idle_ttl_secs"),
         ("objective", "gates"),
         ("objective", "max_cycles_without_progress"),
         ("objective", "judge"),
@@ -12775,6 +12945,7 @@ mod tests {
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),
         ("policy", "network"),
+        ("policy", "network_allowlist"),
         ("policy", "approval"),
         ("policy", "git_push_destructive"),
         ("policy", "tool_access"),

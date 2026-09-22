@@ -186,6 +186,50 @@ impl Stance {
     }
 }
 
+/// One host `[policy] network_allowlist` may name (issue #727). Shared with
+/// the native execution broker's own `runtime::enforcement::NetworkScope`
+/// rather than duplicated -- the validating constructor
+/// (`NetworkTarget::new`) stays on `enforcement.rs` since it returns that
+/// module's own `BrokerError`; this struct itself is harness-neutral data,
+/// same as every other type in this module. `PartialOrd`/`Ord` are needed for
+/// `enforcement::NetworkScope::Only`'s `BTreeSet<NetworkTarget>`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "RawNetworkTarget")]
+pub struct NetworkTarget {
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+/// Deserialization staging shape for [`NetworkTarget`] (review round, issue
+/// #727): TOML/JSON give whatever `scheme`/`host`/`port` an author typed, and
+/// the raw derive would have stored them verbatim -- skipping the exact
+/// validation ([`NetworkTarget::new`], on `runtime::enforcement.rs`) every
+/// PROGRAMMATIC caller (native.rs, `runtime/tools/capability.rs`) already
+/// goes through. Routing `Deserialize` through `TryFrom` below closes that
+/// gap: a `[policy] network_allowlist` entry with a non-http(s) scheme or a
+/// host containing `/ \ @ \0` now hard-errors at parse time instead of
+/// silently becoming an unusable `NetworkTarget`, and `Example.COM.` now
+/// normalizes (lowercase, trailing dot stripped) the same way a programmatic
+/// caller's input would, so a repo layer naming the operator's own host back
+/// in a different case/trailing-dot spelling is still recognized as the same
+/// entry by [`resolve_network_allowlist`]'s `home.contains` check.
+#[derive(Deserialize)]
+struct RawNetworkTarget {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl TryFrom<RawNetworkTarget> for NetworkTarget {
+    type Error = String;
+
+    fn try_from(raw: RawNetworkTarget) -> Result<Self, Self::Error> {
+        NetworkTarget::new(&raw.scheme, &raw.host, raw.port)
+            .map_err(|error| format!("{}://{}: {error}", raw.scheme, raw.host))
+    }
+}
+
 /// zirv's canonical policy: one [`Stance`] per [`Capability`], stated once and
 /// translated per harness rather than restated per harness.
 ///
@@ -222,13 +266,29 @@ impl Stance {
 /// `deny_unknown_fields`: a typo'd capability name hard-errors rather than
 /// silently leaving that capability at `Allow`, which is the failure mode a
 /// permissions surface can least afford.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+///
+/// **No longer `Copy`** (issue #727): `network_allowlist` is a `Vec`, so a
+/// caller that used to rely on an implicit copy now needs `.clone()` --
+/// `narrowed_by`'s own body is the one production case, fixed alongside this
+/// field's addition. Every other capability is still a plain `Stance`/
+/// `Option<Stance>`, both `Copy`, so this only costs the type itself the
+/// derive, not any per-field semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectivePolicy {
     pub repo_fs_write: Stance,
     pub outside_repo_fs_write: Stance,
     pub shell_exec: Stance,
     pub network: Option<Stance>,
+    /// Issue #727: host/port destinations the `Network` capability's own
+    /// `Stance` is further scoped to, when non-empty -- see the module doc's
+    /// "Layering" section for the fold (`resolve_network_allowlist`, home/
+    /// repo only, narrow-only, no env layer yet) and
+    /// `AgentAdapter::network_allowlist_support` for what an adapter can
+    /// honestly do with it. Empty (the default) means "no scoping beyond
+    /// `network` itself" -- today's behavior, unaffected by this field's
+    /// existence until an operator sets one.
+    pub network_allowlist: Vec<NetworkTarget>,
     pub approval: Stance,
     pub git_push_destructive: Stance,
     pub tool_access: Stance,
@@ -299,7 +359,10 @@ impl EffectivePolicy {
     /// so a caller of `narrowed_by` alone (rather than through `resolve`)
     /// must not read the result's `.network` as meaningful.
     pub fn narrowed_by(self, narrower: EffectivePolicy) -> EffectivePolicy {
-        let mut out = self;
+        // `.clone()`, not a move: `network_allowlist` (issue #727) is a `Vec`,
+        // which cost `EffectivePolicy` its `Copy` derive, and the loop below
+        // still reads `self` after this line.
+        let mut out = self.clone();
         for capability in Capability::ALL {
             if capability == Capability::Network {
                 continue;
@@ -326,6 +389,7 @@ impl EffectivePolicy {
             outside_repo_fs_write: Stance::Deny,
             shell_exec: Stance::Deny,
             network: Some(Stance::Deny),
+            network_allowlist: Vec::new(),
             approval: Stance::Deny,
             git_push_destructive: Stance::Deny,
             tool_access: Stance::Deny,
@@ -362,6 +426,9 @@ impl EffectivePolicy {
             shell_exec: Stance::Ask,
             // `WebFetch`/`WebSearch` are pre-approved.
             network: Some(Stance::Allow),
+            // No allowlist ships by default -- wholesale `WebFetch` stays the
+            // baseline until an operator opts into scoping it (issue #727).
+            network_allowlist: Vec::new(),
             approval: Stance::Ask,
             // Force-push and history rewrites are in the built-in ask set.
             git_push_destructive: Stance::Ask,
@@ -394,6 +461,14 @@ impl EffectivePolicy {
 /// exactly as if it had explicitly denied it, defeating an operator's own
 /// home-level `network = "allow"` even when the repo took no position at
 /// all. `resolve_network` below is the fix -- see its own doc comment.
+///
+/// **`network_allowlist` (issue #727) is folded a third way**, alongside
+/// `network`'s own special-case above: narrow-only, but as a hard error on a
+/// widening attempt rather than `narrowed_by`'s ordinary silent `max` -- see
+/// `resolve_network_allowlist`'s own doc comment. No environment layer yet:
+/// the operator escape hatch every other capability gets via `ZIRV_CTX_*` is
+/// deliberately out of scope for this pass (issue #727's v1), since nothing
+/// yet consumes the resolved list beyond `zirv ctx status`'s own report.
 pub fn resolve(
     home: Option<toml::Value>,
     repo: Option<toml::Value>,
@@ -401,10 +476,14 @@ pub fn resolve(
 ) -> CtxResult<EffectivePolicy> {
     let home_network = parse_network_layer(&home, "~/.zirv/ctx.toml")?;
     let repo_network = parse_network_layer(&repo, "<repo>/.zirv/ctx.toml")?;
+    let home_allowlist = parse_network_allowlist_layer(&home, "~/.zirv/ctx.toml")?;
+    let repo_allowlist = parse_network_allowlist_layer(&repo, "<repo>/.zirv/ctx.toml")?;
 
     let mut resolved = parse_layer(home, "~/.zirv/ctx.toml")?
         .narrowed_by(parse_layer(repo, "<repo>/.zirv/ctx.toml")?);
     resolved.network = resolve_network(home_network, repo_network);
+    resolved.network_allowlist =
+        resolve_network_allowlist(home_allowlist.unwrap_or_default(), repo_allowlist)?;
 
     // `Network` is excluded from this loop and handled separately right
     // below: its field is `Option<Stance>`, so `stance_mut` cannot name a
@@ -526,6 +605,67 @@ fn resolve_network(home: Option<Stance>, repo: Option<Stance>) -> Option<Stance>
         home.unwrap_or(Stance::Deny),
         repo.unwrap_or(Stance::Allow),
     ))
+}
+
+/// One `[policy]` layer's raw, unresolved opinion on `network_allowlist`
+/// alone -- `None` when the layer never mentions the key, distinct from an
+/// explicit empty list, the same shape [`parse_network_layer`] uses for
+/// `network` itself and for the identical reason: [`resolve_network_
+/// allowlist`] needs to tell "this layer took no position" apart from
+/// "this layer explicitly named zero targets" before folding.
+fn parse_network_allowlist_layer(
+    layer: &Option<toml::Value>,
+    origin: &str,
+) -> CtxResult<Option<Vec<NetworkTarget>>> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct AllowlistOnly {
+        network_allowlist: Option<Vec<NetworkTarget>>,
+    }
+    let Some(layer) = layer else {
+        return Ok(None);
+    };
+    let parsed: AllowlistOnly = layer
+        .clone()
+        .try_into()
+        .map_err(|e| format!("{origin}: invalid [policy] section: {e}"))?;
+    Ok(parsed.network_allowlist)
+}
+
+/// `network_allowlist`'s own home/repo fold (issue #727) -- narrow-only, but
+/// NOT the silent `max`/subset-intersection every other list-shaped `[policy]`
+/// key in `config.rs` uses (e.g. `narrow_objective_gates`'s "drop whatever the
+/// repo did not also name"). A silent drop is right when a repo checkout's
+/// own opinion is *itself* untrusted data being filtered down to what the
+/// operator already trusted; here the individual VALUES are hostnames the
+/// repo chooses, so a host the operator never granted must fail loudly, the
+/// same as a mistyped `[policy]` stance does in [`resolve`] -- silently
+/// keeping only the intersection would let a compromised repo checkout name
+/// an extra destination and have it quietly vanish from the resolved policy
+/// with no signal that the repo layer overreached at all.
+///
+/// `repo: None` (the layer never mentions the key) keeps the operator's own
+/// list untouched. `repo: Some(list)` may name any subset of `home`,
+/// including the empty list (the repo narrowing the mechanism down to no
+/// scoped hosts at all is always safe); naming anything `home` did not is a
+/// hard error naming the offending host.
+fn resolve_network_allowlist(
+    home: Vec<NetworkTarget>,
+    repo: Option<Vec<NetworkTarget>>,
+) -> CtxResult<Vec<NetworkTarget>> {
+    let Some(repo) = repo else {
+        return Ok(home);
+    };
+    if let Some(ungranted) = repo.iter().find(|target| !home.contains(target)) {
+        let port = ungranted.port.map(|p| format!(":{p}")).unwrap_or_default();
+        return Err(format!(
+            "<repo>/.zirv/ctx.toml: [policy] network_allowlist may only narrow the operator's \
+             own list; {}://{}{port} is not in it",
+            ungranted.scheme, ungranted.host,
+        )
+        .into());
+    }
+    Ok(repo)
 }
 
 /// What zirv can honestly promise for one capability on one harness. There is
@@ -806,12 +946,29 @@ pub fn evaluate(
             } else {
                 policy.stance(capability)
             };
-            let descriptor = match stance {
-                Stance::Allow => CapabilityDescriptor::operator_controlled(
-                    "zirv declares no restriction; the harness's own defaults and the operator's \
-                     own settings decide",
-                ),
-                _ => adapter.policy_support(capability, stance, mode),
+            // Issue #727: a non-empty `network_allowlist` gets its own
+            // descriptor path, ahead of the ordinary `Stance::Allow` catch-all
+            // right below -- the allowlist is a real (if `Degraded`) scoping
+            // mechanism an adapter may offer even when `network` itself is
+            // `Allow`/`Ask`, so it must not be swallowed by "zirv imposes
+            // nothing" the way an unconfigured `Allow` is. `Deny` is excluded
+            // deliberately: denying network outright leaves nothing for a
+            // host allowlist to scope. An empty allowlist never reaches this
+            // arm, so a launch with none configured renders identically to
+            // before this field existed.
+            let descriptor = if capability == Capability::Network
+                && stance != Stance::Deny
+                && !policy.network_allowlist.is_empty()
+            {
+                adapter.network_allowlist_support(&policy.network_allowlist, stance, mode)
+            } else {
+                match stance {
+                    Stance::Allow => CapabilityDescriptor::operator_controlled(
+                        "zirv declares no restriction; the harness's own defaults and the \
+                         operator's own settings decide",
+                    ),
+                    _ => adapter.policy_support(capability, stance, mode),
+                }
             };
             Some(CapabilityOutcome {
                 capability,
@@ -1184,6 +1341,7 @@ mod tests {
             outside_repo_fs_write: Stance::Deny,
             shell_exec: Stance::Deny,
             network: None,
+            network_allowlist: Vec::new(),
             approval: Stance::Ask,
             git_push_destructive: Stance::Deny,
             tool_access: Stance::Ask,
@@ -1193,11 +1351,12 @@ mod tests {
             outside_repo_fs_write: Stance::Allow,
             shell_exec: Stance::Allow,
             network: None,
+            network_allowlist: Vec::new(),
             approval: Stance::Allow,
             git_push_destructive: Stance::Allow,
             tool_access: Stance::Allow,
         };
-        assert_eq!(operator.narrowed_by(widening_attempt), operator);
+        assert_eq!(operator.clone().narrowed_by(widening_attempt), operator);
     }
 
     /// `network` is deliberately left at its own default (`None`) on both
@@ -1362,6 +1521,275 @@ mod tests {
         let vars = env_from(&[("ZIRV_CTX_POLICY_NETWORK", "allow")]);
         let resolved = resolve(None, repo, &|k| vars.get(k).cloned()).expect("resolves");
         assert_eq!(resolved.network, Some(Stance::Allow));
+    }
+
+    /// Issue #727: the whole point of a repo-owned `network_allowlist` is
+    /// that a checkout cannot name a destination the operator never granted.
+    /// A repo layer adding a host beyond the home layer's own set is a hard
+    /// error -- the same widening-rejection shape as an unparseable stance
+    /// above, not a silent drop like `narrow_objective_gates`'s subset
+    /// filter in `config.rs` (see `resolve_network_allowlist`'s own doc
+    /// comment for why a silent drop is wrong here).
+    #[test]
+    fn a_repo_layer_cannot_widen_the_network_allowlist_with_a_host_home_never_granted() {
+        let home = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"api.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"evil.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let err = resolve(home, repo, &|k| vars.get(k).cloned())
+            .expect_err("a repo may not name a host the operator never granted");
+        assert!(
+            err.to_string().contains("evil.example.com"),
+            "the error must name the offending host: {err}"
+        );
+    }
+
+    /// The other half: a repo layer may always narrow the operator's own
+    /// allowlist down to a subset -- removing a host is always safe, the
+    /// same direction `network` itself and every other `[policy]` capability
+    /// already allow.
+    #[test]
+    fn a_repo_layer_may_narrow_the_network_allowlist_by_removing_a_host() {
+        let home = table(
+            "[policy]\nnetwork_allowlist = [\n  \
+             { scheme = \"https\", host = \"api.example.com\" },\n  \
+             { scheme = \"https\", host = \"docs.example.com\" },\n]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"api.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, repo, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(
+            resolved.network_allowlist,
+            vec![NetworkTarget {
+                scheme: "https".to_string(),
+                host: "api.example.com".to_string(),
+                port: None,
+            }]
+        );
+    }
+
+    /// A repo layer that never mentions `network_allowlist` at all takes no
+    /// position, the same "silence carries no opinion" rule `network` itself
+    /// follows -- the operator's own list survives untouched.
+    #[test]
+    fn a_repo_layer_that_never_mentions_the_allowlist_keeps_the_operators_own() {
+        let home = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"api.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, None, &|k| vars.get(k).cloned()).expect("resolves");
+        assert_eq!(
+            resolved.network_allowlist,
+            vec![NetworkTarget {
+                scheme: "https".to_string(),
+                host: "api.example.com".to_string(),
+                port: None,
+            }]
+        );
+    }
+
+    /// Review round (issue #727): a malformed host must hard-error at parse
+    /// time, naming the offending entry -- before this fix, `NetworkTarget`'s
+    /// plain derived `Deserialize` accepted any string verbatim, skipping the
+    /// validation ([`NetworkTarget::new`]) every programmatic caller already
+    /// goes through.
+    #[test]
+    fn a_malformed_host_in_the_repo_layer_hard_errors_naming_the_entry() {
+        let home = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"api.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"evil/example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let err = resolve(home, repo, &|k| vars.get(k).cloned())
+            .expect_err("a host containing '/' must not deserialize");
+        assert!(
+            err.to_string().contains("evil/example.com"),
+            "the error must name the malformed entry: {err}"
+        );
+    }
+
+    /// Review round (issue #727): routing `Deserialize` through
+    /// `NetworkTarget::new` normalizes case and a trailing dot on the way in,
+    /// so a repo layer spelling the operator's own granted host differently
+    /// (`Example.COM.`) still resolves to the SAME entry `home` granted --
+    /// narrowing is accepted rather than rejected as "a host home never
+    /// granted".
+    #[test]
+    fn a_repo_layer_spelling_normalizes_so_narrowing_is_accepted() {
+        let home = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"HTTPS\", host = \"Example.COM.\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, repo, &|k| vars.get(k).cloned())
+            .expect("a normalized repeat of the operator's own host must not hard-error");
+        assert_eq!(
+            resolved.network_allowlist,
+            vec![NetworkTarget {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                port: None,
+            }]
+        );
+    }
+
+    /// Review round (issue #727), item 4: the operator never mentioning
+    /// `network_allowlist` at all is NOT the same as granting an empty list --
+    /// a repo layer naming any host at all against a silent home is naming a
+    /// host the operator never granted, the same hard error as against an
+    /// explicit non-empty home list.
+    #[test]
+    fn home_omitting_the_allowlist_while_repo_sets_a_nonempty_list_is_a_hard_error() {
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"api.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let err = resolve(None, repo, &|k| vars.get(k).cloned())
+            .expect_err("a repo may not name any host when the operator granted none");
+        assert!(
+            err.to_string().contains("api.example.com"),
+            "the error must name the offending host: {err}"
+        );
+    }
+
+    /// The acceptance criterion in its most literal form: with no
+    /// `network_allowlist` configured anywhere (today's only shipped state),
+    /// both the report claude's `policy_support` path produces AND the real
+    /// argv `policy_args` emits are byte-identical to before this field
+    /// existed -- an empty allowlist changes nothing.
+    #[test]
+    fn an_empty_network_allowlist_leaves_claudes_report_and_argv_unaffected() {
+        let policy = EffectivePolicy {
+            network: Some(Stance::Allow),
+            ..EffectivePolicy::default()
+        };
+        assert!(policy.network_allowlist.is_empty());
+        let claude = ClaudeAdapter::new(None);
+        let report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
+        let network_outcome = report
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.capability == Capability::Network)
+            .expect("network row present when network is Some");
+        assert_eq!(network_outcome.support, Support::OperatorControlled);
+        assert_eq!(
+            claude.policy_args(&policy, adapters::LaunchMode::Interactive),
+            Vec::<String>::new(),
+            "an empty allowlist must not change policy_args' argv at all"
+        );
+    }
+
+    /// Claude's honest answer once an operator actually configures a
+    /// non-empty allowlist: the mechanism must name its own actual permission
+    /// rule syntax and the gap it leaves (Bash is unscoped); it must never
+    /// claim `Enforced`. Round 2 (issue #727): the mechanism string is now a
+    /// generic, static description of the mechanism -- the actual configured
+    /// host is no longer duplicated into it (round 1's `Box::leak`'d,
+    /// per-call string); the real per-host rules live in the launch argv
+    /// `ClaudeAdapter::default_sandbox_args` builds, exercised by
+    /// `default_sandbox_args_replaces_the_wholesale_webfetch_websearch_
+    /// allow_with_per_host_rules` in `adapters/claude.rs`.
+    #[test]
+    fn claude_reports_a_configured_allowlist_as_degraded_and_names_the_bash_gap() {
+        let claude = ClaudeAdapter::new(None);
+        let allowlist = vec![NetworkTarget {
+            scheme: "https".to_string(),
+            host: "api.example.com".to_string(),
+            port: None,
+        }];
+        let descriptor = claude.network_allowlist_support(
+            &allowlist,
+            Stance::Allow,
+            adapters::LaunchMode::Headless,
+        );
+        assert_eq!(descriptor.support, Support::Degraded);
+        assert_ne!(descriptor.support, Support::Enforced);
+        assert!(
+            descriptor.mechanism.contains("WebFetch(domain:<host>)"),
+            "must name claude's own permission-rule syntax: {}",
+            descriptor.mechanism
+        );
+        assert!(
+            descriptor.mechanism.contains("Bash"),
+            "must name the Bash-scoping gap: {}",
+            descriptor.mechanism
+        );
+    }
+
+    /// The same answer, reached through `evaluate` end to end (not by calling
+    /// the adapter method directly): a configured allowlist with `network`
+    /// not denied renders as `Degraded` in the actual report, never
+    /// `Enforced` -- `zirv ctx status`/`policy` must never claim more than
+    /// this mechanism delivers.
+    #[test]
+    fn evaluate_renders_a_configured_allowlist_as_degraded_never_enforced() {
+        let policy = EffectivePolicy {
+            network: Some(Stance::Allow),
+            network_allowlist: vec![NetworkTarget {
+                scheme: "https".to_string(),
+                host: "api.example.com".to_string(),
+                port: None,
+            }],
+            ..EffectivePolicy::default()
+        };
+        let claude = ClaudeAdapter::new(None);
+        let report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
+        let network_outcome = report
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.capability == Capability::Network)
+            .expect("network row present");
+        assert_eq!(network_outcome.support, Support::Degraded);
+        assert_ne!(network_outcome.support, Support::Enforced);
+        assert!(
+            network_outcome
+                .mechanism
+                .contains("WebFetch(domain:<host>)")
+        );
+    }
+
+    /// A `Deny` network stance leaves nothing for a host allowlist to scope:
+    /// `evaluate` must not reach `network_allowlist_support` at all here, so
+    /// the report is unchanged from before this field existed (claude's
+    /// plain `Unsupported` for a denied network).
+    #[test]
+    fn a_denied_network_stance_ignores_the_allowlist_entirely() {
+        let policy = EffectivePolicy {
+            network: Some(Stance::Deny),
+            network_allowlist: vec![NetworkTarget {
+                scheme: "https".to_string(),
+                host: "api.example.com".to_string(),
+                port: None,
+            }],
+            ..EffectivePolicy::default()
+        };
+        let claude = ClaudeAdapter::new(None);
+        let report = evaluate(&policy, &claude, adapters::LaunchMode::Headless);
+        let network_outcome = report
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.capability == Capability::Network)
+            .expect("network row present");
+        assert_eq!(network_outcome.support, Support::Unsupported);
     }
 
     /// The operator's escape hatch above the fold, mirroring
