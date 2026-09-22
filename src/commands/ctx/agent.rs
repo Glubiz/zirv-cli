@@ -243,6 +243,25 @@ pub struct AgentArgs {
     /// respawn_decision` instead of ever marking it `Done` silently.
     #[arg(long)]
     pub task: Option<String>,
+    /// Issue #725: a YAML file describing this delegation declaratively,
+    /// instead of the long flag list above -- `brief`/`task`/`group`/
+    /// `workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/
+    /// `no_network`/`result` (`agent_manifest::apply`, the one place this
+    /// is resolved, called at the very top of `run_with` before anything
+    /// else reads `args`). UNTRUSTED input, exactly like any other
+    /// repo-owned surface: resolved into these same `AgentArgs` fields and
+    /// nothing else, then validated through the unchanged existing gates
+    /// below -- it can never grant more than the same flags typed on the
+    /// CLI could. A field both the manifest and an explicit CLI flag name
+    /// is a hard error when they disagree, except the narrowing-capable
+    /// fields (`no_network`, `budget_tokens`, `max_tool_calls`,
+    /// `path_scope`, read-only `mode`), where the stricter value always
+    /// wins regardless of source. Relative paths inside the manifest
+    /// (`workdir`, `result.schema`, `path_scope`) resolve against the
+    /// manifest file's own directory. No `agent: <AgentManifest id>`
+    /// field: see `agent_manifest`'s own doc comment for why v1 drops it.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
     /// Issue #452: print a machine-readable delegation receipt instead of
     /// the human lines -- see [`DelegationReceipt`]. Exit codes are
     /// unchanged; this only changes what reaches stdout.
@@ -315,6 +334,7 @@ impl Default for AgentArgs {
             no_network: false,
             depth: None,
             task: None,
+            manifest: None,
             json: false,
             runtime: super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
@@ -1622,16 +1642,19 @@ pub(crate) fn cap_report(text: Option<&str>) -> (Option<String>, bool) {
     (Some(text[..end].to_string()), true)
 }
 
-/// Shared writer for [`store_result`]/[`store_report_only`]: both persist
-/// the identical record shape (`DelegationResultRecord`) to the identical
-/// path, differing only in what `outcome`/`validated`/`errors`/`undeclared`
-/// mean for the delegation that produced them. Returns the path written to,
+/// Shared writer for [`store_result`]/[`store_report_only`]/the
+/// `ExitedNoReport` case in [`run_with`]: all three persist the identical
+/// record shape (`DelegationResultRecord`) to the identical path, differing
+/// only in what `outcome`/`validated`/`errors`/`undeclared`/`report` mean
+/// for the delegation that produced them. Returns the path written to,
 /// regardless of whether the write itself actually succeeded (best-effort,
 /// like every other piece of state-dir housekeeping in this module) -- a
 /// [`DelegationReceipt`]'s own `result_path` names where the record was
-/// *meant* to land.
+/// *meant* to land. `pub(crate)` so `mcp::coordination`'s own tests can
+/// write the exact record shape their readers are meant to handle without
+/// re-implementing this writer.
 #[allow(clippy::too_many_arguments)]
-fn write_delegation_result(
+pub(crate) fn write_delegation_result(
     state: &super::state::StateDir,
     repo: &Path,
     session: &str,
@@ -3718,6 +3741,13 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    // Issue #725: resolved before anything else below reads a field
+    // `--manifest` can touch -- see `agent_manifest`'s own doc comment for
+    // the trust-boundary rules this merge follows. A no-op when
+    // `args.manifest` is `None`, exactly today's behavior.
+    let mut owned_args = args.clone();
+    super::agent_manifest::apply(&mut owned_args)?;
+    let args = &owned_args;
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
     // Issue #479 (roadmap N10): resolved first, and an unknown value is a
@@ -4806,21 +4836,16 @@ pub fn run_with<W: Write>(
         // earlier one.
         blocked_families = blocked_family_lines(&state_dir, &worker_session);
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
-        // Issue #317: `--task`'s own completion signal. Without a declared
-        // `--result-schema`, a plain exit 0 is the only success evidence this
-        // function has, so it is treated as `Reported`; a schema declared
-        // below overrides this once `validated` is known -- an unvalidated
-        // report-back is exactly the "worker completed but produced nothing
-        // usable" shape `ExitKind::SilentZero` exists for.
-        let mut task_exit_kind = if result_schema.is_none() {
-            Some(if code == 0 {
-                super::task::ExitKind::Reported
-            } else {
-                super::task::ExitKind::Crash
-            })
-        } else {
-            None
-        };
+        // Issue #317: `--task`'s own completion signal, decided below once
+        // `first_text`/`validated` are known -- both the declared-contract
+        // branch and the no-contract branch (issue #722) unconditionally set
+        // this from their own real outcome, never left at a guess made
+        // before either was known. The no-contract branch still checks
+        // `code` first (a nonzero exit is always `Crash`, whatever
+        // `first_text` says): only a clean exit with nothing usable is
+        // `SilentZero`, the "completed but produced nothing usable" shape
+        // `ExitKind::SilentZero` exists for -- never a silent `Reported`.
+        let task_exit_kind: Option<super::task::ExitKind>;
 
         // Issue #452: the final-assistant-text extraction used to live only
         // inside the `--result-schema` branch below; hoisted out so a plain
@@ -5058,6 +5083,27 @@ pub fn run_with<W: Write>(
                 Some(_) => DelegationState::Reported,
                 None => DelegationState::ExitedNoReport,
             };
+            // Issue #722: `task_exit_kind` above was decided from
+            // `code == 0` alone, before `first_text` was known -- revise it
+            // here now that both are known, but (orchestrator ruling on
+            // review round 1) `code` still decides first, exactly as it did
+            // before this issue touched this branch: a nonzero exit is
+            // always `Crash`, whether or not some final text happened to be
+            // extractable, because extractable text is not evidence the
+            // worker actually succeeded. Only a clean (`code == 0`) exit
+            // asks `first_text` at all -- `Reported` when there is one,
+            // `SilentZero` (respawn-guarded, same as `Crash`) when there is
+            // not, never a silent `Reported` that closes the card `Done` as
+            // if the worker had actually reported something. The declared-
+            // contract branch above can ignore `code` entirely only because
+            // it first forces `code = exec::EXIT_CONTRACT_FAILED` itself.
+            task_exit_kind = Some(if code != 0 {
+                super::task::ExitKind::Crash
+            } else if first_text.is_some() {
+                super::task::ExitKind::Reported
+            } else {
+                super::task::ExitKind::SilentZero
+            });
             if let Some(text) = first_text.as_deref() {
                 let (stored_report, stored_truncated) = cap_report(Some(text));
                 report_truncated = stored_truncated;
@@ -5073,8 +5119,30 @@ pub fn run_with<W: Write>(
                     writeln!(w, "{}", no_contract_result_line(Some(&path), code))?;
                 }
                 result_path = Some(path);
-            } else if !args.json {
-                writeln!(w, "{}", no_contract_result_line(None, code))?;
+            } else {
+                // Issue #722: previously nothing was ever persisted for a
+                // worker that exited with no extractable report -- reuse
+                // `write_delegation_result` directly (the same writer
+                // `store_result`/`store_report_only` both call) so a durable
+                // post-mortem survives even with nothing to store as the
+                // report, and `result_path`/the `--json` receipt's own
+                // `result_path` are never left empty for this state.
+                let path = write_delegation_result(
+                    &state_dir,
+                    repo,
+                    &worker_session,
+                    &args.name,
+                    "exited_no_report",
+                    &None,
+                    &[],
+                    &[],
+                    None,
+                    false,
+                );
+                if !args.json {
+                    writeln!(w, "{}", no_contract_result_line(None, code))?;
+                }
+                result_path = Some(path);
             }
 
             if code != 0
@@ -7786,6 +7854,7 @@ mod tests {
             no_network: false,
             depth: None,
             task: None,
+            manifest: None,
             json: false,
             runtime: super::super::runtime::RuntimeKind::Harness.to_string(),
             route: None,
@@ -9549,6 +9618,123 @@ mod tests {
         );
     }
 
+    /// Issue #722: a plain (no `--result-schema`/`--result-kind`) delegation
+    /// that exits clean but never produces an extractable final report
+    /// (`DelegationState::ExitedNoReport`) used to persist NOTHING at all --
+    /// `store_report_only` was only ever reached when `first_text.is_some()`.
+    /// It now always gets a durable `delegation-results/<session>.json`
+    /// too, written through the same `write_delegation_result` writer every
+    /// other outcome uses, with `outcome: "exited_no_report"` and an empty
+    /// report -- so `result_path` in the `--json` receipt is never left
+    /// empty for this state either.
+    #[test]
+    fn a_no_contract_run_with_no_extractable_report_still_persists_a_post_mortem() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "0");
+        }
+
+        let mut args = args_for("claude", "do the work");
+        args.json = true;
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "the worker process itself exited clean"
+        );
+
+        let printed = String::from_utf8_lossy(&out);
+        let receipt: serde_json::Value =
+            serde_json::from_str(printed.trim()).expect("receipt json");
+        assert_eq!(receipt["state"], "exited_no_report");
+        let result_path = receipt["result_path"]
+            .as_str()
+            .expect("result_path is populated even with nothing to report");
+
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(result_path).expect("read post-mortem"))
+                .expect("json");
+        assert_eq!(record["outcome"], "exited_no_report");
+        assert!(record["report"].is_null());
+
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
+        let results_dir = state_dir.logs().join("delegation-results");
+        let files: Vec<_> = std::fs::read_dir(&results_dir)
+            .expect("results dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "exactly one durable post-mortem record, even with no report text"
+        );
+    }
+
+    /// Issue #722 (orchestrator follow-up): confirms what a reader actually
+    /// sees for `ExitedNoReport` on a NONZERO exit -- `FAKE_AGENT_TURNS=0`
+    /// (no text) plus `FAKE_AGENT_MODE=fail` (exits 3) reaches the identical
+    /// `write_delegation_result` call the clean-exit case does, since
+    /// `delegation_state`/the post-mortem write only ever branch on
+    /// `first_text`, never on `code`. The `--json` receipt still carries the
+    /// real exit code; `DelegationResultRecord` (the persisted file) has no
+    /// `exit_code` field at all, for this outcome or any other -- that was
+    /// already true before this issue, not something #722 introduced.
+    #[test]
+    fn a_no_contract_run_with_a_nonzero_exit_and_no_text_is_still_exited_no_report() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "fail");
+            std::env::set_var("FAKE_AGENT_TURNS", "0");
+        }
+
+        let mut args = args_for("claude", "do the work");
+        args.json = true;
+        args.max_restarts = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+        assert_eq!(code.expect("runs"), 3, "the crash exit code propagates");
+
+        let printed = String::from_utf8_lossy(&out);
+        let receipt: serde_json::Value =
+            serde_json::from_str(printed.trim()).expect("receipt json");
+        assert_eq!(receipt["state"], "exited_no_report");
+        assert_eq!(
+            receipt["exit_code"], 3,
+            "the receipt still carries the real exit code"
+        );
+        let result_path = receipt["result_path"].as_str().expect("result_path");
+
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(result_path).expect("read post-mortem"))
+                .expect("json");
+        assert_eq!(record["outcome"], "exited_no_report");
+        assert!(record["report"].is_null());
+        assert!(
+            record.get("exit_code").is_none(),
+            "the persisted record has no exit_code field at all, for any outcome: {record}"
+        );
+    }
+
     /// Issue #303 gave codex a real `headless_resume_cmd` (`codex exec
     /// resume`), but review round 1 found it targeted zirv's own session id
     /// instead of codex's own minted one -- a wasted resume against a
@@ -9960,6 +10146,146 @@ mod tests {
             "a successful run closes the card, never leaves it Running"
         );
         assert!(card.outcome.is_some());
+    }
+
+    /// Issue #722: a clean-exit (`code == 0`), no-contract `--task`
+    /// delegation whose worker produced no extractable final text
+    /// (`DelegationState::ExitedNoReport`) must not close its card `Done`
+    /// -- that used to happen because `task_exit_kind` was decided from
+    /// `code == 0` alone, before `first_text` was known, and was only ever
+    /// revised on the declared-`--result-schema` branch. `FAKE_AGENT_TURNS=0`
+    /// makes fake-agent.sh exit 0 with an empty transcript, so `first_text`
+    /// is `None` while `code` is still `0`. `respawn_decision`'s own
+    /// `ExitKind::SilentZero` arm ("card already completed successfully" is
+    /// the only path back to `Done`, and it is never reached here) sends
+    /// the card back to `Ready` for a respawn instead.
+    #[test]
+    fn run_with_task_leaves_the_card_open_on_a_clean_exit_with_no_extractable_report() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+            std::env::set_var("FAKE_AGENT_TURNS", "0");
+        }
+
+        let state = crate::commands::ctx::state::StateDir::resolve(&|k: &str| env.get(k).cloned())
+            .expect("state resolves");
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "task-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "do the work".to_string(),
+                brief: "do the work well".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create task card");
+
+        let mut args = args_for("claude", "do the work");
+        args.task = Some("task-1".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_TURNS");
+        }
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "the worker process itself exited clean"
+        );
+
+        let cards = crate::commands::ctx::task::load_cards(&state, &repo_slug);
+        let card = &cards["task-1"];
+        assert_eq!(
+            card.state,
+            crate::commands::ctx::task::State::Ready,
+            "a clean exit with no extractable report is a SilentZero, respawn-guarded \
+             back to Ready, never closed Done: {card:?}"
+        );
+        assert!(
+            card.outcome.is_none(),
+            "no real outcome was ever reported: {card:?}"
+        );
+    }
+
+    /// Issue #722 regression (orchestrator ruling on deviation 3): a
+    /// NONZERO exit with extractable final text must still be a `Crash`,
+    /// exactly as it was before this issue's fix -- never `Reported`, which
+    /// would close the card `Done` as if the worker had actually succeeded.
+    /// `FAKE_AGENT_MODE=fail` writes a healthy transcript (so `first_text`
+    /// is `Some`) and then exits 3, with `max_restarts: Some(0)` so the
+    /// crash exit code propagates instead of being retried away.
+    #[test]
+    fn run_with_task_records_a_crash_not_done_on_a_nonzero_exit_with_text() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = tmp.path().join("state");
+        let mut env = base_env(&state_dir);
+        env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "fail");
+        }
+
+        let state = crate::commands::ctx::state::StateDir::resolve(&|k: &str| env.get(k).cloned())
+            .expect("state resolves");
+        let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "task-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "do the work".to_string(),
+                brief: "do the work well".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create task card");
+
+        let mut args = args_for("claude", "do the work");
+        args.task = Some("task-1".to_string());
+        args.max_restarts = Some(0);
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
+        assert_eq!(code.expect("runs"), 3, "the crash exit code propagates");
+
+        let cards = crate::commands::ctx::task::load_cards(&state, &repo_slug);
+        let card = &cards["task-1"];
+        assert_eq!(
+            card.state,
+            crate::commands::ctx::task::State::Ready,
+            "a nonzero exit with text is a Crash, respawn-guarded back to Ready, \
+             never closed Done just because a report happened to be extractable: {card:?}"
+        );
+        assert!(
+            card.outcome.is_none(),
+            "no real outcome was ever reported: {card:?}"
+        );
+        let events = crate::commands::ctx::task::read_events(&state, &repo_slug);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, crate::commands::ctx::task::Event::Crash { .. })),
+            "recorded as a crash, not a protocol violation or a completion: {events:?}"
+        );
     }
 
     /// Issue #317 acceptance: a card with an unmet parent cannot be claimed,

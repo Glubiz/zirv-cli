@@ -264,13 +264,17 @@ notices still print normally.
   yet — check `zirv ctx inbox` later for the worker's own report),
   `launch_failed` (refused, or the worker process never started at all —
   see `reason`), `exited_no_report` (the process exited but no final
-  assistant text could be extracted — treat the task as unverified),
+  assistant text could be extracted — treat the task as unverified; a
+  post-mortem record still lands at `result_path`, with an empty report),
   `reported` (final text extracted, no `--result-schema`/`--result-kind`
   contract declared), `reported_validated` (a declared contract was
   satisfied), `reported_contract_failed` (a declared contract failed even
   after the one bounded retry — see `errors`).
-- **`result_path`** — where the worker's full report was persisted, when
-  one was (see [Sending mail between sessions](#sending-mail-between-sessions)
+- **`result_path`** — where the worker's own record was persisted, when
+  one was; on the harness runtime `exited_no_report` always gets one too
+  (`outcome: "exited_no_report"`, no report text) so a clean exit with
+  nothing usable is never left with no durable trace (see
+  [Sending mail between sessions](#sending-mail-between-sessions)
   below for the file's own shape).
 
 Only `zirv ctx agent`/`zirv agent` (a one-shot delegation) has `--json` today
@@ -884,9 +888,23 @@ to the section that documents it in depth.
   [Verbs](#verbs) and [Cross-harness fallback and
   handover](#cross-harness-fallback-and-handover).
 - **Status and attention** — `status`, `explain-status`, and `wait` report
-  or block on a session's composed attention projection; `snapshot` prints a
-  redacted, capped diagnostic summary. See [Verbs](#verbs) and [Signals and
-  verdicts](#signals-and-verdicts).
+  or block on a session's composed attention projection; `watch <session-or-
+  delegation> [--json] [--since <revision>]` blocks on a session OR a
+  `zirv agent` delegation id until it reaches a terminal state, printing one
+  line per distinct revision observed along the way instead of only the
+  final one; `--since` resumes without re-printing a revision an earlier
+  `watch` already reported — since neither store keeps a history, only its
+  current value, a resumed watch never replays every intermediate transition
+  that happened while nobody was watching, only the ones it happens to catch
+  plus the latest state. Stdout is transition data only, in both text and
+  `--json` mode — "gone"/"replaced"/"timed out" are diagnostics, not
+  transitions, and always go to stderr instead, so a `--json` consumer's
+  stdout is never anything but valid `{revision, phase, at}` lines. An exact
+  delegation id resolves even when it is also an ambiguous or unmatched
+  session prefix; when it names both an unambiguous session and a
+  delegation, the session wins. `snapshot` prints a redacted, capped
+  diagnostic
+  summary. See [Verbs](#verbs) and [Signals and verdicts](#signals-and-verdicts).
 - **Mail and nudges** — `send`/`inbox` leave and read short notes between
   live sessions on this machine, and `nudge` wakes one early with a message;
   `kill` terminates a registered session outright. See [Sending mail between
@@ -902,7 +920,8 @@ to the section that documents it in depth.
   [Verbs](#verbs).
 - **Delegation controls** — `group`, `objective`, `spend`, `savings`,
   `worktree`, `task`, and `swarm` bound, account for, and reclaim delegated
-  work; `permissions` (`audit`/`compile`/`propose`) and `safety`
+  work; `reconcile` runs every dead-owner sweep in one pass (`--dry-run` to
+  report only); `permissions` (`audit`/`compile`/`propose`) and `safety`
   (`check`/`list`/`explain`) audit and enforce zirv's harness-neutral
   command-safety policy; `close` ends a group or objective early. See
   [Permission auditing and safe-list
@@ -2502,7 +2521,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
 | `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
-| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` reports coming soon and refuses to start (also `zirv agent`) |
+| `zirv ctx agent <name> <prompt> [--manifest <path>]` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` (issue #725) resolves a YAML file's `brief`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same flags instead of typing each one -- untrusted input that can only narrow: a field it shares with an explicit CLI flag is a hard error on any disagreement, except the narrowing-capable fields, where the stricter value always wins |
 | `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
@@ -2514,6 +2533,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the five advisory gates, the credential env var name and presence (never the value), the endpoint and model, and why it is or is not active — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+| `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
 
 ### Runtime backends
 
@@ -3541,6 +3561,7 @@ configuration so a host's working directory cannot select the wrong project.
 | `worker_status` | Optional `id`, `cursor`, `limit` | Repository-scoped delegation/report records with recorded phase, attempt, exit code where available, report outcome and truncation. Worker IDs sort lexicographically; follow `next_cursor`. |
 | `result_read` | `id`, optional `offset`, `revision`, `max_bytes` | A page of the persisted worker result JSON, including report text, structured result, validation errors and undeclared changes. Use an ID from `worker_status`. |
 | `inbox_read` | Optional `cursor`, `limit`, `max_bytes` | Unread message previews for the launch-bound recipient, with sender labels, truncation and `next_cursor`. Never consumes, acknowledges, claims, expires or retries delivery. |
+| `self` | `{}` | THIS worker's own delegation envelope (decoded through the same `parse_envelope_env` the enforcement path uses), its bound task card claim, its declared result contract, and its parent delegation handle. Requires a session bound at launch; refuses otherwise. Never accepts a session id. Each field is absent, not fabricated, when it does not apply. |
 | `skill_list` | Optional `query`, `phase`, `limit` | Every registered skill as a metadata-only digest (never instruction text) with no query; with a query, the best-matching skills ranked by the deterministic activation scorer, each with `score` and `reasons`. |
 | `skill_load` | `id` (accepts `id@version`) | The skill's dependency-ordered instruction stack, content hash, and resource list. Refused before any text is returned if this session's capability report does not support the skill's required capabilities or integrations; a repository-sourced skill is marked untrusted data. Records one activation-journal entry on success. |
 | `skill_read_resource` | `id`, `path` | One bundle resource body (reference doc, script or asset) by its bundle-relative path. |
@@ -3559,8 +3580,10 @@ files, so callers should restart pagination if they change between reads.
 Worker listings default to 16 records (maximum 64). `id` selects one exact
 worker and cannot be combined with `cursor`. Ordinary harness reports have no
 delegation phase or exit code unless a corresponding durable delegation exists;
-those fields remain null. Report outcomes such as `reported`, `validated` and
-`contract_failed` describe stored evidence, not process liveness or task correctness.
+those fields remain null. Report outcomes such as `reported`, `validated`,
+`contract_failed` and `exited_no_report` (a clean exit with no extractable
+report -- still a durable record, just with no report text) describe stored
+evidence, not process liveness or task correctness.
 Unreadable, oversized or unscoped reports are omitted from listings; an explicit
 `result_read` returns an error. Reports written before repository provenance was
 recorded require a matching scoped delegation reference, never just a filename.
@@ -3590,6 +3613,18 @@ undirected mail addressed to `any` in this repository is visible. With a binding
 existing directed delivery envelopes can locate that recipient's mail across
 mailbox directories; unrelated broadcast mail stays repository-scoped.
 
+`self` reuses the identical binding: it reads the SAME `Reader` a bound
+`--session`/`ZIRV_CTX_SESSION` resolves, and refuses outright when unbound --
+there is no repository-wide fallback the way `inbox_read` has, because there
+is no meaningful "self" without one. Its envelope comes from decoding this
+server process's own inherited `ZIRV_ENVELOPE` (absent for a root,
+non-delegated session); its task card is this session's own claim in the
+repository's task store; its result contract is this session's own declared
+`ZIRV_CTX_RESULT_SCHEMA`/`ZIRV_CTX_RESULT_WORKDIR`; its parent is the
+delegation record naming this session as the worker. The token figure shown
+is the envelope's ceiling, not remaining spend -- live usage lives in the
+supervising process, not this stateless server.
+
 **New Claude Code and Codex sessions launched through Zirv register this bridge
 automatically.** This includes chat/wrap, dashboard panes, headless workers,
 loop cycles and their supervised restarts. No `.mcp.json` or manual server
@@ -3604,7 +3639,7 @@ name is reserved for this automatic entry during the launch. No project or
 user host settings are edited. On Windows, Zirv writes Claude's generated JSON
 under the private state directory's `mcp-launch/` to keep JSON off shell-shim
 command lines; users do not create or maintain that file.
-Claude launches also pre-approve the bridge's ten named read-only tools so
+Claude launches also pre-approve the bridge's eleven named read-only tools so
 headless `dontAsk` sessions can use them. Native deny/ask rules and the server's
 current policy gates still apply; other servers receive no added permissions.
 
@@ -3681,6 +3716,7 @@ ordinary zirv CLI for that repository before starting the host.
 | Artifact IDs | Resolved in this repository's existing artifact registry. Payload access uses a directory capability to reject traversal and symlink escapes; arbitrary file paths are not tool arguments. |
 | Worker results | IDs resolve inside the operator-owned result store. Canonical repository provenance or a matching scoped delegation authorizes each read; unscoped legacy filenames grant nothing. Directory capabilities reject report traversal and symlink escapes. |
 | Inbox recipient | Operator launch configuration/inherited supervisor identity selects a registered session in this repository. Agent and mailbox come from that record, never tool arguments. The binding is not an OS authentication boundary. |
+| `self` scope | Reads only the bound session's own inherited env (`ZIRV_ENVELOPE`/`ZIRV_CTX_RESULT_SCHEMA`/`ZIRV_CTX_RESULT_WORKDIR`) and this repository's own task/delegation records filtered to that exact session id. Refuses outright when unbound; never accepts a session id as an argument. |
 | Mail policy and receipts | Current `mail.enabled` and delivery budgets apply to every read. Existing expiry and fan-out visibility rules are reused without receipt or mailbox mutations. Sender labels remain claims. |
 | Returned text | Memory provenance is retained; artifacts, worker reports, mail and shared facts are labeled untrusted information, never operator instructions. |
 | OS account and local state | Operator-owned state is trusted as with the CLI. This local service does not isolate mutually hostile processes that already share filesystem access under the same account. |
