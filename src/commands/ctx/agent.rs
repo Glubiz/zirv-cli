@@ -4184,13 +4184,7 @@ pub fn run_with<W: Write>(
         } else {
             None
         };
-        let ready = super::workspace::materialize(
-            workspace,
-            &root,
-            adapter.as_ref(),
-            &flags,
-            env,
-        )?;
+        let ready = super::workspace::materialize(workspace, &root, adapter.as_ref(), &flags, env)?;
         drop(materialization_permit);
         Some(ready)
     } else {
@@ -9034,10 +9028,16 @@ mod tests {
             std::env::remove_var("FAKE_AGENT_ARGV_LOG");
         }
 
-        assert!(error.to_string().contains("no configured MCP server(s): linear"));
+        assert!(
+            error
+                .to_string()
+                .contains("no configured MCP server(s): linear")
+        );
         let invocations = std::fs::read_to_string(&argv_log).unwrap_or_default();
         assert!(
-            invocations.lines().all(|line| !line.contains("--session-id")),
+            invocations
+                .lines()
+                .all(|line| !line.contains("--session-id")),
             "the worker launched despite the missing MCP dependency: {invocations}"
         );
     }

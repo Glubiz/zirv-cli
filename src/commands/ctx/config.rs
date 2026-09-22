@@ -6364,8 +6364,7 @@ impl CtxConfig {
                 format_config_error(&error_msg, &key_origins).into();
             add_config_error_prefix(msg)
         })?;
-        super::workspace::validate_catalogue(&cfg.workspace)
-            .map_err(add_config_error_prefix)?;
+        super::workspace::validate_catalogue(&cfg.workspace).map_err(add_config_error_prefix)?;
 
         // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
         // over here, once the full config (both layers, narrowing and env
@@ -13834,8 +13833,7 @@ git = [{ repo = "https://example.test/docs.git", branch = "main", dir = "deps/do
         let repo = tempfile::tempdir().expect("repo");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir repo");
         let repo_config = repo.path().join(".zirv/ctx.toml");
-        std::fs::write(&repo_config, "[[workspace]]\nname = \"project\"\n")
-            .expect("repo config");
+        std::fs::write(&repo_config, "[[workspace]]\nname = \"project\"\n").expect("repo config");
 
         let cfg = CtxConfig::load(repo.path(), &|_| None).expect("additive workspaces");
         assert_eq!(
@@ -13849,7 +13847,11 @@ git = [{ repo = "https://example.test/docs.git", branch = "main", dir = "deps/do
         std::fs::write(&repo_config, "[[workspace]]\nname = \"operator\"\n")
             .expect("duplicate repo config");
         let error = CtxConfig::load(repo.path(), &|_| None).expect_err("duplicate name");
-        assert!(error.to_string().contains("duplicate workspace name 'operator'"));
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate workspace name 'operator'")
+        );
     }
 
     #[test]
@@ -13864,6 +13866,9 @@ git = [{ repo = "https://example.test/docs.git", branch = "main", dir = "deps/do
         )
         .expect("write");
         let error = CtxConfig::load(repo.path(), &|_| None).expect_err("unknown field");
-        assert!(error.to_string().contains("unknown key `unknown`"), "{error}");
+        assert!(
+            error.to_string().contains("unknown key `unknown`"),
+            "{error}"
+        );
     }
 }

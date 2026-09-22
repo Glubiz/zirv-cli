@@ -157,23 +157,29 @@ pub fn validate_catalogue(workspaces: &[WorkspaceConfig]) -> CtxResult<()> {
     Ok(())
 }
 
-pub fn resolve<'a>(workspaces: &'a [WorkspaceConfig], name: &str) -> CtxResult<&'a WorkspaceConfig> {
-    workspaces.iter().find(|workspace| workspace.name == name).ok_or_else(|| {
-        let known = workspaces
-            .iter()
-            .map(|workspace| workspace.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "unknown workspace '{name}'{}",
-            if known.is_empty() {
-                "; no [[workspace]] entries are configured".to_string()
-            } else {
-                format!("; configured workspaces: {known}")
-            }
-        )
-        .into()
-    })
+pub fn resolve<'a>(
+    workspaces: &'a [WorkspaceConfig],
+    name: &str,
+) -> CtxResult<&'a WorkspaceConfig> {
+    workspaces
+        .iter()
+        .find(|workspace| workspace.name == name)
+        .ok_or_else(|| {
+            let known = workspaces
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "unknown workspace '{name}'{}",
+                if known.is_empty() {
+                    "; no [[workspace]] entries are configured".to_string()
+                } else {
+                    format!("; configured workspaces: {known}")
+                }
+            )
+            .into()
+        })
 }
 
 /// Workspace skills override manifest defaults only when the selected
@@ -359,7 +365,10 @@ fn validate_existing_clone(
     git: &WorkspaceGit,
     destination: &Path,
 ) -> CtxResult<()> {
-    if std::fs::symlink_metadata(destination)?.file_type().is_symlink() {
+    if std::fs::symlink_metadata(destination)?
+        .file_type()
+        .is_symlink()
+    {
         return Err(format!(
             "workspace '{}': refusing symlinked git dir '{}'",
             workspace.name,
@@ -458,13 +467,11 @@ pub(crate) fn configured_mcp_servers(
 /// a server configuration the eventual pane child never receives.
 pub(crate) fn uses_launch_scoped_mcp_config(adapter: &str, flags: &[String]) -> bool {
     match adapter {
-        "claude" => {
-            flags.iter().any(|flag| {
-                flag == "--mcp-config"
-                    || flag.starts_with("--mcp-config=")
-                    || flag == "--strict-mcp-config"
-            })
-        }
+        "claude" => flags.iter().any(|flag| {
+            flag == "--mcp-config"
+                || flag.starts_with("--mcp-config=")
+                || flag == "--strict-mcp-config"
+        }),
         "codex" => {
             let mut index = 0;
             while index < flags.len() {
@@ -523,7 +530,10 @@ fn codex_mcp_servers(
     env: EnvLookup<'_>,
 ) -> CtxResult<BTreeSet<String>> {
     let mut names = BTreeSet::new();
-    if let Some(home) = env("CODEX_HOME").map(PathBuf::from).or_else(|| home_dir(env).map(|h| h.join(".codex"))) {
+    if let Some(home) = env("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir(env).map(|h| h.join(".codex")))
+    {
         read_toml_mcp_file(&home.join("config.toml"), &mut names)?;
     }
     read_toml_mcp_file(&repo.join(".codex/config.toml"), &mut names)?;
@@ -572,7 +582,10 @@ fn collect_json_mcp_names(
     repo: Option<&Path>,
     names: &mut BTreeSet<String>,
 ) {
-    if let Some(servers) = value.get("mcpServers").and_then(serde_json::Value::as_object) {
+    if let Some(servers) = value
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+    {
         names.extend(servers.keys().cloned());
     }
     let Some(repo) = repo else { return };
@@ -632,7 +645,11 @@ fn flag_values<'a>(flags: &'a [String], name: &str) -> Vec<&'a str> {
 
 fn resolve_config_path(repo: &Path, raw: &str) -> PathBuf {
     let path = PathBuf::from(raw);
-    if path.is_absolute() { path } else { repo.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    }
 }
 
 fn home_dir(env: EnvLookup<'_>) -> Option<PathBuf> {
@@ -647,9 +664,13 @@ fn validate_relative_dir(workspace: &str, dir: &Path) -> CtxResult<()> {
     let Some(first) = components.next() else {
         return Err(format!("workspace '{workspace}': git.dir must not be empty").into());
     };
+    let targets_zirv = first
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(crate::utils::SCRIPT_DIR_NAME);
     if !matches!(first, Component::Normal(_))
         || components.any(|component| !matches!(component, Component::Normal(_)))
-        || first.as_os_str() == crate::utils::SCRIPT_DIR_NAME
+        || targets_zirv
     {
         return Err(format!(
             "workspace '{workspace}': git.dir '{}' must be a relative child path outside .zirv",
@@ -663,7 +684,8 @@ fn validate_relative_dir(workspace: &str, dir: &Path) -> CtxResult<()> {
 fn valid_name(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
 }
 
 fn skill_request(reference: &SkillRef) -> String {
@@ -726,7 +748,23 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
             },
         ];
         let error = config.validate().expect_err("overlapping destinations");
-        assert!(error.to_string().contains("git dirs 'deps' and 'deps/two' overlap"));
+        assert!(
+            error
+                .to_string()
+                .contains("git dirs 'deps' and 'deps/two' overlap")
+        );
+    }
+
+    #[test]
+    fn git_destinations_cannot_target_zirv_metadata_with_different_case() {
+        let mut config = workspace();
+        config.git.push(WorkspaceGit {
+            repo: "https://example.test/repo".into(),
+            branch: "main".into(),
+            dir: ".ZIRV/vendor".into(),
+        });
+        let error = config.validate().expect_err("reserved metadata directory");
+        assert!(error.to_string().contains("outside .zirv"));
     }
 
     #[test]
@@ -759,7 +797,10 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
             id: "workspace".into(),
             version: Some(2),
         });
-        assert_eq!(effective_skill_refs(Some(&selected), &defaults), selected.skills);
+        assert_eq!(
+            effective_skill_refs(Some(&selected), &defaults),
+            selected.skills
+        );
     }
 
     #[test]
@@ -834,7 +875,9 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
             branch: "main".into(),
             dir: PathBuf::from("deps/docs"),
         });
-        config.setup.push("test -f deps/docs/README.md && touch ready".into());
+        config
+            .setup
+            .push("test -f deps/docs/README.md && touch ready".into());
 
         clone_repositories(&config, &root).expect("clone");
         run_setup(&config, &root).expect("setup after clone");
