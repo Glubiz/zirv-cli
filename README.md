@@ -2521,7 +2521,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
 | `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
-| `zirv ctx agent <name> <prompt> [--manifest <path>]` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` (issue #725) resolves a YAML file's `brief`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same flags instead of typing each one -- untrusted input that can only narrow: a field it shares with an explicit CLI flag is a hard error on any disagreement, except the narrowing-capable fields, where the stricter value always wins |
+| `zirv ctx agent <name> <prompt> [--manifest <path>] [--worktree] [--workspace <name>]` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; a selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` (issue #725) resolves a YAML file's `brief`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same flags instead of typing each one -- untrusted input that can only narrow: a field it shares with an explicit CLI flag is a hard error on any disagreement, except the narrowing-capable fields, where the stricter value always wins |
 | `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
@@ -2534,6 +2534,69 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
+
+#### Declarative worker workspaces
+
+The harness runtime can prepare a repeatable worker environment before the
+worker receives its first turn. Repository-owned `.zirv/ctx.toml` may declare
+only inert requirements:
+
+```toml
+[[workspace]]
+name = "backend"
+mcp_servers = ["linear"]
+skills = [{ id = "systematic-debugging" }]
+```
+
+Clone URLs and shell commands are executable on the operator's machine, so
+they are accepted only from `~/.zirv/ctx.toml`:
+
+```toml
+[[workspace]]
+name = "backend-with-dependencies"
+git = [
+  { repo = "https://github.com/example/api-contracts.git", branch = "main", dir = "deps/api-contracts" },
+]
+setup = ["cargo fetch", "cargo build --workspace"]
+```
+
+```console
+zirv ctx agent claude "implement the API change" --worktree --workspace backend-with-dependencies
+```
+
+With `--worktree`, extra repositories and setup commands run inside the fresh
+linked worktree. Without it, the explicit `--workdir` or current checkout is
+the workspace root. Repositories are cloned in declaration order and setup
+commands run sequentially after every clone is ready. A failed clone or setup
+command aborts the delegation; the worker never starts. Clones time out after
+five minutes and each setup step after ten minutes. Both run with credentials,
+all `ZIRV_*` authority/session variables, and inherited git-control variables
+removed from their environment. Existing clone directories are accepted only
+when their `origin` and current branch match the declaration, and symlinks in
+any destination component are refused. Because materialization happens before
+the worker harness, executable workspaces require an unexpired writing, shell,
+network, and root-path delegation envelope; Zirv refuses them when it cannot
+enforce a narrower grant.
+
+`mcp_servers` contains names only—never commands, endpoints, or secrets. Zirv
+checks the final routed harness's own MCP configuration (including Claude
+`--mcp-config`/`.mcp.json` and Codex `mcp_servers` configuration) and refuses
+the delegation if any name is absent. Claude project MCP files and disable
+settings follow the headless launch's normal precedence; Codex project config
+is counted only below a path the operator's user config marks trusted. A
+workspace with MCP requirements runs inline on the validated harness with
+cross-harness fallback disabled for that launch. `skills` are resolved through the normal
+`SkillRegistry`, including version pins and dependencies, and are attached as
+labelled instructions that grant no authority. Harness-runtime workspaces use
+only their explicit `skills` list; `AgentManifest` defaults are not part of
+this launch path.
+
+Workspace arrays from the operator and repository layers are additive. Names
+must be unique, unknown fields are rejected, git destinations must be relative
+children outside `.zirv`, and the repository layer cannot replace an
+operator-defined workspace. Repository entries containing `git` or `setup`
+are rejected as security errors; selecting a workspace name is deliberately
+not treated as authorization because an autonomous seat can select one too.
 
 ### Runtime backends
 
@@ -3901,6 +3964,8 @@ keep only your own.
 | Native release availability | fixed in the binary | no flag, configuration, environment variable or Cargo feature can enable native execution |
 | `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
 | `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
+| `[[workspace]]` in `.zirv/ctx.toml` | repo-owned and untrusted | additive-only inert `name`/`mcp_servers`/`skills`; `git` and `setup` are rejected because selecting a name is not operator authorization |
+| `[[workspace]]` in `~/.zirv/ctx.toml` | operator | may additionally declare bounded, environment-scrubbed `git` clones and `setup` commands; every materialization finishes before worker launch |
 | `ZIRV_CTX_OBFUSCATE_MODE` | operator environment | selects `off`, `flag` or `obfuscate`; no repository equivalent |
 | `ZIRV_CTX_OBFUSCATE_ENTROPY` | operator environment | selects whether heuristic entropy findings are flagged or masked |
 | `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |

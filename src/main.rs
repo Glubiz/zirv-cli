@@ -1304,12 +1304,12 @@ mod tests {
         );
     }
 
-    /// Issue #267: `--mode`/`--worktree` are ordinary trailing argv to this
-    /// alias rewrite -- it forwards everything after the verb byte-for-byte,
-    /// so a new `AgentArgs` flag needs no rewrite-side change to reach
-    /// `zirv ctx agent`'s own clap parser.
+    /// Issue #267/#716: `--mode`/`--worktree`/`--workspace` are ordinary
+    /// trailing argv to this alias rewrite -- it forwards everything after the
+    /// verb byte-for-byte, so a new `AgentArgs` flag needs no rewrite-side
+    /// change to reach `zirv ctx agent`'s own clap parser.
     #[test]
-    fn the_agent_alias_forwards_mode_and_worktree_flags_unchanged() {
+    fn the_agent_alias_forwards_mode_worktree_and_workspace_flags_unchanged() {
         assert_eq!(
             rewrite_ctx_alias_args(
                 "agent",
@@ -1320,7 +1320,9 @@ mod tests {
                     "go",
                     "--mode",
                     "read-only",
-                    "--worktree"
+                    "--worktree",
+                    "--workspace",
+                    "backend"
                 ])
             ),
             vec![
@@ -1331,6 +1333,8 @@ mod tests {
                 "--mode".to_string(),
                 "read-only".to_string(),
                 "--worktree".to_string(),
+                "--workspace".to_string(),
+                "backend".to_string(),
             ]
         );
     }

@@ -161,6 +161,14 @@ pub struct AgentArgs {
     /// so has no tree to isolate.
     #[arg(long, default_value_t = false)]
     pub worktree: bool,
+    /// Materialize a named `[[workspace]]` from `.zirv/ctx.toml` before the
+    /// harness worker launches. The selected workspace may declare extra git
+    /// repositories, required MCP server names, skills, and ordered setup
+    /// commands. All are strict pre-launch gates. With `--worktree`, they are
+    /// materialized inside the fresh linked tree; otherwise the current
+    /// checkout (or explicit `--workdir`) is the workspace root.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Attach the repo's accepted workflow artifact for this stage to the
     /// worker's task prompt: resolves `--workflow` (or the repo's own
     /// active workflow when unstated), reads its accepted intent/spec/plan
@@ -325,6 +333,7 @@ impl Default for AgentArgs {
             workdir: None,
             mode: WorkerMode::Writing,
             worktree: false,
+            workspace: None,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -1907,6 +1916,44 @@ pub(crate) fn requested_envelope_from_args(
         args.depth,
         token_budget,
     )
+}
+
+/// Workspace setup is a zirv-owned shell process that runs before the child
+/// harness can enforce an envelope. Until it has a sandbox that can impose a
+/// narrower path or network grant, an executable workspace needs the complete
+/// writing/shell/network grant over its launch root.
+fn workspace_execution_allowed(
+    workspace: &super::workspace::WorkspaceConfig,
+    args: &AgentArgs,
+    parent: &envelope::WorkerEnvelope,
+    now: u64,
+) -> CtxResult<()> {
+    let requested =
+        requested_envelope_from_args(args, parent, "workspace-preflight".to_string(), None);
+    let effective = envelope::WorkerEnvelope::narrow(parent, &requested)
+        .map_err(|error| format!("delegation envelope refused: {error}"))?;
+    if !workspace.requires_write() {
+        return Ok(());
+    }
+    let root_allowed = effective
+        .paths
+        .iter()
+        .any(|scope| envelope::PathScope::new(".").is_subset_of(scope));
+    if effective.expires_at < now
+        || !effective.destructive
+        || !effective.network
+        || !effective.tools.edit
+        || !effective.tools.shell
+        || !effective.tools.network
+        || !root_allowed
+    {
+        return Err(format!(
+            "workspace '{}': executable clone/setup requires an unexpired writing, shell, network, and root-path delegation envelope; refusing before workspace materialization",
+            workspace.name
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Issue #318: resolves `--result-schema`/`--result-kind` into the actual
@@ -3756,6 +3803,9 @@ pub fn run_with<W: Write>(
     // same-harness refusal, `adapters::select`, cross-harness rerouting --
     // is meaningless for a native worker, whose `<name>` is a provider route.
     let native = resolve_runtime(args)? == super::runtime::RuntimeKind::Native;
+    if native && args.workspace.is_some() {
+        return Err("--workspace is available only for the harness runtime".into());
+    }
     if !native && let Some(message) = same_harness_refusal(args, env) {
         return Err(message.into());
     }
@@ -3782,6 +3832,53 @@ pub fn run_with<W: Write>(
     // (every headless delegation itself, and any interactive session not yet
     // wired to a seat by task 5).
     super::seat::fence(&state)?;
+    // Workspace selection must be resolved and its skill references checked
+    // before worktree allocation. A bad name or stale skill therefore cannot
+    // leave even a clean temporary tree behind. The same loaded config is
+    // reused by all later routing and spawn gates.
+    let cfg = CtxConfig::load_for_launch(repo, env)?;
+    let selected_workspace = args
+        .workspace
+        .as_deref()
+        .map(|name| super::workspace::resolve(&cfg.workspace, name))
+        .transpose()?;
+    let workspace_requires_mcp =
+        selected_workspace.is_some_and(|workspace| !workspace.mcp_servers.is_empty());
+    if let Some(workspace) = selected_workspace {
+        super::workspace::validate_skills(workspace, repo, env)?;
+    }
+    // A workspace clone or setup step is executed by zirv itself, before the
+    // harness child exists to enforce its envelope. Resolve the caller's
+    // envelope before allocating a worktree or taking a writer permit, and
+    // refuse executable workspaces unless their effects fit that grant.
+    let parent_envelope = match resolve_parent_envelope(&cfg, env) {
+        Ok(envelope) => envelope,
+        Err(reason) => {
+            if args.json {
+                let receipt =
+                    launch_failure_receipt(args, None, None, None, Some(2), reason.clone(), &[]);
+                print_receipt(w, &receipt)?;
+            } else {
+                writeln!(w, "agent: {reason}")?;
+            }
+            return Ok(2);
+        }
+    };
+    if parent_envelope.delegation_depth == 0 {
+        let reason =
+            "this session's delegation envelope has depth 0; it may not run `zirv agent` itself";
+        if args.json {
+            let receipt =
+                launch_failure_receipt(args, None, None, None, Some(2), reason.to_string(), &[]);
+            print_receipt(w, &receipt)?;
+        } else {
+            writeln!(w, "agent: {reason}")?;
+        }
+        return Ok(2);
+    }
+    if let Some(workspace) = selected_workspace {
+        workspace_execution_allowed(workspace, args, &parent_envelope, super::state::now_secs())?;
+    }
     // Issue #228: validated and canonicalised before anything else in this
     // delegation runs -- a bad `--workdir` must fail loudly, up front, not
     // surface as a confusing sandbox error deep inside a harness's own
@@ -3823,6 +3920,10 @@ pub fn run_with<W: Write>(
         },
     );
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
+    let prompt = match selected_workspace {
+        Some(workspace) => super::workspace::attach_skills(workspace, repo, prompt, env)?,
+        None => prompt,
+    };
 
     // Issue #250: no `--workdir` means the worker stays confined to `repo`
     // (see `effective_launch_repo`) -- a non-fatal nudge toward `--workdir`
@@ -3843,66 +3944,6 @@ pub fn run_with<W: Write>(
         && let Some(hint) = same_harness_hint(args, env)
     {
         writeln!(w, "{hint}")?;
-    }
-
-    // Loaded here rather than after the dashboard-join attempt below (its
-    // former position): the spawn gate needs `cfg.pace` before either fork
-    // of this delegation -- a pane spawn and an inline supervised run -- is
-    // chosen, and `try_join_dashboard` is the fork point between them.
-    // `exec::run_with` still loads its own copy internally on the inline path
-    // (the same pattern `chat.rs` already uses ahead of `wrap::run_with`),
-    // so this remains one extra read of the same layered config rather than
-    // a new code path.
-    let cfg = CtxConfig::load_for_launch(repo, env)?;
-
-    // Issue #262: this session's OWN delegation envelope (root, when
-    // `ENVELOPE_ENV` is absent), read before any routing/spawn decision --
-    // depth 0 means this session may not run `zirv agent` itself at all, so
-    // refusing here, before `try_join_dashboard`/anything else that could
-    // spawn, is the "one line, exit code 2, before any spawn" the nested-
-    // delegation contract requires.
-    let parent_envelope = match resolve_parent_envelope(&cfg, env) {
-        Ok(envelope) => envelope,
-        Err(reason) => {
-            // Issue #452 (review round 1): reached before `try_join_dashboard`
-            // ever runs, so there is no worker session/workdir/model to
-            // report yet -- `launch_failure_receipt`'s `Option` parameters
-            // exist for exactly this.
-            if args.json {
-                let receipt = launch_failure_receipt(
-                    args,
-                    None,
-                    None,
-                    canonical_workdir.as_deref(),
-                    Some(2),
-                    reason.clone(),
-                    &[],
-                );
-                print_receipt(w, &receipt)?;
-            } else {
-                writeln!(w, "agent: {reason}")?;
-            }
-            return Ok(2);
-        }
-    };
-    if parent_envelope.delegation_depth == 0 {
-        let reason =
-            "this session's delegation envelope has depth 0; it may not run `zirv agent` itself";
-        if args.json {
-            let receipt = launch_failure_receipt(
-                args,
-                None,
-                None,
-                canonical_workdir.as_deref(),
-                Some(2),
-                reason.to_string(),
-                &[],
-            );
-            print_receipt(w, &receipt)?;
-        } else {
-            writeln!(w, "agent: {reason}")?;
-        }
-        return Ok(2);
     }
 
     // `--attach-artifact`: resolved and spliced onto the operator's own
@@ -4145,6 +4186,52 @@ pub fn run_with<W: Write>(
         route_applied = Some(route);
     }
 
+    // The route is final before workspace validation: MCP requirements must
+    // be checked against the adapter that will actually launch, not merely
+    // the originally requested harness. Materialization remains ahead of the
+    // dashboard/headless fork, so neither path can spawn early. A workspace
+    // writing into an existing checkout takes a short-lived writer permit;
+    // a fresh `--worktree` is already unique to this delegation.
+    let _workspace_ready = if let Some(workspace) = selected_workspace {
+        let adapter = adapters::select(Some(&routed_args.name), &[], &cfg)?;
+        let root = effective_launch_repo(routed_args.workdir.as_deref(), repo);
+        let flags = headless_worker_flags(&cfg, &routed_args, adapter.as_ref());
+        let materialization_permit = if workspace.requires_write() {
+            let tree = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let identity = super::seat::env_seat_identity();
+            let fence = identity
+                .as_ref()
+                .map(|(short, generation)| permit::SeatFence {
+                    short,
+                    generation: *generation,
+                });
+            Some(
+                permit::acquire_writer(
+                    &state,
+                    cfg.supervise.max_writers,
+                    &format!("workspace {}: {}", workspace.name, routed_args.name),
+                    &tree,
+                    fence,
+                )
+                .map_err(|refusal| {
+                    permit::describe_writer_refusal(
+                        &refusal,
+                        &state,
+                        cfg.supervise.max_writers,
+                        &tree,
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let ready = super::workspace::materialize(workspace, &root, adapter.as_ref(), &flags, env)?;
+        drop(materialization_permit);
+        Some(ready)
+    } else {
+        None
+    };
+
     // Issue #358 (T9): usage headroom is a ranking signal for
     // `route_new_delegation` above, never a reason to refuse or delay a
     // spawn -- the pre-launch "harness-reset-wait" deferral that used to sit
@@ -4272,7 +4359,15 @@ pub fn run_with<W: Write>(
     // structured `AnswerFacts` alongside `Dispatch::Answered` below
     // (`dashboard_answer_receipt`), not from this buffer's text.
     let mut dash_buf: Vec<u8> = Vec::new();
-    let dispatch = if args.json {
+    let dispatch = if workspace_requires_mcp {
+        eprintln!(
+            "zirv ctx agent: workspace MCP requirements bind this launch to the validated harness; \
+             running inline with cross-harness fallback disabled"
+        );
+        Dispatch::Inline {
+            no_dashboard: false,
+        }
+    } else if args.json {
         try_join_dashboard(
             args,
             &prompt,
@@ -4363,7 +4458,9 @@ pub fn run_with<W: Write>(
     let grouped = group_env(&quieted, args.group.clone());
     let parented = parent_session_env(&grouped, worker_parent);
     let delegated = |key: &str| {
-        if key == super::fallback::DELEGATION_ENV {
+        if workspace_requires_mcp && key == "ZIRV_CTX_FALLBACK" {
+            Some("false".to_string())
+        } else if key == super::fallback::DELEGATION_ENV {
             Some(
                 if source_model_explicit {
                     "explicit-model"
@@ -7845,6 +7942,7 @@ mod tests {
             workdir: None,
             mode: WorkerMode::Writing,
             worktree: false,
+            workspace: None,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -8984,6 +9082,192 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// Issue #716: a workspace's MCP list is a hard dependency checked after
+    /// final adapter resolution and before either dashboard or headless spawn.
+    /// The Claude adapter's readiness probe may invoke the fake binary with
+    /// `--help`; a real worker invocation is the one carrying `--session-id`,
+    /// and none may occur when the named server is absent.
+    #[test]
+    fn workspace_missing_mcp_server_refuses_before_worker_spawn() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[[workspace]]\nname = \"needs-linear\"\nmcp_servers = [\"linear\"]\n",
+        )
+        .expect("workspace config");
+        let argv_log = tmp.path().join("argv.log");
+        unsafe {
+            std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
+        }
+
+        let env = base_env(&tmp.path().join("state"));
+        let args = AgentArgs {
+            workspace: Some("needs-linear".into()),
+            ..args_for("claude", "go")
+        };
+        let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect_err("missing MCP server must refuse");
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_ARGV_LOG");
+        }
+
+        assert!(
+            error
+                .to_string()
+                .contains("no configured MCP server(s): linear"),
+            "{error}"
+        );
+        let invocations = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        assert!(
+            invocations
+                .lines()
+                .all(|line| !line.contains("--session-id")),
+            "the worker launched despite the missing MCP dependency: {invocations}"
+        );
+    }
+
+    #[test]
+    fn restricted_envelopes_refuse_executable_workspace_before_worktree_or_setup() {
+        if cfg!(windows) {
+            return;
+        }
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir");
+        let marker = tmp.path().join("workspace-ran");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            format!(
+                "[[workspace]]\nname = \"setup\"\nsetup = [\"touch {}\"]\n",
+                marker.display()
+            ),
+        )
+        .expect("operator workspace config");
+        let base_parent = root_envelope(&CtxConfig::default());
+        let base_args = AgentArgs {
+            workspace: Some("setup".into()),
+            worktree: true,
+            ..args_for("claude", "go")
+        };
+        let now = crate::commands::ctx::state::now_secs();
+        let mut cases: Vec<(&str, envelope::WorkerEnvelope, AgentArgs, bool)> = Vec::new();
+
+        let mut parent = base_parent.clone();
+        parent.destructive = false;
+        cases.push(("non-destructive", parent, base_args.clone(), false));
+        let mut parent = base_parent.clone();
+        parent.network = false;
+        cases.push(("parent network", parent, base_args.clone(), false));
+        let mut parent = base_parent.clone();
+        parent.tools.shell = false;
+        cases.push(("parent shell", parent, base_args.clone(), false));
+        let mut parent = base_parent.clone();
+        parent.paths = vec![envelope::PathScope::new("src")];
+        cases.push(("parent path", parent, base_args.clone(), false));
+        let mut parent = base_parent.clone();
+        parent.expires_at = now.saturating_sub(1);
+        cases.push(("expired", parent, base_args.clone(), false));
+        let mut args = base_args.clone();
+        args.no_network = true;
+        cases.push(("--no-network", base_parent.clone(), args, false));
+        let mut args = base_args.clone();
+        args.mode = WorkerMode::ReadOnly;
+        cases.push(("read-only", base_parent.clone(), args, false));
+        let mut args = base_args.clone();
+        args.path_scope = vec![PathBuf::from("src")];
+        cases.push(("narrow path", base_parent.clone(), args, false));
+        let mut args = base_args.clone();
+        args.path_scope = vec![PathBuf::from("../outside")];
+        cases.push(("path widening", base_parent.clone(), args, false));
+        let mut parent = base_parent.clone();
+        parent.delegation_depth = 1;
+        let mut args = base_args.clone();
+        args.depth = Some(1);
+        cases.push(("depth widening", parent, args, false));
+        let mut parent = base_parent;
+        parent.delegation_depth = 0;
+        cases.push(("depth zero", parent, base_args, true));
+
+        for (name, parent, args, returns_exit_code) in cases {
+            let mut env = base_env(&tmp.path().join(format!("state-{name}")));
+            env.insert("HOME".into(), home.display().to_string());
+            env.insert(
+                ENVELOPE_ENV.into(),
+                envelope::canonical_json(&parent).expect("envelope"),
+            );
+            let result = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+                env.get(key).cloned()
+            });
+            if returns_exit_code {
+                assert_eq!(
+                    result.expect("depth zero is a refusal receipt"),
+                    2,
+                    "{name}"
+                );
+            } else {
+                let error = result.expect_err(name);
+                assert!(
+                    error.to_string().contains("envelope")
+                        || error.to_string().contains("requires an unexpired writing"),
+                    "{name}: {error}"
+                );
+            }
+            assert!(
+                !marker.exists(),
+                "{name}: workspace setup ran despite refusal"
+            );
+            let worktrees = tmp.path().join(".zirv/worktrees");
+            assert!(
+                !worktrees.exists()
+                    || std::fs::read_dir(&worktrees)
+                        .expect("worktrees")
+                        .next()
+                        .is_none(),
+                "{name}: worktree allocated before workspace refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_envelope_allows_workspace_setup() {
+        if cfg!(windows) {
+            return;
+        }
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir");
+        let marker = tmp.path().join("workspace-ran");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            format!(
+                "[[workspace]]\nname = \"setup\"\nsetup = [\"touch {}\"]\n",
+                marker.display()
+            ),
+        )
+        .expect("operator workspace config");
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("HOME".into(), home.display().to_string());
+        let args = AgentArgs {
+            workspace: Some("setup".into()),
+            ..args_for("claude", "go")
+        };
+        assert_eq!(
+            run_with(&args, &mut Vec::new(), tmp.path(), &|key| env
+                .get(key)
+                .cloned())
+            .expect("unrestricted workspace runs"),
+            0
+        );
+        assert!(marker.exists(), "workspace setup did not run");
     }
 
     /// Review finding (2026-09), finding 2a: `is_agent_managed_worktree`
@@ -10821,6 +11105,30 @@ mod tests {
         })
     }
 
+    fn respond_if_request(dir: PathBuf, timeout: Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() <= deadline {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = path.file_name().and_then(|name| name.to_str())?;
+                    if name.starts_with("req-") && name.ends_with(".json") {
+                        let contents = std::fs::read_to_string(&path).expect("read request");
+                        let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+                        std::fs::write(
+                            dir.join(format!("ack-{stem}.json")),
+                            r#"{"ok":true,"short":"abcd1234","reason":null}"#,
+                        )
+                        .expect("write ack");
+                        return Some(contents);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
     /// The `AgentArgs` shape a dashboard join actually accepts: no restart
     /// budget, no wall-clock limit, no trailing flags -- a pane carries none
     /// of those, so `try_join_dashboard` deliberately falls back to headless
@@ -10864,6 +11172,80 @@ mod tests {
             request_body.contains("a specific delegated task"),
             "the prompt must travel as data in the request file: {request_body}"
         );
+    }
+
+    #[test]
+    fn mcp_workspace_stays_on_the_validated_inline_adapter_after_a_limit() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(home.join(".codex")).expect("codex config dir");
+        std::fs::create_dir_all(tmp.path().join(".zirv")).expect("zirv config dir");
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[mcp_servers.docs]\ncommand = 'docs'\n",
+        )
+        .expect("codex config");
+        std::fs::write(
+            tmp.path().join(".zirv/ctx.toml"),
+            "[[workspace]]\nname = 'docs'\nmcp_servers = ['docs']\n",
+        )
+        .expect("workspace config");
+
+        let state = StateDir::from_root(state_dir.clone());
+        let now = crate::commands::ctx::state::now_secs();
+        window::store_for(
+            &state,
+            window::CODEX_USAGE_PROVIDER,
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 60,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: true,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store usage");
+
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "limit\nhealthy\n").expect("modes");
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let (requests_dir, mut env) = live_dashboard_dir(tmp.path());
+        env.insert("HOME".into(), home.display().to_string());
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        env.insert("ZIRV_CTX_PACE_JITTER_SECS".into(), "0".into());
+        env.insert("ZIRV_CTX_PACE_MAX_WAIT_SECS".into(), "0".into());
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".into(),
+            format!("sh {}", fixture("fake-codex-agent.sh").display()),
+        );
+        let responder =
+            std::thread::spawn(move || respond_if_request(requests_dir, Duration::from_secs(3)));
+
+        let mut args = joinable_args("codex", "use the docs server");
+        args.workspace = Some("docs".into());
+        args.force = true;
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect("workspace worker runs");
+        let dashboard_request = responder.join().expect("responder");
+
+        assert_eq!(code, 0);
+        assert!(
+            dashboard_request.is_none(),
+            "an MCP-bound worker must not be handed to a dashboard that can reroute it"
+        );
+        let log = std::fs::read_to_string(state_dir.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"limit-park\""), "{log}");
+        assert!(!log.contains("\"action\":\"harness-handover\""), "{log}");
     }
 
     /// A lone `--model` pin is the one trailing flag a pane can honour, so it

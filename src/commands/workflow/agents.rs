@@ -48,6 +48,7 @@ impl std::fmt::Display for ModelTier {
 /// copy by copy. [`AgentRegistry::validate_against`] is the one place an
 /// unknown or version-mismatched reference is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillRef {
     pub id: String,
     #[serde(default)]

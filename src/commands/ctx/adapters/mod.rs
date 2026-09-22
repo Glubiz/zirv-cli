@@ -1394,6 +1394,23 @@ pub fn seat_role_env(role: super::prompt::PromptRole) -> Vec<(String, String)> {
 pub trait AgentAdapter: std::fmt::Debug {
     fn name(&self) -> &'static str;
 
+    /// Names of MCP servers the wrapped harness will actually resolve for
+    /// this launch. Workspace binding uses this as a strict pre-spawn gate:
+    /// a declaration is a requirement, never a hint zirv may silently drop.
+    ///
+    /// The default delegates to the adapter-specific config readers in
+    /// `ctx::workspace` (Claude and Codex today). A future adapter must add a
+    /// verified reader there or override this method; an unknown format
+    /// fails closed rather than guessing. Secret values are never returned.
+    fn configured_mcp_servers(
+        &self,
+        repo: &Path,
+        flags: &[String],
+        env: super::config::EnvLookup<'_>,
+    ) -> CtxResult<std::collections::BTreeSet<String>> {
+        super::workspace::configured_mcp_servers(self.name(), repo, flags, env)
+    }
+
     /// The program this adapter actually spawns -- `agent_bin`'s override, or
     /// this adapter's own default binary name, whichever `ClaudeAdapter::new`/
     /// `CodexAdapter::new` resolved to `program` at construction. Distinct
