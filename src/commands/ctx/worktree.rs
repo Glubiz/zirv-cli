@@ -459,34 +459,21 @@ fn lock_file_path(state: &StateDir, repo_slug: &str) -> PathBuf {
     state.worktrees().join(format!("{repo_slug}.lock"))
 }
 
-/// Review finding (2026-09, CRITICAL, issue #718): one advisory OS lock per
-/// repo's own worktree store, serializing [`find_reusable`] + the caller's
-/// claim (an appended `Active` record) in `agent::allocate_worktree` against
-/// [`idle_count`] + the mark-`Idle` write in `agent::reclaim_worktree` --
-/// without it, two concurrent `--worktree-reuse` allocations (or an
-/// allocation racing a reclaim) could both observe the same `Idle` record
-/// before either claimed it, handing the same directory to two different
-/// workers. Mirrors `group::GroupLock` exactly in shape -- same
-/// open-then-`lock()`, same unlock-on-drop, same reason the file itself is
-/// never deleted (see `group::GroupLock`'s own doc comment) -- a sibling
-/// issue (#728) will fold both into one shared guard type.
-pub(crate) struct WorktreeLock(std::fs::File);
-
-impl Drop for WorktreeLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-/// Acquires this repo's own worktree-store lock, blocking until any other
-/// holder (in this process or another) releases it. Callers hold the
-/// returned guard across every read-then-write step that must not race --
-/// see [`WorktreeLock`]'s own doc comment for which ones.
-pub(crate) fn lock_worktrees(state: &StateDir, repo_slug: &str) -> CtxResult<WorktreeLock> {
+/// Acquires this repo's own worktree-store lock (issue #718), blocking until
+/// any other holder (in this process or another) releases it. It serializes
+/// [`find_reusable`] + the caller's claim (an appended `Active` record) in
+/// `agent::allocate_worktree` against [`idle_count`] + the mark-`Idle` write
+/// in `agent::reclaim_worktree`: without it, two concurrent
+/// `--worktree-reuse` allocations (or an allocation racing a reclaim) could
+/// both observe the same `Idle` record before either claimed it and hand the
+/// same directory to two workers. Callers hold the guard across every
+/// read-then-write step that must not race.
+pub(crate) fn lock_worktrees(
+    state: &StateDir,
+    repo_slug: &str,
+) -> CtxResult<super::state::FileLock> {
     create_private_dir_all(&state.worktrees())?;
-    let file = super::group::open_lock_file(&lock_file_path(state, repo_slug))?;
-    file.lock()?;
-    Ok(WorktreeLock(file))
+    super::state::acquire_lock(&lock_file_path(state, repo_slug))
 }
 
 /// Appends one ownership-record line. Append-only by design (see this
