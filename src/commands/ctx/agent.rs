@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::adapters::{self, AgentAdapter};
@@ -169,6 +169,15 @@ pub struct AgentArgs {
     /// checkout (or explicit `--workdir`) is the workspace root.
     #[arg(long)]
     pub workspace: Option<String>,
+    /// Prepare this checkout for the operator's stated goal before the main
+    /// worker launches. Harness runtime only.
+    #[arg(long)]
+    pub goal: Option<String>,
+    /// Internal result of `--manifest agent:` resolution. This has no CLI
+    /// spelling: it is intentionally populated only by the untrusted
+    /// delegation-manifest merge, then used for skill defaults.
+    #[arg(skip)]
+    pub manifest_agent: Option<String>,
     /// Attach the repo's accepted workflow artifact for this stage to the
     /// worker's task prompt: resolves `--workflow` (or the repo's own
     /// active workflow when unstated), reads its accepted intent/spec/plan
@@ -334,6 +343,8 @@ impl Default for AgentArgs {
             mode: WorkerMode::Writing,
             worktree: false,
             workspace: None,
+            goal: None,
+            manifest_agent: None,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -3782,6 +3793,208 @@ fn same_harness_refusal(args: &AgentArgs, env: EnvLookup<'_>) -> Option<String> 
     ))
 }
 
+#[derive(Deserialize)]
+struct BootstrapCompletion {
+    status: String,
+    evidence: String,
+}
+
+const BOOTSTRAP_SYSTEM_PROMPT: &str = "Prepare only the local development environment needed for the operator goal. Do not edit business logic, delegate, or run `zirv ctx agent`. Report only the environment preparation performed. Your final response must contain JSON: {\"status\":\"Done\",\"evidence\":\"...\"}.";
+
+fn goal_bootstrap_envelope(
+    args: &AgentArgs,
+    parent: &envelope::WorkerEnvelope,
+    session: &str,
+    budget_tokens: Option<u64>,
+) -> Result<(envelope::WorkerEnvelope, String), envelope::CannotGrow> {
+    let short = super::sessions::short_id(session);
+    let principal = format!("{}/{}", parent.principal, short);
+    let mut bootstrap_args = args.clone();
+    bootstrap_args.depth = Some(0);
+    let mut requested =
+        requested_envelope_from_args(&bootstrap_args, parent, principal.clone(), budget_tokens);
+    requested.tools.delegate = false;
+    envelope::WorkerEnvelope::narrow(parent, &requested).map(|child| (child, principal))
+}
+
+fn run_goal_bootstrap(
+    goal: &str,
+    args: &AgentArgs,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    parent_envelope: &envelope::WorkerEnvelope,
+    budget_tokens: Option<u64>,
+    env: EnvLookup<'_>,
+) -> CtxResult<()> {
+    let adapter = adapters::select(Some(&args.name), &[], cfg)?;
+    let mut command =
+        adapters::policy_launch_args(cfg, adapter.as_ref(), &[], adapters::LaunchMode::Headless);
+    if let Some(model) = adapters::resolve_tiered_model(
+        cfg,
+        adapter.name(),
+        crate::commands::workflow::agents::ModelTier::Fast,
+    ) {
+        command.extend(adapter.model_args(model));
+    }
+    let system_prompt_args = adapter.system_prompt_args(BOOTSTRAP_SYSTEM_PROMPT);
+    if system_prompt_args.is_empty() {
+        return Err(format!(
+            "goal bootstrap cannot run on adapter '{}': it has no verified system-prompt channel",
+            adapter.name()
+        )
+        .into());
+    }
+    command.extend(system_prompt_args);
+
+    let session = SessionId::new_v4().to_string();
+    let (bootstrap_envelope, principal) =
+        goal_bootstrap_envelope(args, parent_envelope, &session, budget_tokens)
+            .map_err(|error| format!("goal bootstrap envelope refused: {error}"))?;
+    let envelope_json = envelope::canonical_json(&bootstrap_envelope).ok();
+    let envelope_sha256 = envelope::digest(&bootstrap_envelope).ok();
+    let parent_session = super::mail::session_identity(env).unwrap_or_default();
+    let bootstrap_env = envelope_env(env, envelope_json, Some(principal.clone()));
+    let bootstrap_env = result_schema_env(&bootstrap_env, None);
+    let bootstrap_env = |key: &str| {
+        if key == "ZIRV_CTX_FALLBACK" {
+            Some("false".to_string())
+        } else {
+            bootstrap_env(key)
+        }
+    };
+    let exec_args = ExecArgs {
+        agent: Some(args.name.clone()),
+        session_id: Some(session.clone()),
+        prompt: Some(goal.to_string()),
+        max_restarts: Some(1),
+        timeout_secs: Some(cfg.worker.bootstrap_timeout_secs),
+        budget_tokens,
+        command,
+        cancellation: args.cancellation.clone(),
+        simple: true,
+        ..Default::default()
+    };
+    let mut output = Vec::new();
+    let (code, report) = match exec::run_with_report(&exec_args, &mut output, repo, &bootstrap_env)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let path = write_delegation_result(
+                state,
+                repo,
+                &session,
+                &args.name,
+                "launch_failed",
+                &None,
+                &[vec![error.to_string()]],
+                &[],
+                None,
+                false,
+            );
+            let _ = super::log::append_delegation(
+                state,
+                &super::log::Delegation {
+                    ts: super::state::now_secs(),
+                    session: &session,
+                    parent_session: &parent_session,
+                    work_group_id: args.group.as_deref(),
+                    agent: &args.name,
+                    model: adapters::last_model_flag(&exec_args.command),
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                    wall_ms: 0,
+                    exit_code: 1,
+                    outcome: "bootstrap-launch-failed",
+                    mode: Some(WorkerMode::Writing),
+                    task_class: Some(super::log::TaskClass::Other),
+                    principal: &principal,
+                    envelope_sha256: envelope_sha256.as_deref(),
+                },
+            );
+            return Err(format!(
+                "goal bootstrap failed to launch: {error}; diagnostic result: {}",
+                path.display()
+            )
+            .into());
+        }
+    };
+    let final_session = report
+        .segments
+        .last()
+        .map(|segment| segment.session.as_str())
+        .unwrap_or(session.as_str());
+    let transcript = adapter.transcript_path(&SessionRef {
+        id: SessionId::parse(final_session),
+        cwd: repo.to_path_buf(),
+    });
+    let text = std::fs::read_to_string(&transcript).ok().and_then(|jsonl| {
+        adapter
+            .structural_context(&jsonl, 1)
+            .assistant_texts
+            .last()
+            .cloned()
+    });
+    let completion = text
+        .as_deref()
+        .and_then(result_schema::extract_json_candidate)
+        .and_then(|json| serde_json::from_str::<BootstrapCompletion>(&json).ok());
+    let valid = completion.is_some_and(|completion| {
+        completion.status == "Done" && !completion.evidence.trim().is_empty()
+    });
+    let (stored, truncated) = cap_report(text.as_deref());
+    let path = if let Some(report_text) = stored.as_deref() {
+        store_report_only(
+            state,
+            repo,
+            final_session,
+            &args.name,
+            report_text,
+            truncated,
+        )
+    } else {
+        write_delegation_result(
+            state,
+            repo,
+            final_session,
+            &args.name,
+            "exited_no_report",
+            &None,
+            &[vec!["bootstrap produced no assistant report".to_string()]],
+            &[],
+            None,
+            false,
+        )
+    };
+    let outcome = if code == 0 && valid {
+        "bootstrap-ok"
+    } else {
+        "bootstrap-failed"
+    };
+    append_execution_segments(
+        state,
+        &report,
+        &parent_session,
+        args.group.as_deref(),
+        code,
+        outcome,
+        WorkerMode::Writing,
+        Some(super::log::TaskClass::Other),
+        &principal,
+        envelope_sha256.as_deref(),
+    );
+    if code != 0 || !valid {
+        return Err(format!(
+            "goal bootstrap refused main worker launch (exit {code}; current explicit Done report with non-empty evidence required); diagnostic result: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub fn run_with<W: Write>(
     args: &AgentArgs,
     w: &mut W,
@@ -3794,7 +4007,7 @@ pub fn run_with<W: Write>(
     // `args.manifest` is `None`, exactly today's behavior.
     let mut owned_args = args.clone();
     super::agent_manifest::apply(&mut owned_args)?;
-    let args = &owned_args;
+    let args = &mut owned_args;
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
     // Issue #479 (roadmap N10): resolved first, and an unknown value is a
@@ -3803,6 +4016,9 @@ pub fn run_with<W: Write>(
     // same-harness refusal, `adapters::select`, cross-harness rerouting --
     // is meaningless for a native worker, whose `<name>` is a provider route.
     let native = resolve_runtime(args)? == super::runtime::RuntimeKind::Native;
+    if native && args.goal.is_some() {
+        return Err("--goal is available only for the harness runtime".into());
+    }
     if native && args.workspace.is_some() {
         return Err("--workspace is available only for the harness runtime".into());
     }
@@ -3837,6 +4053,40 @@ pub fn run_with<W: Write>(
     // leave even a clean temporary tree behind. The same loaded config is
     // reused by all later routing and spawn gates.
     let cfg = CtxConfig::load_for_launch(repo, env)?;
+    let manifest_skills = if let Some(id) = args.manifest_agent.as_deref() {
+        let home = env("HOME")
+            .or_else(|| env("USERPROFILE"))
+            .map(PathBuf::from);
+        let registry = crate::commands::workflow::agents::AgentRegistry::load_for_repo(
+            repo,
+            home.as_deref(),
+            true,
+        )?;
+        let manifest = registry.get(id)?;
+        if manifest.manifest.read_only {
+            args.mode = WorkerMode::ReadOnly;
+        }
+        let adapter = adapters::select(Some(&args.name), &[], &cfg)?;
+        let report = crate::commands::workflow::capability::CapabilityReport::for_policy(
+            adapter.name(),
+            &cfg.policy,
+        );
+        for capability in &manifest.manifest.required_capabilities {
+            if !report.support(*capability).satisfies_requirement() {
+                return Err(format!(
+                    "agent manifest '{id}' requires capability '{capability}' which is unavailable under the effective policy for adapter '{}'",
+                    adapter.name()
+                )
+                .into());
+            }
+        }
+        manifest.manifest.skills.clone()
+    } else {
+        Vec::new()
+    };
+    if args.goal.is_some() && args.mode == WorkerMode::ReadOnly {
+        return Err("--goal requires a writing worker because environment preparation changes the checkout; refusing before workspace setup".into());
+    }
     let selected_workspace = args
         .workspace
         .as_deref()
@@ -3922,7 +4172,13 @@ pub fn run_with<W: Write>(
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
     let prompt = match selected_workspace {
         Some(workspace) => super::workspace::attach_skills(workspace, repo, prompt, env)?,
-        None => prompt,
+        None => super::workspace::attach_skill_refs(
+            args.manifest_agent.as_deref().unwrap_or("agent manifest"),
+            &manifest_skills,
+            repo,
+            prompt,
+            env,
+        )?,
     };
 
     // Issue #250: no `--workdir` means the worker stays confined to `repo`
@@ -4225,7 +4481,8 @@ pub fn run_with<W: Write>(
         } else {
             None
         };
-        let ready = super::workspace::materialize(workspace, &root, adapter.as_ref(), &flags, env)?;
+        let ready =
+            super::workspace::materialize(workspace, &state, &root, adapter.as_ref(), &flags, env)?;
         drop(materialization_permit);
         Some(ready)
     } else {
@@ -4359,7 +4616,14 @@ pub fn run_with<W: Write>(
     // structured `AnswerFacts` alongside `Dispatch::Answered` below
     // (`dashboard_answer_receipt`), not from this buffer's text.
     let mut dash_buf: Vec<u8> = Vec::new();
-    let dispatch = if workspace_requires_mcp {
+    let dispatch = if args.goal.is_some() {
+        eprintln!(
+            "zirv ctx agent: --goal preparation runs synchronously; running this delegation inline"
+        );
+        Dispatch::Inline {
+            no_dashboard: false,
+        }
+    } else if workspace_requires_mcp {
         eprintln!(
             "zirv ctx agent: workspace MCP requirements bind this launch to the validated harness; \
              running inline with cross-harness fallback disabled"
@@ -4795,6 +5059,49 @@ pub fn run_with<W: Write>(
     // which is the delegating session's own identity, not the worker's
     // target): only the actual worker launch reads `launch_repo`, computed
     // above (ahead of `command`) rather than here.
+
+    if let Some(goal) = args.goal.as_deref() {
+        if let Err(error) = run_goal_bootstrap(
+            goal,
+            args,
+            &cfg,
+            &state,
+            &launch_repo,
+            &parent_envelope,
+            worker_budget.tokens,
+            &env,
+        ) {
+            drop(writer_permit);
+            if let Some(id) = &args.group {
+                super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+            }
+            release_reservation();
+            discard_minted_group();
+            finish_task_card(
+                &state,
+                repo,
+                &cfg,
+                args,
+                super::task::ExitKind::Crash,
+                "goal bootstrap failed",
+                super::state::now_secs(),
+            );
+            if args.json {
+                let receipt = launch_failure_receipt(
+                    args,
+                    model.as_deref(),
+                    Some(&worker_session),
+                    Some(&launch_repo),
+                    Some(2),
+                    error.to_string(),
+                    &capability_warnings,
+                );
+                print_receipt(w, &receipt)?;
+                return Ok(2);
+            }
+            return Err(error);
+        }
+    }
 
     let exec_args = ExecArgs {
         agent: Some(args.name.clone()),
@@ -7943,6 +8250,8 @@ mod tests {
             mode: WorkerMode::Writing,
             worktree: false,
             workspace: None,
+            goal: None,
+            manifest_agent: None,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -10207,6 +10516,449 @@ mod tests {
             code.expect("runs"),
             0,
             "--quiet must not change the outcome"
+        );
+    }
+
+    #[test]
+    fn goal_runs_setup_then_a_depth_zero_fast_bootstrap_then_the_main_worker() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(home.join(".zirv")).expect("config dir");
+        let order = tmp.path().join("order.log");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            format!(
+                "[model_tiers.claude]\nfast = 'haiku-cheap'\n\n[[workspace]]\nname = 'prepared'\nsetup = [\"printf 'setup\\n' >> '{}'\"]\n",
+                order.display()
+            ),
+        )
+        .expect("operator config");
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "bootstrap-ok\nhealthy\n").expect("modes");
+        let argv = tmp.path().join("argv.log");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_MODE_LOG", order.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv.to_str()),
+        ]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("HOME".into(), home.display().to_string());
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+
+        let mut args = args_for("claude", "implement the feature");
+        args.goal = Some("install dependencies".into());
+        args.workspace = Some("prepared".into());
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect("goal delegation succeeds");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&order).expect("order"),
+            "setup\nbootstrap-ok\nhealthy\n"
+        );
+        let argv = std::fs::read_to_string(argv).expect("argv");
+        let launches: Vec<_> = argv
+            .lines()
+            .filter(|line| line.starts_with("-p "))
+            .collect();
+        assert_eq!(launches.len(), 2, "bootstrap and main: {launches:?}");
+        assert!(launches[0].contains("--model haiku-cheap"), "{launches:?}");
+        assert!(
+            argv.contains("--append-system-prompt Prepare only the local development environment"),
+            "fixed bootstrap instructions must be a system prompt: {argv}"
+        );
+        assert!(launches[1].contains("--model sonnet"), "{launches:?}");
+        assert!(!launches[1].contains("haiku-cheap"), "{launches:?}");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let rows = super::super::log::tail_delegations(&state, 10).expect("ledger");
+        assert_eq!(rows.len(), 2, "bootstrap spend is separate: {rows:?}");
+        assert!(rows.iter().any(|row| row.contains("bootstrap-ok")));
+        assert!(rows.iter().any(|row| row.contains("haiku-cheap")));
+    }
+
+    #[test]
+    fn goal_bootstrap_is_a_depth_zero_sibling_with_request_floors() {
+        let mut parent = envelope::WorkerEnvelope {
+            principal: "root/requester".into(),
+            paths: vec![envelope::PathScope::new("src")],
+            tools: envelope::ToolSet::all(),
+            network: true,
+            destructive: true,
+            delegation_depth: 3,
+            expires_at: 42,
+            token_budget: Some(900),
+        };
+        parent.tools.network = false;
+        let mut args = args_for("claude", "go");
+        args.no_network = true;
+        args.path_scope = vec![PathBuf::from("src/bin")];
+        let session = "aaaaaaaa-1111-4111-8111-111111111111";
+
+        let (bootstrap, principal) =
+            goal_bootstrap_envelope(&args, &parent, session, Some(700)).expect("narrow");
+
+        assert_eq!(principal, "root/requester/aaaaaaaa");
+        assert_eq!(bootstrap.principal, principal);
+        assert_eq!(bootstrap.delegation_depth, 0);
+        assert!(!bootstrap.tools.delegate);
+        assert!(!bootstrap.tools.network);
+        assert!(!bootstrap.network);
+        assert_eq!(bootstrap.paths, vec![envelope::PathScope::new("src/bin")]);
+        assert_eq!(bootstrap.token_budget, Some(700));
+        assert_eq!(bootstrap.expires_at, 42);
+    }
+
+    #[test]
+    fn blocked_goal_report_preserves_diagnostics_and_never_launches_main() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "bootstrap-blocked\nhealthy\n").expect("modes");
+        let argv = tmp.path().join("argv.log");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_ARGV_LOG", argv.to_str()),
+        ]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "main must not run");
+        args.goal = Some("prepare it".into());
+
+        let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect_err("Blocked bootstrap refuses delegation");
+
+        assert!(
+            error.to_string().contains("goal bootstrap refused"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("diagnostic result:"), "{error}");
+        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "healthy\n");
+        let argv = std::fs::read_to_string(argv).expect("argv");
+        let bootstrap = argv
+            .lines()
+            .find(|line| line.starts_with("-p "))
+            .expect("bootstrap launch");
+        assert!(
+            !bootstrap.contains("--model"),
+            "an unmapped Fast tier leaves model selection to the adapter: {bootstrap}"
+        );
+        let result_dir = tmp.path().join("state/logs/delegation-results");
+        assert_eq!(
+            std::fs::read_dir(result_dir).expect("result dir").count(),
+            1,
+            "the failed bootstrap keeps one diagnostic result"
+        );
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let rows = super::super::log::tail_delegations(&state, 10).expect("ledger");
+        assert_eq!(
+            rows.len(),
+            1,
+            "main worker must have no ledger row: {rows:?}"
+        );
+        assert!(rows[0].contains("bootstrap-failed"));
+    }
+
+    #[test]
+    fn missing_goal_report_refuses_main_and_keeps_the_result() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "healthy\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "main must not run");
+        args.goal = Some("prepare it".into());
+
+        let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect_err("missing Done report refuses delegation");
+
+        assert!(
+            error.to_string().contains("explicit Done report"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("diagnostic result:"), "{error}");
+        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "healthy\n");
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("state/logs/delegation-results"))
+                .expect("result dir")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nonzero_goal_exit_refuses_main_even_with_a_report() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "fail\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "main must not run");
+        args.goal = Some("prepare it".into());
+
+        let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect_err("nonzero bootstrap refuses delegation");
+
+        assert!(error.to_string().contains("exit 3"), "{error}");
+        assert!(error.to_string().contains("diagnostic result:"), "{error}");
+        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "healthy\n");
+    }
+
+    #[test]
+    fn goal_failure_json_prints_one_delegation_receipt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "bootstrap-blocked\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "main must not run");
+        args.goal = Some("prepare it".into());
+        args.json = true;
+        let mut out = Vec::new();
+
+        let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned())
+            .expect("JSON failure is a structured exit");
+
+        assert_eq!(code, 2);
+        let text = String::from_utf8(out).expect("utf8");
+        let receipt: serde_json::Value = serde_json::from_str(text.trim()).expect("receipt");
+        assert_eq!(receipt["state"], "launch_failed");
+        assert!(
+            receipt["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("diagnostic result:")),
+            "{receipt}"
+        );
+        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "healthy\n");
+    }
+
+    #[test]
+    fn goal_timeout_refuses_main_with_one_whole_run_deadline() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "hang\nhang\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        env.insert("ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS".into(), "1".into());
+        let mut args = args_for("claude", "main must not run");
+        args.goal = Some("prepare it".into());
+        let started = std::time::Instant::now();
+
+        let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect_err("timed-out bootstrap refuses delegation");
+
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(
+            error.to_string().contains("goal bootstrap refused"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("diagnostic result:"), "{error}");
+        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "healthy\n");
+    }
+
+    #[test]
+    fn goal_forces_inline_even_when_a_dashboard_is_live() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "bootstrap-ok\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_AGENT_MODE_FILE",
+            modes.to_str(),
+        )]);
+        let (requests, mut env) = live_dashboard_dir(tmp.path());
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = joinable_args("claude", "main runs inline");
+        args.goal = Some("prepare it".into());
+
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect("goal delegation runs");
+
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "");
+        let requests: Vec<_> = std::fs::read_dir(requests)
+            .expect("requests")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(
+            requests.is_empty(),
+            "--goal must bypass pane requests: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn a_main_worker_restart_does_not_repeat_goal_preparation() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let modes = tmp.path().join("modes.txt");
+        let order = tmp.path().join("order.log");
+        std::fs::write(&modes, "bootstrap-ok\nrot\nhealthy\n").expect("modes");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_MODE_LOG", order.to_str()),
+            ("FAKE_AGENT_SLEEP", Some("5")),
+        ]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "main restarts once");
+        args.goal = Some("prepare once".into());
+        args.max_restarts = Some(1);
+        args.timeout_secs = Some(20);
+
+        let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect("delegation succeeds after restart");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(order).expect("order"),
+            "bootstrap-ok\nrot\nhealthy\n",
+            "the bootstrap must run once outside the main supervisor restart loop"
+        );
+    }
+
+    #[test]
+    fn read_only_goal_is_rejected_before_workspace_setup() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(home.join(".zirv")).expect("config dir");
+        let touched = tmp.path().join("must-not-exist");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            format!(
+                "[[workspace]]\nname = 'prepared'\nsetup = [\"touch '{}'\"]\n",
+                touched.display()
+            ),
+        )
+        .expect("operator config");
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("HOME".into(), home.display().to_string());
+        let mut args = args_for("claude", "go");
+        args.goal = Some("prepare".into());
+        args.workspace = Some("prepared".into());
+        args.mode = WorkerMode::ReadOnly;
+
+        let error = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            env.get(key).cloned()
+        })
+        .expect_err("read-only prep is incompatible");
+        assert!(
+            error.to_string().contains("requires a writing worker"),
+            "{error}"
+        );
+        assert!(!touched.exists(), "setup must not have run");
+    }
+
+    #[test]
+    fn manifest_agent_skills_are_real_prompt_defaults() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let manifest = tmp.path().join("delegation.yaml");
+        std::fs::write(&manifest, "agent: debugger\nbrief: go\n").expect("manifest");
+        let argv = tmp.path().join("argv.log");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("FAKE_AGENT_ARGV_LOG", argv.to_str()),
+        ]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("HOME".into(), home.display().to_string());
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "go");
+        args.manifest = Some(manifest);
+
+        assert_eq!(
+            run_with(&args, &mut Vec::new(), tmp.path(), &|key| env
+                .get(key)
+                .cloned())
+            .expect("manifest delegation"),
+            0
+        );
+        let argv = std::fs::read_to_string(argv).expect("argv");
+        assert!(
+            argv.contains("[skill systematic-debugging@"),
+            "debugger's default skill must reach the real worker prompt: {argv}"
+        );
+    }
+
+    #[test]
+    fn explicit_workspace_skills_replace_manifest_agent_defaults() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let manifest = tmp.path().join("delegation.yaml");
+        std::fs::write(&manifest, "agent: debugger\nbrief: go\n").expect("manifest");
+        std::fs::create_dir_all(home.join(".zirv")).expect("config dir");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            "[[workspace]]\nname = 'plain'\nskills = []\n",
+        )
+        .expect("workspace config");
+        let argv = tmp.path().join("argv.log");
+        let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("FAKE_AGENT_ARGV_LOG", argv.to_str()),
+        ]);
+        let mut env = base_env(&tmp.path().join("state"));
+        env.insert("HOME".into(), home.display().to_string());
+        env.insert("ZIRV_CTX_PACE".into(), "false".into());
+        let mut args = args_for("claude", "go");
+        args.manifest = Some(manifest);
+        args.workspace = Some("plain".into());
+
+        assert_eq!(
+            run_with(&args, &mut Vec::new(), tmp.path(), &|key| env
+                .get(key)
+                .cloned())
+            .expect("workspace delegation"),
+            0
+        );
+        let argv = std::fs::read_to_string(argv).expect("argv");
+        assert!(
+            !argv.contains("[skill systematic-debugging@"),
+            "an explicit workspace skill list replaces manifest defaults: {argv}"
         );
     }
 

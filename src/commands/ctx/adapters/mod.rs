@@ -3997,7 +3997,7 @@ pub(crate) fn resolve_review_model(
 /// and zirv must never decide by itself that a `Deep` seat may run cheaper
 /// than the operator configured. Only the tier word the manifest already
 /// carries is ever looked up; this never substitutes a different one.
-fn resolve_tiered_model<'a>(
+pub(crate) fn resolve_tiered_model<'a>(
     cfg: &'a CtxConfig,
     adapter: &str,
     tier: crate::commands::workflow::agents::ModelTier,

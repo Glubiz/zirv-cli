@@ -1990,6 +1990,10 @@ pub struct WorkerConfig {
     /// checkout may only turn this ON, never force it back off once the
     /// operator (or another repo layer) has denied network access.
     pub deny_network: bool,
+    /// Operator-only whole-run cap for a goal bootstrap before a delegated
+    /// worker starts. A repository must not be able to spend the operator's
+    /// account by lengthening it.
+    pub bootstrap_timeout_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -2001,6 +2005,7 @@ impl Default for WorkerConfig {
             default_read_only: false,
             max_depth: u8::MAX,
             deny_network: false,
+            bootstrap_timeout_secs: 600,
         }
     }
 }
@@ -3712,6 +3717,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS",
+        &["worker", "bootstrap_timeout_secs"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP",
         &["handover", "claude", "cheap"],
         EnvKind::Str,
@@ -4890,6 +4900,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // block that narrowing too.
     (&["worker", "claude"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
     (&["worker", "codex"], "ZIRV_CTX_WORKER_MODEL_CODEX"),
+    (
+        &["worker", "bootstrap_timeout_secs"],
+        "ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS",
+    ),
     // Issue #262: the delegation-envelope defaults a ROOT session's
     // `envelope::WorkerEnvelope` starts from. See `WorkerConfig`'s own doc
     // comment on each field for why these two -- unlike `max_depth`/
@@ -6778,6 +6792,11 @@ impl CtxConfig {
         }
         if let Some(model) = cfg.worker.codex.as_deref() {
             validate_model_str("worker.codex", model)?;
+        }
+        if cfg.worker.bootstrap_timeout_secs == 0 {
+            return Err(add_config_error_prefix(
+                "worker.bootstrap_timeout_secs must be greater than 0, got 0".into(),
+            ));
         }
 
         // `handover.<agent>.<tier>` reach a real launch argv directly too
@@ -9734,6 +9753,24 @@ mod tests {
         assert!(!worker.default_read_only);
         assert_eq!(worker.max_depth, u8::MAX);
         assert!(!worker.deny_network);
+        assert_eq!(worker.bootstrap_timeout_secs, 600);
+    }
+
+    #[test]
+    fn bootstrap_timeout_must_be_positive() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS", "0")]);
+
+        let error = CtxConfig::load(repo.path(), &|key| env.get(key).cloned())
+            .expect_err("zero cannot bound a bootstrap run");
+        assert!(
+            error
+                .to_string()
+                .contains("worker.bootstrap_timeout_secs must be greater than 0"),
+            "{error}"
+        );
     }
 
     #[test]
