@@ -1177,9 +1177,19 @@ fn verdict_rank(verdict: Verdict) -> u8 {
 /// (`every_segment_is_allow_or_unmatched_default`, Task 6) can run the
 /// identical chain without a second, drifting copy of these seven analyzer
 /// calls.
+///
+/// `original` is the whole compound `command` this `candidate` was split
+/// from ([`apply_recursive_delete_outcome`]'s own doc comment says why it
+/// needs that: a `cd <dir> && rm -rf <relative target>` candidate loses the
+/// `cd` once `normalize_segments` splits it apart). Every call site that
+/// does not itself track a broader original text passes `candidate` again
+/// here, which is exactly today's behavior -- this parameter only WIDENS an
+/// outcome, never narrows one, so a caller with nothing better to offer than
+/// the candidate itself loses nothing by repeating it.
 fn evaluate_candidate_outcome(
     policy: &SafetyPolicy,
     candidate: &str,
+    original: &str,
     fallback: Verdict,
     scratchpad_roots: &[String],
 ) -> Outcome {
@@ -1188,7 +1198,7 @@ fn evaluate_candidate_outcome(
     let outcome = apply_credential_outcome(candidate, outcome);
     let outcome = apply_operator_config_outcome(candidate, outcome);
     let outcome = apply_network_outcome(candidate, outcome);
-    let outcome = apply_recursive_delete_outcome(candidate, outcome);
+    let outcome = apply_recursive_delete_outcome(candidate, original, outcome);
     let outcome = apply_vcs_outcome(candidate, outcome, scratchpad_roots);
     let outcome = apply_distribution_outcome(candidate, outcome);
     let outcome = apply_orchestrator_outcome(candidate, outcome);
@@ -1274,7 +1284,7 @@ fn evaluate_candidates(
                 None => continue,
             }
         } else {
-            evaluate_candidate_outcome(policy, &candidate, fallback, scratchpad_roots)
+            evaluate_candidate_outcome(policy, &candidate, command, fallback, scratchpad_roots)
         };
         let rank = verdict_rank(outcome.verdict);
         let is_worse = match &worst {
@@ -1401,8 +1411,52 @@ fn apply_network_outcome(command: &str, base: Outcome) -> Outcome {
     }
 }
 
-fn apply_recursive_delete_outcome(command: &str, base: Outcome) -> Outcome {
-    if !is_recursive_delete(command) || base.verdict != Verdict::Allow {
+/// `original` is the whole compound command `command` (this candidate) was
+/// split from -- see [`evaluate_candidate_outcome`]'s own doc comment. Used
+/// only to resolve a relative recursive-delete target against a leading `cd
+/// <dir>` segment ([`recursive_delete_confined_to_temp`]); every other rule
+/// here reasons about `command` alone, exactly as before.
+///
+/// Headless-denial bug (72-run sample: all 8 permission denials were
+/// recursive deletes of scratch the agent had just created, e.g. `rm -rf
+/// /tmp/ledgerlite_doc_test`, `cd /tmp && rm -rf lltest && ...`): the shipped
+/// `Bash(rm -rf *)` ASK posture cannot be answered at all under
+/// `--permission-mode dontAsk`, so it silently denies instead, costing a
+/// whole turn for cleanup the agent just created inside its own throwaway
+/// scratch directory. [`recursive_delete_confined_to_temp`] narrows this one
+/// case back to `Allow`.
+///
+/// `rm -rf` itself never reaches the fallback `Ask` this function builds at
+/// its own bottom: `"rm -rf *"`/`"rm -fr *"` are already explicit
+/// `Origin::BuiltIn` globs in `SHIPPED_POSTURE_ASK`, so `base` arrives here
+/// ALREADY `Ask` (matched, not the plain unmatched-command default) for
+/// every ordinary `rm -rf ...`. `overridable` is what lets this function
+/// still widen THAT case: only when the `Ask` it is being asked to
+/// reconsider is itself the shipped built-in posture (`Origin::BuiltIn`) --
+/// an operator's or a repository's own, deliberately narrower `ask` rule
+/// (`Origin::Operator`/`Origin::Repo`) is never widened, and neither is an
+/// existing `Deny` (e.g. a target naming `zirv`, `"rm -rf*zirv*"`, which
+/// wins by matching BEFORE this function ever runs).
+fn apply_recursive_delete_outcome(command: &str, original: &str, base: Outcome) -> Outcome {
+    if !is_recursive_delete(command) {
+        return base;
+    }
+    let overridable = base.verdict == Verdict::Allow
+        || (base.verdict == Verdict::Ask
+            && base
+                .matched
+                .as_ref()
+                .is_some_and(|rule| rule.origin == Origin::BuiltIn));
+    if overridable && recursive_delete_confined_to_temp(command, original) {
+        return Outcome {
+            verdict: Verdict::Allow,
+            matched: Some(Rule {
+                pattern: "<filesystem: temp-scratch recursive deletion>".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+    }
+    if base.verdict != Verdict::Allow {
         return base;
     }
     Outcome {
@@ -1412,6 +1466,221 @@ fn apply_recursive_delete_outcome(command: &str, base: Outcome) -> Outcome {
             origin: Origin::BuiltIn,
         }),
     }
+}
+
+// ---------------------------------------------------------------------
+// Recursive delete of the caller's OWN temp-scratch directory (headless
+// `dontAsk` denial fix): a recursive delete is allowed, despite the shipped
+// ASK posture above, when every one of its own targets resolves -- lexically,
+// text only, no filesystem access, matching this whole module's contract --
+// STRICTLY below `std::env::temp_dir()` or the literal POSIX roots `/tmp`/
+// `/var/tmp` (Windows Git Bash maps `/tmp` onto its own temp directory, so a
+// headless agent's `rm -rf /tmp/...` targets a real scratch path there too).
+// ---------------------------------------------------------------------
+
+/// The temp roots a recursive delete's targets may be confined to.
+/// `std::env::temp_dir()` covers the platform default (and any `TMPDIR`/
+/// `TEMP`/`TMP` override already baked into it); `/tmp` and `/var/tmp` are
+/// included literally since a Bash command's own `/tmp` is a real, distinct
+/// scratch path on every platform (including Windows Git Bash) regardless of
+/// what `std::env::temp_dir()` itself reports for THIS process.
+fn temp_delete_roots() -> Vec<String> {
+    let mut roots = vec!["/tmp".to_string(), "/var/tmp".to_string()];
+    let temp_dir = std::env::temp_dir()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if !temp_dir.is_empty() && !roots.contains(&temp_dir) {
+        roots.push(temp_dir);
+    }
+    roots
+}
+
+/// Splits an absolute, forward-slash-normalized path into its root anchor
+/// (`"/"`, or a Windows drive prefix like `"C:/"`) and the rest -- `None` for
+/// anything not absolute in either sense, which this classifier then leaves
+/// exactly as restrictive as today rather than guess at a cwd.
+fn split_absolute_root(path: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = path.strip_prefix('/') {
+        return Some((&path[..1], rest));
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/' {
+        return Some((&path[..3], &path[3..]));
+    }
+    None
+}
+
+/// Resolves `.`/`..` components AS TEXT, never touching the filesystem --
+/// this whole module's contract (see [`generated_path`]'s own NON-GOAL note).
+/// `None` when a `..` would climb above the root: there is nothing further
+/// up to pop, so the true target is unknowable from the text alone and this
+/// is treated as an escape rather than guessed at (e.g. `/tmp/../etc`
+/// resolves to `/etc`, which is NOT what escaping above `/tmp/`'s own root
+/// component would even mean here -- it simply lands outside every temp
+/// root, which the confinement check below then correctly refuses).
+fn lexically_normalize_absolute(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let (root, rest) = split_absolute_root(&normalized)?;
+    let mut stack: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    Some(format!("{root}{}", stack.join("/")))
+}
+
+/// True when `path` is STRICTLY below `root` (deleting `root` itself, e.g.
+/// `rm -rf /tmp`, stays `Ask` -- the temp root is not itself a throwaway
+/// scratch directory, and depending on the platform emptying it can break
+/// other tools' own live state).
+fn path_strictly_below(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    !root.is_empty() && root.len() != path.len() && path.starts_with(root) && {
+        let rest = &path[root.len()..];
+        rest.starts_with('/')
+    }
+}
+
+/// True when `target` -- one token of a recursive delete already confirmed
+/// by [`is_recursive_delete`] -- resolves, purely lexically, strictly below
+/// one of [`temp_delete_roots`]. A glob, shell variable, home (`~`), or
+/// command-substitution character leaves today's verdict untouched: none of
+/// those can be trusted from the text alone, so this returns `false` rather
+/// than guess at what the target actually expands to. A relative `target` is
+/// joined onto `cwd` (the compound's own leading `cd <dir>`, from
+/// [`recursive_delete_confined_to_temp`]) when present; with no `cwd` a
+/// relative target cannot be resolved at all and this returns `false`,
+/// leaving it exactly as restrictive as today.
+fn target_confined_to_temp(target: &str, cwd: Option<&str>) -> bool {
+    let target = strip_quotes(target);
+    if target.is_empty() || target.contains(['$', '`', '~', '*', '?']) {
+        return false;
+    }
+    let normalized_target = target.replace('\\', "/");
+    let absolute = if split_absolute_root(&normalized_target).is_some() {
+        normalized_target
+    } else {
+        let Some(cwd) = cwd else { return false };
+        if cwd.contains(['$', '`', '~', '*', '?']) || split_absolute_root(cwd).is_none() {
+            return false;
+        }
+        format!("{}/{normalized_target}", cwd.trim_end_matches('/'))
+    };
+    let Some(resolved) = lexically_normalize_absolute(&absolute) else {
+        return false;
+    };
+    temp_delete_roots()
+        .iter()
+        .any(|root| path_strictly_below(&resolved, root))
+}
+
+/// Extracts a recursive delete's own target tokens: everything past the
+/// program name that is not itself one of that program's own flags. `None`
+/// when the command does not tokenize, or names a delete program this
+/// classifier does not recognize (kept in lock-step with
+/// [`normalized_delete_program`]'s own match arms via the `_ => None`
+/// fallback, so an unrecognized program is never silently treated as having
+/// zero targets).
+///
+/// Stops at the first shell chain-separator token (`&&`, `||`, `;`, `|`):
+/// [`normalize_segments`]'s candidate list always includes the WHOLE raw
+/// command as its own first candidate, alongside the split-apart segments
+/// `visit_executable_nodes` derives from it, so `command` here can be e.g.
+/// `rm -rf /tmp/x && mkdir -p /tmp/x && echo ok` in full -- the exact
+/// headless-agent-cleanup shape from the 72-run sample when the delete is
+/// the FIRST segment (no leading `cd` for `strip_known_root_cd_prefix` to
+/// eat). Without this, `rm`'s own "targets" would swallow the chained
+/// commands' tokens too (`"&&"`, `"mkdir"`, `"echo"`, `"ok"`, none of which
+/// are real delete targets), so [`recursive_delete_confined_to_temp`]'s
+/// "every target confined" check would always fail on those bogus entries
+/// and this whole-command candidate would stay `Ask` even though the actual
+/// `rm -rf` segment is confined -- outvoting the correctly-`Allow`ed split
+/// candidate in `evaluate_candidates`' worst-of-all-candidates fold. A
+/// legitimate `rm`/`del`/... invocation never carries a bare chain-separator
+/// token as its own argument, so stopping there loses nothing for the
+/// single-command case (the loop simply never reaches one).
+fn delete_targets(command: &str) -> Option<Vec<String>> {
+    let tokens = sql_tokens(&collapse_whitespace(command))?;
+    let first = tokens.first()?;
+    let program = normalized_delete_program(first);
+    let mut targets = Vec::new();
+    for token in tokens.iter().skip(1) {
+        if matches!(token.as_str(), "&&" | "||" | ";" | "|") {
+            break;
+        }
+        let is_flag = match program.as_str() {
+            "rm" | "remove-item" => token.starts_with('-'),
+            "rmdir" | "rd" | "del" | "erase" => token.starts_with('/') || token.starts_with('-'),
+            _ => return None,
+        };
+        if !is_flag {
+            targets.push(token.clone());
+        }
+    }
+    Some(targets)
+}
+
+/// The literal-`cd`-prefix parse shared by [`strip_known_root_cd_prefix`]
+/// (issue #168) and [`recursive_delete_confined_to_temp`] (this fix): a
+/// leading, single-token, non-dynamic `cd <path>` segment followed by `&&`,
+/// `;`, or a newline. Returns the normalized (backslash-free) path token and
+/// the untouched remainder; `None` for anything this text-only classifier
+/// cannot trust -- no leading `cd` at all, a `$`/backtick/`~`/glob path, a
+/// path containing `..` (a relative escape this classifier cannot
+/// re-resolve), or nothing chained after it.
+fn parse_leading_cd_segment(command: &str) -> Option<(String, String)> {
+    let trimmed = command.trim_start();
+    let rest = trimmed.strip_prefix("cd ")?;
+    let (split_at, sep_len) = ["&&", ";", "\n"]
+        .iter()
+        .filter_map(|sep| rest.find(sep).map(|idx| (idx, sep.len())))
+        .min_by_key(|&(idx, _)| idx)?;
+    let (path_token, remainder) = {
+        let (head, tail) = rest.split_at(split_at);
+        (head.trim(), tail[sep_len..].trim())
+    };
+    if path_token.is_empty() || remainder.is_empty() {
+        return None;
+    }
+    if path_token.split_whitespace().count() != 1
+        || path_token.contains(['$', '`', '~', '*', '?'])
+        || path_token.contains("..")
+    {
+        return None;
+    }
+    let normalized = strip_quotes(path_token).replace('\\', "/");
+    Some((normalized, remainder.to_string()))
+}
+
+/// True when EVERY target of the recursive delete `candidate` (one segment
+/// of the whole compound `original`) resolves strictly below a temp root --
+/// see [`target_confined_to_temp`]. A relative target is resolved against
+/// `original`'s own leading `cd <dir>` prefix, found via
+/// [`parse_leading_cd_segment`] applied to `original` itself (NOT
+/// `candidate`: by the time `candidate` reaches here, [`normalize_segments`]
+/// has already split the `cd` and the delete into separate top-level
+/// candidates, so the `cd` is only ever recoverable from the original
+/// compound text). `false` when `candidate` names no target at all (an
+/// `is_recursive_delete` command always has at least one, but a delete
+/// program this classifier does not recognize could reach here with none).
+fn recursive_delete_confined_to_temp(candidate: &str, original: &str) -> bool {
+    let Some(targets) = delete_targets(candidate) else {
+        return false;
+    };
+    if targets.is_empty() {
+        return false;
+    }
+    let cwd = parse_leading_cd_segment(original).map(|(path, _)| path);
+    targets
+        .iter()
+        .all(|target| target_confined_to_temp(target, cwd.as_deref()))
 }
 
 fn apply_orchestrator_outcome(command: &str, base: Outcome) -> Outcome {
@@ -7270,7 +7539,8 @@ fn every_segment_is_allow_or_unmatched_default(
         return false;
     }
     candidates.iter().all(|candidate| {
-        let outcome = evaluate_candidate_outcome(policy, candidate, fallback, scratchpad_roots);
+        let outcome =
+            evaluate_candidate_outcome(policy, candidate, command, fallback, scratchpad_roots);
         outcome.verdict == Verdict::Allow
             || (outcome.verdict == fallback && outcome.matched.is_none())
     })
@@ -7833,7 +8103,8 @@ fn segment_verdict_is_allow_or_unmatched(
     scratchpad_roots: &[String],
 ) -> bool {
     let collapsed = collapse_whitespace(segment);
-    let outcome = evaluate_candidate_outcome(policy, &collapsed, fallback, scratchpad_roots);
+    let outcome =
+        evaluate_candidate_outcome(policy, &collapsed, &collapsed, fallback, scratchpad_roots);
     outcome.verdict == Verdict::Allow || (outcome.verdict == fallback && outcome.matched.is_none())
 }
 
@@ -8517,7 +8788,7 @@ fn retry_has_allow_verdict(
     let mut saw_scaffolding = false;
     for candidate in candidates {
         let candidate_outcome =
-            evaluate_candidate_outcome(policy, &candidate, Verdict::Ask, scratchpad_roots);
+            evaluate_candidate_outcome(policy, &candidate, command, Verdict::Ask, scratchpad_roots);
         if candidate_outcome.verdict == Verdict::Allow {
             saw_allow = true;
             continue;
@@ -9061,33 +9332,14 @@ pub(crate) fn strip_known_root_cd_prefix(
     command: &str,
     allowed_roots: &[String],
 ) -> Option<String> {
-    let trimmed = command.trim_start();
-    let rest = trimmed.strip_prefix("cd ")?;
-    let (split_at, sep_len) = ["&&", ";", "\n"]
-        .iter()
-        .filter_map(|sep| rest.find(sep).map(|idx| (idx, sep.len())))
-        .min_by_key(|&(idx, _)| idx)?;
-    let (path_token, remainder) = {
-        let (head, tail) = rest.split_at(split_at);
-        (head.trim(), tail[sep_len..].trim())
-    };
-    if path_token.is_empty() || remainder.is_empty() {
-        return None;
-    }
-    if path_token.split_whitespace().count() != 1
-        || path_token.contains(['$', '`', '~', '*', '?'])
-        || path_token.contains("..")
-    {
-        return None;
-    }
-    let normalized = strip_quotes(path_token).replace('\\', "/");
+    let (normalized, remainder) = parse_leading_cd_segment(command)?;
     let under_worktrees =
         normalized.contains(".claude/worktrees/") || normalized.ends_with(".claude/worktrees");
     let under_allowed_root = allowed_roots.iter().any(|root| {
         !root.is_empty() && (normalized == *root || normalized.starts_with(&format!("{root}/")))
     });
     if under_worktrees || under_allowed_root {
-        Some(remainder.to_string())
+        Some(remainder)
     } else {
         None
     }
@@ -9964,7 +10216,7 @@ mod tests {
             ("rm -rf /home/user/zirv", Verdict::Deny),
             ("some-totally-unknown-tool --flag", Verdict::Ask),
         ] {
-            let direct = evaluate_candidate_outcome(&policy, command, Verdict::Ask, &[]);
+            let direct = evaluate_candidate_outcome(&policy, command, command, Verdict::Ask, &[]);
             let via_evaluate_candidates =
                 evaluate_candidates(&policy, command, Verdict::Ask, LaunchMode::Headless, &[]);
             assert_eq!(direct.verdict, expected, "{command}");
@@ -9995,6 +10247,127 @@ mod tests {
             direct.matched.as_ref().map(|rule| rule.pattern.as_str()),
             Some("rm -rf*zirv*")
         );
+    }
+
+    // -- recursive delete of a temp-scratch target (headless `dontAsk`
+    // denial fix, 72-run sample) ------------------------------------------
+
+    /// A bare `rm -rf` of an absolute path under `/tmp` is the common
+    /// headless-agent-cleaning-up-after-itself shape and must be allowed in
+    /// every launch mode, not just interactive -- the whole point is that a
+    /// headless session (`--permission-mode dontAsk`) cannot answer an `Ask`
+    /// at all.
+    #[test]
+    fn recursive_delete_of_an_absolute_temp_target_is_allowed() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            let outcome = evaluate(&policy, "rm -rf /tmp/ledgerlite_doc_test", mode);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{mode:?}: {outcome:?}");
+        }
+    }
+
+    /// The exact shape from the 72-run sample: a relative delete target
+    /// resolved against the compound's own leading `cd /tmp` -- the case
+    /// [`recursive_delete_confined_to_temp`] resolves via
+    /// [`parse_leading_cd_segment`] applied to the WHOLE original command,
+    /// since `normalize_segments` has already split `cd /tmp` away from `rm
+    /// -rf lltest` by the time either reaches `apply_recursive_delete_outcome`.
+    ///
+    /// Interactive mode, deliberately: a bare `cd /tmp` segment has no
+    /// shipped allow/ask rule of its own, so under the shipped policy's
+    /// `default: Ask` for HEADLESS it would independently ask regardless of
+    /// this fix, which is a fact about `cd`'s own lack of a rule, not
+    /// something this fix is scoped to change. `interactive_default: Allow`
+    /// keeps that unrelated fact out of this test, isolating exactly the
+    /// recursive-delete widening this fix adds; the real headless hook path
+    /// exercises the mode-sensitivity separately via `evaluate_candidates`'
+    /// own `mode` parameter, unaffected by this change either way.
+    #[test]
+    fn recursive_delete_of_a_relative_target_under_a_leading_cd_tmp_is_allowed() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "cd /tmp && rm -rf lltest", LaunchMode::Interactive);
+        assert_eq!(outcome.verdict, Verdict::Allow, "got {outcome:?}");
+    }
+
+    /// Another exact shape from the 72-run sample, this time with the delete
+    /// as the FIRST segment and no leading `cd` at all: `rm -rf /tmp/ll2 &&
+    /// mkdir -p /tmp/ll2 && ...`. `normalize_segments` always carries the
+    /// WHOLE raw command as its own first candidate (see its own doc
+    /// comment), so this compound is itself one of the candidates
+    /// `evaluate_candidates` folds -- and since it literally starts with
+    /// `rm -rf `, it independently matches the built-in `rm -rf *` ask glob
+    /// too, on top of the properly split-out `rm -rf /tmp/ll2` segment.
+    /// Before `delete_targets` stopped at the chain separator, that
+    /// whole-command candidate's "targets" swallowed the chained tokens
+    /// (`"&&"`, `"mkdir"`, `"echo"`, `"ok"`, ...) too, so its own confinement
+    /// check always failed and its `Ask` outvoted the correctly-`Allow`ed
+    /// split candidate in the worst-of-all-candidates fold -- reproduced
+    /// live via a real headless `zirv ctx exec` probe, not just this
+    /// classifier's own return value.
+    #[test]
+    fn recursive_delete_of_a_temp_target_followed_by_chained_commands_is_allowed() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            let outcome = evaluate(
+                &policy,
+                "rm -rf /tmp/ll2 && mkdir -p /tmp/ll2 && echo done",
+                mode,
+            );
+            assert_eq!(outcome.verdict, Verdict::Allow, "{mode:?}: {outcome:?}");
+        }
+    }
+
+    /// `..` must not escape the temp root: `/tmp/../etc` lexically resolves
+    /// to `/etc`, which is not confined to any temp root, so this stays
+    /// exactly as restrictive as an ordinary `rm -rf /etc` -- `Ask` under the
+    /// shipped default posture.
+    #[test]
+    fn recursive_delete_cannot_escape_the_temp_root_via_dot_dot() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "rm -rf /tmp/../etc", LaunchMode::Interactive);
+        assert_eq!(outcome.verdict, Verdict::Ask, "got {outcome:?}");
+    }
+
+    /// Deleting the temp root itself is not a throwaway-scratch cleanup --
+    /// `path_strictly_below` requires the target to be STRICTLY below a temp
+    /// root, never equal to one.
+    #[test]
+    fn recursive_delete_of_the_temp_root_itself_stays_ask() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "rm -rf /tmp", LaunchMode::Interactive);
+        assert_eq!(outcome.verdict, Verdict::Ask, "got {outcome:?}");
+    }
+
+    /// A target with no leading `cd` and no absolute prefix cannot be
+    /// resolved against anything -- this must stay exactly as restrictive as
+    /// today rather than assume the process's own cwd is confined.
+    #[test]
+    fn recursive_delete_of_an_unresolvable_relative_target_stays_ask() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "rm -rf src", LaunchMode::Interactive);
+        assert_eq!(outcome.verdict, Verdict::Ask, "got {outcome:?}");
+    }
+
+    /// A shell variable in the target cannot be trusted from the text alone
+    /// -- `$X` could expand to anything, including a path outside every temp
+    /// root -- so this verdict is UNCHANGED by the fix: still `Ask`, exactly
+    /// as it was before this fix existed.
+    #[test]
+    fn recursive_delete_of_a_target_carrying_a_shell_variable_is_unchanged() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "rm -rf /tmp/$X", LaunchMode::Interactive);
+        assert_eq!(outcome.verdict, Verdict::Ask, "got {outcome:?}");
+    }
+
+    /// The existing `rm -rf*zirv*` DENY still wins even for a target that
+    /// also happens to be confined to a temp root: [`apply_recursive_delete_
+    /// outcome`] only ever reconsiders a `base.verdict == Allow`, and a
+    /// target naming `zirv` already produced `Deny` upstream of it.
+    #[test]
+    fn recursive_delete_deny_for_a_zirv_named_target_wins_even_under_tmp() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(&policy, "rm -rf /tmp/zirv-stuff", LaunchMode::Interactive);
+        assert_eq!(outcome.verdict, Verdict::Deny, "got {outcome:?}");
     }
 
     // -- is_read_only_escape_safe (issue #168, decision a) ---------------
@@ -13671,17 +14044,23 @@ mod tests {
     /// Checked in both launch modes: interactive's `Ask` comes from
     /// upgrading the unmatched-command `Allow` default, headless's `Ask` IS
     /// that default already -- the wrapper must not disturb either path.
+    ///
+    /// Target is `/srv/app/x`, not `/tmp/x`: a target confined to a temp
+    /// root is now deliberately `Allow` (the headless-`dontAsk`-denial fix,
+    /// see `recursive_delete_confined_to_temp`), so this test needs a target
+    /// outside every temp root to still exercise the "stays `Ask`" case the
+    /// keyword-wrap regression is actually about.
     #[test]
     fn keyword_wrapped_recursive_deletes_stay_ask_in_both_launch_modes() {
         let policy = SafetyPolicy::default();
         for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
             assert_eq!(
-                evaluate(&policy, "rm -rf /tmp/x", mode).verdict,
+                evaluate(&policy, "rm -rf /srv/app/x", mode).verdict,
                 Verdict::Ask,
-                "rm -rf /tmp/x must ask ({mode:?})"
+                "rm -rf /srv/app/x must ask ({mode:?})"
             );
             assert_eq!(
-                evaluate(&policy, "{ rm -rf /tmp/x; }", mode).verdict,
+                evaluate(&policy, "{ rm -rf /srv/app/x; }", mode).verdict,
                 Verdict::Ask,
                 "the brace-wrapped form must ask exactly like the bare command ({mode:?})"
             );
@@ -13876,12 +14255,21 @@ mod tests {
     /// -- a destructive `rm -rf` inside the container asks exactly like it
     /// would bare, and a read-only `ls` stays allowed rather than folding
     /// to the whole invocation's unmatched-command default.
+    ///
+    /// `/srv/data`, not `/tmp/data`: a target confined to a temp root is now
+    /// deliberately `Allow` when it reaches `apply_recursive_delete_outcome`
+    /// (the headless-`dontAsk`-denial fix), and this text-only classifier
+    /// cannot distinguish the container's own `/tmp` from the host's, so an
+    /// inner `rm -rf /tmp/...` would now widen too -- exactly reaching bare's
+    /// verdict, which is this test's own stated point. Kept out of scope
+    /// here: this test is about the exec-prefix unwrap, not the temp-root
+    /// widening, so it uses a target outside every temp root either way.
     #[test]
     fn docker_and_kubectl_exec_reach_the_inner_commands_verdict() {
         let policy = SafetyPolicy::default();
         for command in [
-            "docker exec db rm -rf /tmp/data",
-            "kubectl exec pod -- rm -rf /tmp/data",
+            "docker exec db rm -rf /srv/data",
+            "kubectl exec pod -- rm -rf /srv/data",
         ] {
             assert_eq!(
                 evaluate(&policy, command, LaunchMode::Interactive).verdict,
@@ -16115,12 +16503,17 @@ mod tests {
     /// same test module as half one on purpose -- the two together are the
     /// requirement, and reading one without the other invites widening the
     /// ask set until half one starts failing.
+    ///
+    /// `/srv/scratch`, not `/tmp/scratch`: a target confined to a temp root
+    /// is now deliberately `Allow` (the headless-`dontAsk`-denial fix, see
+    /// `recursive_delete_confined_to_temp`), so this "still dangerous" list
+    /// needs a target outside every temp root.
     #[test]
     fn the_product_requirement_only_genuinely_dangerous_commands_prompt() {
         let policy = SafetyPolicy::default();
         let dangerous = [
             "rm -rf ./src",
-            "rm -fr /tmp/scratch",
+            "rm -fr /srv/scratch",
             "git push --force origin main",
             "git push origin -f",
             "git push origin --delete old-branch",
@@ -16339,12 +16732,17 @@ mod tests {
     /// genuinely dangerous but recoverable command must ASK, not die. These
     /// were all denied outright before, which under `--permission-mode
     /// dontAsk` meant a silent, unexplained failure.
+    ///
+    /// `/srv/scratch`, not `/tmp/scratch`: a target confined to a temp root
+    /// is now deliberately `Allow` (the headless-`dontAsk`-denial fix), so
+    /// this generic "still dangerous" example needs a target outside every
+    /// temp root.
     #[test]
     fn builtin_ask_covers_the_genuinely_dangerous_families() {
         let policy = SafetyPolicy::default();
         let must_ask = [
             "rm -rf ./src",
-            "rm -fr /tmp/scratch",
+            "rm -fr /srv/scratch",
             "git push --force origin main",
             "git push origin --force",
             "git push origin -f",

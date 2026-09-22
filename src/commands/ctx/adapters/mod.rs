@@ -4341,7 +4341,17 @@ fn join_with_or(items: &[&str]) -> String {
 /// exist for it on that platform, which is categorically different from
 /// "not ready yet" -- the latter implies installing the binary would fix
 /// it.
+/// How many times this process has actually walked every adapter's
+/// `ready()` (i.e. called [`readiness_note`]) -- observable from tests so a
+/// perf regression that makes some ordinary `zirv ctx <verb>` invocation pay
+/// this probe again shows up as a counter mismatch rather than only a wall-
+/// clock number nobody is watching (see `ctx::mod::ctx_about`, which is the
+/// only call site and gates it behind "help is actually about to render").
+pub(crate) static READINESS_NOTE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub fn readiness_note() -> String {
+    READINESS_NOTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut clauses: Vec<String> = Vec::new();
 
     // Item 11: each adapter is constructed and `ready()`-checked exactly
