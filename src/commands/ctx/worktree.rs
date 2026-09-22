@@ -360,6 +360,18 @@ pub struct WorktreeRecord {
     /// exactly today's behavior.
     #[serde(default)]
     pub setup_digest: Option<String>,
+    /// Review finding (2026-09, issue #718): when this record last
+    /// transitioned to [`WorktreeStatus::Idle`] -- set by [`update_status`]
+    /// exactly then, never carried forward from an earlier `Active` line.
+    /// [`gc`]/[`gc_candidates`] age an `Idle` record from THIS field, not
+    /// `created_at` (which `update_status` otherwise carries forward
+    /// unchanged): `created_at` is fixed at the tree's original allocation,
+    /// so measuring the pool TTL against it would treat a tree released
+    /// after a long-running task as already expired the moment it went
+    /// idle. `#[serde(default)]` so a record written before this field
+    /// existed still parses as `None`.
+    #[serde(default)]
+    pub idled_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,6 +455,40 @@ fn record_path(state: &StateDir, repo_slug: &str) -> PathBuf {
     state.worktrees().join(format!("{repo_slug}.jsonl"))
 }
 
+fn lock_file_path(state: &StateDir, repo_slug: &str) -> PathBuf {
+    state.worktrees().join(format!("{repo_slug}.lock"))
+}
+
+/// Review finding (2026-09, CRITICAL, issue #718): one advisory OS lock per
+/// repo's own worktree store, serializing [`find_reusable`] + the caller's
+/// claim (an appended `Active` record) in `agent::allocate_worktree` against
+/// [`idle_count`] + the mark-`Idle` write in `agent::reclaim_worktree` --
+/// without it, two concurrent `--worktree-reuse` allocations (or an
+/// allocation racing a reclaim) could both observe the same `Idle` record
+/// before either claimed it, handing the same directory to two different
+/// workers. Mirrors `group::GroupLock` exactly in shape -- same
+/// open-then-`lock()`, same unlock-on-drop, same reason the file itself is
+/// never deleted (see `group::GroupLock`'s own doc comment) -- a sibling
+/// issue (#728) will fold both into one shared guard type.
+pub(crate) struct WorktreeLock(std::fs::File);
+
+impl Drop for WorktreeLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Acquires this repo's own worktree-store lock, blocking until any other
+/// holder (in this process or another) releases it. Callers hold the
+/// returned guard across every read-then-write step that must not race --
+/// see [`WorktreeLock`]'s own doc comment for which ones.
+pub(crate) fn lock_worktrees(state: &StateDir, repo_slug: &str) -> CtxResult<WorktreeLock> {
+    create_private_dir_all(&state.worktrees())?;
+    let file = super::group::open_lock_file(&lock_file_path(state, repo_slug))?;
+    file.lock()?;
+    Ok(WorktreeLock(file))
+}
+
 /// Appends one ownership-record line. Append-only by design (see this
 /// module's own doc comment) -- callers never rewrite or truncate this file,
 /// only [`read_records`]/[`latest_for_path`] fold it down to current state.
@@ -490,6 +536,12 @@ pub fn latest_for_path(state: &StateDir, repo_slug: &str, path: &Path) -> Option
 /// Appends a status-changing line for `path`'s existing record, carrying
 /// forward every other field unchanged. A no-op (never fabricates a record)
 /// when `path` has none -- there is nothing honest to update.
+///
+/// Issue #718 review: transitioning TO [`WorktreeStatus::Idle`] stamps
+/// `idled_at` with the current time -- the one place this ever happens, so
+/// [`gc`]/[`gc_candidates`] can age the pool TTL from the moment a tree
+/// actually went idle rather than from its original `created_at`. Any other
+/// transition leaves `idled_at` exactly as it was; nothing else reads it.
 pub fn update_status(
     state: &StateDir,
     repo_slug: &str,
@@ -502,6 +554,9 @@ pub fn update_status(
     };
     record.status = status;
     record.note = note;
+    if status == WorktreeStatus::Idle {
+        record.idled_at = Some(now_secs());
+    }
     append_record(state, repo_slug, &record)
 }
 
@@ -646,6 +701,14 @@ pub fn prune_one(
 /// [`prune_one`] runs before anything is actually removed: TTL expiry only
 /// decides which records this loop even considers, never widens what
 /// `prune_one` itself would allow.
+///
+/// Review finding (2026-09): aged from `idled_at`, the moment
+/// [`update_status`] actually marked the record `Idle`, never from
+/// `created_at` (fixed at the tree's original allocation, long before it
+/// ever went idle). An `Idle` record with no `idled_at` at all -- one
+/// written before this field existed -- counts as already expired: there is
+/// no honest "moment it went idle" to age it from, so this is the
+/// conservative choice over letting it linger in the pool indefinitely.
 pub fn gc(
     state: &StateDir,
     repo: &Path,
@@ -658,7 +721,9 @@ pub fn gc(
     for record in read_records(state, &repo_slug) {
         let is_candidate = match record.status {
             WorktreeStatus::Active => record.owner_pid.is_some_and(|pid| !is_alive(pid)),
-            WorktreeStatus::Idle => now.saturating_sub(record.created_at) >= idle_ttl_secs,
+            WorktreeStatus::Idle => record
+                .idled_at
+                .is_none_or(|idled_at| now.saturating_sub(idled_at) >= idle_ttl_secs),
             WorktreeStatus::InspectionFailed | WorktreeStatus::Removed => false,
         };
         if !is_candidate {
@@ -693,7 +758,8 @@ pub fn gc(
 /// outright.
 ///
 /// Issue #718: mirrors `gc`'s own `Idle`-past-TTL branch too, using the
-/// identical `idle_ttl_secs`/`now` comparison -- see `gc`'s own doc comment.
+/// identical `idle_ttl_secs`/`now` comparison against `idled_at` -- see
+/// `gc`'s own doc comment, including its `idled_at == None` -> expired rule.
 pub(crate) fn gc_candidates(
     state: &StateDir,
     repo: &Path,
@@ -706,7 +772,9 @@ pub(crate) fn gc_candidates(
         .into_iter()
         .filter(|record| match record.status {
             WorktreeStatus::Active => record.owner_pid.is_some_and(|pid| !is_alive(pid)),
-            WorktreeStatus::Idle => now.saturating_sub(record.created_at) >= idle_ttl_secs,
+            WorktreeStatus::Idle => record
+                .idled_at
+                .is_none_or(|idled_at| now.saturating_sub(idled_at) >= idle_ttl_secs),
             WorktreeStatus::InspectionFailed | WorktreeStatus::Removed => false,
         })
         .collect()
@@ -1410,6 +1478,7 @@ mod tests {
             status,
             note: None,
             setup_digest: None,
+            idled_at: None,
         }
     }
 
@@ -1572,6 +1641,7 @@ mod tests {
                 status: WorktreeStatus::Active,
                 note: None,
                 setup_digest: None,
+                idled_at: None,
             },
         )
         .expect("append record");
@@ -1914,10 +1984,14 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
         let repo_slug = super::super::state::repo_slug(&repo);
-        // `repo_with_recorded_worktree`'s own fixed `created_at` (1_700_000_000)
-        // is already far enough in the past to be expired against any
-        // realistic TTL once compared with the real wall clock `gc` reads.
         update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+        // Review finding (2026-09): `gc` ages an `Idle` record from
+        // `idled_at`, not the fixture's own fixed `created_at` -- set it
+        // explicitly, far enough in the past to be expired against any
+        // realistic TTL.
+        let mut aged = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        aged.idled_at = Some(1_700_000_000);
+        append_record(&state, &repo_slug, &aged).expect("append with an aged idled_at");
 
         let outcomes = gc(&state, &repo, &|_pid| false, 60);
         assert_eq!(outcomes.len(), 1);
@@ -1937,13 +2011,48 @@ mod tests {
         let repo_slug = super::super::state::repo_slug(&repo);
         let mut record = latest_for_path(&state, &repo_slug, &worktree).expect("record");
         record.status = WorktreeStatus::Idle;
-        record.created_at = now_secs();
+        record.idled_at = Some(now_secs());
         append_record(&state, &repo_slug, &record).expect("append idle, freshly timestamped");
 
         let outcomes = gc(&state, &repo, &|_pid| false, 3600);
         assert!(
             outcomes.is_empty(),
             "a not-yet-expired idle tree must be left alone"
+        );
+        assert!(worktree.exists());
+    }
+
+    /// Review finding (2026-09), issue #718 HIGH: `update_status` carries
+    /// `created_at` forward unchanged on every transition, so a tree with a
+    /// stale `created_at` (allocated long ago) that just went `Idle` a
+    /// moment ago must NOT be treated as expired -- `gc` has to age it from
+    /// `idled_at`, not `created_at`, or a tree released after a long task
+    /// would be collected on the very next GC pass.
+    #[test]
+    fn gc_never_touches_an_idle_tree_with_a_stale_created_at_but_a_fresh_idled_at() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        // The fixture's own `created_at` (1_700_000_000) is far in the past.
+        let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        // `update_status` stamps `idled_at` with the current time on this
+        // very transition -- `created_at` stays exactly as stale as it was.
+        update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+        let record = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        assert_ne!(
+            record.created_at,
+            record.idled_at.expect("idled_at set"),
+            "the fixture's stale created_at must not equal the fresh idled_at"
+        );
+
+        let outcomes = gc(&state, &repo, &|_pid| false, 3600);
+        assert!(
+            outcomes.is_empty(),
+            "a stale created_at must never expire a just-idled tree"
         );
         assert!(worktree.exists());
     }
@@ -1963,6 +2072,11 @@ mod tests {
         let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
         let repo_slug = super::super::state::repo_slug(&repo);
         update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+        // Age `idled_at` explicitly -- see the sibling test above on why
+        // `gc` no longer reads the fixture's own stale `created_at`.
+        let mut aged = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        aged.idled_at = Some(1_700_000_000);
+        append_record(&state, &repo_slug, &aged).expect("append with an aged idled_at");
         std::fs::write(worktree.join("README.md"), "changed, not committed\n").expect("write");
 
         let outcomes = gc(&state, &repo, &|_pid| false, 60);
@@ -1987,10 +2101,13 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
         let repo_slug = super::super::state::repo_slug(&repo);
-        // `repo_with_recorded_worktree`'s own fixed `created_at`
-        // (1_700_000_000) is already far in the past, so this is expired
-        // against any realistic TTL once compared with the real wall clock.
         update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+        // Age `idled_at` explicitly, far enough in the past to be expired
+        // against any realistic TTL -- `gc_candidates` reads `idled_at`, not
+        // the fixture's own stale `created_at`.
+        let mut aged = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        aged.idled_at = Some(1_700_000_000);
+        append_record(&state, &repo_slug, &aged).expect("append with an aged idled_at");
 
         let candidates = gc_candidates(&state, &repo, &|_pid| false, 60);
         assert_eq!(candidates.len(), 1);
@@ -2000,10 +2117,10 @@ mod tests {
             "gc_candidates must never remove anything itself"
         );
 
-        // A freshly-timestamped `Idle` record, by contrast, is not yet
-        // expired against a generous TTL.
+        // A freshly-idled record, by contrast, is not yet expired against a
+        // generous TTL.
         let mut fresh = latest_for_path(&state, &repo_slug, &worktree).expect("record");
-        fresh.created_at = now_secs();
+        fresh.idled_at = Some(now_secs());
         append_record(&state, &repo_slug, &fresh).expect("append fresh idle");
         assert!(
             gc_candidates(&state, &repo, &|_pid| false, 3600 * 24).is_empty(),
@@ -2245,6 +2362,7 @@ mod tests {
                 status: WorktreeStatus::Active,
                 note: None,
                 setup_digest: None,
+                idled_at: None,
             },
         )
         .expect("append record for wt-b");

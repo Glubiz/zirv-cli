@@ -807,6 +807,82 @@ fn refused_workdir_root(canonical: &Path, homes: &WorkdirHomes) -> Option<&'stat
         .find_map(|(name, root)| canonical.starts_with(root).then_some(*name))
 }
 
+/// Review finding (2026-09, CRITICAL, issue #718): finds an `Idle` record
+/// matching `digest` and claims + resets it as ONE operation -- called by
+/// [`allocate_worktree`] with this repo's own `worktree::lock_worktrees`
+/// already held, so two concurrent `--worktree-reuse` callers can never
+/// both [`worktree::find_reusable`] the same record before either claims
+/// it. The claim -- an `Active` record written over the old `Idle` one --
+/// is appended BEFORE `git reset --hard` ever runs, so a competing caller
+/// that takes the lock next always sees this record already claimed, never
+/// still `Idle`, even if the reset that follows is slow or fails outright.
+///
+/// A failed reset (or a `validate_workdir` failure right after) marks the
+/// now-claimed record `InspectionFailed` rather than leaving a half-reset
+/// tree `Idle` for a later call to find again: `None` tells the caller to
+/// fall back to a fresh cold worktree, and the tree itself is left for
+/// `zirv ctx worktree prune` after manual inspection, exactly like any
+/// other `decide` refusal this module already leaves in place.
+fn claim_idle_worktree(
+    state: &StateDir,
+    repo_slug: &str,
+    digest: &str,
+    base_commit: &str,
+    owner_session: Option<&str>,
+) -> Option<PathBuf> {
+    let reusable = worktree::find_reusable(state, repo_slug, digest)?;
+    let path = PathBuf::from(&reusable.path);
+    let claimed = worktree::WorktreeRecord {
+        path: path.to_string_lossy().to_string(),
+        branch: reusable.branch,
+        base_commit: base_commit.to_string(),
+        owner_session: owner_session.map(str::to_string),
+        owner_pid: Some(std::process::id()),
+        created_at: super::state::now_secs(),
+        status: worktree::WorktreeStatus::Active,
+        note: None,
+        setup_digest: Some(digest.to_string()),
+        idled_at: None,
+    };
+    if let Err(e) = worktree::append_record(state, repo_slug, &claimed) {
+        eprintln!(
+            "--worktree {}: could not record reuse ownership ({e}); allocating a fresh one \
+             instead",
+            path.display()
+        );
+        return None;
+    }
+    let reset_ok = std::process::Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(&path)
+        .arg("reset")
+        .arg("--hard")
+        .arg(base_commit)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if reset_ok && let Ok(validated) = validate_workdir(&path) {
+        return Some(validated);
+    }
+    eprintln!(
+        "--worktree {}: could not reuse the idle tree (reset or validation failed after the \
+         claim); marking it for manual inspection and allocating a fresh one instead",
+        path.display()
+    );
+    let _ = worktree::update_status(
+        state,
+        repo_slug,
+        &path,
+        worktree::WorktreeStatus::InspectionFailed,
+        Some("git reset --hard failed after a --worktree-reuse claim".to_string()),
+    );
+    None
+}
+
 /// Issue #267/#319: `--worktree`'s own allocation -- a fresh linked `git
 /// worktree add` sibling of `repo` at `<repo>/.zirv/worktrees/<short>`,
 /// returned through [`validate_workdir`] so it is held to the identical
@@ -877,50 +953,31 @@ fn allocate_worktree(
     // lands (see `worktree::setup_digest`'s own doc comment); a digest
     // mismatch (no matching `Idle` record) or a reset/`validate_workdir`
     // failure falls straight through to cold allocation, never forced.
+    //
+    // Review finding (2026-09, CRITICAL): select + claim run under this
+    // repo's own worktree-store lock (`worktree::lock_worktrees`), so two
+    // concurrent `--worktree-reuse` calls can never both select the same
+    // `Idle` record -- see `claim_idle_worktree`'s own doc comment. A lock
+    // failure (best-effort, like every other housekeeping write in this
+    // function) skips reuse for this allocation rather than risking an
+    // unsynchronized claim.
     let digest = reuse.then(|| worktree::setup_digest(&base_commit, ""));
-    if let Some(digest) = &digest
-        && let Some(reusable) = worktree::find_reusable(state, &repo_slug, digest)
-    {
-        let path = PathBuf::from(&reusable.path);
-        let reset_ok = std::process::Command::new("git")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .arg("-C")
-            .arg(&path)
-            .arg("reset")
-            .arg("--hard")
-            .arg(&base_commit)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if reset_ok && let Ok(path) = validate_workdir(&path) {
-            let reused = worktree::WorktreeRecord {
-                path: path.to_string_lossy().to_string(),
-                branch: reusable.branch,
-                base_commit,
-                owner_session: owner_session.map(str::to_string),
-                owner_pid: Some(std::process::id()),
-                created_at: super::state::now_secs(),
-                status: worktree::WorktreeStatus::Active,
-                note: None,
-                setup_digest: Some(digest.clone()),
-            };
-            if let Err(e) = worktree::append_record(state, &repo_slug, &reused) {
+    if let Some(digest) = &digest {
+        match worktree::lock_worktrees(state, &repo_slug) {
+            Ok(_lock) => {
+                if let Some(path) =
+                    claim_idle_worktree(state, &repo_slug, digest, &base_commit, owner_session)
+                {
+                    return Ok(path);
+                }
+            }
+            Err(e) => {
                 eprintln!(
-                    "--worktree {}: could not record reuse ownership ({e}); a later reclaim \
-                     will require manual `zirv ctx worktree prune`",
-                    path.display()
+                    "--worktree-reuse: could not lock the worktree store ({e}); skipping reuse \
+                     for this allocation"
                 );
             }
-            return Ok(path);
         }
-        eprintln!(
-            "--worktree {}: could not reuse the idle tree (reset or validation failed); \
-             allocating a fresh one instead",
-            path.display()
-        );
     }
 
     let root = repo.join(crate::utils::SCRIPT_DIR_NAME).join("worktrees");
@@ -962,6 +1019,7 @@ fn allocate_worktree(
         status: worktree::WorktreeStatus::Active,
         note: None,
         setup_digest: digest,
+        idled_at: None,
     };
     if let Err(e) = worktree::append_record(state, &repo_slug, &record) {
         eprintln!(
@@ -1037,8 +1095,12 @@ pub(crate) enum ReclaimOutcome {
 /// every other tree keeps today's exact remove/archive/keep behavior,
 /// byte-for-byte. Even then, idling runs the identical `probe`/`decide`
 /// proof `prune_one` requires (never skipped), and only while
-/// `worktree::idle_count` is under the cap; a `Keep` refusal or a full pool
-/// falls straight through to the normal proof-required removal below.
+/// `worktree::idle_count` is under the cap, both read and acted on under
+/// this repo's own `worktree::lock_worktrees` (review finding, 2026-09,
+/// CRITICAL) -- the same lock `claim_idle_worktree` holds, so an idle-count
+/// check here can never race a concurrent allocation's own claim. A `Keep`
+/// refusal, a full pool, or a lock failure all fall straight through to the
+/// normal proof-required removal below.
 pub(crate) fn reclaim_worktree(
     state: &StateDir,
     repo: &Path,
@@ -1054,22 +1116,38 @@ pub(crate) fn reclaim_worktree(
                 .to_string(),
         };
     };
-    if record.setup_digest.is_some()
-        && worktree::idle_count(state, &repo_slug) < idle_pool_max as usize
-    {
-        let probes = worktree::probe(path, &record.base_commit);
-        if matches!(
-            worktree::decide(&probes),
-            worktree::PruneDecision::Remove | worktree::PruneDecision::ArchiveThenRemove(_)
-        ) {
-            let _ = worktree::update_status(
-                state,
-                &repo_slug,
-                path,
-                worktree::WorktreeStatus::Idle,
-                None,
-            );
-            return ReclaimOutcome::Idled;
+    if record.setup_digest.is_some() {
+        // Review finding (2026-09, CRITICAL): the same worktree-store lock
+        // `allocate_worktree`'s own claim takes -- otherwise a reclaim
+        // idling this tree could race a concurrent allocation's own
+        // `idle_count` read/claim, over- or under-counting the pool.
+        match worktree::lock_worktrees(state, &repo_slug) {
+            Ok(_lock) => {
+                if worktree::idle_count(state, &repo_slug) < idle_pool_max as usize {
+                    let probes = worktree::probe(path, &record.base_commit);
+                    if matches!(
+                        worktree::decide(&probes),
+                        worktree::PruneDecision::Remove
+                            | worktree::PruneDecision::ArchiveThenRemove(_)
+                    ) {
+                        let _ = worktree::update_status(
+                            state,
+                            &repo_slug,
+                            path,
+                            worktree::WorktreeStatus::Idle,
+                            None,
+                        );
+                        return ReclaimOutcome::Idled;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "--worktree {}: could not lock the worktree store ({e}); falling back to a \
+                     normal removal instead of idling",
+                    path.display()
+                );
+            }
         }
     }
     match worktree::prune_one(state, repo, &repo_slug, path, &record.base_commit) {
@@ -8525,6 +8603,137 @@ mod tests {
             std::fs::read_to_string(first.join("README.md")).expect("read"),
             "dirtied while idle\n",
             "the dirty content must be untouched -- no `git reset --hard` ever ran against it"
+        );
+    }
+
+    /// Review finding (2026-09, CRITICAL, issue #718): two concurrent
+    /// `--worktree --worktree-reuse` allocations racing for the same single
+    /// `Idle`, matching-digest record must never both claim it -- the
+    /// per-repo worktree-store lock (`worktree::lock_worktrees`) serializes
+    /// select+claim, so the loser always sees the record already claimed
+    /// (`Active`) and falls back to a fresh cold worktree instead.
+    #[test]
+    fn allocate_worktree_reuse_never_lets_two_concurrent_calls_claim_the_same_idle_record() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = std::sync::Arc::new(StateDir::from_root(tmp.path().join("state")));
+        let repo = std::sync::Arc::new(repo);
+        let first = allocate_worktree(&state, &repo, None, true).expect("first allocation");
+        assert_eq!(
+            reclaim_worktree(&state, &repo, &first, 4),
+            ReclaimOutcome::Idled
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let repo = repo.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    allocate_worktree(&state, &repo, None, true).expect("allocation")
+                })
+            })
+            .collect();
+        let results: Vec<PathBuf> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread joins"))
+            .collect();
+
+        assert_ne!(
+            results[0], results[1],
+            "two concurrent reuse allocations must never both claim the same idle tree"
+        );
+        assert!(
+            results.contains(&first),
+            "exactly one of the two concurrent calls must have reused the idle tree"
+        );
+    }
+
+    /// Review finding (2026-09, CRITICAL, issue #718): a `git reset --hard`
+    /// that fails AFTER the claim record has already been appended must
+    /// never leave that record `Idle` for a later call to find again --
+    /// `claim_idle_worktree` marks it `InspectionFailed` and returns `None`
+    /// so the caller falls back to a fresh cold worktree. The digest is
+    /// matched against a real, valid `Idle` record (so `find_reusable`'s own
+    /// proof passes); the `base_commit` passed to `claim_idle_worktree`
+    /// itself is bogus, standing in for a reset that fails for any reason
+    /// after a successful claim.
+    #[test]
+    fn claim_idle_worktree_falls_back_and_leaves_no_idle_record_when_reset_fails() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let first = allocate_worktree(&state, &repo, None, true).expect("first allocation");
+        assert_eq!(
+            reclaim_worktree(&state, &repo, &first, 4),
+            ReclaimOutcome::Idled
+        );
+
+        let repo_slug = super::super::state::repo_slug(&repo);
+        let digest = worktree::latest_for_path(&state, &repo_slug, &first)
+            .expect("idle record")
+            .setup_digest
+            .expect("idle record carries a digest");
+
+        let claimed = claim_idle_worktree(&state, &repo_slug, &digest, "not-a-real-commit", None);
+        assert!(
+            claimed.is_none(),
+            "a reset against a bogus commit must fail and never be returned as reused"
+        );
+        let record = worktree::latest_for_path(&state, &repo_slug, &first)
+            .expect("the claimed record must still exist");
+        assert_ne!(
+            record.status,
+            worktree::WorktreeStatus::Idle,
+            "a failed reset must never leave the claimed record Idle"
+        );
+        assert!(
+            worktree::find_reusable(&state, &repo_slug, &digest).is_none(),
+            "no Idle record must remain for this path after a failed reset"
         );
     }
 
