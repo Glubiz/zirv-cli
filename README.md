@@ -920,7 +920,8 @@ to the section that documents it in depth.
   [Verbs](#verbs).
 - **Delegation controls** — `group`, `objective`, `spend`, `savings`,
   `worktree`, `task`, and `swarm` bound, account for, and reclaim delegated
-  work; `permissions` (`audit`/`compile`/`propose`) and `safety`
+  work; `reconcile` runs every dead-owner sweep in one pass (`--dry-run` to
+  report only); `permissions` (`audit`/`compile`/`propose`) and `safety`
   (`check`/`list`/`explain`) audit and enforce zirv's harness-neutral
   command-safety policy; `close` ends a group or objective early. See
   [Permission auditing and safe-list
