@@ -93,6 +93,10 @@ pub(super) struct WorkerSummary {
     id: String,
     delegation: Option<String>,
     phase: Option<String>,
+    /// Issue #723: the typed reasons recorded alongside `phase`, newest
+    /// last, each rendered `"<reason>@<unix time>"` -- empty for a worker
+    /// known only from its report (no delegation record).
+    conditions: Vec<String>,
     attempt: Option<u32>,
     exit_code: Option<i32>,
     updated_at: u64,
@@ -427,6 +431,11 @@ impl Scope {
                     id,
                     delegation: Some(record.handle.delegation.clone()),
                     phase: Some(record.phase.as_str().into()),
+                    conditions: record
+                        .conditions
+                        .iter()
+                        .map(delegation::Condition::label)
+                        .collect(),
                     attempt: Some(record.handle.attempt),
                     exit_code: record.exit_code,
                     updated_at: record.updated_at,
@@ -450,6 +459,7 @@ impl Scope {
                 id,
                 delegation: None,
                 phase: None,
+                conditions: Vec::new(),
                 attempt: None,
                 exit_code: None,
                 updated_at: report.ts,

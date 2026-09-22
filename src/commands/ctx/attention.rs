@@ -2039,6 +2039,7 @@ mod tests {
             cancel_requested: false,
             unknown_tool_outcomes: Vec::new(),
             attempts: Vec::new(),
+            conditions: Vec::new(),
         };
         delegation::save(state, repo, &record).unwrap();
     }

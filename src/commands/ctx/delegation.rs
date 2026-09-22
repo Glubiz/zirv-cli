@@ -88,6 +88,79 @@ impl Phase {
     }
 }
 
+/// Issue #723: the fine-grained WHY behind a delegation's coarse [`Phase`],
+/// for a consumer that wants to branch on a specific decision rather than
+/// only on where the delegation currently sits (google/ax's own
+/// `Condition.reason` is a free-form string nothing typechecks -- see
+/// this crate's tracking issue for why zirv uses a closed enum instead).
+/// Exhaustively matched on purpose: a new reason is a variant added here,
+/// never a new free-form string. Payload strings (`TaskBlocked`) are the
+/// SAME free text the deciding call site already carries (`task::Block::
+/// reason`), never new prose minted by this module.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionReason {
+    /// [`record_launch`]: the durable record now names a resolved workdir
+    /// for this delegation's worker.
+    WorkspaceReady,
+    /// [`bind_launched_worker`]: the worker's own process/session is
+    /// actually bound to the record.
+    Launched,
+    /// This delegation's `--task` card was claimed before it launched
+    /// (`task::claim_locked`, taken by the caller).
+    TaskClaimed,
+    /// This delegation's `--task` card is blocked; the payload is
+    /// `task::Block::reason` verbatim, never new prose.
+    TaskBlocked(String),
+    /// This delegation's `--group` admitted it within its token budget
+    /// (`group::admit_child`).
+    BudgetOk,
+    /// This delegation's `--group` refused admission: its token budget or
+    /// deadline is exhausted (`group::admit_child`,
+    /// `group::AdmissionExhausted`).
+    BudgetExhausted,
+    /// [`publish_terminal`]: this attempt produced a report/summary.
+    Reporting,
+    /// A declared `--result-schema`/`--result-kind` contract was satisfied
+    /// (`result_schema::evaluate`).
+    ContractValid,
+    /// A declared contract was not satisfied even after the bounded retry
+    /// (`result_schema::evaluate`).
+    ContractFailed,
+}
+
+/// One fact recorded about a delegation, alongside (never replacing) its
+/// coarse [`Phase`]. Append-only: nothing here is ever removed or edited, so
+/// a later reader sees the SEQUENCE a delegation went through, not only its
+/// most recent state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Condition {
+    pub reason: ConditionReason,
+    pub at: u64,
+}
+
+impl Condition {
+    /// A compact, stable rendering for a text surface (`worker_status`'s
+    /// MCP tool, `zirv ctx status`) that has no business depending on this
+    /// enum's own shape -- `"<reason>@<unix time>"`, with `TaskBlocked`'s
+    /// payload appended after a colon, exactly the free text
+    /// `task::Block::reason` already carries.
+    pub fn label(&self) -> String {
+        let reason = match &self.reason {
+            ConditionReason::WorkspaceReady => "workspace_ready".to_string(),
+            ConditionReason::Launched => "launched".to_string(),
+            ConditionReason::TaskClaimed => "task_claimed".to_string(),
+            ConditionReason::TaskBlocked(reason) => format!("task_blocked: {reason}"),
+            ConditionReason::BudgetOk => "budget_ok".to_string(),
+            ConditionReason::BudgetExhausted => "budget_exhausted".to_string(),
+            ConditionReason::Reporting => "reporting".to_string(),
+            ConditionReason::ContractValid => "contract_valid".to_string(),
+            ConditionReason::ContractFailed => "contract_failed".to_string(),
+        };
+        format!("{reason}@{}", self.at)
+    }
+}
+
 /// The stable worker handle. Deliberately independent of any provider
 /// conversation id (an Anthropic/OpenAI response id, a harness rollout uuid):
 /// those change on every resume and are not addressable by a parent, while
@@ -208,6 +281,11 @@ pub struct Record {
     pub unknown_tool_outcomes: Vec<String>,
     #[serde(default)]
     pub attempts: Vec<Attempt>,
+    /// Issue #723: typed reasons recorded alongside `phase`, never replacing
+    /// it. `#[serde(default)]` so a record written before this field existed
+    /// deserializes with an empty list rather than failing.
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
 }
 
 impl Record {
@@ -364,6 +442,10 @@ pub fn record_launch(
         cancel_requested: false,
         unknown_tool_outcomes: Vec::new(),
         attempts: vec![attempt],
+        conditions: vec![Condition {
+            reason: ConditionReason::WorkspaceReady,
+            at: now,
+        }],
     };
     save(state, repo, &record)?;
     Ok(record)
@@ -385,6 +467,26 @@ pub fn record_ownership(
     };
     record.reservation = reservation;
     record.write_claim = write_claim;
+    record.updated_at = now;
+    save(state, repo, &record)
+}
+
+/// Issue #723: appends one [`Condition`] to a delegation's durable record --
+/// recording a fact some caller already decided elsewhere (a task claim, a
+/// budget admission, a contract evaluation), never deciding anything new
+/// itself. Mirrors [`record_ownership`]'s own lock-load-mutate-save shape.
+pub fn record_condition(
+    state: &StateDir,
+    repo: &Path,
+    delegation: &str,
+    reason: ConditionReason,
+    now: u64,
+) -> CtxResult<()> {
+    let _lock = lock_delegation(state, repo, delegation)?;
+    let Some(mut record) = load(state, repo, delegation) else {
+        return Err(format!("no delegation {delegation:?} in this repository").into());
+    };
+    record.conditions.push(Condition { reason, at: now });
     record.updated_at = now;
     save(state, repo, &record)
 }
@@ -451,6 +553,15 @@ pub fn publish_terminal(
             attempt.ended_at = Some(now);
             attempt.summary.clone_from(&summary);
             attempt.result_path.clone_from(&result_path);
+        }
+        // Issue #723: this write already decided whether the attempt has
+        // anything to show for itself -- recorded once, on the genuine
+        // write, never on a replay of the same terminal facts.
+        if summary.is_some() {
+            record.conditions.push(Condition {
+                reason: ConditionReason::Reporting,
+                at: now,
+            });
         }
         save(state, repo, &record)?;
     }
@@ -1193,6 +1304,10 @@ fn bind_launched_worker(
             .clone_from(&record.handle.worker_session);
         attempt.short.clone_from(&record.handle.short);
     }
+    record.conditions.push(Condition {
+        reason: ConditionReason::Launched,
+        at: now,
+    });
     record.updated_at = now;
     save(state, repo, &record)?;
     Ok(record)
@@ -1607,6 +1722,151 @@ mod tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
         (dir, state, repo, CtxConfig::default())
+    }
+
+    // Issue #723: typed per-worker conditions alongside the coarse phase.
+
+    /// Acceptance criterion 1: a record written before `conditions` existed
+    /// has no such field on disk at all -- it must deserialize as an empty
+    /// list, never fail.
+    #[test]
+    fn a_record_predating_conditions_deserializes_with_an_empty_list() {
+        let json = r#"{
+            "schema_version": 1,
+            "handle": {
+                "delegation": "old1",
+                "attempt": 1,
+                "runtime": "harness",
+                "worker_session": "old1-session",
+                "short": "olds1",
+                "role": "worker",
+                "workdir": "."
+            },
+            "phase": "completed",
+            "revision": 1,
+            "launched_at": 10,
+            "updated_at": 20
+        }"#;
+        let record: Record = serde_json::from_str(json).expect("old record still parses");
+        assert_eq!(record.conditions, Vec::new());
+    }
+
+    /// [`record_launch`] and [`bind_launched_worker`] each note the exact
+    /// fact they decide, in order, on the SAME record `publish_terminal`
+    /// later closes out.
+    #[test]
+    fn a_launch_and_its_bound_worker_each_note_their_own_condition() {
+        let (_dir, state, repo, _cfg) = fixture();
+        let record = record_launch(
+            &state,
+            &repo,
+            handle("deleg-cond", RuntimeKind::Native),
+            None,
+            10,
+        )
+        .expect("launch");
+        assert_eq!(
+            record.conditions,
+            vec![Condition {
+                reason: ConditionReason::WorkspaceReady,
+                at: 10,
+            }]
+        );
+
+        let worker = LaunchedWorker {
+            exit_code: 0,
+            session: "deleg-cond-worker".to_string(),
+            short: "dc0001".to_string(),
+            receipt: None,
+        };
+        let bound = bind_launched_worker(&state, &repo, "deleg-cond", &worker, 11).expect("bind");
+        assert_eq!(
+            bound.conditions,
+            vec![
+                Condition {
+                    reason: ConditionReason::WorkspaceReady,
+                    at: 10,
+                },
+                Condition {
+                    reason: ConditionReason::Launched,
+                    at: 11,
+                },
+            ]
+        );
+    }
+
+    /// Acceptance criterion 3: a blocked task card's condition carries the
+    /// SAME text `Card::block.reason` stores, never new prose.
+    #[test]
+    fn a_blocked_tasks_condition_carries_the_cards_own_reason_text() {
+        use crate::commands::ctx::task;
+
+        let card = task::Card {
+            id: "t1".to_string(),
+            repo_slug: "repo".to_string(),
+            title: "title".to_string(),
+            brief: "brief".to_string(),
+            state: task::State::Ready,
+            parents: Vec::new(),
+            claim: None,
+            block: None,
+            comments: Vec::new(),
+            workdir: None,
+            group_id: None,
+            outcome: None,
+            attempts: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let blocked = task::block(&card, "waiting on review", "sess-1", 10).expect("block");
+        let block = blocked.block.expect("block always sets it");
+
+        let condition = Condition {
+            reason: ConditionReason::TaskBlocked(block.reason.clone()),
+            at: 10,
+        };
+        assert_eq!(
+            condition.reason,
+            ConditionReason::TaskBlocked("waiting on review".to_string())
+        );
+        assert_eq!(block.reason, "waiting on review");
+    }
+
+    /// Acceptance criterion 4: an exhausted group produces `BudgetExhausted`
+    /// before any launch attempt is made -- `group::admit_child` refuses
+    /// admission entirely on its own, with no delegation ever recorded.
+    #[test]
+    fn an_exhausted_groups_admission_maps_to_budget_exhausted_before_any_launch() {
+        use crate::commands::ctx::group;
+
+        let (_dir, state, repo, _cfg) = fixture();
+        let exhausted = group::WorkGroup {
+            work_group_id: "g1".to_string(),
+            parent_session_id: "sess-parent".to_string(),
+            scope: "batch".to_string(),
+            child_limit: 3,
+            token_budget: Some(100),
+            spent_tokens: 100,
+            reserved_tokens: 0,
+            deadline_secs: None,
+            completion_contract: "reports by mail".to_string(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        group::create(&state, &exhausted).expect("create group");
+
+        let error = group::admit_child(&state, "g1", 10, None).expect_err("budget is exhausted");
+        assert!(group::is_admission_exhausted(error.as_ref()));
+
+        let condition = Condition {
+            reason: ConditionReason::BudgetExhausted,
+            at: 10,
+        };
+        assert_eq!(condition.reason, ConditionReason::BudgetExhausted);
+        // No delegation was ever launched for this admission attempt.
+        assert!(list(&state, &repo).is_empty());
     }
 
     #[test]

@@ -2548,7 +2548,32 @@ fn render_agents_json<W: Write>(w: &mut W, repo: &Path, env: EnvLookup<'_>) -> C
     let usage = native_ux::build_usage(&view, &billing_label(&cfg, repo));
     let notices = native_ux::NoticeLog::new(native_ux::NOTICE_LOG_CAP);
     let report = native_ux::headless_report(&overview, &usage, &notices, now);
-    let json = serde_json::to_string_pretty(&report)
+    let mut value = serde_json::to_value(&report)
+        .map_err(|e| format!("status --agents: failed to serialize the report: {e}"))?;
+    // Issue #723: an in-flight delegation's typed conditions, alongside
+    // (never replacing) its coarse phase -- keyed by delegation id, the same
+    // id an `agents[].id` row for a worker already carries, so a caller
+    // never has to correlate through anything new.
+    if let Some(object) = value.as_object_mut() {
+        let conditions: std::collections::BTreeMap<String, Vec<String>> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.handle.delegation.clone(),
+                    record
+                        .conditions
+                        .iter()
+                        .map(delegation::Condition::label)
+                        .collect(),
+                )
+            })
+            .collect();
+        object.insert(
+            "delegation_conditions".to_string(),
+            serde_json::to_value(conditions).unwrap_or_default(),
+        );
+    }
+    let json = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("status --agents: failed to serialize the report: {e}"))?;
     writeln!(w, "{json}")?;
     Ok(0)
