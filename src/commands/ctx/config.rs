@@ -12906,6 +12906,7 @@ mod tests {
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),
         ("policy", "network"),
+        ("policy", "network_allowlist"),
         ("policy", "approval"),
         ("policy", "git_push_destructive"),
         ("policy", "tool_access"),

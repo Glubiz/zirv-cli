@@ -291,6 +291,7 @@ model = "fable"
 # outside_repo_fs_write = "allow"    # writes anywhere else on the machine. Default: "allow".
 # shell_exec = "allow"               # running shell commands at all. Default: "allow".
 # network = "allow"                  # outbound network access from the session. Default: "allow".
+# network_allowlist = []             # host/port destinations `network` is further scoped to when non-empty (issue #727); a repo checkout may only remove entries, never name one beyond the operator's own list. Default: [] (no scoping beyond `network` itself).
 # approval = "allow"                 # "allow" = approvals may be bypassed, "ask" = must be requested, "deny" = attempt nothing needing approval (a read-only session). Default: "allow".
 # git_push_destructive = "allow"     # `git push`, and history-rewriting/destructive git. Default: "allow".
 # tool_access = "allow"              # which of the harness's own tools (including MCP servers) may run. Default: "allow".

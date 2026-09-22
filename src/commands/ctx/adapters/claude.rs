@@ -2582,15 +2582,41 @@ impl AgentAdapter for ClaudeAdapter {
         _stance: crate::commands::ctx::policy::Stance,
         _mode: super::LaunchMode,
     ) -> crate::commands::ctx::policy::CapabilityDescriptor {
-        let _ = allowlist;
-        crate::commands::ctx::policy::CapabilityDescriptor::degraded(
-            "one WebFetch(domain:<host>)/WebSearch(domain:<host>) allow rule per \
-             network_allowlist entry (claude's own documented --allowedTools rule syntax), \
-             replacing the wholesale WebFetch/WebSearch allow; this scopes those two brokered \
-             tools only -- Bash network calls (curl, wget, a raw socket, or any other \
-             network-capable program a shell command runs) are not scoped by this mechanism at \
-             all",
-        )
+        // Review round (issue #727): the doc comment above promises "one rule
+        // per target", so the mechanism string must actually name them --
+        // sorted and deduplicated by host so the same report is produced
+        // regardless of the allowlist's own declaration order, and so two
+        // targets differing only in scheme/port (claude's own rule syntax
+        // has no port granularity) render as one rule, not a repeat.
+        let mut hosts: Vec<&str> = allowlist
+            .iter()
+            .map(|target| target.host.as_str())
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        let rules = hosts
+            .iter()
+            .map(|host| format!("WebFetch(domain:{host})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `CapabilityDescriptor::mechanism` is `&'static str` (every other
+        // adapter answer is a literal); this is the one answer built from the
+        // operator's own configured data, so it is deliberately leaked --
+        // bounded by the size of the operator's own allowlist, and this
+        // method is reached only at report/spawn time (`policy::evaluate`),
+        // never in a per-tick loop.
+        let mechanism: &'static str = Box::leak(
+            format!(
+                "one WebFetch(domain:<host>)/WebSearch(domain:<host>) allow rule per \
+                 network_allowlist entry (claude's own documented --allowedTools rule syntax): \
+                 {rules}; replacing the wholesale WebFetch/WebSearch allow; this scopes those \
+                 two brokered tools only -- Bash network calls (curl, wget, a raw socket, or any \
+                 other network-capable program a shell command runs) are not scoped by this \
+                 mechanism at all"
+            )
+            .into_boxed_str(),
+        );
+        crate::commands::ctx::policy::CapabilityDescriptor::degraded(mechanism)
     }
 
     /// The one stance this adapter has a verified per-run mechanism for

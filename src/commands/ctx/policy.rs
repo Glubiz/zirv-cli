@@ -194,10 +194,40 @@ impl Stance {
 /// same as every other type in this module. `PartialOrd`/`Ord` are needed for
 /// `enforcement::NetworkScope::Only`'s `BTreeSet<NetworkTarget>`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "RawNetworkTarget")]
 pub struct NetworkTarget {
     pub scheme: String,
     pub host: String,
     pub port: Option<u16>,
+}
+
+/// Deserialization staging shape for [`NetworkTarget`] (review round, issue
+/// #727): TOML/JSON give whatever `scheme`/`host`/`port` an author typed, and
+/// the raw derive would have stored them verbatim -- skipping the exact
+/// validation ([`NetworkTarget::new`], on `runtime::enforcement.rs`) every
+/// PROGRAMMATIC caller (native.rs, `runtime/tools/capability.rs`) already
+/// goes through. Routing `Deserialize` through `TryFrom` below closes that
+/// gap: a `[policy] network_allowlist` entry with a non-http(s) scheme or a
+/// host containing `/ \ @ \0` now hard-errors at parse time instead of
+/// silently becoming an unusable `NetworkTarget`, and `Example.COM.` now
+/// normalizes (lowercase, trailing dot stripped) the same way a programmatic
+/// caller's input would, so a repo layer naming the operator's own host back
+/// in a different case/trailing-dot spelling is still recognized as the same
+/// entry by [`resolve_network_allowlist`]'s `home.contains` check.
+#[derive(Deserialize)]
+struct RawNetworkTarget {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl TryFrom<RawNetworkTarget> for NetworkTarget {
+    type Error = String;
+
+    fn try_from(raw: RawNetworkTarget) -> Result<Self, Self::Error> {
+        NetworkTarget::new(&raw.scheme, &raw.host, raw.port)
+            .map_err(|error| format!("{}://{}: {error}", raw.scheme, raw.host))
+    }
 }
 
 /// zirv's canonical policy: one [`Stance`] per [`Capability`], stated once and
@@ -1568,6 +1598,79 @@ mod tests {
         );
     }
 
+    /// Review round (issue #727): a malformed host must hard-error at parse
+    /// time, naming the offending entry -- before this fix, `NetworkTarget`'s
+    /// plain derived `Deserialize` accepted any string verbatim, skipping the
+    /// validation ([`NetworkTarget::new`]) every programmatic caller already
+    /// goes through.
+    #[test]
+    fn a_malformed_host_in_the_repo_layer_hard_errors_naming_the_entry() {
+        let home = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"api.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"evil/example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let err = resolve(home, repo, &|k| vars.get(k).cloned())
+            .expect_err("a host containing '/' must not deserialize");
+        assert!(
+            err.to_string().contains("evil/example.com"),
+            "the error must name the malformed entry: {err}"
+        );
+    }
+
+    /// Review round (issue #727): routing `Deserialize` through
+    /// `NetworkTarget::new` normalizes case and a trailing dot on the way in,
+    /// so a repo layer spelling the operator's own granted host differently
+    /// (`Example.COM.`) still resolves to the SAME entry `home` granted --
+    /// narrowing is accepted rather than rejected as "a host home never
+    /// granted".
+    #[test]
+    fn a_repo_layer_spelling_normalizes_so_narrowing_is_accepted() {
+        let home = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"HTTPS\", host = \"Example.COM.\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let resolved = resolve(home, repo, &|k| vars.get(k).cloned())
+            .expect("a normalized repeat of the operator's own host must not hard-error");
+        assert_eq!(
+            resolved.network_allowlist,
+            vec![NetworkTarget {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                port: None,
+            }]
+        );
+    }
+
+    /// Review round (issue #727), item 4: the operator never mentioning
+    /// `network_allowlist` at all is NOT the same as granting an empty list --
+    /// a repo layer naming any host at all against a silent home is naming a
+    /// host the operator never granted, the same hard error as against an
+    /// explicit non-empty home list.
+    #[test]
+    fn home_omitting_the_allowlist_while_repo_sets_a_nonempty_list_is_a_hard_error() {
+        let repo = table(
+            "[policy]\nnetwork_allowlist = [{ scheme = \"https\", host = \"api.example.com\" }]\n",
+        )
+        .and_then(|v| v.get("policy").cloned());
+        let vars = env_from(&[]);
+        let err = resolve(None, repo, &|k| vars.get(k).cloned())
+            .expect_err("a repo may not name any host when the operator granted none");
+        assert!(
+            err.to_string().contains("api.example.com"),
+            "the error must name the offending host: {err}"
+        );
+    }
+
     /// The acceptance criterion in its most literal form: with no
     /// `network_allowlist` configured anywhere (today's only shipped state),
     /// both the report claude's `policy_support` path produces AND the real
@@ -1597,8 +1700,10 @@ mod tests {
 
     /// Claude's honest answer once an operator actually configures a
     /// non-empty allowlist: the mechanism must name its own actual permission
-    /// rule syntax and the gap it leaves (Bash is unscoped), and must never
-    /// claim `Enforced`.
+    /// rule syntax, the CONFIGURED HOST ITSELF (review round, issue #727 --
+    /// the doc comment promises "one rule per target", so a static string
+    /// that never varies with the input would be a lie), and the gap it
+    /// leaves (Bash is unscoped); it must never claim `Enforced`.
     #[test]
     fn claude_reports_a_configured_allowlist_as_degraded_and_names_the_bash_gap() {
         let claude = ClaudeAdapter::new(None);
@@ -1615,13 +1720,65 @@ mod tests {
         assert_eq!(descriptor.support, Support::Degraded);
         assert_ne!(descriptor.support, Support::Enforced);
         assert!(
-            descriptor.mechanism.contains("WebFetch(domain:"),
-            "must name claude's own permission-rule syntax: {}",
+            descriptor
+                .mechanism
+                .contains("WebFetch(domain:api.example.com)"),
+            "must name claude's own permission-rule syntax for the configured host: {}",
             descriptor.mechanism
         );
         assert!(
             descriptor.mechanism.contains("Bash"),
             "must name the Bash-scoping gap: {}",
+            descriptor.mechanism
+        );
+    }
+
+    /// Review round (issue #727): two configured hosts render as two
+    /// deterministic, sorted rules -- not the input order, and not a repeat
+    /// when two entries differ only in scheme/port (claude's own rule syntax
+    /// has no port granularity, so they collapse to one rule for the host).
+    #[test]
+    fn claude_sorts_and_deduplicates_hosts_in_the_allowlist_mechanism() {
+        let claude = ClaudeAdapter::new(None);
+        let allowlist = vec![
+            NetworkTarget {
+                scheme: "https".to_string(),
+                host: "z.example.com".to_string(),
+                port: None,
+            },
+            NetworkTarget {
+                scheme: "http".to_string(),
+                host: "a.example.com".to_string(),
+                port: Some(8080),
+            },
+            NetworkTarget {
+                scheme: "https".to_string(),
+                host: "a.example.com".to_string(),
+                port: None,
+            },
+        ];
+        let descriptor = claude.network_allowlist_support(
+            &allowlist,
+            Stance::Allow,
+            adapters::LaunchMode::Headless,
+        );
+        let a_index = descriptor
+            .mechanism
+            .find("WebFetch(domain:a.example.com)")
+            .expect("a.example.com rule present");
+        let z_index = descriptor
+            .mechanism
+            .find("WebFetch(domain:z.example.com)")
+            .expect("z.example.com rule present");
+        assert!(
+            a_index < z_index,
+            "hosts must be sorted, not declaration order: {}",
+            descriptor.mechanism
+        );
+        assert_eq!(
+            descriptor.mechanism.matches("a.example.com").count(),
+            1,
+            "duplicate host (differing only by scheme/port) must render once: {}",
             descriptor.mechanism
         );
     }
@@ -1651,7 +1808,11 @@ mod tests {
             .expect("network row present");
         assert_eq!(network_outcome.support, Support::Degraded);
         assert_ne!(network_outcome.support, Support::Enforced);
-        assert!(network_outcome.mechanism.contains("WebFetch(domain:"));
+        assert!(
+            network_outcome
+                .mechanism
+                .contains("WebFetch(domain:api.example.com)")
+        );
     }
 
     /// A `Deny` network stance leaves nothing for a host allowlist to scope:

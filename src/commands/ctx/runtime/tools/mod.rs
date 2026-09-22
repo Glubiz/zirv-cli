@@ -4542,7 +4542,7 @@ mod tests {
                 ResourceClaims::new(&repo, &repo, state.root(), &home, network).expect("claims"),
                 ApprovalMode::Headless,
                 std::sync::Arc::new(FixedPolicy(
-                    PolicySnapshot::new(policy, safety.clone()).expect("policy"),
+                    PolicySnapshot::new(policy.clone(), safety.clone()).expect("policy"),
                 )),
                 std::sync::Arc::new(FixedFence),
                 std::sync::Arc::new(ApprovalAuthority::new()),
