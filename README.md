@@ -717,6 +717,15 @@ predates the registry (`s/*.sock` with no matching JSON record) still shows
 up, labeled `(no record)`, so a mixed-version machine never silently drops a
 live session from the listing.
 
+Addressing a **parked** seat (see "the displaced harness is parked, not
+closed" below) whose own supervisor process has since exited -- a "ghost
+park" -- is recognized instead of reported as a plain unknown id. If its
+park window has already elapsed, `send`/`nudge` resume it (the same path a
+live poll tick would take) before delivering; if the window has not yet
+elapsed, the mail is queued as usual and the reply names the park and its
+reason instead of a bare not-found. Either way mail never resumes a park
+early on its own -- only a window that has already elapsed does.
+
 `zirv ctx nudge <prefix> --message <text>` wakes a live session early instead
 of waiting for it to notice on its own:
 

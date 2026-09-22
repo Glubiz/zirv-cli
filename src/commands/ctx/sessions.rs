@@ -1534,6 +1534,42 @@ pub fn resolve_prefix(state: &StateDir, prefix: &str) -> Result<Record, ResolveE
     }
 }
 
+/// What addressing a short id (or full session id) prefix finds: the one
+/// live record [`resolve_prefix`] already resolves, or -- issue #721 -- a
+/// still-parked seat whose owning session record no longer exists.
+/// `rollover::forget` deliberately keeps `<short>.seat.json` alive past its
+/// own session's teardown while the park's window has not yet elapsed (its
+/// own doc comment calls this a "ghost park"), so a bare registry miss
+/// cannot tell a genuinely unknown id apart from one whose supervisor
+/// already exited but is still owed a wake-up.
+#[derive(Debug)]
+pub enum Addressed {
+    Live(Box<Record>),
+    Parked(Box<super::seat::Seat>),
+}
+
+/// [`resolve_prefix`], extended to recognize a ghost-parked seat (issue
+/// #721) instead of reporting it as a bare [`ResolveError::NotFound`].
+/// Every other outcome is untouched and byte-identical to calling
+/// `resolve_prefix` directly: a live match, an ambiguous prefix, and a
+/// prefix that matches neither a live record nor exactly one parked seat all
+/// fall straight through unchanged -- only a `NotFound` whose prefix names
+/// exactly one parked seat is reinterpreted.
+pub fn resolve_prefix_or_parked(state: &StateDir, prefix: &str) -> Result<Addressed, ResolveError> {
+    match resolve_prefix(state, prefix) {
+        Ok(record) => Ok(Addressed::Live(Box::new(record))),
+        Err(ResolveError::NotFound { existing }) => {
+            let mut parked = super::seat::find_parked_by_prefix(state, prefix);
+            if parked.len() == 1 {
+                Ok(Addressed::Parked(Box::new(parked.remove(0))))
+            } else {
+                Err(ResolveError::NotFound { existing })
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
 // N4: `zirv ctx nudge <prefix>`. A nudge is two independent pieces: a
 // payload (an ordinary, durable, session-addressed mail message, so it is
 // visible in `zirv ctx inbox` and survives however long it takes to be
@@ -1890,12 +1926,70 @@ pub fn run_nudge_with<W: Write>(
     // filters to live records (a stale one was swept from disk by the time a
     // caller could act on it), so an unknown *or* dead session both surface
     // as the same `NotFound`, naming what is actually there instead.
-    let record = resolve_prefix(&state, &args.prefix).map_err(|e| {
+    let addressed = resolve_prefix_or_parked(&state, &args.prefix).map_err(|e| {
         format!(
             "zirv ctx nudge: {}",
             resolve_error_with_diagnostics(&e, &state, env)
         )
     })?;
+    // Issue #721: a ghost-parked seat -- a parked seat whose owning session
+    // record `rollover::forget` already removed -- has no live process to
+    // hold a turn-signal socket, so the `reachable`/interactive-advisory
+    // contract below (which is about a *running* supervisor) does not apply.
+    // Deliver the mail (resuming the seat first if its window has already
+    // elapsed) and report, rather than falling into the rest of this
+    // function's live-session contract.
+    let record = match addressed {
+        Addressed::Live(record) => record,
+        Addressed::Parked(seat) => {
+            let body = resolve_nudge_message(args, stdin)?;
+            if body.is_empty() {
+                return Err(
+                    "zirv ctx nudge: no message given; pass --message, --message-file, or pipe one on stdin"
+                        .into(),
+                );
+            }
+            let super::seat::Phase::Parked { until, reason, .. } = seat.phase.clone() else {
+                unreachable!("resolve_prefix_or_parked only returns Phase::Parked seats");
+            };
+            let now = super::state::now_secs();
+            if until <= now {
+                // Issue #721: see the matching comment in
+                // `mail::run_send_with` -- `on_resume`'s returned handover
+                // request is deliberately discarded, since acting on it
+                // would spawn a successor process from this short-lived
+                // `nudge` invocation.
+                let _ = super::rollover::on_resume(&state, &cfg, "nudge", &seat.short, now, false);
+            } else {
+                writeln!(
+                    w,
+                    "zirv ctx nudge: session {} is parked until {} ({}); mail queued",
+                    seat.short, until, reason
+                )?;
+            }
+            let from_session = super::mail::identity_or_unknown(env, super::adapters::SESSION_ENV);
+            let msg = super::mail::Message {
+                from_session: from_session.clone(),
+                from_agent: super::mail::identity_or_unknown(env, super::adapters::AGENT_ENV),
+                to: seat.agent.clone(),
+                to_session: Some(seat.short.clone()),
+                sent: now,
+                body,
+            };
+            // Issue #721: the seat's own repo cannot be recovered -- `Seat`
+            // carries no repo slug -- so this reuses the sender's own repo,
+            // same as `mail::run_send_with`'s matching fallback.
+            let own_slug = super::state::repo_slug(repo);
+            super::mail::store_to(&state, &own_slug, &own_slug, &msg, &cfg)?;
+            write_nudge_marker(&state, &seat.short, &short_id(&from_session));
+            writeln!(
+                w,
+                "zirv ctx nudge: queued for {} ({}) in {}",
+                seat.short, seat.agent, own_slug
+            )?;
+            return Ok(0);
+        }
+    };
 
     // NEW-3: a supervisor with no turn-signal socket claims no wake-up
     // markers, so it cannot act on a nudge *or* advise about one -- the
@@ -3396,6 +3490,91 @@ mod tests {
             other => panic!("expected NotFound, got {other:?}"),
         }
         assert!(err.to_string().contains(&record.short));
+    }
+
+    /// Issue #721: a "ghost park" -- a parked seat whose owning session
+    /// record `rollover::forget` already removed -- is recognized by
+    /// `resolve_prefix_or_parked` instead of falling through as a bare
+    /// `NotFound`.
+    #[test]
+    fn resolve_prefix_or_parked_recognizes_a_ghost_parked_seat() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let now = super::super::state::now_secs();
+        crate::commands::ctx::seat::register(
+            &state,
+            "ghost123",
+            "ghost-session",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        crate::commands::ctx::seat::park(&state, "ghost123", now + 3600, "5h", "rate limited", now)
+            .expect("park");
+
+        let addressed = resolve_prefix_or_parked(&state, "ghost").expect("recognized as parked");
+        match addressed {
+            Addressed::Parked(seat) => assert_eq!(seat.short, "ghost123"),
+            Addressed::Live(record) => panic!("expected Parked, got Live({record:?})"),
+        }
+    }
+
+    /// A parked seat whose session is still live must resolve exactly as
+    /// `resolve_prefix` alone already does -- `resolve_prefix_or_parked`
+    /// only reinterprets a `NotFound`, never a live match.
+    #[test]
+    fn resolve_prefix_or_parked_is_unchanged_for_a_live_parked_seat() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let now = super::super::state::now_secs();
+        let record = record_for("eeeeeeee-2222-4333-8444-555555555555", &repo, Verb::Wrap);
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+        crate::commands::ctx::seat::register(
+            &state,
+            &short,
+            "eeeeeeee-2222-4333-8444-555555555555",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        crate::commands::ctx::seat::park(&state, &short, now + 3600, "5h", "rate limited", now)
+            .expect("park");
+
+        let addressed =
+            resolve_prefix_or_parked(&state, &short[..4]).expect("live record still resolves");
+        match addressed {
+            Addressed::Live(resolved) => assert_eq!(resolved.short, short),
+            Addressed::Parked(seat) => panic!("expected Live, got Parked({seat:?})"),
+        }
+    }
+
+    /// A prefix matching neither a live record nor a parked seat still gets
+    /// today's exact `NotFound`, unchanged.
+    #[test]
+    fn resolve_prefix_or_parked_is_unchanged_for_a_truly_unknown_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let record = record_for("ffffffff-2222-4333-8444-555555555555", &repo, Verb::Chat);
+        write_record(&state, &record);
+
+        let err = resolve_prefix_or_parked(&state, "zzzz").expect_err("nothing starts with zzzz");
+        match &err {
+            ResolveError::NotFound { existing } => {
+                assert_eq!(existing, &vec![record.short.clone()]);
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]

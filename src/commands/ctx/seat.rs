@@ -727,6 +727,27 @@ pub fn park(
     Ok(seat)
 }
 
+/// Every parked seat (`Phase::Parked`) whose short id starts with `prefix` --
+/// mirrors `sessions::resolve_prefix`'s own prefix contract, but over the
+/// seat registry rather than the live session registry, so a "ghost park" (a
+/// parked seat whose owning session record `rollover::forget` already
+/// removed) can be recognized by `send`/`nudge` addressing (issue #721).
+pub fn find_parked_by_prefix(state: &StateDir, prefix: &str) -> Vec<Seat> {
+    let Ok(entries) = std::fs::read_dir(state.sessions()) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let short = name.to_str()?.strip_suffix(".seat.json")?.to_string();
+            short.starts_with(prefix).then_some(short)
+        })
+        .filter_map(|short| load(state, &short))
+        .filter(|seat| matches!(seat.phase, Phase::Parked { .. }))
+        .collect()
+}
+
 /// Returns a parked seat to [`Phase::Idle`]. A no-op success (not an error)
 /// when the seat is not currently parked, matching this module's general
 /// "a caller re-asserting an already-true state is not a failure" shape.

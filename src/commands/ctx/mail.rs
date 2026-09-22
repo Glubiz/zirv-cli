@@ -2146,24 +2146,87 @@ pub fn run_send_with<W: Write>(
             .as_ref()
             .or(inferred_reply_target.as_ref())
             .expect("addressing was validated");
-        let record = sessions::resolve_prefix(&state, prefix).map_err(|e| {
-            format!(
-                "zirv ctx send: {}",
-                sessions::resolve_error_with_diagnostics(&e, &state, env)
-            )
-        })?;
-        let msg = Message {
-            from_session: from.session.clone(),
-            from_agent: from.harness.clone(),
-            to: to_agent.clone(),
-            to_session: Some(record.short.clone()),
-            sent: created_at,
-            body,
-        };
-        let path = store_to(&state, &record.repo_slug, &own_slug, &msg, &cfg)?;
-        stored_bytes = stored_body_bytes(&path);
-        targets.push(target_for(&state, &record, &path));
-        notify.push(record);
+        match sessions::resolve_prefix_or_parked(&state, prefix) {
+            Ok(sessions::Addressed::Live(record)) => {
+                let msg = Message {
+                    from_session: from.session.clone(),
+                    from_agent: from.harness.clone(),
+                    to: to_agent.clone(),
+                    to_session: Some(record.short.clone()),
+                    sent: created_at,
+                    body,
+                };
+                let path = store_to(&state, &record.repo_slug, &own_slug, &msg, &cfg)?;
+                stored_bytes = stored_body_bytes(&path);
+                targets.push(target_for(&state, &record, &path));
+                notify.push(*record);
+            }
+            Ok(sessions::Addressed::Parked(seat)) => {
+                let super::seat::Phase::Parked { until, reason, .. } = seat.phase.clone() else {
+                    unreachable!("resolve_prefix_or_parked only returns Phase::Parked seats");
+                };
+                if until <= created_at {
+                    // Issue #721: the seat's own window has elapsed with
+                    // nobody left to poll it (its wrap/dash process is
+                    // gone) -- call the exact resume path a live poll tick
+                    // would, before delivering. Its returned handover
+                    // request (naming a DIFFERENT harness as the best fit)
+                    // is deliberately discarded: acting on it means
+                    // spawning a successor process, which this short-lived
+                    // `send` invocation must never do -- that is wrap's/
+                    // dash's own supervision loop, not this one. An
+                    // abandoned `Prepared` transaction left behind is
+                    // exactly what `rollover::on_startup`'s crash recovery
+                    // already exists to unwind the next time a supervisor
+                    // registers for this seat.
+                    let _ = super::rollover::on_resume(
+                        &state,
+                        &cfg,
+                        "send",
+                        &seat.short,
+                        created_at,
+                        false,
+                    );
+                } else {
+                    writeln!(
+                        w,
+                        "zirv ctx send: session {} is parked until {} ({}); mail queued",
+                        seat.short, until, reason
+                    )?;
+                }
+                let msg = Message {
+                    from_session: from.session.clone(),
+                    from_agent: from.harness.clone(),
+                    to: to_agent.clone(),
+                    to_session: Some(seat.short.clone()),
+                    sent: created_at,
+                    body,
+                };
+                // Issue #721: a ghost-parked seat's own repo cannot be
+                // recovered -- `Seat` carries no repo slug, since nothing
+                // outlives `rollover::forget`'s removal of the session
+                // record but the seat file itself -- so this reuses the
+                // sender's own repo, the same fallback the undirected
+                // `--claim-once` arm above already makes.
+                let path = store_to(&state, &own_slug, &own_slug, &msg, &cfg)?;
+                stored_bytes = stored_body_bytes(&path);
+                targets.push(DeliveryTarget {
+                    session: Some(seat.short.clone()),
+                    harness: Some(seat.agent.clone()),
+                    role: Some(seat.role.clone()),
+                    repo_slug: own_slug.clone(),
+                    mail_path: mail_relative_path(&state, &path),
+                });
+                sessions::notify_mail(&state, &seat.short, &from.session);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "zirv ctx send: {}",
+                    sessions::resolve_error_with_diagnostics(&e, &state, env)
+                )
+                .into());
+            }
+        }
     }
 
     let selector = if args.all {
@@ -3450,6 +3513,247 @@ This is part of the body too.\n";
         assert_eq!(listed[0].1.from_agent, "claude");
         assert_eq!(listed[0].1.to, "any");
         assert_eq!(listed[0].1.body, "heads up: the webhook route moved");
+    }
+
+    /// Issue #721: mail addressed to a "ghost park" -- a parked seat whose
+    /// owning session record `rollover::forget` already removed -- once its
+    /// window has elapsed, must trigger `rollover::on_resume` (the seat's
+    /// `Phase::Parked` clears) before the message is stored, rather than
+    /// reporting a bare not-found.
+    #[test]
+    fn send_to_a_ghost_parked_seat_past_its_window_resumes_before_delivering() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = super::super::state::now_secs();
+        crate::commands::ctx::seat::register(
+            &state,
+            "duepark1",
+            "due-session",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        // Already elapsed: `until` is in the past.
+        crate::commands::ctx::seat::park(
+            &state,
+            "duepark1",
+            now.saturating_sub(60),
+            "5h",
+            "usage exhausted",
+            now,
+        )
+        .expect("park");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to_session: Some("duepark1".to_string()),
+            message: Some("still there?".to_string()),
+            ..SendArgs::default()
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+        assert_eq!(code, 0);
+
+        let seat = crate::commands::ctx::seat::load(&state, "duepark1").expect("seat exists");
+        assert!(
+            !matches!(seat.phase, crate::commands::ctx::seat::Phase::Parked { .. }),
+            "a due ghost park must be resumed before delivery, got {:?}",
+            seat.phase
+        );
+
+        let slug = repo_slug(tmp.path());
+        let listed = list(&state, &slug, None, None).expect("list");
+        assert_eq!(listed.len(), 1, "the mail is still delivered");
+        assert_eq!(listed[0].1.body, "still there?");
+    }
+
+    /// A ghost-parked seat whose window has NOT elapsed queues normally and
+    /// reports the park instead of resuming early -- `park_for_reset`'s own
+    /// rate-limit contract must not be short-circuited just because mail
+    /// arrived.
+    #[test]
+    fn send_to_a_ghost_parked_seat_before_its_window_queues_and_reports_parked_until() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = super::super::state::now_secs();
+        crate::commands::ctx::seat::register(
+            &state,
+            "notdue01",
+            "notdue-session",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        let until = now + 3600;
+        crate::commands::ctx::seat::park(&state, "notdue01", until, "5h", "usage exhausted", now)
+            .expect("park");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to_session: Some("notdue01".to_string()),
+            message: Some("checking in".to_string()),
+            ..SendArgs::default()
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+        assert_eq!(code, 0);
+
+        let seat = crate::commands::ctx::seat::load(&state, "notdue01").expect("seat exists");
+        assert!(
+            matches!(
+                seat.phase,
+                crate::commands::ctx::seat::Phase::Parked { until: u, .. } if u == until
+            ),
+            "must not resume before its window: {:?}",
+            seat.phase
+        );
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("is parked until") && printed.contains("usage exhausted"),
+            "must surface the park instead of a bare not-found: {printed}"
+        );
+
+        let slug = repo_slug(tmp.path());
+        let listed = list(&state, &slug, None, None).expect("list");
+        assert_eq!(listed.len(), 1, "mail is still queued");
+        assert_eq!(listed[0].1.body, "checking in");
+    }
+
+    /// A parked seat whose session is still LIVE (not a ghost park) must
+    /// deliver exactly as it did before issue #721 -- straight through the
+    /// live registry, never through the new ghost-park path.
+    #[test]
+    fn send_to_a_live_parked_seat_is_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let now = super::super::state::now_secs();
+        let record = sessions::Record::new(
+            "live1111-2222-4333-8444-555555555555",
+            "claude",
+            tmp.path(),
+            sessions::Verb::Wrap,
+        );
+        let short = record.short.clone();
+        let expected_slug = record.repo_slug.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+        crate::commands::ctx::seat::register(
+            &state,
+            &short,
+            "live1111-2222-4333-8444-555555555555",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            now,
+        )
+        .expect("register");
+        crate::commands::ctx::seat::park(&state, &short, now + 3600, "5h", "usage exhausted", now)
+            .expect("park");
+
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to_session: Some(short.clone()),
+            message: Some("hello".to_string()),
+            ..SendArgs::default()
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let code = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect("send");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.contains("is parked until"),
+            "a live parked seat must not be reported as a ghost park: {printed}"
+        );
+
+        let listed = list(&state, &expected_slug, None, None).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.body, "hello");
+    }
+
+    /// A truly unknown short id -- no live record, no seat file at all --
+    /// still gets today's exact not-found error, unaffected by issue #721.
+    #[test]
+    fn send_to_a_truly_unknown_short_id_is_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let args = SendArgs {
+            to_session: Some("zzzzzzzz".to_string()),
+            message: Some("hello".to_string()),
+            ..SendArgs::default()
+        };
+        let mut out = Vec::new();
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = run_send_with(
+            &args,
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            &mut stdin,
+        )
+        .expect_err("an unknown id refuses");
+        assert!(
+            err.to_string().contains("no sessions are registered"),
+            "today's plain not-found error must be unchanged: {err}"
+        );
     }
 
     /// Builds a realistic multi-KB worker report: prose, then two markdown
