@@ -2096,7 +2096,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
             2,
         );
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 11);
         let result = request(
             json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
                 "name":"workflow_status", "arguments":{}
@@ -2215,7 +2215,7 @@ mod tests {
         );
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["ok"], true);
-        assert_eq!(report["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(report["tools"].as_array().unwrap().len(), 11);
         assert_eq!(
             report["repository"],
             f.scope.repo.to_string_lossy().as_ref()
