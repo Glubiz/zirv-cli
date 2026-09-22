@@ -19830,7 +19830,8 @@ mod tests {
 
         let adapter = ClaudeAdapter::new(None);
         let pinned_mode_of = |mode| -> Option<String> {
-            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            let args =
+                adapter.default_sandbox_args(&Default::default(), &Default::default(), &[], mode);
             let position = args.iter().position(|a| a == "--permission-mode")?;
             Some(args[position + 1].clone())
         };

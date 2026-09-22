@@ -7382,6 +7382,7 @@ mod tests {
         let mut expected = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Headless,
         );
         expected.extend(flags.iter().cloned());
@@ -7395,6 +7396,7 @@ mod tests {
         let mut expected_joined = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Headless,
         );
         expected_joined.extend(joined.iter().cloned());
@@ -7536,6 +7538,7 @@ mod tests {
         expected.extend(adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Headless,
         ));
         assert_eq!(worker_launch_flags(&cfg, "claude", &adapter, &[]), expected);
@@ -7586,6 +7589,7 @@ mod tests {
         expected_claude.extend(claude.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Headless,
         ));
         assert_eq!(
@@ -8005,6 +8009,7 @@ mod tests {
         expected_claude.extend(claude.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Headless,
         ));
         expected_claude.push("--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string());

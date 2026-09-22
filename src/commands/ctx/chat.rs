@@ -2894,6 +2894,7 @@ mod tests {
         expected.extend(adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Interactive,
         ));
         expected.extend(adapter.session_pin_args("11111111-2222-4333-8444-555555555555"));

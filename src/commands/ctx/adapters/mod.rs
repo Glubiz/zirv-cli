@@ -2194,13 +2194,24 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// identical_to_the_pre_safety_shipped_default` in `claude.rs`. Codex
     /// has no per-command mechanism to receive either parameter and ignores
     /// both.
+    ///
+    /// `network_allowlist` (issue #727 round 2): the resolved `[policy]
+    /// network_allowlist` (`EffectivePolicy::network_allowlist`), passed so
+    /// an adapter that can honestly scope network access by destination may
+    /// do so in the REAL launch argv, not only in `network_allowlist_
+    /// support`'s report. Empty (today's shipped default, and every caller
+    /// that has no policy in scope) must leave this method's argv byte-
+    /// identical to before this parameter existed -- claude's own
+    /// implementation only branches on it when non-empty. Codex has no
+    /// per-destination mechanism and ignores it, same as `sandbox`/`safety`.
     fn default_sandbox_args(
         &self,
         sandbox: &super::config::SandboxConfig,
         safety: &super::safety::SafetyPolicy,
+        network_allowlist: &[super::policy::NetworkTarget],
         mode: LaunchMode,
     ) -> Vec<String> {
-        let _ = (sandbox, safety, mode);
+        let _ = (sandbox, safety, network_allowlist, mode);
         Vec::new()
     }
 
@@ -4154,7 +4165,12 @@ pub fn policy_launch_args_for_surface(
     // Neither CLI option accepts a second occurrence from the baseline.
     let policy_supplies_sandbox = adapter.name() == "codex" && flags_pin_policy(&policy);
     let mut out = if cfg.sandbox.enabled && !policy_supplies_sandbox {
-        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety, approval_mode)
+        adapter.default_sandbox_args(
+            &cfg.sandbox,
+            &cfg.safety,
+            &cfg.policy.network_allowlist,
+            approval_mode,
+        )
     } else {
         Vec::new()
     };
@@ -5400,6 +5416,7 @@ mod tests {
                 let sandbox_args = adapter.default_sandbox_args(
                     &resolved_cfg.sandbox,
                     &resolved_cfg.safety,
+                    &[],
                     LaunchMode::Headless,
                 );
                 if !sandbox_args.is_empty() {

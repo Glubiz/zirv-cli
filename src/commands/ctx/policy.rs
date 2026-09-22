@@ -1700,10 +1700,14 @@ mod tests {
 
     /// Claude's honest answer once an operator actually configures a
     /// non-empty allowlist: the mechanism must name its own actual permission
-    /// rule syntax, the CONFIGURED HOST ITSELF (review round, issue #727 --
-    /// the doc comment promises "one rule per target", so a static string
-    /// that never varies with the input would be a lie), and the gap it
-    /// leaves (Bash is unscoped); it must never claim `Enforced`.
+    /// rule syntax and the gap it leaves (Bash is unscoped); it must never
+    /// claim `Enforced`. Round 2 (issue #727): the mechanism string is now a
+    /// generic, static description of the mechanism -- the actual configured
+    /// host is no longer duplicated into it (round 1's `Box::leak`'d,
+    /// per-call string); the real per-host rules live in the launch argv
+    /// `ClaudeAdapter::default_sandbox_args` builds, exercised by
+    /// `default_sandbox_args_replaces_the_wholesale_webfetch_websearch_
+    /// allow_with_per_host_rules` in `adapters/claude.rs`.
     #[test]
     fn claude_reports_a_configured_allowlist_as_degraded_and_names_the_bash_gap() {
         let claude = ClaudeAdapter::new(None);
@@ -1720,65 +1724,13 @@ mod tests {
         assert_eq!(descriptor.support, Support::Degraded);
         assert_ne!(descriptor.support, Support::Enforced);
         assert!(
-            descriptor
-                .mechanism
-                .contains("WebFetch(domain:api.example.com)"),
-            "must name claude's own permission-rule syntax for the configured host: {}",
+            descriptor.mechanism.contains("WebFetch(domain:<host>)"),
+            "must name claude's own permission-rule syntax: {}",
             descriptor.mechanism
         );
         assert!(
             descriptor.mechanism.contains("Bash"),
             "must name the Bash-scoping gap: {}",
-            descriptor.mechanism
-        );
-    }
-
-    /// Review round (issue #727): two configured hosts render as two
-    /// deterministic, sorted rules -- not the input order, and not a repeat
-    /// when two entries differ only in scheme/port (claude's own rule syntax
-    /// has no port granularity, so they collapse to one rule for the host).
-    #[test]
-    fn claude_sorts_and_deduplicates_hosts_in_the_allowlist_mechanism() {
-        let claude = ClaudeAdapter::new(None);
-        let allowlist = vec![
-            NetworkTarget {
-                scheme: "https".to_string(),
-                host: "z.example.com".to_string(),
-                port: None,
-            },
-            NetworkTarget {
-                scheme: "http".to_string(),
-                host: "a.example.com".to_string(),
-                port: Some(8080),
-            },
-            NetworkTarget {
-                scheme: "https".to_string(),
-                host: "a.example.com".to_string(),
-                port: None,
-            },
-        ];
-        let descriptor = claude.network_allowlist_support(
-            &allowlist,
-            Stance::Allow,
-            adapters::LaunchMode::Headless,
-        );
-        let a_index = descriptor
-            .mechanism
-            .find("WebFetch(domain:a.example.com)")
-            .expect("a.example.com rule present");
-        let z_index = descriptor
-            .mechanism
-            .find("WebFetch(domain:z.example.com)")
-            .expect("z.example.com rule present");
-        assert!(
-            a_index < z_index,
-            "hosts must be sorted, not declaration order: {}",
-            descriptor.mechanism
-        );
-        assert_eq!(
-            descriptor.mechanism.matches("a.example.com").count(),
-            1,
-            "duplicate host (differing only by scheme/port) must render once: {}",
             descriptor.mechanism
         );
     }
@@ -1811,7 +1763,7 @@ mod tests {
         assert!(
             network_outcome
                 .mechanism
-                .contains("WebFetch(domain:api.example.com)")
+                .contains("WebFetch(domain:<host>)")
         );
     }
 

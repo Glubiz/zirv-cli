@@ -11355,6 +11355,7 @@ mod tests {
                 .default_sandbox_args(
                     &Default::default(),
                     &Default::default(),
+                    &[],
                     super::super::adapters::LaunchMode::Headless,
                 )
                 .iter()
@@ -11866,6 +11867,7 @@ mod tests {
         let args = claude.default_sandbox_args(
             &cfg.sandbox,
             &Default::default(),
+            &[],
             super::super::adapters::LaunchMode::Headless,
         );
         let allow_arg = args

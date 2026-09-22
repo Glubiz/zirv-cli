@@ -2553,70 +2553,43 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
-    /// Issue #727: the one honest thing claude can do with a non-empty
-    /// `network_allowlist` -- `WebFetch(domain:<host>)`/`WebSearch(domain:
-    /// <host>)` are claude's own documented `--allowedTools` rule syntax
-    /// (code.claude.com/docs/en/permissions, "Tool-specific permission
-    /// rules"), so one such rule per configured target replaces the
-    /// wholesale `WebFetch`/`WebSearch` entries `SHIPPED_POSTURE_ALLOW`
-    /// carries today. `Degraded`, never `Enforced`: the rule scopes exactly
-    /// the two brokered tools it names, and nothing about it touches `Bash`
-    /// -- `curl`, `wget`, a raw socket, or any other network-capable program
-    /// a shell command runs reaches the network completely unscoped by this
-    /// mechanism, which is why the mechanism string says so explicitly
-    /// rather than leaving an operator to assume host-scoping is total.
+    /// Issue #727 round 2: `default_sandbox_args` above now actually EMITS
+    /// one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule
+    /// per `network_allowlist` entry -- claude's own documented
+    /// `--allowedTools` rule syntax (code.claude.com/docs/en/permissions,
+    /// "Tool-specific permission rules") -- in place of the wholesale
+    /// `WebFetch`/`WebSearch` entries `SHIPPED_POSTURE_ALLOW` carries by
+    /// default. This method is the report of that real mechanism, not a
+    /// separate claim: `Degraded`, never `Enforced`, because the rule scopes
+    /// exactly the two brokered tools it names and nothing about it touches
+    /// `Bash` -- `curl`, `wget`, a raw socket, or any other network-capable
+    /// program a shell command runs reaches the network completely unscoped
+    /// by this mechanism, which is why the mechanism string says so
+    /// explicitly rather than leaving an operator to assume host-scoping is
+    /// total.
+    ///
+    /// The mechanism string is a generic, static description of the
+    /// mechanism -- not the configured hosts themselves (round 1 built one
+    /// with `Box::leak` per call; the actual per-host rules an operator
+    /// should read live in the launch argv `default_sandbox_args` builds,
+    /// which is the single source of truth this description now points at
+    /// instead of duplicating).
     ///
     /// `policy::evaluate` only reaches this method for a non-empty allowlist
     /// at a non-`Deny` `Network` stance (see its own doc comment); this
     /// implementation does not re-check either condition.
-    ///
-    /// **v1 (issue #727) is report-only**: this changes what `zirv ctx
-    /// status`/`policy` renders, not the argv `default_sandbox_args` actually
-    /// emits -- `SHIPPED_POSTURE_ALLOW`'s wholesale `WebFetch`/`WebSearch`
-    /// entries are unchanged, so an empty allowlist (today's only shipped
-    /// state) is byte-identical to before this method existed. Wiring the
-    /// per-host rules into the real launch argv is follow-up work.
     fn network_allowlist_support(
         &self,
-        allowlist: &[crate::commands::ctx::policy::NetworkTarget],
+        _allowlist: &[crate::commands::ctx::policy::NetworkTarget],
         _stance: crate::commands::ctx::policy::Stance,
         _mode: super::LaunchMode,
     ) -> crate::commands::ctx::policy::CapabilityDescriptor {
-        // Review round (issue #727): the doc comment above promises "one rule
-        // per target", so the mechanism string must actually name them --
-        // sorted and deduplicated by host so the same report is produced
-        // regardless of the allowlist's own declaration order, and so two
-        // targets differing only in scheme/port (claude's own rule syntax
-        // has no port granularity) render as one rule, not a repeat.
-        let mut hosts: Vec<&str> = allowlist
-            .iter()
-            .map(|target| target.host.as_str())
-            .collect();
-        hosts.sort_unstable();
-        hosts.dedup();
-        let rules = hosts
-            .iter()
-            .map(|host| format!("WebFetch(domain:{host})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // `CapabilityDescriptor::mechanism` is `&'static str` (every other
-        // adapter answer is a literal); this is the one answer built from the
-        // operator's own configured data, so it is deliberately leaked --
-        // bounded by the size of the operator's own allowlist, and this
-        // method is reached only at report/spawn time (`policy::evaluate`),
-        // never in a per-tick loop.
-        let mechanism: &'static str = Box::leak(
-            format!(
-                "one WebFetch(domain:<host>)/WebSearch(domain:<host>) allow rule per \
-                 network_allowlist entry (claude's own documented --allowedTools rule syntax): \
-                 {rules}; replacing the wholesale WebFetch/WebSearch allow; this scopes those \
-                 two brokered tools only -- Bash network calls (curl, wget, a raw socket, or any \
-                 other network-capable program a shell command runs) are not scoped by this \
-                 mechanism at all"
-            )
-            .into_boxed_str(),
-        );
-        crate::commands::ctx::policy::CapabilityDescriptor::degraded(mechanism)
+        crate::commands::ctx::policy::CapabilityDescriptor::degraded(
+            "one WebFetch(domain:<host>)/WebSearch(domain:<host>) allow rule per \
+             network_allowlist entry replaces the wholesale WebFetch/WebSearch allow in \
+             --allowedTools; scopes those two brokered tools only -- Bash network calls (curl, \
+             wget, raw sockets) are not scoped by this mechanism",
+        )
     }
 
     /// The one stance this adapter has a verified per-run mechanism for
@@ -2761,10 +2734,20 @@ impl AgentAdapter for ClaudeAdapter {
     /// built-in Read tool and scrub cloud credentials from child environments.
     /// Native Windows receives the hook/read/env layer but no unsupported
     /// sandbox key.
+    ///
+    /// `network_allowlist` (issue #727 round 2): when non-empty, this method
+    /// itself removes `WebFetch`/`WebSearch` from the pre-approved surface
+    /// above and replaces them with one `WebFetch(domain:<host>)`/
+    /// `WebSearch(domain:<host>)` rule per configured target -- see the
+    /// implementation below and `network_allowlist_support`'s own doc
+    /// comment for the mechanism and its `Bash`-scoping gap. This is no
+    /// longer report-only: an empty list (today's shipped default) leaves
+    /// this argv byte-identical to before the parameter existed.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
         safety: &crate::commands::ctx::safety::SafetyPolicy,
+        network_allowlist: &[crate::commands::ctx::policy::NetworkTarget],
         mode: super::LaunchMode,
     ) -> Vec<String> {
         // Issue #504: computed once, up front, so the SAME bounded worktree
@@ -2784,6 +2767,34 @@ impl AgentAdapter for ClaudeAdapter {
             .filter(|(rule, _)| !rule.starts_with("Bash("))
             .map(|(rule, _)| rule.to_string())
             .collect();
+
+        // Issue #727 round 2: a configured `[policy] network_allowlist`
+        // replaces the wholesale `WebFetch`/`WebSearch` allow above with one
+        // host-scoped `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)`
+        // rule per configured target (claude's own documented
+        // `--allowedTools` rule syntax) -- see `network_allowlist_support`'s
+        // own doc comment for why this is `Degraded`, never `Enforced`, and
+        // for the `Bash`-scoping gap it leaves. Hosts are sorted and
+        // deduplicated so the argv is deterministic regardless of the
+        // allowlist's own declaration order, and so two targets differing
+        // only in scheme/port (this rule syntax has no port granularity)
+        // still produce one rule per host, not a repeat. Empty (today's
+        // shipped default, and every caller with no `[policy]` in scope)
+        // takes neither branch, so the wholesale entries stay exactly as
+        // they were before this parameter existed.
+        if !network_allowlist.is_empty() {
+            allow_entries.retain(|rule| rule != "WebFetch" && rule != "WebSearch");
+            let mut hosts: Vec<&str> = network_allowlist
+                .iter()
+                .map(|target| target.host.as_str())
+                .collect();
+            hosts.sort_unstable();
+            hosts.dedup();
+            for host in hosts {
+                allow_entries.push(format!("WebFetch(domain:{host})"));
+                allow_entries.push(format!("WebSearch(domain:{host})"));
+            }
+        }
 
         // Issue #504: native subagents delegate into worktrees the launch
         // cwd's own `Edit(./**)`/`Read(./**)` scope above does not reach --
@@ -4325,6 +4336,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         assert_eq!(
@@ -5067,7 +5079,8 @@ mod tests {
             super::super::LaunchMode::Interactive,
             super::super::LaunchMode::Headless,
         ] {
-            let args = adapter.default_sandbox_args(&Default::default(), &Default::default(), mode);
+            let args =
+                adapter.default_sandbox_args(&Default::default(), &Default::default(), &[], mode);
             let index = args
                 .iter()
                 .position(|arg| arg == "--settings")
@@ -5215,6 +5228,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         assert!(!args.iter().any(|arg| arg == "--settings"));
@@ -5243,6 +5257,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         assert!(
@@ -5276,6 +5291,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         let deny_arg = args
@@ -5303,6 +5319,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         assert_eq!(
@@ -5346,6 +5363,7 @@ mod tests {
         let interactive = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         assert_eq!(
@@ -5356,6 +5374,7 @@ mod tests {
         let headless = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         assert_eq!(
@@ -5374,6 +5393,7 @@ mod tests {
         let plain = ClaudeAdapter::new(None).default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         let bypassed = ClaudeAdapter::new(None)
@@ -5381,6 +5401,7 @@ mod tests {
             .default_sandbox_args(
                 &Default::default(),
                 &Default::default(),
+                &[],
                 super::super::LaunchMode::Interactive,
             );
         // `plain` carries no `--permission-mode` flag at all now (issue
@@ -5421,6 +5442,7 @@ mod tests {
         let interactive = ClaudeAdapter::new(None).default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Interactive,
         );
         let allow_arg = interactive
@@ -5439,6 +5461,7 @@ mod tests {
         let headless = ClaudeAdapter::new(None).default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         let headless_allow = headless
@@ -5488,6 +5511,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         assert_eq!(args.len(), 6, "got {args:?}");
@@ -5536,6 +5560,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         let allow_arg = args
@@ -5582,6 +5607,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
 
@@ -5637,6 +5663,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &sandbox,
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         let allow_arg = args
@@ -5674,6 +5701,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         let allow_arg = args
@@ -5699,6 +5727,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         let allow_arg = args
@@ -5726,6 +5755,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         let deny_arg = args
@@ -5742,6 +5772,7 @@ mod tests {
         let args = adapter.default_sandbox_args(
             &Default::default(),
             &Default::default(),
+            &[],
             super::super::LaunchMode::Headless,
         );
         assert!(
@@ -5750,6 +5781,139 @@ mod tests {
                 .any(|a| a.contains("dangerously-skip-permissions")
                     || a.contains("bypassPermissions")),
             "must never widen: {args:?}"
+        );
+    }
+
+    /// Issue #727 round 2: an EMPTY `network_allowlist` -- today's shipped
+    /// default, and every caller with no `[policy]` in scope -- must leave
+    /// this argv byte-identical to before the parameter existed: the
+    /// wholesale `WebFetch`/`WebSearch` entries stay, and no `domain:` rule
+    /// appears anywhere.
+    #[test]
+    fn an_empty_network_allowlist_leaves_the_wholesale_webfetch_websearch_allow_untouched() {
+        let adapter = ClaudeAdapter::new(None);
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            &[],
+            super::super::LaunchMode::Headless,
+        );
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        let entries: Vec<&str> = allow_arg
+            .trim_start_matches("--allowedTools=")
+            .split(',')
+            .collect();
+        assert!(
+            entries.contains(&"WebFetch"),
+            "the wholesale entry must survive an empty allowlist: {allow_arg}"
+        );
+        assert!(
+            entries.contains(&"WebSearch"),
+            "the wholesale entry must survive an empty allowlist: {allow_arg}"
+        );
+        assert!(
+            !allow_arg.contains("domain:"),
+            "an empty allowlist must never introduce a host-scoped rule: {allow_arg}"
+        );
+    }
+
+    /// The actual fix (issue #727 round 2): a non-empty `network_allowlist`
+    /// replaces the wholesale `WebFetch`/`WebSearch` allow entries with one
+    /// host-scoped rule per entry for EACH tool -- checked entry-by-entry
+    /// (split on `,`), never as a substring match against the whole argv,
+    /// so a bare `WebFetch`/`WebSearch` left behind by mistake cannot hide
+    /// inside a `WebFetch(domain:...)` substring match.
+    #[test]
+    fn default_sandbox_args_replaces_the_wholesale_webfetch_websearch_allow_with_per_host_rules() {
+        let adapter = ClaudeAdapter::new(None);
+        let allowlist = vec![crate::commands::ctx::policy::NetworkTarget {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            port: None,
+        }];
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            &allowlist,
+            super::super::LaunchMode::Headless,
+        );
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        let entries: Vec<&str> = allow_arg
+            .trim_start_matches("--allowedTools=")
+            .split(',')
+            .collect();
+        assert!(
+            entries.contains(&"WebFetch(domain:example.com)"),
+            "got {allow_arg}"
+        );
+        assert!(
+            entries.contains(&"WebSearch(domain:example.com)"),
+            "got {allow_arg}"
+        );
+        assert!(
+            !entries.contains(&"WebFetch"),
+            "the wholesale entry must be gone once a host is configured: {allow_arg}"
+        );
+        assert!(
+            !entries.contains(&"WebSearch"),
+            "the wholesale entry must be gone once a host is configured: {allow_arg}"
+        );
+    }
+
+    /// Review round (issue #727): two configured hosts render as two
+    /// deterministic, sorted rules -- not the input order, and not a repeat
+    /// when two entries differ only in scheme/port (claude's own rule syntax
+    /// has no port granularity, so they collapse to one rule for the host).
+    #[test]
+    fn default_sandbox_args_sorts_and_deduplicates_hosts_in_the_allowlist_argv() {
+        let adapter = ClaudeAdapter::new(None);
+        let allowlist = vec![
+            crate::commands::ctx::policy::NetworkTarget {
+                scheme: "https".to_string(),
+                host: "z.example.com".to_string(),
+                port: None,
+            },
+            crate::commands::ctx::policy::NetworkTarget {
+                scheme: "http".to_string(),
+                host: "a.example.com".to_string(),
+                port: Some(8080),
+            },
+            crate::commands::ctx::policy::NetworkTarget {
+                scheme: "https".to_string(),
+                host: "a.example.com".to_string(),
+                port: None,
+            },
+        ];
+        let args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            &allowlist,
+            super::super::LaunchMode::Headless,
+        );
+        let allow_arg = args
+            .iter()
+            .find(|a| a.starts_with("--allowedTools="))
+            .expect("an --allowedTools= token");
+        let a_index = allow_arg
+            .find("WebFetch(domain:a.example.com)")
+            .expect("a.example.com rule present");
+        let z_index = allow_arg
+            .find("WebFetch(domain:z.example.com)")
+            .expect("z.example.com rule present");
+        assert!(
+            a_index < z_index,
+            "hosts must be sorted, not declaration order: {allow_arg}"
+        );
+        assert_eq!(
+            allow_arg.matches("a.example.com").count(),
+            2,
+            "one WebFetch and one WebSearch rule for the deduplicated host, no more: {allow_arg}"
         );
     }
 
