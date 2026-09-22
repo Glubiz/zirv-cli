@@ -1,0 +1,7 @@
+I'd like to set a monthly budget per category and get warned when I've gone over it.
+
+Please add:
+- A new `ledgerlite/budget.py` module with a `Budget` type (a category name and a limit amount) and a function `overspend(txns, budgets)` that returns how much over budget each category is, for categories that are actually over their limit (spending is the sum of that category's negative amounts, expressed as a positive number).
+- A `budget` command on the CLI:
+  - `python -m ledgerlite budget --set <category>=<limit>` saves a budget for that category (persist it alongside the ledger data in the same store file, under a "budgets" key).
+  - `python -m ledgerlite budget --report` prints one line per category that is currently over its budget, in the form `<category>: over by <amount>`.

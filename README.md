@@ -27,6 +27,7 @@
 - [Features](#features)
   - [Script runner](#script-runner)
   - [Harness supervision (`zirv ctx`)](#harness-supervision-zirv-ctx)
+  - [What wrapping costs (measured)](#what-wrapping-costs-measured)
   - [Development workflow commands](#development-workflow-commands)
   - [Verification](#verification)
   - [Housekeeping](#housekeeping)
@@ -997,6 +998,35 @@ to the section that documents it in depth.
   inspects, reveals, audits and clears the per-repository placeholder vault
   that keeps credentials and personal data out of model and remote traffic.
   See [What leaves this device](#what-leaves-this-device).
+
+### What wrapping costs (measured)
+
+Wrapping a session is not free, and on short tasks it buys nothing this
+benchmark can see. 156 headless runs of the same twelve tasks (bug fixes,
+features, a refactor, docs, code questions; hidden unittest graders and a
+blind judge) in a fresh copy of the same repository, vanilla `claude -p`
+versus `zirv ctx exec` at the same model, 2026-09-22, Claude Code 2.1.278,
+zirv 4.20.0. Change is zirv relative to vanilla; the 95% intervals are paired
+bootstraps over task×rep.
+
+| Metric | Sonnet, 36 runs each | Haiku, 24 runs each | Better |
+|---|---|---|---|
+| Speed (mean wall-clock per task) | 55.3 s → 76.9 s, **+39%** [+17%, +62%] | 72.0 s → 95.7 s, **+33%** [+19%, +49%] | lower |
+| Token cost (mean list price per task) | $0.236 → $0.332, **+41%** [+24%, +59%] | $0.127 → $0.159, **+25%** [+9%, +43%] | lower |
+| Intelligence (mean score, 0–1) | 0.986 → 1.000, **+1.4%** [0%, +3.5%] | 0.959 → 0.990, **+3.2%** [−1.6%, +8.8%] | higher |
+
+The overhead has two roughly equal halves: about 11k extra tokens of system
+prefix on every model turn (engineering standard, meta-harness rules, skill
+index, registered skills and MCP schemas), and about 13 s of non-API time
+per run (supervision, prompt compilation, a hook process per tool call). The
+correctness column is at ceiling for Sonnet and within noise for Haiku.
+Adding Jev intake routing (`zirv-proxy`: 36 more Sonnet runs) cut the tokens
+overhead to +14% by sending trivial tasks to Haiku, but sent two feature
+tasks to Opus and ended at **+47%** cost and **+24%** wall. What zirv is
+built for -- rot over long sessions, restart with handoff, cross-harness
+rollover -- never engages in a run that ends in four minutes and is not yet
+measured. Protocol, per-task tables, the harness and the raw per-run CSVs:
+[docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
 
 ### Development workflow commands
 

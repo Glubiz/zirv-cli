@@ -1,0 +1,1 @@
+The `summary` command in the CLI recomputes per-category totals and percent shares by hand, but `ledgerlite/report.py` already has `category_totals()` and `summarize()` that do the same thing. Please remove the duplication in `cli.py` so it delegates to the existing `report` functions instead, without changing the command's output.

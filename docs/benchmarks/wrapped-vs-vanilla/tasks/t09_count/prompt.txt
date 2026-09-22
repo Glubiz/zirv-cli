@@ -1,0 +1,1 @@
+How many rows in examples/sample.csv get categorised as `groceries` by the default rules? Answer with just the number.

@@ -1,0 +1,11 @@
+I need to get transactions out of ledgerlite so I can hand them to my accountant, and right now there's no way to do that.
+
+Please add an `export` command to the CLI: `python -m ledgerlite export --format csv|json [--since YYYY-MM-DD] [--until YYYY-MM-DD] --store <path>`.
+
+What I need it to do:
+- `--since` and `--until` are both optional and inclusive on both ends -- a transaction dated exactly on `--since` or exactly on `--until` should be included.
+- Rows should come out sorted oldest to newest by date; if two transactions land on the same date, break the tie by their id, ascending.
+- `--format csv` should write proper CSV (use the stdlib `csv` module so commas/quotes/newlines inside a memo are quoted correctly, not corrupted) with this exact header: `id,date,amount,payee,memo,category`. Amount should look like `-12.00` (i.e. just `str()` of the Decimal). If a transaction has no category, leave that CSV field blank.
+- `--format json` should print a JSON array of objects with those same six keys, pretty-printed with 2-space indent, and it must not escape non-ASCII characters (accented names etc. should appear as themselves, not `\uXXXX`). Amounts must be JSON strings (e.g. `"-12.00"`), not numbers, so nothing gets rounded. Unlike the CSV, when a transaction has no category, its JSON `category` should be `null`, not an empty string.
+- If nothing matches the filter, csv format should print just the header row and json format should print `[]`.
+- If someone passes a `--since` that's after `--until`, don't print anything to stdout -- print an error to stderr and exit with status 2.
