@@ -24,6 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::CtxResult;
 use super::state::{StateDir, create_private_dir_all, now_secs, open_private_append};
@@ -351,6 +352,14 @@ pub struct WorktreeRecord {
     pub status: WorktreeStatus,
     #[serde(default)]
     pub note: Option<String>,
+    /// Issue #718: `Some(digest)` (see [`setup_digest`]) marks this tree as
+    /// eligible for the warm-worktree pool -- set only when its owning
+    /// `zirv ctx agent --worktree --worktree-reuse` call opted in.
+    /// `#[serde(default)]` so a record written before this issue (or by any
+    /// non-opted-in `--worktree` call) still parses as `None`, unpoolable --
+    /// exactly today's behavior.
+    #[serde(default)]
+    pub setup_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +368,12 @@ pub enum WorktreeStatus {
     Active,
     InspectionFailed,
     Removed,
+    /// Issue #718: reclaimed back to the warm pool instead of `git worktree
+    /// remove`d -- the directory (and any warm build cache inside it, e.g.
+    /// `target/`) stays on disk, eligible for [`super::agent::
+    /// allocate_worktree`]'s reuse search until it is claimed again or
+    /// [`gc`] retires it past its TTL.
+    Idle,
 }
 
 impl std::fmt::Display for WorktreeStatus {
@@ -367,8 +382,61 @@ impl std::fmt::Display for WorktreeStatus {
             Self::Active => "active",
             Self::InspectionFailed => "inspection-failed",
             Self::Removed => "removed",
+            Self::Idle => "idle",
         })
     }
+}
+
+/// Issue #718: sha256 of `base_commit` plus an optional setup-command list
+/// rendered as one string -- `setup` is empty today (no `[[workspace]].setup`
+/// yet, see #716), so this degrades to a hash of `base_commit` alone until
+/// that lands and starts feeding a real, non-empty setup list through this
+/// same parameter without changing its shape. Pure: identical inputs give an
+/// identical digest on every platform and every run, the same purity
+/// contract this module's own `decide` holds to. A NUL separator between the
+/// two inputs keeps `("ab", "c")` and `("a", "bc")` from colliding.
+pub fn setup_digest(base_commit: &str, setup: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(base_commit.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(setup.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Issue #718: how many `Idle` records this repo currently has -- the pool
+/// occupancy [`super::agent::reclaim_worktree`] checks against `[worktree]
+/// idle_pool_max` before idling one more, so a pool already at its cap falls
+/// back to a normal proof-required removal instead of growing past it.
+pub fn idle_count(state: &StateDir, repo_slug: &str) -> usize {
+    read_records(state, repo_slug)
+        .into_iter()
+        .filter(|r| r.status == WorktreeStatus::Idle)
+        .count()
+}
+
+/// Issue #718: an `Idle` record for this repo whose `setup_digest` matches
+/// `digest` AND whose tree still passes the exact same [`decide`] proof
+/// [`prune_one`] itself requires before removing anything -- never skipped
+/// for reuse. `Remove` and `ArchiveThenRemove` both certify nothing tracked
+/// or committed would be lost; either is safe to hand back out, since reuse
+/// only ever runs `git reset --hard` on it, which never touches untracked or
+/// ignored content in the first place (untracked files, including a warm
+/// `target/`, persist across reuse by design). A `Keep` refusal (unpushed
+/// commits, tracked dirt, a cherry-unmatched commit, or a probe that could
+/// not even run) excludes the record exactly as it would exclude a prune.
+pub fn find_reusable(state: &StateDir, repo_slug: &str, digest: &str) -> Option<WorktreeRecord> {
+    read_records(state, repo_slug).into_iter().find(|r| {
+        r.status == WorktreeStatus::Idle
+            && r.setup_digest.as_deref() == Some(digest)
+            && matches!(
+                decide(&probe(Path::new(&r.path), &r.base_commit)),
+                PruneDecision::Remove | PruneDecision::ArchiveThenRemove(_)
+            )
+    })
 }
 
 fn record_path(state: &StateDir, repo_slug: &str) -> PathBuf {
@@ -570,21 +638,30 @@ pub fn prune_one(
 /// A tree whose directory is already gone from disk (removed by some other
 /// means) is simply marked `removed` without running any probe -- there is
 /// nothing left to inspect.
+///
+/// Issue #718: an `Idle` record is a GC candidate once it has sat in the pool
+/// at least `idle_ttl_secs` (`[worktree] idle_ttl_secs`), in place of
+/// `Active`'s own dead-owner test -- an idle tree has no live owner to check
+/// liveness against in the first place. Either way the SAME proof-required
+/// [`prune_one`] runs before anything is actually removed: TTL expiry only
+/// decides which records this loop even considers, never widens what
+/// `prune_one` itself would allow.
 pub fn gc(
     state: &StateDir,
     repo: &Path,
     is_alive: &dyn Fn(u32) -> bool,
+    idle_ttl_secs: u64,
 ) -> Vec<(WorktreeRecord, PruneOutcome)> {
     let repo_slug = super::state::repo_slug(repo);
+    let now = now_secs();
     let mut outcomes = Vec::new();
     for record in read_records(state, &repo_slug) {
-        if record.status != WorktreeStatus::Active {
-            continue;
-        }
-        let Some(pid) = record.owner_pid else {
-            continue;
+        let is_candidate = match record.status {
+            WorktreeStatus::Active => record.owner_pid.is_some_and(|pid| !is_alive(pid)),
+            WorktreeStatus::Idle => now.saturating_sub(record.created_at) >= idle_ttl_secs,
+            WorktreeStatus::InspectionFailed | WorktreeStatus::Removed => false,
         };
-        if is_alive(pid) {
+        if !is_candidate {
             continue;
         }
         let path = PathBuf::from(&record.path);
@@ -614,16 +691,24 @@ pub fn gc(
 /// returns is not a promise of removal (the proof-required probe still runs,
 /// live, if `gc` is later actually called), only that `gc` would not skip it
 /// outright.
+///
+/// Issue #718: mirrors `gc`'s own `Idle`-past-TTL branch too, using the
+/// identical `idle_ttl_secs`/`now` comparison -- see `gc`'s own doc comment.
 pub(crate) fn gc_candidates(
     state: &StateDir,
     repo: &Path,
     is_alive: &dyn Fn(u32) -> bool,
+    idle_ttl_secs: u64,
 ) -> Vec<WorktreeRecord> {
     let repo_slug = super::state::repo_slug(repo);
+    let now = now_secs();
     read_records(state, &repo_slug)
         .into_iter()
-        .filter(|record| record.status == WorktreeStatus::Active)
-        .filter(|record| record.owner_pid.is_some_and(|pid| !is_alive(pid)))
+        .filter(|record| match record.status {
+            WorktreeStatus::Active => record.owner_pid.is_some_and(|pid| !is_alive(pid)),
+            WorktreeStatus::Idle => now.saturating_sub(record.created_at) >= idle_ttl_secs,
+            WorktreeStatus::InspectionFailed | WorktreeStatus::Removed => false,
+        })
         .collect()
 }
 
@@ -1324,6 +1409,7 @@ mod tests {
             created_at: 1_700_000_000,
             status,
             note: None,
+            setup_digest: None,
         }
     }
 
@@ -1383,6 +1469,32 @@ mod tests {
 
         let records = read_records(&state, "repo-slug");
         assert_eq!(records.len(), 1, "the corrupt line must be skipped");
+    }
+
+    /// Issue #718 acceptance criterion: a record written before `setup_digest`
+    /// existed (no such key in its JSON at all) still parses, `#[serde(default)]`
+    /// giving it `None` -- unpoolable, exactly today's behavior for every
+    /// pre-#718 `--worktree` allocation.
+    #[test]
+    fn a_pre_718_record_with_no_setup_digest_key_still_parses_as_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let path = tmp.path().join("wt-a");
+        {
+            create_private_dir_all(&state.worktrees()).expect("mkdir");
+            let mut file =
+                open_private_append(&record_path(&state, "repo-slug")).expect("open for append");
+            writeln!(
+                file,
+                r#"{{"path":{:?},"branch":"abcd1234","base_commit":"deadbeef","created_at":1700000000,"status":"active"}}"#,
+                path.to_string_lossy()
+            )
+            .expect("write pre-#718 record");
+        }
+
+        let records = read_records(&state, "repo-slug");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].setup_digest, None);
     }
 
     #[test]
@@ -1459,6 +1571,7 @@ mod tests {
                 created_at: 1_700_000_000,
                 status: WorktreeStatus::Active,
                 note: None,
+                setup_digest: None,
             },
         )
         .expect("append record");
@@ -1614,7 +1727,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, Some(4242));
 
-        let outcomes = gc(&state, &repo, &|pid| pid == 4242);
+        let outcomes = gc(&state, &repo, &|pid| pid == 4242, 3600);
         assert!(outcomes.is_empty());
         assert!(
             worktree.exists(),
@@ -1632,7 +1745,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, Some(4242));
 
-        let outcomes = gc(&state, &repo, &|_pid| false);
+        let outcomes = gc(&state, &repo, &|_pid| false, 3600);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].1, PruneOutcome::Removed);
         assert!(!worktree.exists());
@@ -1648,7 +1761,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
 
-        let outcomes = gc(&state, &repo, &|_pid| false);
+        let outcomes = gc(&state, &repo, &|_pid| false, 3600);
         assert!(
             outcomes.is_empty(),
             "an unrecorded owner must never be assumed dead"
@@ -1671,17 +1784,230 @@ mod tests {
         let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, Some(4242));
 
         assert!(
-            gc_candidates(&state, &repo, &|pid| pid == 4242).is_empty(),
+            gc_candidates(&state, &repo, &|pid| pid == 4242, 3600).is_empty(),
             "a live owner is never a candidate"
         );
         assert!(worktree.exists());
 
-        let candidates = gc_candidates(&state, &repo, &|_pid| false);
+        let candidates = gc_candidates(&state, &repo, &|_pid| false, 3600);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, worktree.to_string_lossy());
         assert!(
             worktree.exists(),
             "gc_candidates must never remove anything itself"
+        );
+    }
+
+    // -- issue #718: warm-worktree pool (digest, idle_count, find_reusable,
+    // gc/gc_candidates on Idle) ---------------------------------------------
+
+    #[test]
+    fn setup_digest_is_pure_and_sensitive_to_both_inputs() {
+        assert_eq!(setup_digest("abc123", ""), setup_digest("abc123", ""));
+        assert_ne!(
+            setup_digest("abc123", ""),
+            setup_digest("abc123", "npm install")
+        );
+        assert_ne!(setup_digest("abc123", ""), setup_digest("def456", ""));
+    }
+
+    #[test]
+    fn idle_count_counts_only_idle_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let a = tmp.path().join("wt-a");
+        let b = tmp.path().join("wt-b");
+        append_record(
+            &state,
+            "repo-slug",
+            &sample_record(&a, WorktreeStatus::Active),
+        )
+        .expect("append active");
+        append_record(
+            &state,
+            "repo-slug",
+            &sample_record(&b, WorktreeStatus::Idle),
+        )
+        .expect("append idle");
+        assert_eq!(idle_count(&state, "repo-slug"), 1);
+    }
+
+    /// Issue #718 acceptance criterion: a mismatched digest never matches,
+    /// and neither does a record that is `Idle` but carries no digest at all
+    /// (an ordinary, non-`--worktree-reuse` idle-able tree, if one ever
+    /// existed) -- reuse is opt-in per record, not inferred from status alone.
+    #[test]
+    fn find_reusable_matches_only_an_idle_record_with_a_matching_digest_and_clean_proof() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        let digest = setup_digest(&base, "");
+
+        // Still `Active`: no match, regardless of digest.
+        assert!(find_reusable(&state, &repo_slug, &digest).is_none());
+
+        update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+        // `Idle` now, but the record carries no `setup_digest` yet: still no match.
+        assert!(find_reusable(&state, &repo_slug, &digest).is_none());
+
+        let mut record = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        record.setup_digest = Some(digest.clone());
+        append_record(&state, &repo_slug, &record).expect("append with a matching digest");
+
+        let found = find_reusable(&state, &repo_slug, &digest).expect("must find the idle match");
+        assert_eq!(found.path, worktree.to_string_lossy());
+
+        assert!(
+            find_reusable(&state, &repo_slug, "deadbeef").is_none(),
+            "a differing digest must never match"
+        );
+    }
+
+    /// The safety test this issue's ruling requires: an `Idle` tree with
+    /// uncommitted (tracked) changes is never offered for reuse, and
+    /// `find_reusable` never touches it while deciding -- the dirty content
+    /// is read back byte-for-byte unchanged.
+    #[test]
+    fn find_reusable_excludes_an_idle_tree_with_tracked_dirt_and_never_touches_it() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        let digest = setup_digest(&base, "");
+        let mut record = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        record.status = WorktreeStatus::Idle;
+        record.setup_digest = Some(digest.clone());
+        append_record(&state, &repo_slug, &record).expect("append idle with digest");
+
+        std::fs::write(worktree.join("README.md"), "changed, not committed\n").expect("write");
+
+        assert!(
+            find_reusable(&state, &repo_slug, &digest).is_none(),
+            "a dirty idle tree must never be offered for reuse"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("README.md")).expect("read"),
+            "changed, not committed\n",
+            "find_reusable must never reset or otherwise touch a dirty tree"
+        );
+    }
+
+    /// Issue #718: `gc` applies the identical proof-required removal to an
+    /// `Idle` record once it is past `idle_ttl_secs`, exactly as it already
+    /// does for a dead-owner `Active` record.
+    #[test]
+    fn gc_removes_an_expired_idle_tree_via_the_same_proof_required_prune() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        // `repo_with_recorded_worktree`'s own fixed `created_at` (1_700_000_000)
+        // is already far enough in the past to be expired against any
+        // realistic TTL once compared with the real wall clock `gc` reads.
+        update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+
+        let outcomes = gc(&state, &repo, &|_pid| false, 60);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, PruneOutcome::Removed);
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn gc_never_touches_an_idle_tree_still_within_its_ttl() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        let mut record = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        record.status = WorktreeStatus::Idle;
+        record.created_at = now_secs();
+        append_record(&state, &repo_slug, &record).expect("append idle, freshly timestamped");
+
+        let outcomes = gc(&state, &repo, &|_pid| false, 3600);
+        assert!(
+            outcomes.is_empty(),
+            "a not-yet-expired idle tree must be left alone"
+        );
+        assert!(worktree.exists());
+    }
+
+    /// TTL expiry only decides which records `gc` even LOOKS at -- it never
+    /// widens what `prune_one`'s own proof would allow, so an expired but
+    /// dirty `Idle` tree still survives, exactly as a dead-owner `Active` one
+    /// would.
+    #[test]
+    fn gc_keeps_an_expired_idle_tree_that_fails_prune_ones_own_proof() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+        std::fs::write(worktree.join("README.md"), "changed, not committed\n").expect("write");
+
+        let outcomes = gc(&state, &repo, &|_pid| false, 60);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            PruneOutcome::Kept(reason) => assert_eq!(reason.probe, "dirty"),
+            other => panic!("expected Kept(dirty), got {other:?}"),
+        }
+        assert!(
+            worktree.exists(),
+            "a dirty expired idle tree must still survive"
+        );
+    }
+
+    #[test]
+    fn gc_candidates_reports_an_expired_idle_record_without_touching_anything() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, _base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        // `repo_with_recorded_worktree`'s own fixed `created_at`
+        // (1_700_000_000) is already far in the past, so this is expired
+        // against any realistic TTL once compared with the real wall clock.
+        update_status(&state, &repo_slug, &worktree, WorktreeStatus::Idle, None).expect("idle");
+
+        let candidates = gc_candidates(&state, &repo, &|_pid| false, 60);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, worktree.to_string_lossy());
+        assert!(
+            worktree.exists(),
+            "gc_candidates must never remove anything itself"
+        );
+
+        // A freshly-timestamped `Idle` record, by contrast, is not yet
+        // expired against a generous TTL.
+        let mut fresh = latest_for_path(&state, &repo_slug, &worktree).expect("record");
+        fresh.created_at = now_secs();
+        append_record(&state, &repo_slug, &fresh).expect("append fresh idle");
+        assert!(
+            gc_candidates(&state, &repo, &|_pid| false, 3600 * 24).is_empty(),
+            "a not-yet-expired idle record is not a candidate"
         );
     }
 
@@ -1918,6 +2244,7 @@ mod tests {
                 created_at: 1_700_000_001,
                 status: WorktreeStatus::Active,
                 note: None,
+                setup_digest: None,
             },
         )
         .expect("append record for wt-b");

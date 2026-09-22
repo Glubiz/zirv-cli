@@ -45,6 +45,10 @@ model = "fable"
 # max_depth = 255                   # narrow-only (a repo layer may only LOWER this): operator ceiling on any envelope's delegation_depth. Default: 255 (no extra cap beyond default_depth).
 # deny_network = false              # narrow-only (a repo layer may only turn this ON): denies network tools for every envelope computed in this repo. Default: false.
 
+# [worktree]                        # the warm-worktree pool `zirv ctx agent --worktree --worktree-reuse` draws from (issue #718); both keys below are narrow-only (a repo layer may only shrink the pool or shorten the TTL)
+# idle_pool_max = 4                 # how many `Idle` trees this repo may keep on disk at once. Default: 4.
+# idle_ttl_secs = 3600              # how long an `Idle` tree may sit unclaimed before startup GC/`zirv ctx reconcile` retire it. Default: 3600 (1 hour).
+
 # [objective]                        # completion-judge policy for an objective-driven `zirv ctx loop` run (issue #314); every key below is narrow-only
 # gates = ["zirv test changed", "zirv verify"]  # narrow-only (a repo layer may only DROP entries, never add or reorder one): deterministic gates run, in order, before the judge every cycle.
 # max_cycles_without_progress = 5   # narrow-only (a repo layer may only LOWER this): consecutive no-progress cycles before the loop gives up.

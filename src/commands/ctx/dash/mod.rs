@@ -3470,7 +3470,17 @@ fn reclaim_pane_worktree(
     if !owns_cwd || !super::agent::is_agent_managed_worktree(repo, cwd) {
         return None;
     }
-    Some(super::agent::reclaim_worktree(state, repo, cwd))
+    // Issue #718: a dashboard-hosted pane has no `cfg` in scope here, so its
+    // own worktree reclaim uses the built-in `[worktree] idle_pool_max`
+    // default rather than a repo/operator override -- the headless
+    // `zirv ctx agent --worktree --worktree-reuse` path (`agent::run_with`)
+    // is this issue's actual scope and honors the configured cap.
+    Some(super::agent::reclaim_worktree(
+        state,
+        repo,
+        cwd,
+        super::config::WorktreeConfig::default().idle_pool_max,
+    ))
 }
 
 /// One stderr-bound line describing [`reclaim_pane_worktree`]'s own outcome
@@ -3500,6 +3510,11 @@ fn describe_pane_worktree_reclaim(
         ),
         super::agent::ReclaimOutcome::Failed(reason) => format!(
             "pane '{pane_short}' worktree {} left in place ({reason})",
+            path.display()
+        ),
+        super::agent::ReclaimOutcome::Idled => format!(
+            "pane '{pane_short}' worktree {} idled; kept warm for the next `--worktree-reuse` \
+             allocation with a matching base commit",
             path.display()
         ),
     }
@@ -11297,7 +11312,7 @@ fn run_dashboard_inner(
     // trees this repo's own dead sessions left behind. Best-effort and never
     // fatal to the dashboard itself -- the same never-make-it-worse posture
     // the owner-pid write just below already holds to.
-    let _ = super::worktree::gc(state, repo, &sessions::is_alive);
+    let _ = super::worktree::gc(state, repo, &sessions::is_alive, cfg.worktree.idle_ttl_secs);
 
     // Mutable, and kept current by the `Event::Resize` arm below (F6): the
     // zoom handler resizes every pane against `full`, so a `full` frozen at
@@ -22000,6 +22015,7 @@ mod tests {
                 created_at: 1_700_000_000,
                 status: crate::commands::ctx::worktree::WorktreeStatus::Active,
                 note: None,
+                setup_digest: None,
             },
         )
         .ok()?;

@@ -169,6 +169,16 @@ pub struct AgentArgs {
     /// checkout (or explicit `--workdir`) is the workspace root.
     #[arg(long)]
     pub workspace: Option<String>,
+    /// Issue #718: opt-in warm-worktree reuse for `--worktree` -- before
+    /// minting a fresh `git worktree add`, `allocate_worktree` looks for an
+    /// `Idle` pooled tree whose recorded base commit (hashed with
+    /// `worktree::setup_digest`) matches this call's, reusing it via `git
+    /// reset --hard` instead. Off by default: silently handing a worker a
+    /// previously-used tree is a bigger behavior change than a bounded
+    /// finding should force on every `--worktree` caller. Meaningless, and
+    /// never consulted, without `--worktree`.
+    #[arg(long, default_value_t = false)]
+    pub worktree_reuse: bool,
     /// Attach the repo's accepted workflow artifact for this stage to the
     /// worker's task prompt: resolves `--workflow` (or the repo's own
     /// active workflow when unstated), reads its accepted intent/spec/plan
@@ -334,6 +344,7 @@ impl Default for AgentArgs {
             mode: WorkerMode::Writing,
             worktree: false,
             workspace: None,
+            worktree_reuse: false,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -835,12 +846,8 @@ fn allocate_worktree(
     state: &StateDir,
     repo: &Path,
     owner_session: Option<&str>,
+    reuse: bool,
 ) -> CtxResult<PathBuf> {
-    let root = repo.join(crate::utils::SCRIPT_DIR_NAME).join("worktrees");
-    std::fs::create_dir_all(&root)
-        .map_err(|e| format!("--worktree: could not create {}: {e}", root.display()))?;
-    let short = super::sessions::short_id(&SessionId::new_v4().to_string());
-    let path = root.join(&short);
     let base_commit = std::process::Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -862,6 +869,65 @@ fn allocate_worktree(
     let base_commit = String::from_utf8_lossy(&base_commit.stdout)
         .trim()
         .to_string();
+    let repo_slug = super::state::repo_slug(repo);
+    // Issue #718: `--worktree-reuse` tries the warm pool first -- a `git
+    // reset --hard` on an `Idle` tree `worktree::find_reusable` already
+    // re-proved clean, never a fresh `git worktree add` -- before ever
+    // falling through to the cold path below. `setup` is empty until #716
+    // lands (see `worktree::setup_digest`'s own doc comment); a digest
+    // mismatch (no matching `Idle` record) or a reset/`validate_workdir`
+    // failure falls straight through to cold allocation, never forced.
+    let digest = reuse.then(|| worktree::setup_digest(&base_commit, ""));
+    if let Some(digest) = &digest
+        && let Some(reusable) = worktree::find_reusable(state, &repo_slug, digest)
+    {
+        let path = PathBuf::from(&reusable.path);
+        let reset_ok = std::process::Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .arg("-C")
+            .arg(&path)
+            .arg("reset")
+            .arg("--hard")
+            .arg(&base_commit)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if reset_ok && let Ok(path) = validate_workdir(&path) {
+            let reused = worktree::WorktreeRecord {
+                path: path.to_string_lossy().to_string(),
+                branch: reusable.branch,
+                base_commit,
+                owner_session: owner_session.map(str::to_string),
+                owner_pid: Some(std::process::id()),
+                created_at: super::state::now_secs(),
+                status: worktree::WorktreeStatus::Active,
+                note: None,
+                setup_digest: Some(digest.clone()),
+            };
+            if let Err(e) = worktree::append_record(state, &repo_slug, &reused) {
+                eprintln!(
+                    "--worktree {}: could not record reuse ownership ({e}); a later reclaim \
+                     will require manual `zirv ctx worktree prune`",
+                    path.display()
+                );
+            }
+            return Ok(path);
+        }
+        eprintln!(
+            "--worktree {}: could not reuse the idle tree (reset or validation failed); \
+             allocating a fresh one instead",
+            path.display()
+        );
+    }
+
+    let root = repo.join(crate::utils::SCRIPT_DIR_NAME).join("worktrees");
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("--worktree: could not create {}: {e}", root.display()))?;
+    let short = super::sessions::short_id(&SessionId::new_v4().to_string());
+    let path = root.join(&short);
     let output = std::process::Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -886,7 +952,6 @@ fn allocate_worktree(
         .into());
     }
     let path = validate_workdir(&path)?;
-    let repo_slug = super::state::repo_slug(repo);
     let record = worktree::WorktreeRecord {
         path: path.to_string_lossy().to_string(),
         branch: short,
@@ -896,6 +961,7 @@ fn allocate_worktree(
         created_at: super::state::now_secs(),
         status: worktree::WorktreeStatus::Active,
         note: None,
+        setup_digest: digest,
     };
     if let Err(e) = worktree::append_record(state, &repo_slug, &record) {
         eprintln!(
@@ -939,6 +1005,12 @@ pub(crate) enum ReclaimOutcome {
     /// but the archive copy or `git worktree remove` itself failed. Left in
     /// place either way.
     Failed(String),
+    /// Issue #718: this tree's own allocation opted into `--worktree-reuse`
+    /// (its record carries a `setup_digest`), the pool had room, and the
+    /// same proof `Removed`/`Archived` require passed -- so it was marked
+    /// `Idle` and left on disk, warm build cache included, instead of being
+    /// `git worktree remove`d.
+    Idled,
 }
 
 /// Issue #319: routed entirely through `worktree::prune_one` -- the same
@@ -959,7 +1031,20 @@ pub(crate) enum ReclaimOutcome {
 /// `pub(crate)` (review finding, 2026-09): `dash::mod::reap_ended_panes`
 /// calls this directly for a dashboard-hosted `--worktree` pane -- see
 /// [`ReclaimOutcome`]'s own doc comment.
-pub(crate) fn reclaim_worktree(state: &StateDir, repo: &Path, path: &Path) -> ReclaimOutcome {
+///
+/// Issue #718: `idle_pool_max` is consulted ONLY when this tree's own record
+/// carries a `setup_digest` (it was allocated with `--worktree-reuse`) --
+/// every other tree keeps today's exact remove/archive/keep behavior,
+/// byte-for-byte. Even then, idling runs the identical `probe`/`decide`
+/// proof `prune_one` requires (never skipped), and only while
+/// `worktree::idle_count` is under the cap; a `Keep` refusal or a full pool
+/// falls straight through to the normal proof-required removal below.
+pub(crate) fn reclaim_worktree(
+    state: &StateDir,
+    repo: &Path,
+    path: &Path,
+    idle_pool_max: u32,
+) -> ReclaimOutcome {
     let repo_slug = super::state::repo_slug(repo);
     let Some(record) = worktree::latest_for_path(state, &repo_slug, path) else {
         return ReclaimOutcome::InspectionFailed {
@@ -969,6 +1054,24 @@ pub(crate) fn reclaim_worktree(state: &StateDir, repo: &Path, path: &Path) -> Re
                 .to_string(),
         };
     };
+    if record.setup_digest.is_some()
+        && worktree::idle_count(state, &repo_slug) < idle_pool_max as usize
+    {
+        let probes = worktree::probe(path, &record.base_commit);
+        if matches!(
+            worktree::decide(&probes),
+            worktree::PruneDecision::Remove | worktree::PruneDecision::ArchiveThenRemove(_)
+        ) {
+            let _ = worktree::update_status(
+                state,
+                &repo_slug,
+                path,
+                worktree::WorktreeStatus::Idle,
+                None,
+            );
+            return ReclaimOutcome::Idled;
+        }
+    }
     match worktree::prune_one(state, repo, &repo_slug, path, &record.base_commit) {
         worktree::PruneOutcome::Removed | worktree::PruneOutcome::RemovedWithSkipped(_) => {
             ReclaimOutcome::Removed
@@ -1006,13 +1109,21 @@ pub(crate) fn is_agent_managed_worktree(repo: &Path, cwd: &Path) -> bool {
 /// Reclaims `path` (an allocated `--worktree`) and reports the outcome as a
 /// single stderr line -- shared by `run_with`'s own explicit post-run call
 /// and [`WorktreeReclaimGuard`]'s `Drop`, so both report identically rather
-/// than drifting.
-fn reclaim_worktree_and_report(state: &StateDir, repo: &Path, path: &Path) {
+/// than drifting. `idle_pool_max` is forwarded to [`reclaim_worktree`]
+/// unchanged -- see its own doc comment.
+fn reclaim_worktree_and_report(state: &StateDir, repo: &Path, path: &Path, idle_pool_max: u32) {
     let short = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("?");
-    match reclaim_worktree(state, repo, path) {
+    match reclaim_worktree(state, repo, path, idle_pool_max) {
+        ReclaimOutcome::Idled => {
+            eprintln!(
+                "--worktree {}: idled; kept warm for the next `--worktree-reuse` allocation with a \
+                 matching base commit",
+                path.display()
+            );
+        }
         ReclaimOutcome::Removed => {
             eprintln!(
                 "--worktree {}: reclaimed; branch {short} keeps the worker's commits",
@@ -1061,11 +1172,17 @@ struct WorktreeReclaimGuard<'a> {
     state: &'a StateDir,
     repo: &'a Path,
     path: Option<PathBuf>,
+    idle_pool_max: u32,
 }
 
 impl<'a> WorktreeReclaimGuard<'a> {
-    fn new(state: &'a StateDir, repo: &'a Path, path: Option<PathBuf>) -> Self {
-        Self { state, repo, path }
+    fn new(state: &'a StateDir, repo: &'a Path, path: Option<PathBuf>, idle_pool_max: u32) -> Self {
+        Self {
+            state,
+            repo,
+            path,
+            idle_pool_max,
+        }
     }
 
     /// Ownership of the worktree has passed elsewhere -- `Drop` must not
@@ -1078,7 +1195,7 @@ impl<'a> WorktreeReclaimGuard<'a> {
 impl Drop for WorktreeReclaimGuard<'_> {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
-            reclaim_worktree_and_report(self.state, self.repo, &path);
+            reclaim_worktree_and_report(self.state, self.repo, &path, self.idle_pool_max);
         }
     }
 }
@@ -3894,12 +4011,34 @@ pub fn run_with<W: Write>(
     // Issue #319, design item 4: a conservative startup GC runs immediately
     // before allocating a new tree -- best-effort, never fatal to this
     // delegation, so a GC failure never blocks a worker from starting.
+    //
+    // Issue #718: `[worktree]`'s pool cap/TTL are resolved once here, ahead
+    // of `cfg`'s own later load below (timed instead against the
+    // dashboard-join fork) -- the same "extra read of the same layered
+    // config" `exec::run_with`'s own inline-path reload already normalizes
+    // in this module (see the comment on `cfg`'s load a few lines down). A
+    // load failure falls back to the built-in default rather than newly
+    // blocking the GC pass that already ran unconditionally before this
+    // issue existed.
+    let worktree_pool = if args.worktree {
+        CtxConfig::load(repo, env)
+            .map(|c| c.worktree)
+            .unwrap_or_default()
+    } else {
+        super::config::WorktreeConfig::default()
+    };
     let canonical_workdir = if args.worktree {
-        let _ = worktree::gc(&state, repo, &super::sessions::is_alive);
+        let _ = worktree::gc(
+            &state,
+            repo,
+            &super::sessions::is_alive,
+            worktree_pool.idle_ttl_secs,
+        );
         Some(allocate_worktree(
             &state,
             repo,
             env(adapters::SESSION_ENV).as_deref(),
+            args.worktree_reuse,
         )?)
     } else {
         args.workdir.as_deref().map(validate_workdir).transpose()?
@@ -3918,6 +4057,7 @@ pub fn run_with<W: Write>(
         } else {
             None
         },
+        worktree_pool.idle_pool_max,
     );
     let prompt = resolve_prompt(&args.prompt, &mut std::io::stdin())?;
     let prompt = match selected_workspace {
@@ -4040,7 +4180,7 @@ pub fn run_with<W: Write>(
         if args.worktree
             && let Some(path) = canonical_workdir.as_deref()
         {
-            reclaim_worktree_and_report(&state, repo, path);
+            reclaim_worktree_and_report(&state, repo, path, worktree_pool.idle_pool_max);
         }
         return code;
     }
@@ -5378,7 +5518,7 @@ pub fn run_with<W: Write>(
     if args.worktree
         && let Some(path) = canonical_workdir.as_deref()
     {
-        reclaim_worktree_and_report(&state, repo, path);
+        reclaim_worktree_and_report(&state, repo, path, worktree_pool.idle_pool_max);
     }
     worktree_guard.disarm();
 
@@ -7943,6 +8083,7 @@ mod tests {
             mode: WorkerMode::Writing,
             worktree: false,
             workspace: None,
+            worktree_reuse: false,
             attach_artifact: None,
             workflow: None,
             task_class: None,
@@ -8173,7 +8314,8 @@ mod tests {
         assert!(run(&["commit", "-q", "-m", "initial"]));
 
         let state = StateDir::from_root(tmp.path().join("state"));
-        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
+        let worktree =
+            allocate_worktree(&state, &repo, None, false).expect("allocate a fresh worktree");
 
         assert!(
             worktree.starts_with(
@@ -8228,9 +8370,237 @@ mod tests {
         assert!(run(&["commit", "-q", "-m", "initial"]));
 
         let state = StateDir::from_root(tmp.path().join("state"));
-        let first = allocate_worktree(&state, &repo, None).expect("first allocation");
-        let second = allocate_worktree(&state, &repo, None).expect("second allocation");
+        let first = allocate_worktree(&state, &repo, None, false).expect("first allocation");
+        let second = allocate_worktree(&state, &repo, None, false).expect("second allocation");
         assert_ne!(first, second, "each --worktree call must get its own tree");
+    }
+
+    /// Issue #718 acceptance criterion: a matching `Idle` record, reused via
+    /// `--worktree --worktree-reuse`, is reset in place -- no new directory
+    /// is created, and its warm build directory (a stand-in `target/`) is
+    /// still on disk afterward.
+    #[test]
+    fn allocate_worktree_reuse_reuses_an_idle_tree_with_a_matching_base_commit() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let first = allocate_worktree(&state, &repo, None, true).expect("first allocation");
+        // A stand-in warm build directory the pool is supposed to preserve.
+        std::fs::create_dir_all(first.join("target")).expect("mkdir target");
+        std::fs::write(first.join("target/warm"), "cached\n").expect("write warm cache");
+
+        assert_eq!(
+            reclaim_worktree(&state, &repo, &first, 4),
+            ReclaimOutcome::Idled,
+            "a reuse-eligible, clean tree must be idled, not removed"
+        );
+        assert!(first.is_dir(), "an idled tree must stay on disk");
+
+        let second = allocate_worktree(&state, &repo, None, true).expect("reuse allocation");
+        assert_eq!(
+            second, first,
+            "a matching idle tree must be reused in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.join("target/warm")).expect("read warm cache"),
+            "cached\n",
+            "the warm build directory must survive reuse"
+        );
+    }
+
+    /// A digest mismatch (a different base commit since the tree was idled)
+    /// must never force reuse -- the delegation falls back to a fresh cold
+    /// worktree instead.
+    #[test]
+    fn allocate_worktree_reuse_falls_back_to_cold_on_a_different_base_commit() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let first = allocate_worktree(&state, &repo, None, true).expect("first allocation");
+        assert_eq!(
+            reclaim_worktree(&state, &repo, &first, 4),
+            ReclaimOutcome::Idled
+        );
+
+        // The repo's HEAD moves on -- a fresh commit changes the base commit
+        // any later `--worktree-reuse` allocation would digest against.
+        std::fs::write(repo.join("README.md"), "hello again\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "second"]));
+
+        let second = allocate_worktree(&state, &repo, None, true).expect("cold fallback");
+        assert_ne!(
+            second, first,
+            "a digest mismatch must never force reuse of the stale tree"
+        );
+    }
+
+    /// The mandated safety test: an `Idle` tree with uncommitted (tracked)
+    /// changes is NEVER reused and NEVER reset -- the delegation falls back
+    /// to a cold worktree, and the dirty tree is left intact, byte-for-byte.
+    #[test]
+    fn allocate_worktree_reuse_never_reuses_or_resets_a_dirty_idle_tree() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let first = allocate_worktree(&state, &repo, None, true).expect("first allocation");
+        assert_eq!(
+            reclaim_worktree(&state, &repo, &first, 4),
+            ReclaimOutcome::Idled
+        );
+        // Dirty the idled tree with an uncommitted TRACKED change -- exactly
+        // the condition `worktree::decide` refuses a plain prune over too.
+        std::fs::write(first.join("README.md"), "dirtied while idle\n").expect("write");
+
+        let second = allocate_worktree(&state, &repo, None, true).expect("cold fallback");
+        assert_ne!(
+            second, first,
+            "a dirty idle tree must never be handed back out"
+        );
+        assert!(first.is_dir(), "the dirty idle tree must be left in place");
+        assert_eq!(
+            std::fs::read_to_string(first.join("README.md")).expect("read"),
+            "dirtied while idle\n",
+            "the dirty content must be untouched -- no `git reset --hard` ever ran against it"
+        );
+    }
+
+    /// Issue #718: `reclaim_worktree` never idles a tree its own record did
+    /// not opt into pooling (`setup_digest: None`, today's exact default) --
+    /// unchanged, byte-identical behavior for every plain `--worktree` call.
+    #[test]
+    fn reclaim_worktree_never_idles_a_tree_that_never_opted_into_reuse() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let worktree = allocate_worktree(&state, &repo, None, false).expect("plain allocation");
+        assert_eq!(
+            reclaim_worktree(&state, &repo, &worktree, 4),
+            ReclaimOutcome::Removed
+        );
+        assert!(!worktree.exists());
+    }
+
+    /// A full idle pool falls back to a normal proof-required removal
+    /// instead of growing past `idle_pool_max`.
+    #[test]
+    fn reclaim_worktree_falls_back_to_removal_when_the_idle_pool_is_full() {
+        if !git_available() {
+            eprintln!("skipping: git not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("session-base");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        assert!(git_init(&repo), "git init");
+        let run = |dir: &Path, args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(run(&repo, &["config", "user.email", "test@example.com"]));
+        assert!(run(&repo, &["config", "user.name", "test"]));
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        assert!(run(&repo, &["add", "README.md"]));
+        assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let first = allocate_worktree(&state, &repo, None, true).expect("first allocation");
+        // `idle_pool_max: 0` -- there is never room for even one idle entry.
+        assert_eq!(
+            reclaim_worktree(&state, &repo, &first, 0),
+            ReclaimOutcome::Removed,
+            "a zero-capacity pool must fall back to a normal removal"
+        );
+        assert!(!first.exists());
     }
 
     /// Review finding (2026-09), acceptance: a genuinely clean allocated
@@ -8263,14 +8633,15 @@ mod tests {
         assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
 
         let state = StateDir::from_root(tmp.path().join("state"));
-        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
+        let worktree =
+            allocate_worktree(&state, &repo, None, false).expect("allocate a fresh worktree");
         let short = worktree
             .file_name()
             .and_then(|n| n.to_str())
             .expect("short id")
             .to_string();
 
-        let outcome = reclaim_worktree(&state, &repo, &worktree);
+        let outcome = reclaim_worktree(&state, &repo, &worktree, 4);
         assert_eq!(outcome, ReclaimOutcome::Removed);
         assert!(
             !worktree.exists(),
@@ -8325,12 +8696,13 @@ mod tests {
         assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
 
         let state = StateDir::from_root(tmp.path().join("state"));
-        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
+        let worktree =
+            allocate_worktree(&state, &repo, None, false).expect("allocate a fresh worktree");
         std::fs::write(worktree.join("worker-output.txt"), "done\n").expect("write");
         assert!(run(&worktree, &["add", "worker-output.txt"]));
         assert!(run(&worktree, &["commit", "-q", "-m", "worker commit"]));
 
-        let outcome = reclaim_worktree(&state, &repo, &worktree);
+        let outcome = reclaim_worktree(&state, &repo, &worktree, 4);
         match outcome {
             ReclaimOutcome::InspectionFailed { probe, .. } => assert_eq!(probe, "ahead"),
             other => panic!("expected InspectionFailed(ahead), got {other:?}"),
@@ -8370,12 +8742,13 @@ mod tests {
         assert!(run(&repo, &["commit", "-q", "-m", "initial"]));
 
         let state = StateDir::from_root(tmp.path().join("state"));
-        let worktree = allocate_worktree(&state, &repo, None).expect("allocate a fresh worktree");
+        let worktree =
+            allocate_worktree(&state, &repo, None, false).expect("allocate a fresh worktree");
         // An untracked file is enough to make `git status --porcelain`
         // non-empty -- no commit needed.
         std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
 
-        let outcome = reclaim_worktree(&state, &repo, &worktree);
+        let outcome = reclaim_worktree(&state, &repo, &worktree, 4);
         match outcome {
             ReclaimOutcome::Archived(dest) => {
                 assert_eq!(
