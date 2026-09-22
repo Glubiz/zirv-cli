@@ -2328,7 +2328,7 @@ fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
 /// cannot suppress this audit trail merely by adding a `REPO_FORBIDDEN` key
 /// that makes `CtxConfig::load` hard-error. On a load failure this falls
 /// back to `CtxConfig::default()` (memory is enabled by default) and warns
-/// once, the same graceful-degrade shape `reviewer_argv`'s own
+/// once, the same graceful-degrade shape `reviewer_args`'s own
 /// `.unwrap_or_default()` uses for the review model -- only an
 /// operator-level `memory.enabled = false` (a repo layer cannot set that key
 /// at all) skips the write.
@@ -2664,34 +2664,10 @@ fn append_reviewer_findings(
     Ok(())
 }
 
-/// One delegated run's stdout line, read as "the dashboard took this request".
-///
-/// Only consulted when a dashboard spawn-request channel actually exists
-/// (`dash_active`): the relayed lines include the reviewer's own output, which
-/// quotes a repository diff, so a diff containing this very prefix would
-/// otherwise suppress evidence for a real completed review. Fail-closed either
-/// way, but there is no reason to read the marker where no dashboard could have
-/// written it.
-fn is_dashboard_ack(line: &str) -> bool {
-    line.trim_start()
-        .starts_with(crate::commands::ctx::agent::DASH_SPAWN_ACK_PREFIX)
-}
-
-// T8: `env` used to be a hard-coded `std::env::var` read -- the one process-
-// global lookup in this file with no injectable seam at all, unlike
-// `sessions::nested_session_evidence`'s own `EnvLookup`-based read of the
-// same variable. Nothing here manipulates the real `ZIRV_CTX_DASH_REQUESTS`
-// today, so it was not observed to leak between tests, but a hard-coded
-// real-env read is exactly the shape that does once something does -- the
-// call site below still passes the real environment, so production behavior
-// is unchanged.
-fn dash_channel_active(env: crate::commands::ctx::config::EnvLookup<'_>) -> bool {
-    env(crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV).is_some()
-}
-
-/// The argv a reviewer is launched with, after the program itself. On the
-/// harness runtime the adapter's read-only pin travels as trailing `-- flags`,
-/// which `zirv agent` passes through to the harness's own CLI.
+/// The private supervised request for one workflow reviewer. On the harness
+/// runtime, adapter model and read-only controls travel in `AgentArgs::flags`;
+/// native requests carry no vendor flags. `inline` has no CLI spelling and is
+/// set only here because this caller consumes the completed review evidence.
 ///
 /// Issue #484 (roadmap N15): under `RuntimeKind::Native` the same seat runs
 /// with no vendor CLI at all. `agent` is then read as the provider ROUTE, the
@@ -2700,14 +2676,15 @@ fn dash_channel_active(env: crate::commands::ctx::config::EnvLookup<'_>) -> bool
 /// process to pass them to; and `--mode read-only` is not advice but the
 /// mechanism -- `native_worker` takes no writer permit for a read-only worker,
 /// so the execution broker refuses every mutating effect at effect time.
-pub(crate) fn reviewer_argv(
+pub(crate) fn reviewer_args(
     runtime: RuntimeKind,
     agent: &str,
+    prompt: String,
     repo: &Path,
     include_custom_agents: bool,
     budget_tokens: Option<u64>,
     max_tool_calls: Option<u32>,
-) -> CtxResult<Vec<String>> {
+) -> CtxResult<crate::commands::ctx::agent::AgentArgs> {
     if agent.is_empty()
         || agent.len() > 64
         || !agent
@@ -2752,32 +2729,18 @@ pub(crate) fn reviewer_argv(
         seat.manifest.instructions.trim()
     );
     if native {
-        // No adapter lookup, no model argument, no read-only argv floor and no
-        // trailing passthrough: every one of those exists to steer a vendor
-        // CLI, and there is none here. The route is what `zirv agent --runtime
-        // native` reads the positional as, and the reserved value `native`
-        // defers to the operator's own `[roles]` entry.
-        let mut argv = vec![
-            "agent".to_string(),
-            agent.to_string(),
-            "-".to_string(),
-            "--runtime".to_string(),
-            RuntimeKind::Native.as_str().to_string(),
-            "--mode".to_string(),
-            "read-only".to_string(),
-            "--inline".to_string(),
-            "--system-prompt".to_string(),
-            system_prompt,
-        ];
-        if let Some(tokens) = budget_tokens {
-            argv.push("--budget-tokens".to_string());
-            argv.push(tokens.to_string());
-        }
-        if let Some(calls) = max_tool_calls {
-            argv.push("--max-tool-calls".to_string());
-            argv.push(calls.to_string());
-        }
-        return Ok(argv);
+        return Ok(crate::commands::ctx::agent::AgentArgs {
+            name: agent.to_string(),
+            prompt,
+            runtime: runtime.as_str().to_string(),
+            mode: crate::commands::ctx::permit::WorkerMode::ReadOnly,
+            inline: true,
+            system_prompt: Some(system_prompt),
+            budget_tokens,
+            max_tool_calls,
+            json: true,
+            ..Default::default()
+        });
     }
     let adapter = adapter.expect("the harness path always resolves an adapter");
 
@@ -2832,59 +2795,27 @@ pub(crate) fn reviewer_argv(
     // load-bearing half is the read-only floor; `--mode read-only` states
     // that as a request field instead, which `dash::worker_pane_extra_args`
     // re-applies server-side from this adapter's own read-only pin. A
-    // Issue #733: `--inline` below keeps this caller synchronous so it can
+    // Issue #733: the private `inline` field below keeps this caller
+    // synchronous so it can
     // validate and persist completed review evidence even when a dashboard
     // is live.
     //
     // R1-4: the seat instructions state that the same way -- `--system-
     // prompt`, a zirv flag, which travels on the request as data instead of
     // being dropped with the trailing flags.
-    let mut argv = vec![
-        "agent".to_string(),
-        agent.to_string(),
-        "-".to_string(),
-        "--mode".to_string(),
-        "read-only".to_string(),
-        "--inline".to_string(),
-        "--system-prompt".to_string(),
-        system_prompt,
-    ];
-    // Must land before `--`: these are `zirv agent`'s own flags, not the
-    // adapter's passthrough.
-    if let Some(tokens) = budget_tokens {
-        argv.push("--budget-tokens".to_string());
-        argv.push(tokens.to_string());
-    }
-    if let Some(calls) = max_tool_calls {
-        argv.push("--max-tool-calls".to_string());
-        argv.push(calls.to_string());
-    }
-    argv.push("--".to_string());
-    argv.extend(seat_args);
-    Ok(argv)
-}
-
-/// Relays the child's stdout to this process's stdout line by line, lossily:
-/// a reviewer that emits a non-UTF-8 byte used to end the relay early (a
-/// `lines()` error was read as end-of-stream), which dropped the read end,
-/// which handed the reviewer a SIGPIPE mid-review.
-fn relay_lines(mut stdout: impl Read, mut on_line: impl FnMut(&str)) {
-    let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
-    while let Ok(count) = stdout.read(&mut chunk) {
-        if count == 0 {
-            break;
-        }
-        pending.extend_from_slice(&chunk[..count]);
-        while let Some(at) = pending.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = pending.drain(..=at).collect();
-            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
-            on_line(text.trim_end_matches('\r'));
-        }
-    }
-    if !pending.is_empty() {
-        on_line(&String::from_utf8_lossy(&pending));
-    }
+    Ok(crate::commands::ctx::agent::AgentArgs {
+        name: agent.to_string(),
+        prompt,
+        runtime: runtime.as_str().to_string(),
+        mode: crate::commands::ctx::permit::WorkerMode::ReadOnly,
+        inline: true,
+        system_prompt: Some(system_prompt),
+        budget_tokens,
+        max_tool_calls,
+        flags: seat_args,
+        json: true,
+        ..Default::default()
+    })
 }
 
 /// Whether a delegated run counts as a completed independent review. A
@@ -3097,59 +3028,65 @@ fn reviewer_worker_budget(repo: &Path) -> (Option<u64>, Option<u32>) {
     }
 }
 
+pub(crate) fn reviewer_env(key: &str) -> Option<String> {
+    if key == "ZIRV_CTX_MEMORY_HARVEST" {
+        Some("false".to_string())
+    } else {
+        std::env::var(key).ok()
+    }
+}
+
+pub(crate) fn reviewer_report(receipt: &[u8], cap: usize) -> CtxResult<String> {
+    let receipt: serde_json::Value = serde_json::from_slice(receipt)?;
+    let path = receipt
+        .get("result_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("reviewer delegation produced no result path")?;
+    let record: crate::commands::ctx::agent::DelegationResultRecord =
+        serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let report = record
+        .report
+        .ok_or("reviewer delegation produced no report")?;
+    if record.report_truncated || report.len() > cap {
+        return Err(format!("reviewer output exceeds {cap} bytes").into());
+    }
+    Ok(report)
+}
+
 fn launch_reviewer(
     runtime: RuntimeKind,
     agent: &str,
     package: &ReviewPackage,
 ) -> CtxResult<ReviewerRun> {
     let (budget_tokens, max_tool_calls) = reviewer_worker_budget(&package.repo_root);
-    let argv = reviewer_argv(
+    let prompt = build_reviewer_prompt(package, budget_tokens, max_tool_calls)?;
+    let args = reviewer_args(
         runtime,
         agent,
+        prompt,
         &package.repo_root,
         package.include_custom_agents,
         budget_tokens,
         max_tool_calls,
     )?;
-    let prompt = build_reviewer_prompt(package, budget_tokens, max_tool_calls)?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .args(&argv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    let mut stdin = child.stdin.take();
-    let writer = std::thread::spawn(move || {
-        if let Some(stdin) = stdin.as_mut() {
-            let _ = stdin.write_all(prompt.as_bytes());
-        }
-        drop(stdin);
-    });
-    let dash_active = dash_channel_active(&|k| std::env::var(k).ok());
-    let mut dashboard_spawn = false;
     let mut output = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        relay_lines(stdout, |line| {
-            dashboard_spawn |= dash_active && is_dashboard_ack(line);
-            if output.len() < MAX_REVIEW_OUTPUT_BYTES.saturating_add(1) {
-                let remaining = MAX_REVIEW_OUTPUT_BYTES
-                    .saturating_add(1)
-                    .saturating_sub(output.len());
-                let bytes = line.as_bytes();
-                output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-                if output.len() < MAX_REVIEW_OUTPUT_BYTES.saturating_add(1) {
-                    output.push(b'\n');
-                }
-            }
-            println!("{line}");
-        });
-    }
-    let code = child.wait()?.code().unwrap_or(1);
-    let _ = writer.join();
+    let code = crate::commands::ctx::agent::run_with(
+        &args,
+        &mut output,
+        &package.repo_root,
+        &reviewer_env,
+    )?;
+    let reviewer_output = if code == 0 {
+        reviewer_report(&output, MAX_REVIEW_OUTPUT_BYTES)?
+    } else {
+        reviewer_report(&output, MAX_REVIEW_OUTPUT_BYTES)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&output).into_owned())
+    };
+    writeln!(std::io::stdout(), "{reviewer_output}")?;
     Ok(ReviewerRun {
         code,
-        dashboard_spawn,
-        output: Some(String::from_utf8_lossy(&output).into_owned()),
+        dashboard_spawn: false,
+        output: Some(reviewer_output),
     })
 }
 
@@ -4251,31 +4188,11 @@ mod tests {
         assert!(!kept.contains(".zirv/work"));
     }
 
-    /// T8: `dash_channel_active` reads whichever channel its `env` lookup
-    /// hands back, never the real process environment directly -- so this
-    /// exercises both branches without ever touching (or leaking) the real
-    /// `ZIRV_CTX_DASH_REQUESTS`.
-    #[test]
-    fn dash_channel_active_reads_only_its_injected_env() {
-        let set = std::collections::HashMap::from([(
-            crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV.to_string(),
-            "/tmp/some-requests-dir".to_string(),
-        )]);
-        assert!(dash_channel_active(&|k| set.get(k).cloned()));
-        assert!(!dash_channel_active(&|_| None));
-    }
-
     /// C4: under `ZIRV_CTX_DASH_REQUESTS` a delegation exits 0 as soon as the
     /// dashboard *accepts* the request. Recording review evidence off that
     /// exit code credited a review that had not run.
     #[test]
     fn a_dashboard_spawn_ack_is_not_a_completed_review() {
-        let ack = format!(
-            "{}abcd1234",
-            crate::commands::ctx::agent::DASH_SPAWN_ACK_PREFIX
-        );
-        assert!(is_dashboard_ack(&ack));
-        assert!(!is_dashboard_ack("Findings: 1 major issue"));
         assert!(!records_evidence(
             &ReviewerRun {
                 code: 0,
@@ -4302,210 +4219,143 @@ mod tests {
         ));
     }
 
-    /// Issue #484 (roadmap N15): the same reviewer seat, on zirv's own
-    /// runtime, with no vendor CLI anywhere in the argv.
-    ///
-    /// The two things that must survive are the read-only pin -- stated as
-    /// `--mode read-only`, which `native_worker` turns into "no writer permit"
-    /// and the broker turns into a refusal -- and the seat instructions, which
-    /// travel as `--system-prompt` exactly as they do on the harness path.
-    /// What must NOT survive is anything adapter-shaped: no `--` passthrough,
-    /// no model flag, no sandbox argv floor, because there is no external
-    /// process to hand them to.
     #[test]
-    fn a_native_reviewer_argv_pins_read_only_with_no_harness_flags() {
+    fn a_native_reviewer_request_pins_private_inline_read_only_without_harness_flags() {
         let repo = tempdir().unwrap();
         let home = tempdir().unwrap();
         let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-        let argv = reviewer_argv(
+        let args = reviewer_args(
             RuntimeKind::Native,
             "fast-review",
+            "review package".to_string(),
             repo.path(),
             false,
             Some(50_000),
             Some(40),
         )
         .unwrap();
+        assert_eq!(args.name, "fast-review");
+        assert_eq!(args.runtime, "native");
         assert_eq!(
-            &argv[..8],
-            [
-                "agent",
-                "fast-review",
-                "-",
-                "--runtime",
-                "native",
-                "--mode",
-                "read-only",
-                "--inline",
-            ],
-            "the route replaces the adapter name and the read-only pin stays: {argv:?}"
+            args.mode,
+            crate::commands::ctx::permit::WorkerMode::ReadOnly
         );
-        assert_eq!(argv[8], "--system-prompt");
+        assert!(args.inline);
+        assert_eq!(args.prompt, "review package");
+        assert_eq!(args.budget_tokens, Some(50_000));
+        assert_eq!(args.max_tool_calls, Some(40));
         assert!(
-            argv[9].contains("zirv workflow agent seat: reviewer@"),
-            "the seat instructions must still travel as data: {}",
-            argv[9]
+            args.flags.is_empty(),
+            "native has no harness flags: {args:?}"
         );
         assert!(
-            !argv.iter().any(|argument| argument == "--"),
-            "a native reviewer has no vendor CLI to pass flags through to: {argv:?}"
-        );
-        assert!(
-            !argv.iter().any(|argument| argument == "--model"),
-            "a native reviewer's model is its route's, not a CLI flag: {argv:?}"
-        );
-        assert!(
-            argv.windows(2)
-                .any(|pair| pair[0] == "--budget-tokens" && pair[1] == "50000"),
-            "the worker budget still reaches the native seat: {argv:?}"
-        );
-        assert!(
-            argv.windows(2)
-                .any(|pair| pair[0] == "--max-tool-calls" && pair[1] == "40"),
-            "the tool-call ceiling still reaches the native seat: {argv:?}"
+            args.system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("zirv workflow agent seat: reviewer@"))
         );
     }
 
-    /// The pin has to reach the argv the reviewer is actually launched with,
-    /// after a `--` so `zirv agent` passes it through to the harness's own CLI
-    /// -- a correct lookup table that never made it onto the command line
-    /// would restrict nothing.
     #[test]
-    fn a_reviewer_seat_is_always_pinned_read_only_or_refused() {
+    fn ordinary_cli_cannot_request_the_private_inline_dispatch() {
+        use clap::Parser;
+        let parsed = crate::commands::ctx::CtxCli::try_parse_from([
+            "ctx", "agent", "claude", "review", "--inline",
+        ]);
+        assert!(parsed.is_err(), "--inline must have no CLI spelling");
+    }
+
+    #[test]
+    fn a_harness_reviewer_keeps_private_inline_read_only_model_and_seat_prompt() {
         let repo = tempdir().unwrap();
-        // Isolate from this machine's own `~/.zirv/ctx.toml`: `reviewer_argv`
-        // now loads config to resolve the review model, and an unrelated
-        // real home config must not make this assertion machine-dependent.
         let home = tempdir().unwrap();
         let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-        let claude = reviewer_argv(
+        let claude = reviewer_args(
             RuntimeKind::Harness,
             "claude",
+            "review".to_string(),
             repo.path(),
             false,
             None,
             None,
         )
         .unwrap();
+        assert_eq!(claude.runtime, "harness");
         assert_eq!(
-            &claude[..7],
-            [
-                "agent",
-                "claude",
-                "-",
-                "--mode",
-                "read-only",
-                "--inline",
-                "--system-prompt"
-            ],
-            "2026-09-06: no `--headless` -- the reviewer states its read-only floor and (R1-4) its \
-             seat instructions as request fields, so a pane fulfilling it re-applies both \
-             server-side"
+            claude.mode,
+            crate::commands::ctx::permit::WorkerMode::ReadOnly
         );
-        assert_eq!(
-            claude.get(8).map(String::as_str),
-            Some("--"),
-            "the seat text is one argv token, and the passthrough separator follows it: {claude:?}"
-        );
+        assert!(claude.inline);
+        assert_eq!(claude.budget_tokens, None);
+        assert_eq!(claude.max_tool_calls, None);
         assert!(
-            !claude.iter().any(|arg| arg == "--headless"),
-            "`--headless` no longer exists: {claude:?}"
-        );
-        assert_eq!(
-            claude.last().map(String::as_str),
-            Some("--disallowedTools=Write,Edit,Bash,NotebookEdit"),
-            "the reviewer seat's hard read-only floor must be appended last"
+            claude
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("workflow agent seat: reviewer@1"))
         );
         assert!(
             claude
-                .iter()
-                .any(|arg| arg.contains("workflow agent seat: reviewer@1")),
-            "the provider-neutral reviewer manifest must reach the harness system prompt"
+                .flags
+                .windows(2)
+                .any(|pair| pair == ["--model", "opus"])
         );
-        assert!(
-            claude.windows(2).any(|pair| pair == ["--model", "opus"]),
-            "no `chat.model`/`review.claude` configured: the reviewer must still be pinned to \
-             the derived ladder default (claude's own top tier) rather than running unpinned: \
-             {claude:?}"
-        );
-        let model_at = claude
-            .iter()
-            .position(|arg| arg == "--model")
-            .expect("--model must be present");
-        let read_only_at = claude
-            .iter()
-            .position(|arg| arg == "--disallowedTools=Write,Edit,Bash,NotebookEdit")
-            .expect("read-only floor must be present");
-        assert!(
-            model_at < read_only_at,
-            "the model flag must land before the read-only floor, never after: {claude:?}"
+        assert_eq!(
+            claude.flags.last().map(String::as_str),
+            Some("--disallowedTools=Write,Edit,Bash,NotebookEdit")
         );
 
-        let codex = reviewer_argv(
+        let codex = reviewer_args(
             RuntimeKind::Harness,
             "codex",
+            "review".to_string(),
             repo.path(),
             false,
             None,
             None,
         )
         .unwrap();
-        assert_eq!(
-            &codex[..7],
-            [
-                "agent",
-                "codex",
-                "-",
-                "--mode",
-                "read-only",
-                "--inline",
-                "--system-prompt"
-            ]
+        assert!(codex.inline);
+        assert!(
+            codex
+                .flags
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "read-only"])
         );
         assert!(
             codex
+                .flags
                 .windows(2)
-                .any(|pair| pair == ["--sandbox", "read-only"]),
-            "codex reviewer must retain the adapter-owned read-only sandbox pin: {codex:?}"
-        );
-        assert!(
-            codex.iter().any(|arg| arg.contains("reviewer@1")),
-            "the same reviewer seat must be addressable through codex"
-        );
-        assert!(
-            codex
-                .windows(2)
-                .any(|pair| pair == ["--model", "gpt-5.6-terra"]),
-            "codex reviewer must also be pinned to its own derived ladder default: {codex:?}"
+                .any(|pair| pair == ["--model", "gpt-5.6-terra"])
         );
 
-        let error = reviewer_argv(RuntimeKind::Harness, "nope", repo.path(), false, None, None)
-            .unwrap_err()
-            .to_string();
         assert!(
-            error.contains("unknown") || error.contains("unsupported"),
-            "{error}"
-        );
-        assert!(
-            reviewer_argv(
+            reviewer_args(
                 RuntimeKind::Harness,
-                "Claude",
+                "nope",
+                "review".to_string(),
                 repo.path(),
                 false,
                 None,
-                None
+                None,
             )
-            .is_err(),
-            "the adapter name is validated too"
+            .is_err()
+        );
+        assert!(
+            reviewer_args(
+                RuntimeKind::Harness,
+                "Claude",
+                "review".to_string(),
+                repo.path(),
+                false,
+                None,
+                None,
+            )
+            .is_err()
         );
     }
 
-    /// An operator's own `review.<agent>` (`REPO_FORBIDDEN`, only settable
-    /// from `~/.zirv/ctx.toml` or `ZIRV_CTX_REVIEW_MODEL_*`) must win over the
-    /// adapter's derived ladder default, and that choice must actually reach
-    /// the reviewer's own launch argv -- not just the advisory roster line.
     #[test]
-    fn an_operators_configured_review_model_reaches_the_reviewer_argv() {
+    fn an_operators_configured_review_model_reaches_the_reviewer_request() {
         let repo = tempdir().unwrap();
         let home = tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".zirv")).unwrap();
@@ -4515,10 +4365,14 @@ mod tests {
         )
         .unwrap();
         let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-
-        let claude = reviewer_argv(
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_REVIEW_MODEL_CODEX",
+            Some("gpt-5.6-review-pin"),
+        )]);
+        let claude = reviewer_args(
             RuntimeKind::Harness,
             "claude",
+            "review".to_string(),
             repo.path(),
             false,
             None,
@@ -4527,142 +4381,163 @@ mod tests {
         .unwrap();
         assert!(
             claude
+                .flags
                 .windows(2)
-                .any(|pair| pair == ["--model", "claude-opus-4-1-review-pin"]),
-            "the operator's configured review.claude must reach the reviewer argv, not the \
-             derived ladder default: {claude:?}"
+                .any(|pair| pair == ["--model", "claude-opus-4-1-review-pin"])
         );
-
-        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
-        unsafe {
-            std::env::set_var("ZIRV_CTX_REVIEW_MODEL_CODEX", "gpt-5.6-review-pin");
-        }
-        let codex = reviewer_argv(
+        let codex = reviewer_args(
             RuntimeKind::Harness,
             "codex",
+            "review".to_string(),
             repo.path(),
             false,
             None,
             None,
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("ZIRV_CTX_REVIEW_MODEL_CODEX");
-        }
         assert!(
             codex
+                .flags
                 .windows(2)
-                .any(|pair| pair == ["--model", "gpt-5.6-review-pin"]),
-            "the operator's env-configured review.codex must also win over the ladder default: \
-             {codex:?}"
+                .any(|pair| pair == ["--model", "gpt-5.6-review-pin"])
         );
     }
 
     #[test]
-    fn reviewer_argv_codex_has_one_read_only_sandbox_through_headless_launch() {
-        use crate::commands::ctx::{CtxCli, CtxVerb, adapters, agent, config::CtxConfig};
-        use clap::Parser;
+    fn reviewer_request_codex_has_one_read_only_sandbox_and_direct_budgets() {
+        use crate::commands::ctx::{adapters, agent, config::CtxConfig};
         let repo = tempdir().unwrap();
-        let argv = reviewer_argv(
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let args = reviewer_args(
             RuntimeKind::Harness,
             "codex",
-            repo.path(),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-        let parsed =
-            CtxCli::try_parse_from(std::iter::once("ctx".to_string()).chain(argv.clone())).unwrap();
-        let CtxVerb::Agent(args) = parsed.verb else {
-            panic!("reviewer must delegate an agent")
-        };
-        assert!(
-            args.inline,
-            "workflow reviews must request a completed inline run before evidence is recorded"
-        );
-        let adapter = adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(true);
-        let flags = agent::headless_worker_flags(&CtxConfig::default(), &args, &adapter);
-        for composed in [&argv, &flags] {
-            let sandbox: Vec<_> = composed
-                .windows(2)
-                .filter(|w| w[0] == "--sandbox")
-                .map(|w| w[1].as_str())
-                .collect();
-            assert_eq!(sandbox, ["read-only"], "{composed:?}");
-        }
-    }
-
-    /// Budget flags must land before the `--` separator, and only when set.
-    #[test]
-    fn reviewer_argv_appends_worker_budget_flags_before_the_separator_only_when_set() {
-        let repo = tempdir().unwrap();
-        let unbounded = reviewer_argv(
-            RuntimeKind::Harness,
-            "claude",
-            repo.path(),
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(
-            !unbounded.iter().any(|arg| arg == "--budget-tokens"),
-            "no budget configured must append no flag: {unbounded:?}"
-        );
-        assert!(
-            !unbounded.iter().any(|arg| arg == "--max-tool-calls"),
-            "no tool-call ceiling configured must append no flag: {unbounded:?}"
-        );
-
-        let bounded = reviewer_argv(
-            RuntimeKind::Harness,
-            "claude",
+            "review".to_string(),
             repo.path(),
             false,
             Some(50_000),
             Some(40),
         )
         .unwrap();
-        let separator = bounded
-            .iter()
-            .position(|arg| arg == "--")
-            .expect("reviewer argv always has a flag separator");
-        let budget_at = bounded
-            .iter()
-            .position(|arg| arg == "--budget-tokens")
-            .expect("--budget-tokens must be present when a budget is configured");
-        let calls_at = bounded
-            .iter()
-            .position(|arg| arg == "--max-tool-calls")
-            .expect("--max-tool-calls must be present when a tool-call ceiling is configured");
-        assert!(
-            budget_at < separator && calls_at < separator,
-            "both budget flags must land before the `--` separator so `zirv agent` parses \
-             them as its own flags rather than passthrough harness argv: {bounded:?}"
-        );
-        assert_eq!(bounded[budget_at + 1], "50000");
-        assert_eq!(bounded[calls_at + 1], "40");
+        assert_eq!(args.budget_tokens, Some(50_000));
+        assert_eq!(args.max_tool_calls, Some(40));
+        let adapter = adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(true);
+        let flags = agent::headless_worker_flags(&CtxConfig::default(), &args, &adapter);
+        for composed in [&args.flags, &flags] {
+            let sandbox: Vec<_> = composed
+                .windows(2)
+                .filter(|pair| pair[0] == "--sandbox")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            assert_eq!(sandbox, ["read-only"], "{composed:?}");
+        }
     }
 
-    /// A reviewer that emits a non-UTF-8 byte used to end the relay early (a
-    /// `lines()` error read as end-of-stream), dropping the read end and
-    /// handing the reviewer a SIGPIPE mid-review.
     #[test]
-    fn non_utf8_reviewer_output_does_not_end_the_relay() {
-        let mut input: Vec<u8> = b"first line\n".to_vec();
-        input.extend_from_slice(&[0xff, 0xfe]);
-        input.extend_from_slice(b" second line\nthird line\n");
-        input.extend_from_slice(b"no trailing newline");
-        let mut lines = Vec::new();
-        relay_lines(std::io::Cursor::new(input), |line| {
-            lines.push(line.to_string())
-        });
-        assert_eq!(lines.len(), 4, "got {lines:?}");
-        assert_eq!(lines[0], "first line");
-        assert!(lines[1].ends_with(" second line"));
-        assert_eq!(lines[2], "third line");
-        assert_eq!(lines[3], "no trailing newline");
+    fn a_private_reviewer_runs_inline_without_harvest_or_fingerprint_drift() {
+        let repo = git_repo();
+        let repo_path = std::fs::canonicalize(repo.path()).unwrap();
+        let home = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let dashboard = tempdir().unwrap();
+        let requests = dashboard.path().join("requests");
+        std::fs::create_dir_all(&requests).unwrap();
+        std::fs::write(
+            dashboard.path().join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let fake_agent =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-agent.sh");
+        let fake_command = format!("sh {}", fake_agent.display());
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE", Some("review-ok")),
+            ("ZIRV_CTX_AGENT_BIN", Some(fake_command.as_str())),
+            (
+                crate::commands::ctx::state::STATE_ENV,
+                state_root.path().to_str(),
+            ),
+            (
+                crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV,
+                requests.to_str(),
+            ),
+            ("ZIRV_CTX_PACE", Some("false")),
+            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
+            ("ZIRV_CTX_MEMORY_HARVEST", Some("true")),
+        ]);
+        let args = reviewer_args(
+            RuntimeKind::Harness,
+            "claude",
+            "review this change".to_string(),
+            &repo_path,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let before = verification::change_fingerprint(&repo_path).unwrap();
+        let mut output = Vec::new();
+
+        let code =
+            crate::commands::ctx::agent::run_with(&args, &mut output, &repo_path, &reviewer_env)
+                .expect("reviewer completes");
+
+        assert_eq!(code, 0);
+        let output = reviewer_report(&output, MAX_REVIEW_OUTPUT_BYTES).unwrap();
+        assert!(
+            parse_reviewer_output(&output)
+                .unwrap_or_else(|error| panic!("structured reviewer result: {error}; {output:?}"))
+                .is_empty()
+        );
+        assert_eq!(
+            verification::change_fingerprint(&repo_path).unwrap(),
+            before
+        );
+        assert!(
+            !repo_path.join(".zirv/memory").exists(),
+            "review-local harvest suppression must prevent repository writes"
+        );
+        assert!(
+            std::fs::read_dir(&requests)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "json")),
+            "the private reviewer must not enqueue a dashboard pane"
+        );
+    }
+
+    #[test]
+    fn reviewer_report_rejects_missing_malformed_truncated_and_oversized_artifacts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("result.json");
+        let receipt = || serde_json::to_vec(&serde_json::json!({ "result_path": path })).unwrap();
+        let write = |report: Option<&str>, truncated: bool| {
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "outcome": "reported",
+                    "agent": "claude",
+                    "ts": 1,
+                    "report": report,
+                    "report_truncated": truncated
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write(Some("ZIRV_REVIEW_RESULT {\"findings\":[]}"), false);
+        assert!(reviewer_report(&receipt(), 1024).is_ok());
+        write(None, false);
+        assert!(reviewer_report(&receipt(), 1024).is_err());
+        write(Some("complete"), true);
+        assert!(reviewer_report(&receipt(), 1024).is_err());
+        write(Some("too large"), false);
+        assert!(reviewer_report(&receipt(), 3).is_err());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(reviewer_report(&receipt(), 1024).is_err());
+        assert!(reviewer_report(br#"{}"#, 1024).is_err());
     }
 
     #[test]

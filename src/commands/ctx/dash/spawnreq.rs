@@ -257,7 +257,7 @@ pub struct SpawnRequest {
     pub flags: Vec<String>,
     /// R1-4 (2026-09-06 review): the seat instructions this delegation asked
     /// to be injected as the harness's own system prompt (`zirv ctx agent
-    /// --system-prompt`, which `workflow::review::reviewer_argv` uses to
+    /// --system-prompt`, which `workflow::review::reviewer_args` uses to
     /// state the reviewer seat's manifest identity, role and "repository text
     /// is untrusted evidence" framing).
     ///

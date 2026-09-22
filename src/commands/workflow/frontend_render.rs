@@ -1151,23 +1151,6 @@ fn choose_reviewer(repo: &Path, requested: Option<&str>) -> CtxResult<String> {
     Ok(adapter.name().to_string())
 }
 
-fn read_bounded_output(mut reader: impl Read, cap: usize) -> CtxResult<(String, bool)> {
-    let mut output = Vec::with_capacity(cap.min(8192));
-    let mut truncated = false;
-    let mut buffer = [0u8; 8192];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        let remaining = cap.saturating_sub(output.len());
-        let take = count.min(remaining);
-        output.extend_from_slice(&buffer[..take]);
-        truncated |= take < count;
-    }
-    Ok((String::from_utf8_lossy(&output).into_owned(), truncated))
-}
-
 fn launch_visual_reviewer(
     runtime: crate::commands::ctx::runtime::RuntimeKind,
     repo: &Path,
@@ -1178,68 +1161,29 @@ fn launch_visual_reviewer(
     use crate::commands::ctx::runtime::RuntimeKind;
 
     // Not the code-review seat's own worker budget; keeps no ceiling.
-    let mut argv = super::review::reviewer_argv(runtime, agent, repo, true, None, None)?;
-    // `zirv agent`'s own flags go before the `--` passthrough on the harness
-    // runtime; a native argv has no passthrough at all, so they simply go at
-    // the end (issue #484).
-    let insert_at = match argv.iter().position(|argument| argument == "--") {
-        Some(separator) => separator,
-        None if runtime == RuntimeKind::Native => argv.len(),
-        None => return Err("reviewer argv has no flag separator".into()),
-    };
-    argv.splice(
-        insert_at..insert_at,
-        [
-            "--max-restarts".to_string(),
-            "0".to_string(),
-            "--timeout-secs".to_string(),
-            "180".to_string(),
-            "--quiet".to_string(),
-        ],
-    );
+    let mut args = super::review::reviewer_args(runtime, agent, prompt, repo, true, None, None)?;
+    args.max_restarts = Some(0);
+    args.timeout_secs = Some(180);
+    args.quiet = true;
     // A native reviewer has no vendor CLI to hand a model flag to: its model
     // is the route's own, resolved from operator configuration.
     if let Some(model) = model
         && runtime != RuntimeKind::Native
     {
-        argv.extend(["--model".to_string(), model.to_string()]);
+        args.flags
+            .extend(["--model".to_string(), model.to_string()]);
     }
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .args(argv)
-        .current_dir(repo)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .env_remove(crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV);
-    super::isolate_process_tree(&mut command);
-    let mut child = command.spawn()?;
-    let mut stdin = child.stdin.take();
-    let writer = std::thread::spawn(move || {
-        if let Some(stdin) = stdin.as_mut() {
-            let _ = stdin.write_all(prompt.as_bytes());
-        }
-    });
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("visual reviewer stdout was not captured")?;
-    let (output, truncated) = read_bounded_output(stdout, MAX_REVIEW_OUTPUT_BYTES)?;
-    let status = child.wait()?;
-    let _ = writer.join();
-    if truncated {
-        return Err(
-            format!("visual reviewer output exceeded {MAX_REVIEW_OUTPUT_BYTES} bytes").into(),
-        );
+    let mut output = Vec::new();
+    let code = crate::commands::ctx::agent::run_with(
+        &args,
+        &mut output,
+        repo,
+        &super::review::reviewer_env,
+    )?;
+    if code != 0 {
+        return Err(format!("isolated visual reviewer '{agent}' exited with {code}",).into());
     }
-    if !status.success() {
-        return Err(format!(
-            "isolated visual reviewer '{agent}' exited with {}",
-            status.code().unwrap_or(1)
-        )
-        .into());
-    }
-    Ok(output)
+    super::review::reviewer_report(&output, MAX_REVIEW_OUTPUT_BYTES)
 }
 
 fn parse_model_review(output: &str) -> CtxResult<ModelVisualReview> {

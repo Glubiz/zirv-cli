@@ -68,7 +68,7 @@ pub struct AgentArgs {
     /// ([`flags_with_system_prompt`]), and a dashboard pane carries it as
     /// `SpawnRequest::system_prompt` -- which survives the file-drop
     /// sanitiser, unlike the trailing `-- <flags>` a caller used to spell it
-    /// in. `workflow::review::reviewer_argv` is the first caller: its
+    /// in. `workflow::review::reviewer_args` is the first caller: its
     /// reviewer-seat instructions used to be dropped outright the moment a
     /// live dashboard fulfilled the review as a pane.
     #[arg(long)]
@@ -174,9 +174,9 @@ pub struct AgentArgs {
     #[arg(long)]
     pub goal: Option<String>,
     /// Internal synchronous-dispatch request for callers that must consume
-    /// the completed result before they can continue.
-    #[arg(long, hide = true, default_value_t = false)]
-    pub inline: bool,
+    /// the completed result before they can continue. No CLI spelling.
+    #[arg(skip)]
+    pub(crate) inline: bool,
     /// Internal result of `--manifest agent:` resolution. This has no CLI
     /// spelling: it is intentionally populated only by the untrusted
     /// delegation-manifest merge, then used for skill defaults.
@@ -3088,7 +3088,7 @@ fn try_join_dashboard<W: Write>(
     // R1-4 (2026-09-06 review): read with `last_model_flag`, not `model_only_
     // flags`. The latter gives up on ANY non-model token, so a caller that
     // pinned a model alongside anything else (`workflow::review::
-    // reviewer_argv`, whose read-only floor rides in the same list) silently
+    // reviewer_args`, whose read-only floor rides in the same list) silently
     // lost the pin and the pane ran on the generic worker default. The value
     // is still re-checked at the fulfilment side (`dash::mod::pane_model_
     // args`: `argv_unsafe_prompt` plus `validate_model_str`); the leading-dash
@@ -12345,7 +12345,7 @@ mod tests {
         let mut args = joinable_args("claude", "review this package");
         args.system_prompt =
             Some("zirv workflow agent seat: reviewer@1\nrole: reviewer".to_string());
-        // Exactly what `workflow::review::reviewer_argv` puts after `--`:
+        // Exactly what `workflow::review::reviewer_args` puts in `flags`:
         // the model pin never travels alone.
         args.flags = vec![
             "--model".to_string(),

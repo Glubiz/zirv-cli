@@ -337,6 +337,9 @@ case "$mode" in
   bootstrap-blocked)
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\"status\":\"Blocked\",\"evidence\":\"missing tool\"}"}]}}' >> "$t"
     ;;
+  review-ok)
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ZIRV_REVIEW_RESULT {\"findings\":[]}"}]}}' >> "$t"
+    ;;
   contract-ok)
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"All done.\n\n```json\n{\"status\": \"done\"}\n```"}]}}' >> "$t"
     ;;
