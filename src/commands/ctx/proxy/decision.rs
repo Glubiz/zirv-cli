@@ -109,10 +109,16 @@ impl SeatRole {
 /// tier question never cleared the floor, while its `execution` answers were
 /// themselves unreliable, 17-74 confidence, calling architectural work
 /// "direct") -- so `seat_tier` (like `execution`) is now derived, never
-/// asked, from [`SeatTier::from_execution`]. `Frontier` is the top-of-fleet
-/// tier `worker_tier`/[`super::catalogue::Tier`] deliberately has no
-/// equivalent of: a delegated worker is never the orchestrator seat
-/// compiling the team, so it never needs the top rung.
+/// asked, from [`SeatTier::from_execution_complexity_risk`]. `Frontier` is
+/// the top-of-fleet tier `worker_tier`/[`super::catalogue::Tier`]
+/// deliberately has no equivalent of: a delegated worker is never the
+/// orchestrator seat compiling the team, so it never needs the top rung.
+///
+/// Frontier seat gate (wrapper-overhead benchmark, 2026-09-22): a 36-run
+/// replay of the proxy intake found `Substantial` complexity alone routing
+/// two six-step feature tasks to a frontier orchestrator seat at 1.7-2.2x
+/// cost with no correctness gain. `Orchestrated` execution no longer implies
+/// `Frontier` by itself -- see [`SeatTier::from_execution_complexity_risk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeatTier {
@@ -123,14 +129,31 @@ pub enum SeatTier {
 }
 
 impl SeatTier {
-    /// Issue #537: the baseline maps directly from `execution` -- `Direct`
-    /// needs no more than a cheap seat, `Bounded` a standard one, and only
-    /// `Orchestrated` (a real compiled team) earns the frontier rung.
-    fn from_execution(execution: ExecutionMode) -> Self {
+    /// Issue #537, revised by the wrapper-overhead benchmark: `Direct` needs
+    /// no more than a cheap seat and `Bounded` a standard one, exactly as
+    /// before. `Orchestrated` (a real compiled team) no longer earns the
+    /// frontier rung on complexity alone -- it earns `Frontier` only when the
+    /// complexity is `Architectural` (an architectural-scope task always
+    /// gets the top seat) OR the risk is `High`/`Critical` (a sensitive
+    /// surface always gets the top seat regardless of scope); a `Substantial`
+    /// task at `Low`/`Medium` risk gets a `Standard` seat instead. `execution`,
+    /// `seat_role` (still `SeatRole::from_execution`), and `worker_tier`
+    /// (still `worker_tier_from_execution`) are untouched by this rule.
+    fn from_execution_complexity_risk(
+        execution: ExecutionMode,
+        complexity: Complexity,
+        risk: RiskBand,
+    ) -> Self {
         match execution {
             ExecutionMode::Direct => SeatTier::Cheap,
             ExecutionMode::Bounded => SeatTier::Standard,
-            ExecutionMode::Orchestrated => SeatTier::Frontier,
+            ExecutionMode::Orchestrated => {
+                if complexity == Complexity::Architectural || risk >= RiskBand::High {
+                    SeatTier::Frontier
+                } else {
+                    SeatTier::Standard
+                }
+            }
         }
     }
 
@@ -1095,12 +1118,14 @@ fn worker_tier_from_execution(execution: ExecutionMode) -> Tier {
 /// Derives every field that follows deterministically from the merged,
 /// floor-raised `complexity`/`risk` alone: `execution` (from `complexity`,
 /// then floored by `risk` via [`apply_risk_execution_floor`]), the
-/// direct-execution/workflow rule, `seat_tier`/`worker_tier`/`seat_role`
-/// (from the final `execution`), and the orchestrator's own resolved
-/// `model` (from `seat_tier` via `handover::resolve_model`, see
-/// [`model_for_tier`]). The ONE place all of this is computed, called at
-/// the tail of both [`baseline`] and [`merge`], after
-/// [`apply_security_risk_floor`] has already had its say on `risk`.
+/// direct-execution/workflow rule, `seat_tier` (from the FINAL `execution`
+/// plus `complexity`/`risk` -- see [`SeatTier::from_execution_complexity_risk`]),
+/// `worker_tier`/`seat_role` (from the final `execution` alone, unchanged),
+/// and the orchestrator's own resolved `model` (from `seat_tier` via
+/// `handover::resolve_model`, see [`model_for_tier`]). The ONE place all of
+/// this is computed, called at the tail of both [`baseline`] and [`merge`],
+/// after [`apply_security_risk_floor`] has already had its say on `risk`, so
+/// the frontier gate below always sees the final, floor-raised risk.
 fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
     decision.execution = execution_from_complexity(decision.complexity);
     let complexity_label = format!("{:?}", decision.complexity).to_lowercase();
@@ -1109,7 +1134,11 @@ fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
     ));
     apply_risk_execution_floor(decision);
     apply_direct_execution_workflow_rule(decision);
-    decision.seat_tier = SeatTier::from_execution(decision.execution);
+    decision.seat_tier = SeatTier::from_execution_complexity_risk(
+        decision.execution,
+        decision.complexity,
+        decision.risk,
+    );
     decision.worker_tier = worker_tier_from_execution(decision.execution);
     decision.seat_role = SeatRole::from_execution(decision.execution);
     decision.orchestrator.model =
@@ -1938,8 +1967,13 @@ mod tests {
         );
     }
 
+    /// Renamed by the wrapper-overhead benchmark's frontier seat gate: this
+    /// exact near-tie shape (a multi-step production investigation) is one
+    /// of the two cases the benchmark found riding a frontier seat for no
+    /// correctness gain -- `Substantial` complexity at `Low` risk now earns
+    /// a `Standard` orchestrator seat instead, never `Frontier`.
     #[test]
-    fn the_production_complexity_near_tie_selects_a_frontier_orchestrator() {
+    fn the_production_complexity_near_tie_selects_a_standard_orchestrator() {
         let cfg = CtxConfig::default();
         let mut baseline = sample_decision();
         baseline.complexity = Complexity::Trivial;
@@ -1971,8 +2005,8 @@ mod tests {
         assert_eq!(merged.complexity, Complexity::Substantial);
         assert_eq!(merged.execution, ExecutionMode::Orchestrated);
         assert_eq!(merged.seat_role, SeatRole::Orchestrator);
-        assert_eq!(merged.seat_tier, SeatTier::Frontier);
-        assert_eq!(merged.orchestrator.model, "fable");
+        assert_eq!(merged.seat_tier, SeatTier::Standard);
+        assert_eq!(merged.orchestrator.model, "sonnet");
         assert!(
             merged
                 .reasons
@@ -2208,11 +2242,17 @@ mod tests {
         );
     }
 
-    /// Issue #537 design revision: `execution`/`seat_tier`/`worker_tier`/
-    /// `seat_role` follow `complexity` alone, exercised across the whole
-    /// ladder -- `Trivial` a single cheap seat, `Bounded` a single standard
-    /// seat, `Substantial`/`Architectural` a frontier orchestrator with
-    /// standard-tier workers.
+    /// Issue #537 design revision, revised by the wrapper-overhead
+    /// benchmark's frontier seat gate: `execution`/`worker_tier`/`seat_role`
+    /// still follow `complexity` alone, exercised across the whole ladder --
+    /// `Trivial` a single cheap seat, `Bounded` a single standard seat,
+    /// `Substantial`/`Architectural` an orchestrator with standard-tier
+    /// workers. `seat_tier` no longer follows complexity alone: at the
+    /// `Low` risk every case in this ladder carries (from `sample_decision`),
+    /// `Substantial` earns only a `Standard` orchestrator seat, while
+    /// `Architectural` still earns `Frontier` unconditionally -- see
+    /// `frontier_requires_architectural_complexity_or_high_risk` for the
+    /// risk-gated half of the rule.
     #[test]
     fn the_whole_seat_ladder_follows_the_merged_complexity() {
         let cfg = CtxConfig::default();
@@ -2234,7 +2274,7 @@ mod tests {
             (
                 Complexity::Substantial,
                 ExecutionMode::Orchestrated,
-                SeatTier::Frontier,
+                SeatTier::Standard,
                 Tier::Standard,
                 SeatRole::Orchestrator,
             ),
@@ -2349,20 +2389,72 @@ mod tests {
         );
     }
 
-    /// Issue #537: the baseline maps `seat_tier` from `execution` alone.
+    /// Issue #537, revised by the wrapper-overhead benchmark: the baseline
+    /// maps `seat_tier` from `execution` alone for `Direct`/`Bounded`;
+    /// `Orchestrated` additionally needs `complexity`/`risk` -- see
+    /// `frontier_requires_architectural_complexity_or_high_risk` for that
+    /// half of the rule.
     #[test]
-    fn baseline_seat_tier_follows_execution() {
+    fn baseline_seat_tier_follows_execution_complexity_and_risk() {
         assert_eq!(
-            SeatTier::from_execution(ExecutionMode::Direct),
+            SeatTier::from_execution_complexity_risk(
+                ExecutionMode::Direct,
+                Complexity::Trivial,
+                RiskBand::Low
+            ),
             SeatTier::Cheap
         );
         assert_eq!(
-            SeatTier::from_execution(ExecutionMode::Bounded),
+            SeatTier::from_execution_complexity_risk(
+                ExecutionMode::Bounded,
+                Complexity::Bounded,
+                RiskBand::Medium
+            ),
             SeatTier::Standard
         );
         assert_eq!(
-            SeatTier::from_execution(ExecutionMode::Orchestrated),
+            SeatTier::from_execution_complexity_risk(
+                ExecutionMode::Orchestrated,
+                Complexity::Architectural,
+                RiskBand::Low
+            ),
             SeatTier::Frontier
+        );
+    }
+
+    /// Change 1 (frontier seat gate): the wrapper-overhead benchmark found
+    /// `Substantial` complexity alone routing to a frontier orchestrator
+    /// seat at 1.7-2.2x cost with no correctness gain. `Frontier` now
+    /// requires either `Architectural` complexity or `High`+ risk while
+    /// `Orchestrated`; a `Substantial` task at lower risk gets `Standard`.
+    #[test]
+    fn frontier_requires_architectural_complexity_or_high_risk() {
+        assert_eq!(
+            SeatTier::from_execution_complexity_risk(
+                ExecutionMode::Orchestrated,
+                Complexity::Substantial,
+                RiskBand::Low
+            ),
+            SeatTier::Standard,
+            "substantial + low risk must not earn the frontier seat"
+        );
+        assert_eq!(
+            SeatTier::from_execution_complexity_risk(
+                ExecutionMode::Orchestrated,
+                Complexity::Substantial,
+                RiskBand::High
+            ),
+            SeatTier::Frontier,
+            "substantial + high risk still earns the frontier seat"
+        );
+        assert_eq!(
+            SeatTier::from_execution_complexity_risk(
+                ExecutionMode::Orchestrated,
+                Complexity::Architectural,
+                RiskBand::Low
+            ),
+            SeatTier::Frontier,
+            "architectural complexity earns the frontier seat regardless of risk"
         );
     }
 
