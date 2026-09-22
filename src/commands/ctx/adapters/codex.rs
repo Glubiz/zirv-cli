@@ -1578,17 +1578,16 @@ impl AgentAdapter for CodexAdapter {
         )
     }
 
-    /// Codex's own model ladder, top to bottom: `gpt-5.6-sol` (the default
-    /// used when no `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, and the
-    /// older, hidden `gpt-5.4-mini` -- verified via `codex debug models` in
-    /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md's "Cheap model
-    /// alias for distillation" section (codex-cli 0.146.0), now data in
-    /// `catalogue` (issue #381) rather than a hand-written ladder here.
+    /// Codex's supported model ladder, top to bottom: `gpt-5.6-sol` (the
+    /// default used when no `-m` is given), `gpt-5.6-terra`, and
+    /// `gpt-5.6-luna`. The historical model observation remains recorded in
+    /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md; the current
+    /// supported ladder lives in `catalogue` (issue #381).
     /// Matched by substring on `seat`, lowercased first (same as claude's
     /// own ladder) so a mixed-case seat still lands on the right rung
-    /// instead of falling through to the unknown arm. `gpt-5.4-mini` is
+    /// instead of falling through to the unknown arm. `gpt-5.6-luna` is
     /// already the floor, so it maps to itself; an absent or unrecognised
-    /// seat (including one naming another adapter's model, e.g. a claude
+    /// seat (including one naming another adapter's model, e.g. a Claude
     /// orchestrator's own `chat.model`) assumes the top tier -- the
     /// deliberate consequence is that the computed default can then resolve
     /// to a model *more expensive* than the seat actually in use (an
@@ -3536,19 +3535,9 @@ mod tests {
         }
     }
 
-    /// The codex ladder, top to bottom: `gpt-5.6-sol` (the default when no
-    /// `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` --
-    /// verified via `codex debug models` in docs/superpowers/notes/
-    /// 2026-07-31-codex-cli-facts.md's "Cheap model alias for distillation"
-    /// section, sourced from a 0.146.0 capture; codex is not installed on
-    /// this machine to re-verify the catalog against 0.105.0 (the version
-    /// most operators actually get, per `distiller_cmd`'s own doc comment),
-    /// so treat this ladder as unverified for that version specifically --
-    /// the cited note documents the `--ignore-rules`/`--ignore-user-config`
-    /// gap only, not this catalog. `review_model_below` returns the tier one
-    /// below `seat`; an unknown or absent seat assumes the top tier
-    /// (`gpt-5.6-sol`), and `gpt-5.4-mini` (already the floor) maps to
-    /// itself.
+    /// `review_model_below` returns the tier one below `seat`; an unknown or
+    /// absent seat assumes the top tier (`gpt-5.6-sol`), and
+    /// `gpt-5.6-luna` (the supported floor) maps to itself.
     #[test]
     fn review_model_below_walks_the_codex_ladder() {
         let adapter = CodexAdapter::new(None);
@@ -3562,11 +3551,7 @@ mod tests {
         );
         assert_eq!(
             adapter.review_model_below(Some("gpt-5.6-luna")),
-            "gpt-5.4-mini"
-        );
-        assert_eq!(
-            adapter.review_model_below(Some("gpt-5.4-mini")),
-            "gpt-5.4-mini"
+            "gpt-5.6-luna"
         );
         assert_eq!(
             adapter.review_model_below(None),
@@ -3596,26 +3581,28 @@ mod tests {
         );
         assert_eq!(
             adapter.review_model_below(Some("GPT-5.6-LUNA")),
-            "gpt-5.4-mini"
-        );
-        assert_eq!(
-            adapter.review_model_below(Some("GPT-5.4-Mini")),
-            "gpt-5.4-mini"
+            "gpt-5.6-luna"
         );
     }
 
-    /// Issue #381: `review_model_below`/`model_strength` now delegate to
-    /// `catalogue`. This pins every answer the pre-catalogue hand-written
-    /// ladder gave, so the migration cannot silently change one.
+    /// The supported Codex ladder is catalogue-backed. The retired mini
+    /// model remains priceable for historical usage, but must never be
+    /// selected or used to lower a review tier.
     #[test]
-    fn catalogue_backed_answers_match_the_pre_catalogue_ladder() {
+    fn catalogue_keeps_luna_as_the_lowest_supported_codex_tier() {
         let adapter = CodexAdapter::new(None);
+        let vendor = catalogue::vendor(CATALOGUE_VENDOR).expect("openai is catalogued");
+        assert_eq!(catalogue::rung_of(vendor, "gpt-5.4-mini"), None);
+        assert_eq!(catalogue::strength(vendor, "gpt-5.4-mini"), None);
+        assert_eq!(
+            catalogue::tier_model(vendor, catalogue::Tier::Cheap),
+            Some("gpt-5.6-luna")
+        );
         for (seat, expected) in [
             (Some("gpt-5.6-sol"), "gpt-5.6-terra"),
             (Some("gpt-6-astra"), "gpt-5.6-terra"),
             (Some("gpt-5.6-terra"), "gpt-5.6-luna"),
-            (Some("gpt-5.6-luna"), "gpt-5.4-mini"),
-            (Some("gpt-5.4-mini"), "gpt-5.4-mini"),
+            (Some("gpt-5.6-luna"), "gpt-5.6-luna"),
             (None, "gpt-5.6-terra"),
             (Some("claude-fable-5"), "gpt-5.6-terra"),
         ] {
@@ -3626,7 +3613,7 @@ mod tests {
             ("gpt-6-astra", Some(4)),
             ("gpt-5.6-terra", Some(3)),
             ("gpt-5.6-luna", Some(2)),
-            ("gpt-5.4-mini", Some(1)),
+            ("gpt-5.4-mini", None),
         ] {
             assert_eq!(adapter.model_strength(model), expected, "model={model}");
         }

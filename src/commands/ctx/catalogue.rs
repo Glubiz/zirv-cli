@@ -241,14 +241,6 @@ const OPENAI_RUNGS: &[Rung] = &[
         strength: 2,
         context_window: None,
         price: Some(LUNA),
-        tier: None,
-    },
-    Rung {
-        alias: "gpt-5.4-mini",
-        id: "gpt-5.4-mini",
-        strength: 1,
-        context_window: None,
-        price: Some(MINI),
         tier: Some(Tier::Cheap),
     },
 ];
@@ -648,7 +640,7 @@ const VENDORS: &[Vendor] = &[
         slug: "openai",
         rungs: OPENAI_RUNGS,
         default_context_window: None,
-        extra_prices: &[("gpt-5-codex", TERRA)],
+        extra_prices: &[("gpt-5.4-mini", MINI), ("gpt-5-codex", TERRA)],
         as_of: None,
     },
     Vendor {

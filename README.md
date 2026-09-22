@@ -2067,7 +2067,7 @@ standard = "sonnet"
 deep = "opus"
 
 [model_tiers.codex]
-fast = "gpt-5.4-mini"
+fast = "gpt-5.6-luna"
 standard = "gpt-5.6-terra"
 deep = "gpt-5.6-sol"
 ```
@@ -5986,8 +5986,7 @@ same string, so the id is shown only where it differs.
 | openai | `gpt-6-astra` | — |
 | openai | `gpt-5.6-sol` | Deep |
 | openai | `gpt-5.6-terra` | Standard |
-| openai | `gpt-5.6-luna` | — |
-| openai | `gpt-5.4-mini` | Cheap |
+| openai | `gpt-5.6-luna` | Cheap |
 | google | `gemini-3.1-pro-preview` | Deep |
 | google | `gemini-3.7-flash` | Standard |
 | google | `gemini-3.5-flash-lite` | Cheap |
