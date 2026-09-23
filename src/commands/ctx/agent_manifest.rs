@@ -38,18 +38,10 @@
 //! `envelope::narrow`) a CLI-typed path already goes through, not by new
 //! code here.
 //!
-//! # Non-goal: `agent:` (an `AgentManifest` id)
-//!
-//! The issue proposed an `agent: <AgentManifest id>` field resolved via
-//! `workflow::agents::AgentRegistry::get`, the same registry the native
-//! `delegate` MCP tool already uses. The harness-runtime `zirv ctx agent`
-//! path (`agent.rs`) has no notion of `AgentManifest` at all today: no
-//! `model_tier`-to-harness-model mapping, no capability/skill gating, and
-//! `--role` here means "worker" or "sub-orchestrator" (`validate_role`),
-//! not the organizational role an `AgentManifest` carries. Wiring `agent:`
-//! in here would mean half-implementing that native-only machinery rather
-//! than reusing it, so v1 drops it: this manifest is declarative
-//! `AgentArgs` only.
+//! `agent: <AgentManifest id>` contributes default skills and the manifest's
+//! read-only/required-capability floors. It deliberately does not copy the
+//! manifest's role, runtime, instructions, or model tier into this harness
+//! delegation; those are seat-dispatch choices rather than task defaults.
 
 use std::path::{Path, PathBuf};
 
@@ -74,12 +66,13 @@ struct ManifestResult {
     kind: Option<String>,
 }
 
-/// Field names mirror `AgentArgs`'s own long flags 1:1 -- no new
-/// vocabulary. `agent` (see this module's doc comment) is deliberately
-/// absent from v1.
+/// Field names mirror `AgentArgs`'s own long flags, plus the optional
+/// `AgentManifest` id described in the module-level trust-boundary contract.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DelegationManifest {
+    #[serde(default)]
+    agent: Option<String>,
     #[serde(default)]
     brief: Option<String>,
     #[serde(default)]
@@ -157,6 +150,12 @@ fn merge(args: &mut AgentArgs, manifest: DelegationManifest, manifest_dir: &Path
     }
 
     merge_identity(&mut args.task, manifest.task, "--task", "--manifest task")?;
+    merge_identity(
+        &mut args.manifest_agent,
+        manifest.agent,
+        "--manifest agent",
+        "--manifest agent",
+    )?;
     merge_identity(
         &mut args.group,
         manifest.group,
@@ -376,6 +375,9 @@ mod tests {
             mode: WorkerMode::Writing,
             worktree: false,
             workspace: None,
+            goal: None,
+            inline: false,
+            manifest_agent: None,
             worktree_reuse: false,
             attach_artifact: None,
             workflow: None,
@@ -470,12 +472,12 @@ mod tests {
     fn an_unknown_manifest_field_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest_path = tmp.path().join("bad.yaml");
-        write(&manifest_path, "brief: go\nagent: implementer\n");
+        write(&manifest_path, "brief: go\nfuture_field: implementer\n");
 
         let mut args = args_for("claude", "");
         args.manifest = Some(manifest_path);
-        let error = apply(&mut args).expect_err("agent: is not v1 vocabulary");
-        assert!(error.to_string().contains("agent"), "got {error}");
+        let error = apply(&mut args).expect_err("unknown fields are refused");
+        assert!(error.to_string().contains("future_field"), "got {error}");
     }
 
     /// Rule 2: a plain identity field where the CLI and the manifest

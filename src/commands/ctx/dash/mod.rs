@@ -6479,7 +6479,7 @@ type ComposedWorkerPrompt = (
 );
 
 /// R1-4: the ceiling on `SpawnRequest::system_prompt`. The honest caller
-/// (`workflow::review::reviewer_argv`) sends an agent manifest's own
+/// (`workflow::review::reviewer_args`) sends an agent manifest's own
 /// instructions, a few kilobytes at most; the channel is untrusted, so a
 /// request cannot use it to push an unbounded body into every pane's argv.
 /// Truncated rather than refused, the same way every other capped block in
@@ -6579,7 +6579,7 @@ fn compose_worker_prompt(
     .composed;
     // R1-4 (2026-09-06 review): the seat instructions the requester asked to
     // be injected (`zirv ctx agent --system-prompt`, e.g. `workflow::review::
-    // reviewer_argv`'s reviewer-seat text). Folded into this pane's own
+    // reviewer_args`'s reviewer-seat text). Folded into this pane's own
     // composed prompt -- the same channel, and the same `with_mail_layer`
     // shape, the rest of the prompt already travels on -- rather than
     // appended as a SECOND system-prompt argv pair, which claude would append

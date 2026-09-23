@@ -399,14 +399,11 @@ impl std::fmt::Display for WorktreeStatus {
     }
 }
 
-/// Issue #718: sha256 of `base_commit` plus an optional setup-command list
-/// rendered as one string -- `setup` is empty today (no `[[workspace]].setup`
-/// yet, see #716), so this degrades to a hash of `base_commit` alone until
-/// that lands and starts feeding a real, non-empty setup list through this
-/// same parameter without changing its shape. Pure: identical inputs give an
-/// identical digest on every platform and every run, the same purity
-/// contract this module's own `decide` holds to. A NUL separator between the
-/// two inputs keeps `("ab", "c")` and `("a", "bc")` from colliding.
+/// Issue #718: sha256 of `base_commit` plus the selected workspace's ordered
+/// setup-command list rendered as one string. Pure: identical inputs give an
+/// identical digest on every platform and every run, the same purity contract
+/// this module's own `decide` holds to. A NUL separator between the two inputs
+/// keeps `("ab", "c")` and `("a", "bc")` from colliding.
 pub fn setup_digest(base_commit: &str, setup: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base_commit.as_bytes());

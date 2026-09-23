@@ -1527,7 +1527,7 @@ impl AgentAdapter for CodexAdapter {
     /// The read-only mail profile plus, when `ignore_flags_supported()` confirms
     /// the installed codex-cli documents them, `--ignore-rules
     /// --ignore-user-config` (issue #89). Shared by `distiller_cmd` above
-    /// and the workflow reviewer (`workflow::review::reviewer_argv`, via
+    /// and the workflow reviewer (`workflow::review::reviewer_args`, via
     /// `adapters::read_only_args_for_agent_name`), so both consumers of
     /// this pin get the stronger guarantee together, on the same installed
     /// binary's own verified capability, rather than drifting apart.

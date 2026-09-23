@@ -421,10 +421,21 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
 /// seat(s), the workflow, (issue #537 A2, both conditional) the domain tags
 /// and a clarify instruction, and (`Single` only) one line telling the
 /// session plainly that it is the one doing the work, not an orchestrator.
+///
+/// `started_workflow_id` (wrapper-overhead benchmark, 2026-09-22 change 2):
+/// the instance id `proxy::launch::start_workflow_for` actually started for
+/// this launch, when it did -- `chat.rs` threads it through from the SAME
+/// start call that names `decision.workflow`'s kind, so the workflow line
+/// can point the seat at that concrete instance instead of only naming the
+/// kind (the field evidence gap: a workflow started in 27/36 replayed runs,
+/// never consulted, because nothing named the running id or what to do with
+/// it). `None` when the intake never decided, the start was skipped
+/// (already-active workflow) or failed, or a decision names no workflow --
+/// every one of those keeps today's plain `workflow: <kind or none>` line.
 // T2 is the first caller (folds this into `compile.rs`'s composed context);
 // exercised here only by this module's own tests in the meantime.
 #[allow(dead_code)]
-pub fn prompt_layer(decision: &ProxyDecision) -> String {
+pub fn prompt_layer(decision: &ProxyDecision, started_workflow_id: Option<&str>) -> String {
     let mut lines = vec!["[zirv proxy]".to_string()];
     lines.push(format!(
         "execution: {} (complexity {}, risk {})",
@@ -447,10 +458,14 @@ pub fn prompt_layer(decision: &ProxyDecision) -> String {
             tier_str(decision.worker_tier),
         ),
     });
-    lines.push(format!(
-        "workflow: {}",
-        decision.workflow.as_deref().unwrap_or("none")
-    ));
+    lines.push(match (decision.workflow.as_deref(), started_workflow_id) {
+        (Some(kind), Some(id)) => format!(
+            "workflow: {kind} (started {id}) -- run `zirv workflow status` and follow its \
+             current step"
+        ),
+        (Some(kind), None) => format!("workflow: {kind}"),
+        (None, _) => "workflow: none".to_string(),
+    });
     if !decision.domains.is_empty() {
         lines.push(format!("domains: {}", decision.domains.join(", ")));
     }
@@ -877,7 +892,7 @@ mod tests {
 
     #[test]
     fn prompt_layer_is_bounded_and_starts_with_the_header() {
-        let layer = prompt_layer(&sample_decision());
+        let layer = prompt_layer(&sample_decision(), None);
         let lines: Vec<&str> = layer.lines().collect();
         assert!(lines.len() <= 8, "{lines:?}");
         assert_eq!(lines[0], "[zirv proxy]");
@@ -893,7 +908,7 @@ mod tests {
         decision.domains = vec!["security".to_string(), "data".to_string()];
         decision.needs_clarification = 0.9;
         decision.needs_clarification_decisive = true;
-        let layer = prompt_layer(&decision);
+        let layer = prompt_layer(&decision, None);
         assert!(layer.contains("domains: security, data"), "{layer}");
         assert!(
             layer.contains("clarify: ask the user one precise question before acting"),
@@ -902,7 +917,7 @@ mod tests {
 
         let mut clear_decision = sample_decision();
         clear_decision.needs_clarification = 0.1;
-        let clear_layer = prompt_layer(&clear_decision);
+        let clear_layer = prompt_layer(&clear_decision, None);
         assert!(!clear_layer.contains("domains:"), "{clear_layer}");
         assert!(!clear_layer.contains("clarify:"), "{clear_layer}");
     }
@@ -915,7 +930,7 @@ mod tests {
         let mut decision = sample_decision();
         decision.needs_clarification = 0.9;
         decision.needs_clarification_decisive = false;
-        let layer = prompt_layer(&decision);
+        let layer = prompt_layer(&decision, None);
         assert!(!layer.contains("clarify:"), "{layer}");
     }
 
@@ -925,13 +940,59 @@ mod tests {
         decision.execution = ExecutionMode::Direct;
         decision.seat_role = SeatRole::Single;
         assert!(
-            prompt_layer(&decision)
+            prompt_layer(&decision, None)
                 .contains("You are the single seat for this request: do the work here yourself")
         );
 
         decision.execution = ExecutionMode::Orchestrated;
         decision.seat_role = SeatRole::Orchestrator;
-        assert!(!prompt_layer(&decision).contains("You are the single seat"));
+        assert!(!prompt_layer(&decision, None).contains("You are the single seat"));
+    }
+
+    /// Change 2 (started workflow reaches the seat): a decision that named a
+    /// workflow AND actually started one names the concrete running instance
+    /// and tells the seat what to do with it, instead of only the kind.
+    #[test]
+    fn prompt_layer_names_the_started_workflow_instance_when_one_started() {
+        let decision = sample_decision();
+        assert_eq!(decision.workflow.as_deref(), Some("feature"));
+        let layer = prompt_layer(&decision, Some("feature-3f2a"));
+        assert!(
+            layer.contains(
+                "workflow: feature (started feature-3f2a) -- run `zirv workflow status` and \
+                 follow its current step"
+            ),
+            "{layer}"
+        );
+    }
+
+    /// Change 2: when the intake decided a workflow KIND but no instance
+    /// actually started (skipped -- an active workflow already exists, or
+    /// the start failed), the line stays exactly what it is today: the kind
+    /// alone, with no instruction to check a status that doesn't exist.
+    #[test]
+    fn prompt_layer_names_only_the_kind_when_no_workflow_started() {
+        let decision = sample_decision();
+        assert_eq!(decision.workflow.as_deref(), Some("feature"));
+        let layer = prompt_layer(&decision, None);
+        assert!(
+            layer.lines().any(|line| line == "workflow: feature"),
+            "{layer}"
+        );
+        assert!(!layer.contains("started"), "{layer}");
+        assert!(!layer.contains("zirv workflow status"), "{layer}");
+    }
+
+    /// Change 2: a decision that names no workflow at all keeps `workflow:
+    /// none`, regardless of `started_workflow_id` (which should never be
+    /// `Some` in that case in practice, but the formatter must not fabricate
+    /// a workflow line if it were).
+    #[test]
+    fn prompt_layer_names_no_workflow_when_the_decision_named_none() {
+        let mut decision = sample_decision();
+        decision.workflow = None;
+        let layer = prompt_layer(&decision, None);
+        assert!(layer.contains("workflow: none"), "{layer}");
     }
 
     #[test]
@@ -1409,8 +1470,10 @@ mod tests {
             assert_eq!(decision.workflow, case.workflow, "{}: workflow", case.name);
             // Issue #537: every battery case is `direct` or `bounded`, never
             // `orchestrated`, so `seat_role` must always be `Single` -- and
-            // `seat_tier` must follow `execution` exactly
-            // (`SeatTier::from_execution`).
+            // `seat_tier` must follow `execution` exactly for those two
+            // modes. (The `orchestrated` arm below mirrors the frontier seat
+            // gate -- `SeatTier::from_execution_complexity_risk`, private to
+            // `decision` -- for defense in depth; no case here reaches it.)
             assert_eq!(
                 decision.seat_role,
                 decision::SeatRole::Single,
@@ -1420,7 +1483,15 @@ mod tests {
             let expected_seat_tier = match decision.execution {
                 ExecutionMode::Direct => decision::SeatTier::Cheap,
                 ExecutionMode::Bounded => decision::SeatTier::Standard,
-                ExecutionMode::Orchestrated => decision::SeatTier::Frontier,
+                ExecutionMode::Orchestrated => {
+                    if decision.complexity == Complexity::Architectural
+                        || decision.risk >= RiskBand::High
+                    {
+                        decision::SeatTier::Frontier
+                    } else {
+                        decision::SeatTier::Standard
+                    }
+                }
             };
             assert_eq!(
                 decision.seat_tier, expected_seat_tier,
@@ -1552,6 +1623,17 @@ mod tests {
     /// fully suppress for these two request shapes, left as their
     /// originally-recorded ruling rather than loosened to tolerate either
     /// outcome.
+    ///
+    /// Frontier seat gate (wrapper-overhead benchmark, 2026-09-22): `seat_
+    /// tier` no longer follows `execution`/`complexity` alone -- see
+    /// `decision::SeatTier::from_execution_complexity_risk`. A live re-run
+    /// against this fixture confirmed every recorded `orchestrated` case's
+    /// `seat_tier` is unchanged under the new rule: the four `architectural`
+    /// cases (`plugin-system`, `sqlite-migration`, `tui-redesign`, `new-
+    /// adapter`) earn `frontier` unconditionally, and the one `substantial`
+    /// case (`dependency-upgrade`) also stays `frontier` because Jev's own
+    /// risk answer for it is `high` (the request touches provider-client
+    /// credentials), not because complexity alone would clear the gate.
     ///
     /// Jev determinism fix (2026-09-18 replay): with `build_intake` no
     /// longer measuring the repository at all (see `decision::

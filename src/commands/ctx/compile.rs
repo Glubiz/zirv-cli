@@ -360,12 +360,7 @@ pub(crate) fn select_skill_descriptions_for_task(
     let Some(composed) = compiled.composed.as_mut() else {
         return;
     };
-    let Some((selected, descriptions, removed_bytes)) =
-        selected_skill_index_text(cfg, state, repo, home, Some(task))
-    else {
-        return;
-    };
-    if removed_bytes == 0 {
+    if !composed.text.contains(prompt::SKILL_INDEX_HEADER) {
         return;
     }
     let Some(baseline) = prompt::skill_index_text(repo, home) else {
@@ -377,6 +372,14 @@ pub(crate) fn select_skill_descriptions_for_task(
     else {
         return;
     };
+    let Some((selected, descriptions, removed_bytes)) =
+        selected_skill_index_text(cfg, state, repo, home, Some(task))
+    else {
+        return;
+    };
+    if removed_bytes == 0 {
+        return;
+    }
     let start = at + prompt::SKILL_INDEX_HEADER.len();
     composed
         .text
@@ -515,8 +518,9 @@ pub struct CompiledContext {
 /// Built entirely from data [`CompiledContext`] already holds and the exact
 /// literal header constants `prompt.rs`'s own `with_*_layer` functions write
 /// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `SKILL_INDEX_
-/// HEADER`, `WORKFLOW_LAYER_HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/
-/// `MEMORY_SHARED_LAYER_HEADER`, `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) --
+/// HEADER`, `SKILL_POINTER_LAYER`, `WORKFLOW_LAYER_HEADER`, `MEMORY_PRIVATE_
+/// LAYER_HEADER`/`MEMORY_SHARED_LAYER_HEADER`, `PEER_MAIL_HEADER`/`PARENT_
+/// MAIL_HEADER`) --
 /// **no file is read again** to build this list, only `composed.text` and
 /// `composed.sources`, both
 /// already in memory. Issue #275 (`zirv context lint`) is the first consumer
@@ -625,6 +629,12 @@ impl CompiledContext {
                         )
                     })
                 }
+                // v13 (wrapper-overhead audit): `Worker`/`Single`'s one-line
+                // counterpart to `SkillIndex` above, at the same position in
+                // the emission order -- see `prompt::SkillPointer`'s own doc
+                // comment.
+                PromptSource::SkillPointer => find_after(text, cursor, prompt::SKILL_POINTER_LAYER)
+                    .map(|header_at| (header_at + prompt::SKILL_POINTER_LAYER.len(), None, None)),
                 // The combined common+harness-specific block: its two
                 // sub-budgets are already reported per-file by `provenance`,
                 // so this range covers the whole block with no single budget
@@ -2231,6 +2241,47 @@ mod tests {
         .0;
         unsafe { std::env::remove_var("JEV_TEST_SKILL_SELECT_737") };
         assert!(explicit.contains("- database-helper: frontend CSS layout guidance"));
+    }
+
+    #[test]
+    fn worker_skill_pointer_never_triggers_context_advice() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let state_dir = tempfile::tempdir().expect("state");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.jev.context = true;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_WORKER_POINTER_737".into();
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:9".into();
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var("JEV_TEST_WORKER_POINTER_737", "secret") };
+        let mut compiled = compile(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Worker,
+            &state,
+            now_secs(),
+            LaunchMode::Headless,
+            false,
+        );
+        let before = compiled.composed.as_ref().expect("prompt").text.clone();
+        assert!(before.contains(prompt::SKILL_POINTER_LAYER));
+        select_skill_descriptions_for_task(
+            &mut compiled,
+            &cfg,
+            &state,
+            repo.path(),
+            Some(home.path()),
+            "Fix the CSS frontend layout",
+        );
+        unsafe { std::env::remove_var("JEV_TEST_WORKER_POINTER_737") };
+        assert_eq!(compiled.composed.as_ref().expect("prompt").text, before);
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-cache").exists());
     }
 
     /// Golden capture for `reading_each_context_and_memory_file_once_does_

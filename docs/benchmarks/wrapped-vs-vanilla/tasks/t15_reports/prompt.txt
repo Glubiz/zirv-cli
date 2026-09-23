@@ -1,0 +1,49 @@
+I want two new ways to look at my spending: a month-by-month breakdown for
+a whole year, and a trend line for one category over time.
+
+Please add:
+
+1. `report.monthly_breakdown(txns, year)` -- returns a dict keyed by month
+   number (`1`-`12`). A month is only present in the dict if at least one
+   transaction is dated in that month of `year`; months with zero
+   transactions are left out entirely, they don't show up as an empty
+   dict. Each month's value is itself a dict mapping category to that
+   category's net (signed) `Decimal` total for that month -- transactions
+   with no category are grouped under the key `"uncategorised"`.
+
+2. `report.trend(txns, category, months)` -- returns a list of exactly
+   `months` `(month_string, Decimal)` tuples, oldest first, covering
+   `months` consecutive calendar months and ending at the calendar month
+   of the single most recent transaction in `txns` (looking at all
+   transactions, not just ones in `category`). `month_string` looks like
+   `"2024-03"`. Unlike `monthly_breakdown`, nothing is ever left out here:
+   a month with no matching-category transactions still gets an entry,
+   with a total of `Decimal("0")`. If `txns` is empty, return an empty
+   list.
+
+3. A `report` CLI command with two mutually exclusive modes:
+   - `python -m ledgerlite report --year YYYY [--format table|csv] --store
+     <path>` prints the monthly breakdown for that year. `--format`
+     defaults to `table`.
+     - Table format: a header line
+       `Month    Category            Amount` followed by one line per
+       (month, category) pair, sorted by month ascending and then by
+       category alphabetically within a month, formatted as
+       `f"{month:<7}  {category:<14}  {amount:>10.2f}"` -- e.g.
+       `2024-01  groceries           -45.67`. If the year has no
+       transactions at all, print just the header line.
+     - CSV format: written with Python's `csv` module, header row
+       `Month,Category,Amount`, one data row per (month, category) pair in
+       the same sort order, with the amount formatted to exactly two
+       decimal places as a plain string (e.g. `-45.67`, not `-45.7` or
+       `-45.670`).
+   - `python -m ledgerlite report --trend <category> --months N --store
+     <path>` prints one line per month from `report.trend`, oldest first,
+     each formatted exactly as `f"{month}: {amount:.2f}"` -- e.g.
+     `2024-02: 0.00`. `--format` is not used in this mode.
+   - `--year` and `--trend` are mutually exclusive; passing both, or
+     neither, should be rejected the same way `argparse` already rejects
+     an invalid combination of arguments elsewhere in this CLI (a usage
+     error on stderr, exit status 2). Separately, if `--trend` is given
+     without `--months`, print an error to stderr and exit with status 2
+     without printing anything to stdout.

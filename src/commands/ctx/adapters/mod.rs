@@ -1677,7 +1677,7 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// there is nothing to disclose. Consulted by
     /// [`announce_sandbox_residual_once`] whenever this adapter is resolved
     /// as the distiller (`handoff::run_model`) or the workflow reviewer
-    /// (`workflow::review::reviewer_argv`, via
+    /// (`workflow::review::reviewer_args`, via
     /// [`read_only_args_for_agent_name`]), so an operator whose judgment/
     /// review child runs on codex learns about the residual instead of
     /// discovering it only in a doc file a terminal session never opens.
@@ -3489,7 +3489,7 @@ pub fn read_only_args_for_agent_name(name: &str, mode: LaunchMode) -> Option<Vec
             // run_model` for the distiller role. `chrome.events` is not
             // known at this call site (no `CtxConfig` in hand), so this
             // defaults to enabled, matching this function's own pre-
-            // existing "no config, no repo" shape; `reviewer_argv`'s own
+            // existing "no config, no repo" shape; `reviewer_args`'s own
             // caller may still be running under `ZIRV_CTX_QUIET`, which
             // `Announcer` itself does not re-check here -- see the
             // documented residual on `announce_sandbox_residual_once`.
@@ -3993,7 +3993,7 @@ pub(crate) struct ReviewModelChoice {
     pub(crate) configured: bool,
 }
 
-/// `pub(crate)`: also the seam `reviewer_argv` (`workflow::review`) uses to
+/// `pub(crate)`: also the seam `reviewer_args` (`workflow::review`) uses to
 /// enforce the same resolved model on the reviewer's own launch, not just to
 /// advise it in the roster line below.
 pub(crate) fn resolve_review_model(
@@ -4033,7 +4033,7 @@ pub(crate) fn resolve_review_model(
 /// and zirv must never decide by itself that a `Deep` seat may run cheaper
 /// than the operator configured. Only the tier word the manifest already
 /// carries is ever looked up; this never substitutes a different one.
-fn resolve_tiered_model<'a>(
+pub(crate) fn resolve_tiered_model<'a>(
     cfg: &'a CtxConfig,
     adapter: &str,
     tier: crate::commands::workflow::agents::ModelTier,
@@ -4243,7 +4243,7 @@ fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> 
             // actually spawned -- without it, this line advised a native-
             // ladder model for a harness the operator retargeted at a
             // vendor endpoint, even though the real review launch
-            // (`reviewer_argv`, via this adapter's own `model_args`) pins to
+            // (`reviewer_args`, via this adapter's own `model_args`) pins to
             // that endpoint's ladder.
             apply_endpoint_override(&mut adapter, cfg);
             let choice = resolve_review_model(cfg, name, adapter.as_ref());
@@ -4341,7 +4341,17 @@ fn join_with_or(items: &[&str]) -> String {
 /// exist for it on that platform, which is categorically different from
 /// "not ready yet" -- the latter implies installing the binary would fix
 /// it.
+/// How many times this process has actually walked every adapter's
+/// `ready()` (i.e. called [`readiness_note`]) -- observable from tests so a
+/// perf regression that makes some ordinary `zirv ctx <verb>` invocation pay
+/// this probe again shows up as a counter mismatch rather than only a wall-
+/// clock number nobody is watching (see `ctx::mod::ctx_about`, which is the
+/// only call site and gates it behind "help is actually about to render").
+pub(crate) static READINESS_NOTE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub fn readiness_note() -> String {
+    READINESS_NOTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut clauses: Vec<String> = Vec::new();
 
     // Item 11: each adapter is constructed and `ready()`-checked exactly
@@ -5996,7 +6006,7 @@ mod tests {
     /// Review finding: without `apply_endpoint_override` attached to the
     /// adapter this function itself constructs, an endpoint-overridden
     /// harness's roster line advised claude's native ladder text even
-    /// though the actual review launch (`workflow::review::reviewer_argv`,
+    /// though the actual review launch (`workflow::review::reviewer_args`,
     /// via this same adapter's own `model_args`) pins to the endpoint
     /// vendor's own ladder -- the two could name different models. Under
     /// `[endpoint.claude] vendor = "zhipu"` with no seat and no `review.

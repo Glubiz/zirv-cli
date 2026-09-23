@@ -9,6 +9,7 @@
 # Behavior comes from the environment:
 #   FAKE_AGENT_MODE=healthy|rot|compact-tier|hang|fail   (default healthy)
 #   FAKE_AGENT_MODE_FILE=<path>             one mode per line, popped per run
+#   FAKE_AGENT_MODE_LOG=<path>              append the selected mode per run
 #   FAKE_AGENT_TURNS=<n>                    (default 12)
 #   FAKE_AGENT_SLEEP=<secs>                 rot mode only (default 0)
 #   FAKE_AGENT_SESSION_ENV_LOG=<path>       append $ZIRV_CTX_SESSION per run,
@@ -258,6 +259,7 @@ case "$prompt" in
     fi
     ;;
 esac
+[ -z "${FAKE_AGENT_MODE_LOG:-}" ] || printf '%s\n' "$mode" >> "$FAKE_AGENT_MODE_LOG"
 
 if [ -n "${FAKE_AGENT_SESSION_ENV_LOG:-}" ]; then
   printf '%s\n' "${ZIRV_CTX_SESSION:-}" >> "$FAKE_AGENT_SESSION_ENV_LOG"
@@ -329,6 +331,15 @@ fi
 # the OUTPUT CONTRACT extraction/validation tests have a real transcript to
 # read a candidate out of.
 case "$mode" in
+  bootstrap-ok)
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\"status\":\"Done\",\"evidence\":\"dependencies installed\"}"}]}}' >> "$t"
+    ;;
+  bootstrap-blocked)
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\"status\":\"Blocked\",\"evidence\":\"missing tool\"}"}]}}' >> "$t"
+    ;;
+  review-ok)
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ZIRV_REVIEW_RESULT {\"findings\":[]}"}]}}' >> "$t"
+    ;;
   contract-ok)
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"All done.\n\n```json\n{\"status\": \"done\"}\n```"}]}}' >> "$t"
     ;;

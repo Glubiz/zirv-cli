@@ -1,0 +1,6 @@
+I just tried importing my bank's CSV export and hit two problems with how amounts are parsed:
+
+1. Refunds and credits on my statement are shown wrapped in parentheses, like `(12.00)`. Those come into the ledger as positive `12.00` when they should be negative -- parentheses mean "negative" on my bank's statements.
+2. Some larger transactions have a thousands separator, like `1,234.50`, and importing a file with one of those in it just crashes the whole import instead of reading the amount.
+
+Can you fix the amount parsing so both of these work correctly?

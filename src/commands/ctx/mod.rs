@@ -496,15 +496,45 @@ pub type CtxResult<T> = Result<T, Box<dyn std::error::Error>>;
 // *every* `try_parse_from` -- i.e. every `dispatch()` call, whether or not
 // help text is ever displayed. `readiness_note()` calls `ready()` on every
 // registered adapter, and on Windows that walks `PATH`/`PATHEXT` per
-// adapter, so an ordinary `ctx hook Stop` (once per turn) or `ctx usage tee`
-// (once per statusline render) used to pay that cost for text nobody was
-// about to read. `ctx_about()` computes it once per process and caches it,
-// which is free within one process (tests, in particular, call `dispatch`
+// adapter, so an ordinary `ctx hook pretool` (fired by Claude Code on every
+// tool call) or `ctx usage tee` (once per statusline render) used to pay
+// ~275ms for text nobody was about to read. `dispatch` now decides from raw
+// argv, before `try_parse_from` ever builds `CtxCli::command()`, whether this
+// invocation will actually render `zirv ctx`'s own help (see
+// `ctx_will_render_help`, which mirrors `main.rs`'s pre-clap
+// `is_top_level_help`) and only then flips `SHOW_READINESS_NOTE`.
+// `ctx_about()` skips the probe entirely otherwise, and once the note *has*
+// been computed for a help render it stays cached for the rest of the
+// process -- free within one process (tests, in particular, call `dispatch`
 // hundreds of times) even though a fresh `zirv ctx ...` invocation is still
-// its own process either way.
+// its own process either way. The flag only ever moves false -> true: a
+// process that renders help after already having dispatched a plain verb
+// must still show the note, so nothing resets it back to false.
+static SHOW_READINESS_NOTE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True when `args` (`args[0]` is the literal "ctx", matching `dispatch`'s
+/// own convention) will make clap render `zirv ctx`'s own top-level help --
+/// no verb at all, or `help`/`-h`/`--help` immediately after it. A help flag
+/// on a *subcommand* (`zirv ctx hook --help`) renders that subcommand's own
+/// help, not `CtxCli`'s `about`, so it is deliberately not matched here.
+/// Conservative on the "no verb" arm: clap's missing-required-subcommand
+/// error may not always print the full about paragraph, but treating it as a
+/// help render costs nothing (it was already going to fail) and keeps this
+/// simple enough to trust by inspection.
+fn ctx_will_render_help(args: &[String]) -> bool {
+    matches!(
+        args.get(1).map(String::as_str),
+        None | Some("help") | Some("-h") | Some("--help")
+    )
+}
+
 fn ctx_about() -> String {
-    static ABOUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ABOUT
+    if !SHOW_READINESS_NOTE.load(std::sync::atomic::Ordering::Relaxed) {
+        return "Autonomous context management for AI coding agents.".to_string();
+    }
+    static ABOUT_WITH_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ABOUT_WITH_NOTE
         .get_or_init(|| {
             format!(
                 "Autonomous context management for AI coding agents. {}",
@@ -733,6 +763,9 @@ pub fn dispatch(args: &[String]) -> i32 {
     if args.len() == 3 && args[1] == "provider" && args[2] == "bridge" {
         return runtime::execution::bridge_stdio().unwrap_or(1);
     }
+    if ctx_will_render_help(args) {
+        SHOW_READINESS_NOTE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let argv = std::iter::once("zirv ctx".to_string()).chain(args.iter().skip(1).cloned());
     let cli = match CtxCli::try_parse_from(argv) {
         Ok(cli) => cli,
@@ -862,6 +895,11 @@ mod tests {
     #[test]
     fn the_top_level_help_names_every_adapter_that_is_not_ready() {
         use clap::CommandFactory;
+        // `ctx_about()` only pays for the readiness probe when `dispatch`
+        // has decided (from raw argv) that help is actually about to render;
+        // calling `CtxCli::command()` directly bypasses that decision, so
+        // this test makes it itself rather than going through `dispatch`.
+        SHOW_READINESS_NOTE.store(true, std::sync::atomic::Ordering::Relaxed);
         let about = CtxCli::command()
             .get_about()
             .map(|s| s.to_string())
@@ -934,6 +972,76 @@ mod tests {
             );
         }
         assert!(note.to_lowercase().contains("not ready"), "got {note}");
+    }
+
+    /// Perf regression guard for the fix above: a hook invocation (fired by
+    /// Claude Code on every single tool call) must never pay for
+    /// `adapters::readiness_note()`'s PATH walk. `SHOW_READINESS_NOTE` starts
+    /// this test process false; `ctx_will_render_help` must say a hook argv
+    /// does not render help, and parsing it -- the exact `CtxCli::
+    /// try_parse_from` call `dispatch` makes, which is what bakes `about`
+    /// into `CtxCli::command()` regardless of whether help is shown -- must
+    /// not bump `adapters::READINESS_NOTE_CALLS`.
+    #[test]
+    fn hook_argv_does_not_invoke_the_readiness_probe() {
+        let hook_argv = vec!["ctx".to_string(), "hook".to_string(), "pretool".to_string()];
+        assert!(
+            !ctx_will_render_help(&hook_argv),
+            "a hook verb must never be classified as a help render"
+        );
+
+        let calls_before =
+            adapters::READINESS_NOTE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let cli = CtxCli::try_parse_from(["zirv ctx", "hook", "pretool"])
+            .expect("hook pretool should parse");
+        assert!(matches!(cli.verb, CtxVerb::Hook(_)));
+        assert_eq!(
+            adapters::READINESS_NOTE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            calls_before,
+            "parsing a hook argv must not walk PATH probing adapter readiness"
+        );
+    }
+
+    /// The other half of the same guard: `zirv ctx --help` (and the no-verb
+    /// and bare-`help` shapes) must still open the readiness gate and still
+    /// carry the note, so the fix above never regresses `--help`'s own
+    /// output. `SHOW_READINESS_NOTE` only ever moves false -> true, so
+    /// asserting it is set is enough to know `ctx_about()` recomputes with
+    /// the probe the next time it is read (the property test above already
+    /// pins the exact wording).
+    #[test]
+    fn help_argv_still_opens_the_readiness_note_gate() {
+        for help_argv in [
+            vec!["ctx".to_string()],
+            vec!["ctx".to_string(), "help".to_string()],
+            vec!["ctx".to_string(), "-h".to_string()],
+            vec!["ctx".to_string(), "--help".to_string()],
+        ] {
+            assert!(
+                ctx_will_render_help(&help_argv),
+                "{help_argv:?} must be classified as a help render"
+            );
+        }
+
+        SHOW_READINESS_NOTE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let about = ctx_about();
+        assert!(
+            about.starts_with("Autonomous context management for AI coding agents."),
+            "got {about}"
+        );
+        assert_ne!(
+            about, "Autonomous context management for AI coding agents.",
+            "with the gate open, about must carry the readiness note, not the bare sentence: {about}"
+        );
+
+        // A subcommand's own `--help` (e.g. `zirv ctx hook --help`) renders
+        // that subcommand's help, not `CtxCli`'s `about` -- so it must not be
+        // classified as a top-level help render.
+        assert!(!ctx_will_render_help(&[
+            "ctx".to_string(),
+            "hook".to_string(),
+            "--help".to_string(),
+        ]));
     }
 
     #[test]
