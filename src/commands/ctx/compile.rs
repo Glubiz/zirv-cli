@@ -228,26 +228,26 @@ pub(super) fn selected_skill_index_text(
     repo: &Path,
     home: Option<&Path>,
     task_text: Option<&str>,
-) -> Option<(String, String, usize)> {
+) -> Option<(String, String, usize, Option<String>)> {
     let baseline = prompt::skill_index_text(repo, home)?;
     if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     }
     let Some(task_text) = task_text else {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     };
     let Some(entries) = prompt::skill_index_entries(repo, home) else {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     };
     let task_lower = task_text.to_ascii_lowercase();
     if entries
         .iter()
         .any(|(id, _, _)| task_lower.contains(&id.to_ascii_lowercase()))
     {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     }
     let Some(task_domain) = context_domain(task_text) else {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     };
     let mut facts = vec![vec![domain_code(task_domain)]];
     let mut questions = Vec::new();
@@ -278,7 +278,7 @@ pub(super) fn selected_skill_index_text(
         ));
     }
     if questions.is_empty() {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     }
     let input = ParentReportMetadata {
         _zirv_metadata_only: true,
@@ -292,7 +292,7 @@ pub(super) fn selected_skill_index_text(
         &input,
         &questions,
     ) else {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     };
     let mut omitted = 0usize;
     let descriptions = entries
@@ -317,7 +317,7 @@ pub(super) fn selected_skill_index_text(
         .collect::<Vec<_>>()
         .join("\n");
     if omitted == 0 {
-        return Some((baseline, String::new(), 0));
+        return Some((baseline, String::new(), 0, None));
     }
     let index = entries
         .iter()
@@ -338,9 +338,9 @@ pub(super) fn selected_skill_index_text(
         };
     let removed = baseline.len().saturating_sub(selected_bytes);
     if removed == 0 {
-        Some((baseline, String::new(), 0))
+        Some((baseline, String::new(), 0, None))
     } else {
-        Some((index, descriptions, removed))
+        Some((index, descriptions, removed, Some(baseline)))
     }
 }
 
@@ -372,7 +372,7 @@ pub(crate) fn select_skill_descriptions_for_task(
     else {
         return;
     };
-    let Some((selected, descriptions, removed_bytes)) =
+    let Some((selected, descriptions, removed_bytes, _)) =
         selected_skill_index_text(cfg, state, repo, home, Some(task))
     else {
         return;
@@ -2209,7 +2209,7 @@ mod tests {
         cfg.proxy.typesafe.credential_env = "JEV_TEST_SKILL_SELECT_737".into();
         // SAFETY (test-only): this test owns a unique env variable name.
         unsafe { std::env::set_var("JEV_TEST_SKILL_SELECT_737", "secret") };
-        let (selected, descriptions, removed) = selected_skill_index_text(
+        let (selected, descriptions, removed, _) = selected_skill_index_text(
             &cfg,
             &state,
             repo.path(),

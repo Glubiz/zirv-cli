@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use super::super::CtxResult;
 use super::super::config::CtxConfig;
 use super::super::context as chunk_a;
+use super::super::jev;
 use super::super::memory::{self, MemoryScope};
 use super::super::optimize;
 use super::super::prompt::{self, PromptRole};
@@ -321,14 +322,30 @@ pub fn compile(request: &CompileRequest<'_>) -> CtxResult<CompiledNativeContext>
         .into());
     }
 
-    let candidates = select_sources(request)?;
+    let (candidates, baseline_index) = select_sources(request)?;
     let estimated = tool_tokens_estimated
         || candidates.iter().any(|candidate| {
             counter
                 .count_message(&candidate.message(candidate.text.clone()))
                 .is_none()
         });
-    pack_sources(
+    let descriptions_expected = candidates
+        .iter()
+        .any(|candidate| candidate.source == SourceKind::SkillDescriptions);
+    let baseline_candidates = baseline_index.map(|full_index| {
+        let mut baseline = candidates.clone();
+        if let Some(index) = baseline
+            .iter_mut()
+            .find(|candidate| candidate.source == SourceKind::SkillIndex)
+        {
+            index.raw_bytes = full_index.len();
+            index.text = full_index;
+        }
+        baseline.retain(|candidate| candidate.source != SourceKind::SkillDescriptions);
+        baseline
+    });
+    let baseline_tools = baseline_candidates.as_ref().map(|_| tools.clone());
+    let compiled = pack_sources(
         candidates,
         tools,
         counter,
@@ -336,10 +353,46 @@ pub fn compile(request: &CompileRequest<'_>) -> CtxResult<CompiledNativeContext>
         request.budget,
         input_limit,
         tool_tokens,
-    )
+    )?;
+    if let (Some(baseline_candidates), Some(baseline_tools)) = (baseline_candidates, baseline_tools)
+        && let Ok(baseline) = pack_sources(
+            baseline_candidates,
+            baseline_tools,
+            counter,
+            estimated,
+            request.budget,
+            input_limit,
+            tool_tokens,
+        )
+        && fully_included(&baseline, SourceKind::SkillIndex)
+        && fully_included(&compiled, SourceKind::SkillIndex)
+        && (!descriptions_expected || fully_included(&compiled, SourceKind::SkillDescriptions))
+    {
+        let baseline_bytes: usize = baseline.messages.iter().map(|m| m.content.len()).sum();
+        let actual_bytes: usize = compiled.messages.iter().map(|m| m.content.len()).sum();
+        if let Some(removed_bytes) = baseline_bytes.checked_sub(actual_bytes).filter(|n| *n > 0) {
+            let mut effect =
+                jev::JevEffect::new("context-skill-descriptions", "description_bytes_removed");
+            effect.removed_bytes = u64::try_from(removed_bytes).ok();
+            jev::record_effect(
+                request.config,
+                request.state,
+                request.config.jev.context,
+                &effect,
+            );
+        }
+    }
+    Ok(compiled)
 }
 
-fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
+fn fully_included(compiled: &CompiledNativeContext, source: SourceKind) -> bool {
+    compiled
+        .provenance
+        .iter()
+        .any(|entry| entry.source == source && entry.decision == SourceDecision::Included)
+}
+
+fn select_sources(request: &CompileRequest<'_>) -> CtxResult<(Vec<Candidate>, Option<String>)> {
     let mut out = Vec::new();
     push(
         &mut out,
@@ -407,7 +460,7 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
             )
         })
         .flatten();
-    if let Some((index, _, _)) = &skill_selection {
+    if let Some((index, _, _, _)) = &skill_selection {
         let intro = prompt::SKILL_INDEX_HEADER
             .trim_start_matches("\n\n---\n\n")
             .trim_end();
@@ -552,7 +605,7 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
         );
     }
 
-    if let Some((_, descriptions, _)) = &skill_selection
+    if let Some((_, descriptions, _, _)) = &skill_selection
         && !descriptions.is_empty()
     {
         push(
@@ -624,7 +677,15 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
         };
         out.push(candidate);
     }
-    Ok(out)
+    let baseline_index = skill_selection
+        .and_then(|(_, _, removed, baseline)| (removed > 0).then_some(baseline).flatten())
+        .map(|index| {
+            let intro = prompt::SKILL_INDEX_HEADER
+                .trim_start_matches("\n\n---\n\n")
+                .trim_end();
+            format!("{intro}\n\n{index}")
+        });
+    Ok((out, baseline_index))
 }
 
 /// A `[skill ...]` header is only recognised right after this exact marker,
@@ -1747,7 +1808,6 @@ mod tests {
             ample_budget(),
         ))
         .expect("compile");
-        unsafe { std::env::remove_var("JEV_TEST_NATIVE_SKILL_SELECT_737") };
         handle.join().expect("server");
         let index_message = compiled
             .messages
@@ -1781,6 +1841,94 @@ mod tests {
             .position(|m| m.source == SourceKind::SkillDescriptions)
             .expect("detail position");
         assert!(index_at < details_at);
+        let baseline_index =
+            prompt::skill_index_text(repo.path(), Some(home.path())).expect("full skill index");
+        let baseline_bytes = prompt::SKILL_INDEX_HEADER
+            .trim_start_matches("\n\n---\n\n")
+            .trim_end()
+            .len()
+            + 2
+            + baseline_index.len();
+        let selected_bytes: usize = compiled.messages.iter().map(|m| m.content.len()).sum();
+        let baseline_compiled = {
+            let mut baseline_cfg = cfg.clone();
+            baseline_cfg.jev.context = false;
+            compile(&request(
+                Some(home.path()),
+                repo.path(),
+                &state,
+                &baseline_cfg,
+                "Fix the CSS frontend layout",
+                ample_budget(),
+            ))
+            .expect("baseline compile")
+        };
+        let baseline_rendered_bytes: usize = baseline_compiled
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .sum();
+        assert!(baseline_bytes > index_message.content.len() + detail_message.content.len());
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("native selection effect");
+        let row: serde_json::Value = serde_json::from_str(effects.trim()).expect("effect row");
+        assert_eq!(row["site"], "context-skill-descriptions");
+        assert_eq!(row["action"], "description_bytes_removed");
+        assert_eq!(
+            row["removed_bytes"],
+            baseline_rendered_bytes - selected_bytes
+        );
+
+        let failed_budget = TokenBudget {
+            context_window_tokens: compiled.accounting.tool_tokens + 100,
+            output_reserve_tokens: 0,
+            max_inline_evidence_bytes: 256,
+        };
+        assert!(
+            compile(&request(
+                Some(home.path()),
+                repo.path(),
+                &state,
+                &cfg,
+                "Fix the CSS frontend layout",
+                failed_budget,
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.root().join("jev-effects.jsonl")).expect("effect"),
+            effects,
+            "failed compilation must not append a savings effect"
+        );
+
+        let off_root = tempfile::tempdir().expect("off state");
+        let off_state = StateDir::from_root(off_root.path().to_path_buf());
+        let mut off_cfg = cfg.clone();
+        off_cfg.jev.context = false;
+        compile(&request(
+            Some(home.path()),
+            repo.path(),
+            &off_state,
+            &off_cfg,
+            "Fix the CSS frontend layout",
+            ample_budget(),
+        ))
+        .expect("off compile");
+        assert!(!off_state.root().join("jev-effects.jsonl").exists());
+
+        unsafe { std::env::remove_var("JEV_TEST_NATIVE_SKILL_SELECT_737") };
+        let no_key_root = tempfile::tempdir().expect("no-key state");
+        let no_key_state = StateDir::from_root(no_key_root.path().to_path_buf());
+        compile(&request(
+            Some(home.path()),
+            repo.path(),
+            &no_key_state,
+            &cfg,
+            "Fix the CSS frontend layout",
+            ample_budget(),
+        ))
+        .expect("no-key compile");
+        assert!(!no_key_state.root().join("jev-effects.jsonl").exists());
     }
 
     #[test]
