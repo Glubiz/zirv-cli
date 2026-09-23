@@ -88,6 +88,11 @@ fn context_domain(text: &str) -> Option<&'static str> {
     matches.next().is_none().then_some(first)
 }
 
+/// The `{"_zirv_metadata_only": true, "facts": [...]}` shape `jev::
+/// safe_metadata_request` requires, shared by every metadata-only call site
+/// in this module (parent-report/skill-description selection, and -- since
+/// issue #743 -- `rerank_memory_candidates`): plain, locally computed,
+/// bounded integers only, never repository text.
 #[derive(Serialize)]
 struct ParentReportMetadata {
     _zirv_metadata_only: bool,
@@ -729,37 +734,103 @@ fn find_after(haystack: &str, from: usize, needle: &str) -> Option<usize> {
 /// Jev in one [`rerank_memory_candidates`] call -- state stays bounded
 /// regardless of how large `[memory] retrieval_max_entries` is configured.
 const MEMORY_ADVISE_MAX_CANDIDATES: usize = 32;
-const MEMORY_ADVISE_QUERY_MAX_BYTES: usize = 4096;
 const MEMORY_ADVISE_MAX_CHANGED_PATHS: usize = 100;
-const MEMORY_ADVISE_SUMMARY_MAX_BYTES: usize = 300;
 
-#[derive(Debug, Serialize)]
-struct MemoryAdviseCandidate<'a> {
-    id: &'a str,
-    key: &'a str,
-    summary: String,
+/// Static instructions for every [`rerank_memory_candidates`] question
+/// (issue #743): one shared string, never per-row text, so the whole
+/// question set stays [`jev::Question::metadata_noul`]-eligible. Facts row N
+/// (matching question id `cN`) carries only numbers this module computed
+/// locally, never the candidate's own key or body -- see [`memory_advise_
+/// facts_row`].
+const MEMORY_ADVISE_INSTRUCTIONS: &str = "Facts row N (0-based; id cN) is \
+    [candidate index, trust tier (0 shared, 1 private, 2 explicit), \
+    retrieval score, body size in bytes, verified age in days, 1 if the \
+    candidate's key/body mentions a changed path else 0, count of query \
+    terms it shares]. A higher score, higher tier, a path mention, and \
+    more shared terms indicate a more useful candidate; a larger age \
+    indicates a less useful one. Is this candidate likely directly useful \
+    for carrying out the request? Answer true if uncertain.";
+
+/// Lowercased, punctuation-trimmed words of at least 3 characters -- the
+/// same coarse normalization `context_domain` (above) already applies, used
+/// here only to COUNT a lexical overlap locally; no word ever leaves this
+/// process.
+fn normalized_terms(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
-#[derive(Debug, Serialize)]
-struct MemoryAdviseState<'a> {
-    query: String,
-    changed_paths: &'a [String],
-    candidates: Vec<MemoryAdviseCandidate<'a>>,
+/// One [`rerank_memory_candidates`] fact row for `ranked`, at position
+/// `index` in the sent slice: `[index, trust tier, retrieval score, body
+/// bytes, verified age in days, changed-path mention, query term overlap]`
+/// -- see [`MEMORY_ADVISE_INSTRUCTIONS`] for the field order Jev is told.
+/// Every cell is a locally computed, bounded, non-negative integer; the
+/// candidate's own key and body text are read here only to derive numbers,
+/// never serialized.
+fn memory_advise_facts_row(
+    index: usize,
+    ranked: &retrieval::Ranked<'_>,
+    query_terms: &std::collections::BTreeSet<String>,
+    changed_paths: &[String],
+) -> Vec<u32> {
+    let entry = &ranked.candidate.entry;
+    let tier: u32 = if ranked.candidate.shared {
+        0
+    } else if entry.source == "explicit" {
+        2
+    } else {
+        1
+    };
+    let mentions_changed_path =
+        u32::from(changed_paths.iter().any(|path| {
+            !path.is_empty() && (entry.body.contains(path) || entry.key.contains(path))
+        }));
+    let overlap = normalized_terms(&format!("{} {}", entry.key, entry.body))
+        .intersection(query_terms)
+        .count()
+        .min(31) as u32;
+    vec![
+        index as u32,
+        tier,
+        u32::try_from(ranked.score.max(0))
+            .unwrap_or(u32::MAX)
+            .min(1_000_000),
+        u32::try_from(entry.body.len())
+            .unwrap_or(u32::MAX)
+            .min(1_000_000),
+        u32::try_from(ranked.candidate.verified_age_days)
+            .unwrap_or(u32::MAX)
+            .min(1_000_000),
+        mentions_changed_path,
+        overlap,
+    ]
 }
 
-/// Issue #537 (A3): re-ranks and prunes `selected` -- already
-/// deterministically chosen and budgeted by `retrieval::select` -- with one
-/// Jev advisory call (site `"memory"`) when `cfg.jev.memory` is on. Never
-/// ADDS a candidate `retrieval::select` did not already choose: this only
-/// reorders (by relevance `noul`, descending, stable) and prunes (`noul`
-/// below [`memory::MEMORY_RELEVANCE_FLOOR`]) the same set. Best-effort like every
-/// other `[jev]`-gated site: the gate being off, no credential set, or any
-/// transport/parse error all surface as `jev::advise` returning `None`,
-/// which leaves `selected` in its original deterministic order, membership
-/// AND LENGTH, completely untouched -- the common case, and the only case
-/// today's default config ever takes (`cfg.jev.memory` defaults `false`),
-/// so this never affects `compile`'s own documented determinism guarantee
-/// unless an operator has explicitly opted a Jev credential in.
+/// Issue #537 (A3), re-projected to metadata-only by issue #743: re-ranks
+/// and prunes `selected` -- already deterministically chosen and budgeted by
+/// `retrieval::select` -- with one Jev advisory call (site `"memory"`) when
+/// `cfg.jev.memory` is on. Never ADDS a candidate `retrieval::select` did
+/// not already choose: this only reorders (by relevance `noul`, descending,
+/// stable) and prunes (`noul` below [`memory::MEMORY_RELEVANCE_FLOOR`]) the
+/// same set. Best-effort like every other `[jev]`-gated site: the gate
+/// being off, no credential set, or any transport/parse error all surface
+/// as `jev::advise` returning `None`, which leaves `selected` in its
+/// original deterministic order, membership AND LENGTH, completely
+/// untouched -- the common case, and the only case today's default config
+/// ever takes (`cfg.jev.memory` defaults `false`), so this never affects
+/// `compile`'s own documented determinism guarantee unless an operator has
+/// explicitly opted a Jev credential in.
+///
+/// Issue #743: since issue #746's `jev::safe_metadata_request` egress
+/// boundary, only the `{"_zirv_metadata_only": true, "facts": [...]}` shape
+/// ever reaches Jev; a candidate's key and body NEVER leave this process --
+/// see [`memory_advise_facts_row`] for the locally computed numbers sent in
+/// their place. An enabled-but-legacy-text request used to be rejected by
+/// that boundary before any cache read or network call, which made this
+/// site's own `[jev] memory` gate a dead feature end to end; this metadata
+/// projection is what makes it reachable again.
 ///
 /// Review finding: only the first [`MEMORY_ADVISE_MAX_CANDIDATES`] of
 /// `selected` are ever SENT to Jev (state stays bounded regardless of how
@@ -773,6 +844,15 @@ struct MemoryAdviseState<'a> {
 /// after the ranked ones, ahead of the beyond-slice tail: an incomplete
 /// answer set is never grounds to drop a candidate `retrieval::select`
 /// already chose.
+///
+/// Issue #743: records one `"memory"`/`"candidates_pruned"` [`jev::
+/// JevEffect`] (baseline/actual counts and removed body bytes, all
+/// restricted to the sent slice -- the only candidates that can ever be
+/// pruned) whenever the call succeeds AND actually prunes something; never
+/// when the gate is off, the credential is missing, the call fails, or
+/// nothing was pruned, matching every other effect-recording call site in
+/// this module (`task_context_with_selected_reports`, `select_skill_
+/// descriptions_for_task`).
 fn rerank_memory_candidates<'a>(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -784,36 +864,31 @@ fn rerank_memory_candidates<'a>(
         return selected;
     }
     let sent_len = selected.len().min(MEMORY_ADVISE_MAX_CANDIDATES);
-    let ids: Vec<String> = (0..sent_len).map(|i| i.to_string()).collect();
-    let candidates: Vec<MemoryAdviseCandidate> = selected[..sent_len]
+    let ids: Vec<String> = (0..sent_len).map(|i| format!("c{i}")).collect();
+    let changed_paths_bounded =
+        &changed_paths[..changed_paths.len().min(MEMORY_ADVISE_MAX_CHANGED_PATHS)];
+    let query_terms = normalized_terms(query);
+    let facts: Vec<Vec<u32>> = selected[..sent_len]
         .iter()
-        .zip(&ids)
-        .map(|(ranked, id)| MemoryAdviseCandidate {
-            id,
-            key: ranked.candidate.entry.key.as_str(),
-            summary: crate::utils::truncate_bytes(
-                ranked.candidate.entry.body.clone(),
-                Some(MEMORY_ADVISE_SUMMARY_MAX_BYTES),
-            ),
+        .enumerate()
+        .map(|(index, ranked)| {
+            memory_advise_facts_row(index, ranked, &query_terms, changed_paths_bounded)
         })
         .collect();
     let questions: Vec<jev::Question> = ids
         .iter()
         .map(|id| {
-            jev::Question::noul(
+            jev::Question::metadata_noul(
                 id,
-                "Is this candidate directly useful for carrying out the request?",
-                "yes, directly useful for the request",
-                "no, not directly useful for the request",
+                MEMORY_ADVISE_INSTRUCTIONS,
+                "candidate is useful; keep it",
+                "candidate is not useful; prune it",
             )
         })
         .collect();
-    let changed_paths_bounded =
-        &changed_paths[..changed_paths.len().min(MEMORY_ADVISE_MAX_CHANGED_PATHS)];
-    let advise_state = MemoryAdviseState {
-        query: crate::utils::truncate_bytes(query.to_string(), Some(MEMORY_ADVISE_QUERY_MAX_BYTES)),
-        changed_paths: changed_paths_bounded,
-        candidates,
+    let advise_state = ParentReportMetadata {
+        _zirv_metadata_only: true,
+        facts,
     };
     let Some(answers) = jev::advise(
         cfg,
@@ -826,13 +901,18 @@ fn rerank_memory_candidates<'a>(
         return selected;
     };
 
+    let sent_body_bytes: Vec<usize> = selected[..sent_len]
+        .iter()
+        .map(|ranked| ranked.candidate.entry.body.len())
+        .collect();
     let mut remaining = selected;
     let tail = remaining.split_off(sent_len);
     let sent = remaining;
 
     let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = Vec::new();
     let mut unanswered: Vec<retrieval::Ranked<'a>> = Vec::new();
-    for (ranked, id) in sent.into_iter().zip(ids.iter()) {
+    let mut retained_body_bytes = 0usize;
+    for ((index, ranked), id) in sent.into_iter().enumerate().zip(ids.iter()) {
         // Jev determinism fix: a noul answer that is not `decisive` (margin
         // below `jev::DEFAULT_MIN_MARGIN`; a noul has no separate confidence
         // to check, so this is a margin-only gate) is treated the same as a
@@ -840,17 +920,37 @@ fn rerank_memory_candidates<'a>(
         // score or prune the candidate.
         match answers.get(id) {
             Some(answer) if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) => {
+                retained_body_bytes += sent_body_bytes[index];
                 unanswered.push(ranked);
             }
             Some(answer) => match answer.as_noul() {
-                Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => scored.push((noul, ranked)),
+                Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => {
+                    retained_body_bytes += sent_body_bytes[index];
+                    scored.push((noul, ranked));
+                }
                 Some(_) => {} // a decisive low-relevance verdict prunes the candidate.
-                None => unanswered.push(ranked), // unparseable: kept, original position.
+                None => {
+                    retained_body_bytes += sent_body_bytes[index];
+                    unanswered.push(ranked); // unparseable: kept, original position.
+                }
             },
-            None => unanswered.push(ranked), // missing: kept, original position.
+            None => {
+                retained_body_bytes += sent_body_bytes[index];
+                unanswered.push(ranked); // missing: kept, original position.
+            }
         }
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let pruned_count = sent_len - scored.len() - unanswered.len();
+    if pruned_count > 0 {
+        let mut effect = jev::JevEffect::new("memory", "candidates_pruned");
+        effect.baseline_count = u32::try_from(sent_len).ok();
+        effect.actual_count = u32::try_from(scored.len() + unanswered.len()).ok();
+        effect.removed_bytes =
+            u64::try_from(sent_body_bytes.iter().sum::<usize>() - retained_body_bytes).ok();
+        jev::record_effect(cfg, state, cfg.jev.memory, &effect);
+    }
 
     let mut result: Vec<retrieval::Ranked<'a>> =
         scored.into_iter().map(|(_, ranked)| ranked).collect();
@@ -2405,39 +2505,166 @@ mod tests {
             .collect()
     }
 
-    /// Legacy memory summaries contain free-form text. With the gate and key
-    /// present, the shared privacy boundary refuses them before cache, HTTP,
-    /// or logging and preserves deterministic membership and order.
+    /// A minimal fake HTTP server, structurally like `jev::tests::
+    /// one_shot_server`, that additionally CAPTURES the exact bytes of the
+    /// one request it accepts (as the decoded request body) instead of
+    /// discarding them -- what this module's own metadata-only assertions
+    /// need that the shared `jev::tests` helper does not expose.
+    fn capturing_one_shot_server(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("local_addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let content_length: usize = String::from_utf8_lossy(&buf[..header_end])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let _ = tx.send(
+                String::from_utf8_lossy(&buf[header_end..header_end + content_length]).into_owned(),
+            );
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: \
+                 {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (format!("http://{address}"), rx, handle)
+    }
+
+    /// Issue #743: since issue #746's `jev::safe_metadata_request` egress
+    /// boundary, the legacy text-carrying state this test used to exercise
+    /// is unreachable dead code end to end -- `rerank_memory_candidates` now
+    /// sends only numeric metadata, which is what makes an enabled call
+    /// reach Jev at all. Replaces the old `rejects_text_state_without_
+    /// egress` test (that boundary is still covered directly by `jev.rs`'s
+    /// own `unsafe_text_and_mutated_question_never_read_cache_or_reach_
+    /// http`); this is the success path it used to make impossible to test
+    /// here.
     #[test]
-    fn rerank_memory_candidates_rejects_text_state_without_egress() {
+    fn rerank_memory_candidates_enabled_prunes_a_decisive_candidate_and_records_an_effect() {
         let candidates = [
-            retrieval_candidate("alpha", "secret memory summary"),
-            retrieval_candidate("bravo", "another summary"),
+            retrieval_candidate("alpha", "alpha body text"),
+            retrieval_candidate("bravo", "bravo body text, prune this one"),
+            retrieval_candidate("charlie", "charlie body text"),
         ];
         let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let expected = keys(&selected);
-        let credential_env = "COMPILE_TEST_MEMORY_PRIVACY_746";
+        let response_body = r#"{"model":"jev-1.13.0","answers":{
+            "c0":{"type":"noul","noul":0.9},
+            "c1":{"type":"noul","noul":0.05},
+            "c2":{"type":"noul","noul":0.8}
+        },"usage":{"input_tokens":10,"output_tokens":3}}"#;
+        let (url, request_rx, handle) = capturing_one_shot_server(200, response_body);
+        let credential_env = "COMPILE_TEST_MEMORY_METADATA_743";
         // SAFETY (test-only): this test owns a unique env variable name.
         unsafe { std::env::set_var(credential_env, "secret") };
         let mut cfg = CtxConfig::default();
         cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = "http://127.0.0.1:9".into();
+        cfg.proxy.typesafe.base_url = url;
         cfg.proxy.typesafe.credential_env = credential_env.into();
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+        let result = rerank_memory_candidates(
+            &cfg,
+            &state,
+            "irrelevant query text",
+            &["src/some/changed/path.rs".to_string()],
+            selected,
+        );
         unsafe { std::env::remove_var(credential_env) };
-        assert_eq!(keys(&result), expected);
-        assert!(!state.root().join("jev-decisions.jsonl").exists());
-        assert!(!state.root().join("jev-cache").exists());
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            keys(&result),
+            vec!["alpha", "charlie"],
+            "bravo (decisive noul 0.05, below the relevance floor) must be pruned; \
+             alpha/charlie remain, ranked by noul descending"
+        );
+
+        let sent = request_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the request body must have been captured");
+        assert!(
+            sent.contains("\"_zirv_metadata_only\":true") || sent.contains("_zirv_metadata_only"),
+            "got: {sent}"
+        );
+        for banned in [
+            "alpha",
+            "bravo",
+            "charlie",
+            "body text",
+            "irrelevant query",
+            "changed/path",
+        ] {
+            assert!(
+                !sent.contains(banned),
+                "no candidate key/body or query/path text may reach the wire, got: {sent}"
+            );
+        }
+
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("jev-effects.jsonl must exist after a successful prune");
+        let line = effects.lines().next().expect("one effect line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse effect line");
+        assert_eq!(value["site"], "memory");
+        assert_eq!(value["action"], "candidates_pruned");
+        assert_eq!(value["baseline_count"].as_u64(), Some(3));
+        assert_eq!(value["actual_count"].as_u64(), Some(2));
+        assert_eq!(
+            value["removed_bytes"].as_u64(),
+            Some(candidates[1].entry.body.len() as u64)
+        );
     }
 
     /// Issue #537 (A3): with the gate off, `rerank_memory_candidates` never
     /// even attempts a call (no server listening at that address, so any
     /// attempt would error) and returns the deterministic list untouched --
-    /// the same outcome the 500 fallback above produces, proven independent
-    /// ways.
+    /// the same outcome the 500 fallback below produces, proven independent
+    /// ways. Issue #743: also confirms no decision, cache, or effect file is
+    /// ever created on this path.
     #[test]
     fn rerank_memory_candidates_is_a_pass_through_when_the_gate_is_off() {
         let candidates = [
@@ -2460,6 +2687,189 @@ mod tests {
             3,
             "the ranked list must never be longer than the deterministic one"
         );
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-cache").exists());
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// Issue #743: gate off must not even READ a cache entry that a prior,
+    /// gate-on call already left behind for the identical request -- not
+    /// merely "make no new call". Warms the cache with a real call (gate
+    /// on) that decisively prunes `bravo`, then repeats the identical
+    /// request (same query/changed_paths/candidates, so the same cache
+    /// key) with the gate off and no server listening at all: any attempt
+    /// to reach the network OR read that cache entry would either fail the
+    /// call or return the already-pruned list, so the full deterministic
+    /// list surviving is the proof neither happened.
+    #[test]
+    fn rerank_memory_candidates_gate_off_ignores_a_warm_cache_entry() {
+        let candidates = [
+            retrieval_candidate("alpha", "alpha body"),
+            retrieval_candidate("bravo", "bravo body, prune this one"),
+        ];
+        let response_body = r#"{"model":"jev-1.13.0","answers":{
+            "c0":{"type":"noul","noul":0.9},
+            "c1":{"type":"noul","noul":0.05}
+        },"usage":{"input_tokens":5,"output_tokens":2}}"#;
+        let (url, handle) = jev::tests::one_shot_server(200, response_body);
+        let credential_env = "COMPILE_TEST_MEMORY_WARM_CACHE_743";
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let mut cfg_on = CtxConfig::default();
+        cfg_on.jev.memory = true;
+        cfg_on.proxy.typesafe.base_url = url;
+        cfg_on.proxy.typesafe.credential_env = credential_env.into();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let selected_on: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let deterministic_keys = keys(&selected_on);
+        let warmed = rerank_memory_candidates(&cfg_on, &state, "a query", &[], selected_on);
+        handle.join().expect("server thread must not panic");
+        assert_eq!(
+            keys(&warmed),
+            vec!["alpha"],
+            "the warming call itself must have pruned bravo"
+        );
+        assert!(state.root().join("jev-cache").exists());
+        let decisions_after_warm =
+            std::fs::read_to_string(state.root().join("jev-decisions.jsonl"))
+                .expect("decisions after the warming call");
+        assert_eq!(decisions_after_warm.lines().count(), 1);
+
+        let mut cfg_off = cfg_on.clone();
+        cfg_off.jev.memory = false;
+        let selected_off: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let result = rerank_memory_candidates(&cfg_off, &state, "a query", &[], selected_off);
+        unsafe { std::env::remove_var(credential_env) };
+
+        assert_eq!(
+            keys(&result),
+            deterministic_keys,
+            "gate off must return the full deterministic list even though a matching \
+             warm cache entry (from the earlier gate-on call) would have pruned bravo"
+        );
+        let decisions_after_off = std::fs::read_to_string(state.root().join("jev-decisions.jsonl"))
+            .expect("decisions file must still exist");
+        assert_eq!(
+            decisions_after_off.lines().count(),
+            1,
+            "gate off must write no new decision line"
+        );
+        let effect_lines = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            effect_lines, 1,
+            "gate off must write no new effect line beyond the warming call's own"
+        );
+    }
+
+    /// Issue #743: the gate is on but the named credential env var is unset,
+    /// so `jev::available` is false -- `advise` short-circuits to
+    /// `MissingCredential` before any cache read or connection attempt (no
+    /// server is even started here, so an attempt would hang or error).
+    /// Deterministic order, membership, and length are preserved, and no
+    /// decision/cache/effect file is ever created.
+    #[test]
+    fn rerank_memory_candidates_missing_key_is_a_pass_through() {
+        let candidates = [
+            retrieval_candidate("alpha", "alpha body"),
+            retrieval_candidate("bravo", "bravo body"),
+        ];
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let deterministic_keys = keys(&selected);
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.credential_env = "COMPILE_TEST_MEMORY_MISSING_KEY_743_UNSET".into();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+
+        assert_eq!(keys(&result), deterministic_keys);
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-cache").exists());
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// Issue #743: a non-decisive answer (margin below `jev::
+    /// DEFAULT_MIN_MARGIN`) and a missing answer (the id absent from the
+    /// response entirely) are both treated the same as each other -- kept,
+    /// in their original relative order -- and are never grounds to prune.
+    /// Only the one decisive answer (`alpha`) can move at all, promoted
+    /// ahead of both; nothing is pruned, so no effect row is written.
+    #[test]
+    fn rerank_memory_candidates_uncertain_and_missing_answers_keep_their_candidates() {
+        let candidates = [
+            retrieval_candidate("bravo", "bravo body"), // non-decisive answer
+            retrieval_candidate("alpha", "alpha body"), // decisive, promoted
+            retrieval_candidate("charlie", "charlie body"), // missing answer entirely
+        ];
+        let response_body = r#"{"model":"jev-1.13.0","answers":{
+            "c0":{"type":"noul","noul":0.55},
+            "c1":{"type":"noul","noul":0.9}
+        },"usage":{"input_tokens":4,"output_tokens":2}}"#;
+        let (url, handle) = jev::tests::one_shot_server(200, response_body);
+        let credential_env = "COMPILE_TEST_MEMORY_UNCERTAIN_743";
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.into();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+        unsafe { std::env::remove_var(credential_env) };
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            keys(&result),
+            vec!["alpha", "bravo", "charlie"],
+            "alpha (decisive) is promoted; bravo (non-decisive) and charlie (missing \
+             answer) both keep their original relative order"
+        );
+        assert!(
+            !state.root().join("jev-effects.jsonl").exists(),
+            "nothing was pruned, so no effect row must be written"
+        );
+    }
+
+    /// Issue #743: a failed call (here, a 500 response) falls back to the
+    /// deterministic list exactly like the gate-off/missing-key paths, and
+    /// writes no effect row -- `jev::advise` itself still records the
+    /// failed attempt as a decision-log fallback (covered directly by
+    /// `jev.rs`'s own `advise_on_a_500_response_returns_none_and_records_
+    /// the_fallback`); this test is the call-site guarantee that a failure
+    /// never touches `selected` and never prunes.
+    #[test]
+    fn rerank_memory_candidates_on_a_failed_call_keeps_the_deterministic_list() {
+        let candidates = [
+            retrieval_candidate("alpha", "alpha body"),
+            retrieval_candidate("bravo", "bravo body"),
+        ];
+        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
+        let deterministic_keys = keys(&selected);
+        let (url, handle) = jev::tests::one_shot_server(500, "{}");
+        let credential_env = "COMPILE_TEST_MEMORY_FALLBACK_743";
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.into();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
+        unsafe { std::env::remove_var(credential_env) };
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(keys(&result), deterministic_keys);
+        assert!(!state.root().join("jev-effects.jsonl").exists());
     }
 
     /// Review finding (#537 A3): the per-call cap on candidates SENT to Jev
@@ -2953,6 +3363,103 @@ mod tests {
         assert!(retrieved.iter().any(|line| {
             line.key == "global-retrieval" && line.scope != memory::MemoryScope::Shared
         }));
+    }
+
+    /// Issue #743: `gather_memory` computes `core` (`select_memory_within_
+    /// cap`) independently of, and before, `rerank_memory_candidates` --
+    /// only the separately budgeted `retrieved` layer is ever sent to Jev.
+    /// An entry that is both core AND (sharing the same underlying bank) a
+    /// retrieval candidate is decisively PRUNED from retrieval here, yet
+    /// still reaches the final merged memory layer through `core`,
+    /// untouched -- proving core/explicit facts can never be pruned by
+    /// Jev's ruling on a retrieval-layer duplicate of the same key.
+    #[test]
+    fn gather_memory_core_survives_a_decisive_jev_prune_of_its_retrieval_duplicate() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let response_body = r#"{"model":"jev-1.13.0","answers":{
+            "c0":{"type":"noul","noul":0.05}
+        },"usage":{"input_tokens":2,"output_tokens":1}}"#;
+        let (url, handle) = jev::tests::one_shot_server(200, response_body);
+        let credential_env = "COMPILE_TEST_MEMORY_CORE_PROTECTED_743";
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let mut cfg = CtxConfig::default();
+        cfg.jev.memory = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = credential_env.into();
+
+        let entry = memory::Entry {
+            key: "explicit-core".to_string(),
+            body: "database migration explicit core fact".to_string(),
+            written: 1,
+            verified: 1,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        memory::upsert_scoped(
+            memory::MemoryScope::Global,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &entry,
+        )
+        .expect("store the explicit core entry");
+
+        let classification = crate::commands::workflow::classify::classify(
+            &crate::commands::workflow::classify::ClassificationInput {
+                task: String::new(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            },
+        )
+        .expect("classify");
+        crate::commands::workflow::engine::save(
+            &state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.path().to_path_buf(),
+                "run the database migration".into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classification,
+            ),
+            true,
+        )
+        .expect("save active workflow");
+
+        let (core, retrieved) = gather_memory(&state, repo.path(), &slug, &cfg, now_secs());
+        unsafe { std::env::remove_var(credential_env) };
+        handle.join().expect("server thread must not panic");
+
+        assert!(
+            core.iter().any(|line| line.key == "explicit-core"),
+            "the explicit entry must still be in core: {core:?}"
+        );
+        let merged = merge_memory_layers(&core, &retrieved);
+        assert!(
+            merged.iter().any(|line| line.key == "explicit-core"),
+            "and therefore still in the final merged memory layer, regardless of \
+             what Jev answered about its retrieval-layer duplicate: {merged:?}"
+        );
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("jev-effects.jsonl");
+        assert!(
+            effects.contains("\"candidates_pruned\""),
+            "Jev must actually have decisively pruned the retrieval-layer duplicate \
+             for this to be a meaningful proof, got: {effects}"
+        );
     }
 
     /// Issue #253, exercised end to end through `compile` -- every real

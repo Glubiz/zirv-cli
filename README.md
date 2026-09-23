@@ -3946,7 +3946,7 @@ timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 # the shared Jev client; each is also gated on the `[proxy.typesafe]`
 # credential actually being set (see "Harness proxy" above)
 [jev]
-memory = false      # reranks retrieval, gates harvest; ZIRV_CTX_JEV_MEMORY
+memory = false      # reranks retrieval from numeric metadata only (never key/body text), gates harvest, records candidates_pruned effects; ZIRV_CTX_JEV_MEMORY
 supervisor = false  # judge pre-filter, crash triage, handoff quality; ZIRV_CTX_JEV_SUPERVISOR
 dispatch = false    # model tier for an omitted Agent model; ZIRV_CTX_JEV_DISPATCH
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
