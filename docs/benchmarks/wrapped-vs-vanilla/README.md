@@ -34,7 +34,7 @@ scored, timed, and cost-tracked; `aggregate.py` rolls the per-run
 ## Reproducing the recorded grids
 
 From this directory, current grid (zirv under test vs. vanilla + superpowers,
-2026-09-23, `report-opt-*.md` / `results-opt-*.csv`):
+2026-09-23):
 
 ```
 python run.py --tasks all --conds vanilla,zirv,zirv-proxy --reps 3 --model sonnet --parallel 3 \
