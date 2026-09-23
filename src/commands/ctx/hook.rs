@@ -1891,6 +1891,20 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
     // (`obfuscate.mode == Off`), exactly like this handler's own pre-#466
     // `.ok()` fallback for the adoption marker.
     let cfg = super::config::CtxConfig::load(&repo, env).unwrap_or_default();
+
+    // Issue #745: a closed-set, deterministic administrative dispatch that
+    // answers a known-safe read-only request in-process and blocks the
+    // prompt before any model request -- the actual LLM-turn saving this
+    // hook can offer. Checked first: when it matches, nothing else in this
+    // handler (obfuscation, the marker/mail context, attention) runs,
+    // because no model turn happens at all. Gate off, credential missing, no
+    // exact match, or the matched renderer failing -- returns `None` and
+    // falls straight through, byte-identical to today.
+    if let Some(block) = admin_dispatch_block(&cfg, &repo, env, &prompt_text_from(stdin)) {
+        let _ = writeln!(w, "{block}");
+        return Ok(0);
+    }
+
     if cfg.obfuscate.mode != super::config::ObfuscateMode::Off {
         let prompt = serde_json::from_str::<serde_json::Value>(stdin)
             .ok()
@@ -1972,6 +1986,158 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
         );
     }
     Ok(0)
+}
+
+/// Issue #745: prompts this hook can answer without ever asking a model -- a
+/// closed set of already-authorized, read-only administrative operations,
+/// matched by exact string equality after normalization. No arguments are
+/// read from the prompt and no operation takes any beyond `repo`/`env`: a
+/// near-miss, extra words, or an argument anywhere in the prompt matches
+/// nothing here and falls straight through to today's path rather than
+/// attempting a partial match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminOp {
+    CtxStatus,
+    JevStatus,
+    Inbox,
+}
+
+impl AdminOp {
+    /// The static op name recorded on the effect row and shown in the block
+    /// reason's prefix line -- never the raw prompt text, which this
+    /// closed-set path never logs, records, or sends anywhere (including to
+    /// Jev; see [`admin_dispatch_block`]'s own doc comment).
+    fn name(self) -> &'static str {
+        match self {
+            AdminOp::CtxStatus => "zirv ctx status",
+            AdminOp::JevStatus => "zirv jev status",
+            AdminOp::Inbox => "zirv inbox",
+        }
+    }
+
+    fn matching(normalized: &str) -> Option<Self> {
+        match normalized {
+            "zirv status" | "zirv ctx status" => Some(AdminOp::CtxStatus),
+            "zirv jev status" => Some(AdminOp::JevStatus),
+            "zirv inbox" => Some(AdminOp::Inbox),
+            _ => None,
+        }
+    }
+
+    /// Renders this operation's output in-process -- the same function the
+    /// matching CLI verb itself calls -- with no shell, no arguments beyond
+    /// `repo`/`env`, and no side effect beyond what that renderer already
+    /// performs as a read (`inbox --peek` reads mail without consuming it;
+    /// `status` is called here with `diff: false` so it never writes a
+    /// per-session snapshot). `None` means "could not render"; the caller
+    /// falls back to today's path rather than ever failing the prompt.
+    fn render(self, cfg: &CtxConfig, repo: &Path, env: EnvLookup<'_>) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        match self {
+            AdminOp::CtxStatus => {
+                let args = super::status::StatusArgs {
+                    decisions: 10,
+                    brief: true,
+                    diff: false,
+                    breakdown: None,
+                    json: false,
+                    agents: false,
+                    full: false,
+                };
+                super::status::run_with(&args, &mut out, repo, env, false).ok()?;
+            }
+            AdminOp::JevStatus => {
+                super::jev::status(cfg, &mut out).ok()?;
+            }
+            AdminOp::Inbox => {
+                let args = super::mail::InboxArgs {
+                    peek: true,
+                    ..Default::default()
+                };
+                super::mail::run_inbox_with(&args, &mut out, repo, env).ok()?;
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Trim, lowercase, collapse whitespace runs, and strip one leading `/` --
+/// the exact normalization [`AdminOp::matching`] compares against. Never a
+/// fuzzy match: this is byte-for-byte equality against the *normalized*
+/// string only, so "zirv ctx status now" or "zirv ctx status --json" match
+/// nothing here.
+fn normalize_admin_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    let trimmed = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The raw `prompt` field straight out of the hook's stdin JSON -- not
+/// carried on [`HookPayload`] because nothing else in this handler needs it.
+fn prompt_text_from(stdin: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(stdin)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// Issue #745: answers a closed-set, already-authorized, read-only
+/// administrative request in-process, with a `{"decision":"block","reason":
+/// ...}` `UserPromptSubmit` output that stops the prompt before any model
+/// request -- the actual LLM-turn saving this hook can offer. Active only
+/// when the operator gate (`cfg.jev.admin_dispatch`) is on AND the Jev
+/// credential is present (`jev::available`) -- this feature's own
+/// Jev-optional contract, even though this path never makes a Jev HTTP call:
+/// issue #746's egress boundary (`jev.rs::safe_metadata_request`) forbids
+/// sending prompt text anywhere, so v1's selection is deterministic
+/// exact-match only, and only a static effect row (never a decision/cache
+/// row) is recorded. `None` (gate off, credential missing, no exact match,
+/// or the matched renderer failing) means "run today's path" -- byte-
+/// identical output, no effect row written.
+fn admin_dispatch_block(
+    cfg: &CtxConfig,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    prompt: &str,
+) -> Option<String> {
+    if !cfg.jev.admin_dispatch || !super::jev::available(&cfg.proxy.typesafe) {
+        return None;
+    }
+    let op = AdminOp::matching(&normalize_admin_prompt(prompt))?;
+    let rendered = op.render(cfg, repo, env)?;
+    let body =
+        crate::utils::truncate_bytes(String::from_utf8_lossy(&rendered).into_owned(), Some(8192));
+    let reason = format!(
+        "zirv: answered \"{}\" locally (no model turn)\n\n{}",
+        op.name(),
+        body.trim_end()
+    );
+
+    if let Ok(state) = StateDir::resolve(env) {
+        let effect = super::jev::JevEffect {
+            item_id: Some(op.name()),
+            reason: Some(op.name()),
+            ..super::jev::JevEffect::new("admin_dispatch", "llm_turn_avoided")
+        };
+        super::jev::record_effect(cfg, &state, cfg.jev.admin_dispatch, &effect);
+    }
+
+    Some(
+        serde_json::json!({
+            "decision": "block",
+            "reason": reason
+        })
+        .to_string(),
+    )
 }
 
 /// PreCompact cannot add instructions to a compaction (verified against the
@@ -11940,5 +12106,333 @@ capable a model does it actually need?",
         let reason = value["reason"].as_str().expect("reason");
         assert!(reason.contains("GITHUB_TOKEN:1"), "{reason}");
         assert!(!reason.contains("ghp_"), "{reason}");
+    }
+
+    // -- Issue #745: closed-set administrative dispatch ---------------------
+
+    /// The operator env-override keys [`admin_dispatch_block`] reads through
+    /// `CtxConfig::load`'s `env` closure -- `jev::available` itself reads
+    /// the credential straight off the REAL process environment (never this
+    /// closure), so every admin-dispatch test also sets `credential_var`
+    /// via [`crate::commands::ctx::testenv::VarGuard`], not here.
+    fn admin_dispatch_env(
+        state: &std::path::Path,
+        credential_var: &str,
+        gate_on: bool,
+    ) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV".to_string(),
+                credential_var.to_string(),
+            ),
+        ]
+        .into();
+        if gate_on {
+            env.insert(
+                "ZIRV_CTX_JEV_ADMIN_DISPATCH".to_string(),
+                "true".to_string(),
+            );
+        }
+        env
+    }
+
+    fn run_prompt_captured(
+        cwd: &str,
+        prompt: &str,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Vec<u8> {
+        let stdin = serde_json::json!({
+            "session_id": "s1",
+            "cwd": cwd,
+            "prompt": prompt
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_prompt(&mut out, &stdin, &|k| env.get(k).cloned()).expect("hook");
+        out
+    }
+
+    /// Gate on, credential present, exact match (case/whitespace normalized)
+    /// -- blocks the prompt before any model request with the rendered
+    /// `zirv ctx status` output, and records exactly one effect row. No Jev
+    /// HTTP call is ever made on this path (issue #746's egress boundary
+    /// forbids sending prompt text to Jev at all), so no decision row and no
+    /// cache entry exist either.
+    #[test]
+    fn admin_dispatch_answers_zirv_ctx_status_without_a_model_turn() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = repo.path().join("state");
+        StateDir::from_root(state.clone())
+            .ensure()
+            .expect("ensure state dir");
+        let credential_var = "JEV_TEST_ADMIN_DISPATCH_CTX_STATUS_745";
+        let _cred =
+            crate::commands::ctx::testenv::VarGuard::set(&[(credential_var, Some("secret"))]);
+        let env = admin_dispatch_env(&state, credential_var, true);
+
+        let out = run_prompt_captured(
+            repo.path().to_str().expect("utf8 repo path"),
+            "  Zirv   CTX   Status  ",
+            &env,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("block json");
+        assert_eq!(value["decision"], "block");
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(
+            reason.starts_with("zirv: answered \"zirv ctx status\" locally (no model turn)"),
+            "got {reason}"
+        );
+        assert!(reason.contains("state dir:"), "got {reason}");
+
+        let effects =
+            std::fs::read_to_string(state.join("jev-effects.jsonl")).expect("effects file");
+        assert!(
+            effects.contains("\"site\":\"admin_dispatch\""),
+            "got {effects}"
+        );
+        assert!(
+            effects.contains("\"action\":\"llm_turn_avoided\""),
+            "got {effects}"
+        );
+        assert!(
+            effects.contains("\"item_id\":\"zirv ctx status\""),
+            "got {effects}"
+        );
+        assert_eq!(
+            effects.lines().count(),
+            1,
+            "exactly one effect row, no other write: {effects}"
+        );
+        assert!(
+            !state.join("jev-decisions.jsonl").exists(),
+            "an exact-match admin dispatch makes no Jev call, so it writes no decision row"
+        );
+        assert!(
+            !state.join("jev-cache").exists(),
+            "an exact-match admin dispatch makes no Jev call, so no cache entry can exist"
+        );
+    }
+
+    /// Same contract, the `zirv jev status` operation.
+    #[test]
+    fn admin_dispatch_answers_zirv_jev_status_without_a_model_turn() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = repo.path().join("state");
+        let credential_var = "JEV_TEST_ADMIN_DISPATCH_JEV_STATUS_745";
+        let _cred =
+            crate::commands::ctx::testenv::VarGuard::set(&[(credential_var, Some("secret"))]);
+        let env = admin_dispatch_env(&state, credential_var, true);
+
+        let out = run_prompt_captured(
+            repo.path().to_str().expect("utf8 repo path"),
+            "/zirv jev status",
+            &env,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("block json");
+        assert_eq!(value["decision"], "block");
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(
+            reason.starts_with("zirv: answered \"zirv jev status\" locally (no model turn)"),
+            "got {reason}"
+        );
+        assert!(reason.contains("jev.admin_dispatch on"), "got {reason}");
+        assert!(reason.contains("status        active"), "got {reason}");
+        assert!(
+            std::fs::read_to_string(state.join("jev-effects.jsonl"))
+                .expect("effects file")
+                .contains("\"item_id\":\"zirv jev status\"")
+        );
+    }
+
+    /// `zirv inbox` -- the rendered output must be a PEEK: the message stays
+    /// unread (still readable by an ordinary `inbox --peek` afterward), not
+    /// moved into `read/` as a normal consuming `zirv ctx inbox` would.
+    #[test]
+    fn admin_dispatch_answers_zirv_inbox_without_consuming_mail() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = repo.path().join("state");
+        let send_env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let mut send_out = Vec::new();
+        let mut send_stdin = std::io::Cursor::new(Vec::<u8>::new());
+        super::super::mail::run_send_with(
+            &super::super::mail::SendArgs {
+                claim_once: true,
+                message: Some("admin dispatch peek marker: still unread".to_string()),
+                ..super::super::mail::SendArgs::default()
+            },
+            &mut send_out,
+            repo.path(),
+            &|k| send_env.get(k).cloned(),
+            &mut send_stdin,
+        )
+        .expect("seed mail");
+
+        let credential_var = "JEV_TEST_ADMIN_DISPATCH_INBOX_745";
+        let _cred =
+            crate::commands::ctx::testenv::VarGuard::set(&[(credential_var, Some("secret"))]);
+        let env = admin_dispatch_env(&state, credential_var, true);
+
+        let out = run_prompt_captured(
+            repo.path().to_str().expect("utf8 repo path"),
+            "zirv inbox",
+            &env,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("block json");
+        assert_eq!(value["decision"], "block");
+        let reason = value["reason"].as_str().expect("reason");
+        assert!(
+            reason.starts_with("zirv: answered \"zirv inbox\" locally (no model turn)"),
+            "got {reason}"
+        );
+        assert!(
+            reason.contains("admin dispatch peek marker: still unread"),
+            "got {reason}"
+        );
+
+        // Still there, unconsumed: an ordinary peek after the hook ran must
+        // see it exactly as before.
+        let mut check_out = Vec::new();
+        super::super::mail::run_inbox_with(
+            &super::super::mail::InboxArgs {
+                peek: true,
+                ..Default::default()
+            },
+            &mut check_out,
+            repo.path(),
+            &|k| send_env.get(k).cloned(),
+        )
+        .expect("inbox check");
+        let text = String::from_utf8(check_out).expect("utf8");
+        assert!(
+            text.contains("admin dispatch peek marker: still unread"),
+            "the peek must not have consumed the message: {text}"
+        );
+    }
+
+    /// Extra words after an otherwise-recognized command are a near-miss,
+    /// not a match: the closed set is exact-match only. Falls straight
+    /// through to today's path, byte-identical to a run with the gate off,
+    /// and records no effect row.
+    #[test]
+    fn admin_dispatch_near_miss_falls_through_byte_identical() {
+        let prompt = "zirv ctx status --json";
+        let cwd = "/repo";
+
+        let home_on = tempfile::tempdir().expect("home");
+        let _home_on = crate::commands::ctx::testenv::HomeGuard::set(home_on.path());
+        let state_on_dir = tempfile::tempdir().expect("state");
+        let state_on = state_on_dir.path().to_path_buf();
+        let credential_var = "JEV_TEST_ADMIN_DISPATCH_NEAR_MISS_745";
+        let _cred =
+            crate::commands::ctx::testenv::VarGuard::set(&[(credential_var, Some("secret"))]);
+        let env_on = admin_dispatch_env(&state_on, credential_var, true);
+        let out_on = run_prompt_captured(cwd, prompt, &env_on);
+        drop(_home_on);
+
+        let home_off = tempfile::tempdir().expect("home");
+        let _home_off = crate::commands::ctx::testenv::HomeGuard::set(home_off.path());
+        let state_off_dir = tempfile::tempdir().expect("state");
+        let state_off = state_off_dir.path().to_path_buf();
+        // "Today" -- no jev overrides in the environment at all.
+        let env_off: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_off.display().to_string(),
+        )]
+        .into();
+        let out_off = run_prompt_captured(cwd, prompt, &env_off);
+
+        assert_eq!(
+            out_on, out_off,
+            "a near-miss must fall through byte-identical to today"
+        );
+        assert!(!state_on.join("jev-effects.jsonl").exists());
+    }
+
+    /// Gate off, credential present, otherwise-exact match -- byte-identical
+    /// to today, and no effect row.
+    #[test]
+    fn admin_dispatch_gate_off_falls_through_byte_identical() {
+        let prompt = "zirv jev status";
+        let cwd = "/repo";
+        let credential_var = "JEV_TEST_ADMIN_DISPATCH_GATE_OFF_745";
+        let _cred =
+            crate::commands::ctx::testenv::VarGuard::set(&[(credential_var, Some("secret"))]);
+
+        let home_off = tempfile::tempdir().expect("home");
+        let _home_off = crate::commands::ctx::testenv::HomeGuard::set(home_off.path());
+        let state_off_dir = tempfile::tempdir().expect("state");
+        let state_off = state_off_dir.path().to_path_buf();
+        let env_off = admin_dispatch_env(&state_off, credential_var, false);
+        let out_off = run_prompt_captured(cwd, prompt, &env_off);
+        drop(_home_off);
+
+        let home_today = tempfile::tempdir().expect("home");
+        let _home_today = crate::commands::ctx::testenv::HomeGuard::set(home_today.path());
+        let state_today_dir = tempfile::tempdir().expect("state");
+        let state_today = state_today_dir.path().to_path_buf();
+        let env_today: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_today.display().to_string(),
+        )]
+        .into();
+        let out_today = run_prompt_captured(cwd, prompt, &env_today);
+
+        assert_eq!(
+            out_off, out_today,
+            "gate off must fall through byte-identical to today"
+        );
+        assert!(!state_off.join("jev-effects.jsonl").exists());
+    }
+
+    /// Gate on, exact match, but the credential env var is unset -- same
+    /// contract as gate off: byte-identical to today, no effect row. Proves
+    /// `jev::available` (which reads the REAL process environment, not the
+    /// `env` closure `CtxConfig::load` uses) is actually consulted, not just
+    /// the gate.
+    #[test]
+    fn admin_dispatch_missing_credential_falls_through_byte_identical() {
+        let prompt = "zirv ctx status";
+        let cwd = "/repo";
+        let credential_var = "JEV_TEST_ADMIN_DISPATCH_MISSING_KEY_745";
+        // Never set: `available` must see it as absent.
+
+        let home_on = tempfile::tempdir().expect("home");
+        let _home_on = crate::commands::ctx::testenv::HomeGuard::set(home_on.path());
+        let state_on_dir = tempfile::tempdir().expect("state");
+        let state_on = state_on_dir.path().to_path_buf();
+        let env_on = admin_dispatch_env(&state_on, credential_var, true);
+        let out_on = run_prompt_captured(cwd, prompt, &env_on);
+        drop(_home_on);
+
+        let home_today = tempfile::tempdir().expect("home");
+        let _home_today = crate::commands::ctx::testenv::HomeGuard::set(home_today.path());
+        let state_today_dir = tempfile::tempdir().expect("state");
+        let state_today = state_today_dir.path().to_path_buf();
+        let env_today: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_today.display().to_string(),
+        )]
+        .into();
+        let out_today = run_prompt_captured(cwd, prompt, &env_today);
+
+        assert_eq!(
+            out_on, out_today,
+            "a missing credential must fall through byte-identical to today"
+        );
+        assert!(!state_on.join("jev-effects.jsonl").exists());
     }
 }
