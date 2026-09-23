@@ -2535,7 +2535,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
 | `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
-| `zirv ctx agent <name> <prompt> [--manifest <path>] [--worktree] [--worktree-reuse] [--workspace <name>]` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal; a selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` (issue #725) resolves a YAML file's `brief`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same flags instead of typing each one -- untrusted input that can only narrow: a field it shares with an explicit CLI flag is a hard error on any disagreement, except the narrowing-capable fields, where the stricter value always wins. `--worktree --worktree-reuse` (issue #718, opt-in, default off) tries the warm pool first: an `Idle` tree from a prior `--worktree-reuse` allocation whose base commit (and, once #716 lands, `[[workspace]].setup` list) digests the same is `git reset --hard`, never `git worktree add`, reused with its build cache (e.g. `target/`) intact -- untracked/ignored content is left on disk across reuse by design, since `reset --hard` never touches it. A digest mismatch or a `worktree::decide` refusal (any unpushed commit, tracked dirt, or cherry-unmatched commit) falls back to a cold `git worktree add`, exactly today's `--worktree` behavior; a dirty `Idle` tree is never reused and never reset. On release, an opted-in tree is marked `Idle` and kept on disk (subject to `[worktree] idle_pool_max`) instead of `git worktree remove`d, until `[worktree] idle_ttl_secs` expires it through the same proof-required GC/`zirv ctx reconcile` path every other worktree removal already goes through |
+| `zirv ctx agent <name> <prompt> [--manifest <path>] [--worktree] [--worktree-reuse] [--workspace <name>] [--goal <text>]` | Delegates one task to a supervised worker on another enabled harness — a dashboard pane when one is live, otherwise inline in this terminal; workflow reviewers run inline because their caller must consume completed review evidence synchronously. A selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` resolves a YAML file's `brief`/`agent`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same launch instead of typing each one; `agent` contributes default skills and read-only/capability floors. Untrusted manifest input can only narrow: a field it shares with an explicit CLI flag is a hard error on disagreement, except narrowing-capable fields, where the stricter value wins. `--worktree --worktree-reuse` (issue #718, opt-in, default off) tries the warm pool first: an `Idle` tree from a prior reuse allocation whose base commit and ordered `[[workspace]].setup` list digest the same is reset to that base and reused with its untracked build cache intact. A digest mismatch or proof refusal falls back to a cold worktree; matched setup receipts retain the same checkout identity and resume only unchanged successful steps. On release, eligible trees remain `Idle` up to `[worktree] idle_pool_max`; `[worktree] idle_ttl_secs` expires them through proof-required GC/reconcile. `--goal` forces an inline launch and first runs one bounded, depth-zero environment-preparation bootstrap in the selected checkout; it must exit zero and report explicit `Done` JSON before the main worker may start. The bootstrap uses the operator's configured Fast tier when present, otherwise leaves model selection to the harness. |
 | `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
@@ -2581,8 +2581,10 @@ zirv ctx agent claude "implement the API change" --worktree --workspace backend-
 With `--worktree`, extra repositories and setup commands run inside the fresh
 linked worktree. Without it, the explicit `--workdir` or current checkout is
 the workspace root. Repositories are cloned in declaration order and setup
-commands run sequentially after every clone is ready. A failed clone or setup
-command aborts the delegation; the worker never starts. Clones time out after
+commands run sequentially after every clone is ready. Each successful setup
+step is recorded append-only by checkout, index and command digest, so retrying
+a failed setup skips only unchanged successes; a changed command reruns. A
+failed clone or setup command aborts the delegation; the worker never starts. Clones time out after
 five minutes and each setup step after ten minutes. Both run with credentials,
 all `ZIRV_*` authority/session variables, and inherited git-control variables
 removed from their environment. Existing clone directories are accepted only
@@ -2601,9 +2603,11 @@ is counted only below a path the operator's user config marks trusted. A
 workspace with MCP requirements runs inline on the validated harness with
 cross-harness fallback disabled for that launch. `skills` are resolved through the normal
 `SkillRegistry`, including version pins and dependencies, and are attached as
-labelled instructions that grant no authority. Harness-runtime workspaces use
-only their explicit `skills` list; `AgentManifest` defaults are not part of
-this launch path.
+labelled instructions that grant no authority. A delegation manifest may name
+an `AgentManifest` with `agent: <id>`; its skills are defaults only, and an
+explicit workspace `skills` list replaces them. This does not apply the
+manifest's model, role, or runtime settings; its read-only and required
+capability constraints still gate the launch.
 
 Workspace arrays from the operator and repository layers are additive. Names
 must be unique, unknown fields are rejected, git destinations must be relative
@@ -4005,6 +4009,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
+`worker.bootstrap_timeout_secs`,
 `handover`, `obfuscate.mode`, `obfuscate.entropy`, `obfuscate.prompt`,
 `obfuscate.allow`, `obfuscate.literals_file`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
 `score.token_ceiling`, `score.token_floor_ratio`, `score.token_ceiling_ratio`,
@@ -4156,6 +4161,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `worker.codex` | `ZIRV_CTX_WORKER_MODEL_CODEX` |
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
+| `worker.bootstrap_timeout_secs` | `ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS` (whole goal-bootstrap run; default `600`, must be greater than zero) |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `model_tiers` (`model_tiers.<agent>.<tier>`) | `ZIRV_CTX_MODEL_TIERS_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_MODEL_TIERS_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |

@@ -11,14 +11,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::adapters::AgentAdapter;
 use super::config::EnvLookup;
+use super::state::{StateDir, create_private_dir_all, open_private_append};
 use super::{CtxResult, supervise};
 use crate::commands::workflow::agents::SkillRef;
 use crate::commands::workflow::skill::SkillRegistry;
@@ -222,7 +225,19 @@ pub fn attach_skills(
     prompt: String,
     env: EnvLookup<'_>,
 ) -> CtxResult<String> {
-    let requested_skills = &workspace.skills;
+    attach_skill_refs(&workspace.name, &workspace.skills, repo, prompt, env)
+}
+
+/// Attach an already-authorized list of skill references through the one
+/// workspace renderer. Agent-manifest defaults use this too, so dependency
+/// resolution and the untrusted-instruction label cannot drift.
+pub fn attach_skill_refs(
+    source: &str,
+    requested_skills: &[SkillRef],
+    repo: &Path,
+    prompt: String,
+    env: EnvLookup<'_>,
+) -> CtxResult<String> {
     if requested_skills.is_empty() {
         return Ok(prompt);
     }
@@ -234,7 +249,7 @@ pub fn attach_skills(
         let requested = skill_request(requested);
         let root = registry
             .get(&requested)
-            .map_err(|error| format!("workspace '{}': {error}", workspace.name))?;
+            .map_err(|error| format!("skill source '{source}': {error}"))?;
         for skill in registry.resolve_stack(&root.manifest.id)? {
             if !seen.insert(skill.manifest.id.clone()) {
                 continue;
@@ -264,6 +279,7 @@ pub struct WorkspaceReady {
 
 pub fn materialize(
     workspace: &WorkspaceConfig,
+    state: &StateDir,
     root: &Path,
     adapter: &dyn AgentAdapter,
     adapter_flags: &[String],
@@ -271,7 +287,7 @@ pub fn materialize(
 ) -> CtxResult<WorkspaceReady> {
     validate_mcp_servers(workspace, root, adapter, adapter_flags, env)?;
     clone_repositories(workspace, root)?;
-    run_setup(workspace, root)?;
+    run_setup(workspace, state, root)?;
     Ok(WorkspaceReady { _private: () })
 }
 
@@ -517,16 +533,119 @@ fn git_output(cwd: &Path, args: &[&str]) -> CtxResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn run_setup(workspace: &WorkspaceConfig, root: &Path) -> CtxResult<()> {
-    run_setup_with_timeout(workspace, root, SETUP_STEP_TIMEOUT)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SetupProgress {
+    step_index: usize,
+    step_digest: String,
+    completed_at: u64,
+}
+
+fn setup_record_path(state: &StateDir, root: &Path) -> PathBuf {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if canonical
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "worktrees")
+        && canonical
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == crate::utils::SCRIPT_DIR_NAME)
+        && let (Some(source_repo), Some(short)) = (
+            canonical
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent),
+            canonical.file_name().and_then(|name| name.to_str()),
+        )
+    {
+        return state
+            .worktrees()
+            .join(super::state::repo_slug(source_repo))
+            .join(format!("{short}-setup.jsonl"));
+    }
+    let rendered = canonical.to_string_lossy();
+    let digest = Sha256::digest(rendered.as_bytes());
+    let suffix: String = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let stem = canonical
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "checkout".to_string());
+    state
+        .worktrees()
+        .join(super::state::repo_slug(&canonical))
+        .join(format!("{stem}-{suffix}-setup.jsonl"))
+}
+
+fn setup_step_digest(command: &str) -> String {
+    Sha256::digest(command.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn completed_setup_steps(path: &Path) -> HashSet<(usize, String)> {
+    std::fs::read_to_string(path)
+        .ok()
+        .into_iter()
+        .flat_map(|contents| contents.lines().map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|line| serde_json::from_str::<SetupProgress>(&line).ok())
+        .map(|record| (record.step_index, record.step_digest))
+        .collect()
+}
+
+fn append_setup_completion(path: &Path, step_index: usize, step_digest: String) -> CtxResult<()> {
+    let parent = path.parent().ok_or("setup progress path has no parent")?;
+    create_private_dir_all(parent)?;
+    let mut file = open_private_append(path)?;
+    // The leading newline turns a torn final record into one ignorable row,
+    // keeping this success record independently parseable on the next read.
+    writeln!(
+        file,
+        "\n{}",
+        serde_json::to_string(&SetupProgress {
+            step_index,
+            step_digest,
+            completed_at: super::state::now_secs(),
+        })?
+    )?;
+    Ok(())
+}
+
+fn run_setup(workspace: &WorkspaceConfig, state: &StateDir, root: &Path) -> CtxResult<()> {
+    run_setup_with_timeout(workspace, state, root, SETUP_STEP_TIMEOUT)
 }
 
 fn run_setup_with_timeout(
     workspace: &WorkspaceConfig,
+    state: &StateDir,
     root: &Path,
     timeout: Duration,
 ) -> CtxResult<()> {
+    let path = setup_record_path(state, root);
+    let completed = completed_setup_steps(&path);
     for (index, command) in workspace.setup.iter().enumerate() {
+        let digest = setup_step_digest(command);
+        if completed.contains(&(index, digest.clone())) {
+            continue;
+        }
         let mut shell = if cfg!(windows) {
             let mut shell = Command::new("powershell");
             shell.arg("-Command").arg(command);
@@ -545,7 +664,7 @@ fn run_setup_with_timeout(
             )
         })?;
         match outcome {
-            supervise::Outcome::Exited(0) => {}
+            supervise::Outcome::Exited(0) => append_setup_completion(&path, index, digest)?,
             supervise::Outcome::Exited(code) => {
                 return Err(format!(
                     "workspace '{}': setup step {} failed with exit code {code}; refusing delegation before worker launch",
@@ -1446,9 +1565,10 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
             return;
         }
         let temp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(temp.path().join("state"));
         let mut config = workspace();
         config.setup = vec!["false".into(), "touch should-not-exist".into()];
-        let error = run_setup(&config, temp.path()).expect_err("first step fails");
+        let error = run_setup(&config, &state, temp.path()).expect_err("first step fails");
         assert!(error.to_string().contains("setup step 1 failed"));
         assert!(!temp.path().join("should-not-exist").exists());
     }
@@ -1490,13 +1610,105 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
             return;
         }
         let temp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(temp.path().join("state"));
         let mut config = workspace();
         config.setup.push("sleep 30".into());
         let started = Instant::now();
-        let error = run_setup_with_timeout(&config, temp.path(), Duration::from_millis(50))
+        let error = run_setup_with_timeout(&config, &state, temp.path(), Duration::from_millis(50))
             .expect_err("setup must time out");
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn setup_progress_resumes_only_matching_successes_and_ignores_torn_rows() {
+        if cfg!(windows) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(temp.path().join("state"));
+        let counter = temp.path().join("counter");
+        let later = temp.path().join("later");
+        let mut config = workspace();
+        config.setup = vec![
+            format!("printf first >> {}", counter.display()),
+            "false".into(),
+            format!("touch {}", later.display()),
+        ];
+        run_setup(&config, &state, temp.path()).expect_err("partial setup fails");
+        assert_eq!(
+            std::fs::read_to_string(&counter).expect("first ran"),
+            "first"
+        );
+        assert!(!later.exists());
+
+        let path = setup_record_path(&state, temp.path());
+        let mut progress = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("progress exists");
+        write!(progress, "{{\"torn\"").expect("torn row");
+        config.setup[1] = "true".into();
+        run_setup(&config, &state, temp.path()).expect("retry succeeds");
+        assert_eq!(
+            std::fs::read_to_string(&counter).expect("first remains once"),
+            "first"
+        );
+        assert!(later.exists());
+
+        config.setup[0] = format!("printf changed >> {}", counter.display());
+        run_setup(&config, &state, temp.path()).expect("changed command reruns");
+        assert_eq!(
+            std::fs::read_to_string(&counter).expect("counter"),
+            "firstchanged"
+        );
+    }
+
+    #[test]
+    fn setup_progress_identity_is_root_and_index_sensitive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(temp.path().join("state"));
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(&left).expect("left");
+        std::fs::create_dir_all(&right).expect("right");
+        assert_ne!(
+            setup_record_path(&state, &left),
+            setup_record_path(&state, &right)
+        );
+
+        let digest = setup_step_digest("echo setup");
+        let completed = HashSet::from([(0, digest.clone())]);
+        assert!(completed.contains(&(0, digest.clone())));
+        assert!(!completed.contains(&(1, digest)));
+    }
+
+    #[test]
+    fn setup_step_digest_matches_sha256_vector() {
+        assert_eq!(
+            setup_step_digest("echo setup"),
+            "893a2fc5244216ce6b1c0796aa0a30dd959fdb7ca95256aed58892a08fc8174c"
+        );
+    }
+
+    #[test]
+    fn managed_worktree_progress_uses_source_repo_slug_and_short_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let checkout = source
+            .join(crate::utils::SCRIPT_DIR_NAME)
+            .join("worktrees")
+            .join("abcd1234");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+        let state = StateDir::from_root(temp.path().join("state"));
+
+        assert_eq!(
+            setup_record_path(&state, &checkout),
+            state
+                .worktrees()
+                .join(super::super::state::repo_slug(&source))
+                .join("abcd1234-setup.jsonl")
+        );
     }
 
     #[cfg(unix)]
@@ -1530,6 +1742,7 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source");
         let root = temp.path().join("workspace");
+        let state = StateDir::from_root(temp.path().join("state"));
         std::fs::create_dir_all(&source).expect("source");
         std::fs::create_dir_all(&root).expect("root");
         let git = |args: &[&str]| {
@@ -1560,7 +1773,7 @@ git = [{ repo = "https://example.test/repo", branch = "main", dir = "dep", extra
             .push("test -f deps/docs/README.md && touch ready".into());
 
         clone_repositories(&config, &root).expect("clone");
-        run_setup(&config, &root).expect("setup after clone");
+        run_setup(&config, &state, &root).expect("setup after clone");
         assert!(root.join("deps/docs/README.md").is_file());
         assert!(root.join("ready").is_file());
         clone_repositories(&config, &root).expect("existing matching clone is idempotent");

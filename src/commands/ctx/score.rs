@@ -2043,8 +2043,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = dir.path().join("t.jsonl");
         std::fs::write(&transcript, body("claude-opus-5[1m]")).expect("write transcript");
-        let long_window =
-            score_transcript(&transcript, None, dir.path(), &|_| None).expect("full score runs");
+        let long_window = score_transcript(&transcript, Some("claude"), dir.path(), &|_| None)
+            .expect("full score runs");
         assert_eq!(
             long_window.verdict,
             rot::Verdict::Healthy,
@@ -2054,8 +2054,13 @@ mod tests {
         let baseline_dir = tempfile::tempdir().expect("tempdir");
         let baseline_transcript = baseline_dir.path().join("t.jsonl");
         std::fs::write(&baseline_transcript, body("claude-opus-5")).expect("write transcript");
-        let baseline = score_transcript(&baseline_transcript, None, baseline_dir.path(), &|_| None)
-            .expect("full score runs");
+        let baseline = score_transcript(
+            &baseline_transcript,
+            Some("claude"),
+            baseline_dir.path(),
+            &|_| None,
+        )
+        .expect("full score runs");
         assert_ne!(
             baseline.verdict,
             rot::Verdict::Healthy,
