@@ -69,7 +69,7 @@ In an interactive terminal, bare `zirv` starts a session when the current direct
 - [Supported harnesses and models](https://github.com/Glubiz/zirv-cli/blob/main/REFERENCE.md#supported-harnesses-and-models)
 - [Upgrading](https://github.com/Glubiz/zirv-cli/blob/main/REFERENCE.md#upgrading)
 
-The [full CLI reference](https://github.com/Glubiz/zirv-cli/blob/main/REFERENCE.md) preserves detailed commands, configuration examples, and current development notes. On the website, these links open the reference on GitHub.
+The [full CLI reference](https://github.com/Glubiz/zirv-cli/blob/main/REFERENCE.md) preserves detailed commands, configuration examples, and current development notes.
 
 ## Contributing and license
 
