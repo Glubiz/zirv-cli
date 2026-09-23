@@ -1109,6 +1109,25 @@ fn rollover_receipt_prompt(
     )
 }
 
+/// Issue #681: where a staged successor's turn-signal socket is bound. A hook
+/// files its conversation marker and attention under the socket's file stem
+/// (`hook::run_stop`'s `stable_short`), and the staged socket stays the pane's
+/// socket after commit, so the stem must be the seat's own short. A random
+/// stem sent every later marker to an address nothing reads, leaving the seat
+/// resuming -- and building handoffs from -- the pre-rollover conversation.
+/// The extension is a nonce so the path never collides with the live socket,
+/// and it is no longer than `.sock`, so `signal::check_len` is unaffected.
+fn staged_socket_path(state: &StateDir, short: &str) -> PathBuf {
+    let live = state.socket_for(short);
+    loop {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let path = live.with_extension(&nonce[..4]);
+        if !path.exists() {
+            return path;
+        }
+    }
+}
+
 fn rollover_receipt_token(req: &super::super::handover::HandoverRequest, session: &str) -> String {
     format!(
         "zirv-rollover-ready-{}-{}-{}",
@@ -3168,9 +3187,10 @@ impl Pane {
             super::super::runtime::RuntimeKind::Harness,
         );
         let staged_server = if req.generation.is_some() {
-            Some(SignalServer::bind(
-                &self.state_dir.socket_for(&uuid::Uuid::new_v4().to_string()),
-            )?)
+            Some(SignalServer::bind(&staged_socket_path(
+                &self.state_dir,
+                self.short(),
+            ))?)
         } else {
             None
         };
@@ -3685,6 +3705,29 @@ impl Pane {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// #681: a lifecycle hook files a session's conversation marker under its
+    /// socket's file stem. The staged successor's socket must therefore carry
+    /// the seat's short, or after a committed rollover every marker lands on a
+    /// random address and the seat keeps resuming the conversation from before.
+    #[test]
+    fn staged_socket_keeps_the_seat_short_as_its_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let short = "abcd1234";
+        let live = state.socket_for(short);
+        crate::commands::ctx::state::create_private_dir_all(&state.sockets()).unwrap();
+        std::fs::write(&live, "").unwrap();
+        let staged = staged_socket_path(&state, short);
+        assert_ne!(staged, live);
+        assert!(!staged.exists());
+        assert_eq!(staged.file_stem().and_then(|s| s.to_str()), Some(short));
+        assert!(
+            staged.as_os_str().len() <= live.as_os_str().len(),
+            "{}",
+            staged.display()
+        );
+    }
 
     /// #710: exercise usage admission, a real PTY successor, and the dashboard's
     /// settlement loop. The source process, its worker, socket and screen survive
