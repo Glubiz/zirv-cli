@@ -4015,9 +4015,11 @@ clean session exit, the handoff distillation that exists solely to feed it.
 It sees only local counts -- content size bucket, item count, duplicate
 ratio against the existing memory bank, existing entry count, path-like
 token count, and durable-fact-shape line count -- never the handoff text
-itself. A handoff with repeated tool errors, an explicit-remember marker, or
-overlap with an entry already protected as `source: explicit` is never even
-asked about; generation always runs for it. Otherwise, only a decisive "no
+itself. Material with an explicit-remember marker or overlap with an entry
+already protected as `source: explicit`, and a clean-exit harvest with
+repeated tool errors, is never even asked about; generation always runs for
+it. (Restart-seam harvests carry no tool-error list, so only the marker and
+explicit-entry guards apply there.) Otherwise, only a decisive "no
 new durable knowledge" answer skips generation; a disabled gate, a missing
 credential, or an uncertain/partial/failed answer all fall back to running
 generation exactly as before.
