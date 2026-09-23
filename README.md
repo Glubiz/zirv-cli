@@ -1691,7 +1691,7 @@ zirv workflow team show [--workflow <id>|active] [--json]
 zirv workflow team brief <seat-id> [--json]       # Agent-tool-ready brief for one compiled seat
 zirv workflow approve <id>                        # approve the current gated step
 zirv workflow advance <id> --outcome success|failure
-zirv workflow review package <id> | run <id> --agent <name> | add | ...
+zirv workflow review package <id> | run <id> --agent <name> | add | record <id> --model <name> [--finding <id>]... | ...
 zirv workflow maintain scan [--repo <path>] [--json]
 zirv workflow stats                               # local bounded telemetry: per-phase timing, the implement/validate wall-clock split, approval wait, and fix-round causes (issue #699 Phase 0)
 ```
@@ -2444,6 +2444,13 @@ Interactive artifact fallback obeys canonical policy (`ask` needs `--approve`),
 and supervised Claude/Codex workflows attribute available transcript token
 deltas automatically. Telemetry excludes prompts, source code, diffs, command
 output, and model responses by construction.
+
+An orchestrator seat is refused from `review run --agent <its own harness>`
+(same-harness delegation belongs to the harness's native subagent tool, not
+`zirv agent`); after reviewing there and filing findings with `review add`,
+record the completed run with `zirv workflow review record <id> --model
+<name> [--finding <id>]...` so it counts toward the review step's fresh
+independent review run gate exactly like a `review run` invocation.
 
 ## Context Management (zirv ctx)
 
