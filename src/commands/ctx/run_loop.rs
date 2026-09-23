@@ -2853,6 +2853,18 @@ mod tests {
     /// brand-new run is exactly the pre-launch call `PaceGate::initial_
     /// launch` downgrades: it still passes through the gate first, but a
     /// `WaitUntil` verdict there is a warning, not a wait.
+    ///
+    /// Issue #669: this used to also assert `started.elapsed() < 1s`, which
+    /// fails under CPU contention for reasons that have nothing to do with
+    /// pacing -- the real cycle here spawns a subprocess, and process/thread
+    /// scheduling overhead alone can exceed a second under load (reproduced:
+    /// 4.5s elapsed on an unrelated run). The two log assertions below
+    /// already prove the actual invariant directly (the warn action fired,
+    /// the wait action never did), so the wall-clock proxy for it is gone
+    /// rather than widened -- a regression here would only ever wait ~1-2s
+    /// anyway (the fixture's own window resets after 1s, capped at 2s by
+    /// `ZIRV_CTX_PACE_MAX_WAIT_SECS`), which no timeout threshold could
+    /// distinguish from ordinary scheduling noise.
     #[test]
     fn the_first_cycle_passes_the_pacing_gate_without_waiting() {
         let tmp = crate::commands::ctx::testenv::repo();
@@ -2868,7 +2880,6 @@ mod tests {
             std::env::set_var("FAKE_AGENT_MODE", "healthy");
             std::env::set_var("FAKE_AGENT_TURNS", "2");
         }
-        let started = std::time::Instant::now();
         let mut out = Vec::new();
         let code = run_with(&args_for(1), &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
@@ -2877,10 +2888,6 @@ mod tests {
         }
 
         assert_eq!(code.expect("runs"), 0, "a warning is never an exit");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "usage headroom must never delay the first cycle's launch"
-        );
         assert_eq!(transcripts_in(&home).len(), 1, "the cycle still ran");
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
@@ -3706,6 +3713,16 @@ mod tests {
         let state_dir = tmp.path().join("state");
         let argv_log = tmp.path().join("argv.log");
         let marker = tmp.path().join("cycle-marker");
+        // Issue #669: cycle 1 used to hold the window open with a blind
+        // `sleep 0.3` while the writer thread raced to resolve the live
+        // session and send its nudge before that timer expired. Under
+        // scheduler contention the writer could lose that race outright
+        // (the resolve or the nudge dispatch simply hadn't run yet), which
+        // is exactly the flake this issue reports. Cycle 1 now blocks on an
+        // explicit release marker the writer creates once it is done
+        // attempting the nudge (own bounded poll below as a safety net
+        // against a genuine hang, not the normal path).
+        let nudge_sent = tmp.path().join("nudge-sent");
         let script = tmp.path().join("mid-loop-agent.sh");
         std::fs::write(
             &script,
@@ -3714,7 +3731,11 @@ mod tests {
              [ -z \"${FAKE_AGENT_ARGV_LOG:-}\" ] || printf '%s\\n' \"$*\" >> \"$FAKE_AGENT_ARGV_LOG\"\n\
              if [ ! -f \"$CYCLE_MARKER\" ]; then\n\
              \ttouch \"$CYCLE_MARKER\"\n\
-             \tsleep 0.3\n\
+             \ti=0\n\
+             \twhile [ ! -f \"$NUDGE_SENT_MARKER\" ] && [ \"$i\" -lt 100 ]; do\n\
+             \t\ti=$((i + 1))\n\
+             \t\tsleep 0.05\n\
+             \tdone\n\
              fi\n\
              exit 0\n",
         )
@@ -3733,22 +3754,31 @@ mod tests {
         let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
             ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
             ("CYCLE_MARKER", marker.to_str()),
+            ("NUDGE_SENT_MARKER", nudge_sent.to_str()),
         ]);
 
         let state_for_writer = state_dir.clone();
         let repo_for_writer = tmp.path().to_path_buf();
         let marker_for_writer = marker.clone();
+        let nudge_sent_for_writer = nudge_sent.clone();
         let writer = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !marker_for_writer.exists() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
+            // Every exit path from here must release cycle 1's script,
+            // including a failed resolve below -- otherwise cycle 1 just
+            // burns its own 5s fallback for nothing.
+            let release = || {
+                let _ = std::fs::write(&nudge_sent_for_writer, b"");
+            };
             let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
             // The empty prefix matches whichever session is currently live --
             // `loop` keeps exactly one registry record at a time, refreshed
             // each cycle, so this is cycle 1's own short id while it is
             // still running.
             let Ok(live) = crate::commands::ctx::sessions::resolve_prefix(&state, "") else {
+                release();
                 return;
             };
             let env = [(
@@ -3771,6 +3801,7 @@ mod tests {
                 &|k| env.get(k).cloned(),
                 &mut stdin,
             );
+            release();
         });
 
         let mut args = args_for(3);

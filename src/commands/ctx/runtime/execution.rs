@@ -1714,7 +1714,14 @@ mod tests {
             stream.write_all(&record.as_bytes()[1..]).unwrap();
             read_record(&mut BufReader::new(stream)).unwrap()
         });
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Issue #669: this used to match the client's own 3s read timeout
+        // exactly, so under scheduler contention the two raced -- whichever
+        // fired first decided whether the reply ever got relayed. This loop
+        // exits the instant `client.is_finished()` on every real run; the
+        // deadline is a pure safety net against a genuine hang, not part of
+        // the normal path, so it can stay well clear of the client's own
+        // budget without slowing anything down.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !client.is_finished() && Instant::now() < deadline {
             bridge
                 .serve(&json!([]), &mut |_| {

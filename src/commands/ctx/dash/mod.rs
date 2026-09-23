@@ -18948,14 +18948,20 @@ mod tests {
         // conversation id that is NOT zirv's session uuid.
         sessions::record_native_conversation(&state, &short, "claude", session_id, native_id);
 
-        // The relaunch records the argv it was actually given. Written to a
-        // path relative to the pane's own cwd (the repo), so the script has
-        // no host path to quote.
-        let argv_log = repo.join("argv.txt");
+        // Issue #450: the relaunch records the argv it was actually given.
+        // A relative filename here used to rely on the pane's own cwd being
+        // `repo`, but a liveness/capability probe of this same `agent_bin`
+        // shim spawns it with no `current_dir` set, so a relative path could
+        // land in the real process cwd instead. An absolute tempdir path,
+        // quoted, is immune to that.
+        let argv_log = tmp.path().join("argv.txt");
         let relaunched = tmp.path().join("relaunched.sh");
         std::fs::write(
             &relaunched,
-            "#!/bin/sh\nprintf '%s\n' \"$@\" > argv.txt\nsleep 30\n",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 30\n",
+                argv_log.display()
+            ),
         )
         .expect("write relaunch script");
         let mut cfg = CtxConfig {
