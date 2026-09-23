@@ -135,10 +135,9 @@ indicative, not conclusive.
 | Haiku large -- vanilla | 225.1 | 0.461 | 0.649 |
 | Haiku large -- zirv | 209.7 (-7%) | 0.364 (-21%) | 0.933 (+44%) |
 
-Full per-task tables, features-used counts and zirv-proxy's per-task
-seat/model/workflow decisions are in `report-opt-sonnet.md` and
-`report-opt-haiku.md`; the per-run rows behind every number above are in
-`results-opt-sonnet.csv` / `results-opt-haiku.csv`.
+Per-task tables, features-used counts and zirv-proxy's per-task
+seat/model/workflow decisions come from `aggregate.py` (see §8); the raw
+results are not committed.
 
 ## 5. Reading the results honestly
 
@@ -189,9 +188,7 @@ non-interactive notice, 12 tasks. On that comparison, wrapping was pure
 overhead: Sonnet wall +39% (55.3 s -> 76.9 s), cost +41% ($0.236 ->
 $0.332); Haiku wall +33% (72.0 s -> 95.7 s), cost +25% ($0.127 -> $0.159).
 Correctness didn't move outside noise on either grid (Sonnet was already at
-a 0.986-1.000 ceiling). Full protocol, per-task tables and CSVs:
-`report-sonnet.md`, `report-haiku.md`, `results-sonnet.csv`,
-`results-haiku.csv` in the harness directory.
+a 0.986-1.000 ceiling). The raw results are not committed.
 
 This grid answers a narrower question than §4 -- "what does zirv cost over
 nothing at all" -- rather than "what does zirv cost over a comparably
@@ -207,7 +204,6 @@ $0.339 / 0.993. Haiku: vanilla 95.7 s / $0.151 / 0.484 (48 runs); zirv
 sign of efficiency: it stopped to ask for approval in 10 of 36 Sonnet runs
 and a comparable share of Haiku runs, scoring nothing on those and exiting
 fast. That artifact is exactly why §1's notice exists in the current grid.
-Reports: `report-sp-sonnet.md`, `report-sp-haiku.md`.
 
 ## 7. Not yet measured
 
@@ -236,8 +232,7 @@ python run.py --tasks all --conds vanilla,zirv --reps 2 --model haiku --runs-sub
 python aggregate.py --runs runs-haiku --out report-opt-haiku.md
 ```
 
-`results-opt-sonnet.csv` and `results-opt-haiku.csv` are the per-run rows
-behind §4; `report-opt-*.md` are the aggregator's own output. Passing
+`aggregate.py` writes the per-task report and a per-run CSV. Passing
 `--tasks t01,t02,...,t12` and dropping `--vanilla-plugin-dir`/
 `--noninteractive` reproduces the §6.1 grid; keeping
 `--vanilla-plugin-dir` but dropping `--noninteractive` reproduces §6.2. The

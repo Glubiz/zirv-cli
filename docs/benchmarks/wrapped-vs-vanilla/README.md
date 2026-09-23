@@ -49,10 +49,9 @@ python aggregate.py --runs runs-haiku --out report-opt-haiku.md
 Earlier grids used fewer tasks and different vanilla conditions -- pass
 `--tasks t01,t02,...,t12` to hold the task set at twelve, drop
 `--vanilla-plugin-dir`/`--noninteractive` to reproduce the original
-disableAllHooks vanilla (`report-sonnet.md` / `report-haiku.md`), or keep
+disableAllHooks vanilla, or keep
 `--vanilla-plugin-dir` without `--noninteractive` to reproduce the
-superpowers-baseline grid where vanilla could still stop to ask
-(`report-sp-sonnet.md` / `report-sp-haiku.md`). See
+superpowers-baseline grid where vanilla could still stop to ask. See
 `../wrapped-vs-vanilla.md` for what each grid means and why they aren't
 directly comparable.
 
