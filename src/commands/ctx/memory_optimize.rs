@@ -261,6 +261,45 @@ fn find_near_duplicates(candidates: &[OptimizeCandidate]) -> Vec<Finding> {
     out
 }
 
+/// Issue #773: a lightweight, single-entry duplicate/near-duplicate check
+/// against a bank's OTHER existing entries, run at `remember` write time
+/// (`memory::warn_if_duplicate_write`) rather than only via the manual
+/// `zirv memory optimize` this module otherwise exists for. Reuses the
+/// exact detectors [`find_duplicates`]/[`find_near_duplicates`] above build
+/// on (`normalize_body`/`normalized_word_set`/`jaccard`/
+/// [`NEAR_DUPLICATE_THRESHOLD`]) so the two never drift on what "duplicate"
+/// means, but takes only bare `(key, body)` pairs -- never a full
+/// [`OptimizeCandidate`] (which needs `verified_age_days`/`lifecycle`/
+/// `dead_paths`, all filesystem/clock-derived and, per this module's own
+/// top-level doc comment, SHARED-only) -- so it works unmodified for every
+/// memory tier `analyze` itself never touches. Returns the sorted keys of
+/// every OTHER entry that is an exact duplicate (body identical mod
+/// whitespace/case) or a near-duplicate (Jaccard word overlap at or above
+/// `NEAR_DUPLICATE_THRESHOLD`) of `new_body` -- empty when there is no
+/// overlap worth a warning. Never blocks or alters a write: the caller
+/// decides what, if anything, to do with a non-empty result.
+pub(crate) fn duplicate_keys_for(new_body: &str, existing: &[(String, String)]) -> Vec<String> {
+    let new_norm = normalize_body(new_body);
+    if new_norm.is_empty() {
+        return Vec::new();
+    }
+    let new_words = normalized_word_set(new_body);
+    let mut hits: Vec<String> = existing
+        .iter()
+        .filter(|(_, body)| {
+            let norm = normalize_body(body);
+            if norm.is_empty() {
+                return false;
+            }
+            norm == new_norm
+                || jaccard(&new_words, &normalized_word_set(body)) >= NEAR_DUPLICATE_THRESHOLD
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    hits.sort();
+    hits
+}
+
 /// Entries whose subjects overlap but whose bodies disagree using one of
 /// `POLARITY_PAIRS`. See that constant's own doc comment for the detection
 /// rule and its deliberate limits.

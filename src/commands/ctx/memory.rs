@@ -124,6 +124,52 @@ pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> 
     })
 }
 
+/// Issue #773: the one-line stderr warning `zirv ctx remember`/`zirv memory
+/// remember` print when a new entry's body is an exact or near duplicate of
+/// one already in the same bank -- `zirv memory optimize`'s own duplicate/
+/// near-duplicate detectors otherwise only ever run when an operator
+/// remembers to invoke it manually. Reads the bank's OTHER existing entries
+/// (the key about to be written excluded, so an in-place update of the same
+/// key is never flagged against itself) through the same scope-aware
+/// `list_scoped` every other read in this module uses, so a disabled scope
+/// or an unreadable directory reads as "nothing to compare against" --
+/// `None`, never a hard error over a write that already succeeded or is
+/// about to. The session tier has no scope-generic listing (`upsert_
+/// scoped`'s own `Session` doc comment) and is skipped outright: ephemeral,
+/// per-session notes are not the durable-bank duplication this exists to
+/// catch. `pub(super)`, the same cross-module reuse `truncation_warning`
+/// above gets, since `memory_cli.rs`'s own `--shared` handler needs it too.
+/// Never blocks or alters the write -- `memory_optimize::duplicate_keys_for`
+/// does the actual comparison and this only formats its result.
+pub(super) fn duplicate_write_warning(
+    command: &str,
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    entry: &Entry,
+) -> Option<String> {
+    if scope == MemoryScope::Session {
+        return None;
+    }
+    let existing: Vec<(String, String)> = list_scoped(scope, repo, state, slug, cfg)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, other)| other.key != entry.key)
+        .map(|(_, other)| (other.key, other.body))
+        .collect();
+    let hits = super::memory_optimize::duplicate_keys_for(&entry.body, &existing);
+    if hits.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{command}: '{}' looks like a duplicate or near-duplicate of existing key(s): {}",
+        entry.key,
+        hits.join(", ")
+    ))
+}
+
 fn cap_body(entry: &Entry, cap: usize) -> Entry {
     let mut entry = entry.clone();
     if entry.body.len() > cap {
@@ -4412,6 +4458,20 @@ pub fn run_remember_with<W: Write>(
                 // exists to set it yet.
                 paths: Vec::new(),
             };
+            // Issue #773: computed before the write (see `duplicate_write_
+            // warning`'s own doc comment for why the key about to be
+            // written is excluded from the comparison), printed right
+            // after so it lands ahead of the success line below rather
+            // than being lost above it.
+            let duplicate_warning = duplicate_write_warning(
+                "zirv ctx remember",
+                scope,
+                repo,
+                &state,
+                &slug,
+                &cfg,
+                &entry,
+            );
             // Review round 2, finding 1: every write acquires this bank's
             // lock now. `--if-unchanged` needs the check and the write
             // under the SAME held lock (else a second writer could land in
@@ -4481,6 +4541,9 @@ pub fn run_remember_with<W: Write>(
                 upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)
             }
             .map_err(|e| format!("zirv ctx remember: {e}"))?;
+            if let Some(warning) = duplicate_warning {
+                eprintln!("{warning}");
+            }
             writeln!(
                 w,
                 "zirv ctx remember: stored '{}' in the {bank_label} bank at {}{session_fallback_note}",
@@ -4871,6 +4934,122 @@ mod tests {
         assert!(warning.contains("zirv ctx remember"), "{warning}");
         assert!(warning.contains("600"), "{warning}");
         assert!(warning.contains("512"), "{warning}");
+    }
+
+    fn dedup_test_entry(key: &str, body: &str, written: u64) -> Entry {
+        Entry {
+            key: key.to_string(),
+            written_by: "claude".to_string(),
+            written,
+            verified: written,
+            source: "explicit".to_string(),
+            body: body.to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// Issue #773: `duplicate_write_warning` must name an existing key when
+    /// the new entry's body is a near-duplicate of one already in the same
+    /// bank (Jaccard word overlap at or above `memory_optimize::
+    /// NEAR_DUPLICATE_THRESHOLD`, the exact detector `zirv memory optimize`
+    /// itself uses), and must never fire against the entry's OWN key (an
+    /// in-place update is not a duplicate of itself).
+    #[test]
+    fn duplicate_write_warning_names_an_existing_near_duplicate_key() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        remember(
+            &state,
+            slug,
+            &dedup_test_entry(
+                "retry-limit",
+                "The retry limit is always three attempts before giving up on the request.",
+                1_700_000_000,
+            ),
+            &cfg,
+        )
+        .expect("remember existing");
+
+        let new_entry = dedup_test_entry(
+            "max-retries",
+            "The retry limit is always three attempts before giving up on the call.",
+            1_700_000_100,
+        );
+        let warning = duplicate_write_warning(
+            "zirv ctx remember",
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            slug,
+            &cfg,
+            &new_entry,
+        )
+        .expect("a near-duplicate body must warn");
+        assert!(warning.contains("max-retries"), "got {warning}");
+        assert!(warning.contains("retry-limit"), "got {warning}");
+
+        // Re-remembering the SAME key with the SAME body (an ordinary
+        // in-place update) must never warn against itself.
+        assert_eq!(
+            duplicate_write_warning(
+                "zirv ctx remember",
+                MemoryScope::Private,
+                repo.path(),
+                &state,
+                slug,
+                &cfg,
+                &dedup_test_entry(
+                    "retry-limit",
+                    "The retry limit is always three attempts before giving up on the request.",
+                    1_700_000_200,
+                ),
+            ),
+            None,
+            "an entry never counts as its own duplicate"
+        );
+    }
+
+    /// A body unrelated to anything already stored must never warn.
+    #[test]
+    fn duplicate_write_warning_is_none_for_a_distinct_body() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        remember(
+            &state,
+            slug,
+            &dedup_test_entry(
+                "retry-limit",
+                "The retry limit is three attempts.",
+                1_700_000_000,
+            ),
+            &cfg,
+        )
+        .expect("remember existing");
+
+        let new_entry = dedup_test_entry(
+            "deploy-window",
+            "Deploys only happen between 09:00 and 17:00 UTC on weekdays.",
+            1_700_000_100,
+        );
+        assert_eq!(
+            duplicate_write_warning(
+                "zirv ctx remember",
+                MemoryScope::Private,
+                repo.path(),
+                &state,
+                slug,
+                &cfg,
+                &new_entry,
+            ),
+            None
+        );
     }
 
     // N2: the header block ends at the first blank line. Before this, a
