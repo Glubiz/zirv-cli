@@ -4434,7 +4434,7 @@ mod tests {
     }
 
     #[test]
-    fn a_private_reviewer_runs_inline_without_harvest_or_fingerprint_drift() {
+    fn a_private_reviewer_with_a_pacing_warning_keeps_a_parseable_receipt() {
         let repo = git_repo();
         let repo_path = std::fs::canonicalize(repo.path()).unwrap();
         let home = tempdir().unwrap();
@@ -4445,6 +4445,23 @@ mod tests {
         std::fs::write(
             dashboard.path().join("owner.pid"),
             std::process::id().to_string(),
+        )
+        .unwrap();
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_root.path().to_path_buf());
+        let now = crate::commands::ctx::state::now_secs();
+        crate::commands::ctx::window::store(
+            &state,
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 60,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
         )
         .unwrap();
         let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -4462,7 +4479,8 @@ mod tests {
                 crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV,
                 requests.to_str(),
             ),
-            ("ZIRV_CTX_PACE", Some("false")),
+            ("ZIRV_CTX_PACE", Some("true")),
+            ("ZIRV_CTX_PACE_POLL", Some("false")),
             ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
             ("ZIRV_CTX_MEMORY_HARVEST", Some("true")),
         ]);
@@ -4484,6 +4502,12 @@ mod tests {
                 .expect("reviewer completes");
 
         assert_eq!(code, 0);
+        assert!(
+            std::fs::read_to_string(state.logs().join("decisions.jsonl"))
+                .unwrap()
+                .contains("\"action\":\"pace-initial-launch-warn\""),
+            "the regression must exercise the operational warning that used to prefix the receipt"
+        );
         let output = reviewer_report(&output, MAX_REVIEW_OUTPUT_BYTES).unwrap();
         assert!(
             parse_reviewer_output(&output)

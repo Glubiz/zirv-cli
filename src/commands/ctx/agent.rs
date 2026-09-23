@@ -5507,49 +5507,58 @@ pub fn run_with<W: Write>(
     // permanently burn the group's admission slot for a child that never
     // ran. `state` is the same handle resolved above for the spawn gate,
     // unused since; reused here rather than re-resolved.
-    let (mut code, execution_report) =
-        match exec::run_with_report(&exec_args, w, &launch_repo, &env) {
-            Ok(result) => result,
-            Err(e) => {
-                if args.goal.is_some() {
-                    settle_initial_reservation(bootstrap_spend);
-                } else {
-                    if let Some(id) = &args.group {
-                        super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
-                    }
-                    release_reservation();
+    // `--json` promises that `w` contains exactly one DelegationReceipt.
+    // The exec supervisor also writes human pacing/restart notices to its
+    // writer, so keep those visible on stderr instead of prefixing the JSON
+    // receipt that this function appends after the run.
+    let execution = if args.json {
+        let mut stderr = std::io::stderr();
+        exec::run_with_report(&exec_args, &mut stderr, &launch_repo, &env)
+    } else {
+        exec::run_with_report(&exec_args, w, &launch_repo, &env)
+    };
+    let (mut code, execution_report) = match execution {
+        Ok(result) => result,
+        Err(e) => {
+            if args.goal.is_some() {
+                settle_initial_reservation(bootstrap_spend);
+            } else {
+                if let Some(id) = &args.group {
+                    super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
                 }
-                // Finding 4: with the admission rolled back the group is pristine
-                // again, so a group this invocation minted for a launch that
-                // never happened is removed rather than left open forever.
-                discard_minted_group();
-                // Issue #317: the worker never actually ran -- same "never
-                // Done, always crash/respawn-guarded" treatment as any other
-                // run that reached completion but failed.
-                finish_task_card(
-                    &state,
-                    repo,
-                    &cfg,
-                    args,
-                    super::task::ExitKind::Crash,
-                    "launch failed",
-                    super::state::now_secs(),
-                );
-                if args.json {
-                    let receipt = launch_failure_receipt(
-                        args,
-                        model.as_deref(),
-                        Some(&worker_session),
-                        Some(&launch_repo),
-                        None,
-                        e.to_string(),
-                        &capability_warnings,
-                    );
-                    print_receipt(w, &receipt)?;
-                }
-                return Err(e);
+                release_reservation();
             }
-        };
+            // Finding 4: with the admission rolled back the group is pristine
+            // again, so a group this invocation minted for a launch that
+            // never happened is removed rather than left open forever.
+            discard_minted_group();
+            // Issue #317: the worker never actually ran -- same "never
+            // Done, always crash/respawn-guarded" treatment as any other
+            // run that reached completion but failed.
+            finish_task_card(
+                &state,
+                repo,
+                &cfg,
+                args,
+                super::task::ExitKind::Crash,
+                "launch failed",
+                super::state::now_secs(),
+            );
+            if args.json {
+                let receipt = launch_failure_receipt(
+                    args,
+                    model.as_deref(),
+                    Some(&worker_session),
+                    Some(&launch_repo),
+                    None,
+                    e.to_string(),
+                    &capability_warnings,
+                );
+                print_receipt(w, &receipt)?;
+            }
+            return Err(e);
+        }
+    };
     // Issue #170: this delegation's scope is done -- successfully or not --
     // the moment its supervised run exits. The free-text completion contract
     // remains reviewer-checked; token spend is rolled up below. Closes the
