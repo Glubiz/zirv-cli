@@ -698,6 +698,18 @@ pub struct PromptConfig {
     /// checkout may only narrow it to `false` (`narrow_intake_discipline_
     /// bool`), never force it back on for an operator who turned it off.
     pub intake_discipline: bool,
+    /// Issue #755: whether the standing skill index drops a skill family
+    /// the repository shows no signal for (`frontend-*` with no
+    /// `package.json`/frontend source files; the four Kibana/Elastic
+    /// operational skills with no Elastic/Kibana config) -- see
+    /// `prompt::filter_skill_entries_by_repo_signal`. A dropped skill stays
+    /// fully loadable through `zirv skill list`/`load`; only its passive
+    /// advertisement in this layer narrows. `REPO_FORBIDDEN`, the same
+    /// trust asymmetry as `harnesses`/`codex_orchestrator` above: disabling
+    /// this heuristic widens what a session sees (every skill listed again),
+    /// so only the operator may do it -- a repo checkout must not be able to
+    /// force its own family back into every session's standing prefix.
+    pub skill_index_repo_filter: bool,
     /// Whether a codex Orchestrator session's composed prompt gets codex's
     /// own `AgentAdapter::base_system_prompt` layer (issue #167,
     /// `adapters::codex::ORCHESTRATOR_PROMPT`) -- the codex analogue of
@@ -735,6 +747,7 @@ impl Default for PromptConfig {
             harnesses: true,
             skill_index: true,
             intake_discipline: true,
+            skill_index_repo_filter: true,
             codex_orchestrator: true,
             orchestrator_writes: OrchestratorWrites::Advise,
         }
@@ -3471,6 +3484,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER",
+        &["prompt", "skill_index_repo_filter"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_PROMPT_VERBOSITY",
         &["prompt", "verbosity"],
         EnvKind::Str,
@@ -4564,6 +4582,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["prompt", "codex_orchestrator"],
         "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
+    ),
+    // Issue #755: disabling the repo-signal skill-family filter widens what
+    // every session sees (every skill family advertised again), the same
+    // trust asymmetry as `prompt.harnesses`/`prompt.codex_orchestrator`
+    // above -- only the operator may do it.
+    (
+        &["prompt", "skill_index_repo_filter"],
+        "ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER",
     ),
     // Issue #427: without this a repo checkout could simply raise its own
     // tier, making an operator's chosen `"minimal"`/`"standard"` decorative

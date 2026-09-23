@@ -1781,7 +1781,8 @@ mod tests {
             ),
         )
         .expect("fixture");
-        let entries = prompt::skill_index_entries(repo.path(), Some(home.path())).expect("entries");
+        let entries =
+            prompt::skill_index_entries(repo.path(), Some(home.path()), false).expect("entries");
         let index = entries
             .iter()
             .position(|(id, _, _)| id == "database-helper")
@@ -1795,6 +1796,14 @@ mod tests {
         );
         let mut cfg = CtxConfig::default();
         cfg.jev.context = true;
+        // Issue #755: this test's own `entries`/`index` above are computed
+        // unfiltered (`false`), so the real compile below must see the
+        // identical, unfiltered entry list -- otherwise the mocked jev
+        // answer's `s{index}` key would land on a different candidate than
+        // the one this test actually planted, unrelated to what this test
+        // is about (Jev-driven optional-description selection, not the
+        // repo-signal family filter).
+        cfg.prompt.skill_index_repo_filter = false;
         cfg.proxy.typesafe.base_url = url;
         cfg.proxy.typesafe.credential_env = "JEV_TEST_NATIVE_SKILL_SELECT_737".into();
         // SAFETY (test-only): this test owns a unique env variable name.
@@ -1841,8 +1850,8 @@ mod tests {
             .position(|m| m.source == SourceKind::SkillDescriptions)
             .expect("detail position");
         assert!(index_at < details_at);
-        let baseline_index =
-            prompt::skill_index_text(repo.path(), Some(home.path())).expect("full skill index");
+        let baseline_index = prompt::skill_index_text(repo.path(), Some(home.path()), false)
+            .expect("full skill index");
         let baseline_bytes = prompt::SKILL_INDEX_HEADER
             .trim_start_matches("\n\n---\n\n")
             .trim_end()

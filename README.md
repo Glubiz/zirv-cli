@@ -2270,8 +2270,24 @@ remains one `zirv skill list`/`show` call away. `prompt.skill_index` (`ZIRV_CTX_
 default `true`, not `REPO_FORBIDDEN` -- a repository may only narrow it to
 `false`, never force it back on) turns the layer off entirely when a host's
 own inline-argv limits make even the compact index too much; skills stay
-loadable through `zirv skill list`/`load` either way. The index's own
-loading instruction leads with
+loadable through `zirv skill list`/`load` either way. The index also drops a
+whole skill family the repository shows no signal for: the `frontend-*`
+family when there is no `package.json` (at the repo root or a few common
+nested locations) and no `*.tsx`/`*.jsx`/`*.vue`/`*.svelte`/`*.html` under a
+bounded, deterministic scan of the repository, and the four Kibana/Elastic
+operational skills (`kibana-log-investigation`, `saved-object-change-
+management`, `dashboard-review`, `alert-rule-diagnosis`) when there is no
+Elastic/Kibana marker file or manifest mention. Both probes only read the
+filesystem, so the same repository state always filters the same way. A
+dropped skill is never gone -- it stays fully loadable through `zirv skill
+list`/`load` and resolvable by an explicit workflow-step skill selection,
+which never goes through this index at all -- only its unprompted
+advertisement in the standing catalogue narrows. `prompt.
+skill_index_repo_filter` (`ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER`, default
+`true`, `REPO_FORBIDDEN`) is the operator-only opt-out: disabling it widens
+what every session sees, so only the operator may do it, the same trust
+asymmetry as `prompt.harnesses`. The index's own loading instruction leads
+with
 `zirv skill load <id>`, run from a shell: it works in every session,
 including a wrapped host where the `skill_load` tool is namespaced and
 deferred behind a tool-search lookup a small model rarely takes. `zirv skill
@@ -4173,7 +4189,7 @@ A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
-`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
+`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
@@ -4273,6 +4289,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
 | `prompt.codex_orchestrator` | `ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR` |
+| `prompt.skill_index_repo_filter` | `ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER` |
 | `prompt.verbosity` | `ZIRV_CTX_PROMPT_VERBOSITY` |
 | `chat.claude_permission_mode` | `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |

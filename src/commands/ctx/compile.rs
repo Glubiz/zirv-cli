@@ -234,14 +234,15 @@ pub(super) fn selected_skill_index_text(
     home: Option<&Path>,
     task_text: Option<&str>,
 ) -> Option<(String, String, usize, Option<String>)> {
-    let baseline = prompt::skill_index_text(repo, home)?;
+    let baseline = prompt::skill_index_text(repo, home, cfg.prompt.skill_index_repo_filter)?;
     if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) {
         return Some((baseline, String::new(), 0, None));
     }
     let Some(task_text) = task_text else {
         return Some((baseline, String::new(), 0, None));
     };
-    let Some(entries) = prompt::skill_index_entries(repo, home) else {
+    let Some(entries) = prompt::skill_index_entries(repo, home, cfg.prompt.skill_index_repo_filter)
+    else {
         return Some((baseline, String::new(), 0, None));
     };
     let task_lower = task_text.to_ascii_lowercase();
@@ -368,7 +369,8 @@ pub(crate) fn select_skill_descriptions_for_task(
     if !composed.text.contains(prompt::SKILL_INDEX_HEADER) {
         return;
     }
-    let Some(baseline) = prompt::skill_index_text(repo, home) else {
+    let Some(baseline) = prompt::skill_index_text(repo, home, cfg.prompt.skill_index_repo_filter)
+    else {
         return;
     };
     let Some(at) = composed
@@ -1930,6 +1932,21 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
         ));
     }
 
+    // Issue #755: the skill index (`PromptSource::SkillIndex`) is the
+    // largest injected block on an orchestrator session but had no
+    // `--measure` row at all, so the table's totals silently under-reported
+    // it and the per-layer ranking in `token-cost.md` never saw it. Reuses
+    // `emitted_layers`, the same byte-range machinery `built_in_prompt_
+    // layers` (context_cli.rs) and every other row below it already trust,
+    // rather than re-deriving the range with a second, independent search.
+    if let Some(layer) = compiled
+        .emitted_layers()
+        .into_iter()
+        .find(|l| l.source == PromptSource::SkillIndex)
+    {
+        rows.push(measure_row("skill index", layer.range.len(), ""));
+    }
+
     for entry in &compiled.provenance {
         let name = entry
             .surface
@@ -2294,7 +2311,8 @@ mod tests {
             ),
         )
         .expect("fixture");
-        let entries = prompt::skill_index_entries(repo.path(), Some(home.path())).expect("entries");
+        let entries =
+            prompt::skill_index_entries(repo.path(), Some(home.path()), false).expect("entries");
         let index = entries
             .iter()
             .position(|(id, _, _)| id == "database-helper")
@@ -2305,6 +2323,14 @@ mod tests {
         let (url, handle) = jev::tests::one_shot_server(200, Box::leak(body.into_boxed_str()));
         let mut cfg = CtxConfig::default();
         cfg.jev.context = true;
+        // Issue #755: this test's own `entries`/`index` above are computed
+        // unfiltered (`false`), so `selected_skill_index_text` must see the
+        // identical, unfiltered entry list -- otherwise the mocked jev
+        // answer's `s{index}` key would land on a different candidate than
+        // the one this test actually planted, unrelated to what this test
+        // is about (Jev-driven optional-description selection, not the
+        // repo-signal family filter).
+        cfg.prompt.skill_index_repo_filter = false;
         cfg.proxy.typesafe.base_url = url;
         cfg.proxy.typesafe.credential_env = "JEV_TEST_SKILL_SELECT_737".into();
         // SAFETY (test-only): this test owns a unique env variable name.
@@ -5146,6 +5172,48 @@ mod tests {
             smaller_total < total,
             "removing the repo system-prompt layer must shrink the real total: \
              {smaller_total} vs {total}"
+        );
+    }
+
+    /// Issue #755: the skill index (`PromptSource::SkillIndex`) is the
+    /// largest injected block on an orchestrator session but had no
+    /// `--measure` row at all -- `render_measure_table` must report it, with
+    /// the exact byte count `emitted_layers` computes for that layer, so the
+    /// table's rows reconcile with the real composed total.
+    #[test]
+    fn measure_table_reports_the_skill_index_row() {
+        let repo = repo_with_context_files(&[(
+            "common.md",
+            "Always run the full test suite before committing.",
+        )]);
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
+        let layer = compiled
+            .emitted_layers()
+            .into_iter()
+            .find(|l| l.source == PromptSource::SkillIndex)
+            .expect("skill index layer present in a default-config orchestrator compile");
+        assert!(!layer.range.is_empty(), "got a zero-byte skill index layer");
+        assert!(
+            table.contains(&measure_row("skill index", layer.range.len(), "")),
+            "got:\n{table}"
         );
     }
 
