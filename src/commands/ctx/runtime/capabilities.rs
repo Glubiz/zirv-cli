@@ -492,9 +492,12 @@ impl ChromiumRunner {
 
 impl BrowserRunner for ChromiumRunner {
     fn run(&self, url: &str, action: &BrowserAction, timeout: Duration) -> Result<String, String> {
+        let profile = crate::commands::workflow::frontend_render::BrowserProfileDir::new()
+            .map_err(|error| format!("could not create browser profile dir: {error}"))?;
         let mut command = Command::new(&self.binary);
         command
             .arg("--headless=new")
+            .arg(profile.arg())
             .arg("--disable-background-networking")
             .arg("--disable-component-update")
             .arg("--disable-default-apps")
@@ -810,8 +813,8 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
         None => IntegrationStatus::unavailable(
             IntegrationId::Browser,
             "no Chromium-family browser was discovered",
-            "install chromium/google-chrome/microsoft-edge, or set \
-             capabilities.browser.binary",
+            "install chromium/google-chrome/microsoft-edge, or set `binary` under \
+             [capabilities.browser] in ~/.zirv/ctx.toml",
         ),
     });
 
@@ -843,8 +846,8 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
         None => IntegrationStatus::unavailable(
             IntegrationId::FrontendRender,
             "frontend capture needs a headless browser",
-            "install chromium/google-chrome/microsoft-edge, or set \
-             capabilities.browser.binary",
+            "install chromium/google-chrome/microsoft-edge, or set `binary` under \
+             [capabilities.browser] in ~/.zirv/ctx.toml",
         ),
     });
 

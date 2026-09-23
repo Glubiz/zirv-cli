@@ -7633,7 +7633,10 @@ mod tests {
     #[test]
     fn resolve_native_route_returns_none_for_no_candidate_or_a_blank_one() {
         let repo = tempfile::tempdir().expect("tempdir");
-        assert_eq!(resolve_native_route(None, "orchestrator", repo.path()), None);
+        assert_eq!(
+            resolve_native_route(None, "orchestrator", repo.path()),
+            None
+        );
         assert_eq!(
             resolve_native_route(Some("   "), "orchestrator", repo.path()),
             None

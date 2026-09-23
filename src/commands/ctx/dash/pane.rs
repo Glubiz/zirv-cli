@@ -6078,13 +6078,14 @@ pub(crate) mod tests {
         // shim with no `current_dir` set at all, so a relative path landed
         // in the real process cwd (the checkout root) instead. An absolute
         // tempdir path, quoted, is immune to both which cwd a spawn actually
-        // used and to a tempdir path containing spaces.
+        // used and to a tempdir path containing spaces. The probe itself
+        // exits unlogged, or its `--help` would land in the log first.
         let argv_log = tmp.path().join("return-argv.log");
         let script = tmp.path().join("log-argv.sh");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 3\n",
+                "#!/bin/sh\n[ \"$1\" = --help ] && exit 0\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 3\n",
                 argv_log.display()
             ),
         )
