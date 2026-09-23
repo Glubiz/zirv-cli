@@ -377,7 +377,7 @@ fn sessions_lines(
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("sock"))
+                .filter(|e| super::sessions::is_endpoint_file(&e.path()))
                 .filter_map(|e| {
                     e.path()
                         .file_stem()

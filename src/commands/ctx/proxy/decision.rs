@@ -422,9 +422,11 @@ fn request_size_floor(request: &str) -> Complexity {
         .filter(|line| {
             line.starts_with("- ")
                 || line.starts_with("* ")
-                || line
-                    .split_once(['.', ')'])
-                    .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                || line.split_once(['.', ')']).is_some_and(|(n, rest)| {
+                    (1..=2).contains(&n.len())
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && rest.starts_with(' ')
+                })
         })
         .count();
     if words >= 300 || items >= 8 {
@@ -2640,6 +2642,18 @@ mod tests {
         );
         let enumerated = "Please fix these:\n1. paging skips a row\n2. amounts lose their sign\n3) regex rules are case-sensitive\n";
         assert_eq!(classify_request(enumerated).complexity, Complexity::Bounded);
+        assert_eq!(
+            classify_request(
+                "Outage:
+2026.09 sync failed
+4.26.0 rollback
+10.2 timed out
+"
+            )
+            .complexity,
+            Complexity::Trivial,
+            "version- and date-shaped lines are not list items"
+        );
         let spec = format!(
             "Add recurring transactions.\n{}",
             (1..=8)
