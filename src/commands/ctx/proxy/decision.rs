@@ -395,8 +395,45 @@ pub fn classify_request(request: &str) -> Classification {
     classification.reasons.push(
         "classification: request text only; repository diff not measured at intake".to_string(),
     );
+    // With no paths or lines, `classify` can only ever answer `Trivial`, and
+    // a metadata-only Jev intake sees nothing better -- so every multi-part
+    // spec was routed to the cheap seat (wrapped-vs-vanilla benchmark,
+    // 2026-09-23: large tasks lost points on haiku). The request's own size
+    // is the one scope signal intake has.
+    let size_floor = request_size_floor(request);
+    if size_floor > classification.complexity {
+        classification.complexity = size_floor;
+        classification.reasons.push(format!(
+            "complexity: request size floors it at {}",
+            format!("{size_floor:?}").to_ascii_lowercase()
+        ));
+    }
     classification.reasons.sort();
     classification
+}
+
+/// A long or enumerated request describes several requirements; never
+/// `Architectural`, which needs real paths to justify.
+fn request_size_floor(request: &str) -> Complexity {
+    let words = request.split_whitespace().count();
+    let items = request
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line
+                    .split_once(['.', ')'])
+                    .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count();
+    if words >= 300 || items >= 8 {
+        Complexity::Substantial
+    } else if words >= 120 || items >= 3 {
+        Complexity::Bounded
+    } else {
+        Complexity::Trivial
+    }
 }
 
 /// Issue #537 field evidence problem (a): the orchestrator seat's model is
@@ -2593,6 +2630,34 @@ mod tests {
         assert_eq!(merged.execution, ExecutionMode::Orchestrated);
         assert_eq!(merged.seat_role, SeatRole::Orchestrator);
         assert!(merged.validation.independent_test);
+    }
+
+    #[test]
+    fn classify_request_floors_complexity_by_request_size() {
+        assert_eq!(
+            classify_request("Fix the typo in the README").complexity,
+            Complexity::Trivial
+        );
+        let enumerated = "Please fix these:\n1. paging skips a row\n2. amounts lose their sign\n3) regex rules are case-sensitive\n";
+        assert_eq!(classify_request(enumerated).complexity, Complexity::Bounded);
+        let spec = format!(
+            "Add recurring transactions.\n{}",
+            (1..=8)
+                .map(|n| format!("- requirement {n}\n"))
+                .collect::<String>()
+        );
+        let classification = classify_request(&spec);
+        assert_eq!(classification.complexity, Complexity::Substantial);
+        assert!(
+            classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("request size"))
+        );
+        assert_eq!(
+            classify_request(&"word ".repeat(2000)).complexity,
+            Complexity::Substantial
+        );
     }
 
     /// A `Roster` whose registry is the real built-in one (loaded against an

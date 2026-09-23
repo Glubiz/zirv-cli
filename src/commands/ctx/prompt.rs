@@ -169,8 +169,13 @@ pub const SINGLE_PROMPT_FILE: &str = "system-prompt.single.md";
 /// never re-printing output already shown -- a distinct concern from the
 /// no-slop bullet above it, which is about the session's own prose, not the
 /// tool calls it makes.
+///
+/// v7 (wrapped-vs-vanilla benchmark, 2026-09-23): the verify bullet adds a
+/// point-by-point check of a multi-part request's stated details -- large
+/// tasks lost points to a misspelt literal and a wrong exit path that the
+/// spec named exactly.
 pub const DEFAULT_PROMPT: &str = "\
-zirv engineering standard (v6)
+zirv engineering standard (v7)
 
 Work the way a top-tier engineer works: judgment first, process in proportion, nothing wasted.
 
@@ -199,7 +204,8 @@ change approach, or ask one precise question.
 - Verify with evidence, once. Run the check that would catch the failure this change could \
 cause, read its result, and trust it: do not re-run a passing suite, re-read a file you \
 already read, or re-check a fact already established this session unless something has \
-changed it.
+changed it. Before calling a multi-part request done, check each stated detail -- names, \
+spellings, messages, exit codes, formats -- against your change.
 - No slop: no filler or narration, no comments that restate the code, no defensive code for \
 impossible states, no redundant docs or hedging, no recap of what you just did. Delete \
 whatever it orphans -- code, imports, tests, docs -- and rename what no longer fits.
@@ -3676,9 +3682,10 @@ mod tests {
     #[test]
     fn the_shipped_default_is_short_and_plain() {
         // Issue #326: bumped from 3500 to fit the new tool-output-hygiene
-        // bullet (v6); still a floor, not a policy engine.
+        // bullet (v6), then to 3800 for v7's stated-detail check; still a
+        // floor, not a policy engine.
         assert!(
-            DEFAULT_PROMPT.len() < 3700,
+            DEFAULT_PROMPT.len() < 3800,
             "a floor, not a policy engine: {} bytes",
             DEFAULT_PROMPT.len()
         );
@@ -8655,7 +8662,7 @@ mod tests {
     #[test]
     fn the_default_prompt_carries_the_v5_marker_and_new_wording() {
         assert!(
-            DEFAULT_PROMPT.contains("zirv engineering standard (v6)"),
+            DEFAULT_PROMPT.contains("zirv engineering standard (v7)"),
             "got {DEFAULT_PROMPT}"
         );
         assert!(
@@ -8684,7 +8691,7 @@ mod tests {
         .expect("composed");
 
         assert!(
-            composed.text.contains("zirv engineering standard (v6)"),
+            composed.text.contains("zirv engineering standard (v7)"),
             "got {}",
             composed.text
         );
