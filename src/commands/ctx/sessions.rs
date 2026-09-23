@@ -63,11 +63,12 @@ pub fn short_id(session: &str) -> String {
 /// `SEAT_MODEL_ENV` does -- it names *this* session's own seat role, and a
 /// worker that inherited an orchestrator's copy would be mistaken for the
 /// seat it is not sitting in.
-pub const SUPERVISION_ENV: [&str; 10] = [
+pub const SUPERVISION_ENV: [&str; 11] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
     super::adapters::SEAT_MODEL_ENV,
     super::adapters::SEAT_ROLE_ENV,
+    super::adapters::PROXY_DECIDED_ENV,
     super::wrap::TRANSCRIPT_ENV,
     super::adapters::LAUNCH_MODE_ENV,
     super::agent::PARENT_SESSION_ENV,

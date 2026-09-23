@@ -1016,6 +1016,13 @@ impl StateDir {
         self.0.join("adoption")
     }
 
+    /// Issue #753: one empty marker file per session whose first prompt the
+    /// `UserPromptSubmit` hook has already classified
+    /// (`<state>/intake/<hash>`), mirroring `adoption()`'s layout.
+    pub fn intake(&self) -> PathBuf {
+        self.0.join("intake")
+    }
+
     /// Issue #246: `status --diff`'s per-session snapshot of the previous
     /// `--diff` call's rendered sections, one file per session id
     /// (`<state>/status-snapshots/<session-id>.json`), mirroring

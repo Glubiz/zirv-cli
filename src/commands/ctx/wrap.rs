@@ -2339,6 +2339,10 @@ pub fn run_with(
     // Issues #328/#334: which seat role this session runs as, for the same
     // guard -- unlike `seat_model_env`, unconditional for every role.
     turn_env.extend(adapters::seat_role_env(role));
+    // Issue #753: a proxy-decided launch tells its hook not to re-run intake.
+    if args.proxy_layer.is_some() {
+        turn_env.push((adapters::PROXY_DECIDED_ENV.to_string(), "1".to_string()));
+    }
     // Issue #358 (task 5): the logical orchestrator seat this session sits
     // in. Registered here rather than beside `SessionGuard::register` above
     // (where `seat::register`'s own wiring note points) for one reason: the

@@ -281,6 +281,13 @@ pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
 /// `SEAT_MODEL_ENV`.
 pub const SEAT_ROLE_ENV: &str = "ZIRV_CTX_SEAT_ROLE";
 
+/// Issue #753: set to `"1"` on a session whose launch already applied a
+/// harness-proxy decision (`WrapArgs::proxy_layer` is `Some`), so the
+/// `UserPromptSubmit` hook's own intake discipline never repeats what the
+/// proxy decided. Listed in `sessions::SUPERVISION_ENV` so a worker spawned
+/// from inside that session decides fresh rather than inheriting it.
+pub const PROXY_DECIDED_ENV: &str = "ZIRV_CTX_PROXY_DECIDED";
+
 /// Set on every child zirv itself launches interactively -- `zirv chat`,
 /// `zirv ctx wrap`, or a dashboard pane spawned from a request that vouches
 /// a human is present (`SpawnRequest.interactive`) -- so `zirv ctx safety

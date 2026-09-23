@@ -691,6 +691,13 @@ pub struct PromptConfig {
     /// dedupe_native` uses, never force it back on for an operator who
     /// turned it off.
     pub skill_index: bool,
+    /// Issue #753: whether the `UserPromptSubmit` hook classifies a
+    /// session's FIRST prompt (text only, no network) and, for a
+    /// substantial one, adds the one-turn plan/test discipline note
+    /// (`hook::INTAKE_DISCIPLINE_TEXT`). NOT `REPO_FORBIDDEN`: a repo
+    /// checkout may only narrow it to `false` (`narrow_intake_discipline_
+    /// bool`), never force it back on for an operator who turned it off.
+    pub intake_discipline: bool,
     /// Whether a codex Orchestrator session's composed prompt gets codex's
     /// own `AgentAdapter::base_system_prompt` layer (issue #167,
     /// `adapters::codex::ORCHESTRATOR_PROMPT`) -- the codex analogue of
@@ -727,6 +734,7 @@ impl Default for PromptConfig {
             max_repo_bytes: 4096,
             harnesses: true,
             skill_index: true,
+            intake_discipline: true,
             codex_orchestrator: true,
             orchestrator_writes: OrchestratorWrites::Advise,
         }
@@ -3453,6 +3461,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_PROMPT_INTAKE_DISCIPLINE",
+        &["prompt", "intake_discipline"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
         &["prompt", "codex_orchestrator"],
         EnvKind::Bool,
@@ -4276,6 +4289,13 @@ fn narrow_dedupe_bool(home: bool, repo: Option<bool>) -> bool {
 /// on for an operator who disabled it (e.g. to work around a host's own
 /// inline-argv limits).
 fn narrow_skill_index_bool(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// Issue #753: the repo-narrowing fold for `prompt.intake_discipline` --
+/// `false` (no intake note) is this key's strict direction, exactly like
+/// `narrow_skill_index_bool`.
+fn narrow_intake_discipline_bool(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
@@ -5705,6 +5725,8 @@ impl CtxConfig {
         // lift-before-merge treatment, folded by `narrow_skill_index_bool` --
         // unlike every other `[prompt]` key, this one is not `REPO_FORBIDDEN`.
         let home_prompt_skill_index = bool_at(take_nested(&mut merged, "prompt", "skill_index"));
+        let home_prompt_intake_discipline =
+            bool_at(take_nested(&mut merged, "prompt", "intake_discipline"));
         // Issue #309: `verify_on_stop.enabled`/`max_nudges` get the identical
         // lift-before-merge treatment -- see `narrow_verify_on_stop_enabled`/
         // `narrow_max_nudges` below for each field's strict direction.
@@ -5908,6 +5930,8 @@ impl CtxConfig {
             bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
         let repo_prompt_skill_index =
             bool_at(take_nested(&mut repo_layer, "prompt", "skill_index"));
+        let repo_prompt_intake_discipline =
+            bool_at(take_nested(&mut repo_layer, "prompt", "intake_discipline"));
         let repo_verify_on_stop_enabled =
             bool_at(take_nested(&mut repo_layer, "verify_on_stop", "enabled"));
         let repo_verify_on_stop_max_nudges =
@@ -6190,6 +6214,14 @@ impl CtxConfig {
             toml::Value::Boolean(narrow_skill_index_bool(
                 home_prompt_skill_index.unwrap_or(default_prompt.skill_index),
                 repo_prompt_skill_index,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["prompt", "intake_discipline"],
+            toml::Value::Boolean(narrow_intake_discipline_bool(
+                home_prompt_intake_discipline.unwrap_or(default_prompt.intake_discipline),
+                repo_prompt_intake_discipline,
             )),
         );
         let default_verify_on_stop = VerifyOnStopConfig::default();
@@ -9804,6 +9836,48 @@ mod tests {
         );
     }
 
+    /// Issue #753: `prompt.intake_discipline` is narrow-only from the repo
+    /// layer -- a repo `false` turns it off, a repo `true` cannot undo the
+    /// operator's own `false`, and neither layer setting it keeps `true`.
+    #[test]
+    fn a_repo_layer_may_disable_intake_discipline_but_never_re_enable_it() {
+        let load = |home_text: Option<&str>, repo_text: &str| {
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            if let Some(text) = home_text {
+                std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+                std::fs::write(home.path().join(".zirv").join(CTX_CONFIG_FILE), text)
+                    .expect("write home layer");
+            }
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv").join(CTX_CONFIG_FILE), repo_text)
+                .expect("write repo layer");
+            let empty: HashMap<String, String> = HashMap::new();
+            CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("loads")
+                .prompt
+                .intake_discipline
+        };
+        assert!(load(None, ""), "default is on");
+        assert!(!load(
+            None,
+            "[prompt]
+intake_discipline = false
+"
+        ));
+        assert!(!load(
+            Some(
+                "[prompt]
+intake_discipline = false
+"
+            ),
+            "[prompt]
+intake_discipline = true
+"
+        ));
+    }
+
     /// The default, and the common case: neither layer mentions the key at
     /// all, so it must stay at the built-in `true` -- not fold to `false`
     /// the way an unmodified `narrow_pace_bool` reuse would (its `repo`-
@@ -12929,6 +13003,7 @@ mod tests {
         ("prompt", "max_repo_bytes"),
         ("prompt", "harnesses"),
         ("prompt", "skill_index"),
+        ("prompt", "intake_discipline"),
         ("prompt", "codex_orchestrator"),
         ("prompt", "verbosity"),
         ("context", "max_common_bytes"),

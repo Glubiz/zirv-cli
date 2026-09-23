@@ -1135,7 +1135,16 @@ fn run_dash_branch(
             proxy_layer,
             task,
         )?;
-        dash::run_dashboard(cfg, repo, env, state, pane, None, force_pace)
+        // Issue #753: marks the first pane as proxy-decided (see
+        // `adapters::PROXY_DECIDED_ENV`); every other key reads through.
+        let proxied = |key: &str| {
+            if proxy_layer.is_some() && key == super::adapters::PROXY_DECIDED_ENV {
+                Some("1".to_string())
+            } else {
+                env(key)
+            }
+        };
+        dash::run_dashboard(cfg, repo, &proxied, state, pane, None, force_pace)
     })
 }
 

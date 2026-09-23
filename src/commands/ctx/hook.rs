@@ -1966,7 +1966,21 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
     }
 
     let adoption_nudge = prompt_adoption_nudge(&repo, &cfg, env);
-    let output = prompt_output(&cfg.score.marker, adoption_nudge.as_deref(), &repo, env);
+    // Issue #753: the one-turn intake discipline note rides the same extra
+    // line as the adoption nudge; `None` on every turn but a substantial
+    // first one.
+    let intake_note = intake_discipline_note(&cfg, &payload.session_id, stdin, env);
+    let extra = [intake_note, adoption_nudge]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let extra = (!extra.is_empty()).then(|| {
+        extra.join(
+            "
+",
+        )
+    });
+    let output = prompt_output(&cfg.score.marker, extra.as_deref(), &repo, env);
     if !output.is_empty() {
         let _ = writeln!(w, "{output}");
     }
@@ -1986,6 +2000,93 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
         );
     }
     Ok(0)
+}
+
+/// Issue #753: the discipline a substantial task gets on its first turn --
+/// the plan/test habits the large-task benchmark rows lost without the
+/// proxy's routing (docs/benchmarks/wrapped-vs-vanilla.md section 4-5). Kept
+/// under 400 bytes: it is paid once per session, never per turn.
+pub(crate) const INTAKE_DISCIPLINE_TEXT: &str = "[zirv intake] Substantial task. Plan ordered, verifiable steps before editing. Write or extend tests first for behaviour changes. Never modify or weaken existing or protected tests to make them pass. Run the full test suite before declaring done. Skills: zirv skill load plan / tdd / verify.";
+
+/// Pure: the intake note for `prompt` -- the proxy's own deterministic,
+/// text-only classifier (`decision::try_classify_request`, no Git, no
+/// network), `Some` only for a `Substantial`+ complexity or `High`+ risk.
+fn intake_discipline_for(prompt: &str) -> Option<&'static str> {
+    let classification = super::proxy::decision::try_classify_request(prompt)?;
+    (classification.complexity >= crate::commands::workflow::classify::Complexity::Substantial
+        || classification.risk >= crate::commands::workflow::classify::RiskBand::High)
+        .then_some(INTAKE_DISCIPLINE_TEXT)
+}
+
+/// Whether this session's launch already decided (the harness proxy) or it
+/// is a delegated seat that follows its parent's plan -- either way, intake
+/// is not this hook's call.
+fn intake_skipped_for_launch(env: EnvLookup<'_>) -> bool {
+    let set = |key: &str| env(key).is_some_and(|value| !value.is_empty());
+    env(adapters::PROXY_DECIDED_ENV).as_deref() == Some("1")
+        || matches!(
+            env(adapters::SEAT_ROLE_ENV).as_deref(),
+            Some("worker" | "sub-orchestrator" | "single")
+        )
+        || set(super::agent::WORK_GROUP_ENV)
+        || set(super::agent::PARENT_SESSION_ENV)
+}
+
+/// Claims this session's first prompt: `true` exactly once per session,
+/// by atomically creating its marker file. Any I/O doubt is `false` --
+/// inject nothing rather than risk repeating the note every turn.
+fn claim_first_prompt(state: &StateDir, session: &str) -> bool {
+    let dir = state.intake();
+    if super::state::create_private_dir_all(&dir).is_err() {
+        return false;
+    }
+    let path = dir.join(format!("{:016x}", input_hash(session)));
+    let claimed = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .is_ok();
+    if claimed {
+        super::state::prune_to_newest(&dir, super::state::KEEP_NEWEST);
+    }
+    claimed
+}
+
+/// Issue #753: classify a wrapped session's FIRST prompt and, when it is
+/// substantial, return the one-turn discipline note. Every gate (config,
+/// proxy/worker launch, no session id, no state dir, not the first prompt,
+/// classifier refusal) degrades to `None`: this never blocks a prompt.
+fn intake_discipline_note(
+    cfg: &CtxConfig,
+    payload_session: &str,
+    stdin: &str,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !cfg.prompt.intake_discipline || intake_skipped_for_launch(env) {
+        return None;
+    }
+    let session = env(SESSION_ENV)
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))?;
+    let state = StateDir::resolve(env).ok()?;
+    if !claim_first_prompt(&state, &session) {
+        return None;
+    }
+    let note = intake_discipline_for(&prompt_text_from(stdin))?;
+    let _ = log::append(
+        &state,
+        &log::Decision {
+            ts: now_secs(),
+            session: &session,
+            verb: "hook",
+            verdict: "n/a",
+            score: 0,
+            action: "intake-discipline",
+            detail: "substantial first prompt",
+            observed_at: None,
+        },
+    );
+    Some(note.to_string())
 }
 
 /// Issue #745: prompts this hook can answer without ever asking a model -- a
@@ -12434,5 +12535,131 @@ capable a model does it actually need?",
             "a missing credential must fall through byte-identical to today"
         );
         assert!(!state_on.join("jev-effects.jsonl").exists());
+    }
+
+    /// Issue #753: a prompt the proxy's own size floor calls `Substantial`
+    /// (eight enumerated requirements), and a one-liner that stays trivial.
+    const SUBSTANTIAL_PROMPT: &str = "Build the importer:\n1. parse csv\n2. validate rows\n\
+        3. dedupe keys\n4. map columns\n5. write rows\n6. report errors\n7. add a cli flag\n\
+        8. document it";
+    const TRIVIAL_PROMPT: &str = "fix the typo in README";
+
+    fn intake_env(
+        state: &Path,
+        extra: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), "sess-intake".to_string()),
+        ]
+        .into();
+        for (key, value) in extra {
+            env.insert((*key).to_string(), (*value).to_string());
+        }
+        env
+    }
+
+    fn intake_stdin(prompt: &str) -> String {
+        serde_json::json!({ "session_id": "s1", "prompt": prompt }).to_string()
+    }
+
+    #[test]
+    fn intake_discipline_text_stays_compact() {
+        assert!(
+            INTAKE_DISCIPLINE_TEXT.len() <= 400,
+            "{} bytes",
+            INTAKE_DISCIPLINE_TEXT.len()
+        );
+    }
+
+    #[test]
+    fn intake_discipline_fires_on_a_substantial_first_prompt_only_once() {
+        let state = tempfile::tempdir().expect("state");
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::default();
+        let first = intake_discipline_note(&cfg, "s1", &intake_stdin(SUBSTANTIAL_PROMPT), &lookup);
+        assert_eq!(first.as_deref(), Some(INTAKE_DISCIPLINE_TEXT));
+        let second = intake_discipline_note(&cfg, "s1", &intake_stdin(SUBSTANTIAL_PROMPT), &lookup);
+        assert_eq!(second, None, "second turn must carry nothing");
+    }
+
+    #[test]
+    fn intake_discipline_is_absent_for_a_trivial_first_prompt_and_after_it() {
+        let state = tempfile::tempdir().expect("state");
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::default();
+        assert_eq!(
+            intake_discipline_note(&cfg, "s1", &intake_stdin(TRIVIAL_PROMPT), &lookup),
+            None
+        );
+        assert_eq!(
+            intake_discipline_note(&cfg, "s1", &intake_stdin(SUBSTANTIAL_PROMPT), &lookup),
+            None,
+            "only the FIRST prompt is classified"
+        );
+    }
+
+    #[test]
+    fn intake_discipline_respects_the_opt_out() {
+        let state = tempfile::tempdir().expect("state");
+        let env = intake_env(state.path(), &[]);
+        let mut cfg = CtxConfig::default();
+        cfg.prompt.intake_discipline = false;
+        assert_eq!(
+            intake_discipline_note(&cfg, "s1", &intake_stdin(SUBSTANTIAL_PROMPT), &|k| {
+                env.get(k).cloned()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn intake_discipline_skips_proxy_decided_and_delegated_launches() {
+        for extra in [
+            (adapters::PROXY_DECIDED_ENV, "1"),
+            (adapters::SEAT_ROLE_ENV, "worker"),
+            (adapters::SEAT_ROLE_ENV, "single"),
+            (super::super::agent::PARENT_SESSION_ENV, "parent"),
+        ] {
+            let state = tempfile::tempdir().expect("state");
+            let env = intake_env(state.path(), &[extra]);
+            assert_eq!(
+                intake_discipline_note(
+                    &CtxConfig::default(),
+                    "s1",
+                    &intake_stdin(SUBSTANTIAL_PROMPT),
+                    &|k| env.get(k).cloned()
+                ),
+                None,
+                "{extra:?} must skip intake"
+            );
+        }
+    }
+
+    /// End to end through the real `UserPromptSubmit` handler: the note
+    /// lands in `additionalContext` beside the marker line.
+    #[test]
+    fn run_prompt_injects_the_intake_note_on_a_substantial_first_prompt() {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = repo.path().join("state");
+        let env = intake_env(&state, &[]);
+        let cwd = repo.path().display().to_string();
+        let out =
+            String::from_utf8(run_prompt_captured(&cwd, SUBSTANTIAL_PROMPT, &env)).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let context = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("context");
+        assert!(context.contains("[zirv intake]"), "{context}");
+        let again =
+            String::from_utf8(run_prompt_captured(&cwd, SUBSTANTIAL_PROMPT, &env)).expect("utf8");
+        assert!(!again.contains("[zirv intake]"), "{again}");
     }
 }

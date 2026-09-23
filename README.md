@@ -2057,6 +2057,24 @@ so the CLI counts itself instead -- a successful load (never a refused or
 unknown id) bumps the calling session's own record directly, keyed off the
 same `SESSION_ENV` the hooks use, whenever one is set.
 
+#### Intake discipline
+
+On a session's first `UserPromptSubmit`, the Claude hook classifies the
+prompt with the same deterministic, text-only classifier `zirv ctx proxy`
+uses (no Git, no network, no model call). When the prompt is `substantial`
+or larger (a long request, or 8 or more enumerated requirements) or its risk
+is `high`, that one turn's `additionalContext` also carries a note of under
+400 bytes: plan ordered, verifiable steps before editing; write tests first
+for behaviour changes; never modify or weaken existing or protected tests; run
+the full suite before declaring done; and load the `plan`/`tdd`/`verify`
+skills. Trivial and bounded prompts, and every later turn,
+get nothing. The hook never starts a workflow. It skips sessions whose launch
+already applied a proxy decision (`ZIRV_CTX_PROXY_DECIDED=1`, set by `zirv
+chat` for its wrapped or dashboard seat), `single`/`worker`/`sub-orchestrator`
+seats, and delegated `zirv agent` runs. `prompt.intake_discipline`
+(`ZIRV_CTX_PROMPT_INTAKE_DISCIPLINE`, default `true`) turns it off; a
+repository may only narrow it to `false`.
+
 ### Agent registry
 
 Workflow seats are provider-neutral data, not harness-specific plugins: a
@@ -4125,6 +4143,7 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_ENTROPY` | operator environment | selects whether heuristic entropy findings are flagged or masked |
 | `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
+| `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 
