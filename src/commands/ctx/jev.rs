@@ -1220,6 +1220,8 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
                     ("context", cfg.jev.context),
                     ("intake_savings", cfg.jev.intake_savings),
                     ("review_reuse", cfg.jev.review_reuse),
+                    ("harvest_screen", cfg.jev.harvest_screen),
+                    ("admin_dispatch", cfg.jev.admin_dispatch),
                 ];
                 let any_gate_on = gates.iter().any(|(_, on)| *on);
                 let cred_present = available(&cfg.proxy.typesafe);
@@ -1245,6 +1247,8 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
                         "context": cfg.jev.context,
                         "intake_savings": cfg.jev.intake_savings,
                         "review_reuse": cfg.jev.review_reuse,
+                        "harvest_screen": cfg.jev.harvest_screen,
+                        "admin_dispatch": cfg.jev.admin_dispatch,
                     },
                     "credential_env": cred_env,
                     "credential_present": cred_present,
@@ -1282,6 +1286,8 @@ pub fn status(cfg: &CtxConfig, writer: &mut impl Write) -> Result<(), Box<dyn st
         ("context", cfg.jev.context),
         ("intake_savings", cfg.jev.intake_savings),
         ("review_reuse", cfg.jev.review_reuse),
+        ("harvest_screen", cfg.jev.harvest_screen),
+        ("admin_dispatch", cfg.jev.admin_dispatch),
     ];
     let any_gate_on = gates.iter().any(|(_, on)| *on);
 
