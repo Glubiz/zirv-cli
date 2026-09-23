@@ -974,6 +974,25 @@ fn proxy_prompt_role(intake: &ProxyIntakeOutcome) -> PromptRole {
     }
 }
 
+/// Issue #703 (follow-up to #702): the model half of the same decision
+/// `proxy_prompt_role` already reads the seat role from. `apply_proxy_
+/// decision`'s `cfg.chat.model` seam (which flows into `extra_with_model`,
+/// the harness argv and the banner) has no equivalent on the native path --
+/// there is no `--model` flag and no harness argv to fold one into. This
+/// hands `native_pane_spec` the decided model as-is, for `NativeDashboardSpec
+/// ::route`: `NativePaneRuntime::spawn` is what validates it against the
+/// operator's own native provider configuration and falls back to the role's
+/// default route for anything that is not an existing, policy-allowed route
+/// name, rather than failing the launch the way an unresolvable explicit
+/// `--route` would. `None` for every outcome but `Decided`, exactly like
+/// `proxy_prompt_role`, which leaves the pane's route untouched.
+fn proxy_decided_model(intake: &ProxyIntakeOutcome) -> Option<String> {
+    match intake {
+        ProxyIntakeOutcome::Decided { decision, .. } => Some(decision.orchestrator.model.clone()),
+        _ => None,
+    }
+}
+
 /// The harness proxy's own bounded `[zirv proxy]` layer text
 /// (`proxy::prompt_layer`), when [`proxy_intake`] decided this launch;
 /// `None` for every other outcome. Computed once and threaded to every
@@ -1311,7 +1330,11 @@ fn run_native_chat<E: Write>(
     // spend -- therefore applies to it unchanged, and a wrapped harness pane
     // can be spawned beside it in the same process.
     let session = uuid::Uuid::new_v4().to_string();
-    let (pane_spec, native_spec) = native_pane_spec(repo, session, seat_role);
+    // Issue #703: the proxy's decided model, threaded alongside the seat role
+    // it was decided together with -- see `proxy_decided_model`'s own doc
+    // comment for why this is a route CANDIDATE rather than a guaranteed one.
+    let model = proxy_decided_model(&intake);
+    let (pane_spec, native_spec) = native_pane_spec(repo, session, seat_role, model);
     dash::run_dashboard(
         cfg,
         repo,
@@ -1332,10 +1355,17 @@ fn run_native_chat<E: Write>(
 /// mapping is testable without a real TTY or an actual native session:
 /// `dash::run_dashboard` below it is an interactive loop that would
 /// otherwise need one.
+///
+/// Issue #703: `model` (from `proxy_decided_model`) lands on
+/// `NativeDashboardSpec::route` -- the SAME field `dash::mod.rs`'s worker
+/// spawn path already feeds a delegation's own model alias into. `None`
+/// (every outcome but a decided proxy launch) reproduces today's behaviour
+/// exactly: the role's own configured default route, untouched.
 fn native_pane_spec(
     repo: &Path,
     session: String,
     seat_role: PromptRole,
+    model: Option<String>,
 ) -> (dash::PaneSpec, dash::native_pane::NativeDashboardSpec) {
     (
         dash::PaneSpec {
@@ -1349,7 +1379,7 @@ fn native_pane_spec(
         dash::native_pane::NativeDashboardSpec {
             repo: repo.to_path_buf(),
             role: seat_role.label().to_string(),
-            route: None,
+            route: model,
             writing: true,
             provider: None,
             seat: None,
@@ -5272,7 +5302,8 @@ fix the flaky retry test
         let seat_role = proxy_prompt_role(&outcome);
         assert_eq!(seat_role, PromptRole::Single);
 
-        let (pane, native) = native_pane_spec(repo.path(), "session-1".to_string(), seat_role);
+        let (pane, native) =
+            native_pane_spec(repo.path(), "session-1".to_string(), seat_role, None);
 
         assert_eq!(pane.role, PromptRole::Single);
         assert_eq!(
@@ -5295,10 +5326,55 @@ fix the flaky retry test
         let seat_role = proxy_prompt_role(&ProxyIntakeOutcome::Inactive { advisory: None });
         assert_eq!(seat_role, PromptRole::Orchestrator);
 
-        let (pane, native) = native_pane_spec(repo.path(), "session-2".to_string(), seat_role);
+        let (pane, native) =
+            native_pane_spec(repo.path(), "session-2".to_string(), seat_role, None);
 
         assert_eq!(pane.role, PromptRole::Orchestrator);
         assert_eq!(native.role, "orchestrator");
+    }
+
+    /// Issue #703 (follow-up to #702): the actual bug this fixes -- a native
+    /// launch's `NativeDashboardSpec` used to hardcode `route: None` no
+    /// matter what model the proxy decided, because `native_pane_spec` never
+    /// read `ProxyDecision.orchestrator.model` at all. `proxy_decided_model`
+    /// is the seam `run_native_chat` now feeds `native_pane_spec` from, the
+    /// same way `proxy_prompt_role` already feeds it the seat role.
+    #[test]
+    fn proxy_decided_model_reaches_the_native_pane_spec_as_a_route_candidate() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let decision = sample_decision(repo.path(), "claude", "fable", None);
+        let outcome = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "fix a typo in README".to_string(),
+        };
+
+        let model = proxy_decided_model(&outcome);
+        assert_eq!(model.as_deref(), Some("fable"));
+
+        let (_, native) = native_pane_spec(
+            repo.path(),
+            "session-3".to_string(),
+            PromptRole::Single,
+            model,
+        );
+
+        assert_eq!(
+            native.route.as_deref(),
+            Some("fable"),
+            "the decided model must reach NativeDashboardSpec::route as the \
+             candidate NativePaneRuntime::spawn validates"
+        );
+    }
+
+    /// The mirror of the test above: an intake that never decided this
+    /// launch leaves `proxy_decided_model` (and therefore the pane's route)
+    /// `None` -- the role's own configured default route, unchanged.
+    #[test]
+    fn proxy_decided_model_is_none_when_the_proxy_never_decided() {
+        assert_eq!(
+            proxy_decided_model(&ProxyIntakeOutcome::Inactive { advisory: None }),
+            None
+        );
     }
 
     fn git_init_with_commit(repo: &Path) {

@@ -585,8 +585,17 @@ TypeSafe credential is read only from the environment variable named by
 at $0.042 per MTok input, output free — see [Model
 catalogue](#model-catalogue) — and costs at most one bounded call per launch.
 
-The native runtime applies the same decision behind its existing gate; this
-feature does not change that gate.
+The native runtime applies the same decision behind its existing gate: the
+decided seat role (`PromptRole::Single`/`Orchestrator`) always applies, and
+the decided model applies too when it names a configured, policy-allowed
+native `[route]` directly, or — the common case, since the proxy's
+harness-CLI-style aliases and an operator's own route names are independent
+vocabularies — resolves to the same catalogue model as one of them (an
+operator who named a route `cheap` with `model = "sonnet"` still gets it
+picked for a decided `sonnet`; several matching routes prefer the role's own
+default route, else the first by route id). No match at all leaves the pane
+on its role's own default route rather than failing the launch. This feature
+does not change the coming-soon gate itself.
 
 The HTTP call to Jev is a shared client, not proxy-specific code; other
 advisory sites it may back (memory ranking, the supervisor judge, dispatch
@@ -1693,7 +1702,7 @@ zirv workflow team show [--workflow <id>|active] [--json]
 zirv workflow team brief <seat-id> [--json]       # Agent-tool-ready brief for one compiled seat
 zirv workflow approve <id>                        # approve the current gated step
 zirv workflow advance <id> --outcome success|failure
-zirv workflow review package <id> | run <id> --agent <name> | add | ...
+zirv workflow review package <id> | run <id> --agent <name> | add | record <id> --model <name> [--finding <id>]... | ...
 zirv workflow maintain scan [--repo <path>] [--json]
 zirv workflow stats                               # local bounded telemetry: per-phase timing, the implement/validate wall-clock split, approval wait, and fix-round causes (issue #699 Phase 0)
 ```
@@ -2447,6 +2456,13 @@ and supervised Claude/Codex workflows attribute available transcript token
 deltas automatically. Telemetry excludes prompts, source code, diffs, command
 output, and model responses by construction.
 
+An orchestrator seat is refused from `review run --agent <its own harness>`
+(same-harness delegation belongs to the harness's native subagent tool, not
+`zirv agent`); after reviewing there and filing findings with `review add`,
+record the completed run with `zirv workflow review record <id> --model
+<name> [--finding <id>]...` so it counts toward the review step's fresh
+independent review run gate exactly like a `review run` invocation.
+
 ## Context Management (zirv ctx)
 
 ### What leaves this device
@@ -2925,9 +2941,12 @@ placeholder with no activation flags. `zirv chat` remains the existing harness.
 The following describes the implementation retained for a future release.
 
 `zirv chat` takes no `--route` or `--view` flag (those are `zirv ctx exec
---runtime native`'s own) — the native pane always spends the `orchestrator`
-role's route (`[runtime.roles].orchestrator`, or `[roles].orchestrator` in
-`~/.zirv/native.toml` with no per-role runtime override). `--runtime native`
+--runtime native`'s own) — the native pane spends the `orchestrator` role's
+route (`[runtime.roles].orchestrator`, or `[roles].orchestrator` in
+`~/.zirv/native.toml` with no per-role runtime override), unless the harness
+proxy is active and decided a model that resolves to a configured,
+policy-allowed route, directly by name or by catalogue model — see
+[Harness proxy](#harness-proxy). `--runtime native`
 refuses every wrapped-harness-only flag (`--agent`,
 `--simple`, `--resume`, `--pin-harness`, a trailing `extra` argv) rather than
 silently ignoring them, and refuses without an interactive terminal on both
@@ -3419,7 +3438,9 @@ allow_hosts = ["docs.rs", ".rust-lang.org"]   # empty means nothing is reachable
 
 [capabilities.browser]
 enabled = true
-# binary = "chromium"            # discovered on PATH when unset
+# binary = "chromium"            # discovered on PATH, or (macOS) the
+                                  # standard /Applications and
+                                  # $HOME/Applications app bundles, when unset
 
 [[capabilities.mcp]]
 name = "docs"

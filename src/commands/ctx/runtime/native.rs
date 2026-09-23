@@ -8570,9 +8570,15 @@ mod tests {
     /// Issue #537 (T2b): `[proxy] enabled = false` (the default) leaves a
     /// native session's first turn exactly as before -- no decision is ever
     /// computed or persisted, so `proxy-decisions.jsonl` never appears.
+    ///
+    /// Issue #713: `interactive_shutdown_fixture` does not isolate the
+    /// operator's real `~/.zirv/ctx.toml`, so a machine whose operator
+    /// config enables the proxy would otherwise leak that setting in here.
+    /// Pin the posture this test actually needs instead.
     #[test]
     fn proxy_disabled_leaves_the_native_session_unaffected() {
-        let (repo, state, _tree, env) = interactive_shutdown_fixture();
+        let (repo, state, _tree, mut env) = interactive_shutdown_fixture();
+        env.insert("ZIRV_CTX_PROXY_ENABLED".to_string(), "false".to_string());
 
         let session = spawn_fixture_interactive_session(repo.path(), &env);
         session.submit("do the thing".to_string()).expect("submit");

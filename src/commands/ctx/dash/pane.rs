@@ -5889,7 +5889,7 @@ pub(crate) mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s' \"${{ZIRV_CTX_PARENT_SESSION:-}}\" > {}\nsleep 3\n",
+                "#!/bin/sh\nprintf '%s' \"${{ZIRV_CTX_PARENT_SESSION:-}}\" > \"{}\"\nsleep 3\n",
                 env_log.display()
             ),
         )
@@ -5990,7 +5990,7 @@ pub(crate) mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s' \"${{ZIRV_CTX_SEAT_GENERATION:-}}\" > {}\nsleep 3\n",
+                "#!/bin/sh\nprintf '%s' \"${{ZIRV_CTX_SEAT_GENERATION:-}}\" > \"{}\"\nsleep 3\n",
                 env_log.display()
             ),
         )
@@ -6072,13 +6072,22 @@ pub(crate) mod tests {
         )
         .expect("spawn");
 
-        // Relative to the successor's own cwd (the repo), so no host path
-        // has to survive quoting inside the script.
-        let argv_log = repo.join("return-argv.log");
+        // Issue #450: a relative filename here used to rely on the
+        // successor's cwd being `repo`, but `detect_help_flag`'s own
+        // `--append-system-prompt-file` probe spawns this same `agent_bin`
+        // shim with no `current_dir` set at all, so a relative path landed
+        // in the real process cwd (the checkout root) instead. An absolute
+        // tempdir path, quoted, is immune to both which cwd a spawn actually
+        // used and to a tempdir path containing spaces. The probe itself
+        // exits unlogged, or its `--help` would land in the log first.
+        let argv_log = tmp.path().join("return-argv.log");
         let script = tmp.path().join("log-argv.sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > return-argv.log\nsleep 3\n",
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --help ] && exit 0\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 3\n",
+                argv_log.display()
+            ),
         )
         .expect("write script");
 
@@ -6181,7 +6190,7 @@ pub(crate) mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nsleep 3\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 3\n",
                 argv_log.display()
             ),
         )

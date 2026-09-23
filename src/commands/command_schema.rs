@@ -330,6 +330,7 @@ const MUTATING: &[&str] = &[
     "zirv workflow review run",
     "zirv workflow review dispose",
     "zirv workflow review add",
+    "zirv workflow review record",
     "zirv workflow review ingest-pr-comments",
     "zirv workflow agents dispatch",
     "zirv workflow team plan",

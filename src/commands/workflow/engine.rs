@@ -2789,9 +2789,15 @@ pub fn advance_with_evidence(
                 }
                 let required = super::review::required_independent_reviews_for(&state);
                 if required > 0 {
+                    let remedy = format!(
+                        "run `zirv workflow review run --agent <agent> {id}`, or record a \
+                         completed native-subagent review with `zirv workflow review record \
+                         {id} --model <model>`",
+                        id = state.id,
+                    );
                     if state.review_evidence.is_empty() {
                         return Err(format!(
-                            "review step requires {required} fresh independent review run(s); found 0"
+                            "review step requires {required} fresh independent review run(s); found 0; {remedy}"
                         )
                         .into());
                     }
@@ -2803,7 +2809,7 @@ pub fn advance_with_evidence(
                         .count();
                     if completed < required {
                         return Err(format!(
-                            "review step requires {required} fresh independent review run(s); found {completed}"
+                            "review step requires {required} fresh independent review run(s); found {completed}; {remedy}"
                         )
                         .into());
                     }
@@ -4623,6 +4629,15 @@ pub(crate) fn write_state(
             &state.classification.risk_measurement
         {
             writeln!(writer, "risk measurement: unavailable ({reason})")?;
+        }
+        // Issue #685: a gate-time reclassification (`reclassify_at_gate`)
+        // appends its own reason here, but this is the only text render that
+        // reads `classification.reasons` at all -- otherwise an operator's
+        // `--complexity`/`--risk` override at `workflow start` can be
+        // escalated by a later gate with no visible explanation short of
+        // `--json`.
+        for reason in &state.classification.reasons {
+            writeln!(writer, "- {reason}")?;
         }
         // Issue #236: only meaningful when this workflow actually has an
         // intent step -- `Review` never does, and a Feature/Bugfix/Refactor
@@ -9508,6 +9523,38 @@ mod tests {
         assert!(!String::from_utf8(out).unwrap().contains("brainstorm:"));
     }
 
+    /// Issue #685: `reclassify_at_gate` appends a "reclassified at step
+    /// ...: measured risk ..." reason to `classification.reasons`, but
+    /// `write_state`'s text render never printed it -- an operator's
+    /// `--complexity`/`--risk` override at `workflow start` could be
+    /// escalated by a later gate with no visible explanation short of
+    /// `--json`. The text render must print every recorded reason.
+    #[test]
+    fn write_state_renders_classification_reasons() {
+        let repo = tempdir().unwrap();
+        let mut classification = low_classification();
+        classification.reasons = vec![
+            "small".into(),
+            "reclassified at step 'review': measured risk High".into(),
+        ];
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        let mut out = Vec::new();
+        write_state(&mut out, &state, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("- small"), "got: {text}");
+        assert!(
+            text.contains("- reclassified at step 'review': measured risk High"),
+            "got: {text}"
+        );
+    }
+
     /// Issue #542 review finding 3: a REAL pre-#542 state file, not one
     /// synthesized from the current (post-#542) serializer by stripping the
     /// `definition` key back out. `tests/fixtures/workflow/state-v4/
@@ -10974,6 +11021,35 @@ mod tests {
         let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
             .unwrap_err();
         assert!(error.to_string().contains("independent review"));
+    }
+
+    /// Issue #685: a same-harness orchestrator seat is refused from `review
+    /// run --agent <its own harness>` and must record a native-subagent
+    /// review instead -- the missing-run error must name that remedy, not
+    /// only `review run`.
+    #[test]
+    fn missing_review_evidence_error_names_the_review_record_command() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review change".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        let id = state.id.clone();
+        let error = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("zirv workflow review record {id} --model <model>")),
+            "the missing-run error must name the native-subagent record remedy: {error}"
+        );
     }
 
     /// A committed repository with a few pending (untracked) files, so
