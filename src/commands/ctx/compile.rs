@@ -191,8 +191,9 @@ pub struct CompiledContext {
 /// Built entirely from data [`CompiledContext`] already holds and the exact
 /// literal header constants `prompt.rs`'s own `with_*_layer` functions write
 /// (`CONTEXT_LAYER_HEADER`, `HARNESS_ROSTER_LAYER_HEADER`, `SKILL_INDEX_
-/// HEADER`, `WORKFLOW_LAYER_HEADER`, `MEMORY_PRIVATE_LAYER_HEADER`/
-/// `MEMORY_SHARED_LAYER_HEADER`, `PEER_MAIL_HEADER`/`PARENT_MAIL_HEADER`) --
+/// HEADER`, `SKILL_POINTER_LAYER`, `WORKFLOW_LAYER_HEADER`, `MEMORY_PRIVATE_
+/// LAYER_HEADER`/`MEMORY_SHARED_LAYER_HEADER`, `PEER_MAIL_HEADER`/`PARENT_
+/// MAIL_HEADER`) --
 /// **no file is read again** to build this list, only `composed.text` and
 /// `composed.sources`, both
 /// already in memory. Issue #275 (`zirv context lint`) is the first consumer
@@ -292,6 +293,12 @@ impl CompiledContext {
                 // comment for why it sits there instead of near `Workflow`.
                 PromptSource::SkillIndex => find_after(text, cursor, prompt::SKILL_INDEX_HEADER)
                     .map(|header_at| (header_at + prompt::SKILL_INDEX_HEADER.len(), None, None)),
+                // v13 (wrapper-overhead audit): `Worker`/`Single`'s one-line
+                // counterpart to `SkillIndex` above, at the same position in
+                // the emission order -- see `prompt::SkillPointer`'s own doc
+                // comment.
+                PromptSource::SkillPointer => find_after(text, cursor, prompt::SKILL_POINTER_LAYER)
+                    .map(|header_at| (header_at + prompt::SKILL_POINTER_LAYER.len(), None, None)),
                 // The combined common+harness-specific block: its two
                 // sub-budgets are already reported per-file by `provenance`,
                 // so this range covers the whole block with no single budget

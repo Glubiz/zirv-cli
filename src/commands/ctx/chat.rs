@@ -938,40 +938,50 @@ fn proxy_prompt_role(intake: &ProxyIntakeOutcome) -> PromptRole {
 /// place that needs it (`orchestrator_initial_prompt`'s fallback,
 /// `dash_orchestrator_pane`, `wrap_args_for`), so the launch shape actually
 /// taken can never disagree with the others about it.
-fn proxy_layer_text(intake: &ProxyIntakeOutcome) -> Option<String> {
+///
+/// `started_workflow_id` (change 2, wrapper-overhead benchmark): the id
+/// [`start_proxy_workflow`] actually started for this SAME launch, when it
+/// did -- forwarded straight to `proxy::prompt_layer` so the workflow line
+/// names the concrete running instance, not only its kind. It must come
+/// from a workflow start that ran BEFORE this function, which is why
+/// [`start_proxy_workflow`] is now called once at the top of `run_with`,
+/// ahead of every place that reads this text.
+fn proxy_layer_text(
+    intake: &ProxyIntakeOutcome,
+    started_workflow_id: Option<&str>,
+) -> Option<String> {
     match intake {
-        ProxyIntakeOutcome::Decided { decision, .. } => Some(proxy::prompt_layer(decision)),
+        ProxyIntakeOutcome::Decided { decision, .. } => {
+            Some(proxy::prompt_layer(decision, started_workflow_id))
+        }
         _ => None,
     }
 }
 
-/// Starts the proxy's chosen workflow (when [`proxy_intake`] decided one)
-/// immediately before `spawn`, closing it again with `"proxy launch
-/// failed"` if `spawn` itself returns `Err` -- so a failed launch never
-/// leaves an orphaned workflow reported as this repository's active one
-/// forever. A plain pass-through to `spawn` when the intake never took over
-/// this launch. Shared by all three launch shapes below (the dashboard
-/// pane, the `wrap` fallback, and the persistent-runtime spawn), so the
-/// decision reaches whichever one this terminal actually takes.
+/// Starts the proxy's chosen workflow (when [`proxy_intake`] decided one),
+/// once, before any launch shape's own prompt is built -- so the started id
+/// can reach [`proxy_layer_text`] and, through it, every one of the three
+/// launch shapes (change 2, wrapper-overhead benchmark field evidence: a
+/// workflow started in 27/36 replayed runs, never consulted, because
+/// nothing named the running instance or what to do with it). A no-op
+/// (`None`) when the intake never took over this launch.
 ///
 /// Issue #537 review: never silently discards an outcome the operator has
-/// no other way to learn about. `announce` is called through the exact
-/// same `zirv \u{25b8}` channel every other proxy line uses (a `Skipped`
-/// start, a `start_workflow_for` error, or a `close_started` error after a
-/// failed spawn); a `Started` workflow followed by a successful spawn stays
-/// silent, same as today.
-fn with_proxy_workflow<T>(
+/// no other way to learn about. `announce` is called through the exact same
+/// `zirv \u{25b8}` channel every other proxy line uses (a `Skipped` start or
+/// a `start_workflow_for` error); a `Started` workflow stays silent here,
+/// same as today -- it is only ever reported through the prompt layer or,
+/// on a failed spawn, [`close_proxy_workflow_on_failure`].
+fn start_proxy_workflow(
     outcome: &ProxyIntakeOutcome,
     state: &StateDir,
     repo: &Path,
     mut announce: impl FnMut(String),
-    spawn: impl FnOnce() -> CtxResult<T>,
-) -> CtxResult<T> {
+) -> Option<String> {
     let ProxyIntakeOutcome::Decided { decision, request } = outcome else {
-        return spawn();
+        return None;
     };
-    let started_id = match proxy::launch::start_workflow_for(decision, state.root(), repo, request)
-    {
+    match proxy::launch::start_workflow_for(decision, state.root(), repo, request) {
         Ok(proxy::launch::WorkflowStart::Started { id }) => Some(id),
         Ok(proxy::launch::WorkflowStart::Skipped { reason }) => {
             announce(format!("proxy: workflow not started; {reason}"));
@@ -981,10 +991,31 @@ fn with_proxy_workflow<T>(
             announce(format!("proxy: workflow start failed; {err}"));
             None
         }
-    };
+    }
+}
+
+/// Runs `spawn`, closing `started_id` (when [`start_proxy_workflow`] named
+/// one) with `"proxy launch failed"` if `spawn` itself returns `Err` -- so a
+/// failed launch never leaves an orphaned workflow reported as this
+/// repository's active one forever. A plain pass-through to `spawn` when no
+/// workflow was started (nothing to close either way). Shared by every
+/// launch shape below that can actually be the LAST one attempted -- the
+/// dashboard pane (pane build included) and the `wrap` fallback -- each
+/// called with the SAME `started_id` from the one [`start_proxy_workflow`]
+/// call at the top of `run_with`. The persistent-runtime spawn is
+/// deliberately NOT wrapped: it always falls through to one of the other two
+/// on failure, so closing the workflow there would leave that live prompt
+/// text naming a workflow this same function had just closed.
+fn close_proxy_workflow_on_failure<T>(
+    started_id: Option<&str>,
+    state: &StateDir,
+    repo: &Path,
+    mut announce: impl FnMut(String),
+    spawn: impl FnOnce() -> CtxResult<T>,
+) -> CtxResult<T> {
     let result = spawn();
     if result.is_err()
-        && let Some(id) = &started_id
+        && let Some(id) = started_id
         && let Err(close_error) =
             proxy::launch::close_started(state.root(), repo, id, "proxy launch failed")
     {
@@ -994,6 +1025,55 @@ fn with_proxy_workflow<T>(
         ));
     }
     result
+}
+
+/// The dashboard launch shape of `run_with` (its `chrome::dash_eligible`
+/// branch): builds the orchestrator pane and runs the dashboard, both
+/// wrapped in the SAME [`close_proxy_workflow_on_failure`] call -- extracted
+/// (review fix, finding 2) so an `Err` from `dash_orchestrator_pane` itself
+/// closes `started_workflow_id` exactly like a failure inside `dash::
+/// run_dashboard` already did; before this fix the pane build sat outside
+/// the wrapper's own `?`, orphaning the started workflow (the engine never
+/// overwrites an active pointer, so it would block every later `zirv chat`
+/// on this repo). This is also the launch shape that actually runs once
+/// `dash_eligible` is true -- nothing after it in `run_with` reuses
+/// `started_workflow_id` -- which is why it, like the `wrap` fallback, is
+/// wrapped at all (contrast the persistent-runtime attempt just above it in
+/// `run_with`, which never is: see [`close_proxy_workflow_on_failure`]'s own
+/// doc comment).
+///
+/// A free function taking every input explicitly, rather than inlined in
+/// `run_with`, so a test can drive this exact composition directly:
+/// `chrome::dash_eligible` requires a real interactive terminal on both
+/// streams, which `cargo test`'s piped stdio never provides.
+#[allow(clippy::too_many_arguments)]
+fn run_dash_branch(
+    adapter: &dyn AgentAdapter,
+    launch: ChatLaunch,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    session: &str,
+    simple: bool,
+    proxy_layer: Option<&str>,
+    started_workflow_id: Option<&str>,
+    force_pace: bool,
+    announce: impl FnMut(String),
+) -> CtxResult<i32> {
+    close_proxy_workflow_on_failure(started_workflow_id, state, repo, announce, || {
+        let pane = dash_orchestrator_pane(
+            adapter,
+            launch,
+            cfg,
+            state,
+            repo,
+            session,
+            simple,
+            proxy_layer,
+        )?;
+        dash::run_dashboard(cfg, repo, env, state, pane, None, force_pace)
+    })
 }
 
 /// Probes stdout for the launch banner: whether it is a terminal at all, its
@@ -1465,11 +1545,21 @@ pub fn run_with<W: Write, E: Write>(
     // orchestrator always gets one. Folded in here, once, before `build_
     // launch` bakes the positional prompt slot: both branches below reuse
     // this same `launch`.
+    // Change 2 (wrapper-overhead benchmark): the proxy's chosen workflow is
+    // started ONCE, here, before `proxy_layer_text` (and therefore before
+    // `initial_prompt`/`launch`/`wrap_args` bake it in) -- every one of the
+    // three launch shapes below shares this SAME started id, exactly like
+    // they already share `proxy_layer` itself, so the prompt each of them
+    // eventually carries can name the concrete running instance rather than
+    // only the workflow's kind.
+    let started_workflow_id = start_proxy_workflow(&intake, &state, repo, |text| {
+        proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
+    });
     // Issue #537 (T2a): the harness proxy's own bounded layer text, computed
     // once here and threaded to every place that needs it -- the fallback
     // just below, `dash_orchestrator_pane` and `wrap_args_for` -- so all
     // three launch shapes carry exactly the same layer or none at all.
-    let proxy_layer = proxy_layer_text(&intake);
+    let proxy_layer = proxy_layer_text(&intake, started_workflow_id.as_deref());
     // Issue #537 (T3): the seat this launch actually runs as -- `Single` for
     // the proxy's own direct/bounded decision, `Orchestrator` for everything
     // else -- resolved once and threaded to every place a role currently
@@ -1546,34 +1636,25 @@ pub fn run_with<W: Write, E: Write>(
         stdout_is_tty,
     ) == super::session::ChatRoute::Runtime
     {
-        // Issue #537 (T2a): the third spawn shape -- wrapped identically to
-        // the dashboard pane and the `wrap` fallback below, so a decision
-        // this launch made starts (and, on failure, closes) the same
-        // workflow regardless of which of the three shapes actually spawns.
-        // An `Err` here just means the runtime path itself did not pan out
-        // (this process falls through to the in-process launch below,
-        // which gets its own `with_proxy_workflow` around it) -- treating
-        // it as a failed spawn closes the workflow this attempt started
-        // rather than leaving it orphaned, and the fallback path below
-        // starts a fresh one for the launch that actually proceeds.
-        match with_proxy_workflow(
-            &intake,
+        // Issue #537 (T2a), change 2, review fix: this attempt is NEVER the
+        // last one -- an `Err` here always falls through to either the
+        // dashboard pane or the `wrap` fallback below, both of which still
+        // need `started_workflow_id` to name a LIVE workflow (it is already
+        // baked into `proxy_layer`/`initial_prompt`, which neither of those
+        // branches recomputes). Closing it here on failure, as an earlier
+        // version of this fix did, would launch that live prompt text
+        // against a workflow this same function had just closed. Only the
+        // launch shape that actually runs -- the dashboard pane below, or
+        // the `wrap` fallback at the very end -- is wrapped in `close_proxy_
+        // workflow_on_failure`.
+        match super::session::chat_via_runtime(
             &state,
+            adapter.name(),
+            initial_prompt.as_deref(),
+            &extra,
             repo,
-            |text| {
-                proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
-            },
-            || {
-                super::session::chat_via_runtime(
-                    &state,
-                    adapter.name(),
-                    initial_prompt.as_deref(),
-                    &extra,
-                    repo,
-                    w,
-                    launch.role,
-                )
-            },
+            w,
+            launch.role,
         ) {
             Ok(code) => return Ok(code),
             Err(error) => writeln!(
@@ -1592,24 +1673,21 @@ pub fn run_with<W: Write, E: Write>(
         &cfg.dash,
         args.simple,
     ) {
-        let pane = dash_orchestrator_pane(
+        return run_dash_branch(
             adapter.as_ref(),
             launch,
             &cfg,
             &state,
             repo,
+            &env,
             session.as_str(),
             args.simple,
             proxy_layer.as_deref(),
-        )?;
-        return with_proxy_workflow(
-            &intake,
-            &state,
-            repo,
+            started_workflow_id.as_deref(),
+            args.force_pace,
             |text| {
                 proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
             },
-            || dash::run_dashboard(&cfg, repo, &env, &state, pane, None, args.force_pace),
         );
     }
 
@@ -1640,8 +1718,8 @@ pub fn run_with<W: Write, E: Write>(
     }
 
     let wrap_args = wrap_args_for(args, launch.clone(), proxy_layer.clone());
-    with_proxy_workflow(
-        &intake,
+    close_proxy_workflow_on_failure(
+        started_workflow_id.as_deref(),
         &state,
         repo,
         |text| {
@@ -4227,8 +4305,9 @@ mod tests {
             risk: RiskBand::Medium,
             execution: ExecutionMode::Bounded,
             // `Bounded` -> `SeatRole::Single`/`SeatTier::Standard`, mirroring
-            // `decision::SeatRole::from_execution`/`SeatTier::from_execution`
-            // (both private to that module) rather than re-deriving them.
+            // `decision::SeatRole::from_execution`/
+            // `SeatTier::from_execution_complexity_risk` (both private to
+            // that module) rather than re-deriving them.
             seat_role: SeatRole::Single,
             seat_tier: SeatTier::Standard,
             validation: ValidationProfile::default(),
@@ -4934,18 +5013,24 @@ fix the flaky retry test
         git(&["commit", "-q", "-m", "base"]);
     }
 
-    /// `with_proxy_workflow` is a plain pass-through to `spawn` when the
-    /// intake never decided this launch: no workflow is ever touched.
+    /// `start_proxy_workflow` is a plain no-op when the intake never decided
+    /// this launch: no workflow is ever touched, and `close_proxy_workflow_
+    /// on_failure` (given the resulting `None`) is a plain pass-through to
+    /// `spawn`.
     #[test]
-    fn with_proxy_workflow_passes_through_when_inactive() {
+    fn start_proxy_workflow_is_a_no_op_when_inactive() {
         let repo = tempfile::tempdir().expect("tempdir");
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let outcome = ProxyIntakeOutcome::Inactive { advisory: None };
         let mut announced: Vec<String> = Vec::new();
 
-        let result = with_proxy_workflow(
-            &outcome,
+        let started_id =
+            start_proxy_workflow(&outcome, &state, repo.path(), |text| announced.push(text));
+        assert_eq!(started_id, None);
+
+        let result = close_proxy_workflow_on_failure(
+            started_id.as_deref(),
             &state,
             repo.path(),
             |text| announced.push(text),
@@ -4965,7 +5050,7 @@ fix the flaky retry test
     /// (proxy or not) that reaches the same repo, since `engine::
     /// start_workflow` never overwrites an existing active pointer.
     #[test]
-    fn with_proxy_workflow_closes_a_workflow_it_started_when_the_spawn_fails() {
+    fn close_proxy_workflow_on_failure_closes_a_workflow_it_started_when_the_spawn_fails() {
         let repo = tempfile::tempdir().expect("tempdir");
         git_init_with_commit(repo.path());
         let state_tmp = tempfile::tempdir().expect("tempdir");
@@ -4983,8 +5068,12 @@ fix the flaky retry test
         };
 
         let mut announced: Vec<String> = Vec::new();
-        let result: CtxResult<i32> = with_proxy_workflow(
-            &outcome,
+        let started_id =
+            start_proxy_workflow(&outcome, &state, repo.path(), |text| announced.push(text));
+        assert!(started_id.is_some(), "expected a started workflow id");
+
+        let result: CtxResult<i32> = close_proxy_workflow_on_failure(
+            started_id.as_deref(),
             &state,
             repo.path(),
             |text| announced.push(text),
@@ -5005,10 +5094,10 @@ fix the flaky retry test
     }
 
     /// The mirror of the test above: a successful spawn leaves the started
-    /// workflow running -- `with_proxy_workflow` must never close a launch
-    /// that actually succeeded.
+    /// workflow running -- `close_proxy_workflow_on_failure` must never
+    /// close a launch that actually succeeded.
     #[test]
-    fn with_proxy_workflow_leaves_a_successful_launch_s_workflow_running() {
+    fn close_proxy_workflow_on_failure_leaves_a_successful_launch_s_workflow_running() {
         let repo = tempfile::tempdir().expect("tempdir");
         git_init_with_commit(repo.path());
         let state_tmp = tempfile::tempdir().expect("tempdir");
@@ -5022,8 +5111,12 @@ fix the flaky retry test
         };
 
         let mut announced: Vec<String> = Vec::new();
-        let result: CtxResult<i32> = with_proxy_workflow(
-            &outcome,
+        let started_id =
+            start_proxy_workflow(&outcome, &state, repo.path(), |text| announced.push(text));
+        assert!(started_id.is_some(), "expected a started workflow id");
+
+        let result: CtxResult<i32> = close_proxy_workflow_on_failure(
+            started_id.as_deref(),
             &state,
             repo.path(),
             |text| announced.push(text),
@@ -5044,13 +5137,109 @@ fix the flaky retry test
         );
     }
 
+    /// Review fix (findings 1 & 2): `run_with`'s persistent-runtime attempt
+    /// is never the last launch shape tried, so its own failure must not
+    /// close the workflow -- proven here by simulating that failure as a
+    /// plain no-op (exactly what the fixed `run_with` does: it calls
+    /// `chat_via_runtime` directly, with no `close_proxy_workflow_on_failure`
+    /// wrapper) and asserting the workflow is still `Running` afterwards.
+    /// The dashboard branch IS the last shape once it is reached, so building
+    /// its pane is folded into the SAME `close_proxy_workflow_on_failure`
+    /// call as `dash::run_dashboard`, via [`run_dash_branch`] -- the exact
+    /// function `run_with` itself calls -- proven by forcing `dash_
+    /// orchestrator_pane` itself to fail (`protect_composed` refuses when the
+    /// operator's own obfuscation config failed to load, `cfg.obfuscate.
+    /// operator_load_failed`, a deterministic failure with no filesystem
+    /// trickery needed) and asserting that THIS closes the still-running
+    /// workflow. Before the fix, a `dash_orchestrator_pane` failure sat
+    /// outside the wrapper's own `?` and left the workflow orphaned forever
+    /// (the engine never overwrites an active pointer).
+    ///
+    /// `run_with` itself is not driven end to end here: `chat_route`/
+    /// `dash_eligible` both require a real interactive terminal on both
+    /// streams, which `cargo test`'s piped stdio never provides (see
+    /// `run_with_discloses_the_model_before_it_picks_a_launch_path`'s own
+    /// doc comment for the same limitation) -- but [`run_dash_branch`] is a
+    /// free function with no TTY dependency of its own, so it is driven
+    /// directly, exercising the real composition rather than a re-
+    /// implementation of it.
+    #[test]
+    fn a_failed_runtime_attempt_leaves_the_workflow_live_for_the_dash_branch_that_actually_runs() {
+        let repo = crate::commands::ctx::testenv::repo();
+        git_init_with_commit(repo.path());
+        let home = repo.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut decision = sample_decision(repo.path(), "claude", "fable", Some("bugfix"));
+        decision.complexity = Complexity::Trivial;
+        decision.risk = RiskBand::Low;
+        let outcome = ProxyIntakeOutcome::Decided {
+            decision: Box::new(decision),
+            request: "fix a database retry bug".to_string(),
+        };
+
+        let mut announced: Vec<String> = Vec::new();
+        let started_id =
+            start_proxy_workflow(&outcome, &state, repo.path(), |text| announced.push(text));
+        assert!(started_id.is_some(), "expected a started workflow id");
+
+        // The runtime attempt "fails" -- nothing here closes anything, which
+        // is the fix: `close_proxy_workflow_on_failure` is never called
+        // around it any more.
+        let running_after_runtime_failure =
+            crate::commands::workflow::engine::load_active(&state, repo.path())
+                .expect("readable")
+                .expect("still active: the runtime attempt's own failure must not touch it");
+        assert_eq!(
+            running_after_runtime_failure.status,
+            crate::commands::workflow::engine::WorkflowStatus::Running
+        );
+
+        // The dash branch, driven through the real `run_dash_branch` -- pane
+        // build folded into the same wrapped closure as `dash::run_
+        // dashboard`, exactly as `run_with` now composes it.
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let launch = build_launch(&adapter, None, &[]);
+        let mut cfg = CtxConfig::default();
+        cfg.obfuscate.mode = super::super::config::ObfuscateMode::Flag;
+        cfg.obfuscate.operator_load_failed = true;
+        let env: std::collections::HashMap<String, String> = Default::default();
+
+        let result = run_dash_branch(
+            &adapter,
+            launch,
+            &cfg,
+            &state,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+            None,
+            started_id.as_deref(),
+            false,
+            |text| announced.push(text),
+        );
+        assert!(
+            result.is_err(),
+            "the forced pane-build failure must propagate: {result:?}"
+        );
+
+        let active =
+            crate::commands::workflow::engine::load_active(&state, repo.path()).expect("readable");
+        assert!(
+            active.is_none(),
+            "a pane-build failure in the launch shape that actually runs must close the \
+             workflow, not orphan it"
+        );
+    }
+
     /// Issue #537 review: a `Skipped` workflow start (an active workflow
     /// already on the repo) must not vanish silently -- the operator has no
     /// other way to learn the proxy's own decision never actually started a
     /// workflow, unlike `runtime/native.rs`, which already announces this
     /// case.
     #[test]
-    fn with_proxy_workflow_announces_a_skipped_start() {
+    fn start_proxy_workflow_announces_a_skipped_start() {
         let repo = tempfile::tempdir().expect("tempdir");
         git_init_with_commit(repo.path());
         let state_tmp = tempfile::tempdir().expect("tempdir");
@@ -5089,8 +5278,12 @@ fix the flaky retry test
         };
         let mut announced: Vec<String> = Vec::new();
 
-        let result: CtxResult<i32> = with_proxy_workflow(
-            &outcome,
+        let started_id =
+            start_proxy_workflow(&outcome, &state, repo.path(), |text| announced.push(text));
+        assert_eq!(started_id, None, "a skipped start never names an id");
+
+        let result: CtxResult<i32> = close_proxy_workflow_on_failure(
+            started_id.as_deref(),
             &state,
             repo.path(),
             |text| announced.push(text),
