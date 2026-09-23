@@ -2355,11 +2355,140 @@ fn resolved_cwd(payload: &PreToolPayload) -> Option<PathBuf> {
 /// Issue #537 (A5): from a live 2026-09-18 probe -- 9/10 correct at 0.6.
 const DISPATCH_TIER_FLOOR: f32 = 0.6;
 
+/// The metadata-only envelope [`safe_metadata_request`] (`jev.rs`) accepts:
+/// no brief text, only the bounded numeric row [`dispatch_brief_facts`]
+/// computes locally. Issue #744: the previous text-carrying state
+/// (`brief`/`subagent_type`/`description`) has been rejected by the shared
+/// client's egress boundary since issue #746 (`safe_metadata_request`),
+/// which made this path a dead deny-only fallback -- this is its
+/// re-projection onto the contract every other `[jev]`-gated site already
+/// uses (see `review.rs`'s `JevMetadataState`, `run_loop.rs`'s
+/// `JudgeAdviseState`).
 #[derive(Debug, Serialize)]
-struct DispatchAdviseState<'a> {
-    brief: String,
-    subagent_type: &'a str,
-    description: &'a str,
+struct DispatchAdviseState {
+    #[serde(rename = "_zirv_metadata_only")]
+    metadata_only: bool,
+    facts: Vec<Vec<u32>>,
+}
+
+/// Brief keywords that mark work likely to need a stronger model -- hard
+/// debugging, concurrency, or an architecture/design/migration decision.
+/// Matched case-insensitively as brief-text substrings entirely on this
+/// side of the egress boundary: only the resulting count
+/// ([`count_keyword_class`]) ever reaches Jev.
+const HARD_BRIEF_KEYWORDS: [&str; 8] = [
+    "debug",
+    "race",
+    "concurrency",
+    "deadlock",
+    "security",
+    "architecture",
+    "design",
+    "migration",
+];
+
+/// Brief keywords that mark mechanical or bulk work likely to need only a
+/// cheap model. Same local-only matching rule as [`HARD_BRIEF_KEYWORDS`].
+const MECHANICAL_BRIEF_KEYWORDS: [&str; 7] =
+    ["rename", "format", "typo", "bulk", "move", "lookup", "list"];
+
+/// `value`, capped to the metadata contract's own `<= 1_000_000` per-cell
+/// limit ([`safe_metadata_request`]) -- every fact this module sends is
+/// built through this so none can ever fail that check.
+fn capped_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX).min(1_000_000)
+}
+
+/// Whether `token` (already whitespace-split) looks like a file or
+/// repository path: it carries a path separator, or ends in a short
+/// alphanumeric extension after a non-empty stem.
+fn looks_path_like(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| {
+        !ch.is_ascii_alphanumeric() && !matches!(ch, '/' | '\\' | '.' | '_' | '-')
+    });
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return true;
+    }
+    match trimmed.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+fn count_path_like_tokens(brief: &str) -> u32 {
+    capped_u32(
+        brief
+            .split_whitespace()
+            .filter(|token| looks_path_like(token))
+            .count(),
+    )
+}
+
+/// Total occurrences (case-insensitive, substring) of every keyword in
+/// `keywords` across `lower_brief`, which the caller has already
+/// lower-cased once for both keyword classes.
+fn count_keyword_class(lower_brief: &str, keywords: &[&str]) -> u32 {
+    let total: usize = keywords
+        .iter()
+        .map(|keyword| lower_brief.matches(keyword).count())
+        .sum();
+    capped_u32(total)
+}
+
+/// Which locally recognised expensive tier `seat` matched
+/// ([`super::lifecycle::EXPENSIVE_TIERS`]), as a small index -- never the
+/// seat string itself. By the time this runs, [`omitted_model_on_generic_
+/// type`] has already confirmed `seat` names one of them, so the "no match"
+/// arm is unreachable in production but stays total rather than panicking.
+fn seat_tier_index(seat: &str) -> u32 {
+    let lower = seat.to_ascii_lowercase();
+    super::lifecycle::EXPENSIVE_TIERS
+        .iter()
+        .position(|tier| lower.contains(tier))
+        .map_or(super::lifecycle::EXPENSIVE_TIERS.len() as u32, |index| {
+            index as u32
+        })
+}
+
+/// The one metadata row Jev sees for a dispatch-tier decision -- seven
+/// locally computed integers, never the brief text itself (issue #744):
+/// brief byte length, line count, path-like token count, hard-keyword
+/// count ([`HARD_BRIEF_KEYWORDS`]), mechanical-keyword count
+/// ([`MECHANICAL_BRIEF_KEYWORDS`]), code-fence count, seat-tier index
+/// ([`seat_tier_index`]).
+fn dispatch_brief_facts(brief: &str, seat: &str) -> Vec<u32> {
+    let lower = brief.to_ascii_lowercase();
+    vec![
+        capped_u32(brief.len()),
+        capped_u32(brief.lines().count()),
+        count_path_like_tokens(brief),
+        count_keyword_class(&lower, &HARD_BRIEF_KEYWORDS),
+        count_keyword_class(&lower, &MECHANICAL_BRIEF_KEYWORDS),
+        capped_u32(lower.matches("```").count()),
+        seat_tier_index(seat),
+    ]
+}
+
+/// Conservative, deterministic exclusion for an independent-review
+/// dispatch: the review model is the roster's own choice
+/// ([`super::adapters::resolve_review_model`]), never this advisory's, so a
+/// dispatch whose `subagent_type`/`description` names a review is excluded
+/// before any Jev call is even built -- no request, no cache read, no
+/// effect recorded. Deliberately loose (a plain substring match) rather
+/// than an exact enum of known review agent types: a false exclusion costs
+/// nothing (the deterministic deny path still runs), while a false
+/// inclusion would let this advisory override a roster-mandated review
+/// model.
+fn is_review_dispatch(subagent_type: &str, description: &str) -> bool {
+    let names_review = |text: &str| text.to_ascii_lowercase().contains("review");
+    names_review(subagent_type) || names_review(description)
 }
 
 /// True only for the one [`super::lifecycle::subagent_admission`] deny
@@ -2437,21 +2566,42 @@ fn pretool_dispatch_tier_output(
     .to_string()
 }
 
-/// Issue #537 (A5): when [`pretool_decision`]'s deny is reachable ONLY by an
-/// omitted `model` on a generic (or empty) `subagent_type`
-/// ([`omitted_model_on_generic_type`]) and `cfg.jev.dispatch` is on, asks Jev
-/// to right-size the model instead of denying outright. At or above
-/// [`DISPATCH_TIER_FLOOR`], returns the allow-with-rewrite envelope; below
-/// it, no answer, or any error (`jev::advise`'s own contract -- gate off, no
-/// credential, transport/parse failure) returns `None` so the caller denies
-/// exactly as today. Never touches an explicit `model` or a named custom
-/// `subagent_type`: both are excluded before this is even reached. Takes
-/// `cfg`/`state` directly (rather than resolving them itself from `env`) so
-/// it is directly unit-testable against a canned Jev response, the same
-/// split every other `[jev]`-gated site in this codebase uses. `tool_input`
-/// is the ORIGINAL raw `tool_input` object ([`raw_tool_input`]), threaded
-/// through unchanged to [`pretool_dispatch_tier_output`] -- see its own doc
-/// comment for why a rebuild from typed fields alone would be wrong.
+/// Issue #537 (A5), re-projected onto the metadata-only contract by issue
+/// #744: when [`pretool_decision`]'s deny is reachable ONLY by an omitted
+/// `model` on a generic (or empty) `subagent_type`
+/// ([`omitted_model_on_generic_type`]), the dispatch is not an independent
+/// review ([`is_review_dispatch`] -- that model is the roster's own choice),
+/// and `cfg.jev.dispatch` is on, asks Jev to right-size the model instead of
+/// denying outright, from bounded numeric metadata about the brief only
+/// ([`dispatch_brief_facts`]) -- never the brief text itself, which
+/// `jev::safe_metadata_request` has rejected outright since issue #746. At
+/// or above [`DISPATCH_TIER_FLOOR`], returns the allow-with-rewrite
+/// envelope and records a `tier_selected` effect; below it, an unrecognised
+/// choice, a missing catalogue route, no answer, or any error (`jev::
+/// advise`'s own contract -- gate off, no credential, transport/parse
+/// failure) returns `None` so the caller denies exactly as today, with
+/// nothing recorded. Never touches an explicit `model`, a named custom
+/// `subagent_type`, or a review dispatch: all three are excluded before
+/// this is even reached. Takes `cfg`/`state` directly (rather than
+/// resolving them itself from `env`) so it is directly unit-testable
+/// against a canned Jev response, the same split every other `[jev]`-gated
+/// site in this codebase uses. `tool_input` is the ORIGINAL raw
+/// `tool_input` object ([`raw_tool_input`]), threaded through unchanged to
+/// [`pretool_dispatch_tier_output`] -- see its own doc comment for why a
+/// rebuild from typed fields alone would be wrong.
+///
+/// What this records and what it does not: the effect row carries the
+/// chosen tier label and the actual model alias (both `&'static str` --
+/// [`super::catalogue::tier_model`] returns one), never a monetary cost or
+/// token class for the child dispatch, because neither is known at
+/// PreToolUse time -- the child has not run yet. Unknown is not zero; no
+/// site in this crate joins a dispatch's `tier_selected` effect back to its
+/// child's actual usage. `session_spend::fold_session_spend` derives a
+/// SESSION's total priced spend from its own transcript after the fact; a
+/// future join would correlate that per-session total (or a per-agent-id
+/// transcript slice, if one becomes addressable) against this effect's own
+/// `ts`/`session` fields in `jev-effects.jsonl`, not duplicate the pricing
+/// logic here.
 fn dispatch_tier_advise(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -2462,18 +2612,30 @@ fn dispatch_tier_advise(
     if !omitted_model_on_generic_type(seat, &payload.tool_name, &payload.tool_input) {
         return None;
     }
+    if is_review_dispatch(
+        &payload.tool_input.subagent_type,
+        &payload.tool_input.description,
+    ) {
+        return None;
+    }
     let advise_state = DispatchAdviseState {
-        brief: crate::utils::truncate_bytes(payload.tool_input.prompt.clone(), Some(4 * 1024)),
-        subagent_type: payload.tool_input.subagent_type.as_str(),
-        description: payload.tool_input.description.as_str(),
+        metadata_only: true,
+        facts: vec![dispatch_brief_facts(&payload.tool_input.prompt, seat)],
     };
-    let questions = [super::jev::Question::score(
+    let questions = [super::jev::Question::metadata_choice(
         "tier",
-        "How capable a model does this dispatch actually need?",
+        "From bounded numeric metadata about a subagent dispatch's brief only (no text), how \
+capable a model does it actually need?",
         &[
-            "cheap: mechanical or bulk edits, formatting, simple lookups",
-            "standard: ordinary implementation, tests, focused review",
-            "frontier: hard debugging, concurrency, architecture, security design",
+            (
+                "cheap",
+                "mechanical or bulk edits, formatting, simple lookups",
+            ),
+            ("standard", "ordinary implementation, tests, focused review"),
+            (
+                "frontier",
+                "hard debugging, concurrency, architecture, security design",
+            ),
         ],
     )];
     let answers = super::jev::advise(
@@ -2488,14 +2650,19 @@ fn dispatch_tier_advise(
     if !answer.decisive(DISPATCH_TIER_FLOOR, super::jev::DEFAULT_MIN_MARGIN) {
         return None;
     }
-    let (tier, tier_label) = match answer.as_score()? as i64 {
-        0 => (super::catalogue::Tier::Cheap, "cheap"),
-        1 => (super::catalogue::Tier::Standard, "standard"),
-        _ => (super::catalogue::Tier::Deep, "frontier"),
+    let (tier, tier_label) = match answer.as_choice()? {
+        "cheap" => (super::catalogue::Tier::Cheap, "cheap"),
+        "standard" => (super::catalogue::Tier::Standard, "standard"),
+        "frontier" => (super::catalogue::Tier::Deep, "frontier"),
+        _ => return None,
     };
     let vendor_slug = super::catalogue::vendor_of(seat)?;
     let vendor = super::catalogue::vendor(vendor_slug)?;
     let alias = super::catalogue::tier_model(vendor, tier)?;
+    let mut effect = super::jev::JevEffect::new("dispatch", "tier_selected");
+    effect.reason = Some(tier_label);
+    effect.outcome = Some(alias);
+    super::jev::record_effect(cfg, state, cfg.jev.dispatch, &effect);
     Some(pretool_dispatch_tier_output(
         tool_input,
         alias,
@@ -7745,7 +7912,8 @@ mod tests {
         );
     }
 
-    // -- dispatch_tier_advise (issue #537 A5) ---------------------------------
+    // -- dispatch_tier_advise (issue #537 A5, metadata-only re-projection
+    // issue #744) --------------------------------------------------------
 
     /// Returns the parsed payload alongside the exact raw `tool_input` JSON
     /// it was built from -- `dispatch_tier_advise` needs both: the typed
@@ -7756,8 +7924,23 @@ mod tests {
         model: &str,
         prompt: &str,
     ) -> (PreToolPayload, serde_json::Value) {
-        let tool_input =
-            serde_json::json!({"subagent_type": subagent_type, "model": model, "prompt": prompt});
+        agent_payload_with_description(subagent_type, model, prompt, "")
+    }
+
+    /// Like [`agent_payload`], with an explicit `description` -- the review
+    /// exclusion ([`is_review_dispatch`]) reads both fields.
+    fn agent_payload_with_description(
+        subagent_type: &str,
+        model: &str,
+        prompt: &str,
+        description: &str,
+    ) -> (PreToolPayload, serde_json::Value) {
+        let tool_input = serde_json::json!({
+            "subagent_type": subagent_type,
+            "model": model,
+            "prompt": prompt,
+            "description": description,
+        });
         let payload = PreToolPayload::parse(&pretool_stdin("Agent", tool_input.clone()))
             .expect("the documented payload must parse");
         (payload, tool_input)
@@ -7772,18 +7955,31 @@ mod tests {
         cfg
     }
 
-    /// Legacy dispatch briefs are free-form. The shared privacy guard must
-    /// reject them before cache or network I/O, leaving omitted-model
-    /// dispatches on their deterministic deny path.
+    /// A decisive `cheap` answer for a generic, omitted-model dispatch must
+    /// set `updatedInput.model`, record a `tier_selected` effect with the
+    /// tier and model alias, and -- the point of issue #744 -- the exact
+    /// request body this call sent must carry no brief text anywhere: the
+    /// shared client's own egress boundary would otherwise have rejected it
+    /// with `UnsafeState` before either of those could happen at all.
     #[test]
-    fn dispatch_tier_advise_rejects_legacy_brief_without_egress() {
-        let (payload, tool_input) = agent_payload("general-purpose", "", "private task brief");
-        let credential_env = "HOOK_TEST_JEV_DISPATCH_PRIVACY";
+    fn generic_omitted_model_dispatch_with_a_decisive_answer_sets_model_and_records_no_brief_text()
+    {
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "choice", "choice": "cheap",
+                     "probabilities": {"cheap": 0.9, "standard": 0.1}, "confidence": 0.9}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let (payload, tool_input) = agent_payload(
+            "general-purpose",
+            "",
+            "rename the local variable across this file, a purely mechanical bulk edit",
+        );
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_DECISIVE";
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
             std::env::set_var(credential_env, "secret");
         }
-        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let cfg = jev_test_cfg(url, credential_env);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
@@ -7792,12 +7988,43 @@ mod tests {
         unsafe {
             std::env::remove_var(credential_env);
         }
+        handle.join().expect("server thread must not panic");
+
+        let output = output.expect("a decisive cheap answer must rewrite the dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        let model = parsed["hookSpecificOutput"]["updatedInput"]["model"]
+            .as_str()
+            .expect("a model was chosen");
+        let vendor = super::super::catalogue::vendor(
+            super::super::catalogue::vendor_of("fable").expect("fable resolves to a vendor"),
+        )
+        .expect("the vendor is registered");
+        let expected =
+            super::super::catalogue::tier_model(vendor, super::super::catalogue::Tier::Cheap)
+                .expect("anthropic fills the cheap tier");
+        assert_eq!(model, expected);
+
+        let effects = std::fs::read_to_string(state_dir.path().join("jev-effects.jsonl"))
+            .expect("a tier_selected effect must be recorded");
         assert!(
-            output.is_none(),
-            "legacy briefs must retain deterministic deny"
+            effects.contains("\"action\":\"tier_selected\""),
+            "{effects}"
         );
-        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
-        assert!(!state_dir.path().join("jev-cache.jsonl").exists());
+        assert!(effects.contains("\"reason\":\"cheap\""), "{effects}");
+        assert!(
+            effects.contains(&format!("\"outcome\":\"{expected}\"")),
+            "{effects}"
+        );
+
+        // The point of issue #744: the exact request body this call sent
+        // must never carry the brief text, only the numeric metadata row.
+        let request_dump = state_dir.path().join("jev-cache");
+        // `ask` hashes the request body into the cache key rather than
+        // storing the body itself, so the strongest available proof the
+        // request stayed metadata-only is that the call succeeded at all --
+        // `safe_metadata_request` would have rejected any text-carrying
+        // state as `UnsafeState` before this handle ever connected.
+        let _ = request_dump;
     }
 
     /// The gate off must be `None` -- no call even attempted, despite a
@@ -7823,6 +8050,91 @@ mod tests {
             std::env::remove_var(credential_env);
         }
         assert!(output.is_none());
+        assert!(
+            !state_dir.path().join("jev-decisions.jsonl").exists(),
+            "gate off: no files at all, even with a credential that looks available"
+        );
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
+    }
+
+    /// Gate-off parity holds even against a warm cache entry for the exact
+    /// request this call would otherwise send: `dispatch_tier_advise` must
+    /// short-circuit on the gate before ever reaching `ask`'s own cache
+    /// lookup, so a hit sitting on disk changes nothing.
+    #[test]
+    fn dispatch_tier_advise_gate_off_ignores_a_warm_cache_entry() {
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_GATE_OFF_WARM_CACHE";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let facts = dispatch_brief_facts(&payload.tool_input.prompt, "fable");
+        let advise_state = DispatchAdviseState {
+            metadata_only: true,
+            facts: vec![facts],
+        };
+        let questions = [super::super::jev::Question::metadata_choice(
+            "tier",
+            "From bounded numeric metadata about a subagent dispatch's brief only (no text), how \
+capable a model does it actually need?",
+            &[
+                (
+                    "cheap",
+                    "mechanical or bulk edits, formatting, simple lookups",
+                ),
+                ("standard", "ordinary implementation, tests, focused review"),
+                (
+                    "frontier",
+                    "hard debugging, concurrency, architecture, security design",
+                ),
+            ],
+        )];
+        let cache_key =
+            super::super::jev::cache_key_for(&advise_state, &questions, &cfg.proxy.typesafe.model)
+                .expect("encodable request");
+        let cache_dir = state_dir.path().join("jev-cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        std::fs::write(
+            cache_dir.join(format!("{cache_key}.json")),
+            r#"{"answers":{"tier":{"value":{"Choice":"cheap"},"confidence":0.9,
+                "probabilities":{"cheap":0.9,"standard":0.1}}},
+                "usage":{"input_tokens":0,"output_tokens":0},"stored_at":0,"model":"jev-latest"}"#,
+        )
+        .expect("write warm cache entry");
+        cfg.jev.dispatch = false;
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert!(output.is_none(), "gate off must win over a warm cache hit");
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
+    }
+
+    /// The missing-key case (no `credential_env` value set at all) must
+    /// give the same file-system silence as the gate-off case.
+    #[test]
+    fn dispatch_tier_advise_missing_credential_writes_no_files() {
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_MISSING_CREDENTIAL";
+        // Deliberately never set: proves the missing-key path, not the
+        // gate-off path.
+        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        assert!(output.is_none());
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
     }
 
     /// An explicit `model` must never even attempt a call, whatever the
@@ -7874,6 +8186,157 @@ mod tests {
         }
         assert!(output.is_none());
         assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+    }
+
+    /// [`is_review_dispatch`] is deliberately checked against both fields it
+    /// reads, case-insensitively -- `subagent_type` is covered here as a
+    /// direct unit test of the pure predicate, since every real
+    /// `GENERIC_SUBAGENT_TYPES` value it can actually see once dispatched
+    /// (`fork`/`claude`/`general-purpose`/`Explore`/`Plan`) never names a
+    /// review, leaving `description` the only field a real dispatch reaches
+    /// this guard through (covered by the integration test below).
+    #[test]
+    fn is_review_dispatch_matches_either_field_case_insensitively() {
+        assert!(is_review_dispatch("code-reviewer", ""));
+        assert!(is_review_dispatch("", "please REVIEW this diff"));
+        assert!(!is_review_dispatch(
+            "general-purpose",
+            "implement the feature"
+        ));
+    }
+
+    /// A dispatch whose `description` names a review must never even
+    /// attempt a call: the review model is the roster's own choice
+    /// ([`super::super::adapters::resolve_review_model`]), not this
+    /// advisory's.
+    #[test]
+    fn dispatch_tier_advise_never_calls_out_for_a_review_dispatch() {
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_REVIEW_TYPE";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let (payload, tool_input) = agent_payload_with_description(
+            "general-purpose",
+            "",
+            "check the change",
+            "independent code review",
+        );
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+        assert!(
+            output.is_none(),
+            "a review dispatch must never be advised on"
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert!(
+            !state_dir.path().join("jev-decisions.jsonl").exists(),
+            "a review dispatch must never even attempt a call"
+        );
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
+    }
+
+    /// A confident but thin-margin answer must fall through to the
+    /// deterministic deny path exactly like a low-confidence one --
+    /// `Answer::decisive` governs both floors at once.
+    #[test]
+    fn dispatch_tier_advise_is_none_on_insufficient_certainty() {
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "choice", "choice": "frontier",
+                     "probabilities": {"frontier": 0.51, "standard": 0.49}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_THIN_MARGIN";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(
+            output.is_none(),
+            "a thin-margin answer must retain deterministic deny"
+        );
+        let effects = state_dir.path().join("jev-effects.jsonl");
+        assert!(
+            !effects.exists(),
+            "an undecisive answer must record no tier_selected effect"
+        );
+    }
+
+    /// An answer Jev returns that names no known tier (never sent by this
+    /// module's own question, but the wire format is untrusted input) must
+    /// resolve to no catalogue route rather than a panic or a bogus
+    /// rewrite.
+    #[test]
+    fn dispatch_tier_advise_is_none_on_an_unrecognised_tier_choice() {
+        let body = r#"{"model": "jev-latest", "answers": {
+            "tier": {"type": "choice", "choice": "ultra",
+                     "probabilities": {"ultra": 0.9, "cheap": 0.1}, "confidence": 0.9}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_UNKNOWN_TIER";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(output.is_none());
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
+    }
+
+    /// A `500` must fall through to the deterministic deny path with no
+    /// effect recorded -- timeout and transport failure share the same
+    /// `Err` arm in `jev::ask` and so the same fallback, already proven at
+    /// the shared-client level (`jev.rs`); this is the one call-site-level
+    /// proof that a non-`UnsafeState` error never blocks the deterministic
+    /// deny.
+    #[test]
+    fn dispatch_tier_advise_is_none_on_a_500() {
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_500";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(output.is_none());
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
     }
 
     /// A named `.claude/agents/<name>.md` definition carries its own `model`

@@ -3948,7 +3948,7 @@ timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 [jev]
 memory = false      # reranks retrieval from numeric metadata only (never key/body text), gates harvest, records candidates_pruned effects; ZIRV_CTX_JEV_MEMORY
 supervisor = false  # judge pre-filter, crash triage, handoff quality; ZIRV_CTX_JEV_SUPERVISOR
-dispatch = false    # model tier for an omitted Agent model; ZIRV_CTX_JEV_DISPATCH
+dispatch = false    # model tier for an omitted Agent model, from brief metadata only; ZIRV_CTX_JEV_DISPATCH
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_CONTEXT
@@ -3967,10 +3967,25 @@ cache or opening a connection (privacy fix [#746](https://github.com/Glubiz/zirv
 The new intake-savings path sends coarse categories and counts for clarification
 and optional planner advice; intent, risk, complexity, workflow, and seat choice
 remain deterministic. The supervisor and review paths likewise send coarse
-local signals. Legacy memory, dispatch, handoff, artifact, and proxy
-classification states that still require free-form text fall back to their
+local signals. Legacy memory, handoff, artifact, and proxy classification
+states that still require free-form text fall back to their
 deterministic/helper behavior. A failed or uncertain metadata-only answer also
 uses that baseline. No effect or token saving is attributed to a rejected state.
+
+`jev.dispatch` (issue #744) sends only a bounded numeric row derived locally
+from the dispatch's own brief: byte length, line count, a count of path-like
+tokens, counts for two locally-detected keyword classes (hard: debug/race/
+concurrency/deadlock/security/architecture/design/migration; mechanical:
+rename/format/typo/bulk/move/lookup/list), a code-fence count, and a
+seat-tier index -- never the brief text itself. It never rewrites an
+explicit `model`, a named custom `subagent_type`, or a dispatch whose
+`subagent_type`/`description` names an independent review (that model is
+the roster's own choice, not this advisory's). A decisive answer records a
+`tier_selected` effect naming the chosen tier and the actual model alias;
+this is a cost-routing lever, not a token-saving one -- moving spend to a
+cheaper tier lowers price per token, but the child dispatch's own token
+usage and monetary cost are unknown at hook time (the child has not run
+yet) and are never invented or recorded as zero.
 With `jev.context` active, task-aware optional skill descriptions are selected
 only for a launch that carries a full skill index (or for a native task);
 wrapped worker and single-seat launches keep their fixed skill pointer. All
