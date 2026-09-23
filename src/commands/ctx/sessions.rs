@@ -1368,7 +1368,7 @@ fn sweep_orphan_endpoints(state: &StateDir, found: &[(Record, Liveness)]) {
         .collect();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+        if !is_endpoint_file(&path) {
             continue;
         }
         let Some(short) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -1381,6 +1381,17 @@ fn sweep_orphan_endpoints(state: &StateDir, found: &[(Record, Liveness)]) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// A turn-signal endpoint file: a seat's live `<short>.sock`, or a staged
+/// rollover successor's `<short>.<4-hex nonce>` (`dash::pane`'s
+/// `staged_socket_path`), which a crashed dashboard leaves behind just the same.
+pub(crate) fn is_endpoint_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            ext == "sock" || (ext.len() == 4 && ext.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
 }
 
 /// C8: a wake-up marker outlives its session whenever the supervisor died
@@ -4353,6 +4364,19 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "{ORPHANS} dead endpoints took {elapsed:?} to probe; a probe must not retry a              nonexistent endpoint (one second each here blocks the dashboard before its              first frame)"
         );
+    }
+
+    /// #681 review: a staged rollover socket is named `<short>.<nonce>`, not
+    /// `<short>.sock`, and a crashed dashboard leaves it behind all the same.
+    #[test]
+    fn a_dead_staged_rollover_endpoint_is_swept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        super::super::state::create_private_dir_all(&state.sockets()).expect("sockets dir");
+        let staged = state.sockets().join("deadbeef.ab12");
+        std::fs::write(&staged, "").expect("staged endpoint");
+        let _ = list(&state);
+        assert!(!staged.exists(), "a dead staged endpoint must be swept");
     }
 
     /// Both markers are read by OTHER processes while their owner rewrites

@@ -396,7 +396,11 @@ are unchanged.
 **Decider chain.** `decide()` computes the deterministic baseline first. The
 shared client's metadata-only boundary now refuses the legacy text-bearing
 Jev classification request locally, before cache or network; the existing
-helper-model chokepoint remains available, then the baseline. With
+helper-model chokepoint remains available, then the baseline. The
+baseline measures no diff at intake, so it floors complexity by the request's
+own size: 120+ words or 3+ enumerated items is at least bounded, 300+ words
+or 8+ items at least substantial (never architectural) -- without it every
+multi-part spec landed on the cheap seat. With
 `jev.intake_savings` enabled and a credential present, a separate
 metadata-only Jev call may advise clarification and its category. The
 eleven-question classification schema and live battery below describe the
@@ -3436,9 +3440,12 @@ allow_hosts = ["docs.rs", ".rust-lang.org"]   # empty means nothing is reachable
 
 [capabilities.browser]
 enabled = true
-# binary = "chromium"            # discovered on PATH, or (macOS) the
-                                  # standard /Applications and
-                                  # $HOME/Applications app bundles, when unset
+# binary = "chromium"            # discovered on PATH, or the standard
+                                  # per-platform install locations, when
+                                  # unset: macOS's /Applications and
+                                  # $HOME/Applications app bundles, and
+                                  # Windows's Program Files, Program Files
+                                  # (x86), and %LocalAppData% installs
 
 [[capabilities.mcp]]
 name = "docs"
