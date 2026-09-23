@@ -1,0 +1,34 @@
+# Intent
+
+## Problem
+
+Jev already advises memory selection, proxy intake, supervisor continuation and crash triage, and review finding dedup. Those answers save agent tokens only when zirv actually omits optional prompt material or prevents an unnecessary helper, worker, retry, or review launch. The current implementation does not select optional skill/reference descriptions or prior worker reports for a task; the other sites lack enough outcome evidence to distinguish a real avoided call from an advisory annotation or a delayed completion. Issues #737–#741 ask for one bounded, measurable follow-up across these five existing seams.
+
+## Desired outcome
+
+With the relevant operator gate enabled and a nonempty TypeSafe credential present, zirv may select task-relevant optional context before supported harness launches, resolve material intake ambiguity before expensive implementation, avoid a redundant worker with no distinct deliverable, bypass a helper judge on a decisive safe continuation, converge a review on a duplicate Minor/Note finding, and stop a futile worker retry. It records the action actually taken and the subsequent task outcome. Required instructions, explicit operator choices, mandatory evidence, risk floors, independent review requirements, and existing recovery paths remain authoritative. Without Jev, each affected path preserves its current bytes, ordering, behavior, and release availability.
+
+## Constraints
+
+- Scope is the five selected issues #737–#741 in one PR. Reuse the existing shared client, context compilation, proxy policy, `jev.supervisor` judge and crash seams, and `jev.review` dedup/convergence seam; do not create a parallel policy or retry mechanism. No unrelated findings, dependency additions, `rot.rs` changes, or change to `runtime::native_available() == cfg!(test)`.
+- Each new decision path is off by default, operator-only and `REPO_FORBIDDEN`; it runs only with its dedicated gate and a nonempty credential named by `[proxy.typesafe].credential_env`. Gate-off and missing-key paths make no Jev request, read no cached advisory answer, and write no Jev decision or spend row. The operator's existing enabled gates are not product defaults and tests must isolate config, environment, and keys.
+- Jev receives only bounded, permitted summaries and metadata: no secrets, raw files, diffs, or unbounded worker output. A timeout, 5xx, transport/parse failure, partial answer, or uncertain answer falls back to the deterministic behavior without retrying Jev or failing the host operation. Existing decision/spend recording and cache rules apply only after the gate and credential checks.
+- Advice derived from repository- or model-authored material may only narrow behavior. Jev cannot grant permission, lower a risk floor, weaken a required check, approve completion, dismiss a Major/Critical or other blocker, authorize a refused retry, exceed an attempt limit, or turn a failed worker into success. Explicit skill invocations, task constraints, provenance, required evidence, and required reviews remain available.
+- Preserve a discoverable, on-demand route to omitted optional context. Select before launch/injection on supported Claude and Codex paths and keep stable prefixes and selected sets tied to task/source fingerprints. Do not add Jev explanations to prompts merely to justify selection.
+- Measure rendered bytes actually omitted, helper and worker/reviewer/retry calls actually avoided, and task completion, recovery, delay, and rework. Separate fresh input, cache creation, cache reads, and output usage where known; unknown usage is unknown, not zero. Do not present illustrative or counterfactual token estimates as measured savings or double-count cache subsets.
+- Write focused regression tests before changing behavior, including enabled success, gate-off/missing-key parity (also with warm cache), partial/uncertain and HTTP error/timeout fallback, required-context preservation, review blockers, transient crashes, and actual launch suppression. Update README configuration and trust-boundary documentation; bump Cargo version above the main branch base. Run the repository's full pre-PR gates and serial `cargo test -- --test-threads=1`.
+
+## Open questions
+
+Whether the existing task-independent skill index is itself mandatory discovery text or whether individual optional descriptions may be omitted while the index and `zirv skill list/load` remain available. Resolve in the specification before modifying prompt composition.
+
+## Acceptance criteria
+
+- [ ] Optional skill/reference and prior worker-report selection removes irrelevant rendered material while keeping relevant, required, explicitly invoked, and missing-answer candidates available; omitted material remains discoverable on demand and selected sets invalidate when the task or sources change.
+- [ ] Proxy intake uses the existing policy and interaction paths to avoid a worker without a distinct deliverable and to seek material clarification before implementation, while preserving explicit delegation, useful parallelism, sensitive-task floors, and required independent review.
+- [ ] Supervisor telemetry distinguishes accepted Jev continuation, helper invocation, disabled/missing-key, uncertain answer, and error fallback; a fixture proves a helper call was actually skipped. Deterministic gates and no-progress limits remain first, and false continuations cannot cause unbounded extra cycles or silently approve completion.
+- [ ] Review tests show a reworded or moved-line Minor/Note duplicate causing convergence without another launch, while different issues, multiple reviewers, Major/Critical findings, and unresolved blockers still follow the required review flow. Record the dedup decision, convergence reason, and actual launches.
+- [ ] Crash tests cover repeatable access/configuration failures without keyword matches, transient failures, incomplete reports, refusal floors, and resume/recovery. Record baseline retry eligibility, actual automatic block, avoided launches, and later recovery without counting a failed task as completed.
+- [ ] For every new gated site, enabled success and gate-off/missing-key parity, warm-cache isolation, incomplete/uncertain responses, and 5xx/timeout fallback are exercised with inline tests and a local HTTP fixture. The no-Jev path remains byte-identical and emits no Jev call, cache read, decision row, or spend row.
+- [ ] A per-task evidence view records actions, known usage classes, latency and task outcomes; any savings claim is based on observed removals or avoided calls and reports delayed termination, missed information, and rework where applicable.
+- [ ] README documents the gates and trust boundary; `cargo build`, `cargo nextest run --no-fail-fast`, `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test -- --test-threads=1` complete and their results are reported accurately.
