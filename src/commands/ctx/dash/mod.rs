@@ -18953,13 +18953,14 @@ mod tests {
         // `repo`, but a liveness/capability probe of this same `agent_bin`
         // shim spawns it with no `current_dir` set, so a relative path could
         // land in the real process cwd instead. An absolute tempdir path,
-        // quoted, is immune to that.
+        // quoted, is immune to that. The probe itself exits unlogged, or its
+        // `--help` would land in the log first.
         let argv_log = tmp.path().join("argv.txt");
         let relaunched = tmp.path().join("relaunched.sh");
         std::fs::write(
             &relaunched,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 30\n",
+                "#!/bin/sh\n[ \"$1\" = --help ] && exit 0\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 30\n",
                 argv_log.display()
             ),
         )

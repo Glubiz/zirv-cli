@@ -849,7 +849,7 @@ mod tests {
         let integrations = vec![IntegrationStatus::unavailable(
             crate::commands::workflow::capability::IntegrationId::Browser,
             "no browser binary",
-            "install chromium or set capabilities.browser.binary",
+            "install chromium or set `binary` under [capabilities.browser] in ~/.zirv/ctx.toml",
         )];
         let report = diagnose(&DoctorInput {
             native_configured: true,

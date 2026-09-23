@@ -874,6 +874,33 @@ fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
     (None, skipped)
 }
 
+/// A disposable Chrome/Chromium `--user-data-dir`, hand-rolled under
+/// `std::env::temp_dir()` -- the same one-off-unique-path pattern
+/// `review.rs`'s `IndexTempPath` already uses -- rather than the dev-only
+/// `tempfile` crate, since this runs in production. Removed on drop, so
+/// every caller (the discovery probe, the real capture launch, and
+/// `ChromiumRunner`) is cleaned up on every exit path, including a
+/// timeout-kill, without repeating the cleanup at each call site.
+pub(crate) struct BrowserProfileDir(PathBuf);
+
+impl BrowserProfileDir {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!("zirv-browser-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn arg(&self) -> String {
+        format!("--user-data-dir={}", self.0.display())
+    }
+}
+
+impl Drop for BrowserProfileDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Whether `program` can actually launch headless. Chrome (and its
 /// Chromium-family siblings) refuses `--headless` outright when it cannot
 /// create its own DEFAULT per-invocation profile directory, which fails with
@@ -882,23 +909,14 @@ fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
 /// in. Supplying an explicit, disposable `--user-data-dir` sidesteps that
 /// default-creation step entirely, so the probe measures whether the browser
 /// itself works rather than whether this process happened to have a writable
-/// default profile location. This runs in production (render launch and the
-/// `workflow start` capability check both reach it), so the directory is
-/// hand-rolled under `std::env::temp_dir()` -- the same one-off-unique-path
-/// pattern `review.rs`'s `IndexTempPath` already uses -- rather than the
-/// dev-only `tempfile` crate; it is removed again once the probe returns.
+/// default profile location.
 fn probe_browser_launch(program: &str) -> Option<bool> {
-    let profile_dir =
-        std::env::temp_dir().join(format!("zirv-browser-probe-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&profile_dir).ok()?;
-    let user_data_dir = format!("--user-data-dir={}", profile_dir.display());
-    let result = probe_exit(
+    let profile = BrowserProfileDir::new().ok()?;
+    probe_exit(
         program,
-        &["--headless", &user_data_dir, "--version"],
+        &["--headless", &profile.arg(), "--version"],
         Duration::from_secs(2),
-    );
-    let _ = std::fs::remove_dir_all(&profile_dir);
-    result
+    )
 }
 
 fn wait_for_server(child: &mut Child, port: u16) -> CtxResult<bool> {
@@ -1031,9 +1049,11 @@ fn capture_url(base_url: &str, route: &str) -> String {
 }
 
 fn capture(browser: &str, url: &str, path: &Path, viewport: Viewport) -> CtxResult<bool> {
+    let profile = BrowserProfileDir::new()?;
     let mut command = Command::new(browser);
     command
         .arg("--headless=new")
+        .arg(profile.arg())
         .arg("--disable-background-networking")
         .arg("--disable-component-update")
         .arg("--disable-default-apps")
@@ -1980,6 +2000,46 @@ mod tests {
         let (browser, skipped) = discover_browser_verbose();
         assert_eq!(browser.as_deref(), Some("google-chrome"));
         assert!(skipped.iter().any(|name| name == "chromium"), "{skipped:?}");
+    }
+
+    /// PR #748 gave the headless launch PROBE an explicit disposable
+    /// `--user-data-dir` (Chrome refuses `--headless` inside a sandbox
+    /// without one), but the real capture launch still omitted it, so a
+    /// browser that passed the probe could then fail every capture inside
+    /// that same sandbox. This stub mirrors the probe's own regression stub:
+    /// it exits non-zero unless it sees `--user-data-dir=`, so this fails
+    /// loudly if the real launch ever drops that argument again.
+    #[cfg(unix)]
+    #[test]
+    fn capture_passes_a_disposable_user_data_dir_like_the_probe_does() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("chrome-stub");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncase \"$*\" in\n  *--user-data-dir=*) ;;\n  *) exit 9 ;;\nesac\nexit 0\n",
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod +x");
+
+        let output = dir.path().join("out.png");
+        let ok = capture(
+            stub.to_str().expect("utf8 stub path"),
+            "about:blank",
+            &output,
+            Viewport {
+                width: 800,
+                height: 600,
+            },
+        )
+        .expect("capture");
+        assert!(
+            ok,
+            "capture must pass --user-data-dir so the stub does not exit 9"
+        );
     }
 
     /// Issue #678: on macOS a browser install is an app bundle, not a `PATH`
