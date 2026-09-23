@@ -122,6 +122,9 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     // repo may only turn the standing skill index off, never force it back
     // on for an operator who disabled it.
     "prompt.skill_index",
+    // #753: narrow-only fold (`narrow_intake_discipline_bool`) -- repo may
+    // only turn the first-prompt discipline note off.
+    "prompt.intake_discipline",
     // #716: these repository workspace fields are inert requirements. A name
     // only selects an entry; MCP names can only make launch validation refuse;
     // skills are labelled untrusted instructions. `workspace.git` and
