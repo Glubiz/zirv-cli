@@ -3440,9 +3440,12 @@ allow_hosts = ["docs.rs", ".rust-lang.org"]   # empty means nothing is reachable
 
 [capabilities.browser]
 enabled = true
-# binary = "chromium"            # discovered on PATH, or (macOS) the
-                                  # standard /Applications and
-                                  # $HOME/Applications app bundles, when unset
+# binary = "chromium"            # discovered on PATH, or the standard
+                                  # per-platform install locations, when
+                                  # unset: macOS's /Applications and
+                                  # $HOME/Applications app bundles, and
+                                  # Windows's Program Files, Program Files
+                                  # (x86), and %LocalAppData% installs
 
 [[capabilities.mcp]]
 name = "docs"

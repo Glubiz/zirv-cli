@@ -799,8 +799,8 @@ fn command_available(program: &str) -> bool {
 }
 
 /// The bare names `discover_browser` looks for on `PATH`, in preference
-/// order. Kept separate from the macOS bundle paths below so both platforms'
-/// candidates can be extended independently.
+/// order. Kept separate from the macOS and Windows bundle paths below so
+/// every platform's candidates can be extended independently.
 const BROWSER_PATH_CANDIDATES: [&str; 6] = [
     "chromium",
     "chromium-browser",
@@ -845,6 +845,35 @@ fn macos_bundle_candidates() -> Vec<String> {
     Vec::new()
 }
 
+/// Issue #678: on Windows a Chrome/Edge install is an ordinary file under
+/// `Program Files`, `Program Files (x86)`, or a per-user `%LocalAppData%` --
+/// not a `PATH` entry unless the installer happened to add one, which most
+/// don't. This probes the standard per-browser install path under each of
+/// those three roots.
+#[cfg(target_os = "windows")]
+fn windows_bundle_candidates() -> Vec<String> {
+    const RELATIVE: [&str; 2] = [
+        "Google\\Chrome\\Application\\chrome.exe",
+        "Microsoft\\Edge\\Application\\msedge.exe",
+    ];
+    ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .flat_map(|root| {
+            let root = PathBuf::from(root);
+            RELATIVE
+                .iter()
+                .map(move |relative| root.join(relative).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_bundle_candidates() -> Vec<String> {
+    Vec::new()
+}
+
 pub(crate) fn discover_browser() -> Option<String> {
     discover_browser_verbose().0
 }
@@ -862,6 +891,7 @@ fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
         .map(|name| (*name).to_string())
         .collect();
     candidates.extend(macos_bundle_candidates());
+    candidates.extend(windows_bundle_candidates());
 
     let mut skipped = Vec::new();
     for candidate in candidates {
@@ -2078,6 +2108,61 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate
                     .ends_with("Microsoft Edge.app/Contents/MacOS/Microsoft Edge")),
+            "{candidates:?}"
+        );
+    }
+
+    /// Issue #678: on Windows a browser install is an ordinary file under
+    /// `Program Files`, `Program Files (x86)`, or a per-user
+    /// `%LocalAppData%`, so discovery must also probe the standard
+    /// per-browser install path under each of those roots.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_bundle_candidates_cover_every_install_root_for_chrome_and_edge() {
+        let program_files = tempfile::tempdir().expect("tempdir");
+        let program_files_x86 = tempfile::tempdir().expect("tempdir");
+        let local_app_data = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "ProgramFiles",
+                Some(program_files.path().to_str().expect("utf8 tempdir path")),
+            ),
+            (
+                "ProgramFiles(x86)",
+                Some(
+                    program_files_x86
+                        .path()
+                        .to_str()
+                        .expect("utf8 tempdir path"),
+                ),
+            ),
+            (
+                "LocalAppData",
+                Some(local_app_data.path().to_str().expect("utf8 tempdir path")),
+            ),
+        ]);
+
+        let candidates = windows_bundle_candidates();
+        let local_chrome = local_app_data
+            .path()
+            .join("Google\\Chrome\\Application\\chrome.exe")
+            .to_string_lossy()
+            .into_owned();
+        assert!(candidates.contains(&local_chrome), "{candidates:?}");
+        assert!(
+            candidates.iter().any(|candidate| candidate
+                .starts_with(program_files.path().to_str().expect("utf8 tempdir path"))
+                && candidate.ends_with("Google\\Chrome\\Application\\chrome.exe")),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate.starts_with(
+                program_files_x86
+                    .path()
+                    .to_str()
+                    .expect("utf8 tempdir path")
+            ) && candidate
+                .ends_with("Microsoft\\Edge\\Application\\msedge.exe")),
             "{candidates:?}"
         );
     }
