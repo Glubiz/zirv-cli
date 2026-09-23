@@ -4,6 +4,8 @@
 
 Zirv is a CLI that brings your coding agents, project context, and development workflows into one terminal. It runs alongside installed harnesses such as Claude Code and Codex, coordinates work between them, and supervises sessions so progress can survive context loss or a handoff. Its goal is to make multi-agent work reliable and repeatable while you stay in control.
 
+**Measured results:** On the tested repository, context deduplication removed 1,732–1,937 tokens from the session launch prefix (24–26%). In a separate 15-task headless Sonnet benchmark, Zirv finished 22% faster and cost 24% less than Claude Code with the Superpowers plugin. These figures describe those setups; interactive, long-running sessions have not been benchmarked. [Token measurements](https://github.com/Glubiz/zirv-cli/blob/main/docs/benchmarks/token-cost.md#64-beforeafter-for-each-reduction-shipped-in-this-issue) · [Speed benchmark](https://github.com/Glubiz/zirv-cli/blob/main/docs/benchmarks/wrapped-vs-vanilla.md#4-results)
+
 [![Release](https://img.shields.io/github/v/release/Glubiz/zirv-cli)](https://github.com/Glubiz/zirv-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Glubiz/zirv-cli/blob/main/LICENSE)
 
