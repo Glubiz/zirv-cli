@@ -1432,21 +1432,26 @@ fn apply_network_outcome(command: &str, base: Outcome) -> Outcome {
 /// ALREADY `Ask` (matched, not the plain unmatched-command default) for
 /// every ordinary `rm -rf ...`. `overridable` is what lets this function
 /// still widen THAT case: only when the `Ask` it is being asked to
-/// reconsider is itself the shipped built-in posture (`Origin::BuiltIn`) --
-/// an operator's or a repository's own, deliberately narrower `ask` rule
-/// (`Origin::Operator`/`Origin::Repo`) is never widened, and neither is an
-/// existing `Deny` (e.g. a target naming `zirv`, `"rm -rf*zirv*"`, which
-/// wins by matching BEFORE this function ever runs).
+/// reconsider is itself the shipped built-in `"rm -rf *"`/`"rm -fr *"` glob
+/// -- an operator's or a repository's own, deliberately narrower `ask` rule
+/// (`Origin::Operator`/`Origin::Repo`) is never widened, an existing `Deny`
+/// (e.g. a target naming `zirv`, `"rm -rf*zirv*"`, which wins by matching
+/// BEFORE this function ever runs) is never widened, and neither is a
+/// *different* built-in `Ask` that this same `rm -rf` command also happens
+/// to trip -- most notably `apply_credential_outcome`'s own `Origin::BuiltIn`
+/// `"<project secret file read>"` rule (e.g. `rm -rf /tmp/build-1234/.env`),
+/// which must keep asking rather than being silently widened to `Allow` by a
+/// helper that only meant to relax the recursive-delete posture.
 fn apply_recursive_delete_outcome(command: &str, original: &str, base: Outcome) -> Outcome {
     if !is_recursive_delete(command) {
         return base;
     }
     let overridable = base.verdict == Verdict::Allow
         || (base.verdict == Verdict::Ask
-            && base
-                .matched
-                .as_ref()
-                .is_some_and(|rule| rule.origin == Origin::BuiltIn));
+            && base.matched.as_ref().is_some_and(|rule| {
+                rule.origin == Origin::BuiltIn
+                    && matches!(rule.pattern.as_str(), "rm -rf *" | "rm -fr *")
+            }));
     if overridable && recursive_delete_confined_to_temp(command, original) {
         return Outcome {
             verdict: Verdict::Allow,
@@ -10264,6 +10269,34 @@ mod tests {
             let outcome = evaluate(&policy, "rm -rf /tmp/ledgerlite_doc_test", mode);
             assert_eq!(outcome.verdict, Verdict::Allow, "{mode:?}: {outcome:?}");
         }
+    }
+
+    /// Bug fix: `apply_recursive_delete_outcome`'s `overridable` check used
+    /// to accept ANY `Origin::BuiltIn` `Ask` -- including `apply_credential_
+    /// outcome`'s own built-in `"<project secret file read>"` rule -- not
+    /// only the shipped `"rm -rf *"`/`"rm -fr *"` glob it was meant to widen.
+    /// A recursive delete whose target is BOTH confined to temp AND names a
+    /// project secret (a real headless shape: an agent cleaning up its own
+    /// scratch clone, which happens to carry a `.env`) was silently widened
+    /// from `Ask` to `Allow`, defeating the credential guard entirely. This
+    /// must keep asking; an ordinary temp-scratch delete with no secret in
+    /// its target must still be allowed exactly as before.
+    #[test]
+    fn recursive_delete_of_a_project_secret_under_temp_still_asks() {
+        let policy = SafetyPolicy::default();
+        let secret = evaluate(&policy, "rm -rf /tmp/x/.env", LaunchMode::Interactive);
+        assert_eq!(
+            secret.verdict,
+            Verdict::Ask,
+            "a recursive delete targeting a project secret must keep asking: {secret:?}"
+        );
+
+        let plain = evaluate(&policy, "rm -rf /tmp/x", LaunchMode::Interactive);
+        assert_eq!(
+            plain.verdict,
+            Verdict::Allow,
+            "an ordinary temp-scratch recursive delete must still be allowed: {plain:?}"
+        );
     }
 
     /// The exact shape from the 72-run sample: a relative delete target
