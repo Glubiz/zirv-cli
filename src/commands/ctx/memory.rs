@@ -3229,10 +3229,10 @@ fn harvest_screen_size_bucket(bytes: usize) -> u32 {
 /// (`source == "explicit"` -- the same rule `write_durable` already applies
 /// before ever letting a harvest overwrite one; see its own doc comment).
 fn harvest_screen_protected(lines: &[String], existing: &LoadedMemory) -> bool {
-    if lines
-        .iter()
-        .any(|line| line.split(' ').any(|word| word == "remember"))
-    {
+    if lines.iter().any(|line| {
+        line.split(' ')
+            .any(|word| word.trim_matches(|c: char| !c.is_alphanumeric()) == "remember")
+    }) {
         return true;
     }
     existing
@@ -8133,7 +8133,7 @@ This is part of the body too.\n";
         let mut handoff = sample_handoff();
         handoff
             .gotchas
-            .push("remember to run migrations before tests".to_string());
+            .push("Remember: run migrations before tests".to_string());
         let adapter = fake_model_adapter();
         let _mode =
             crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
