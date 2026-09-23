@@ -4352,7 +4352,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
 | `route.<id>.execution` | `~/.zirv/native.toml` only; selects an official provider process and optional absolute executable path. Repository layers cannot select executables, login methods, billing or startup settings; all effects retain the native broker |
 | Claude Code authentication environment and public user settings | User-owned process environment and `~/.claude/settings.json` (or an absolute `CLAUDE_CONFIG_DIR` outside the repository); only authentication settings are carried into the restricted model invocation. Official login receives options after `--`. Inherited auth values are excluded from persisted settings and diagnostic output |
-| `native.toml` keys other than `policy.allowed_routes` and `policy.compaction` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, and repository `compaction` may only narrow `automatic` to `advisory`, never the reverse |
+| `native.toml` keys other than `policy.allowed_routes`, `policy.compaction` and `policy.context_editing` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, repository `compaction` may only narrow `automatic` to `advisory`, and repository `context_editing` may only narrow `true` to `false` -- never the reverse for either |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
@@ -4602,10 +4602,10 @@ hosts and that live probe is skipped; loopback HTTP remains available for
 local runtimes.
 
 The optional repository layer `<repo>/.zirv/native.toml` may contain only
-`schema`, `[policy].allowed_routes` and `[policy].compaction`. Its routes are
-intersected with the operator's set, so a checkout can narrow access but
-cannot add accounts, endpoints, routes, role bindings, credentials, or
-permissions.
+`schema`, `[policy].allowed_routes`, `[policy].compaction` and
+`[policy].context_editing`. Its routes are intersected with the operator's
+set, so a checkout can narrow access but cannot add accounts, endpoints,
+routes, role bindings, credentials, or permissions.
 
 #### Provider-owned execution in the native UI
 
@@ -4916,6 +4916,28 @@ to `advisory` and can never widen it back — see [Trust
 boundary](#trust-boundary). `zirv ctx status` prints one line per native
 session that has compacted or resumed, with the newest reason, and `zirv ctx
 exec --runtime native` reports the same facts in its final-status JSON.
+
+#### Native context editing
+
+The first-party Anthropic Messages adapter (`anthropic-messages` routes only —
+not Bedrock, Vertex, or any other protocol) requests server-side context
+editing (`clear_tool_uses_20250919`, beta `context-management-2025-06-27`) on
+every request by default, so a long tool-heavy native session sheds stale
+tool results before it exhausts context instead of relying solely on
+compaction or a restart. The request asks Anthropic to clear once a turn
+crosses 100,000 input tokens, keeping the 3 most recent tool_use/tool_result
+pairs intact and requiring at least 5,000 tokens be reclaimed for a clear to
+fire at all (these mirror Anthropic's own documented defaults; see
+[Context editing](https://platform.claude.com/docs/en/build-with-claude/context-editing)).
+If Anthropic ever rejects the beta or field with a 400 naming it, zirv retries
+that one request without it and disables it for the rest of the process, with
+a single diagnostic line — it never turns a request that would have succeeded
+into a failure. When the server reports `context_management.applied_edits`,
+zirv surfaces it as a provider stream event.
+
+`[policy].context_editing` is `true` (the default) or `false` (never request
+it). A repository layer may narrow it to `false` and can never widen it back
+— see [Trust boundary](#trust-boundary).
 
 #### Route profiles
 
