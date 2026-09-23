@@ -1279,7 +1279,7 @@ since there is no prompt to fall back on.
 
 ### Running Scripts
 Place your script files in `.zirv/commands/` (e.g., `build.yaml`):
-  
+
 ```yaml
 name: Build
 description: Build the application.
