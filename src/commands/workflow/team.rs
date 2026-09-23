@@ -23,11 +23,14 @@ use serde::{Deserialize, Serialize};
 
 use super::agents::{AgentRegistry, ModelTier, team_role_for};
 use super::capability::CapabilityId;
-use super::classify::{self, Classification, Complexity, Intent};
+use super::classify::{self, Classification, Complexity, Intent, RiskBand};
 use super::engine;
 use super::profile::{ExecutionMode, ExecutionProfile, WorkDomainTag};
 use super::skill::SkillRegistry;
 use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::config::CtxConfig;
+use crate::commands::ctx::jev::{self, AdvisoryStatus, JevEffect, Question};
+use crate::commands::ctx::state::StateDir;
 use crate::commands::ctx::state::now_secs;
 use crate::commands::ctx::team::{Authority, TeamRole};
 
@@ -759,6 +762,159 @@ pub fn compile_explicit(
     })
 }
 
+/// Only coarse compiled-plan facts cross the Jev boundary.
+fn plan_advisory_state(plan: &TeamPlan) -> serde_json::Value {
+    serde_json::json!({
+        "_zirv_metadata_only": true,
+        // [site=1, intent, risk, seats, dependency edges, implementers,
+        // independent review, claim groups]. All values are local coarse
+        // facts; no objective, path, seat brief, or deliverable is sent.
+        "facts": [[
+            1,
+            plan.profile.classification.intent as u8,
+            plan.profile.classification.risk as u8,
+            plan.seats.len(),
+            plan.seats.iter().map(|seat| seat.depends_on.len()).sum::<usize>(),
+            plan.seats.iter().filter(|seat| seat.manifest_id == "implementer").count(),
+            plan.profile.validation.independent_review as u8,
+            plan.seats.iter().any(|seat| seat.manifest_id == "implementer" && !seat.claim.paths.is_empty()) as u8,
+        ]],
+    })
+}
+
+/// Optional Jev advice acts on an already valid deterministic plan. The
+/// caller stores this returned plan, so omitting the planner also omits its
+/// later brief and dispatch from the compiled team path.
+fn maybe_advise_team_plan(cfg: &CtxConfig, state: &StateDir, plan: TeamPlan) -> TeamPlan {
+    if !cfg.jev.intake_savings || !jev::available(&cfg.proxy.typesafe) {
+        return plan;
+    }
+    if plan.profile.execution != ExecutionMode::Orchestrated
+        || plan.profile.classification.complexity != Complexity::Substantial
+        || plan.profile.classification.risk >= RiskBand::High
+        || !plan
+            .seats
+            .iter()
+            .any(|seat| seat.id == "planner-1" && seat.manifest_id == "planner")
+    {
+        return plan;
+    }
+
+    // Explicit requests for delegated planning or exploration retain their
+    // worker even when the advisory would regard its deliverable as similar.
+    let objective_lower = plan.objective.to_ascii_lowercase();
+    if [
+        "plan",
+        "design",
+        "architect",
+        "delegate",
+        "worker",
+        "agent",
+        "team",
+        "parallel",
+        "research",
+        "explor",
+        "investigat",
+    ]
+    .iter()
+    .any(|term| objective_lower.contains(term))
+    {
+        return plan;
+    }
+
+    let input = plan_advisory_state(&plan);
+    let questions = [Question::metadata_noul(
+        "planner_distinct",
+        "Given only these coarse team-plan facts, is a separate planner worker necessary to produce a distinct deliverable beyond the compiled seat order, claims, and dependencies? Answer true if the facts are insufficient or there is any doubt.",
+        "yes, keep the planner worker",
+        "no, the compiled plan already supplies the breakdown",
+    )];
+    let answers = match jev::advise_detailed(
+        cfg,
+        state,
+        "intake_plan",
+        cfg.jev.intake_savings,
+        &input,
+        &questions,
+    ) {
+        AdvisoryStatus::Answered(answers) => answers,
+        AdvisoryStatus::Disabled | AdvisoryStatus::MissingCredential | AdvisoryStatus::Failed => {
+            return plan;
+        }
+    };
+    let omit = answers
+        .get("planner_distinct")
+        .and_then(|answer| {
+            answer
+                .decisive(0.9, 0.9)
+                .then(|| answer.as_noul())
+                .flatten()
+        })
+        .is_some_and(|value| (0.0..=0.05).contains(&value));
+    let mut final_plan = plan.clone();
+    if omit {
+        final_plan.seats.retain(|seat| seat.id != "planner-1");
+        for seat in &mut final_plan.seats {
+            seat.depends_on.retain(|id| id != "planner-1");
+        }
+        let ids: std::collections::BTreeSet<&str> = final_plan
+            .seats
+            .iter()
+            .map(|seat| seat.id.as_str())
+            .collect();
+        if final_plan
+            .seats
+            .iter()
+            .any(|seat| seat.depends_on.iter().any(|id| !ids.contains(id.as_str())))
+        {
+            return plan;
+        }
+        final_plan.groups = topological_groups(&final_plan.seats);
+        if final_plan.groups.len().saturating_sub(1) > final_plan.limits.max_depth {
+            return plan;
+        }
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(plan.objective.as_bytes());
+    let subject_id = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut effect = JevEffect::new(
+        "intake_plan",
+        if omit {
+            "optional_seat_omitted"
+        } else {
+            "baseline_plan_kept"
+        },
+    );
+    effect.subject_id = Some(&subject_id);
+    effect.item_id = Some("planner-1");
+    effect.baseline_count = Some(plan.seats.len() as u32);
+    effect.actual_count = Some(final_plan.seats.len() as u32);
+    effect.reason = Some(if omit {
+        "no_distinct_deliverable"
+    } else {
+        "uncertain_or_distinct"
+    });
+    jev::record_effect(cfg, state, cfg.jev.intake_savings, &effect);
+    final_plan
+}
+
+fn advise_compiled_plan(repo: &Path, plan: TeamPlan) -> TeamPlan {
+    let env = |key: &str| std::env::var(key).ok();
+    let Ok(cfg) = CtxConfig::load(repo, &env) else {
+        return plan;
+    };
+    if !cfg.jev.intake_savings || !jev::available(&cfg.proxy.typesafe) {
+        return plan;
+    }
+    let Ok(state) = StateDir::resolve(&env) else {
+        return plan;
+    };
+    maybe_advise_team_plan(&cfg, &state, plan)
+}
+
 /// The route-eligibility closure for the wrapped-harness CLI surface: when
 /// the operator has configured native `[roles]` routing at all, every team
 /// role is checked against it exactly as `zirv ctx agent --runtime native`
@@ -810,7 +966,7 @@ pub fn compile_for_objective(
     let skills = SkillRegistry::load_for_repo(repo, home, true)?;
     registry.validate_against(&skills)?;
     let eligibility = default_route_eligibility(repo);
-    match seat {
+    let plan = match seat {
         Some(manifest_id) => compile_explicit(
             objective,
             &profile,
@@ -826,7 +982,12 @@ pub fn compile_for_objective(
             &skills,
             eligibility.as_ref(),
         ),
-    }
+    }?;
+    Ok(if seat.is_some() {
+        plan
+    } else {
+        advise_compiled_plan(repo, plan)
+    })
 }
 
 /// Persists `plan`: the active workflow owns it when one exists for this
@@ -983,6 +1144,11 @@ fn run_plan(args: &TeamPlanArgs, writer: &mut impl Write) -> CtxResult<i32> {
             &skills,
             eligibility.as_ref(),
         )?,
+    };
+    let plan = if args.seat.is_some() {
+        plan
+    } else {
+        advise_compiled_plan(&repo, plan)
     };
 
     let mut stored_note: Option<&'static str> = None;
@@ -1388,6 +1554,247 @@ mod tests {
             3,
             "each implementer owns a distinct claim: {plan:?}"
         );
+    }
+
+    #[test]
+    fn jev_intake_omits_only_optional_planner_and_preserves_required_seats() {
+        let state_tmp = tempfile::tempdir().expect("state");
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_tmp.path().to_path_buf());
+        let objective = "implement the billing export across several modules";
+        let mut profile = profile_for(
+            Intent::Feature,
+            Complexity::Substantial,
+            RiskBand::Low,
+            8,
+            objective,
+        );
+        profile.validation.independent_review = true;
+        profile.validation.security_review = true;
+        let baseline = compile(
+            objective,
+            &profile,
+            &registry(),
+            &skills(),
+            &always_eligible,
+        )
+        .expect("baseline plan");
+        assert!(baseline.seats.iter().any(|seat| seat.id == "planner-1"));
+        assert!(baseline.seats.iter().any(|seat| seat.id == "reviewer-1"));
+
+        let mut cfg = crate::commands::ctx::config::CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_PLAN".to_string();
+        cfg.jev.cache_ttl_secs = 0;
+        let body = r#"{"model":"jev-latest","answers":{"planner_distinct":{"type":"noul","noul":0.01}},"usage":{"input_tokens":11,"output_tokens":2}}"#;
+        let (base_url, server) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        cfg.proxy.typesafe.base_url = base_url;
+        // SAFETY: this test owns this unique environment variable.
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_PLAN", "test-key") };
+        let plan = maybe_advise_team_plan(&cfg, &state, baseline.clone());
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_PLAN") };
+        server.join().expect("one request");
+
+        assert_eq!(plan.seats.len() + 1, baseline.seats.len());
+        assert!(!plan.seats.iter().any(|seat| seat.id == "planner-1"));
+        assert!(plan.seats.iter().any(|seat| seat.id == "reviewer-1"));
+        assert!(
+            plan.seats
+                .iter()
+                .any(|seat| seat.id == "security-scanner-1")
+                == baseline
+                    .seats
+                    .iter()
+                    .any(|seat| seat.id == "security-scanner-1")
+        );
+        for seat in &plan.seats {
+            assert!(!seat.depends_on.iter().any(|id| id == "planner-1"));
+        }
+        assert_eq!(plan.groups, topological_groups(&plan.seats));
+    }
+
+    #[test]
+    fn intake_plan_jev_state_has_only_coarse_metadata() {
+        let objective = "implement PRIVATE_BILLING_CUSTOMER_NAME in src/private.rs";
+        let plan = compile(
+            objective,
+            &profile_for(
+                Intent::Feature,
+                Complexity::Substantial,
+                RiskBand::Low,
+                4,
+                objective,
+            ),
+            &registry(),
+            &skills(),
+            &always_eligible,
+        )
+        .expect("baseline");
+        let state = plan_advisory_state(&plan).to_string();
+        assert!(!state.contains("PRIVATE_BILLING_CUSTOMER_NAME"));
+        assert!(!state.contains("src/private.rs"));
+        assert!(!state.contains("group-1"));
+        assert!(state.contains("_zirv_metadata_only"));
+    }
+
+    #[test]
+    fn intake_plan_missing_key_or_disabled_gate_ignores_a_warm_answer() {
+        let state_tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let objective = "implement billing exports across several modules";
+        let baseline = compile(
+            objective,
+            &profile_for(
+                Intent::Feature,
+                Complexity::Substantial,
+                RiskBand::Low,
+                12,
+                objective,
+            ),
+            &registry(),
+            &skills(),
+            &always_eligible,
+        )
+        .expect("baseline");
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_WARM".to_string();
+        let body = r#"{"model":"jev-latest","answers":{"planner_distinct":{"type":"noul","noul":0.01}},"usage":{"input_tokens":11,"output_tokens":2}}"#;
+        let (base_url, server) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_WARM", "test-key") };
+        let omitted = maybe_advise_team_plan(&cfg, &state, baseline.clone());
+        server.join().expect("warm cache response");
+        assert_eq!(omitted.seats.len() + 1, baseline.seats.len());
+        let decisions_before =
+            std::fs::read(state.root().join("jev-decisions.jsonl")).expect("decision log");
+        let effects_before =
+            std::fs::read(state.root().join("jev-effects.jsonl")).expect("effect log");
+
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_WARM") };
+        assert_eq!(
+            maybe_advise_team_plan(&cfg, &state, baseline.clone()),
+            baseline
+        );
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_WARM", "test-key") };
+        cfg.jev.intake_savings = false;
+        assert_eq!(
+            maybe_advise_team_plan(&cfg, &state, baseline.clone()),
+            baseline
+        );
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_WARM") };
+        assert_eq!(
+            std::fs::read(state.root().join("jev-decisions.jsonl")).expect("decisions"),
+            decisions_before
+        );
+        assert_eq!(
+            std::fs::read(state.root().join("jev-effects.jsonl")).expect("effects"),
+            effects_before
+        );
+    }
+
+    #[test]
+    fn intake_plan_partial_or_http_error_keeps_the_baseline() {
+        let state_tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let objective = "implement billing exports across several modules";
+        let baseline = compile(
+            objective,
+            &profile_for(
+                Intent::Feature,
+                Complexity::Substantial,
+                RiskBand::Low,
+                12,
+                objective,
+            ),
+            &registry(),
+            &skills(),
+            &always_eligible,
+        )
+        .expect("baseline");
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.jev.cache_ttl_secs = 0;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_FALLBACK".to_string();
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_FALLBACK", "test-key") };
+        for (status, body) in [
+            (
+                200,
+                r#"{"model":"jev-latest","answers":{},"usage":{"input_tokens":11,"output_tokens":2}}"#,
+            ),
+            (
+                200,
+                r#"{"model":"jev-latest","answers":{"planner_distinct":{"type":"noul","noul":0.5}},"usage":{"input_tokens":11,"output_tokens":2}}"#,
+            ),
+            (503, "unavailable"),
+        ] {
+            let (base_url, server) =
+                crate::commands::ctx::jev::tests::one_shot_server(status, body);
+            cfg.proxy.typesafe.base_url = base_url;
+            assert_eq!(
+                maybe_advise_team_plan(&cfg, &state, baseline.clone()),
+                baseline
+            );
+            server.join().expect("one request");
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("request");
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            drop(stream);
+        });
+        cfg.proxy.typesafe.base_url = format!("http://{address}/v1");
+        cfg.proxy.typesafe.timeout_secs = 1;
+        assert_eq!(
+            maybe_advise_team_plan(&cfg, &state, baseline.clone()),
+            baseline
+        );
+        server.join().expect("timeout fixture");
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_FALLBACK") };
+    }
+
+    #[test]
+    fn intake_plan_keeps_architectural_high_risk_and_explicit_planning_work() {
+        let state_tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_FLOORS".to_string();
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_FLOORS", "test-key") };
+        for (objective, complexity, risk) in [
+            (
+                "implement a new cross-service protocol",
+                Complexity::Architectural,
+                RiskBand::Low,
+            ),
+            (
+                "implement credential rotation across modules",
+                Complexity::Substantial,
+                RiskBand::High,
+            ),
+            (
+                "delegate a plan for billing export across modules",
+                Complexity::Substantial,
+                RiskBand::Low,
+            ),
+        ] {
+            let baseline = compile(
+                objective,
+                &profile_for(Intent::Feature, complexity, risk, 4, objective),
+                &registry(),
+                &skills(),
+                &always_eligible,
+            )
+            .expect("baseline");
+            assert_eq!(
+                maybe_advise_team_plan(&cfg, &state, baseline.clone()),
+                baseline
+            );
+        }
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_FLOORS") };
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
     }
 
     /// Issue #541 chunk C, decision 3: when the classification carries a real

@@ -1067,6 +1067,7 @@ struct ObjectiveProgress {
     last_digest: Option<u64>,
     last_gate_red: bool,
     cycles_without_progress: u32,
+    consecutive_jev_skips: u8,
 }
 
 /// What `run_with_clock` does after `evaluate_objective_after_cycle` runs.
@@ -1199,24 +1200,45 @@ or {\"seconds\": <n>}.";
 /// stay the helper's sole authority, and Jev is never asked to produce them.
 /// Chosen from a live 2026-09-18 probe.
 const JUDGE_CONTINUE_FLOOR: f32 = 0.7;
+const MAX_CONSECUTIVE_JEV_SKIPS: u8 = 2;
 
 #[derive(Debug, Serialize)]
 struct JudgeAdviseState {
-    objective: String,
-    transcript_tail: String,
-    gates_green: bool,
-    cycle: u32,
+    #[serde(rename = "_zirv_metadata_only")]
+    metadata_only: bool,
+    facts: Vec<Vec<u32>>,
 }
 
-/// Issue #537 (A4): `true` only for a confident (`>= JUDGE_CONTINUE_FLOOR`)
-/// `continue` answer from Jev (site `"judge"`), in which case the caller
-/// skips this cycle's helper call outright and proceeds exactly as it does
-/// today on a helper `continue` verdict. `false` -- fall through to today's
-/// helper path completely unchanged -- for the gate being off, no
-/// credential, any transport/parse error, or any other answer (`done`,
-/// `blocked`, `wait`, or a `continue` below the floor): Jev never produces
-/// those three verdicts itself, only ever narrows toward the one outcome
-/// (`continue`) the helper would otherwise have to spend a call confirming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgeAdvice {
+    Continue,
+    OtherVerdict,
+    Uncertain,
+    Error,
+    Disabled,
+    MissingCredential,
+}
+
+impl JudgeAdvice {
+    fn skips_helper(self) -> bool {
+        self == Self::Continue
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Continue => "accepted_continue",
+            Self::OtherVerdict => "other_verdict",
+            Self::Uncertain => "uncertain",
+            Self::Error => "error",
+            Self::Disabled => "disabled",
+            Self::MissingCredential => "missing_credential",
+        }
+    }
+}
+
+/// Advises on a bounded numeric projection of local progress. Only a
+/// decisive `continue` may skip a helper call; the caller forces a helper
+/// recheck after two consecutive skips.
 fn jev_judge_continue(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -1224,17 +1246,40 @@ fn jev_judge_continue(
     transcript_tail: &str,
     cycle: u32,
     gates_green: bool,
-) -> bool {
+) -> JudgeAdvice {
+    if !cfg.jev.supervisor {
+        return JudgeAdvice::Disabled;
+    }
+    if !jev::available(&cfg.proxy.typesafe) {
+        return JudgeAdvice::MissingCredential;
+    }
+    let lower = transcript_tail.to_ascii_lowercase();
+    let has_tool_activity = lower.contains("\"tool_use\"");
+    let has_successful_result = lower.contains("\"is_error\":false");
+    if !gates_green || !has_tool_activity || !has_successful_result {
+        return JudgeAdvice::Uncertain;
+    }
+    let budget_remaining_bucket = record
+        .budget_tokens
+        .map(|budget| {
+            let remaining = budget.saturating_sub(record.spent_tokens);
+            (remaining.saturating_mul(4) / budget.max(1)).min(4) as u32
+        })
+        .unwrap_or(5);
     let advise_state = JudgeAdviseState {
-        objective: crate::utils::truncate_bytes(objective::layer_text(record), Some(2 * 1024)),
-        transcript_tail: crate::utils::truncate_bytes(transcript_tail.to_string(), Some(4 * 1024)),
-        gates_green,
-        cycle,
+        metadata_only: true,
+        facts: vec![vec![
+            u32::from(gates_green),
+            cycle.min(1_000_000),
+            (transcript_tail.len() / 1024).min(4) as u32,
+            u32::from(has_tool_activity),
+            u32::from(has_successful_result),
+            budget_remaining_bucket,
+        ]],
     };
-    let questions = [jev::Question::choice(
+    let questions = [jev::Question::metadata_choice(
         "verdict",
-        "What is the state of this objective right now, from the objective and the recent \
-         transcript tail?",
+        "From coarse local progress metadata only, is another work cycle clearly warranted?",
         &[
             (
                 "done",
@@ -1248,20 +1293,30 @@ fn jev_judge_continue(
             ("wait", "waiting on a process, file or time"),
         ],
     )];
-    let Some(answers) = jev::advise(
+    let answers = match jev::advise_detailed(
         cfg,
         state,
         "judge",
         cfg.jev.supervisor,
         &advise_state,
         &questions,
-    ) else {
-        return false;
+    ) {
+        jev::AdvisoryStatus::Answered(answers) => answers,
+        jev::AdvisoryStatus::Disabled => return JudgeAdvice::Disabled,
+        jev::AdvisoryStatus::MissingCredential => return JudgeAdvice::MissingCredential,
+        jev::AdvisoryStatus::Failed => return JudgeAdvice::Error,
     };
-    answers.get("verdict").is_some_and(|answer| {
-        answer.as_choice() == Some("continue")
-            && answer.decisive(JUDGE_CONTINUE_FLOOR, jev::DEFAULT_MIN_MARGIN)
-    })
+    let Some(answer) = answers.get("verdict") else {
+        return JudgeAdvice::Uncertain;
+    };
+    if !answer.decisive(JUDGE_CONTINUE_FLOOR, jev::DEFAULT_MIN_MARGIN) {
+        return JudgeAdvice::Uncertain;
+    }
+    if answer.as_choice() == Some("continue") {
+        JudgeAdvice::Continue
+    } else {
+        JudgeAdvice::OtherVerdict
+    }
 }
 
 /// The core flow issue #314 asks for: deterministic gates first, a cheap-
@@ -1371,17 +1426,31 @@ fn evaluate_objective_after_cycle<W: Write>(
             // Issue #537 (A4): a confident Jev `continue` skips the helper
             // call for this cycle entirely -- see `jev_judge_continue`'s own
             // doc comment for the full merge rule.
-            if jev_judge_continue(
-                cfg,
-                state,
-                &record,
-                &transcript_tail,
-                cycle,
-                curr_gate_green,
-            ) {
+            let force_helper = progress.consecutive_jev_skips >= MAX_CONSECUTIVE_JEV_SKIPS;
+            let advice = if force_helper {
+                None
+            } else {
+                Some(jev_judge_continue(
+                    cfg,
+                    state,
+                    &record,
+                    &transcript_tail,
+                    cycle,
+                    curr_gate_green,
+                ))
+            };
+            if advice.is_some_and(JudgeAdvice::skips_helper) {
+                progress.consecutive_jev_skips = progress.consecutive_jev_skips.saturating_add(1);
+                let mut effect = jev::JevEffect::new("judge", "helper_skipped");
+                effect.subject_id = Some(&key);
+                effect.baseline_count = Some(1);
+                effect.actual_count = Some(0);
+                effect.outcome = Some("continued");
+                jev::record_effect(cfg, state, cfg.jev.supervisor, &effect);
                 clear_pending_note();
                 return Ok(ObjectiveOutcome::Continue);
             }
+            progress.consecutive_jev_skips = 0;
 
             let model = handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter);
             let prompt = format!(
@@ -1395,6 +1464,16 @@ fn evaluate_objective_after_cycle<W: Write>(
                 &prompt,
                 Duration::from_secs(cfg.handoff.timeout_secs),
             );
+            let mut effect = jev::JevEffect::new("judge", "helper_invoked");
+            effect.subject_id = Some(&key);
+            effect.reason = Some(if force_helper {
+                "forced_recheck"
+            } else {
+                advice.unwrap_or(JudgeAdvice::Disabled).reason()
+            });
+            effect.baseline_count = Some(1);
+            effect.actual_count = Some(1);
+            jev::record_effect(cfg, state, cfg.jev.supervisor, &effect);
             let parsed = answer.ok().and_then(|text| judge::parse_verdict(&text));
             let Some((verdict, reason)) = parsed else {
                 // Fails open: an unavailable or non-conforming judge is
@@ -4050,6 +4129,9 @@ mod tests {
             cfg
         }
 
+        const JUDGE_PROGRESS_TAIL: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","is_error":false}]}}"#;
+
         #[test]
         fn jev_judge_continue_skips_the_helper_on_a_confident_continue_answer() {
             let body = r#"{"model": "jev-latest", "answers": {
@@ -4070,7 +4152,7 @@ mod tests {
                 &cfg,
                 &state,
                 &sample_objective(),
-                "assistant: done",
+                JUDGE_PROGRESS_TAIL,
                 3,
                 true,
             );
@@ -4079,7 +4161,7 @@ mod tests {
                 std::env::remove_var(credential_env);
             }
             handle.join().expect("server thread must not panic");
-            assert!(skip, "a confident continue must skip the helper call");
+            assert_eq!(skip, JudgeAdvice::Continue);
         }
 
         /// Jev determinism fix: a `continue` answer with the right label and
@@ -4107,7 +4189,7 @@ mod tests {
                 &cfg,
                 &state,
                 &sample_objective(),
-                "assistant: done",
+                JUDGE_PROGRESS_TAIL,
                 3,
                 true,
             );
@@ -4117,7 +4199,7 @@ mod tests {
             }
             handle.join().expect("server thread must not panic");
             assert!(
-                !skip,
+                !skip.skips_helper(),
                 "a thin-margin continue must fall through despite high confidence"
             );
         }
@@ -4142,7 +4224,7 @@ mod tests {
                 &cfg,
                 &state,
                 &sample_objective(),
-                "assistant: done",
+                JUDGE_PROGRESS_TAIL,
                 3,
                 true,
             );
@@ -4152,7 +4234,7 @@ mod tests {
             }
             handle.join().expect("server thread must not panic");
             assert!(
-                !skip,
+                !skip.skips_helper(),
                 "Jev must never authorize done/blocked/wait itself, however confident"
             );
         }
@@ -4173,7 +4255,7 @@ mod tests {
                 &cfg,
                 &state,
                 &sample_objective(),
-                "assistant: done",
+                JUDGE_PROGRESS_TAIL,
                 3,
                 true,
             );
@@ -4183,7 +4265,7 @@ mod tests {
             }
             handle.join().expect("server thread must not panic");
             assert!(
-                !skip,
+                !skip.skips_helper(),
                 "a transport/HTTP error must fall through to the helper"
             );
         }
@@ -4206,7 +4288,7 @@ mod tests {
                 &cfg,
                 &state,
                 &sample_objective(),
-                "assistant: done",
+                JUDGE_PROGRESS_TAIL,
                 3,
                 true,
             );
@@ -4214,7 +4296,56 @@ mod tests {
             unsafe {
                 std::env::remove_var(credential_env);
             }
-            assert!(!skip, "the gate is off, so this must never fire");
+            assert_eq!(skip, JudgeAdvice::Disabled);
+        }
+
+        #[test]
+        fn two_jev_continues_skip_real_helpers_then_force_a_blocking_recheck() {
+            let repo_dir = git_repo();
+            let repo_path = repo_dir.path().canonicalize().expect("canonical repo path");
+            let repo = repo_path.as_path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+            let mode_file = state_tmp.path().join("judge-modes.txt");
+            std::fs::write(&mode_file, "blocked\n").expect("judge mode");
+            store_active_objective(&state, repo);
+
+            let body = r#"{"model":"jev-latest","answers":{"verdict":{"type":"choice","choice":"continue","probabilities":{"continue":0.95,"done":0.05},"confidence":0.95}},"usage":{"input_tokens":5,"output_tokens":1}}"#;
+            let (url, handle) = crate::commands::ctx::jev::tests::multi_shot_server(200, body, 2);
+            let mut env = objective_env(state_tmp.path(), "0");
+            env.insert("ZIRV_CTX_JEV_SUPERVISOR".into(), "true".into());
+            env.insert("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL".into(), url);
+            env.insert(
+                "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV".into(),
+                "RUN_LOOP_TEST_BOUNDED_RECHECK".into(),
+            );
+            env.insert("ZIRV_CTX_JEV_CACHE_TTL_SECS".into(), "0".into());
+            let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+                "RUN_LOOP_TEST_BOUNDED_RECHECK",
+                Some("secret"),
+            )]);
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE_FILE", mode_file.to_str()),
+            ]);
+
+            let mut out = Vec::new();
+            let code = run_with(&args_for(5), &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("loop runs"), EXIT_OBJECTIVE_BLOCKED);
+            drop(handle);
+            let effects = std::fs::read_to_string(state_tmp.path().join("jev-effects.jsonl"))
+                .unwrap_or_default();
+            assert_eq!(
+                effects.matches("\"action\":\"helper_skipped\"").count(),
+                2,
+                "{effects}"
+            );
+            assert_eq!(transcripts_in(&home).len(), 3);
+            assert_eq!(std::fs::read_to_string(&mode_file).unwrap(), "");
+            assert!(effects.contains("\"reason\":\"forced_recheck\""));
         }
 
         #[test]

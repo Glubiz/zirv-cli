@@ -175,6 +175,10 @@ pub struct ProxyDecision {
     /// `false` (never fires a clarify round retroactively).
     #[serde(default)]
     pub needs_clarification_decisive: bool,
+    /// A fixed clarification question selected by the optional intake
+    /// advisor. Absent on the original path, including persisted output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clarification_category: Option<String>,
     /// Additive domain tags a confident Jev/helper `Noul` answer added
     /// (issue #537 A2) -- `security`, `data`, `docs_only`, `devops`,
     /// `architecture`, `frontend`. Never removed once added; `#[serde(
@@ -460,6 +464,7 @@ pub fn baseline(
         worker_tier: Tier::Cheap,
         needs_clarification: 0.0,
         needs_clarification_decisive: false,
+        clarification_category: None,
         domains: Vec::new(),
         decider: Decider::Deterministic,
         confidence: BTreeMap::new(),
@@ -1163,6 +1168,7 @@ fn choice(id: &str, instructions: &str, options: Vec<(String, Option<String>)>) 
     Question {
         id: id.to_string(),
         kind: QuestionKind::Choice,
+        metadata_signature: None,
         instructions: instructions.to_string(),
         criteria: Criteria::Choice(options),
     }
@@ -1253,6 +1259,7 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
     out.push(Question {
         id: "complexity".to_string(),
         kind: QuestionKind::Score,
+        metadata_signature: None,
         instructions: "How complex is this request, from the request text and the repository \
                        facts given?"
             .to_string(),
@@ -1305,6 +1312,7 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
     out.push(Question {
         id: "risk".to_string(),
         kind: QuestionKind::Score,
+        metadata_signature: None,
         instructions: "How risky is this request if it goes wrong?".to_string(),
         criteria: Criteria::Score(vec![
             "Low: no sensitive surface; isolated, well-tested change.".to_string(),
@@ -1362,6 +1370,7 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
     out.push(Question {
         id: "needs_clarification".to_string(),
         kind: QuestionKind::Noul,
+        metadata_signature: None,
         instructions: "Is this request too ambiguous to start without asking one clarifying \
                        question first?"
             .to_string(),
@@ -1771,6 +1780,7 @@ mod tests {
             worker_tier: Tier::Cheap,
             needs_clarification: 0.0,
             needs_clarification_decisive: false,
+            clarification_category: None,
             domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),

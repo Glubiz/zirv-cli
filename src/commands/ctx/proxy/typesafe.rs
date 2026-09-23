@@ -31,15 +31,8 @@ pub fn decide(
 mod tests {
     use super::*;
     use crate::commands::ctx::proxy::decision::{
-        AnswerValue, Criteria, IntakePolicy, IntakeRepository, QuestionKind,
+        Criteria, IntakePolicy, IntakeRepository, QuestionKind,
     };
-
-    fn fixture(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join(name)
-    }
 
     fn sample_intake() -> IntakeState {
         IntakeState {
@@ -59,18 +52,21 @@ mod tests {
             Question {
                 id: "category".to_string(),
                 kind: QuestionKind::Choice,
+                metadata_signature: None,
                 instructions: String::new(),
                 criteria: Criteria::Choice(Vec::new()),
             },
             Question {
                 id: "urgency".to_string(),
                 kind: QuestionKind::Score,
+                metadata_signature: None,
                 instructions: String::new(),
                 criteria: Criteria::Score(Vec::new()),
             },
             Question {
                 id: "needs_human".to_string(),
                 kind: QuestionKind::Noul,
+                metadata_signature: None,
                 instructions: String::new(),
                 criteria: Criteria::Noul {
                     when_true: None,
@@ -80,21 +76,17 @@ mod tests {
         ]
     }
 
-    /// Proves this module still wires up to [`jev::ask`]: a canned
-    /// `/systemone` response (the shared fixture `jev.rs`'s own tests read)
-    /// comes back through [`decide`] as the same neutral [`Answers`]/
-    /// [`Usage`] shape `jev::ask` itself is proven to produce.
+    /// The legacy freeform proxy state cannot cross the metadata-only Jev
+    /// boundary, even with a credential. The gated intake path sends its own
+    /// coarse facts through the shared client instead.
     #[test]
-    fn decide_delegates_to_jev_ask_and_returns_its_answers() {
-        let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
-        let body: &'static str = Box::leak(text.into_boxed_str());
-        let (base_url, handle) = jev::tests::one_shot_server(200, body);
+    fn decide_rejects_legacy_freeform_intake_before_network_or_cache() {
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
             std::env::set_var("JEV_TEST_KEY_TYPESAFE_DECIDE", "secret");
         }
         let cfg = ProxyTypesafeConfig {
-            base_url,
+            base_url: "http://127.0.0.1:1".to_string(),
             credential_env: "JEV_TEST_KEY_TYPESAFE_DECIDE".to_string(),
             model: "jev-latest".to_string(),
             timeout_secs: 5,
@@ -113,22 +105,7 @@ mod tests {
         unsafe {
             std::env::remove_var("JEV_TEST_KEY_TYPESAFE_DECIDE");
         }
-        let (answers, usage) = result.expect("decide");
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(usage.input_tokens, 312);
-        assert_eq!(usage.output_tokens, 48);
-        match &answers["category"].value {
-            AnswerValue::Choice(value) => assert_eq!(value, "technical"),
-            other => panic!("expected a choice answer, got {other:?}"),
-        }
-        match &answers["urgency"].value {
-            AnswerValue::Score(value) => assert_eq!(*value, 1.0),
-            other => panic!("expected a score answer, got {other:?}"),
-        }
-        match &answers["needs_human"].value {
-            AnswerValue::Noul(value) => assert_eq!(*value, 0.999),
-            other => panic!("expected a noul answer, got {other:?}"),
-        }
+        assert!(matches!(result, Err(TypesafeError::UnsafeState)));
+        assert!(!state_dir.path().join("jev-cache").exists());
     }
 }

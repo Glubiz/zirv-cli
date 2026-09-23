@@ -740,11 +740,11 @@ pub fn respawn_decision(card: &Card, exit: ExitKind, max_attempts: u32) -> Respa
     }
 }
 
-fn exit_kind_label(exit: ExitKind) -> &'static str {
+fn exit_kind_code(exit: ExitKind) -> u32 {
     match exit {
-        ExitKind::Crash => "crash",
-        ExitKind::SilentZero => "silent_zero",
-        ExitKind::Reported => "reported",
+        ExitKind::Crash => 1,
+        ExitKind::SilentZero => 2,
+        ExitKind::Reported => 3,
     }
 }
 
@@ -753,40 +753,97 @@ fn exit_kind_label(exit: ExitKind) -> &'static str {
 const CRASH_TRIAGE_FLOOR: f32 = 0.9;
 
 #[derive(Debug, Serialize)]
-struct CrashAdviseState<'a> {
-    block_reason: String,
-    exit_kind: &'a str,
-    attempt: u32,
-    max_attempts: u32,
+struct CrashAdviseState {
+    #[serde(rename = "_zirv_metadata_only")]
+    metadata_only: bool,
+    facts: Vec<Vec<u32>>,
 }
 
-/// Issue #537 (A4): when [`respawn_decision`]'s own keyword check on
-/// `block_reason` did not match, asks Jev (site `"crash"`) to semantically
-/// triage it: `access` (an authentication/authorization/credential/login/
-/// quota/permission problem a retry cannot fix) or `deterministic` (a bug,
-/// compile error or missing file that will recur identically) at or above
-/// [`CRASH_TRIAGE_FLOOR`] takes the same [`RespawnVerdict::AutoBlock`] path
-/// the keyword match already takes, with its own reason text. `transient`, a
-/// low-confidence answer, or no answer at all (gate off, no credential, any
-/// transport/parse error -- `jev::advise`'s own contract) returns `None`, so
-/// the caller falls through to today's attempt-count logic unchanged.
+enum CrashAdvice {
+    AutoBlock(&'static str),
+    Baseline(&'static str),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CrashSignals {
+    access: bool,
+    configuration: bool,
+    missing_file: bool,
+    transient: bool,
+}
+
+impl CrashSignals {
+    pub(crate) fn from_text(text: &str) -> Self {
+        let lower: String = text
+            .chars()
+            .take(4096)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let contains_any = |phrases: &[&str]| phrases.iter().any(|phrase| lower.contains(phrase));
+        Self {
+            access: contains_any(&[
+                "token expired",
+                "login again",
+                "permission denied",
+                "access denied",
+            ]),
+            configuration: contains_any(&[
+                "invalid config",
+                "invalid setup",
+                "parse error",
+                "syntax error",
+            ]) || (lower.contains("setup") && lower.contains("invalid")),
+            missing_file: contains_any(&["missing file", "file not found"]),
+            transient: contains_any(&[
+                "timeout",
+                "network",
+                "rate limit",
+                "out of memory",
+                "connection reset",
+            ]),
+        }
+    }
+}
+
+/// Asks Jev only when local, repeatable failure signals support an early
+/// block. The request contains numeric signal categories, not the worker's
+/// freeform failure reason; uncertainty preserves the baseline retry.
 fn jev_crash_cause(
     cfg: &CtxConfig,
     state: &StateDir,
-    block_reason: &str,
+    signals: CrashSignals,
     exit: ExitKind,
     attempt: u32,
     max_attempts: u32,
-) -> Option<RespawnVerdict> {
+) -> CrashAdvice {
+    if !cfg.jev.supervisor {
+        return CrashAdvice::Baseline("disabled");
+    }
+    if !jev::available(&cfg.proxy.typesafe) {
+        return CrashAdvice::Baseline("missing_credential");
+    }
+    let access_signal = signals.access;
+    let configuration_signal = signals.configuration;
+    let missing_file_signal = signals.missing_file;
+    let transient_signal = signals.transient;
+    if transient_signal || !(access_signal || configuration_signal || missing_file_signal) {
+        return CrashAdvice::Baseline("insufficient_repeatable_signal");
+    }
     let advise_state = CrashAdviseState {
-        block_reason: crate::utils::truncate_bytes(block_reason.to_string(), Some(1024)),
-        exit_kind: exit_kind_label(exit),
-        attempt,
-        max_attempts,
+        metadata_only: true,
+        facts: vec![vec![
+            exit_kind_code(exit),
+            attempt.min(1_000_000),
+            max_attempts.min(1_000_000),
+            u32::from(access_signal),
+            u32::from(configuration_signal),
+            u32::from(missing_file_signal),
+            u32::from(transient_signal),
+        ]],
     };
-    let questions = [jev::Question::choice(
+    let questions = [jev::Question::metadata_choice(
         "cause",
-        "Why did this worker fail, from its block reason?",
+        "Classify the failure from coarse local signals only; uncertainty means transient.",
         &[
             (
                 "transient",
@@ -803,38 +860,39 @@ fn jev_crash_cause(
             ),
         ],
     )];
-    let answers = jev::advise(
+    let answers = match jev::advise_detailed(
         cfg,
         state,
         "crash",
         cfg.jev.supervisor,
         &advise_state,
         &questions,
-    )?;
-    let answer = answers.get("cause")?;
+    ) {
+        jev::AdvisoryStatus::Answered(answers) => answers,
+        jev::AdvisoryStatus::Disabled => return CrashAdvice::Baseline("disabled"),
+        jev::AdvisoryStatus::MissingCredential => {
+            return CrashAdvice::Baseline("missing_credential");
+        }
+        jev::AdvisoryStatus::Failed => return CrashAdvice::Baseline("error"),
+    };
+    let Some(answer) = answers.get("cause") else {
+        return CrashAdvice::Baseline("partial_answer");
+    };
     if !answer.decisive(CRASH_TRIAGE_FLOOR, jev::DEFAULT_MIN_MARGIN) {
-        return None;
+        return CrashAdvice::Baseline("uncertain");
     }
-    match answer.as_choice()? {
-        "access" => Some(RespawnVerdict::AutoBlock(format!(
-            "blocked on '{block_reason}': an access/credential problem a retry cannot fix"
-        ))),
-        "deterministic" => Some(RespawnVerdict::AutoBlock(format!(
-            "blocked on '{block_reason}': a deterministic failure that will recur identically"
-        ))),
-        _ => None, // "transient", or any other value: fall through.
+    match answer.as_choice() {
+        Some("access") if access_signal => CrashAdvice::AutoBlock("access"),
+        Some("deterministic") if configuration_signal || missing_file_signal => {
+            CrashAdvice::AutoBlock("deterministic")
+        }
+        Some("transient") => CrashAdvice::Baseline("transient"),
+        _ => CrashAdvice::Baseline("signal_mismatch"),
     }
 }
 
-/// Issue #537 (A4): the gated wrapper around [`respawn_decision`] --
-/// [`respawn_decision`] itself stays pure and its keyword check stays first
-/// and unchanged. When it already returns [`RespawnVerdict::Refuse`] (the
-/// card already succeeded, or the keyword check itself matched), that
-/// verdict is returned as-is -- Jev is never even asked, let alone allowed
-/// to override a refusal. Otherwise, when `card.block` carries a reason the
-/// keyword check did not match, one confident [`jev_crash_cause`] triage may
-/// additionally narrow a `Respawn`/attempt-ceiling `AutoBlock` verdict to an
-/// earlier `AutoBlock` -- never the reverse.
+/// Preserves every deterministic refusal and attempt cap before asking Jev.
+/// Jev can narrow an eligible respawn to an early block, never permit one.
 pub(crate) fn respawn_decision_with_jev(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -842,16 +900,50 @@ pub(crate) fn respawn_decision_with_jev(
     exit: ExitKind,
     max_attempts: u32,
 ) -> RespawnVerdict {
+    respawn_decision_with_jev_signals(cfg, state, card, exit, max_attempts, None)
+}
+
+pub(crate) fn respawn_decision_with_jev_signals(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    card: &Card,
+    exit: ExitKind,
+    max_attempts: u32,
+    failure_signals: Option<CrashSignals>,
+) -> RespawnVerdict {
     let base = respawn_decision(card, exit, max_attempts);
-    if matches!(base, RespawnVerdict::Refuse(_)) {
+    if !matches!(base, RespawnVerdict::Respawn) {
         return base;
     }
-    let Some(block) = &card.block else {
+    let Some(signals) = card
+        .block
+        .as_ref()
+        .map(|block| CrashSignals::from_text(&block.reason))
+        .or(failure_signals)
+    else {
         return base;
     };
-    match jev_crash_cause(cfg, state, &block.reason, exit, card.attempts, max_attempts) {
-        Some(verdict) => verdict,
-        None => base,
+    let advice = jev_crash_cause(cfg, state, signals, exit, card.attempts, max_attempts);
+    let mut effect = jev::JevEffect::new("crash", "retry_decision");
+    effect.subject_id = Some(&card.id);
+    effect.baseline_count = Some(1);
+    match advice {
+        CrashAdvice::AutoBlock(cause) => {
+            effect.reason = Some(cause);
+            effect.outcome = Some("auto_block");
+            jev::record_effect(cfg, state, cfg.jev.supervisor, &effect);
+            RespawnVerdict::AutoBlock(format!(
+                "blocked after a likely {cause} failure that a retry cannot fix; \
+                 inspect with `zirv ctx task show {}` and resume with `zirv ctx task unblock {}`",
+                card.id, card.id
+            ))
+        }
+        CrashAdvice::Baseline(reason) => {
+            effect.reason = Some(reason);
+            effect.outcome = Some("baseline_retry");
+            jev::record_effect(cfg, state, cfg.jev.supervisor, &effect);
+            base
+        }
     }
 }
 
@@ -1569,11 +1661,15 @@ pub fn run_unblock<W: Write>(
         let card = cards.get(&args.id)?;
         match unblock(card, now) {
             Ok(unblocked) => {
+                let recovered_jev_block = card
+                    .block
+                    .as_ref()
+                    .is_some_and(|block| block.by == "system:jev-crash");
                 let event = Event::Unblocked {
                     id: args.id.clone(),
                     at: unblocked.updated_at,
                 };
-                Some((Ok(unblocked), vec![event]))
+                Some((Ok((unblocked, recovered_jev_block)), vec![event]))
             }
             Err(refusal) => Some((Err(refusal), Vec::new())),
         }
@@ -1583,7 +1679,16 @@ pub fn run_unblock<W: Write>(
             writeln!(w, "no task '{}'", args.id)?;
             Ok(1)
         }
-        Some(Ok(_)) => {
+        Some(Ok((_, recovered_jev_block))) => {
+            if recovered_jev_block
+                && let Ok(repo) = std::env::current_dir()
+                && let Ok(cfg) = CtxConfig::load(&repo, &|key| std::env::var(key).ok())
+            {
+                let mut effect = jev::JevEffect::new("crash", "task_unblocked");
+                effect.subject_id = Some(&args.id);
+                effect.outcome = Some("recovered");
+                jev::record_effect(&cfg, state, cfg.jev.supervisor, &effect);
+            }
             writeln!(w, "unblocked {}", args.id)?;
             Ok(0)
         }
@@ -2443,6 +2548,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_exhausted_retry_never_asks_jev_or_replaces_the_attempt_cap_reason() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.attempts = DEFAULT_MAX_ATTEMPTS;
+        card.block = Some(Block {
+            reason: "local setup is invalid".to_string(),
+            by: "worker".to_string(),
+        });
+        let credential_env = "TASK_TEST_JEV_ATTEMPT_CAP";
+        let _credential =
+            crate::commands::ctx::testenv::VarGuard::set(&[(credential_env, Some("secret"))]);
+        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let baseline = respawn_decision(&card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+        let actual =
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS);
+
+        assert_eq!(actual, baseline);
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+    }
+
     /// A block reason with no keyword hit ("token expired, run login
     /// again") and a confident `access` answer (0.95, at or above
     /// `CRASH_TRIAGE_FLOOR`) auto-blocks -- the same path the keyword match
@@ -2616,6 +2744,47 @@ mod tests {
             std::env::remove_var(credential_env);
         }
         assert_eq!(verdict, baseline);
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
+    }
+
+    #[test]
+    fn missing_credential_ignores_a_warm_crash_cache_and_writes_no_new_jev_rows() {
+        let mut card = sample_card("t1", State::Blocked, Vec::new());
+        card.attempts = 1;
+        card.block = Some(Block {
+            reason: "token expired, login again".into(),
+            by: "sess-1".into(),
+        });
+        let body = r#"{"model":"jev-latest","answers":{"cause":{"type":"choice","choice":"access","probabilities":{"access":0.95,"transient":0.05},"confidence":0.95}},"usage":{"input_tokens":5,"output_tokens":0}}"#;
+        let (url, server) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "TASK_TEST_WARM_CACHE_MISSING_KEY";
+        unsafe { std::env::set_var(credential_env, "fixture-key") };
+        let cfg = jev_test_cfg(url, credential_env);
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        assert!(matches!(
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS),
+            RespawnVerdict::AutoBlock(_)
+        ));
+        server.join().unwrap();
+        let before = std::fs::read_to_string(root.path().join("jev-decisions.jsonl")).unwrap();
+        let effects_before =
+            std::fs::read_to_string(root.path().join("jev-effects.jsonl")).unwrap();
+        unsafe { std::env::remove_var(credential_env) };
+
+        assert_eq!(
+            respawn_decision_with_jev(&cfg, &state, &card, ExitKind::Crash, DEFAULT_MAX_ATTEMPTS),
+            RespawnVerdict::Respawn
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("jev-decisions.jsonl")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("jev-effects.jsonl")).unwrap(),
+            effects_before
+        );
     }
 
     // -- CLI verbs, end to end ------------------------------------------------

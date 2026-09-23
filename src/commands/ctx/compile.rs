@@ -54,7 +54,7 @@ use super::policy::{self, PolicyReport};
 use super::prompt::{self, ComposedPrompt, PromptRole, PromptSource};
 use super::state::StateDir;
 use super::surface::{ContextSurface, Trust};
-use super::{CtxResult, context, jev, memory, retrieval};
+use super::{CtxResult, context, jev, memory, retrieval, task};
 
 /// `log::Decision::action` for a canonical context layer cut by its budget.
 pub const TRUNCATED_ACTION: &str = "context-truncated";
@@ -63,6 +63,330 @@ pub const TRUNCATED_ACTION: &str = "context-truncated";
 /// harness's own native file already carries those exact bytes (issue #155,
 /// Phase 3).
 pub const DEDUP_SKIP_ACTION: &str = "context-dedup-skip";
+
+// A parent outcome is optional only when local, allowlisted domains establish
+// a mismatch; Jev sees these labels and counts, never task or report prose.
+const PARENT_REPORT_OMIT_MAX: f64 = 0.1;
+
+fn context_domain(text: &str) -> Option<&'static str> {
+    let words: std::collections::BTreeSet<&str> = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let groups: &[(&str, &[&str])] = &[
+        ("frontend", &["css", "frontend", "layout", "ui"]),
+        ("data", &["database", "schema", "migration", "sql"]),
+        ("security", &["auth", "credential", "permission", "token"]),
+        ("docs", &["docs", "documentation", "readme"]),
+        ("devops", &["deploy", "infrastructure", "release", "ci"]),
+    ];
+    let mut matches = groups
+        .iter()
+        .filter(|(_, terms)| terms.iter().any(|term| words.contains(term)))
+        .map(|(domain, _)| *domain);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+#[derive(Serialize)]
+struct ParentReportMetadata {
+    _zirv_metadata_only: bool,
+    facts: Vec<Vec<u32>>,
+}
+
+fn domain_code(domain: &str) -> u32 {
+    match domain {
+        "frontend" => 1,
+        "data" => 2,
+        "security" => 3,
+        "docs" => 4,
+        "devops" => 5,
+        _ => 0,
+    }
+}
+
+pub(crate) fn task_context_with_selected_reports(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    _repo: &Path,
+    card: &task::Card,
+    parents: &[&task::Card],
+    cap: usize,
+) -> String {
+    let baseline = task::compile_task_prompt(card, parents, cap);
+    if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) {
+        return baseline;
+    }
+    let Some(task_domain) = context_domain(&card.brief) else {
+        return baseline;
+    };
+    let task_words: std::collections::BTreeSet<&str> = card
+        .brief
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= 4)
+        .collect();
+    let mut facts = vec![vec![domain_code(task_domain)]];
+    let mut questions = Vec::new();
+    for (index, parent) in parents.iter().enumerate().take(16) {
+        let Some(outcome) = parent.outcome.as_deref().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let Some(parent_domain) = context_domain(&parent.title) else {
+            continue;
+        };
+        if parent_domain == task_domain
+            || parent.state != task::State::Done
+            || card.brief.contains(&parent.id)
+            || outcome.contains("evidence:")
+            || outcome.contains("required:")
+        {
+            continue;
+        }
+        let overlap = parent
+            .title
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|word| task_words.contains(word))
+            .count()
+            .min(3) as u8;
+        facts.push(vec![
+            index as u32,
+            domain_code(parent_domain),
+            u32::from(overlap),
+            match outcome.len() {
+                0..=255 => 0,
+                256..=1023 => 1,
+                _ => 2,
+            },
+        ]);
+        questions.push(jev::Question::metadata_noul(
+            &format!("p{index}"),
+            "Facts row 0 is task domain (1 frontend, 2 data, 3 security, 4 docs, 5 devops); each later row is [candidate index, parent domain, lexical overlap 0-3, report size bucket 0-2]. Is optional prose for this candidate necessary despite the distinct domain and low overlap? Answer true if uncertain.",
+            "report prose is needed; keep it",
+            "report prose is unrelated; retain only the on-demand task-card pointer",
+        ));
+    }
+    if questions.is_empty() {
+        return baseline;
+    }
+    let input = ParentReportMetadata {
+        _zirv_metadata_only: true,
+        facts,
+    };
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "context-parent-reports",
+        cfg.jev.context,
+        &input,
+        &questions,
+    ) else {
+        return baseline;
+    };
+    let mut selected: Vec<task::Card> = parents.iter().map(|parent| (*parent).clone()).collect();
+    let mut omitted = 0u32;
+    for (index, _) in parents.iter().enumerate().take(16) {
+        let Some(answer) = answers.get(&format!("p{index}")) else {
+            continue;
+        };
+        if answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+            && answer
+                .as_noul()
+                .is_some_and(|value| value <= PARENT_REPORT_OMIT_MAX)
+        {
+            selected[index].outcome = Some(format!(
+                "[optional report omitted; run zirv ctx task show {} to read it]",
+                selected[index].id
+            ));
+            omitted += 1;
+        }
+    }
+    if omitted == 0 {
+        return baseline;
+    }
+    let references: Vec<&task::Card> = selected.iter().collect();
+    let rendered = task::compile_task_prompt(card, &references, cap);
+    let Some(removed_bytes) = baseline
+        .len()
+        .checked_sub(rendered.len())
+        .filter(|n| *n > 0)
+    else {
+        return baseline;
+    };
+    let mut effect = jev::JevEffect::new("context-parent-reports", "report_bytes_removed");
+    effect.baseline_count = u32::try_from(parents.len()).ok();
+    effect.actual_count = u32::try_from(parents.len()).ok().map(|n| n - omitted);
+    effect.removed_bytes = u64::try_from(removed_bytes).ok();
+    jev::record_effect(cfg, state, cfg.jev.context, &effect);
+    rendered
+}
+
+/// Returns a complete discovery index, omitting only Jev-confirmed optional
+/// descriptions. Candidate ids and descriptions stay local; Jev sees codes.
+pub(super) fn selected_skill_index_text(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    home: Option<&Path>,
+    task_text: Option<&str>,
+) -> Option<(String, String, usize)> {
+    let baseline = prompt::skill_index_text(repo, home)?;
+    if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) {
+        return Some((baseline, String::new(), 0));
+    }
+    let Some(task_text) = task_text else {
+        return Some((baseline, String::new(), 0));
+    };
+    let Some(entries) = prompt::skill_index_entries(repo, home) else {
+        return Some((baseline, String::new(), 0));
+    };
+    let task_lower = task_text.to_ascii_lowercase();
+    if entries
+        .iter()
+        .any(|(id, _, _)| task_lower.contains(&id.to_ascii_lowercase()))
+    {
+        return Some((baseline, String::new(), 0));
+    }
+    let Some(task_domain) = context_domain(task_text) else {
+        return Some((baseline, String::new(), 0));
+    };
+    let mut facts = vec![vec![domain_code(task_domain)]];
+    let mut questions = Vec::new();
+    for (index, (_id, summary, _)) in entries.iter().enumerate() {
+        if questions.len() == 16 {
+            break;
+        }
+        let Some(domain) = context_domain(summary) else {
+            continue;
+        };
+        if domain == task_domain {
+            continue;
+        }
+        facts.push(vec![
+            index as u32,
+            domain_code(domain),
+            match summary.len() {
+                0..=63 => 0,
+                64..=127 => 1,
+                _ => 2,
+            },
+        ]);
+        questions.push(jev::Question::metadata_noul(
+            &format!("s{index}"),
+            "Facts row 0 is task domain (1 frontend, 2 data, 3 security, 4 docs, 5 devops); each later row is [candidate index, description domain, size bucket 0-2]. Is this optional skill description needed now despite its distinct domain? Answer true if uncertain; the skill ID and load route remain available.",
+            "keep optional description",
+            "description can be omitted while retaining discovery ID",
+        ));
+    }
+    if questions.is_empty() {
+        return Some((baseline, String::new(), 0));
+    }
+    let input = ParentReportMetadata {
+        _zirv_metadata_only: true,
+        facts,
+    };
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "context-skill-descriptions",
+        cfg.jev.context,
+        &input,
+        &questions,
+    ) else {
+        return Some((baseline, String::new(), 0));
+    };
+    let mut omitted = 0usize;
+    let descriptions = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (id, summary, repository))| {
+            let omit = answers.get(&format!("s{index}")).is_some_and(|answer| {
+                answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+                    && answer
+                        .as_noul()
+                        .is_some_and(|value| value <= PARENT_REPORT_OMIT_MAX)
+            });
+            if omit {
+                omitted += 1;
+                None
+            } else if *repository {
+                Some(format!("- {id}: {summary} (repository-untrusted)"))
+            } else {
+                Some(format!("- {id}: {summary}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if omitted == 0 {
+        return Some((baseline, String::new(), 0));
+    }
+    let index = entries
+        .iter()
+        .map(|(id, _, repository)| {
+            if *repository {
+                format!("- {id} (repository-untrusted)")
+            } else {
+                format!("- {id}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let selected_bytes = index.len()
+        + if descriptions.is_empty() {
+            0
+        } else {
+            prompt::SKILL_DESCRIPTIONS_HEADER.len() + descriptions.len()
+        };
+    let removed = baseline.len().saturating_sub(selected_bytes);
+    if removed == 0 {
+        Some((baseline, String::new(), 0))
+    } else {
+        Some((index, descriptions, removed))
+    }
+}
+
+/// Applies task-aware optional description selection after the caller has
+/// resolved the actual launch task, leaving `compose`'s ordinary path exact.
+pub(crate) fn select_skill_descriptions_for_task(
+    compiled: &mut CompiledContext,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    home: Option<&Path>,
+    task: &str,
+) {
+    if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) || task.is_empty() {
+        return;
+    }
+    let Some(composed) = compiled.composed.as_mut() else {
+        return;
+    };
+    let Some((selected, descriptions, removed_bytes)) =
+        selected_skill_index_text(cfg, state, repo, home, Some(task))
+    else {
+        return;
+    };
+    if removed_bytes == 0 {
+        return;
+    }
+    let Some(baseline) = prompt::skill_index_text(repo, home) else {
+        return;
+    };
+    let Some(at) = composed
+        .text
+        .find(&format!("{}{}", prompt::SKILL_INDEX_HEADER, baseline))
+    else {
+        return;
+    };
+    let start = at + prompt::SKILL_INDEX_HEADER.len();
+    composed
+        .text
+        .replace_range(start..start + baseline.len(), &selected);
+    compiled.composed =
+        prompt::with_skill_descriptions_layer(compiled.composed.take(), &descriptions);
+    let mut effect = jev::JevEffect::new("context-skill-descriptions", "description_bytes_removed");
+    effect.removed_bytes = u64::try_from(removed_bytes).ok();
+    jev::record_effect(cfg, state, cfg.jev.context, &effect);
+}
 
 /// The decision-log half of the truncation report. Session-free on purpose:
 /// `compile` runs before most launch paths have minted a session id (see
@@ -292,6 +616,15 @@ impl CompiledContext {
                 // comment for why it sits there instead of near `Workflow`.
                 PromptSource::SkillIndex => find_after(text, cursor, prompt::SKILL_INDEX_HEADER)
                     .map(|header_at| (header_at + prompt::SKILL_INDEX_HEADER.len(), None, None)),
+                PromptSource::SkillDescriptions => {
+                    find_after(text, cursor, prompt::SKILL_DESCRIPTIONS_HEADER).map(|header_at| {
+                        (
+                            header_at + prompt::SKILL_DESCRIPTIONS_HEADER.len(),
+                            None,
+                            None,
+                        )
+                    })
+                }
                 // The combined common+harness-specific block: its two
                 // sub-budgets are already reported per-file by `provenance`,
                 // so this range covers the whole block with no single budget
@@ -1782,6 +2115,124 @@ mod tests {
     use crate::commands::ctx::policy::{EffectivePolicy, Stance};
     use crate::commands::ctx::state::now_secs;
 
+    #[test]
+    fn optional_parent_report_selection_keeps_dependency_identity_and_relevant_report() {
+        use crate::commands::ctx::task::{Card, State};
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.jev.context = true;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_PARENT_SELECT_737".into();
+        let body = r#"{"model":"jev-latest","answers":{"p0":{"type":"noul","noul":0.02}},"usage":{"input_tokens":8,"output_tokens":1}}"#;
+        let (url, handle) = jev::tests::one_shot_server(200, body);
+        cfg.proxy.typesafe.base_url = url;
+        let card = |id: &str, title: &str, outcome: Option<&str>| Card {
+            id: id.into(),
+            repo_slug: "repo".into(),
+            title: title.into(),
+            brief: "Fix the CSS frontend layout".into(),
+            state: State::Done,
+            parents: Vec::new(),
+            claim: None,
+            block: None,
+            comments: Vec::new(),
+            workdir: None,
+            group_id: None,
+            outcome: outcome.map(str::to_string),
+            attempts: 1,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let task = card("task", "final change", None);
+        let background = card(
+            "background",
+            "database migration",
+            Some(&"Unrelated long report body. ".repeat(20)),
+        );
+        let needed = card("needed", "frontend design", Some("Relevant design result"));
+        let parents = [&background, &needed];
+        // SAFETY (test-only): this unique env name is confined to this test process.
+        unsafe { std::env::set_var("JEV_TEST_PARENT_SELECT_737", "secret") };
+        let rendered =
+            task_context_with_selected_reports(&cfg, &state, repo.path(), &task, &parents, 4096);
+        unsafe { std::env::remove_var("JEV_TEST_PARENT_SELECT_737") };
+        handle.join().expect("server");
+        assert!(rendered.contains("background"));
+        assert!(rendered.contains("zirv ctx task show background"));
+        assert!(!rendered.contains("Unrelated long report body"));
+        assert!(rendered.contains("Relevant design result"));
+    }
+
+    #[test]
+    fn optional_skill_description_selection_keeps_ids_and_explicit_invocations() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let skills = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&skills).expect("skills");
+        let old_description = "database migration schema and SQL changes ".repeat(30);
+        std::fs::write(
+            skills.join("database-helper.yaml"),
+            format!(
+                "schema_version: 1\nid: database-helper\nversion: 1\nname: Database helper\n\
+             description: {old_description}\nimplicit_activation: true\n\
+             context_budget_bytes: 64\nphases: [implement]\ninstructions: use SQL safely\n"
+            ),
+        )
+        .expect("fixture");
+        let entries = prompt::skill_index_entries(repo.path(), Some(home.path())).expect("entries");
+        let index = entries
+            .iter()
+            .position(|(id, _, _)| id == "database-helper")
+            .expect("skill");
+        let body = format!(
+            r#"{{"model":"jev-latest","answers":{{"s{index}":{{"type":"noul","noul":0.02}}}},"usage":{{"input_tokens":8,"output_tokens":1}}}}"#
+        );
+        let (url, handle) = jev::tests::one_shot_server(200, Box::leak(body.into_boxed_str()));
+        let mut cfg = CtxConfig::default();
+        cfg.jev.context = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_SKILL_SELECT_737".into();
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var("JEV_TEST_SKILL_SELECT_737", "secret") };
+        let (selected, descriptions, removed) = selected_skill_index_text(
+            &cfg,
+            &state,
+            repo.path(),
+            Some(home.path()),
+            Some("Fix the CSS frontend layout"),
+        )
+        .expect("index");
+        handle.join().expect("server");
+        assert!(removed > 0);
+        assert!(selected.contains("- database-helper (repository-untrusted)"));
+        assert!(!selected.contains("database migration schema and SQL changes"));
+        assert!(!descriptions.contains("database migration schema and SQL changes"));
+
+        std::fs::write(
+            skills.join("database-helper.yaml"),
+            "schema_version: 1\nid: database-helper\nversion: 1\nname: Database helper\n\
+             description: frontend CSS layout guidance\nimplicit_activation: true\n\
+             context_budget_bytes: 64\nphases: [implement]\ninstructions: use SQL safely\n",
+        )
+        .expect("changed fixture");
+        let explicit = selected_skill_index_text(
+            &cfg,
+            &state,
+            repo.path(),
+            Some(home.path()),
+            Some("Use database-helper to fix the CSS frontend layout"),
+        )
+        .expect("index")
+        .0;
+        unsafe { std::env::remove_var("JEV_TEST_SKILL_SELECT_737") };
+        assert!(explicit.contains("- database-helper: frontend CSS layout guidance"));
+    }
+
     /// Golden capture for `reading_each_context_and_memory_file_once_does_
     /// not_change_the_composed_prompt`: the context+memory tail of the
     /// composed prompt, captured once from the (already refactored, passing)
@@ -1903,90 +2354,32 @@ mod tests {
             .collect()
     }
 
-    /// Issue #537 (A3): on a canned 200 response, candidates below
-    /// `MEMORY_RELEVANCE_FLOOR` are dropped and survivors are reordered by
-    /// `noul` descending -- never a candidate `retrieval::select` did not
-    /// already choose. Jev determinism fix: charlie's own `0.5` noul has
-    /// margin `0.0` (maximally uncertain), so it is not decisive and falls
-    /// to the "kept, original position" bucket rather than being scored --
-    /// it still lands after alpha here only because it was already last
-    /// among the sent candidates once bravo was pruned.
+    /// Legacy memory summaries contain free-form text. With the gate and key
+    /// present, the shared privacy boundary refuses them before cache, HTTP,
+    /// or logging and preserves deterministic membership and order.
     #[test]
-    fn rerank_memory_candidates_prunes_and_reorders_on_a_200_response() {
+    fn rerank_memory_candidates_rejects_text_state_without_egress() {
         let candidates = [
-            retrieval_candidate("alpha", "alpha body"),
-            retrieval_candidate("bravo", "bravo body"),
-            retrieval_candidate("charlie", "charlie body"),
+            retrieval_candidate("alpha", "secret memory summary"),
+            retrieval_candidate("bravo", "another summary"),
         ];
         let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-
-        let body = r#"{"model": "jev-latest", "answers": {
-            "0": {"type": "noul", "noul": 0.9},
-            "1": {"type": "noul", "noul": 0.1},
-            "2": {"type": "noul", "noul": 0.5}
-        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "COMPILE_TEST_MEMORY_KEY_200";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
+        let expected = keys(&selected);
+        let credential_env = "COMPILE_TEST_MEMORY_PRIVACY_746";
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var(credential_env, "secret") };
         let mut cfg = CtxConfig::default();
         cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:9".into();
+        cfg.proxy.typesafe.credential_env = credential_env.into();
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
         let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        // Candidates are ids "0"/"1"/"2" by position: "bravo" (id "1", 0.1)
-        // is pruned; "alpha" (id "0", 0.9) outranks "charlie" (id "2", 0.5).
-        assert_eq!(
-            keys(&result),
-            vec!["alpha".to_string(), "charlie".to_string()]
-        );
-    }
-
-    /// Issue #537 (A3): a transport/HTTP error (here, a 500) makes
-    /// `jev::advise` return `None`, which must leave the list in its
-    /// original deterministic order and membership -- identical to what the
-    /// gate-off path already does today.
-    #[test]
-    fn rerank_memory_candidates_falls_back_to_the_deterministic_list_on_a_500() {
-        let candidates = [
-            retrieval_candidate("alpha", "alpha body"),
-            retrieval_candidate("bravo", "bravo body"),
-        ];
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let deterministic_keys = keys(&selected);
-
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
-        let credential_env = "COMPILE_TEST_MEMORY_KEY_500";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.to_string();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(keys(&result), deterministic_keys);
+        unsafe { std::env::remove_var(credential_env) };
+        assert_eq!(keys(&result), expected);
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-cache").exists());
     }
 
     /// Issue #537 (A3): with the gate off, `rerank_memory_candidates` never
@@ -2038,163 +2431,6 @@ mod tests {
 
         assert_eq!(keys(&result), deterministic_keys);
         assert_eq!(result.len(), 40, "all 40 candidates must survive untouched");
-    }
-
-    /// Review finding (#537 A3): only the first `MEMORY_ADVISE_MAX_CANDIDATES`
-    /// (32) candidates are sent to Jev; the remaining 8 must be appended
-    /// unchanged, in their original order, after the ranked slice.
-    #[test]
-    fn rerank_memory_candidates_appends_the_beyond_cap_tail_unchanged() {
-        let candidates: Vec<retrieval::RetrievalCandidate> = (0..40)
-            .map(|i| retrieval_candidate(&format!("key-{i}"), "body"))
-            .collect();
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let tail_keys: Vec<String> = keys(&selected)[32..].to_vec();
-
-        // Every sent candidate scores well above `MEMORY_RELEVANCE_FLOOR`
-        // (0.3), so none of the 32 sent candidates are pruned -- this test
-        // is only about the beyond-cap tail, asserted below.
-        let answers: Vec<String> = (0..32)
-            .map(|i| {
-                format!(
-                    r#""{i}": {{"type": "noul", "noul": {}}}"#,
-                    0.9 - (i as f64) * 0.01
-                )
-            })
-            .collect();
-        let body = format!(
-            r#"{{"model": "jev-latest", "answers": {{{}}}, "usage": {{"input_tokens": 10, "output_tokens": 0}}}}"#,
-            answers.join(",")
-        );
-        let body: &'static str = Box::leak(body.into_boxed_str());
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "COMPILE_TEST_MEMORY_KEY_TAIL";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.to_string();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(result.len(), 40, "no candidate lost: {}", result.len());
-        assert_eq!(
-            keys(&result)[32..],
-            tail_keys[..],
-            "the beyond-cap tail must survive unchanged, in original order"
-        );
-    }
-
-    /// Review finding (#537 A3): a candidate whose id is missing from the
-    /// answers must keep its original relative position after the ranked
-    /// ones, never dropped by the filter. Jev determinism fix: charlie's own
-    /// `0.5` noul now ALSO lands in that same "kept, original position"
-    /// bucket -- exact `0.5` is the maximally uncertain reading (margin
-    /// `0.0`), so it is no longer decisive enough to outrank bravo's
-    /// complete non-answer; the two are ordered exactly as `selected` gave
-    /// them (bravo before charlie).
-    #[test]
-    fn rerank_memory_candidates_keeps_a_candidate_missing_from_the_answers() {
-        let candidates = [
-            retrieval_candidate("alpha", "alpha body"),
-            retrieval_candidate("bravo", "bravo body"),
-            retrieval_candidate("charlie", "charlie body"),
-        ];
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-
-        // "1" (bravo) is omitted entirely.
-        let body = r#"{"model": "jev-latest", "answers": {
-            "0": {"type": "noul", "noul": 0.9},
-            "2": {"type": "noul", "noul": 0.5}
-        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "COMPILE_TEST_MEMORY_KEY_OMITTED";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.to_string();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        // alpha (0.9, decisive) ranks first; bravo (no answer) and charlie
-        // (0.5, margin 0.0 -- not decisive) both fall to the deterministic
-        // "kept, original position" bucket, in their original relative
-        // order.
-        assert_eq!(
-            keys(&result),
-            vec![
-                "alpha".to_string(),
-                "bravo".to_string(),
-                "charlie".to_string()
-            ]
-        );
-    }
-
-    /// Jev determinism fix: an answer with the "right" (above-floor) raw
-    /// value but a thin margin (0.55, margin 0.1 -- below `jev::
-    /// DEFAULT_MIN_MARGIN`) must fall to the deterministic path (kept,
-    /// original position) exactly like a missing answer, never trusted to
-    /// outrank one.
-    #[test]
-    fn rerank_memory_candidates_treats_a_thin_margin_noul_as_not_decisive() {
-        let candidates = [
-            retrieval_candidate("bravo", "bravo body"),
-            retrieval_candidate("alpha", "alpha body"),
-        ];
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-
-        // "0" (bravo) has no answer at all; "1" (alpha) has an above-floor
-        // but thin-margin noul (0.55, margin 0.1).
-        let body = r#"{"model": "jev-latest", "answers": {
-            "1": {"type": "noul", "noul": 0.55}
-        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "COMPILE_TEST_MEMORY_THIN_MARGIN";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.to_string();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(
-            keys(&result),
-            vec!["bravo".to_string(), "alpha".to_string()],
-            "a thin-margin answer must never outrank a missing one: {:?}",
-            keys(&result)
-        );
     }
 
     /// Issue #537 (T2a): `compile::with_proxy_layer` only ever appends the

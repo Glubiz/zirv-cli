@@ -6765,73 +6765,36 @@ This is part of the body too.\n";
 
     // Issue #537 (A3): `apply_jev_harvest_gate` tests.
 
-    /// The keyword filter's own rejection (`"still need"`, a `REJECT_
-    /// PATTERNS` hit) drops `noisy-status` before Jev ever sees it -- it
-    /// gets no id and no question at all, so Jev has no way to resurrect it
-    /// regardless of how its own canned answers are shaped. Of the two
-    /// candidates the keyword filter DOES accept, Jev scores `borderline`
-    /// at 0.1 (below `MEMORY_RELEVANCE_FLOOR`) and `good-fact` at 0.9: only
-    /// `good-fact` survives.
+    /// A legacy harvest candidate body is free-form text. The shared
+    /// privacy boundary refuses that state even with gate and key present;
+    /// the keyword filter still drops its own rejection and the accepted
+    /// candidates remain unchanged, with no Jev cache, record, or HTTP.
     #[test]
-    fn apply_jev_harvest_gate_never_resurrects_a_keyword_rejection_and_drops_a_low_scoring_one() {
+    fn apply_jev_harvest_gate_rejects_text_state_without_egress() {
         let raw = vec![
             (
                 "noisy-status".to_string(),
-                "still need to wire this up before merging".to_string(),
+                "still need to wire this up".to_string(),
             ),
-            ("borderline".to_string(), "a maybe-durable fact".to_string()),
-            (
-                "good-fact".to_string(),
-                "a genuinely durable fact".to_string(),
-            ),
+            ("good-fact".to_string(), "a durable fact".to_string()),
         ];
-        let cfg_filter = CtxConfig::default();
-        let accepted = filter_durable_candidates(&raw, &cfg_filter);
-        assert_eq!(
-            accepted,
-            vec![
-                ("borderline".to_string(), "a maybe-durable fact".to_string()),
-                (
-                    "good-fact".to_string(),
-                    "a genuinely durable fact".to_string()
-                ),
-            ],
-            "sanity: the keyword filter alone already dropped noisy-status"
-        );
-
-        let body = r#"{"model": "jev-latest", "answers": {
-            "0": {"type": "noul", "noul": 0.1},
-            "1": {"type": "noul", "noul": 0.9}
-        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "MEMORY_TEST_HARVEST_GATE_KEY_200";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
+        let accepted = filter_durable_candidates(&raw, &CtxConfig::default());
+        assert_eq!(accepted.len(), 1);
+        let credential_env = "MEMORY_TEST_HARVEST_PRIVACY_746";
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var(credential_env, "secret") };
         let mut cfg = CtxConfig::default();
         cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:9".into();
+        cfg.proxy.typesafe.credential_env = credential_env.into();
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let gated = apply_jev_harvest_gate(accepted, &cfg, &state, now_secs());
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(
-            gated,
-            vec![(
-                "good-fact".to_string(),
-                "a genuinely durable fact".to_string()
-            )],
-            "noisy-status was never a candidate Jev could accept, and borderline scored below \
-             the floor: {gated:?}"
-        );
+        let gated = apply_jev_harvest_gate(accepted.clone(), &cfg, &state, now_secs());
+        unsafe { std::env::remove_var(credential_env) };
+        assert_eq!(gated, accepted);
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-cache").exists());
     }
 
     /// With the gate off, `apply_jev_harvest_gate` never even attempts a
@@ -6851,63 +6814,6 @@ This is part of the body too.\n";
 
         assert_eq!(gated, accepted);
     }
-
-    /// Review finding (#537 A3): a missing per-id answer must never drop a
-    /// candidate the keyword filter already accepted -- only an explicit
-    /// noul below the floor does. The canned response answers id `"0"` and
-    /// omits `"1"` entirely; `"1"` must still survive.
-    #[test]
-    fn apply_jev_harvest_gate_keeps_a_candidate_with_no_answer_at_all() {
-        let accepted = vec![
-            ("answered".to_string(), "a durable fact".to_string()),
-            ("omitted".to_string(), "another durable fact".to_string()),
-        ];
-
-        let body = r#"{"model": "jev-latest", "answers": {
-            "0": {"type": "noul", "noul": 0.9}
-        }, "usage": {"input_tokens": 10, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "MEMORY_TEST_HARVEST_GATE_KEY_OMITTED";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.to_string();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let gated = apply_jev_harvest_gate(accepted, &cfg, &state, now_secs());
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(
-            gated,
-            vec![
-                ("answered".to_string(), "a durable fact".to_string()),
-                ("omitted".to_string(), "another durable fact".to_string()),
-            ],
-            "a missing per-id answer must keep the keyword filter's own accept: {gated:?}"
-        );
-    }
-
-    // Jev determinism fix: no "below floor but thin margin" test lives here
-    // by design -- `MEMORY_RELEVANCE_FLOOR` (0.3) sits far enough from 0.5
-    // that every value below it already has margin `>= |0.3 - 0.5| * 2 =
-    // 0.4`, well clear of `jev::DEFAULT_MIN_MARGIN` (0.2) this site checks
-    // against (hardcoded, not `cfg.proxy.min_margin` -- see `apply_jev_
-    // harvest_gate`'s own call). A below-floor verdict is therefore ALWAYS
-    // decisive here; the margin gate is real (see `jev::Answer::decisive`'s
-    // own tests for the mechanism) but structurally a no-op at this
-    // particular site's floor. `rerank_memory_candidates_treats_a_thin_
-    // margin_noul_as_not_decisive` in `compile.rs` exercises the same
-    // mechanism at a floor (0.3, checked as `>=`) whose PASSING side does
-    // reach into the thin-margin band.
 
     /// Issue #37: shared writes must remain ordinary visible working-tree
     /// changes -- Zirv must never auto-commit them. No model involved: this

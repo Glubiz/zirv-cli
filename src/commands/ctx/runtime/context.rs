@@ -75,6 +75,7 @@ pub enum SourceKind {
     /// from these descriptions, zirv never pre-selects or matches one to a
     /// task.
     SkillIndex,
+    SkillDescriptions,
     Workflow,
     Skill,
     Memory,
@@ -392,9 +393,21 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
     // concatenated prose needs but a standalone native message does not --
     // reusing the one literal rather than a second, independently-typed
     // copy that could drift on wording.
-    if request.config.prompt.skill_index
-        && let Some(index) = prompt::skill_index_text(request.repo, request.home)
-    {
+    let skill_selection = request
+        .config
+        .prompt
+        .skill_index
+        .then(|| {
+            super::super::compile::selected_skill_index_text(
+                request.config,
+                request.state,
+                request.repo,
+                request.home,
+                request.task,
+            )
+        })
+        .flatten();
+    if let Some((index, _, _)) = &skill_selection {
         let intro = prompt::SKILL_INDEX_HEADER
             .trim_start_matches("\n\n---\n\n")
             .trim_end();
@@ -535,6 +548,26 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
             None,
             task.to_string(),
             Retention::Required,
+            false,
+        );
+    }
+
+    if let Some((_, descriptions, _)) = &skill_selection
+        && !descriptions.is_empty()
+    {
+        push(
+            &mut out,
+            "zirv:skill-descriptions",
+            SourceKind::SkillDescriptions,
+            MessageRole::Instruction,
+            SourceTrust::Zirv,
+            None,
+            format!(
+                "{}{}",
+                prompt::SKILL_DESCRIPTIONS_HEADER.trim_start_matches("\n\n---\n\n"),
+                descriptions
+            ),
+            Retention::Optional,
             false,
         );
     }
@@ -1667,6 +1700,87 @@ mod tests {
             "the index must never carry an instruction-body sentence: {}",
             message.content
         );
+    }
+
+    #[test]
+    fn native_skill_selection_keeps_discovery_ids_in_prefix_and_details_late() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let state_root = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let skills = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&skills).expect("skills");
+        let description = "database migration schema and SQL guidance ".repeat(30);
+        std::fs::write(
+            skills.join("database-helper.yaml"),
+            format!(
+                "schema_version: 1\nid: database-helper\nversion: 1\nname: Database helper\n\
+                     description: {description}\nimplicit_activation: true\n\
+                     context_budget_bytes: 64\nphases: [implement]\ninstructions: use SQL safely\n"
+            ),
+        )
+        .expect("fixture");
+        let entries = prompt::skill_index_entries(repo.path(), Some(home.path())).expect("entries");
+        let index = entries
+            .iter()
+            .position(|(id, _, _)| id == "database-helper")
+            .expect("index");
+        let body = format!(
+            r#"{{"model":"jev-latest","answers":{{"s{index}":{{"type":"noul","noul":0.02}}}},"usage":{{"input_tokens":8,"output_tokens":1}}}}"#
+        );
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(
+            200,
+            Box::leak(body.into_boxed_str()),
+        );
+        let mut cfg = CtxConfig::default();
+        cfg.jev.context = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_NATIVE_SKILL_SELECT_737".into();
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var("JEV_TEST_NATIVE_SKILL_SELECT_737", "secret") };
+        let compiled = compile(&request(
+            Some(home.path()),
+            repo.path(),
+            &state,
+            &cfg,
+            "Fix the CSS frontend layout",
+            ample_budget(),
+        ))
+        .expect("compile");
+        unsafe { std::env::remove_var("JEV_TEST_NATIVE_SKILL_SELECT_737") };
+        handle.join().expect("server");
+        let index_message = compiled
+            .messages
+            .iter()
+            .find(|m| m.source == SourceKind::SkillIndex)
+            .expect("index message");
+        assert!(
+            index_message
+                .content
+                .contains("- database-helper (repository-untrusted)")
+        );
+        assert!(!index_message.content.contains("database migration schema"));
+        let detail_message = compiled
+            .messages
+            .iter()
+            .find(|m| m.source == SourceKind::SkillDescriptions)
+            .expect("detail message");
+        assert!(
+            detail_message
+                .content
+                .contains("Task-relevant skill descriptions:")
+        );
+        let index_at = compiled
+            .messages
+            .iter()
+            .position(|m| m.source == SourceKind::SkillIndex)
+            .expect("index position");
+        let details_at = compiled
+            .messages
+            .iter()
+            .position(|m| m.source == SourceKind::SkillDescriptions)
+            .expect("detail position");
+        assert!(index_at < details_at);
     }
 
     #[test]

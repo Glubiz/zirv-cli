@@ -392,12 +392,15 @@ to `zirv chat`. It implements part of the execution-profile seam tracked in
 classifier, team compiler, workflow definitions and gates it sits in front of
 are unchanged.
 
-**Decider chain.** `decide()` always computes the deterministic baseline
-first, then runs at most one model decider, starting at `cfg.proxy.decider`:
-TypeSafe Jev over HTTP (skipped with a recorded fallback when
-`TYPESAFE_API_KEY` is unset, or on any transport/HTTP error) → the existing
-helper-model chokepoint (skipped when no adapter is ready or the call fails)
-→ the deterministic baseline as is. Jev/the helper model answer eleven
+**Decider chain.** `decide()` computes the deterministic baseline first. The
+shared client's metadata-only boundary now refuses the legacy text-bearing
+Jev classification request locally, before cache or network; the existing
+helper-model chokepoint remains available, then the baseline. With
+`jev.intake_savings` enabled and a credential present, a separate
+metadata-only Jev call may advise clarification and its category. The
+eleven-question classification schema and live battery below describe the
+historical Jev path and the helper's merge behavior. The historical Jev path
+and current helper model answer eleven
 questions — `intent`, `complexity`, `risk`, `workflow`, `needs_clarification`,
 and six additive domain tags (`security`, `data`, `docs_only`, `devops`,
 `architecture`, `frontend`) — never `execution`, seat tier or worker tier
@@ -961,7 +964,7 @@ to the section that documents it in depth.
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
 - **Jev advisory status** — `jev` (`zirv ctx jev status`) reports whether
-  the hosted TypeSafe Jev advisor is active: each of the five `[jev]`
+  the hosted TypeSafe Jev advisor is active: each of the `[jev]`
   gates (off by default), whether its credential is present (never its
   value), and the endpoint and model in use. See [Harness
   proxy](#harness-proxy).
@@ -2544,7 +2547,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
-| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the five advisory gates, the credential env var name and presence (never the value), the endpoint and model, and why it is or is not active — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
+| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, and why it is or is not active — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
@@ -3907,10 +3910,41 @@ supervisor = false  # judge pre-filter, crash triage, handoff quality; ZIRV_CTX_
 dispatch = false    # model tier for an omitted Agent model; ZIRV_CTX_JEV_DISPATCH
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
+context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_CONTEXT
+intake_savings = false # clarification category and optional planner; ZIRV_CTX_JEV_INTAKE_SAVINGS
+review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
 Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
+
+Jev requests now accept only a bounded numeric metadata envelope with static
+questions. The shared client rejects text, paths, diffs, secrets, dynamic
+question content, and legacy text-bearing advisory states before checking its
+cache or opening a connection (privacy fix [#746](https://github.com/Glubiz/zirv-cli/issues/746)).
+The new intake-savings path sends coarse categories and counts for clarification
+and optional planner advice; intent, risk, complexity, workflow, and seat choice
+remain deterministic. The supervisor and review paths likewise send coarse
+local signals. Legacy memory, dispatch, handoff, artifact, and proxy
+classification states that still require free-form text fall back to their
+deterministic/helper behavior. A failed or uncertain metadata-only answer also
+uses that baseline. No effect or token saving is attributed to a rejected state.
+
+The token-savings gates record actions actually taken in the private state
+directory's `jev-effects.jsonl`: rendered bytes removed, a helper call
+skipped, an optional plan seat omitted, a reviewer launch reused, or an
+eligible retry blocked. A plan omission is not itself a worker launch saved.
+Token usage is included only when observed, with cache classes separate;
+unknown usage is omitted. The decision and spend logs remain separate.
+`jev.review_reuse` is separate from `jev.review`: it may reuse a completed
+round only when its semantic dedup actually converged, the fingerprint,
+HEAD, tree, reviewer runtime/agent/model and required distinct-reviewer
+evidence still match, and every open finding has been disposed. Run
+`zirv workflow review run --fresh` to force a new round. Judge advice needs
+local green-gate and successful tool-result evidence; after two consecutive
+advised skips, the helper judge runs. Crash advice sees repeatable failure
+signals, and review advice sees severity/category/overlap numbers, never the
+raw reason, finding text or path.
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
 directory under `zirv/ctx/`, never in the repo. Override with
@@ -3984,6 +4018,7 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_ENTROPY` | operator environment | selects whether heuristic entropy findings are flagged or masked |
 | `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
+| `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 
 Every native instruction file inside the repository checkout — `ZIRV.md`
@@ -4228,6 +4263,9 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.dispatch` | `ZIRV_CTX_JEV_DISPATCH` |
 | `jev.review` | `ZIRV_CTX_JEV_REVIEW` |
 | `jev.gates` | `ZIRV_CTX_JEV_GATES` |
+| `jev.context` | `ZIRV_CTX_JEV_CONTEXT` |
+| `jev.intake_savings` | `ZIRV_CTX_JEV_INTAKE_SAVINGS` |
+| `jev.review_reuse` | `ZIRV_CTX_JEV_REVIEW_REUSE` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |

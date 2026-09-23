@@ -31,6 +31,7 @@ const PROXY_DECISIONS_FILE: &str = "proxy-decisions.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` key the proxy's own
 /// spend row on -- see `catalogue.rs`'s `typesafe` vendor.
 const TYPESAFE_MODEL_ID: &str = "jev-latest";
+const CLARIFICATION_CATEGORY_ID: &str = "clarification_category";
 
 /// Issue #537 (A2): a `decision.needs_clarification` at or above this floor
 /// is worth interrupting an interactive launch for one round of follow-up
@@ -145,6 +146,79 @@ fn protected_model_intake(
     Ok((intake, questions))
 }
 
+fn safe_intake_metadata(request: &str, baseline: &ProxyDecision) -> serde_json::Value {
+    let lower = request.to_ascii_lowercase();
+    let has_target = request.split_whitespace().any(|word| {
+        word.contains('/') || word.contains('\\') || word.ends_with(".rs") || word.ends_with(".md")
+    });
+    let has_outcome = ["should", "expected", "return", "display", "show", "produce"]
+        .iter()
+        .any(|term| lower.contains(term));
+    let has_constraint = ["without", "compatible", "preserve", "only", "must", "don't"]
+        .iter()
+        .any(|term| lower.contains(term));
+    serde_json::json!({
+        "_zirv_metadata_only": true,
+        // [site=2, intent, complexity, risk, word-count bucket, named
+        // target, stated outcome, stated constraint]. No request text,
+        // repository name, workflow description, path, or secret is sent.
+        "facts": [[
+            2,
+            baseline.intent as u8,
+            baseline.complexity as u8,
+            baseline.risk as u8,
+            request.split_whitespace().count().div_ceil(8).min(4),
+            has_target as u8,
+            has_outcome as u8,
+            has_constraint as u8,
+        ]],
+    })
+}
+
+fn safe_intake_questions() -> Vec<Question> {
+    vec![
+        Question::metadata_noul(
+            "needs_clarification",
+            "From facts [site=2, intent (0 feature, 1 bugfix, 2 refactor, 3 spike, 4 review, 5 other), complexity (0 trivial to 3 architectural), risk (0 low to 3 critical), word-count bucket (0 to 4), target/outcome/constraint flags (0 absent, 1 present)], is material information missing before implementation? Answer false if the metadata is insufficient to judge.",
+            "material information is missing",
+            "clear enough to start or insufficient evidence",
+        ),
+        Question::metadata_choice(
+            CLARIFICATION_CATEGORY_ID,
+            "Given the same coarse facts, which single category of missing information should be clarified? Choose other if the metadata is insufficient.",
+            &[
+                (
+                    "target",
+                    "The exact target service, file, component, or scope is missing.",
+                ),
+                (
+                    "behavior",
+                    "The expected behavior or acceptance result is missing.",
+                ),
+                (
+                    "constraint",
+                    "A required constraint or compatibility boundary is missing.",
+                ),
+                (
+                    "other",
+                    "No specific category is clear; use the generic clarification prompt.",
+                ),
+            ],
+        ),
+    ]
+}
+
+fn clarification_category(answers: &Answers, cfg: &CtxConfig) -> Option<String> {
+    let answer = answers.get(CLARIFICATION_CATEGORY_ID)?;
+    if !answer.decisive(cfg.proxy.min_confidence.max(0.7), cfg.proxy.min_margin) {
+        return None;
+    }
+    match answer.as_choice()? {
+        "target" | "behavior" | "constraint" => answer.as_choice().map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Computes one [`ProxyDecision`] for `request`, in `repo`, under `cfg`.
 /// Never fails: every I/O-touching step inside is best-effort, and the
 /// deterministic baseline is always a valid answer on its own. Persists the
@@ -155,7 +229,16 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     let classification = decision::classify_request(request);
     let roster = decision::Roster::gather(cfg, repo);
     let baseline = decision::baseline(cfg, repo, request, &classification, &roster);
-    let model_input = (!matches!(cfg.proxy.decider, ProxyDecider::Deterministic))
+    let safe_intake = cfg.jev.intake_savings
+        && matches!(cfg.proxy.decider, ProxyDecider::Typesafe)
+        && jev::available(&cfg.proxy.typesafe);
+    let safe_input = safe_intake.then(|| {
+        (
+            safe_intake_metadata(request, &baseline),
+            safe_intake_questions(),
+        )
+    });
+    let model_input = (!safe_intake && !matches!(cfg.proxy.decider, ProxyDecider::Deterministic))
         .then(|| protected_model_intake(cfg, state_dir, repo, request, &roster));
 
     let mut fallbacks = Vec::new();
@@ -168,16 +251,32 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
         fallbacks.push(format!("sensitive-data masking: {error}"));
     }
 
-    if matches!(cfg.proxy.decider, ProxyDecider::Typesafe)
+    let typesafe_result = if let Some((input, questions)) = &safe_input {
+        Some(
+            jev::ask(
+                &cfg.proxy.typesafe,
+                state_dir,
+                cfg.jev.cache_ttl_secs,
+                input,
+                questions,
+            )
+            .map(|(answers, usage, _)| (answers, usage)),
+        )
+    } else if matches!(cfg.proxy.decider, ProxyDecider::Typesafe)
         && let Some(Ok((intake, questions))) = &model_input
     {
-        match typesafe::decide(
+        Some(typesafe::decide(
             &cfg.proxy.typesafe,
             state_dir,
             cfg.jev.cache_ttl_secs,
             intake,
             questions,
-        ) {
+        ))
+    } else {
+        None
+    };
+    if let Some(typesafe_result) = typesafe_result {
+        match typesafe_result {
             Ok((answers, model_usage)) => {
                 result = decision::merge(
                     cfg,
@@ -187,6 +286,12 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
                     cfg.proxy.min_confidence,
                     &roster,
                 );
+                if safe_intake
+                    && result.needs_clarification >= CLARIFY_THRESHOLD
+                    && result.needs_clarification_decisive
+                {
+                    result.clarification_category = clarification_category(&answers, cfg);
+                }
                 winner = Decider::Typesafe;
                 usage = Some(model_usage);
                 ran_model = true;
@@ -196,6 +301,7 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     }
 
     if !ran_model
+        && !safe_intake
         && matches!(
             cfg.proxy.decider,
             ProxyDecider::Typesafe | ProxyDecider::Helper
@@ -599,6 +705,7 @@ mod tests {
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
             needs_clarification_decisive: false,
+            clarification_category: None,
             domains: Vec::new(),
             decider: Decider::Typesafe,
             confidence: BTreeMap::from([("seat_tier".to_string(), 0.81_f32)]),
@@ -608,6 +715,86 @@ mod tests {
             usage: None,
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn intake_savings_batches_material_ambiguity_category_in_existing_call() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_CATEGORY".to_string();
+        cfg.jev.cache_ttl_secs = 0;
+        let body = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.99},"clarification_category":{"type":"choice","choice":"target","probabilities":{"target":0.96,"behavior":0.02,"constraint":0.01,"other":0.01},"confidence":0.96}},"usage":{"input_tokens":23,"output_tokens":3}}"#;
+        let (base_url, server) = jev::tests::one_shot_server(200, body);
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_CATEGORY", "test-key") };
+        let decision = decide(&cfg, state_tmp.path(), repo.path(), "change the service");
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_CATEGORY") };
+        server.join().expect("one batched request");
+        assert_eq!(decision.clarification_category.as_deref(), Some("target"));
+        assert!(decision.needs_clarification_decisive);
+    }
+
+    #[test]
+    fn intake_savings_http_error_keeps_the_deterministic_decision() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_ERROR".to_string();
+        cfg.jev.cache_ttl_secs = 0;
+        let (base_url, server) = jev::tests::one_shot_server(503, "unavailable");
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_ERROR", "test-key") };
+        let decision = decide(&cfg, state_tmp.path(), repo.path(), "change the service");
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_ERROR") };
+        server.join().expect("one request");
+        assert_eq!(decision.decider, Decider::Deterministic);
+        assert!(decision.clarification_category.is_none());
+        assert_eq!(decision.needs_clarification, 0.0);
+        assert!(
+            decision
+                .fallbacks
+                .iter()
+                .any(|reason| reason.contains("503"))
+        );
+    }
+
+    #[test]
+    fn missing_or_uncertain_category_keeps_generic_clarification() {
+        let cfg = CtxConfig::default();
+        assert!(clarification_category(&Answers::new(), &cfg).is_none());
+        let mut answers = Answers::new();
+        answers.insert(
+            CLARIFICATION_CATEGORY_ID.to_string(),
+            decision::Answer {
+                value: decision::AnswerValue::Choice("target".to_string()),
+                confidence: 0.2,
+                probabilities: BTreeMap::from([
+                    ("target".to_string(), 0.51),
+                    ("behavior".to_string(), 0.49),
+                ]),
+            },
+        );
+        assert!(clarification_category(&answers, &cfg).is_none());
+        let serialized = serde_json::to_value(sample_decision()).expect("decision JSON");
+        assert!(serialized.get("clarification_category").is_none());
+    }
+
+    #[test]
+    fn intake_savings_projects_only_coarse_request_metadata() {
+        let mut baseline = sample_decision();
+        baseline.intent = crate::commands::workflow::classify::Intent::Feature;
+        let request = "change PRIVATE_CUSTOMER_SERVICE in src/private.rs without downtime";
+        let metadata = safe_intake_metadata(request, &baseline).to_string();
+        assert!(!metadata.contains("PRIVATE_CUSTOMER_SERVICE"));
+        assert!(!metadata.contains("src/private.rs"));
+        assert!(!metadata.contains("without downtime"));
+        assert!(metadata.contains("_zirv_metadata_only"));
+        assert_eq!(safe_intake_questions().len(), 2);
     }
 
     #[test]
@@ -897,6 +1084,7 @@ mod tests {
     fn activation_names_the_unset_credential_env() {
         let mut cfg = CtxConfig::default();
         cfg.proxy.enabled = true;
+        cfg.jev.intake_savings = true;
         cfg.proxy.decider = ProxyDecider::Typesafe;
         cfg.proxy.typesafe.credential_env = "PROXY_TEST_NEVER_SET_537".to_string();
         let error = activation(&cfg).expect_err("must be err");

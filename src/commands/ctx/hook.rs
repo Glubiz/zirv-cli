@@ -7772,24 +7772,18 @@ mod tests {
         cfg
     }
 
-    /// A confident (0.8) `standard` tier answer allows the dispatch with a
-    /// right-sized model instead of denying it -- claude's own ladder maps
-    /// `Tier::Standard` to `sonnet`.
+    /// Legacy dispatch briefs are free-form. The shared privacy guard must
+    /// reject them before cache or network I/O, leaving omitted-model
+    /// dispatches on their deterministic deny path.
     #[test]
-    fn dispatch_tier_advise_allows_a_standard_tier_dispatch_with_a_right_sized_model() {
-        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
-        let body = r#"{"model": "jev-latest", "answers": {
-            "tier": {"type": "score", "score": 1.0,
-                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
-                     "probabilities": {"0": 0.1, "1": 0.8, "2": 0.1}, "confidence": 0.8}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "HOOK_TEST_JEV_DISPATCH_STANDARD";
+    fn dispatch_tier_advise_rejects_legacy_brief_without_egress() {
+        let (payload, tool_input) = agent_payload("general-purpose", "", "private task brief");
+        let credential_env = "HOOK_TEST_JEV_DISPATCH_PRIVACY";
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
             std::env::set_var(credential_env, "secret");
         }
-        let cfg = jev_test_cfg(url, credential_env);
+        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
@@ -7798,151 +7792,12 @@ mod tests {
         unsafe {
             std::env::remove_var(credential_env);
         }
-        handle.join().expect("server thread must not panic");
-
-        let output = output.expect("a confident standard answer must allow");
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
-        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
-        assert_eq!(
-            parsed["hookSpecificOutput"]["updatedInput"]["model"],
-            "sonnet"
-        );
-        let context = parsed["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("additionalContext");
-        assert!(context.contains("sonnet"), "{context}");
-        assert!(context.contains("standard"), "{context}");
-    }
-
-    /// The subagent skill pointer composes with Jev's own model rewrite: the
-    /// single `updatedInput` this envelope carries has to speak for both --
-    /// the right-sized `model` AND the skill pointer appended to `prompt` --
-    /// since claude only ever reads one `updatedInput` per hook call.
-    /// `additionalContext` keeps saying only what Jev picked.
-    #[test]
-    fn dispatch_tier_advise_composes_the_model_rewrite_with_the_skill_pointer() {
-        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
-        let body = r#"{"model": "jev-latest", "answers": {
-            "tier": {"type": "score", "score": 1.0,
-                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
-                     "probabilities": {"0": 0.1, "1": 0.8, "2": 0.1}, "confidence": 0.8}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "HOOK_TEST_JEV_DISPATCH_STANDARD_WITH_POINTER";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let cfg = jev_test_cfg(url, credential_env);
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        let output = output.expect("a confident standard answer must allow");
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
-        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
-        assert_eq!(updated["model"], "sonnet");
-        assert_eq!(
-            updated["prompt"].as_str().expect("prompt string"),
-            format!("implement the feature{SKILL_POINTER_NOTE}")
-        );
-        let context = parsed["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("additionalContext");
-        assert!(context.contains("sonnet"), "{context}");
         assert!(
-            !context.contains("zirv skills"),
-            "the pointer rides updatedInput.prompt, not additionalContext: {context}"
+            output.is_none(),
+            "legacy briefs must retain deterministic deny"
         );
-    }
-
-    /// The identical `standard` answer at 0.5 -- below `DISPATCH_TIER_FLOOR`
-    /// (0.6) -- must fall through so the caller denies exactly as today.
-    #[test]
-    fn dispatch_tier_advise_falls_through_below_the_confidence_floor() {
-        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
-        let body = r#"{"model": "jev-latest", "answers": {
-            "tier": {"type": "score", "score": 1.0,
-                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
-                     "probabilities": {"0": 0.2, "1": 0.5, "2": 0.3}, "confidence": 0.5}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "HOOK_TEST_JEV_DISPATCH_LOW_CONF";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let cfg = jev_test_cfg(url, credential_env);
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-        assert!(output.is_none());
-    }
-
-    /// Jev determinism fix: the identical `standard` tier at a confidence
-    /// (0.8) above `DISPATCH_TIER_FLOOR`, but a thin margin (0.42/0.40)
-    /// between its own top and runner-up level probability, must fall
-    /// through so the caller denies exactly as today.
-    #[test]
-    fn dispatch_tier_advise_falls_through_on_a_thin_margin_answer() {
-        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
-        let body = r#"{"model": "jev-latest", "answers": {
-            "tier": {"type": "score", "score": 1.0,
-                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
-                     "probabilities": {"0": 0.18, "1": 0.42, "2": 0.40}, "confidence": 0.8}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "HOOK_TEST_JEV_DISPATCH_THIN_MARGIN";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let cfg = jev_test_cfg(url, credential_env);
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-        assert!(output.is_none());
-    }
-
-    /// A 500 must fall through so the caller denies exactly as today.
-    #[test]
-    fn dispatch_tier_advise_falls_through_on_a_500() {
-        let (payload, tool_input) = agent_payload("general-purpose", "", "implement the feature");
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
-        let credential_env = "HOOK_TEST_JEV_DISPATCH_500";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let cfg = jev_test_cfg(url, credential_env);
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-        assert!(output.is_none());
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+        assert!(!state_dir.path().join("jev-cache.jsonl").exists());
     }
 
     /// The gate off must be `None` -- no call even attempted, despite a
@@ -8019,75 +7874,6 @@ mod tests {
         }
         assert!(output.is_none());
         assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
-    }
-
-    /// Review finding (issue #537 A5): claude's `updatedInput` REPLACES the
-    /// tool's whole input object rather than merging into it, so a rewrite
-    /// built only from the fields the inserted `model` needed would
-    /// silently drop `prompt`/`subagent_type`/`description` -- and anything
-    /// the payload carried that `PreToolInput` does not even model, such as
-    /// the Agent tool's own `isolation` parameter. Every one of those must
-    /// survive, unchanged, alongside the inserted `model`.
-    #[test]
-    fn dispatch_tier_advise_preserves_every_original_field_alongside_the_inserted_model() {
-        let tool_input = serde_json::json!({
-            "subagent_type": "general-purpose",
-            "model": "",
-            "prompt": "implement the feature",
-            "description": "implement thing",
-            "isolation": "worktree"
-        });
-        let payload = PreToolPayload::parse(&pretool_stdin("Agent", tool_input.clone()))
-            .expect("the documented payload must parse");
-        let body = r#"{"model": "jev-latest", "answers": {
-            "tier": {"type": "score", "score": 1.0,
-                     "legend": {"0": "cheap", "1": "standard", "2": "frontier"},
-                     "probabilities": {"0": 0.1, "1": 0.8, "2": 0.1}, "confidence": 0.8}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "HOOK_TEST_JEV_DISPATCH_PRESERVE_FIELDS";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-        let mut cfg = jev_test_cfg(url, credential_env);
-        // This test is about field preservation, not the subagent skill
-        // pointer (covered separately) -- turning the pointer off keeps its
-        // exact-equality `prompt` assertion below meaningful.
-        cfg.prompt.skill_index = false;
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let output = dispatch_tier_advise(&cfg, &state, "fable", &payload, &tool_input);
-
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-        handle.join().expect("server thread must not panic");
-
-        let output = output.expect("a confident answer must allow");
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
-        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
-        assert_eq!(
-            updated["model"], "sonnet",
-            "the model must be inserted/overwritten: {updated}"
-        );
-        assert_eq!(
-            updated["prompt"], "implement the feature",
-            "the prompt must survive: {updated}"
-        );
-        assert_eq!(
-            updated["subagent_type"], "general-purpose",
-            "subagent_type must survive: {updated}"
-        );
-        assert_eq!(
-            updated["description"], "implement thing",
-            "description must survive: {updated}"
-        );
-        assert_eq!(
-            updated["isolation"], "worktree",
-            "an unmodeled field must survive too: {updated}"
-        );
     }
 
     /// A named `.claude/agents/<name>.md` definition carries its own `model`
