@@ -27,6 +27,7 @@
 - [Features](#features)
   - [Script runner](#script-runner)
   - [Harness supervision (`zirv ctx`)](#harness-supervision-zirv-ctx)
+  - [What wrapping costs (measured)](#what-wrapping-costs-measured)
   - [Development workflow commands](#development-workflow-commands)
   - [Verification](#verification)
   - [Housekeeping](#housekeeping)
@@ -997,6 +998,13 @@ to the section that documents it in depth.
   inspects, reveals, audits and clears the per-repository placeholder vault
   that keeps credentials and personal data out of model and remote traffic.
   See [What leaves this device](#what-leaves-this-device).
+
+### What wrapping costs (measured)
+
+In a headless benchmark against Claude Code with a popular skills plugin,
+zirv was **up to 41% faster** and **up to 51% cheaper** (Sonnet, larger
+multi-module tasks). Protocol, per-task results and the harness:
+[docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
 
 ### Development workflow commands
 

@@ -1,0 +1,3 @@
+Something's off with the pagination in `list`. When I look at page 1, the very first row of my ledger is missing -- it just starts from the second transaction. And separately, whenever my total number of transactions happens to divide evenly by the page size, the last page comes back completely empty instead of showing the final batch of rows.
+
+Can you find and fix whatever is causing this? Other pages seem to look fine.

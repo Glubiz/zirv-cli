@@ -1,0 +1,8 @@
+I sometimes have transactions in foreign currencies and the ledger currently just assumes everything is in Danish kroner.
+
+Please add multi-currency support:
+- `Transaction` should have a `currency` field that defaults to `"DKK"`.
+- Saving and loading the ledger (the JSON store) should round-trip the currency.
+- CSV import should read an optional `currency` column, defaulting to `"DKK"` when the column is absent or blank.
+- Add a `report.totals_by_currency(txns)` function that sums amounts grouped by currency.
+- The `list` command's output should show each transaction's currency.

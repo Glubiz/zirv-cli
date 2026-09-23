@@ -1,0 +1,59 @@
+I pay some bills the same way every month (or week, or year) and I'm tired of
+retyping them into the ledger by hand each time.
+
+Please add recurring transactions:
+
+- A new `ledgerlite/recurring.py` module with a `Recurrence` type (fields:
+  `payee`, `amount`, `category` (optional, defaults to `None`), `start`
+  (a date), `every` which is `"weekly"`, `"monthly"`, or `"yearly"`, and an
+  optional `until` date -- `None` means it repeats forever) and a function
+  `expand(recurrences, start, end)` that returns the list of `Transaction`s
+  a list of recurrences would produce over the closed interval `[start,
+  end]` (both inclusive).
+  - Weekly means every 7 days from the recurrence's own `start`.
+  - Monthly keeps the same day-of-month as the recurrence's `start`; if
+    that day doesn't exist in a later month (e.g. day 31 in February), use
+    that month's last day instead. For example a recurrence starting on
+    2024-01-31 produces occurrences on 2024-01-31, 2024-02-29 (2024 is a
+    leap year), 2024-03-31, 2024-04-30, and so on -- note it goes back to
+    day 31 in March even though February was clamped to 29; the clamping
+    is against the recurrence's original start day each time, it never
+    drifts to the previously-clamped day.
+  - Yearly keeps the same month and day every year, except when the start
+    date is Feb 29: in a year that isn't a leap year, use Feb 28 instead
+    for that year's occurrence.
+  - A recurrence never produces an occurrence before its own `start`, and
+    if `until` is set, never one after `until`, in addition to being
+    clipped to the `[start, end]` window passed into `expand`.
+  - Every generated `Transaction` needs an `id`. Use this rule so ids are
+    deterministic and never collide with a real (imported/stored)
+    transaction id: number the generated transactions `-1, -2, -3, ...` in
+    order -- recurrence by recurrence in the order they appear in the
+    `recurrences` list passed in, and within a recurrence oldest
+    occurrence first. That way every generated id is negative, since
+    regular ledger transactions always get positive ids. Leave each
+    generated transaction's `memo` as an empty string.
+- Recurrences need to be saved. Add a `recurring add` CLI command:
+  `python -m ledgerlite recurring add --payee <name> --amount <amt> --every
+  weekly|monthly|yearly --start YYYY-MM-DD [--category <cat>] [--until
+  YYYY-MM-DD] --store <path>`. It should append the new recurrence to
+  whatever recurrences are already saved under a `"recurring"` key in the
+  store's JSON file (a sibling of the existing `"transactions"` key),
+  without touching the stored transactions.
+- Add `recurring list` (`python -m ledgerlite recurring list --store
+  <path>`): print one line per saved recurrence, in the order they were
+  saved, in the form `<payee>: <amount> <category-or-"uncategorized">
+  every <every> from <start>[ until <until>]` -- the trailing `until
+  <until>` part is only present when that recurrence has an `until` date.
+- Add `--include-recurring`, `--since YYYY-MM-DD`, and `--until YYYY-MM-DD`
+  options to the existing `list` command. `--since`/`--until` are only
+  meaningful together with `--include-recurring` (they don't filter the
+  stored transactions on their own), and both become required as soon as
+  `--include-recurring` is passed: if `--include-recurring` is given
+  without both `--since` and `--until`, print an error to stderr and exit
+  with status 2, printing nothing else. When `--include-recurring --since
+  S --until U` are all given, expand the saved recurrences over `[S, U]`,
+  merge the results with the stored transactions, sort the combined list
+  by `(date, id)` ascending, and print every row using the same per-row
+  format `list` already uses -- ignore `--page`/`--page-size` entirely in
+  this mode and print every merged row.

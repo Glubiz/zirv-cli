@@ -1,0 +1,10 @@
+I want to see what percentage of my spending goes to each category, and the numbers have to actually add up to 100% or it looks broken in my report.
+
+Please add a function to `ledgerlite/report.py`, `category_shares(txns)`, that returns a dict mapping each category to its percentage share of total spending, as a `Decimal` rounded to 2 decimal places (e.g. `Decimal("33.34")`).
+
+Rules:
+- Only money going out counts as "spending" -- use the magnitude of negative amounts. Categories where every transaction is positive (no negative amounts at all) shouldn't show up in the result.
+- Uncategorised transactions (no category) should be grouped together under the key `"uncategorised"`.
+- If there's no spending at all (no negative amounts), just return an empty dict.
+- If there's only one category with any spending, it should show `100.00`.
+- Here's the part that actually matters: the shares in the result have to sum to EXACTLY 100.00, every time. If you just round each category's raw percentage to 2 decimals independently, you'll sometimes get 99.99 or 100.01 instead of 100.00 -- that's not acceptable. When rounding down loses some hundredths of a percent overall, hand those hundredths back to the categories whose raw percentage got rounded down the most (i.e. had the largest leftover fraction), one hundredth at a time, until the total is exactly 100.00. If two categories are equally deserving of the next hundredth, give it to whichever category name comes first alphabetically.

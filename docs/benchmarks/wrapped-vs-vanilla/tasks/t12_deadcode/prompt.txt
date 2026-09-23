@@ -1,0 +1,3 @@
+Which functions or methods in `ledgerlite/` are never called from anywhere in the package or the CLI (tests do not count)? List their qualified names.
+
+End your answer with one line of the form `DEAD: <name>, <name>, ...` listing exactly the functions you consider dead (use `DEAD: none` if there are none).

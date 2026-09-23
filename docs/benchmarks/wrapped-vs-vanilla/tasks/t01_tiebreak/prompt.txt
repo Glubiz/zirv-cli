@@ -1,0 +1,3 @@
+A couple of my transactions have been assigned a category I didn't expect, and when I looked into it I realized more than one of my categorisation rules actually matches the same transaction.
+
+When several rules match a single transaction, which one wins, and where in the code is that decided? Please explain the exact tie-break behaviour, including what happens when two matching rules have the same priority.

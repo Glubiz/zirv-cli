@@ -1,0 +1,1 @@
+`tests/test_rules.py::test_regex_rule_case_insensitive` is failing on this repo. Please find and fix the root cause in the library code -- don't modify the test itself.
