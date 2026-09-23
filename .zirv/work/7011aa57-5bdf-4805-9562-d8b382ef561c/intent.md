@@ -20,7 +20,7 @@ With the relevant operator gate enabled and a nonempty TypeSafe credential prese
 
 ## Open questions
 
-Whether the existing task-independent skill index is itself mandatory discovery text or whether individual optional descriptions may be omitted while the index and `zirv skill list/load` remain available. Resolve in the specification before modifying prompt composition.
+None. Keep every implicit skill ID and the `zirv skill list/load` discovery route. Only optional descriptions are candidates for selection; an explicitly invoked skill keeps its description. Canonical instructions are never candidates.
 
 ## Acceptance criteria
 
