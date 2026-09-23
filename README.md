@@ -1,29 +1,25 @@
 # Zirv
 
-**Make AI development work across agents, models, and long sessions.**
+**Put your AI agents to work together.**
 
-Zirv is a CLI that brings your coding agents, project context, and development workflows into one terminal. It runs alongside installed harnesses such as Claude Code and Codex, coordinates work between them, and supervises sessions so progress can survive context loss or a handoff. Its goal is to make multi-agent work reliable and repeatable while you stay in control.
+Claude Code, Codex, and your other coding agents can do more as a team. Zirv brings them into one terminal, gives them shared project context, and keeps work moving through delegation, supervised handoffs, and repeatable workflows.
 
-**Measured results:** On the tested repository, context deduplication removed 1,732–1,937 tokens from the session launch prefix (24–26%). In a separate 15-task headless Sonnet benchmark against Claude Code with the Superpowers plugin, Zirv averaged **22% less time and 24% lower model cost**, while keeping correctness about the same overall. On the large-task subset, it used **41% less time and 51% less cost**. These results do not measure interactive, long-running sessions. [Token measurements](https://github.com/Glubiz/zirv-cli/blob/main/docs/benchmarks/token-cost.md#64-beforeafter-for-each-reduction-shipped-in-this-issue) · [Speed benchmark](https://github.com/Glubiz/zirv-cli/blob/main/docs/benchmarks/wrapped-vs-vanilla.md#4-results)
+**Up to 41% faster · Up to 51% cheaper**
+
+Measured on larger headless Sonnet tasks against Claude Code with Superpowers; correctness was about the same across the full benchmark.
 
 [![Release](https://img.shields.io/github/v/release/Glubiz/zirv-cli)](https://github.com/Glubiz/zirv-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Glubiz/zirv-cli/blob/main/LICENSE)
 
-[Get started](#get-started) · [Explore capabilities](#what-zirv-does) · [Full CLI reference](https://github.com/Glubiz/zirv-cli/blob/main/REFERENCE.md)
+[Get started](#get-started) · [Why Zirv](#why-zirv) · [Full CLI reference](https://github.com/Glubiz/zirv-cli/blob/main/REFERENCE.md)
 
-> **Native harness: coming soon.** The current release uses the existing harness through `zirv chat`. `zirv native` only shows a notice; native execution cannot be enabled yet. Native design notes in the full reference describe work in progress.
+## Why Zirv
 
-## What Zirv does
-
-| Capability | Why it matters |
-| --- | --- |
-| **Coordinate agents** | Work across supported harnesses and models, delegate tasks to workers, and keep sessions visible in one terminal dashboard. |
-| **Keep useful context** | Share project instructions and compact memory between harnesses, with handoffs when a session needs to restart or change harness. |
-| **Supervise long sessions** | Monitor context health and usage, then advise, compact, or restart with a handoff when work begins to degrade. |
-| **Run repeatable work** | Use development workflows, verification, and project scripts from the same CLI. |
-| **Keep operator control** | Repository context cannot grant itself permissions or override operator-owned safety settings. |
-
-Zirv also runs YAML, JSON, and TOML scripts from `.zirv/commands/`, with parameters, shortcuts, and platform-specific steps.
+- **One team across models.** Delegate work to supported harnesses and keep every session visible in one terminal.
+- **Less repeated context.** Share project instructions and compact memory without paying to send the same context twice.
+- **Long sessions that keep moving.** Watch for context drift, then compact or hand off before progress gets lost.
+- **A path from prompt to shipped work.** Run development workflows, verification, and project scripts from the same CLI.
+- **Your tools, your rules.** Repository content cannot grant itself permissions or override operator settings.
 
 ## Get started
 
@@ -59,6 +55,8 @@ zirv
 ```
 
 In an interactive terminal, bare `zirv` starts a session when the current directory contains a local `.zirv/`. Use `zirv chat` to start explicitly; use `zirv tour` for a guided introduction. Run `zirv init` if you only want to create a project script directory.
+
+> **Native harness: coming soon.** `zirv native` currently only shows a notice. Use `zirv chat` for the existing harness.
 
 ## Go deeper
 
