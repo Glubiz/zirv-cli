@@ -462,7 +462,14 @@ pub(crate) fn render_with_launcher(
         ));
         return finish_render(state, report);
     }
-    let Some(browser) = discover_browser() else {
+    let (chosen_browser, skipped_browsers) = discover_browser_verbose();
+    for skipped in &skipped_browsers {
+        report.notes.push(format!(
+            "browser candidate '{skipped}' was found but failed the headless launch probe; \
+             skipping it"
+        ));
+    }
+    let Some(browser) = chosen_browser else {
         report
             .notes
             .push("no supported local Chromium-family browser was discovered".into());
@@ -756,44 +763,142 @@ fn server_command(spec: &RenderCommand, port: u16) -> Command {
     command
 }
 
-fn command_available(program: &str) -> bool {
+/// Spawns `program` with `args`, waits up to `timeout` for it to exit, and
+/// reports whether it exited successfully. `None` means the process could
+/// not even be started (the binary is not present on this machine).
+fn probe_exit(program: &str, args: &[&str], timeout: Duration) -> Option<bool> {
     let mut command = Command::new(program);
     command
-        .arg("--version")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     super::isolate_process_tree(&mut command);
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
+    let mut child = command.spawn().ok()?;
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = super::terminate_process_tree(&mut child);
+                return Some(false);
+            }
             Err(_) => {
                 let _ = super::terminate_process_tree(&mut child);
-                return false;
+                return Some(false);
             }
         }
     }
-    let _ = super::terminate_process_tree(&mut child);
-    false
+}
+
+fn command_available(program: &str) -> bool {
+    probe_exit(program, &["--version"], Duration::from_secs(2)).unwrap_or(false)
+}
+
+/// The bare names `discover_browser` looks for on `PATH`, in preference
+/// order. Kept separate from the macOS bundle paths below so both platforms'
+/// candidates can be extended independently.
+const BROWSER_PATH_CANDIDATES: [&str; 6] = [
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+    "microsoft-edge",
+    "msedge",
+];
+
+/// Issue #678: on macOS a Chrome/Chromium/Edge install is an app bundle, not
+/// a `PATH` entry, so PATH-name discovery alone never finds it. This probes
+/// the standard bundle executable paths under `/Applications` and
+/// `$HOME/Applications`, the two locations a normal (non-Homebrew) install
+/// uses.
+#[cfg(target_os = "macos")]
+fn macos_bundle_candidates() -> Vec<String> {
+    const BUNDLES: [(&str, &str); 3] = [
+        ("Google Chrome.app", "Google Chrome"),
+        ("Chromium.app", "Chromium"),
+        ("Microsoft Edge.app", "Microsoft Edge"),
+    ];
+    let mut roots = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Applications"));
+    }
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            BUNDLES.iter().map(move |(bundle, binary)| {
+                root.join(bundle)
+                    .join("Contents/MacOS")
+                    .join(binary)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_bundle_candidates() -> Vec<String> {
+    Vec::new()
 }
 
 pub(crate) fn discover_browser() -> Option<String> {
-    [
-        "chromium",
-        "chromium-browser",
-        "google-chrome",
-        "google-chrome-stable",
-        "microsoft-edge",
-        "msedge",
-    ]
-    .into_iter()
-    .find(|program| command_available(program))
-    .map(str::to_string)
+    discover_browser_verbose().0
+}
+
+/// The browser `discover_browser` would choose, plus every candidate that
+/// was actually present but failed the headless launch probe (issue #676: an
+/// Ubuntu snap `chromium` stub exits non-zero for every headless run while
+/// `google-chrome` on the same `PATH` works). A candidate that is simply
+/// absent is not reported here -- only one that exists and could not launch,
+/// so a render report names the stub that was skipped rather than every
+/// browser this machine does not have.
+fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
+    let mut candidates: Vec<String> = BROWSER_PATH_CANDIDATES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    candidates.extend(macos_bundle_candidates());
+
+    let mut skipped = Vec::new();
+    for candidate in candidates {
+        match probe_browser_launch(&candidate) {
+            Some(true) => return (Some(candidate), skipped),
+            Some(false) => skipped.push(candidate),
+            None => {}
+        }
+    }
+    (None, skipped)
+}
+
+/// Whether `program` can actually launch headless. Chrome (and its
+/// Chromium-family siblings) refuses `--headless` outright when it cannot
+/// create its own DEFAULT per-invocation profile directory, which fails with
+/// "Failed to create a unique user data directory for headless" inside a
+/// sandboxed shell -- exactly the shell an agent's `zirv workflow start` runs
+/// in. Supplying an explicit, disposable `--user-data-dir` sidesteps that
+/// default-creation step entirely, so the probe measures whether the browser
+/// itself works rather than whether this process happened to have a writable
+/// default profile location. This runs in production (render launch and the
+/// `workflow start` capability check both reach it), so the directory is
+/// hand-rolled under `std::env::temp_dir()` -- the same one-off-unique-path
+/// pattern `review.rs`'s `IndexTempPath` already uses -- rather than the
+/// dev-only `tempfile` crate; it is removed again once the probe returns.
+fn probe_browser_launch(program: &str) -> Option<bool> {
+    let profile_dir =
+        std::env::temp_dir().join(format!("zirv-browser-probe-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&profile_dir).ok()?;
+    let user_data_dir = format!("--user-data-dir={}", profile_dir.display());
+    let result = probe_exit(
+        program,
+        &["--headless", &user_data_dir, "--version"],
+        Duration::from_secs(2),
+    );
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    result
 }
 
 fn wait_for_server(child: &mut Child, port: u16) -> CtxResult<bool> {
@@ -1835,5 +1940,85 @@ mod tests {
         )
         .expect("save confirmation");
         assert!(review_round(&state, repo.path(), Some("workflow"), 3).is_err());
+    }
+
+    /// Issue #676: an Ubuntu snap `chromium` stub prints a version but exits
+    /// non-zero for every headless run, while `google-chrome` on the same
+    /// `PATH` works. Discovery must probe past the failing stub rather than
+    /// stopping at the first name it finds. Both stubs also fail unless they
+    /// see a `--user-data-dir=` argument, which pins the orchestrator-found
+    /// regression: the probe must pass an explicit profile directory rather
+    /// than relying on Chrome's own default (which a sandboxed shell cannot
+    /// create) -- so this test fails loudly if that argument is ever dropped.
+    #[cfg(unix)]
+    #[test]
+    fn discover_browser_skips_a_stub_that_fails_the_headless_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write_stub = |name: &str, exit_code: i32| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$*\" in\n  *--user-data-dir=*) ;;\n  *) exit 9 ;;\nesac\nexit {exit_code}\n"
+                ),
+            )
+            .expect("write stub");
+            let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod +x");
+        };
+        write_stub("chromium", 1);
+        write_stub("google-chrome", 0);
+
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        let (browser, skipped) = discover_browser_verbose();
+        assert_eq!(browser.as_deref(), Some("google-chrome"));
+        assert!(skipped.iter().any(|name| name == "chromium"), "{skipped:?}");
+    }
+
+    /// Issue #678: on macOS a browser install is an app bundle, not a `PATH`
+    /// entry, so discovery must also probe the standard bundle executable
+    /// paths under both `/Applications` and `$HOME/Applications`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_candidates_cover_both_applications_directories_for_every_browser() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "HOME",
+            Some(home.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        let candidates = macos_bundle_candidates();
+        let home_chrome = home
+            .path()
+            .join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+            .to_string_lossy()
+            .into_owned();
+        assert!(candidates.contains(&home_chrome), "{candidates:?}");
+        assert!(
+            candidates.contains(
+                &"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string()
+            ),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.ends_with("Chromium.app/Contents/MacOS/Chromium")),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate
+                    .ends_with("Microsoft Edge.app/Contents/MacOS/Microsoft Edge")),
+            "{candidates:?}"
+        );
     }
 }
