@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "routes": [
+    {
+      "route": "anthropic-messages",
+      "protocol": "Anthropic Messages (N07, #476)",
+      "collection_status": "not_collected",
+      "collected_at_unix": null,
+      "model": null,
+      "asserted_behaviors": [],
+      "outcome": null,
+      "detail": null,
+      "operator_command": "ANTHROPIC_API_KEY=*** ZIRV_ANTHROPIC_LIVE_MODEL=<exact-model-id> cargo test --bin zirv --release -- --ignored live_anthropic_messages_contract --nocapture"
+    },
+    {
+      "route": "openai-responses",
+      "protocol": "OpenAI Responses (N08, #477)",
+      "collection_status": "not_collected",
+      "collected_at_unix": null,
+      "model": null,
+      "asserted_behaviors": [],
+      "outcome": null,
+      "detail": null,
+      "operator_command": "OPENAI_API_KEY=*** ZIRV_OPENAI_LIVE_MODEL=<exact-model-id> cargo test --bin zirv --release -- --ignored live_openai_responses_contract --nocapture"
+    },
+    {
+      "route": "google-developer",
+      "protocol": "Google Generative AI, Gemini Developer API (N12, #481)",
+      "collection_status": "not_collected",
+      "collected_at_unix": null,
+      "model": null,
+      "asserted_behaviors": [],
+      "outcome": null,
+      "detail": null,
+      "operator_command": "GEMINI_API_KEY=*** ZIRV_GOOGLE_LIVE_MODEL=<exact-model-id> cargo test --bin zirv --release -- --ignored live_google_generative_ai_contract --nocapture"
+    },
+    {
+      "route": "openai-chat-generic",
+      "protocol": "OpenAI-compatible chat completions (N13, #482)",
+      "collection_status": "not_collected",
+      "collected_at_unix": null,
+      "model": null,
+      "asserted_behaviors": [],
+      "outcome": null,
+      "detail": null,
+      "operator_command": "ZIRV_OPENAI_COMPATIBLE_BASE_URL=https://api.<vendor>.com ZIRV_OPENAI_COMPATIBLE_API_KEY=*** ZIRV_OPENAI_COMPATIBLE_LIVE_MODEL=<exact-model-id> cargo test --bin zirv --release -- --ignored live_openai_compatible_chat_contract --nocapture"
+    }
+  ]
+}

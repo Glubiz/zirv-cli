@@ -1982,7 +1982,7 @@ mod tests {
         )
         .unwrap();
         let mut request = request();
-        request.model = model;
+        request.model = model.clone();
         request.messages = vec![super::super::adapter::ProviderMessage {
             role: ProviderMessageRole::User,
             content: vec![ProviderContent::Text {
@@ -1993,13 +1993,21 @@ mod tests {
         request.thinking = ThinkingConfig::Default;
         request.effort = None;
         request.cache = CacheMode::Disabled;
-        let response = adapter
-            .stream(
+        // Issue #592: record the redacted outcome of this live call into the
+        // committed evidence manifest, whichever way it goes, then keep
+        // asserting exactly as before.
+        let response = super::super::evidence::record_stream_result(
+            &adapter,
+            "anthropic-messages",
+            &model,
+            &["single-turn text completion", "usage tokens reported"],
+            adapter.stream(
                 &request,
                 &super::super::adapter::NeverCancelled,
                 &mut Vec::new(),
-            )
-            .unwrap();
+            ),
+        )
+        .unwrap();
         assert!(!response.message_id.is_empty());
         assert!(response.usage.output_tokens > 0);
     }

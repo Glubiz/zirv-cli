@@ -2255,7 +2255,7 @@ mod tests {
         )
         .unwrap();
         let mut request = request();
-        request.model = model;
+        request.model = model.clone();
         request.messages = vec![ProviderMessage {
             role: ProviderMessageRole::User,
             content: vec![ProviderContent::Text {
@@ -2265,9 +2265,17 @@ mod tests {
         request.tools.clear();
         request.thinking = ThinkingConfig::Default;
         request.effort = None;
-        let response = adapter
-            .stream(&request, &NeverCancelled, &mut Vec::new())
-            .unwrap();
+        // Issue #592: record the redacted outcome of this live call into the
+        // committed evidence manifest, whichever way it goes, then keep
+        // asserting exactly as before.
+        let response = super::super::evidence::record_stream_result(
+            &adapter,
+            "openai-responses",
+            &model,
+            &["single-turn text completion", "usage tokens reported"],
+            adapter.stream(&request, &NeverCancelled, &mut Vec::new()),
+        )
+        .unwrap();
         assert!(!response.message_id.is_empty());
         assert!(response.usage.output_tokens > 0);
     }

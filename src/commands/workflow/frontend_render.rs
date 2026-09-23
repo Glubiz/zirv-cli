@@ -2081,4 +2081,118 @@ mod tests {
             "{candidates:?}"
         );
     }
+
+    /// Issue #610 scenario 2 (roadmap N05/N14/N15, review of #493): the
+    /// frontend run-inspect-capture-review path, driven through the real
+    /// production entry points `render()` and `frontend_detector::detect()`
+    /// against a real git repository -- not a fixture transport and not a
+    /// stub browser. Chunk K
+    /// (`docs/design/2026-09-14-native-review-fixes-chunk-k.md`) reported
+    /// this scenario UNMET because no Chromium-family browser was
+    /// discovered in that environment; this test checks the same thing
+    /// live, on whatever machine runs it, rather than assuming the answer.
+    /// When `capabilities.browser` resolves to nothing the test is present,
+    /// named, and prints why it did no work instead of silently vanishing
+    /// from the suite -- the same shape this repo already uses for a
+    /// missing `git` binary (see
+    /// `agent::tests::validate_workdir_rejects_a_directory_with_no_git_ancestry`).
+    ///
+    /// The review half has its own, separate blocker even once a browser is
+    /// present: `launch_visual_reviewer` re-execs a real `zirv agent`
+    /// subprocess, and issue #609's own documented gap means a native
+    /// reviewer's model call cannot be fixture-injected at that boundary
+    /// (only a delegated worker's `HeadlessRequest.provider` can be, and
+    /// that seam is deliberately never exposed to a model-facing launch
+    /// request). A real review call therefore needs a real, credentialed
+    /// coding harness or provider route -- exactly the material issue #592
+    /// forbids fabricating here. So this test drives `review()` for real
+    /// and reports whichever genuinely happens, live evidence or the real
+    /// reason none exists, rather than asserting either outcome.
+    ///
+    /// Ignored by default like the live provider contract tests: a browser
+    /// binary on PATH is not proof it can capture (GitHub's ubuntu image
+    /// ships a `chromium` stub that fails every route), so this only runs
+    /// where the operator has confirmed a working headless browser.
+    #[test]
+    #[ignore = "needs a working headless browser on PATH; run with --ignored where one is confirmed"]
+    fn a_frontend_run_inspect_capture_review_scenario_runs_live_or_names_exactly_what_is_missing() {
+        let Some(browser) = discover_browser() else {
+            eprintln!(
+                "skipping: no supported local Chromium-family browser was discovered on PATH \
+                 (chromium, chromium-browser, google-chrome, google-chrome-stable, \
+                 microsoft-edge, msedge); issue #610's frontend run-inspect-capture-review \
+                 scenario needs `capabilities.browser` configured -- see \
+                 docs/design/2026-09-14-native-release-evidence.md \u{a7}3.5"
+            );
+            return;
+        };
+
+        let state_root = tempfile::tempdir().expect("state root");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::resolve(&|key| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| state_root.path().to_string_lossy().to_string())
+        })
+        .expect("state");
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.path().join("index.html"),
+            "<!doctype html><main>zirv-acceptance-fixture</main>",
+        )
+        .expect("index");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fixture frontend"]);
+
+        // RUN + INSPECT + CAPTURE: the real production entry point, a real
+        // headless browser subprocess, real PNG screenshots on disk.
+        let render_report = render(&state, repo.path()).expect("render must not error");
+        assert_eq!(render_report.browser.as_deref(), Some(browser.as_str()));
+        assert!(
+            render_report.passed(),
+            "a real capture on this machine's own browser must pass: {render_report:?}"
+        );
+        assert!(!render_report.captures.is_empty());
+
+        // The frontend detector is a real, local, deterministic static
+        // analysis with no model or network involved, so `review()`'s own
+        // "fresh passing detector report" precondition is satisfied
+        // honestly here instead of being faked.
+        super::super::frontend_detector::detect(&state, repo.path(), &[], true)
+            .expect("detector must not error");
+
+        let args = VisualReviewArgs {
+            repo: None,
+            agent: None,
+            model: None,
+            runtime: "harness".into(),
+            json: false,
+        };
+        match review(&state, repo.path(), &args) {
+            Ok(review) => eprintln!(
+                "review completed live through a real reviewer: verdict={:?}",
+                review.verdict
+            ),
+            Err(error) => eprintln!(
+                "review half not exercised: {error} (needs a real credentialed coding harness \
+                 or native provider route; issue #592 forbids fabricating one)"
+            ),
+        }
+    }
 }
