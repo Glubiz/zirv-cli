@@ -1888,6 +1888,8 @@ pub struct JevConfig {
     pub context: bool,
     pub intake_savings: bool,
     pub review_reuse: bool,
+    pub harvest_screen: bool,
+    pub admin_dispatch: bool,
     /// How long a cached answer (`<state_dir>/jev-cache/<hash>.json`, keyed
     /// by the exact request body -- see `jev::ask`'s own doc comment) stays
     /// usable, in seconds. `0` disables the cache entirely: every call
@@ -1908,6 +1910,8 @@ impl Default for JevConfig {
             context: false,
             intake_savings: false,
             review_reuse: false,
+            harvest_screen: false,
+            admin_dispatch: false,
             cache_ttl_secs: 86_400,
         }
     }
@@ -3961,6 +3965,16 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_JEV_HARVEST_SCREEN",
+        &["jev", "harvest_screen"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_JEV_ADMIN_DISPATCH",
+        &["jev", "admin_dispatch"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_JEV_CACHE_TTL_SECS",
         &["jev", "cache_ttl_secs"],
         EnvKind::Int,
@@ -5280,6 +5294,8 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "context"], "ZIRV_CTX_JEV_CONTEXT"),
     (&["jev", "intake_savings"], "ZIRV_CTX_JEV_INTAKE_SAVINGS"),
     (&["jev", "review_reuse"], "ZIRV_CTX_JEV_REVIEW_REUSE"),
+    (&["jev", "harvest_screen"], "ZIRV_CTX_JEV_HARVEST_SCREEN"),
+    (&["jev", "admin_dispatch"], "ZIRV_CTX_JEV_ADMIN_DISPATCH"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
 ];
 
@@ -8513,6 +8529,8 @@ mod tests {
         assert!(!cfg.context);
         assert!(!cfg.intake_savings);
         assert!(!cfg.review_reuse);
+        assert!(!cfg.harvest_screen);
+        assert!(!cfg.admin_dispatch);
         assert_eq!(cfg.cache_ttl_secs, 86_400);
     }
 
@@ -8586,6 +8604,8 @@ mod tests {
             ("ZIRV_CTX_JEV_CONTEXT", "true"),
             ("ZIRV_CTX_JEV_INTAKE_SAVINGS", "true"),
             ("ZIRV_CTX_JEV_REVIEW_REUSE", "true"),
+            ("ZIRV_CTX_JEV_HARVEST_SCREEN", "true"),
+            ("ZIRV_CTX_JEV_ADMIN_DISPATCH", "true"),
             ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
@@ -8601,6 +8621,8 @@ mod tests {
         assert!(cfg.jev.context);
         assert!(cfg.jev.intake_savings);
         assert!(cfg.jev.review_reuse);
+        assert!(cfg.jev.harvest_screen);
+        assert!(cfg.jev.admin_dispatch);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 
