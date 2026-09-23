@@ -3954,6 +3954,7 @@ gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_CONTEXT
 intake_savings = false # clarification category and optional planner; ZIRV_CTX_JEV_INTAKE_SAVINGS
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
+harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
@@ -3991,6 +3992,19 @@ local green-gate and successful tool-result evidence; after two consecutive
 advised skips, the helper judge runs. Crash advice sees repeatable failure
 signals, and review advice sees severity/category/overlap numbers, never the
 raw reason, finding text or path.
+
+`jev.harvest_screen` may skip an optional durable-memory-harvest generation
+call before it is made: the durable-harvest distiller itself, and, at a
+clean session exit, the handoff distillation that exists solely to feed it.
+It sees only local counts -- content size bucket, item count, duplicate
+ratio against the existing memory bank, existing entry count, path-like
+token count, and durable-fact-shape line count -- never the handoff text
+itself. A handoff with repeated tool errors, an explicit-remember marker, or
+overlap with an entry already protected as `source: explicit` is never even
+asked about; generation always runs for it. Otherwise, only a decisive "no
+new durable knowledge" answer skips generation; a disabled gate, a missing
+credential, or an uncertain/partial/failed answer all fall back to running
+generation exactly as before.
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
 directory under `zirv/ctx/`, never in the repo. Override with
@@ -4314,6 +4328,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.context` | `ZIRV_CTX_JEV_CONTEXT` |
 | `jev.intake_savings` | `ZIRV_CTX_JEV_INTAKE_SAVINGS` |
 | `jev.review_reuse` | `ZIRV_CTX_JEV_REVIEW_REUSE` |
+| `jev.harvest_screen` | `ZIRV_CTX_JEV_HARVEST_SCREEN` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |

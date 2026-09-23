@@ -3165,6 +3165,248 @@ fn write_durable(
     Ok(written)
 }
 
+// -- Issue #742: pre-harvest Jev screen ------------------------------------
+//
+// A conservative, operator-gated advisory that may skip an optional
+// generation call outright -- the durable-harvest distiller itself, or, at
+// a clean session exit, the handoff distillation that exists solely to feed
+// it (`distill_or_structural`'s own doc comment names "the memory-harvest
+// note" among its non-restart callers, so skipping it here is exactly as
+// safe as skipping the helper call it feeds). Only ever narrows: a decisive
+// "no new durable knowledge" answer skips generation, everything else --
+// disabled, missing credential, an uncertain/partial/failed answer, or any
+// of the deterministic protections below -- keeps today's path unchanged.
+
+/// The confidence floor a decisive "no" must clear, alongside
+/// [`jev::DEFAULT_MIN_MARGIN`]'s own margin floor. Deliberately named even
+/// though [`jev::Answer::decisive`] ignores `min_confidence` for a `Noul`
+/// answer (its own doc comment): the intent -- only ever act on a
+/// confidently negative verdict -- stays explicit in the call below rather
+/// than relying on a margin-only check that happens to have the same effect
+/// today.
+const HARVEST_SCREEN_MIN_CONFIDENCE: f32 = 0.8;
+
+/// The noul probability-of-"true" ceiling a decisive "no" must also clear
+/// before generation may be skipped.
+const HARVEST_SCREEN_MAX_NOUL_FOR_SKIP: f64 = 0.2;
+
+/// Bounded numeric-only metadata state (issue #746's egress boundary): one
+/// fact row, `[content size bucket 0-4, item count, duplicate ratio per
+/// mille against existing memory, existing memory entry count, path-like
+/// token count, durable-fact-shape line count]`.
+#[derive(Debug, Serialize)]
+struct HarvestScreenState {
+    _zirv_metadata_only: bool,
+    facts: Vec<Vec<u32>>,
+}
+
+/// Lowercased, whitespace-collapsed form of `text`, used only for local
+/// (never Jev-visible) duplicate/marker checks against other normalized
+/// text.
+fn normalize_for_dedup(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Buckets a byte count the same coarse way `compile.rs`'s own metadata
+/// callers already bucket report/description sizes.
+fn harvest_screen_size_bucket(bytes: usize) -> u32 {
+    match bytes {
+        0..=63 => 0,
+        64..=255 => 1,
+        256..=1023 => 2,
+        1024..=4095 => 3,
+        _ => 4,
+    }
+}
+
+/// Deterministic, no-Jev-call protection: this screen must never be trusted
+/// to skip generation when `lines` (already [`normalize_for_dedup`]'d)
+/// contains an explicit-remember marker, or overlaps an existing entry this
+/// codebase already treats as deliberately human-authored and protected
+/// (`source == "explicit"` -- the same rule `write_durable` already applies
+/// before ever letting a harvest overwrite one; see its own doc comment).
+fn harvest_screen_protected(lines: &[String], existing: &LoadedMemory) -> bool {
+    if lines
+        .iter()
+        .any(|line| line.split(' ').any(|word| word == "remember"))
+    {
+        return true;
+    }
+    existing
+        .shared
+        .iter()
+        .chain(existing.private.iter())
+        .chain(existing.global.iter())
+        .filter(|(_, entry)| entry.source == "explicit")
+        .any(|(_, entry)| {
+            let body = normalize_for_dedup(&entry.body);
+            !body.is_empty()
+                && lines
+                    .iter()
+                    .any(|line| line.contains(body.as_str()) || body.contains(line.as_str()))
+        })
+}
+
+/// What fraction (per mille) of `lines` already appears, verbatim after
+/// normalization, in an existing memory entry's body across every scope --
+/// a cheap, purely local stand-in for "is this session-only repetition"
+/// that never leaves the machine.
+fn harvest_screen_duplicate_permille(lines: &[String], existing: &LoadedMemory) -> u32 {
+    if lines.is_empty() {
+        return 0;
+    }
+    let bodies: std::collections::BTreeSet<String> = existing
+        .shared
+        .iter()
+        .chain(existing.private.iter())
+        .chain(existing.global.iter())
+        .map(|(_, entry)| normalize_for_dedup(&entry.body))
+        .filter(|body| !body.is_empty())
+        .collect();
+    let matches = lines
+        .iter()
+        .filter(|line| bodies.contains(line.as_str()))
+        .count();
+    ((matches as u64 * 1000) / lines.len() as u64).min(1000) as u32
+}
+
+fn harvest_screen_existing_entry_count(existing: &LoadedMemory) -> u32 {
+    (existing.shared.len() + existing.private.len() + existing.global.len()).min(1_000_000) as u32
+}
+
+fn harvest_screen_path_like_token_count(lines: &[String]) -> u32 {
+    lines
+        .iter()
+        .flat_map(|line| line.split(' '))
+        .filter(|token| token.contains('/') || token.contains('\\'))
+        .count()
+        .min(1_000_000) as u32
+}
+
+/// Coarse, count-only "reads like a durable fact" heuristic: the same style
+/// of word a gotcha/convention/invariant tends to use, never the words
+/// themselves sent to Jev -- only how many lines matched.
+const HARVEST_SCREEN_SHAPE_MARKERS: &[&str] = &["always", "never", "must", "gotcha", "because"];
+
+fn harvest_screen_durable_shape_count(lines: &[String]) -> u32 {
+    lines
+        .iter()
+        .filter(|line| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| HARVEST_SCREEN_SHAPE_MARKERS.contains(&word))
+        })
+        .count()
+        .min(1_000_000) as u32
+}
+
+/// The one seam both harvest-adjacent generation calls (the distiller
+/// itself, and -- at a clean exit -- the handoff distillation that only
+/// ever feeds it) screen through. `raw_lines` is the caller's own bounded,
+/// already-available text (never sent to Jev as text -- only the counts
+/// derived from it are); `item_id` ("helper" | "distill") tags which call
+/// this particular screen guarded, in `jev-effects.jsonl`.
+///
+/// Returns `true` only when: the gate and credential are both active, none
+/// of the deterministic protections above fired, and Jev answered with a
+/// decisive (confidence >= [`HARVEST_SCREEN_MIN_CONFIDENCE`], margin >=
+/// [`jev::DEFAULT_MIN_MARGIN`]) "no", with noul probability-of-"true" below
+/// [`HARVEST_SCREEN_MAX_NOUL_FOR_SKIP`]. Every other outcome -- disabled, no
+/// credential, a partial/uncertain/decisive-yes/failed answer -- returns
+/// `false`, leaving generation to run exactly as it does today.
+#[allow(clippy::too_many_arguments)]
+fn jev_harvest_prescreen<'a>(
+    raw_lines: impl Iterator<Item = &'a str>,
+    tool_errors_present: bool,
+    size_bucket: u32,
+    item_count: u32,
+    item_id: &'static str,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+) -> bool {
+    if !cfg.jev.harvest_screen || tool_errors_present || !jev::available(&cfg.proxy.typesafe) {
+        return false;
+    }
+    let lines: Vec<String> = raw_lines
+        .map(normalize_for_dedup)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let existing = load_all_scopes(repo, state, slug, cfg);
+    if harvest_screen_protected(&lines, &existing) {
+        return false;
+    }
+    let facts = vec![vec![
+        size_bucket,
+        item_count,
+        harvest_screen_duplicate_permille(&lines, &existing),
+        harvest_screen_existing_entry_count(&existing),
+        harvest_screen_path_like_token_count(&lines),
+        harvest_screen_durable_shape_count(&lines),
+    ]];
+    let advise_state = HarvestScreenState {
+        _zirv_metadata_only: true,
+        facts,
+    };
+    let questions = [jev::Question::metadata_noul(
+        "novel",
+        "Facts row 0 is [content size bucket 0-4, item count, duplicate ratio per mille against \
+         existing memory, existing memory entry count, path-like token count, durable-fact-shape \
+         line count]. Based only on these counts, does this material likely contain new durable \
+         repository knowledge not already recorded in memory? Answer true if uncertain.",
+        "likely contains new durable knowledge",
+        "unlikely to add anything not already recorded",
+    )];
+    let mut effect = jev::JevEffect::new("harvest", "helper_invoked");
+    effect.item_id = Some(item_id);
+    effect.baseline_count = Some(1);
+    match jev::advise_detailed(
+        cfg,
+        state,
+        "harvest",
+        cfg.jev.harvest_screen,
+        &advise_state,
+        &questions,
+    ) {
+        jev::AdvisoryStatus::Disabled | jev::AdvisoryStatus::MissingCredential => false,
+        jev::AdvisoryStatus::Answered(answers) => {
+            let Some(answer) = answers.get("novel") else {
+                effect.reason = Some("partial_answer");
+                jev::record_effect(cfg, state, cfg.jev.harvest_screen, &effect);
+                return false;
+            };
+            let decisive = answer.decisive(HARVEST_SCREEN_MIN_CONFIDENCE, jev::DEFAULT_MIN_MARGIN);
+            if decisive
+                && answer
+                    .as_noul()
+                    .is_some_and(|value| value < HARVEST_SCREEN_MAX_NOUL_FOR_SKIP)
+            {
+                let mut skip_effect = jev::JevEffect::new("harvest", "helper_skipped");
+                skip_effect.item_id = Some(item_id);
+                skip_effect.baseline_count = Some(1);
+                skip_effect.actual_count = Some(0);
+                jev::record_effect(cfg, state, cfg.jev.harvest_screen, &skip_effect);
+                return true;
+            }
+            effect.reason = Some(if decisive {
+                "decisive_yes"
+            } else {
+                "uncertain"
+            });
+            jev::record_effect(cfg, state, cfg.jev.harvest_screen, &effect);
+            false
+        }
+        jev::AdvisoryStatus::Failed => {
+            effect.reason = Some("failed");
+            jev::record_effect(cfg, state, cfg.jev.harvest_screen, &effect);
+            false
+        }
+    }
+}
+
 /// THE single durable-harvest entry point (issue #37): every one of the four
 /// call sites (exec.rs/wrap.rs, each with a restart seam and a
 /// clean-session-end seam) funnels through this one function, so a session
@@ -3212,6 +3454,33 @@ fn harvest_durable_with_tool_errors(
     cfg: &CtxConfig,
 ) -> CtxResult<usize> {
     if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
+        return Ok(0);
+    }
+    // Issue #742: a conservative, Jev-screened decision of whether this
+    // handoff is worth a real distiller call at all, checked before the
+    // model is touched -- see `jev_harvest_prescreen`'s own doc comment.
+    if jev_harvest_prescreen(
+        handoff
+            .gotchas
+            .iter()
+            .chain(handoff.files_modified.iter())
+            .map(String::as_str),
+        tool_errors.is_some_and(|errors| !errors.is_empty()),
+        harvest_screen_size_bucket(
+            handoff.gotchas.iter().map(String::len).sum::<usize>()
+                + handoff
+                    .files_modified
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+        ),
+        (handoff.gotchas.len() + handoff.files_modified.len()).min(1_000_000) as u32,
+        "helper",
+        repo,
+        state,
+        slug,
+        cfg,
+    ) {
         return Ok(0);
     }
     let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
@@ -3300,6 +3569,30 @@ pub fn harvest_at_session_end(
     cfg: &CtxConfig,
 ) -> CtxResult<usize> {
     if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
+        return Ok(0);
+    }
+    // Issue #742: screens the clean-exit distillation itself, not just the
+    // helper call it feeds -- safe because this call exists solely to build
+    // `note` below (see `distill_or_structural`'s own doc comment naming
+    // "the memory-harvest note" among its non-restart callers, unlike the
+    // genuinely restart-bound `wrap::pump` call site).
+    if jev_harvest_prescreen(
+        ctx.user_messages
+            .iter()
+            .chain(ctx.assistant_texts.iter())
+            .flat_map(|text| text.lines()),
+        !ctx.tool_errors.is_empty(),
+        harvest_screen_size_bucket(
+            ctx.user_messages.iter().map(String::len).sum::<usize>()
+                + ctx.assistant_texts.iter().map(String::len).sum::<usize>(),
+        ),
+        (ctx.files_read.len() + ctx.files_modified.len()).min(1_000_000) as u32,
+        "distill",
+        repo,
+        state,
+        slug,
+        cfg,
+    ) {
         return Ok(0);
     }
     let previous = super::handoff::latest_for_repo(state, repo)
@@ -7537,6 +7830,332 @@ This is part of the body too.\n";
             list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
                 .expect("list")
                 .is_empty()
+        );
+    }
+
+    // Issue #742: the pre-harvest Jev screen (`jev_harvest_prescreen`).
+
+    fn harvest_screen_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        cfg.jev.harvest_screen = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// A decisive "no new durable knowledge" noul answer (0.05, margin 0.9)
+    /// must skip the distiller call outright -- `PanicOnDistillAdapter`
+    /// proves it, since `helper_answer` falls through to `adapter.
+    /// distiller_cmd` for any non-native model call and that panics if ever
+    /// reached -- and record a `helper_skipped` effect.
+    #[test]
+    fn harvest_screen_decisive_no_skips_the_helper_and_records_the_effect() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let body = r#"{"model": "jev-latest", "answers": {
+            "novel": {"type": "noul", "noul": 0.05}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "MEMORY_TEST_HARVEST_SCREEN_DECISIVE_NO";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = harvest_screen_test_cfg(url, credential_env);
+        let adapter = PanicOnDistillAdapter;
+
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("a screened-out harvest is not an error, just a no-op");
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert_eq!(count, 0);
+        assert!(
+            list_scoped(MemoryScope::Shared, repo.path(), &state, "-work-repo", &cfg)
+                .expect("list")
+                .is_empty()
+        );
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("an effect must be recorded");
+        assert!(
+            effects.contains("\"action\":\"helper_skipped\"")
+                && effects.contains("\"baseline_count\":1")
+                && effects.contains("\"actual_count\":0"),
+            "got {effects}"
+        );
+    }
+
+    /// A decisive "likely new" noul answer (0.95, margin 0.9) must NOT skip:
+    /// the fake-model adapter's `harvest` mode proves the distiller actually
+    /// ran by writing real entries.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_screen_decisive_yes_calls_the_helper() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let body = r#"{"model": "jev-latest", "answers": {
+            "novel": {"type": "noul", "noul": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "MEMORY_TEST_HARVEST_SCREEN_DECISIVE_YES";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = harvest_screen_test_cfg(url, credential_env);
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
+
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(count > 0, "the fixture answers with well-formed facts");
+    }
+
+    /// The gate off (the default) must make no Jev request at all -- no
+    /// decisions log, no new cache write, no effect -- even with a warm
+    /// cache entry already sitting in `jev-cache`, and generation must run
+    /// exactly as if this screen did not exist.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_screen_off_makes_no_request_even_with_a_warm_cache_entry() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.harvest = true;
+        assert!(!cfg.jev.harvest_screen, "sanity: the screen defaults off");
+        let cache_dir = state.root().join("jev-cache");
+        std::fs::create_dir_all(&cache_dir).expect("seed cache dir");
+        std::fs::write(cache_dir.join("warm.json"), "not a real cache entry")
+            .expect("seed a warm cache file");
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
+
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        assert!(
+            count > 0,
+            "generation must proceed exactly as if the screen did not exist"
+        );
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+        assert_eq!(
+            std::fs::read_dir(&cache_dir)
+                .expect("read cache dir")
+                .count(),
+            1,
+            "the only file in jev-cache must still be the pre-seeded one"
+        );
+    }
+
+    /// The credential missing, even with the gate on, must behave exactly
+    /// like the gate being off: no request, no decisions/cache/effects.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_screen_missing_credential_is_the_same_parity_as_gate_off() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let credential_env = "MEMORY_TEST_HARVEST_SCREEN_NO_CREDENTIAL";
+        // SAFETY (test-only): a unique env var name this test owns, and it
+        // is never set here -- the whole point is an absent credential.
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        let mut cfg = harvest_screen_test_cfg("http://127.0.0.1:9".to_string(), credential_env);
+        cfg.proxy.typesafe.timeout_secs = 1;
+        let cache_dir = state.root().join("jev-cache");
+        std::fs::create_dir_all(&cache_dir).expect("seed cache dir");
+        std::fs::write(cache_dir.join("warm.json"), "not a real cache entry")
+            .expect("seed a warm cache file");
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
+
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        assert!(count > 0);
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+        assert_eq!(
+            std::fs::read_dir(&cache_dir)
+                .expect("read cache dir")
+                .count(),
+            1,
+            "the only file in jev-cache must still be the pre-seeded one"
+        );
+    }
+
+    /// A thin-margin ("uncertain") noul answer (0.45) must fall through to
+    /// the helper exactly like an unanswered question would.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_screen_falls_back_to_the_helper_on_an_uncertain_answer() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let body = r#"{"model": "jev-latest", "answers": {
+            "novel": {"type": "noul", "noul": 0.45}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "MEMORY_TEST_HARVEST_SCREEN_UNCERTAIN";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = harvest_screen_test_cfg(url, credential_env);
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
+
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(count > 0, "an uncertain answer must never skip generation");
+    }
+
+    /// A transport/HTTP error (a 500) must fall through to the helper
+    /// exactly like every other Jev-gated site's own 500 fallback.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_screen_falls_back_to_the_helper_on_a_500() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let credential_env = "MEMORY_TEST_HARVEST_SCREEN_500";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = harvest_screen_test_cfg(url, credential_env);
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
+
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &sample_handoff(),
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+        assert!(count > 0, "a 500 must never skip generation");
+    }
+
+    /// Explicit-remember material (the literal word "remember" in a
+    /// gotcha) must never even be asked about: the deterministic guard
+    /// fires before any Jev call, so an unreachable endpoint (a refused
+    /// connection, not a timeout) never produces a `jev-decisions.jsonl`
+    /// line, and generation still runs normally.
+    #[cfg(unix)]
+    #[test]
+    fn harvest_screen_never_asks_or_skips_for_explicit_remember_material() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let credential_env = "MEMORY_TEST_HARVEST_SCREEN_EXPLICIT_REMEMBER";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        // Refused, not merely slow: a real attempt fails fast rather than
+        // hanging out the test's own timeout, so this stays a fast test.
+        let mut cfg = harvest_screen_test_cfg("http://127.0.0.1:9".to_string(), credential_env);
+        cfg.proxy.typesafe.timeout_secs = 1;
+        let mut handoff = sample_handoff();
+        handoff
+            .gotchas
+            .push("remember to run migrations before tests".to_string());
+        let adapter = fake_model_adapter();
+        let _mode =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FAKE_MODEL_MODE", Some("harvest"))]);
+
+        let count = harvest_durable(
+            &adapter,
+            "haiku",
+            &handoff,
+            repo.path(),
+            &state,
+            "-work-repo",
+            &cfg,
+        )
+        .expect("harvests");
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert!(count > 0, "explicit-remember material must never skip");
+        assert!(
+            !state.root().join("jev-decisions.jsonl").exists(),
+            "explicit-remember material must never even be asked about"
         );
     }
 
