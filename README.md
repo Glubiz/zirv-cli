@@ -1001,34 +1001,10 @@ to the section that documents it in depth.
 
 ### What wrapping costs (measured)
 
-Current grid (2026-09-23, zirv 4.21.0): 195 headless runs of 15 tasks
-(t01-t12 small, t13-t15 large multi-module features/bug sweeps, 10-25 min,
-hidden tests) against vanilla `claude -p` with the obra/superpowers plugin
-loaded, both sides given the same "finish it yourself, nobody will answer
-questions" notice. Change is zirv relative to vanilla; 95% intervals are
-paired bootstraps over task×rep; large-task cells are n=9 (Sonnet) or n=6
-(Haiku) per condition and indicative only.
-
-| Grid | Wall Δ | Cost Δ | Score Δ |
-|---|---|---|---|
-| Sonnet, small (t01-t12, n=36) | -6% | -1% | +8% |
-| Sonnet, large (t13-t15, n=9) | **-41%** | **-51%** | -12% |
-| Haiku, small (n=24) | +9% | +7% | +13% |
-| Haiku, large (n=6) | -7% | -21% | **+44%** |
-
-`zirv-proxy` (Jev-routed model/seat/workflow selection) does better still on
-large Sonnet tasks -- **-64%** cost, -27% wall, only -8% score -- by routing
-some work to cheaper seats. The large-task score losses are real: obra/
-superpowers' brainstorm/TDD discipline lets vanilla Sonnet hit a perfect
-1.000 there, where zirv modified a protected test file on one t14 run
-(forced to 0) and passed hidden tests only partially on others. Much of
-zirv's score *lead* elsewhere is not code quality: vanilla+superpowers still
-stopped to ask for approval instead of finishing in 8 of 75 runs despite the
-notice, scoring near zero on each; zirv never did. This is still a headless,
-single-session benchmark and says nothing about the long sessions zirv's
-rot-scoring and restart features target. Full protocol, per-task tables,
-history of two earlier (less comparable) grids, the harness and raw per-run
-CSVs: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
+In a headless benchmark against Claude Code with a popular skills plugin,
+zirv was **up to 41% faster** and **up to 51% cheaper** (Sonnet, larger
+multi-module tasks). Protocol, per-task results and the harness:
+[docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
 
 ### Development workflow commands
 
