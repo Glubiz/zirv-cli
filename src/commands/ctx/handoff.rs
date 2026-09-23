@@ -1474,11 +1474,31 @@ fn carry_forward_undistillable(mut handoff: Handoff, previous: Option<&Handoff>)
 /// Issue #537 (A4): from a live 2026-09-18 probe.
 const HANDOFF_THIN_FLOOR: f32 = 0.9;
 
+/// Bounded numeric-only metadata state (issue #759's re-projection onto the
+/// `jev::safe_metadata_request` egress boundary issue #746 established):
+/// one fact row, `[task text size in bytes, next-step text size in bytes,
+/// constraints text size in bytes, files-modified count, blocked/open-
+/// question count]`. Never the handoff's own task/next-step/constraint text.
 #[derive(Debug, serde::Serialize)]
 struct HandoffQualityState {
-    task: String,
-    next_step: String,
-    constraints: String,
+    _zirv_metadata_only: bool,
+    facts: Vec<Vec<u32>>,
+}
+
+/// Static instructions naming the facts row order above -- see
+/// [`HandoffQualityState`]'s own doc comment.
+const HANDOFF_QUALITY_INSTRUCTIONS: &str = "Facts row 0 is [task text size in bytes, next \
+    step text size in bytes, constraints text size in bytes, files-modified count, blocked/\
+    open-question count]. A restarted session needs enough task, next-step, and constraint \
+    detail, plus at least one touched file, to continue without re-deriving everything from \
+    scratch or waiting on an open question. Based only on these counts, could a restarted \
+    session actually continue this task from this handoff alone?";
+
+/// Bounds any locally computed length into the `safe_metadata_request`
+/// numeric ceiling (1,000,000) the same way every other metadata-only call
+/// site in this crate already clamps its own counts.
+fn bounded_len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX).min(1_000_000)
 }
 
 /// Issue #537 (A4): `Handoff::is_usable`'s own deterministic check (non-
@@ -1491,15 +1511,30 @@ struct HandoffQualityState {
 /// no credential, any transport/parse error -- `jev::advise`'s own contract)
 /// leaves today's usability verdict (`true`, since the caller only reaches
 /// this after `is_usable()` already passed) unchanged.
+///
+/// Issue #759: since issue #746's `jev::safe_metadata_request` egress
+/// boundary, the free-text state this function used to send (task/next-
+/// step/constraints, up to 2 KB each) was rejected before any cache read or
+/// network call -- this gate's own `[jev] supervisor` key was a dead
+/// deny-only fallback end to end. Re-projected onto the same
+/// `_zirv_metadata_only`/`facts` contract every other `[jev]`-gated site
+/// uses: five locally computed integers (see [`HandoffQualityState`]),
+/// never the handoff's own text.
 fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> bool {
+    let facts = vec![vec![
+        bounded_len(handoff.task.len()),
+        bounded_len(handoff.next_step.len()),
+        bounded_len(handoff.constraints.iter().map(String::len).sum()),
+        bounded_len(handoff.files_modified.len()),
+        bounded_len(handoff.blocked.len()),
+    ]];
     let advise_state = HandoffQualityState {
-        task: crate::utils::truncate_bytes(handoff.task.clone(), Some(2 * 1024)),
-        next_step: crate::utils::truncate_bytes(handoff.next_step.clone(), Some(2 * 1024)),
-        constraints: crate::utils::truncate_bytes(handoff.constraints.join("\n"), Some(2 * 1024)),
+        _zirv_metadata_only: true,
+        facts,
     };
-    let questions = [jev::Question::choice(
+    let questions = [jev::Question::metadata_choice(
         "quality",
-        "Could a restarted session actually continue this task from this handoff alone?",
+        HANDOFF_QUALITY_INSTRUCTIONS,
         &[
             (
                 "thin",
@@ -2148,18 +2183,34 @@ mod tests {
         cfg
     }
 
-    /// A legacy handoff contains free-form task and constraint text. The
-    /// shared privacy guard keeps the distilled handoff and stops before
-    /// cache or network I/O even with the supervisor gate and key present.
+    /// Issue #759: since issue #746's `jev::safe_metadata_request` egress
+    /// boundary, the free-text state this call used to send (task/next-
+    /// step/constraints) was rejected before any cache read or network
+    /// call -- the old version of this test (`..._rejects_legacy_handoff_
+    /// without_egress`) proved exactly that rejection, which made the
+    /// `[jev] supervisor` gate a dead deny-only fallback end to end. This
+    /// is the success path re-projecting `jev_handoff_is_thin` onto
+    /// metadata-only facts makes reachable: a decisive "thin" verdict
+    /// demotes a `"distilled"` handoff to `"structural"`, and the request
+    /// actually reaching this fake server (the `.join()` below, plus the
+    /// recorded decision line) is what proves the request `jev_handoff_
+    /// is_thin` builds passes `safe_metadata_request` -- an unsafe state
+    /// returns `UnsafeState` before any connection is ever opened (`jev::
+    /// ask`'s own doc comment).
     #[test]
-    fn distill_or_structural_with_jev_rejects_legacy_handoff_without_egress() {
+    fn distill_or_structural_with_jev_enabled_demotes_a_decisive_thin_verdict() {
         let adapter = fake_model_adapter();
-        let credential_env = "HANDOFF_TEST_JEV_PRIVACY";
+        let body = r#"{"model": "jev-latest", "answers": {
+            "quality": {"type": "choice", "choice": "thin",
+                        "probabilities": {"thin": 0.95, "adequate": 0.05}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_METADATA_759";
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
             std::env::set_var(credential_env, "secret");
         }
-        let cfg = jev_test_cfg("http://127.0.0.1:0".to_string(), credential_env);
+        let cfg = jev_test_cfg(url, credential_env);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
@@ -2177,10 +2228,18 @@ mod tests {
         unsafe {
             std::env::remove_var(credential_env);
         }
-        assert_eq!(source, "distilled");
-        assert_eq!(handoff.task, "Ship the webhook");
-        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
-        assert!(!state_dir.path().join("jev-cache.jsonl").exists());
+        handle.join().expect("server thread must not panic");
+        assert_eq!(source, "structural");
+        assert_eq!(
+            handoff.task, "ship the webhook",
+            "demoted to the structural fallback built from the last user prompt"
+        );
+        let decisions = std::fs::read_to_string(state_dir.path().join("jev-decisions.jsonl"))
+            .expect("a real call must have reached the fake server and been recorded");
+        assert!(
+            decisions.contains("\"site\":\"handoff\""),
+            "got {decisions}"
+        );
     }
 
     /// The gate off must be byte-identical to calling `distill_or_structural`
