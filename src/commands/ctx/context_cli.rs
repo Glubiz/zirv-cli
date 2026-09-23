@@ -359,7 +359,26 @@ fn import_one(
 /// caps it, not silently truncated to something smaller.
 const REPORT_MAX_SURFACE_BYTES: usize = 200_000;
 
-fn run_report<W: Write>(w: &mut W, repo: &Path) -> CtxResult<i32> {
+/// Issue #754: whether `native_path` is a zirv-managed file whose bytes no
+/// longer match a fresh render of the current canonical sources -- the exact
+/// condition that makes `compile.rs`'s `native_file_already_carries_
+/// canonical` return `false` and re-inject the canonical layer on top of
+/// what the native file already (almost) carries. `false` for anything that
+/// is not itself already a managed file: missing or hand-maintained is a
+/// different state, not "stale", and is `--report`'s drift/compatibility
+/// section's job to surface, not `--check`'s.
+fn managed_native_is_stale(
+    native_path: &Path,
+    common: Option<&str>,
+    harness: Option<&str>,
+) -> bool {
+    let Ok(native_text) = fs::read_to_string(native_path) else {
+        return false;
+    };
+    is_managed(&native_text) && native_text != render_generated(common, harness)
+}
+
+fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
     writeln!(
         w,
         "zirv context sync --report (read-only; nothing on disk is changed)\n"
@@ -443,6 +462,49 @@ fn run_report<W: Write>(w: &mut W, repo: &Path) -> CtxResult<i32> {
          native files."
     )?;
 
+    // Issue #754: `--check` is a CI gate on canonical drift -- a managed
+    // native file whose bytes no longer match what `.zirv/context/` would
+    // render today. Computed unconditionally-cheap (two file reads) but only
+    // acted on (printed, folded into the exit code) when asked, so a plain
+    // `zirv context sync`/`--report` keeps its existing output and exit
+    // code exactly.
+    let common = fs::read_to_string(context::common_path(repo)).ok();
+    let mut stale_native_files: Vec<&str> = Vec::new();
+    for (label, canonical_path, native_path) in [
+        (
+            "CLAUDE.md",
+            context::claude_path(repo),
+            native_claude_path(repo),
+        ),
+        (
+            "AGENTS.md",
+            context::codex_path(repo),
+            native_codex_path(repo),
+        ),
+    ] {
+        let harness = fs::read_to_string(&canonical_path).ok();
+        if managed_native_is_stale(&native_path, common.as_deref(), harness.as_deref()) {
+            stale_native_files.push(label);
+        }
+    }
+    if check {
+        if stale_native_files.is_empty() {
+            writeln!(
+                w,
+                "\n--check: every zirv-managed native file matches the canonical context"
+            )?;
+        } else {
+            writeln!(
+                w,
+                "\n--check: {} zirv-managed native file(s) have drifted from the canonical \
+                 context (dedupe will not fire for them, so the canonical layer is injected \
+                 twice every session): {}. Run `zirv context sync --generate` to refresh.",
+                stale_native_files.len(),
+                stale_native_files.join(", ")
+            )?;
+        }
+    }
+
     // Issue #275: CTX001 (budget headroom) and CTX005 (dedupe leak) are the
     // two `zirv context lint` findings wired into this gate as errors --
     // every other finding (CTX002/CTX003/CTX004) stays advisory-only and is
@@ -477,7 +539,13 @@ fn run_report<W: Write>(w: &mut W, repo: &Path) -> CtxResult<i32> {
         }
     }
 
-    Ok(if blocking.is_empty() { 0 } else { 1 })
+    Ok(
+        if blocking.is_empty() && (!check || stale_native_files.is_empty()) {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 fn run_generate<W: Write>(w: &mut W, repo: &Path, force: bool) -> CtxResult<i32> {
@@ -1030,6 +1098,17 @@ pub struct SyncArgs {
     /// default report mode.
     #[arg(long)]
     pub force: bool,
+    /// Issue #754: with the default report mode, also fail (non-zero exit)
+    /// when a zirv-managed `CLAUDE.md`/`AGENTS.md` no longer byte-matches a
+    /// fresh render of the current canonical `.zirv/context/` sources --
+    /// i.e. the same drift that silently disables `compile.rs`'s dedupe and
+    /// doubles the canonical layer into every session. A CI gate: `zirv
+    /// context sync --check` exits non-zero exactly when `--generate` would
+    /// have something to write. Rejected together with `--import`/
+    /// `--generate`/`--init-zirv-md`, which already have their own exit-code
+    /// contract.
+    #[arg(long, conflicts_with_all = ["import", "generate", "init_zirv_md"])]
+    pub check: bool,
 }
 
 enum SyncMode {
@@ -1053,7 +1132,7 @@ fn mode(args: &SyncArgs) -> SyncMode {
 
 pub fn run_with<W: Write>(args: &SyncArgs, w: &mut W, repo: &Path) -> CtxResult<i32> {
     match mode(args) {
-        SyncMode::Report => run_report(w, repo),
+        SyncMode::Report => run_report(w, repo, args.check),
         SyncMode::Import => run_import(w, repo, args.force),
         SyncMode::Generate => run_generate(w, repo, args.force),
         SyncMode::InitZirvMd => run_init_zirv_md(w, repo, args.force),
@@ -1181,6 +1260,17 @@ mod tests {
             generate: false,
             init_zirv_md: false,
             force: false,
+            check: false,
+        }
+    }
+    fn check_args() -> SyncArgs {
+        SyncArgs {
+            report: false,
+            import: false,
+            generate: false,
+            init_zirv_md: false,
+            force: false,
+            check: true,
         }
     }
     fn import_args(force: bool) -> SyncArgs {
@@ -1190,6 +1280,7 @@ mod tests {
             generate: false,
             init_zirv_md: false,
             force,
+            check: false,
         }
     }
     fn generate_args(force: bool) -> SyncArgs {
@@ -1199,6 +1290,7 @@ mod tests {
             generate: true,
             init_zirv_md: false,
             force,
+            check: false,
         }
     }
     fn init_zirv_md_args(force: bool) -> SyncArgs {
@@ -1208,6 +1300,7 @@ mod tests {
             generate: false,
             init_zirv_md: true,
             force,
+            check: false,
         }
     }
 
@@ -1444,6 +1537,7 @@ mod tests {
                 generate: false,
                 init_zirv_md: false,
                 force: false,
+                check: false,
             },
             dir.path(),
         );
@@ -1954,5 +2048,58 @@ mod tests {
         write_canonical(dir.path(), "common.md", "short and sweet");
         let (code, _) = run_sync(&report_args(), dir.path());
         assert_eq!(code, 0);
+    }
+
+    // -- --check: issue #754's CI gate on canonical drift -------------------
+
+    #[test]
+    fn sync_check_exits_nonzero_when_a_managed_native_file_has_drifted() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "original instructions");
+        // Generate CLAUDE.md/AGENTS.md from the current canonical content,
+        // then move the canonical source on -- the same drift issue #754
+        // describes (CLAUDE.md generated before a later common.md edit).
+        let (code, _) = run_sync(&generate_args(false), dir.path());
+        assert_eq!(code, 0);
+        write_canonical(dir.path(), "common.md", "updated instructions");
+
+        let (code, out) = run_sync(&check_args(), dir.path());
+        assert_eq!(code, 1, "got {out}");
+        assert!(out.contains("CLAUDE.md"), "got {out}");
+        assert!(out.contains("AGENTS.md"), "got {out}");
+    }
+
+    #[test]
+    fn sync_check_stays_zero_when_managed_native_files_match_canonical() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "current instructions");
+        let (code, _) = run_sync(&generate_args(false), dir.path());
+        assert_eq!(code, 0);
+
+        let (code, out) = run_sync(&check_args(), dir.path());
+        assert_eq!(code, 0, "got {out}");
+    }
+
+    #[test]
+    fn sync_check_stays_zero_when_no_native_files_exist_yet() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "not yet generated");
+        let (code, out) = run_sync(&check_args(), dir.path());
+        assert_eq!(code, 0, "got {out}");
+    }
+
+    #[test]
+    fn plain_report_exit_code_is_unaffected_by_drift_that_check_would_catch() {
+        let (dir, _guard) = repo();
+        write_canonical(dir.path(), "common.md", "original instructions");
+        let (code, _) = run_sync(&generate_args(false), dir.path());
+        assert_eq!(code, 0);
+        write_canonical(dir.path(), "common.md", "updated instructions");
+
+        let (code, _) = run_sync(&report_args(), dir.path());
+        assert_eq!(
+            code, 0,
+            "--report without --check must keep its existing exit-code contract"
+        );
     }
 }

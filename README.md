@@ -203,6 +203,17 @@ with only `AGENTS.md` needs no migration at all: `zirv context sync
 plan — a `ZIRV.md` containing just `@AGENTS.md` — for anyone who would rather
 link than duplicate.
 
+**Canonical context can drift silently.** `compile.rs` dedupes the canonical
+`.zirv/context/` layer out of a session's prefix only when a managed
+`CLAUDE.md`/`AGENTS.md` byte-for-byte proves it already carries the current
+render — edit `.zirv/context/common.md` without regenerating, and that proof
+fails, so the canonical layer (several KB) is injected twice every session
+with no error, just a warning on `zirv ctx compile --measure`. `zirv context
+sync --check` is the CI-friendly form of `--report`: same read-only report,
+but it also exits non-zero when a managed native file has drifted from the
+canonical sources it claims to render, so a CI step can catch a forgotten
+`zirv context sync --generate` before it merges.
+
 ### `zirv chat` and `zirv agent`
 
 `zirv chat` and `zirv agent` are shorter top-level aliases for `zirv ctx

@@ -71,6 +71,15 @@ jobs:
       - name: Build Binary
         run: cargo build
 
+      # Issue #754: catches canonical context drift before it ships -- a
+      # CLAUDE.md/AGENTS.md regenerated from an older `.zirv/context/` than
+      # what is on this branch silently disables compile.rs's dedupe and
+      # injects the canonical layer twice every session. `--check` fails the
+      # PR the moment a managed native file no longer byte-matches a fresh
+      # render of the current canonical sources.
+      - name: Context sync drift gate (issue #754)
+        run: ./target/debug/zirv context sync --check
+
       # Issue #407: the README's "## Features" section is written by hand
       # against the real command surface, so this gate fails the PR the moment
       # a verb `zirv commands --json` reports (depth-1 or depth-2, e.g.
