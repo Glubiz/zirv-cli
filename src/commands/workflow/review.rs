@@ -2271,6 +2271,11 @@ pub enum ReviewCommand {
     IngestPrComments(IngestPrCommentsArgs),
     /// Record a concrete review finding.
     Add(AddFindingArgs),
+    /// Record a completed independent review run that happened outside
+    /// `review run` -- e.g. a same-harness orchestrator seat's native
+    /// subagent review (issue #685) -- so it counts toward the same fresh
+    /// independent review run gate.
+    Record(RecordReviewArgs),
     /// Update a finding's final disposition.
     Dispose(DisposeFindingArgs),
     /// List findings and their dispositions.
@@ -2349,6 +2354,24 @@ pub struct AddFindingArgs {
     pub path: Option<PathBuf>,
     #[arg(long)]
     pub line: Option<u32>,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordReviewArgs {
+    pub workflow_id: String,
+    /// Identifies this reviewer for the same freshness/gate bookkeeping
+    /// `review run`'s own `--agent` feeds. The native subagent tool has no
+    /// adapter name of its own, so this is typically a model name.
+    #[arg(long)]
+    pub model: String,
+    /// Ids of findings already filed with `review add` that this run
+    /// covers. Optional -- a clean run may cover zero -- but each id given
+    /// must already exist, so a typo or a forgotten `review add` cannot
+    /// silently satisfy the gate with no matching finding on record.
+    #[arg(long = "finding")]
+    pub findings: Vec<String>,
     #[arg(long)]
     pub repo: Option<PathBuf>,
 }
@@ -3687,6 +3710,109 @@ fn run_independent_review(
     Ok(round_exit_code(&outcome, code))
 }
 
+/// `zirv workflow review record` (issue #685): registers a completed
+/// independent review that happened on the native subagent tool rather than
+/// one this process itself launched via `review run` -- the path a
+/// same-harness orchestrator seat needs, since it is refused from `review
+/// run --agent <its own harness>` (`same_harness_refusal` in `ctx::agent`)
+/// and must instead delegate through the harness's own native subagent tool.
+///
+/// Reuses exactly the freshness rule the gate itself checks
+/// (`engine::advance`'s `review_evidence.iter().filter(|e|
+/// e.change_fingerprint == fingerprint)`): the pushed `ReviewRunEvidence`
+/// carries the SAME `verification::change_fingerprint` computation a `review
+/// run` package captures, so it counts toward the required run count under
+/// precisely the same staleness rule.
+fn record_independent_review(args: &RecordReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
+    let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
+    if required_independent_reviews_for(&state) == 0 {
+        return Err(
+            "workflow policy selects self-verification; an independent reviewer is not required"
+                .into(),
+        );
+    }
+    if state.status != WorkflowStatus::Running
+        || state.current().map(|step| step.phase) != Some(super::skill::WorkflowPhase::Review)
+    {
+        return Err("independent review can only be recorded during an active review step".into());
+    }
+    let model = args.model.trim();
+    if model.is_empty() {
+        return Err("--model must not be empty".into());
+    }
+    for finding_id in &args.findings {
+        if !state
+            .review_findings
+            .iter()
+            .any(|finding| &finding.id == finding_id)
+        {
+            return Err(format!(
+                "finding '{finding_id}' not found; record it first with `zirv workflow review add`"
+            )
+            .into());
+        }
+    }
+    let fingerprint = verification::change_fingerprint(&state.repo)?;
+    let review_round = review_round(&state, fingerprint);
+    let head_sha = git(&state.repo, &["rev-parse", "HEAD"]).ok();
+    let reviewed_tree_sha = compute_reviewed_tree_sha(&state.repo).ok();
+    let finding_dispositions = state
+        .review_findings
+        .iter()
+        .map(|finding| (finding.id.clone(), finding.disposition))
+        .collect();
+    let evidence_id = uuid::Uuid::new_v4().to_string();
+    let adapter = format!("native-subagent:{model}");
+    state.review_evidence.push(ReviewRunEvidence {
+        id: evidence_id.clone(),
+        change_fingerprint: fingerprint,
+        adapter: adapter.clone(),
+        review_round,
+        completed_at: now_secs(),
+        head_sha,
+        reviewed_tree_sha,
+        finding_dispositions,
+        jev_dedup_converged_for: None,
+    });
+    let overflow = state
+        .review_evidence
+        .len()
+        .saturating_sub(MAX_REVIEW_EVIDENCE);
+    if overflow > 0 {
+        state.review_evidence.drain(..overflow);
+    }
+    state.updated_at = now_secs();
+    save_state(&state_dir, &state)?;
+    let (total, meaningful, dismissed) = super::telemetry::finding_counts(&state.review_findings);
+    let mut event =
+        super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::ReviewRun);
+    event.workflow_id = Some(state.id.clone());
+    event.phase = Some(super::skill::WorkflowPhase::Review);
+    event.intent = Some(state.classification.intent);
+    event.complexity = Some(state.classification.complexity);
+    event.risk = Some(state.classification.risk);
+    event.work_domain = Some(state.classification.work_domain.domain);
+    event.adapter = Some(adapter);
+    event.succeeded = Some(true);
+    event.findings_total = total;
+    event.findings_meaningful = meaningful;
+    event.findings_dismissed = dismissed;
+    event.worker_count = 1;
+    let _ = super::telemetry::record(
+        &state_dir,
+        &state.repo,
+        &event,
+        &super::telemetry::TelemetryConfig::for_repo(&state.repo),
+    );
+    writeln!(
+        writer,
+        "recorded independent review {evidence_id} (model {model}, round {review_round}, {} \
+         finding(s))",
+        args.findings.len()
+    )?;
+    Ok(0)
+}
+
 pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
     match &args.command {
         ReviewCommand::Package(args) => {
@@ -3827,6 +3953,9 @@ pub fn run(args: &ReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
             record_finding_update(&state_dir, &state);
             remember_finding_disposition(&state_dir, &state, &finding);
             writeln!(writer, "{}", finding.id)?;
+        }
+        ReviewCommand::Record(args) => {
+            return record_independent_review(args, writer);
         }
         ReviewCommand::Dispose(args) => {
             let (state_dir, state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
@@ -4133,6 +4262,116 @@ mod tests {
         assert!(
             String::from_utf8(out).unwrap().contains("dashboard pane"),
             "the operator is told why no evidence was recorded"
+        );
+    }
+
+    /// Issue #685: a same-harness orchestrator seat is refused from `review
+    /// run --agent <its own harness>`, so it reviews on the native subagent
+    /// tool instead and must be able to record the completed run through
+    /// `review record` -- and that recorded run must satisfy the SAME
+    /// `engine::advance` gate a `review run` invocation's own evidence does.
+    #[test]
+    fn a_recorded_native_review_counts_toward_the_advance_gate() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        // SAFETY: this suite runs single-threaded (`--test-threads=1`).
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let mut state = review_workflow(repo.path(), &state_dir);
+        state.review_findings.push(ReviewFinding {
+            id: "native-1".into(),
+            severity: FindingSeverity::Minor,
+            summary: "found by the native subagent review".into(),
+            path: None,
+            line: None,
+            disposition: FindingDisposition::Fixed,
+            recommended_disposition: None,
+            advisory_disposition: None,
+            advisory_confidence: None,
+            duplicate_of: None,
+            created_at: now_secs(),
+        });
+        engine::save(&state_dir, &state, true).unwrap();
+
+        let args = RecordReviewArgs {
+            workflow_id: state.id.clone(),
+            model: "claude-opus-4-1".into(),
+            findings: vec!["native-1".into()],
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let mut out = Vec::new();
+        let code = record_independent_review(&args, &mut out);
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert_eq!(code.expect("the run records"), 0);
+
+        let stored = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        assert_eq!(stored.review_evidence.len(), 1);
+        assert_eq!(
+            stored.review_evidence[0].change_fingerprint,
+            verification::change_fingerprint(repo.path()).unwrap()
+        );
+        assert!(
+            stored.review_evidence[0]
+                .adapter
+                .contains("claude-opus-4-1"),
+            "the model is recorded on the evidence: {:?}",
+            stored.review_evidence[0]
+        );
+
+        let advanced = engine::advance_with_evidence(
+            &state_dir,
+            stored,
+            engine::StepOutcome::Success,
+            None,
+            false,
+        )
+        .expect("a recorded native review must satisfy the review gate");
+        assert_ne!(
+            advanced.current().map(|step| step.phase),
+            Some(crate::commands::workflow::skill::WorkflowPhase::Review),
+            "the workflow must have moved past review: {:?}",
+            advanced.current()
+        );
+    }
+
+    /// A `--finding` id that was never filed with `review add` must be
+    /// refused, not silently ignored -- an operator recording a run against
+    /// the wrong id would otherwise satisfy the gate with no matching
+    /// finding on the workflow at all.
+    #[test]
+    fn record_refuses_an_unknown_finding_id() {
+        let repo = git_repo();
+        let root = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, root.path());
+        }
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = review_workflow(repo.path(), &state_dir);
+
+        let args = RecordReviewArgs {
+            workflow_id: state.id.clone(),
+            model: "claude-opus-4-1".into(),
+            findings: vec!["does-not-exist".into()],
+            repo: Some(repo.path().to_path_buf()),
+        };
+        let mut out = Vec::new();
+        let error = record_independent_review(&args, &mut out)
+            .unwrap_err()
+            .to_string();
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert!(error.contains("does-not-exist"), "{error}");
+        assert!(
+            engine::load(&state_dir, repo.path(), &state.id)
+                .unwrap()
+                .review_evidence
+                .is_empty(),
+            "a refused record must not write any evidence"
         );
     }
 
