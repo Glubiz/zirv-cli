@@ -3955,6 +3955,7 @@ context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_C
 intake_savings = false # clarification category and optional planner; ZIRV_CTX_JEV_INTAKE_SAVINGS
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
+admin_dispatch = false # closed-set read-only status/inbox answered without a model turn; ZIRV_CTX_JEV_ADMIN_DISPATCH
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
@@ -4020,6 +4021,28 @@ asked about; generation always runs for it. Otherwise, only a decisive "no
 new durable knowledge" answer skips generation; a disabled gate, a missing
 credential, or an uncertain/partial/failed answer all fall back to running
 generation exactly as before.
+
+`jev.admin_dispatch` (issue [#745](https://github.com/Glubiz/zirv-cli/issues/745))
+answers a small closed set of already-authorized, read-only administrative
+requests entirely in-process, on Claude Code's `UserPromptSubmit` hook (`zirv
+ctx hook prompt`) -- the one seam that can return `{"decision":"block",
+"reason":...}` and stop a prompt before it ever reaches a model, which is the
+actual LLM-turn saving here (codex and other adapters are untouched). Active
+only when this gate is on AND the `[proxy.typesafe]` credential is present;
+either being false leaves the hook's output byte-identical to today. The
+prompt is normalized (trimmed, lowercased, whitespace-collapsed, one leading
+`/` stripped) and matched by exact string equality against a closed set --
+`zirv status`/`zirv ctx status` (`zirv ctx status`'s own renderer), `zirv jev
+status` (`jev::status`), and `zirv inbox` (a mail PEEK that never consumes
+the message) -- with no arguments accepted anywhere; a near-miss, extra
+words, or an argument falls straight through to today's path. Because of the
+[#746](https://github.com/Glubiz/zirv-cli/issues/746) egress boundary
+(`jev.rs::safe_metadata_request`), no prompt text may ever reach Jev, so this
+path never makes a Jev call at all -- selection is deterministic exact-match
+only. A match records one `admin_dispatch`/`llm_turn_avoided` effect row
+(never a decision or cache row); the rendered output is truncated to 8 KiB
+and prefixed with a line naming the operation. A renderer failure falls back
+to today's path; the hook never fails a prompt.
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
 directory under `zirv/ctx/`, never in the repo. Override with
@@ -4344,6 +4367,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.intake_savings` | `ZIRV_CTX_JEV_INTAKE_SAVINGS` |
 | `jev.review_reuse` | `ZIRV_CTX_JEV_REVIEW_REUSE` |
 | `jev.harvest_screen` | `ZIRV_CTX_JEV_HARVEST_SCREEN` |
+| `jev.admin_dispatch` | `ZIRV_CTX_JEV_ADMIN_DISPATCH` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
