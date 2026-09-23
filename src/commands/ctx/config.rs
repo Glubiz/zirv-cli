@@ -1885,6 +1885,9 @@ pub struct JevConfig {
     pub dispatch: bool,
     pub review: bool,
     pub gates: bool,
+    pub context: bool,
+    pub intake_savings: bool,
+    pub review_reuse: bool,
     /// How long a cached answer (`<state_dir>/jev-cache/<hash>.json`, keyed
     /// by the exact request body -- see `jev::ask`'s own doc comment) stays
     /// usable, in seconds. `0` disables the cache entirely: every call
@@ -1902,6 +1905,9 @@ impl Default for JevConfig {
             dispatch: false,
             review: false,
             gates: false,
+            context: false,
+            intake_savings: false,
+            review_reuse: false,
             cache_ttl_secs: 86_400,
         }
     }
@@ -3943,6 +3949,17 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ("ZIRV_CTX_JEV_DISPATCH", &["jev", "dispatch"], EnvKind::Bool),
     ("ZIRV_CTX_JEV_REVIEW", &["jev", "review"], EnvKind::Bool),
     ("ZIRV_CTX_JEV_GATES", &["jev", "gates"], EnvKind::Bool),
+    ("ZIRV_CTX_JEV_CONTEXT", &["jev", "context"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_JEV_INTAKE_SAVINGS",
+        &["jev", "intake_savings"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_JEV_REVIEW_REUSE",
+        &["jev", "review_reuse"],
+        EnvKind::Bool,
+    ),
     (
         "ZIRV_CTX_JEV_CACHE_TTL_SECS",
         &["jev", "cache_ttl_secs"],
@@ -5260,6 +5277,9 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "dispatch"], "ZIRV_CTX_JEV_DISPATCH"),
     (&["jev", "review"], "ZIRV_CTX_JEV_REVIEW"),
     (&["jev", "gates"], "ZIRV_CTX_JEV_GATES"),
+    (&["jev", "context"], "ZIRV_CTX_JEV_CONTEXT"),
+    (&["jev", "intake_savings"], "ZIRV_CTX_JEV_INTAKE_SAVINGS"),
+    (&["jev", "review_reuse"], "ZIRV_CTX_JEV_REVIEW_REUSE"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
 ];
 
@@ -8490,6 +8510,9 @@ mod tests {
         assert!(!cfg.dispatch);
         assert!(!cfg.review);
         assert!(!cfg.gates);
+        assert!(!cfg.context);
+        assert!(!cfg.intake_savings);
+        assert!(!cfg.review_reuse);
         assert_eq!(cfg.cache_ttl_secs, 86_400);
     }
 
@@ -8530,6 +8553,9 @@ mod tests {
             ("[jev]\ndispatch = true\n", "dispatch"),
             ("[jev]\nreview = true\n", "review"),
             ("[jev]\ngates = true\n", "gates"),
+            ("[jev]\ncontext = true\n", "context"),
+            ("[jev]\nintake_savings = true\n", "intake_savings"),
+            ("[jev]\nreview_reuse = true\n", "review_reuse"),
             ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
@@ -8557,6 +8583,9 @@ mod tests {
             ("ZIRV_CTX_JEV_DISPATCH", "true"),
             ("ZIRV_CTX_JEV_REVIEW", "true"),
             ("ZIRV_CTX_JEV_GATES", "true"),
+            ("ZIRV_CTX_JEV_CONTEXT", "true"),
+            ("ZIRV_CTX_JEV_INTAKE_SAVINGS", "true"),
+            ("ZIRV_CTX_JEV_REVIEW_REUSE", "true"),
             ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
@@ -8569,6 +8598,9 @@ mod tests {
         assert!(cfg.jev.dispatch);
         assert!(cfg.jev.review);
         assert!(cfg.jev.gates);
+        assert!(cfg.jev.context);
+        assert!(cfg.jev.intake_savings);
+        assert!(cfg.jev.review_reuse);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 

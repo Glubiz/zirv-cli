@@ -115,6 +115,7 @@ pub struct Question {
     pub kind: QuestionKind,
     pub instructions: String,
     pub criteria: Criteria,
+    pub(crate) metadata_signature: Option<String>,
 }
 
 impl Question {
@@ -136,6 +137,7 @@ impl Question {
                     })
                     .collect(),
             ),
+            metadata_signature: None,
         }
     }
 
@@ -148,6 +150,7 @@ impl Question {
             kind: QuestionKind::Score,
             instructions: instructions.to_string(),
             criteria: Criteria::Score(levels.iter().map(|level| level.to_string()).collect()),
+            metadata_signature: None,
         }
     }
 
@@ -161,7 +164,40 @@ impl Question {
                 when_true: Some(when_true.to_string()),
                 when_false: Some(when_false.to_string()),
             },
+            metadata_signature: None,
         }
+    }
+
+    pub(crate) fn metadata_choice(
+        id: &str,
+        instructions: &'static str,
+        options: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        let mut question = Self::choice(id, instructions, options);
+        question.metadata_signature = Some(question_signature(&question));
+        question
+    }
+
+    pub(crate) fn metadata_noul(
+        id: &str,
+        instructions: &'static str,
+        when_true: &'static str,
+        when_false: &'static str,
+    ) -> Self {
+        let mut question = Self::noul(id, instructions, when_true, when_false);
+        question.metadata_signature = Some(question_signature(&question));
+        question
+    }
+
+    #[cfg(test)]
+    fn metadata_score(
+        id: &str,
+        instructions: &'static str,
+        levels: &'static [&'static str],
+    ) -> Self {
+        let mut question = Self::score(id, instructions, levels);
+        question.metadata_signature = Some(question_signature(&question));
+        question
     }
 }
 
@@ -311,6 +347,7 @@ pub enum JevError {
     /// The environment variable named by `credential_env` is unset or
     /// empty. Checked before any connection is opened.
     NoCredential(String),
+    UnsafeState,
     Auth,
     Invalid,
     RateLimited,
@@ -325,6 +362,7 @@ impl std::fmt::Display for JevError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoCredential(var) => write!(f, "credential env {var} unset"),
+            Self::UnsafeState => write!(f, "unsafe Jev metadata projection"),
             Self::Auth => write!(f, "authentication rejected (401)"),
             Self::Invalid => write!(f, "invalid request (422)"),
             Self::RateLimited => write!(f, "rate limited (429)"),
@@ -540,6 +578,16 @@ fn hash_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn question_signature(question: &Question) -> String {
+    hash_hex(
+        format!(
+            "{:?}|{:?}|{:?}|{:?}",
+            question.id, question.kind, question.instructions, question.criteria
+        )
+        .as_bytes(),
+    )
+}
+
 fn encoded_request(
     state: &impl Serialize,
     questions: &[Question],
@@ -550,6 +598,92 @@ fn encoded_request(
         .map_err(|error| JevError::Transport(format!("failed to encode request: {error}")))?;
     let cache_key = hash_hex(payload.as_bytes());
     Ok((payload, cache_key))
+}
+
+fn safe_metadata_request(state: &serde_json::Value, questions: &[Question], model: &str) -> bool {
+    let value = state;
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 2
+        || object.get("_zirv_metadata_only") != Some(&serde_json::Value::Bool(true))
+    {
+        return false;
+    }
+    let Some(rows) = object.get("facts").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if rows.len() > 32
+        || rows.iter().any(|row| {
+            row.as_array().is_none_or(|cells| {
+                cells.len() > 32
+                    || cells.iter().any(|cell| match cell {
+                        serde_json::Value::Null | serde_json::Value::Bool(_) => false,
+                        serde_json::Value::Number(number) => {
+                            number.as_u64().is_none_or(|value| value > 1_000_000)
+                        }
+                        _ => true,
+                    })
+            })
+        })
+    {
+        return false;
+    }
+    if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 8 * 1024) {
+        return false;
+    }
+    if questions.is_empty() || questions.len() > 32 || model.len() > 64 {
+        return false;
+    }
+    let valid_atom = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 32
+            && value.bytes().enumerate().all(|(index, byte)| {
+                if index == 0 {
+                    byte.is_ascii_alphabetic()
+                } else {
+                    byte.is_ascii_alphanumeric() || byte == b'_'
+                }
+            })
+    };
+    if !model
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    questions.iter().all(|question| {
+        question
+            .metadata_signature
+            .as_deref()
+            .is_some_and(|signature| signature == question_signature(question))
+            && valid_atom(&question.id)
+            && !question.instructions.is_empty()
+            && question.instructions.len() <= 512
+            && match &question.criteria {
+                Criteria::Choice(options) => {
+                    !options.is_empty()
+                        && options.len() <= 16
+                        && options.iter().all(|(key, description)| {
+                            valid_atom(key)
+                                && description
+                                    .as_deref()
+                                    .is_some_and(|value| value.len() <= 512)
+                        })
+                }
+                Criteria::Noul {
+                    when_true,
+                    when_false,
+                } => [when_true, when_false]
+                    .into_iter()
+                    .all(|value| value.as_deref().is_some_and(|value| value.len() <= 512)),
+                Criteria::Score(levels) => {
+                    !levels.is_empty()
+                        && levels.len() <= 16
+                        && levels.iter().all(|level| level.len() <= 512)
+                }
+            }
+    })
 }
 
 #[cfg(test)]
@@ -604,13 +738,14 @@ fn write_cache_entry(
 /// opened, matching every other credential-by-env-name seam in this crate
 /// (`EndpointTarget`, `AgentAdapter::ready`). `state` is any bounded,
 /// repository-neutral value a caller wants Jev's opinion on -- the harness
-/// proxy passes its own `IntakeState`; a future site passes its own shape.
+/// callers pass only the audited numeric metadata envelope. Legacy text
+/// states return `UnsafeState` before a cache read or network call.
 ///
 /// Cache: the request body (`{state, model, questions}`, the exact bytes
 /// this function would otherwise send) is hashed with SHA-256 and looked up
-/// at `<state_dir>/jev-cache/<hash>.json` BEFORE the credential check or any
-/// network attempt -- an identical request gives an identical answer by
-/// construction, with zero `Usage` and no credential needed at all, up to
+/// at `<state_dir>/jev-cache/<hash>.json` AFTER the credential and privacy
+/// checks but before any network attempt -- an identical request gives an
+/// identical answer by construction, with zero `Usage`, up to
 /// `cache_ttl_secs` old. A miss (including an expired entry, or a corrupt/
 /// unreadable file) falls through to the real call exactly as before; only
 /// a genuine `200` response is stored, never an error. `cache_ttl_secs ==
@@ -625,7 +760,15 @@ pub(crate) fn ask(
     state: &impl Serialize,
     questions: &[Question],
 ) -> Result<(Answers, Usage, bool), JevError> {
-    let (payload, cache_key) = encoded_request(state, questions, &cfg.model)?;
+    let credential = match std::env::var(&cfg.credential_env) {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Err(JevError::NoCredential(cfg.credential_env.clone())),
+    };
+    let safe_state = serde_json::to_value(state).map_err(|_| JevError::UnsafeState)?;
+    if !safe_metadata_request(&safe_state, questions, &cfg.model) {
+        return Err(JevError::UnsafeState);
+    }
+    let (payload, cache_key) = encoded_request(&safe_state, questions, &cfg.model)?;
     let cache_path = state_dir
         .join(JEV_CACHE_DIR)
         .join(format!("{cache_key}.json"));
@@ -642,11 +785,6 @@ pub(crate) fn ask(
             true,
         ));
     }
-
-    let credential = match std::env::var(&cfg.credential_env) {
-        Ok(value) if !value.is_empty() => value,
-        _ => return Err(JevError::NoCredential(cfg.credential_env.clone())),
-    };
 
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .max_redirects(0)
@@ -707,6 +845,7 @@ pub(crate) fn available(cfg: &ProxyTypesafeConfig) -> bool {
 
 #[allow(dead_code)]
 const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
+const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` prices the spend row
 /// on -- see `catalogue.rs`'s `typesafe` vendor. Every `[jev]`-gated site
 /// spends through the same vendor as the harness proxy, regardless of which
@@ -839,6 +978,102 @@ pub(crate) fn record(
     );
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct ObservedUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+}
+
+/// Observed action following advice. An answer alone never counts as an effect.
+#[derive(Debug, Serialize)]
+pub(crate) struct JevEffect<'a> {
+    pub site: &'static str,
+    pub action: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ObservedUsage>,
+}
+
+impl JevEffect<'_> {
+    pub(crate) fn new(site: &'static str, action: &'static str) -> Self {
+        Self {
+            site,
+            action,
+            subject_id: None,
+            item_id: None,
+            reason: None,
+            outcome: None,
+            baseline_count: None,
+            actual_count: None,
+            removed_bytes: None,
+            elapsed_ms: None,
+            usage: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct EffectRecord<'a> {
+    ts: u64,
+    session: &'a str,
+    principal: &'a str,
+    #[serde(flatten)]
+    effect: &'a JevEffect<'a>,
+}
+
+/// Appends an effect only for an active site, without reading an answer cache.
+pub(crate) fn record_effect(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    enabled: bool,
+    effect: &JevEffect<'_>,
+) {
+    if !enabled || !available(&cfg.proxy.typesafe) {
+        return;
+    }
+    let (session, principal) = session_and_principal();
+    let record = EffectRecord {
+        ts: state::now_secs(),
+        session: &session,
+        principal: &principal,
+        effect,
+    };
+    if let Ok(line) = serde_json::to_string(&record)
+        && state::create_private_dir_all(state.root()).is_ok()
+        && let Ok(mut file) = state::open_private_append(&state.root().join(JEV_EFFECTS_FILE))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+pub(crate) enum AdvisoryStatus {
+    Disabled,
+    MissingCredential,
+    Answered(Answers),
+    Failed,
+}
+
 /// The one advisory entry point a `[jev]`-gated site calls: short-circuits
 /// to `None`, with no network call and no log line at all, when `enabled`
 /// is false or the `[proxy.typesafe]` credential is not set ([`available`])
@@ -857,8 +1092,28 @@ pub(crate) fn advise(
     state: &impl Serialize,
     questions: &[Question],
 ) -> Option<Answers> {
-    if !enabled || !available(&cfg.proxy.typesafe) {
-        return None;
+    match advise_detailed(cfg, state_dir, site, enabled, state, questions) {
+        AdvisoryStatus::Answered(answers) => Some(answers),
+        AdvisoryStatus::Disabled | AdvisoryStatus::MissingCredential | AdvisoryStatus::Failed => {
+            None
+        }
+    }
+}
+
+/// Like [`advise`], with explicit no-call and failed-call outcomes for telemetry.
+pub(crate) fn advise_detailed(
+    cfg: &CtxConfig,
+    state_dir: &StateDir,
+    site: &str,
+    enabled: bool,
+    state: &impl Serialize,
+    questions: &[Question],
+) -> AdvisoryStatus {
+    if !enabled {
+        return AdvisoryStatus::Disabled;
+    }
+    if !available(&cfg.proxy.typesafe) {
+        return AdvisoryStatus::MissingCredential;
     }
     let started = std::time::Instant::now();
     let wall_ms = |started: std::time::Instant| -> u64 {
@@ -882,9 +1137,12 @@ pub(crate) fn advise(
                 &[],
                 cached,
             );
-            Some(answers)
+            AdvisoryStatus::Answered(answers)
         }
         Err(error) => {
+            if matches!(error, JevError::UnsafeState) {
+                return AdvisoryStatus::Failed;
+            }
             record(
                 state_dir,
                 cfg,
@@ -898,7 +1156,7 @@ pub(crate) fn advise(
                 &[error.to_string()],
                 false,
             );
-            None
+            AdvisoryStatus::Failed
         }
     }
 }
@@ -959,6 +1217,9 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
                     ("dispatch", cfg.jev.dispatch),
                     ("review", cfg.jev.review),
                     ("gates", cfg.jev.gates),
+                    ("context", cfg.jev.context),
+                    ("intake_savings", cfg.jev.intake_savings),
+                    ("review_reuse", cfg.jev.review_reuse),
                 ];
                 let any_gate_on = gates.iter().any(|(_, on)| *on);
                 let cred_present = available(&cfg.proxy.typesafe);
@@ -981,6 +1242,9 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
                         "dispatch": cfg.jev.dispatch,
                         "review": cfg.jev.review,
                         "gates": cfg.jev.gates,
+                        "context": cfg.jev.context,
+                        "intake_savings": cfg.jev.intake_savings,
+                        "review_reuse": cfg.jev.review_reuse,
                     },
                     "credential_env": cred_env,
                     "credential_present": cred_present,
@@ -999,7 +1263,7 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
 }
 
 /// Prints a read-only status report of whether Jev is enabled and why or why
-/// not: each of the five gates (memory, supervisor, dispatch, review, gates),
+/// not: each operator gate,
 /// the credential env var name and presence, the endpoint base URL, model, and
 /// a one-line verdict. Never makes a network call, never reads the credential
 /// value, never writes config or creates directories. The output format
@@ -1015,6 +1279,9 @@ pub fn status(cfg: &CtxConfig, writer: &mut impl Write) -> Result<(), Box<dyn st
         ("dispatch", cfg.jev.dispatch),
         ("review", cfg.jev.review),
         ("gates", cfg.jev.gates),
+        ("context", cfg.jev.context),
+        ("intake_savings", cfg.jev.intake_savings),
+        ("review_reuse", cfg.jev.review_reuse),
     ];
     let any_gate_on = gates.iter().any(|(_, on)| *on);
 
@@ -1104,17 +1371,18 @@ pub(crate) mod tests {
         request: String,
     }
 
-    fn sample_state() -> SampleState {
+    fn legacy_state() -> SampleState {
         SampleState {
             request: "fix the typo".to_string(),
         }
     }
 
-    fn sample_questions() -> Vec<Question> {
+    fn legacy_questions() -> Vec<Question> {
         vec![
             Question {
                 id: "intent".to_string(),
                 kind: QuestionKind::Choice,
+                metadata_signature: None,
                 instructions: "pick one".to_string(),
                 criteria: Criteria::Choice(vec![
                     ("feature".to_string(), Some("adds behavior".to_string())),
@@ -1124,12 +1392,14 @@ pub(crate) mod tests {
             Question {
                 id: "complexity".to_string(),
                 kind: QuestionKind::Score,
+                metadata_signature: None,
                 instructions: "how complex".to_string(),
                 criteria: Criteria::Score(vec!["trivial".to_string(), "bounded".to_string()]),
             },
             Question {
                 id: "needs_clarification".to_string(),
                 kind: QuestionKind::Noul,
+                metadata_signature: None,
                 instructions: "ambiguous?".to_string(),
                 criteria: Criteria::Noul {
                     when_true: Some("yes".to_string()),
@@ -1137,6 +1407,87 @@ pub(crate) mod tests {
                 },
             },
         ]
+    }
+
+    fn sample_state() -> serde_json::Value {
+        serde_json::json!({"_zirv_metadata_only": true, "facts": [[1, 2, true]]})
+    }
+
+    fn sample_questions() -> Vec<Question> {
+        vec![
+            Question::metadata_choice(
+                "intent",
+                "Pick a category from coarse metadata only.",
+                &[("feature", "adds behavior"), ("other", "other category")],
+            ),
+            Question::metadata_score(
+                "complexity",
+                "How complex is the category?",
+                &["trivial", "bounded"],
+            ),
+            Question::metadata_noul(
+                "needs_clarification",
+                "Is clarification required from coarse metadata?",
+                "yes",
+                "no",
+            ),
+        ]
+    }
+
+    #[test]
+    fn detailed_advice_distinguishes_disabled_and_missing_key_without_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_DETAILED_MISSING_KEY_737".into();
+        let disabled = advise_detailed(
+            &cfg,
+            &state,
+            "context",
+            false,
+            &sample_state(),
+            &sample_questions(),
+        );
+        let missing = advise_detailed(
+            &cfg,
+            &state,
+            "context",
+            true,
+            &sample_state(),
+            &sample_questions(),
+        );
+        assert!(matches!(disabled, AdvisoryStatus::Disabled));
+        assert!(matches!(missing, AdvisoryStatus::MissingCredential));
+        assert!(!dir.path().join(JEV_DECISIONS_FILE).exists());
+        assert!(!dir.path().join(JEV_CACHE_DIR).exists());
+    }
+
+    #[test]
+    fn effect_record_requires_gate_and_key_and_preserves_unknown_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_EFFECT_GATE_737".into();
+        let mut effect = JevEffect::new("context", "description_removed");
+        effect.subject_id = Some("task-fingerprint");
+        effect.item_id = Some("skill-id");
+        effect.baseline_count = Some(1);
+        effect.actual_count = Some(0);
+        effect.removed_bytes = Some(42);
+        record_effect(&cfg, &state, false, &effect);
+        record_effect(&cfg, &state, true, &effect);
+        assert!(!dir.path().join(JEV_EFFECTS_FILE).exists());
+        with_credential(&cfg.proxy.typesafe.credential_env, "secret", || {
+            record_effect(&cfg, &state, true, &effect);
+        });
+        let text = std::fs::read_to_string(dir.path().join(JEV_EFFECTS_FILE)).expect("effect");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+        assert_eq!(value["site"], "context");
+        assert_eq!(value["action"], "description_removed");
+        assert_eq!(value["removed_bytes"], 42);
+        assert!(value.get("usage").is_none());
     }
 
     fn config(base_url: String, credential_env: &str, timeout_secs: u64) -> ProxyTypesafeConfig {
@@ -1150,7 +1501,7 @@ pub(crate) mod tests {
 
     #[test]
     fn request_serde_matches_the_documented_shape() {
-        let request = build_request(&sample_state(), &sample_questions(), "jev-latest");
+        let request = build_request(&legacy_state(), &legacy_questions(), "jev-latest");
         let value = serde_json::to_value(&request).expect("serialize");
         assert_eq!(value["model"], "jev-latest");
         assert_eq!(value["questions"]["intent"]["type"], "choice");
@@ -1180,18 +1531,21 @@ pub(crate) mod tests {
             Question {
                 id: "category".to_string(),
                 kind: QuestionKind::Choice,
+                metadata_signature: None,
                 instructions: String::new(),
                 criteria: Criteria::Choice(Vec::new()),
             },
             Question {
                 id: "urgency".to_string(),
                 kind: QuestionKind::Score,
+                metadata_signature: None,
                 instructions: String::new(),
                 criteria: Criteria::Score(Vec::new()),
             },
             Question {
                 id: "needs_human".to_string(),
                 kind: QuestionKind::Noul,
+                metadata_signature: None,
                 instructions: String::new(),
                 criteria: Criteria::Noul {
                     when_true: None,
@@ -1243,27 +1597,17 @@ pub(crate) mod tests {
         with_credential("JEV_TEST_KEY_PROBABILITIES", "secret", || {
             let cfg = config(url, "JEV_TEST_KEY_PROBABILITIES", 5);
             let questions = vec![
-                Question {
-                    id: "category".to_string(),
-                    kind: QuestionKind::Choice,
-                    instructions: String::new(),
-                    criteria: Criteria::Choice(Vec::new()),
-                },
-                Question {
-                    id: "urgency".to_string(),
-                    kind: QuestionKind::Score,
-                    instructions: String::new(),
-                    criteria: Criteria::Score(Vec::new()),
-                },
-                Question {
-                    id: "needs_human".to_string(),
-                    kind: QuestionKind::Noul,
-                    instructions: String::new(),
-                    criteria: Criteria::Noul {
-                        when_true: None,
-                        when_false: None,
-                    },
-                },
+                Question::metadata_choice(
+                    "category",
+                    "Pick category from coarse facts.",
+                    &[("technical", "technical")],
+                ),
+                Question::metadata_score(
+                    "urgency",
+                    "Pick urgency from coarse facts.",
+                    &["low", "high"],
+                ),
+                Question::metadata_noul("needs_human", "Is human input needed?", "yes", "no"),
             ];
             let (answers, _usage, cached) =
                 ask(&cfg, state_dir.path(), 0, &sample_state(), &questions).expect("ask");
@@ -1453,7 +1797,7 @@ pub(crate) mod tests {
         with_credential("JEV_TEST_KEY_ADVISE_OK", "secret", || {
             let mut cfg = CtxConfig::default();
             cfg.proxy.typesafe = config(url, "JEV_TEST_KEY_ADVISE_OK", 5);
-            let questions = vec![Question::choice(
+            let questions = vec![Question::metadata_choice(
                 "category",
                 "pick one",
                 &[("technical", "a technical question")],
@@ -1589,21 +1933,33 @@ pub(crate) mod tests {
         status: u16,
         body: &'static str,
     ) -> (String, std::thread::JoinHandle<()>) {
+        multi_shot_server(status, body, 1)
+    }
+
+    /// Serves exactly `calls` requests; callers disable the Jev answer cache
+    /// when they need a separate response for each decision cycle.
+    pub(crate) fn multi_shot_server(
+        status: u16,
+        body: &'static str,
+        calls: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            read_full_request(&mut stream);
-            let reason = if status == 200 { "OK" } else { "Error" };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: \
-                 {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
+            for _ in 0..calls {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                read_full_request(&mut stream);
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
         });
         (format!("http://{address}"), handle)
     }
@@ -1622,6 +1978,103 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unsafe_text_and_mutated_question_never_read_cache_or_reach_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let unsafe_state = serde_json::json!({
+            "_zirv_metadata_only": true,
+            "facts": [["sensitive task text /private/secret.key"]]
+        });
+        let questions = sample_questions();
+        let key = cache_key_for(&unsafe_state, &questions, "jev-latest").expect("cache key");
+        let cache_dir = dir.path().join(JEV_CACHE_DIR);
+        std::fs::create_dir(&cache_dir).expect("cache dir");
+        let entry = CacheEntry {
+            answers: Answers::new(),
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 0,
+            },
+            stored_at: state::now_secs(),
+            model: "jev-latest".into(),
+        };
+        std::fs::write(
+            cache_dir.join(format!("{key}.json")),
+            serde_json::to_vec(&entry).expect("entry"),
+        )
+        .expect("cache file");
+
+        with_credential("JEV_TEST_PRIVACY_GUARD_746", "secret", || {
+            let cfg = config(url, "JEV_TEST_PRIVACY_GUARD_746", 1);
+            assert!(matches!(
+                ask(&cfg, dir.path(), 86_400, &unsafe_state, &questions),
+                Err(JevError::UnsafeState)
+            ));
+            let mut mutated = sample_questions();
+            mutated[0].instructions = "send /private/secret.key".into();
+            assert!(matches!(
+                ask(&cfg, dir.path(), 86_400, &sample_state(), &mutated),
+                Err(JevError::UnsafeState)
+            ));
+            let mut full_cfg = CtxConfig::default();
+            full_cfg.proxy.typesafe = cfg;
+            assert!(matches!(
+                advise_detailed(
+                    &full_cfg,
+                    &state,
+                    "privacy",
+                    true,
+                    &unsafe_state,
+                    &questions
+                ),
+                AdvisoryStatus::Failed
+            ));
+        });
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert!(!dir.path().join(JEV_DECISIONS_FILE).exists());
+        assert!(!dir.path().join("spend.jsonl").exists());
+    }
+
+    #[test]
+    fn a_cached_answer_still_requires_the_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(
+            "http://127.0.0.1:9".into(),
+            "JEV_TEST_NEVER_SET_CACHE_CREDENTIAL_746",
+            1,
+        );
+        let state = sample_state();
+        let questions = sample_questions();
+        let key = cache_key_for(&state, &questions, &cfg.model).expect("key");
+        let cache_dir = dir.path().join(JEV_CACHE_DIR);
+        std::fs::create_dir(&cache_dir).expect("cache dir");
+        let entry = CacheEntry {
+            answers: Answers::new(),
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 0,
+            },
+            stored_at: state::now_secs(),
+            model: cfg.model.clone(),
+        };
+        std::fs::write(
+            cache_dir.join(format!("{key}.json")),
+            serde_json::to_vec(&entry).expect("entry"),
+        )
+        .expect("cache file");
+
+        assert!(matches!(
+            ask(&cfg, dir.path(), 86_400, &state, &questions),
+            Err(JevError::NoCredential(_))
+        ));
+    }
+
+    #[test]
     fn a_200_response_converts_to_answers() {
         let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
         let body: &'static str = Box::leak(text.into_boxed_str());
@@ -1629,12 +2082,11 @@ pub(crate) mod tests {
         let state_dir = tempfile::tempdir().expect("tempdir");
         with_credential("JEV_TEST_KEY_OK", "secret", || {
             let cfg = config(url, "JEV_TEST_KEY_OK", 5);
-            let questions = vec![Question {
-                id: "category".to_string(),
-                kind: QuestionKind::Choice,
-                instructions: String::new(),
-                criteria: Criteria::Choice(Vec::new()),
-            }];
+            let questions = vec![Question::metadata_choice(
+                "category",
+                "Select category from coarse facts.",
+                &[("technical", "technical")],
+            )];
             let (answers, usage, cached) =
                 ask(&cfg, state_dir.path(), 0, &sample_state(), &questions).expect("ask");
             assert!(!cached);
@@ -1658,8 +2110,14 @@ pub(crate) mod tests {
             let env_name = format!("JEV_TEST_KEY_{status}");
             with_credential(&env_name, "secret", || {
                 let cfg = config(url, &env_name, 5);
-                let error =
-                    ask(&cfg, state_dir.path(), 0, &sample_state(), &[]).expect_err("must fail");
+                let error = ask(
+                    &cfg,
+                    state_dir.path(),
+                    0,
+                    &sample_state(),
+                    &sample_questions(),
+                )
+                .expect_err("must fail");
                 let matched = matches!(
                     (&error, expect_variant),
                     (JevError::Auth, "auth")
@@ -1691,8 +2149,14 @@ pub(crate) mod tests {
         with_credential("JEV_TEST_KEY_TIMEOUT", "secret", || {
             let cfg = config(format!("http://{address}"), "JEV_TEST_KEY_TIMEOUT", 1);
             let started = std::time::Instant::now();
-            let error =
-                ask(&cfg, state_dir.path(), 0, &sample_state(), &[]).expect_err("must time out");
+            let error = ask(
+                &cfg,
+                state_dir.path(),
+                0,
+                &sample_state(),
+                &sample_questions(),
+            )
+            .expect_err("must time out");
             assert!(matches!(error, JevError::Timeout), "{error:?}");
             assert!(
                 started.elapsed() < Duration::from_secs(5),
@@ -1714,7 +2178,14 @@ pub(crate) mod tests {
         // Deliberately never set: a unique name this process never exports.
         let cfg = config(format!("http://{address}"), "JEV_TEST_KEY_NEVER_SET_537", 1);
         let state_dir = tempfile::tempdir().expect("tempdir");
-        let error = ask(&cfg, state_dir.path(), 0, &sample_state(), &[]).expect_err("must refuse");
+        let error = ask(
+            &cfg,
+            state_dir.path(),
+            0,
+            &sample_state(),
+            &sample_questions(),
+        )
+        .expect_err("must refuse");
         assert!(matches!(error, JevError::NoCredential(_)), "{error:?}");
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),

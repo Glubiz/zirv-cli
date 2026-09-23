@@ -460,7 +460,7 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
                 cfg,
                 args,
                 super::task::ExitKind::Crash,
-                "launch failed",
+                ("launch failed", None),
                 super::state::now_secs(),
             );
             return Err(error);
@@ -583,7 +583,18 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         cfg,
         args,
         exit_kind,
-        delegation_outcome(code),
+        (
+            delegation_outcome(code),
+            (exit_kind == super::task::ExitKind::Crash)
+                .then(|| {
+                    status
+                        .final_text
+                        .as_deref()
+                        .or_else(|| contract_errors.first().map(String::as_str))
+                        .map(super::task::CrashSignals::from_text)
+                })
+                .flatten(),
+        ),
         super::state::now_secs(),
     );
 
@@ -719,7 +730,7 @@ fn release_task_claim(state: &StateDir, repo: &Path, cfg: &CtxConfig, args: &Age
         cfg,
         args,
         super::task::ExitKind::Crash,
-        "launch refused",
+        ("launch refused", None),
         super::state::now_secs(),
     );
 }

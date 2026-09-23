@@ -2622,7 +2622,7 @@ pub(crate) fn attach_task_context_to_prompt(
     state: &super::state::StateDir,
     repo: &Path,
     prompt: String,
-    max_parent_outcome_bytes: usize,
+    cfg: &CtxConfig,
 ) -> CtxResult<String> {
     let Some(task_id) = &args.task else {
         return Ok(prompt);
@@ -2636,7 +2636,14 @@ pub(crate) fn attach_task_context_to_prompt(
         card.parents.iter().filter_map(|id| cards.get(id)).collect();
     Ok(format!(
         "{prompt}{}",
-        super::task::compile_task_prompt(card, &parents, max_parent_outcome_bytes)
+        super::compile::task_context_with_selected_reports(
+            cfg,
+            state,
+            repo,
+            card,
+            &parents,
+            cfg.task.max_parent_outcome_bytes,
+        )
     ))
 }
 
@@ -2652,6 +2659,7 @@ pub(crate) fn attach_task_context_to_prompt(
 fn claim_task_for_delegation(
     state: &super::state::StateDir,
     repo: &Path,
+    cfg: &CtxConfig,
     task_id: &str,
     env: EnvLookup<'_>,
     now: u64,
@@ -2675,7 +2683,26 @@ fn claim_task_for_delegation(
     {
         None => Err(format!("no task '{task_id}' in this repository")),
         Some(Ok(_claimed)) => Ok(()),
-        Some(Err(refusal)) => Err(format!("cannot claim task '{task_id}': {refusal}")),
+        Some(Err(refusal)) => {
+            let blocked_by_jev = super::task::load_cards(state, &repo_slug)
+                .get(task_id)
+                .is_some_and(|card| {
+                    card.state == super::task::State::Blocked
+                        && card
+                            .block
+                            .as_ref()
+                            .is_some_and(|block| block.by == "system:jev-crash")
+                });
+            if blocked_by_jev {
+                let mut effect = super::jev::JevEffect::new("crash", "worker_launch_prevented");
+                effect.subject_id = Some(task_id);
+                effect.reason = Some("jev_auto_block");
+                effect.baseline_count = Some(1);
+                effect.actual_count = Some(0);
+                super::jev::record_effect(cfg, state, cfg.jev.supervisor, &effect);
+            }
+            Err(format!("cannot claim task '{task_id}': {refusal}"))
+        }
     }
 }
 
@@ -2696,9 +2723,10 @@ pub(crate) fn finish_task_card(
     cfg: &CtxConfig,
     args: &AgentArgs,
     exit_kind: super::task::ExitKind,
-    outcome: &str,
+    completion: (&str, Option<super::task::CrashSignals>),
     now: u64,
 ) {
+    let (outcome, failure_signals) = completion;
     let Some(task_id) = &args.task else {
         return;
     };
@@ -2720,13 +2748,27 @@ pub(crate) fn finish_task_card(
             );
         }
         other => {
-            match super::task::respawn_decision_with_jev(
-                cfg,
-                state,
-                card,
-                other,
-                super::task::DEFAULT_MAX_ATTEMPTS,
-            ) {
+            let baseline =
+                super::task::respawn_decision(card, other, super::task::DEFAULT_MAX_ATTEMPTS);
+            let verdict = if let Some(signals) = failure_signals {
+                super::task::respawn_decision_with_jev_signals(
+                    cfg,
+                    state,
+                    card,
+                    other,
+                    super::task::DEFAULT_MAX_ATTEMPTS,
+                    Some(signals),
+                )
+            } else {
+                super::task::respawn_decision_with_jev(
+                    cfg,
+                    state,
+                    card,
+                    other,
+                    super::task::DEFAULT_MAX_ATTEMPTS,
+                )
+            };
+            match verdict {
                 super::task::RespawnVerdict::Respawn => {
                     let reset_event = match other {
                         super::task::ExitKind::SilentZero => super::task::Event::Protocol {
@@ -2750,16 +2792,31 @@ pub(crate) fn finish_task_card(
                     );
                 }
                 super::task::RespawnVerdict::AutoBlock(reason) => {
-                    let _ = super::task::append_event(
+                    let jev_blocked = matches!(baseline, super::task::RespawnVerdict::Respawn);
+                    if super::task::append_event(
                         state,
                         &repo_slug,
                         &super::task::Event::Blocked {
                             id: card.id.clone(),
                             reason,
-                            by: "system:respawn-guard".to_string(),
+                            by: if jev_blocked {
+                                "system:jev-crash"
+                            } else {
+                                "system:respawn-guard"
+                            }
+                            .to_string(),
                             at: now,
                         },
-                    );
+                    )
+                    .is_ok()
+                        && jev_blocked
+                    {
+                        let mut effect = super::jev::JevEffect::new("crash", "retry_auto_blocked");
+                        effect.subject_id = Some(&card.id);
+                        effect.reason = Some("baseline_retry_eligible");
+                        effect.outcome = Some("blocked");
+                        super::jev::record_effect(cfg, state, cfg.jev.supervisor, &effect);
+                    }
                 }
                 super::task::RespawnVerdict::Refuse(_) => {}
             }
@@ -4506,13 +4563,7 @@ pub fn run_with<W: Write>(
     // labelled -- same seam, same "both forks read this one binding"
     // guarantee as `--attach-artifact`/`--result-schema` above. Fails fast
     // when the named card does not exist in this repository.
-    let prompt = attach_task_context_to_prompt(
-        args,
-        &state,
-        repo,
-        prompt,
-        cfg.task.max_parent_outcome_bytes,
-    )?;
+    let prompt = attach_task_context_to_prompt(args, &state, repo, prompt, &cfg)?;
 
     // Issue #223 §E: refuses before any routing/spawn decision below, so an
     // enforced session never even gets as far as picking a route or joining
@@ -4533,7 +4584,7 @@ pub fn run_with<W: Write>(
     // `Ready` on its own -- never left falsely `Running` forever, and never
     // silently marked `Done`.
     if let Some(task_id) = &args.task
-        && let Err(refusal) = claim_task_for_delegation(&state, repo, task_id, env, now)
+        && let Err(refusal) = claim_task_for_delegation(&state, repo, &cfg, task_id, env, now)
     {
         if args.json {
             let receipt = launch_failure_receipt(
@@ -5380,7 +5431,7 @@ pub fn run_with<W: Write>(
                     &cfg,
                     args,
                     super::task::ExitKind::Crash,
-                    "goal bootstrap failed",
+                    ("goal bootstrap failed", None),
                     super::state::now_secs(),
                 );
                 if error.exit_code == Some(exec::EXIT_BUDGET_EXHAUSTED) {
@@ -5437,7 +5488,7 @@ pub fn run_with<W: Write>(
             &cfg,
             args,
             super::task::ExitKind::Crash,
-            reason,
+            (reason, None),
             super::state::now_secs(),
         );
         if args.json {
@@ -5541,7 +5592,7 @@ pub fn run_with<W: Write>(
                 &cfg,
                 args,
                 super::task::ExitKind::Crash,
-                "launch failed",
+                ("launch failed", None),
                 super::state::now_secs(),
             );
             if args.json {
@@ -5953,13 +6004,21 @@ pub fn run_with<W: Write>(
         // this delegation's real outcome is known -- see `finish_task_card`'s
         // own doc comment for why this never marks a card `Done` silently.
         if let Some(exit_kind) = task_exit_kind {
+            let failure_signals = (exit_kind == super::task::ExitKind::Crash)
+                .then(|| {
+                    first_text
+                        .as_deref()
+                        .or_else(|| contract_errors.first().map(String::as_str))
+                        .map(super::task::CrashSignals::from_text)
+                })
+                .flatten();
             finish_task_card(
                 &state_dir,
                 repo,
                 &cfg,
                 args,
                 exit_kind,
-                outcome,
+                (outcome, failure_signals),
                 super::state::now_secs(),
             );
         }
@@ -6717,7 +6776,7 @@ mod tests {
             &state,
             repo.path(),
             "do the operator's own thing".to_string(),
-            crate::commands::ctx::config::TaskConfig::default().max_parent_outcome_bytes,
+            &CtxConfig::default(),
         )
         .expect("resolves");
         assert!(prompt.starts_with("do the operator's own thing"));
@@ -6778,12 +6837,14 @@ mod tests {
 
         let mut args = args_for("claude", "do the operator's own thing");
         args.task = Some("child-1".to_string());
+        let mut cfg = CtxConfig::default();
+        cfg.task.max_parent_outcome_bytes = 16;
         let prompt = attach_task_context_to_prompt(
             &args,
             &state,
             repo.path(),
             "do the operator's own thing".to_string(),
-            16,
+            &cfg,
         )
         .expect("resolves");
         assert!(
@@ -6807,10 +6868,132 @@ mod tests {
             &state,
             repo.path(),
             "go".to_string(),
-            crate::commands::ctx::config::TaskConfig::default().max_parent_outcome_bytes,
+            &CtxConfig::default(),
         )
         .expect_err("no such task");
         assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn jev_blocked_task_refuses_a_new_worker_claim_and_records_the_prevented_launch() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = super::super::state::repo_slug(repo.path());
+        super::super::task::append_event(
+            &state,
+            &slug,
+            &super::super::task::Event::Created {
+                id: "blocked-task".into(),
+                repo_slug: slug.clone(),
+                title: "task".into(),
+                brief: "brief".into(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .unwrap();
+        super::super::task::append_event(
+            &state,
+            &slug,
+            &super::super::task::Event::Blocked {
+                id: "blocked-task".into(),
+                reason: "retry would repeat the failure".into(),
+                by: "system:jev-crash".into(),
+                at: 2,
+            },
+        )
+        .unwrap();
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_BLOCKED_CLAIM_TEST_KEY",
+            Some("fixture-key"),
+        )]);
+        let mut cfg = CtxConfig::default();
+        cfg.jev.supervisor = true;
+        cfg.proxy.typesafe.credential_env = "JEV_BLOCKED_CLAIM_TEST_KEY".into();
+        let result =
+            claim_task_for_delegation(&state, repo.path(), &cfg, "blocked-task", &|_| None, 3);
+        assert!(result.unwrap_err().contains("cannot claim task"));
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl")).unwrap();
+        assert!(effects.contains("\"action\":\"worker_launch_prevented\""));
+        assert!(effects.contains("\"actual_count\":0"));
+    }
+
+    #[test]
+    fn failed_claimed_worker_can_be_jev_blocked_before_its_next_launch() {
+        let body = r#"{"model":"jev-latest","answers":{"cause":{"type":"choice","choice":"access","probabilities":{"access":0.95,"transient":0.05},"confidence":0.95}},"usage":{"input_tokens":5,"output_tokens":0}}"#;
+        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = super::super::state::repo_slug(repo.path());
+        super::super::task::append_event(
+            &state,
+            &slug,
+            &super::super::task::Event::Created {
+                id: "retry-task".into(),
+                repo_slug: slug.clone(),
+                title: "task".into(),
+                brief: "brief".into(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .unwrap();
+        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "JEV_REAL_CRASH_TEST_KEY",
+            Some("fixture-key"),
+        )]);
+        let mut cfg = CtxConfig::default();
+        cfg.jev.supervisor = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = "JEV_REAL_CRASH_TEST_KEY".into();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        claim_task_for_delegation(&state, repo.path(), &cfg, "retry-task", &|_| None, 2).unwrap();
+        let card =
+            super::super::task::load_cards(&state, &super::super::state::repo_slug(repo.path()))
+                .remove("retry-task")
+                .unwrap();
+        assert_eq!(card.state, super::super::task::State::Running);
+        assert!(card.block.is_none());
+        let mut args = args_for("claude", "work");
+        args.task = Some("retry-task".into());
+        finish_task_card(
+            &state,
+            repo.path(),
+            &cfg,
+            &args,
+            super::super::task::ExitKind::Crash,
+            (
+                "failed",
+                Some(super::super::task::CrashSignals::from_text(
+                    "token expired, login again; private-failure-903",
+                )),
+            ),
+            3,
+        );
+        let outbound = request.recv().unwrap();
+        assert!(!outbound.contains("private-failure-903"));
+        let card =
+            super::super::task::load_cards(&state, &super::super::state::repo_slug(repo.path()))
+                .remove("retry-task")
+                .unwrap();
+        assert_eq!(card.state, super::super::task::State::Blocked);
+        assert_eq!(card.block.unwrap().by, "system:jev-crash");
+        assert!(card.outcome.is_none());
+        let refusal =
+            claim_task_for_delegation(&state, repo.path(), &cfg, "retry-task", &|_| None, 4)
+                .unwrap_err();
+        assert!(refusal.contains("cannot claim task"));
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl")).unwrap();
+        assert!(effects.contains("\"action\":\"retry_auto_blocked\""));
+        assert!(effects.contains("\"action\":\"worker_launch_prevented\""));
     }
 
     #[test]
@@ -6823,7 +7006,7 @@ mod tests {
             &state,
             repo.path(),
             "go".to_string(),
-            crate::commands::ctx::config::TaskConfig::default().max_parent_outcome_bytes,
+            &CtxConfig::default(),
         )
         .expect("resolves");
         assert_eq!(prompt, "go");

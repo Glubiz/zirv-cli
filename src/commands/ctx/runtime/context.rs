@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use super::super::CtxResult;
 use super::super::config::CtxConfig;
 use super::super::context as chunk_a;
+use super::super::jev;
 use super::super::memory::{self, MemoryScope};
 use super::super::optimize;
 use super::super::prompt::{self, PromptRole};
@@ -75,6 +76,7 @@ pub enum SourceKind {
     /// from these descriptions, zirv never pre-selects or matches one to a
     /// task.
     SkillIndex,
+    SkillDescriptions,
     Workflow,
     Skill,
     Memory,
@@ -320,14 +322,30 @@ pub fn compile(request: &CompileRequest<'_>) -> CtxResult<CompiledNativeContext>
         .into());
     }
 
-    let candidates = select_sources(request)?;
+    let (candidates, baseline_index) = select_sources(request)?;
     let estimated = tool_tokens_estimated
         || candidates.iter().any(|candidate| {
             counter
                 .count_message(&candidate.message(candidate.text.clone()))
                 .is_none()
         });
-    pack_sources(
+    let descriptions_expected = candidates
+        .iter()
+        .any(|candidate| candidate.source == SourceKind::SkillDescriptions);
+    let baseline_candidates = baseline_index.map(|full_index| {
+        let mut baseline = candidates.clone();
+        if let Some(index) = baseline
+            .iter_mut()
+            .find(|candidate| candidate.source == SourceKind::SkillIndex)
+        {
+            index.raw_bytes = full_index.len();
+            index.text = full_index;
+        }
+        baseline.retain(|candidate| candidate.source != SourceKind::SkillDescriptions);
+        baseline
+    });
+    let baseline_tools = baseline_candidates.as_ref().map(|_| tools.clone());
+    let compiled = pack_sources(
         candidates,
         tools,
         counter,
@@ -335,10 +353,46 @@ pub fn compile(request: &CompileRequest<'_>) -> CtxResult<CompiledNativeContext>
         request.budget,
         input_limit,
         tool_tokens,
-    )
+    )?;
+    if let (Some(baseline_candidates), Some(baseline_tools)) = (baseline_candidates, baseline_tools)
+        && let Ok(baseline) = pack_sources(
+            baseline_candidates,
+            baseline_tools,
+            counter,
+            estimated,
+            request.budget,
+            input_limit,
+            tool_tokens,
+        )
+        && fully_included(&baseline, SourceKind::SkillIndex)
+        && fully_included(&compiled, SourceKind::SkillIndex)
+        && (!descriptions_expected || fully_included(&compiled, SourceKind::SkillDescriptions))
+    {
+        let baseline_bytes: usize = baseline.messages.iter().map(|m| m.content.len()).sum();
+        let actual_bytes: usize = compiled.messages.iter().map(|m| m.content.len()).sum();
+        if let Some(removed_bytes) = baseline_bytes.checked_sub(actual_bytes).filter(|n| *n > 0) {
+            let mut effect =
+                jev::JevEffect::new("context-skill-descriptions", "description_bytes_removed");
+            effect.removed_bytes = u64::try_from(removed_bytes).ok();
+            jev::record_effect(
+                request.config,
+                request.state,
+                request.config.jev.context,
+                &effect,
+            );
+        }
+    }
+    Ok(compiled)
 }
 
-fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
+fn fully_included(compiled: &CompiledNativeContext, source: SourceKind) -> bool {
+    compiled
+        .provenance
+        .iter()
+        .any(|entry| entry.source == source && entry.decision == SourceDecision::Included)
+}
+
+fn select_sources(request: &CompileRequest<'_>) -> CtxResult<(Vec<Candidate>, Option<String>)> {
     let mut out = Vec::new();
     push(
         &mut out,
@@ -392,9 +446,21 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
     // concatenated prose needs but a standalone native message does not --
     // reusing the one literal rather than a second, independently-typed
     // copy that could drift on wording.
-    if request.config.prompt.skill_index
-        && let Some(index) = prompt::skill_index_text(request.repo, request.home)
-    {
+    let skill_selection = request
+        .config
+        .prompt
+        .skill_index
+        .then(|| {
+            super::super::compile::selected_skill_index_text(
+                request.config,
+                request.state,
+                request.repo,
+                request.home,
+                request.task,
+            )
+        })
+        .flatten();
+    if let Some((index, _, _, _)) = &skill_selection {
         let intro = prompt::SKILL_INDEX_HEADER
             .trim_start_matches("\n\n---\n\n")
             .trim_end();
@@ -539,6 +605,26 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
         );
     }
 
+    if let Some((_, descriptions, _, _)) = &skill_selection
+        && !descriptions.is_empty()
+    {
+        push(
+            &mut out,
+            "zirv:skill-descriptions",
+            SourceKind::SkillDescriptions,
+            MessageRole::Instruction,
+            SourceTrust::Zirv,
+            None,
+            format!(
+                "{}{}",
+                prompt::SKILL_DESCRIPTIONS_HEADER.trim_start_matches("\n\n---\n\n"),
+                descriptions
+            ),
+            Retention::Optional,
+            false,
+        );
+    }
+
     for evidence in request.evidence {
         if evidence.handle.is_empty()
             || !evidence
@@ -591,7 +677,15 @@ fn select_sources(request: &CompileRequest<'_>) -> CtxResult<Vec<Candidate>> {
         };
         out.push(candidate);
     }
-    Ok(out)
+    let baseline_index = skill_selection
+        .and_then(|(_, _, removed, baseline)| (removed > 0).then_some(baseline).flatten())
+        .map(|index| {
+            let intro = prompt::SKILL_INDEX_HEADER
+                .trim_start_matches("\n\n---\n\n")
+                .trim_end();
+            format!("{intro}\n\n{index}")
+        });
+    Ok((out, baseline_index))
 }
 
 /// A `[skill ...]` header is only recognised right after this exact marker,
@@ -1667,6 +1761,174 @@ mod tests {
             "the index must never carry an instruction-body sentence: {}",
             message.content
         );
+    }
+
+    #[test]
+    fn native_skill_selection_keeps_discovery_ids_in_prefix_and_details_late() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let state_root = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let skills = repo.path().join(".zirv/skills");
+        std::fs::create_dir_all(&skills).expect("skills");
+        let description = "database migration schema and SQL guidance ".repeat(30);
+        std::fs::write(
+            skills.join("database-helper.yaml"),
+            format!(
+                "schema_version: 1\nid: database-helper\nversion: 1\nname: Database helper\n\
+                     description: {description}\nimplicit_activation: true\n\
+                     context_budget_bytes: 64\nphases: [implement]\ninstructions: use SQL safely\n"
+            ),
+        )
+        .expect("fixture");
+        let entries = prompt::skill_index_entries(repo.path(), Some(home.path())).expect("entries");
+        let index = entries
+            .iter()
+            .position(|(id, _, _)| id == "database-helper")
+            .expect("index");
+        let body = format!(
+            r#"{{"model":"jev-latest","answers":{{"s{index}":{{"type":"noul","noul":0.02}}}},"usage":{{"input_tokens":8,"output_tokens":1}}}}"#
+        );
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(
+            200,
+            Box::leak(body.into_boxed_str()),
+        );
+        let mut cfg = CtxConfig::default();
+        cfg.jev.context = true;
+        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_NATIVE_SKILL_SELECT_737".into();
+        // SAFETY (test-only): this test owns a unique env variable name.
+        unsafe { std::env::set_var("JEV_TEST_NATIVE_SKILL_SELECT_737", "secret") };
+        let compiled = compile(&request(
+            Some(home.path()),
+            repo.path(),
+            &state,
+            &cfg,
+            "Fix the CSS frontend layout",
+            ample_budget(),
+        ))
+        .expect("compile");
+        handle.join().expect("server");
+        let index_message = compiled
+            .messages
+            .iter()
+            .find(|m| m.source == SourceKind::SkillIndex)
+            .expect("index message");
+        assert!(
+            index_message
+                .content
+                .contains("- database-helper (repository-untrusted)")
+        );
+        assert!(!index_message.content.contains("database migration schema"));
+        let detail_message = compiled
+            .messages
+            .iter()
+            .find(|m| m.source == SourceKind::SkillDescriptions)
+            .expect("detail message");
+        assert!(
+            detail_message
+                .content
+                .contains("Task-relevant skill descriptions:")
+        );
+        let index_at = compiled
+            .messages
+            .iter()
+            .position(|m| m.source == SourceKind::SkillIndex)
+            .expect("index position");
+        let details_at = compiled
+            .messages
+            .iter()
+            .position(|m| m.source == SourceKind::SkillDescriptions)
+            .expect("detail position");
+        assert!(index_at < details_at);
+        let baseline_index =
+            prompt::skill_index_text(repo.path(), Some(home.path())).expect("full skill index");
+        let baseline_bytes = prompt::SKILL_INDEX_HEADER
+            .trim_start_matches("\n\n---\n\n")
+            .trim_end()
+            .len()
+            + 2
+            + baseline_index.len();
+        let selected_bytes: usize = compiled.messages.iter().map(|m| m.content.len()).sum();
+        let baseline_compiled = {
+            let mut baseline_cfg = cfg.clone();
+            baseline_cfg.jev.context = false;
+            compile(&request(
+                Some(home.path()),
+                repo.path(),
+                &state,
+                &baseline_cfg,
+                "Fix the CSS frontend layout",
+                ample_budget(),
+            ))
+            .expect("baseline compile")
+        };
+        let baseline_rendered_bytes: usize = baseline_compiled
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .sum();
+        assert!(baseline_bytes > index_message.content.len() + detail_message.content.len());
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("native selection effect");
+        let row: serde_json::Value = serde_json::from_str(effects.trim()).expect("effect row");
+        assert_eq!(row["site"], "context-skill-descriptions");
+        assert_eq!(row["action"], "description_bytes_removed");
+        assert_eq!(
+            row["removed_bytes"],
+            baseline_rendered_bytes - selected_bytes
+        );
+
+        let failed_budget = TokenBudget {
+            context_window_tokens: compiled.accounting.tool_tokens + 100,
+            output_reserve_tokens: 0,
+            max_inline_evidence_bytes: 256,
+        };
+        assert!(
+            compile(&request(
+                Some(home.path()),
+                repo.path(),
+                &state,
+                &cfg,
+                "Fix the CSS frontend layout",
+                failed_budget,
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.root().join("jev-effects.jsonl")).expect("effect"),
+            effects,
+            "failed compilation must not append a savings effect"
+        );
+
+        let off_root = tempfile::tempdir().expect("off state");
+        let off_state = StateDir::from_root(off_root.path().to_path_buf());
+        let mut off_cfg = cfg.clone();
+        off_cfg.jev.context = false;
+        compile(&request(
+            Some(home.path()),
+            repo.path(),
+            &off_state,
+            &off_cfg,
+            "Fix the CSS frontend layout",
+            ample_budget(),
+        ))
+        .expect("off compile");
+        assert!(!off_state.root().join("jev-effects.jsonl").exists());
+
+        unsafe { std::env::remove_var("JEV_TEST_NATIVE_SKILL_SELECT_737") };
+        let no_key_root = tempfile::tempdir().expect("no-key state");
+        let no_key_state = StateDir::from_root(no_key_root.path().to_path_buf());
+        compile(&request(
+            Some(home.path()),
+            repo.path(),
+            &no_key_state,
+            &cfg,
+            "Fix the CSS frontend layout",
+            ample_budget(),
+        ))
+        .expect("no-key compile");
+        assert!(!no_key_state.root().join("jev-effects.jsonl").exists());
     }
 
     #[test]

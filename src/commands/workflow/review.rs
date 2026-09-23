@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use clap::{Args, Subcommand, ValueEnum};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::classify::RiskBand;
 use super::engine::{self, ArtifactStage, WorkflowState, WorkflowStatus};
@@ -42,7 +43,6 @@ const MAX_REVIEW_FINDINGS_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_FIX_REVIEW_ROUNDS: u8 = 3;
 const REVIEW_RESULT_PREFIX: &str = "ZIRV_REVIEW_RESULT ";
-const MAX_JEV_FINDING_DETAIL_BYTES: usize = 1024;
 const MAX_JEV_FINDINGS_PER_BATCH: usize = 20;
 const MAX_JEV_PREVIOUS_FINDINGS: usize = 10;
 /// Minimum disposition confidence from the 2026-09-18 probe.
@@ -90,47 +90,88 @@ pub struct ReviewFinding {
     pub created_at: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy)]
 struct JevFindingState {
-    id: String,
-    severity: FindingSeverity,
-    title: String,
-    detail: String,
-    file: Option<String>,
-    line: Option<u32>,
+    severity: u8,
+    category: u8,
+    file_kind: u8,
+    summary_length_bucket: u8,
 }
 
 impl From<&ReviewFinding> for JevFindingState {
     fn from(finding: &ReviewFinding) -> Self {
-        let detail = crate::utils::truncate_bytes(
-            finding.summary.clone(),
-            Some(MAX_JEV_FINDING_DETAIL_BYTES),
-        );
-        let title = detail.lines().next().unwrap_or_default().to_string();
         Self {
-            id: finding.id.clone(),
-            severity: finding.severity,
-            title,
-            detail,
-            file: finding
+            severity: match finding.severity {
+                FindingSeverity::Note => 0,
+                FindingSeverity::Minor => 1,
+                FindingSeverity::Major => 2,
+                FindingSeverity::Critical => 3,
+            },
+            category: finding_category(&finding.summary),
+            file_kind: match finding
                 .path
                 .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-            line: finding.line,
+                .and_then(|path| path.extension())
+                .and_then(|extension| extension.to_str())
+            {
+                Some("rs") => 1,
+                Some("md") => 2,
+                Some("toml" | "yaml" | "yml" | "json") => 3,
+                _ => 0,
+            },
+            summary_length_bucket: (finding.summary.len() / 128).min(4) as u8,
         }
     }
 }
 
-#[derive(Serialize)]
-struct JevDispositionState {
-    repository_context: String,
-    findings: Vec<JevFindingState>,
+impl JevFindingState {
+    fn facts(self) -> Vec<u32> {
+        vec![
+            u32::from(self.severity),
+            u32::from(self.category),
+            u32::from(self.file_kind),
+            u32::from(self.summary_length_bucket),
+        ]
+    }
+}
+
+fn finding_category(summary: &str) -> u8 {
+    let lower = summary.to_ascii_lowercase();
+    if ["rename", "naming", "variable name"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        1
+    } else if ["off-by-one", "bound", "index", "loop"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        2
+    } else if ["error", "failure", "crash", "exception"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        3
+    } else if ["document", "docs", "comment"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        4
+    } else if ["auth", "permission", "secret", "security"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        5
+    } else {
+        0
+    }
 }
 
 #[derive(Serialize)]
-struct JevDedupState {
-    new_finding: JevFindingState,
-    previous_findings: Vec<JevFindingState>,
+struct JevMetadataState {
+    #[serde(rename = "_zirv_metadata_only")]
+    metadata_only: bool,
+    facts: Vec<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -182,13 +223,6 @@ fn finding_key(finding: &ReviewFinding) -> String {
     }
 }
 
-fn one_line_context(context: &str) -> String {
-    crate::utils::truncate_bytes(
-        context.split_whitespace().collect::<Vec<_>>().join(" "),
-        Some(MAX_JEV_FINDING_DETAIL_BYTES),
-    )
-}
-
 fn advisory_rank(finding: &ReviewFinding) -> u8 {
     match finding.advisory_disposition.as_deref() {
         Some("fix_now") => 0,
@@ -206,19 +240,23 @@ fn sort_findings_by_advisory(findings: &mut [ReviewFinding]) {
 fn advise_dispositions(
     cfg: &CtxConfig,
     state_dir: &StateDir,
-    repository_context: &str,
+    _repository_context: &str,
     findings: &mut [ReviewFinding],
 ) {
     for batch in findings.chunks_mut(MAX_JEV_FINDINGS_PER_BATCH) {
-        let state = JevDispositionState {
-            repository_context: one_line_context(repository_context),
-            findings: batch.iter().map(JevFindingState::from).collect(),
+        let states: Vec<JevFindingState> = batch.iter().map(JevFindingState::from).collect();
+        let state = JevMetadataState {
+            metadata_only: true,
+            facts: states.iter().map(|finding| finding.facts()).collect(),
         };
+        if states.iter().all(|finding| finding.category == 0) {
+            continue;
+        }
         let questions: Vec<Question> = batch
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                Question::choice(
+                Question::metadata_choice(
                     &format!("f{index}"),
                     "Classify this review finding's advisory disposition.",
                     &[
@@ -253,7 +291,8 @@ fn advise_dispositions(
             let AnswerValue::Choice(choice) = &answer.value else {
                 continue;
             };
-            if answer.decisive(JEV_DISPOSITION_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
+            if finding_category(&finding.summary) != 0
+                && answer.decisive(JEV_DISPOSITION_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
                 && matches!(choice.as_str(), "fix_now" | "verify" | "defer" | "reject")
             {
                 finding.advisory_disposition = Some(choice.clone());
@@ -276,6 +315,46 @@ fn apply_duplicate_answer(
     {
         incoming.duplicate_of = Some(finding_key(previous));
     }
+}
+
+fn summary_overlap_bucket(left: &str, right: &str) -> u8 {
+    let words = |text: &str| -> BTreeSet<String> {
+        text.split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|word| word.len() >= 3)
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let left = words(left);
+    let right = words(right);
+    let union = left.union(&right).count();
+    (left.intersection(&right).count() * 4)
+        .checked_div(union)
+        .unwrap_or(0) as u8
+}
+
+fn duplicate_comparison(incoming: &ReviewFinding, previous: &ReviewFinding) -> [u32; 5] {
+    let same_file = incoming.path.is_some() && incoming.path == previous.path;
+    let line_distance = incoming
+        .line
+        .zip(previous.line)
+        .map(|(left, right)| left.abs_diff(right));
+    let overlap = summary_overlap_bucket(&incoming.summary, &previous.summary);
+    let category = finding_category(&incoming.summary);
+    let same_category = category != 0 && category == finding_category(&previous.summary);
+    [
+        u32::from(same_file),
+        line_distance
+            .map(|distance| (distance / 8).min(4))
+            .unwrap_or(5),
+        u32::from(overlap),
+        u32::from(same_category),
+        u32::from(
+            same_file
+                && line_distance.is_some_and(|distance| distance <= 24)
+                && overlap >= 2
+                && same_category,
+        ),
+    ]
 }
 
 fn advise_duplicates(
@@ -304,18 +383,33 @@ fn advise_duplicates(
             FindingSeverity::Note | FindingSeverity::Minor
         ) && !exact.contains(&finding_key(finding))
     }) {
-        let state = JevDedupState {
-            new_finding: JevFindingState::from(&*finding),
-            previous_findings: candidates
+        let comparisons: Vec<[u32; 5]> = candidates
+            .iter()
+            .map(|candidate| duplicate_comparison(finding, candidate))
+            .collect();
+        if !comparisons.iter().any(|facts| facts[4] == 1) {
+            continue;
+        }
+        let mut facts = vec![JevFindingState::from(&*finding).facts()];
+        facts.extend(
+            candidates
                 .iter()
-                .map(|candidate| JevFindingState::from(*candidate))
-                .collect(),
+                .zip(&comparisons)
+                .map(|(candidate, comparison)| {
+                    let mut row = JevFindingState::from(*candidate).facts();
+                    row.extend(comparison);
+                    row
+                }),
+        );
+        let state = JevMetadataState {
+            metadata_only: true,
+            facts,
         };
         let questions: Vec<Question> = candidates
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                Question::noul(
+                Question::metadata_noul(
                     &format!("p{index}"),
                     "Is this the same underlying issue as the new finding?",
                     "the same underlying issue",
@@ -333,6 +427,12 @@ fn advise_duplicates(
         ) else {
             continue;
         };
+        if !questions
+            .iter()
+            .all(|question| answers.contains_key(&question.id))
+        {
+            continue;
+        }
         let best = candidates
             .iter()
             .enumerate()
@@ -353,6 +453,7 @@ fn advise_duplicates(
         // harvest gate documents for its own floor.
         if let Some((candidate, probability, answer)) = best
             && answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+            && duplicate_comparison(finding, candidate)[4] == 1
         {
             apply_duplicate_answer(finding, candidate, probability);
         }
@@ -455,6 +556,11 @@ pub struct ReviewRunEvidence {
     /// changed and resent in full rather than silently dropped.
     #[serde(default)]
     pub finding_dispositions: BTreeMap<String, FindingDisposition>,
+    /// Reviewer identity for a completed round where Jev's semantic dedup
+    /// changed a new Minor/Note finding into convergence. It is provenance,
+    /// never approval to pass the review step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev_dedup_converged_for: Option<String>,
 }
 
 pub fn depth_for_risk(risk: RiskBand) -> ReviewDepth {
@@ -2001,6 +2107,14 @@ fn cap_findings_payload(mut findings: Vec<ReviewFinding>, budget: usize) -> Vec<
     findings
 }
 
+fn resolved_review_base_sha(repo: &Path, base: Option<&str>) -> CtxResult<String> {
+    match base {
+        // Keep an option-like revision from becoming a git flag.
+        Some(base) => git(repo, &["rev-parse", "--verify", "--end-of-options", base]),
+        None => default_base(repo),
+    }
+}
+
 pub fn package(
     state_dir: &StateDir,
     state: &WorkflowState,
@@ -2021,17 +2135,7 @@ pub fn package(
     }) {
         return Err("workflow contains an oversized review finding".into());
     }
-    let base_sha = match base {
-        // `--verify --end-of-options` so a revision starting with `-` is read
-        // as a revision and never as a flag to git itself. Verified against
-        // git 2.50: bare `--end-of-options` echoes itself into stdout, and a
-        // trailing `--` makes rev-parse treat the value as a path instead.
-        Some(base) => git(
-            &state.repo,
-            &["rev-parse", "--verify", "--end-of-options", base],
-        )?,
-        None => default_base(&state.repo)?,
-    };
+    let base_sha = resolved_review_base_sha(&state.repo, base)?;
     let head_sha = git(&state.repo, &["rev-parse", "HEAD"])?;
     let current_fingerprint = verification::change_fingerprint(&state.repo)?;
     let review_round = review_round(state, current_fingerprint);
@@ -2219,6 +2323,9 @@ pub struct RunReviewArgs {
     pub github_repo: Option<String>,
     #[arg(long)]
     pub repo: Option<PathBuf>,
+    /// Run a new reviewer even when an unchanged Jev-converged round is reusable.
+    #[arg(long, default_value_t = false)]
+    pub fresh: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3090,6 +3197,122 @@ fn launch_reviewer(
     })
 }
 
+fn reviewer_identity(cfg: &CtxConfig, runtime: RuntimeKind, agent: &str) -> Option<String> {
+    if runtime != RuntimeKind::Harness {
+        return None;
+    }
+    let adapter = crate::commands::ctx::adapters::all(None)
+        .into_iter()
+        .find(|candidate| candidate.name() == agent)?;
+    let model =
+        crate::commands::ctx::adapters::resolve_review_model(cfg, agent, adapter.as_ref()).model;
+    if model.is_empty() {
+        return None;
+    }
+    Some(format!("harness:{agent}:{model}"))
+}
+
+fn review_reuse_identity(
+    cfg: &CtxConfig,
+    runtime: RuntimeKind,
+    agent: &str,
+    state: &WorkflowState,
+    base_sha: &str,
+    verification: Option<&VerificationEvidence>,
+) -> Option<String> {
+    let reviewer = reviewer_identity(cfg, runtime, agent)?;
+    let verification_basis = verification.map(|evidence| {
+        (
+            &evidence.mode,
+            evidence.passed,
+            evidence.fresh,
+            evidence.fingerprint,
+            evidence
+                .checks
+                .iter()
+                .map(|(id, status, _)| (id, status))
+                .collect::<Vec<_>>(),
+            evidence.passed_with_baseline_waiver,
+            &evidence.waived_failing_tests,
+        )
+    });
+    let basis = serde_json::to_vec(&(
+        &state.task,
+        base_sha,
+        &state.classification,
+        state.deploy_tier,
+        state.include_custom_skills,
+        &state.accepted_preexisting_findings,
+        accepted_artifact_excerpt(state),
+        verification_basis,
+    ))
+    .ok()?;
+    let digest = Sha256::digest(&basis)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(format!("{reviewer}:{digest}"))
+}
+
+/// Reuse only a completed semantic-dedup round for the exact current tree,
+/// with every independent reviewer and finding disposition still satisfied.
+fn reusable_review_evidence<'a>(
+    args: &RunReviewArgs,
+    runtime: RuntimeKind,
+    cfg: &CtxConfig,
+    state_dir: &StateDir,
+    state: &'a WorkflowState,
+) -> Option<&'a ReviewRunEvidence> {
+    if args.fresh
+        || args.pr.is_some()
+        || !cfg.jev.review_reuse
+        || !jev::available(&cfg.proxy.typesafe)
+        || state
+            .review_findings
+            .iter()
+            .any(|finding| finding.disposition == FindingDisposition::Open)
+    {
+        return None;
+    }
+    let base_sha = resolved_review_base_sha(&state.repo, args.base.as_deref()).ok()?;
+    let fingerprint = verification::change_fingerprint(&state.repo).ok()?;
+    let verification = verification::load_latest(state_dir, &state.repo)
+        .ok()?
+        .map(|report| VerificationEvidence::from_report(report, fingerprint, &state.repo));
+    let identity = review_reuse_identity(
+        cfg,
+        runtime,
+        &args.agent,
+        state,
+        &base_sha,
+        verification.as_ref(),
+    )?;
+    let candidate = state.review_evidence.iter().rev().find(|evidence| {
+        evidence.jev_dedup_converged_for.as_deref() == Some(identity.as_str())
+            && evidence.head_sha.is_some()
+            && evidence.reviewed_tree_sha.is_some()
+    })?;
+    let head = git(&state.repo, &["rev-parse", "HEAD"]).ok()?;
+    let tree = compute_reviewed_tree_sha(&state.repo).ok()?;
+    if candidate.change_fingerprint != fingerprint
+        || candidate.head_sha.as_deref() != Some(head.as_str())
+        || candidate.reviewed_tree_sha.as_deref() != Some(tree.as_str())
+    {
+        return None;
+    }
+    let completed_reviewers: BTreeSet<&str> = state
+        .review_evidence
+        .iter()
+        .filter(|evidence| {
+            evidence.change_fingerprint == fingerprint
+                && evidence.head_sha.as_deref() == Some(head.as_str())
+                && evidence.reviewed_tree_sha.as_deref() == Some(tree.as_str())
+        })
+        .map(|evidence| evidence.adapter.as_str())
+        .collect();
+    (completed_reviewers.len() >= required_independent_reviews_for(state)).then_some(candidate)
+}
+
 /// `zirv workflow review run`, with the reviewer launch injected.
 ///
 /// `launch` is a parameter so a test can drive this whole path -- including the
@@ -3119,6 +3342,24 @@ fn run_independent_review(
     if args.pr.is_none() && args.github_repo.is_some() {
         return Err("--github-repo requires --pr".into());
     }
+    let reuse_cfg = CtxConfig::load(&state.repo, &|key| std::env::var(key).ok()).ok();
+    if let Some(cfg) = reuse_cfg.as_ref()
+        && let Some(evidence) = reusable_review_evidence(args, runtime, cfg, &state_dir, &state)
+    {
+        let mut effect = jev::JevEffect::new("workflow-review-reuse", "reviewer_launch_reused");
+        effect.subject_id = Some(&state.id);
+        effect.item_id = Some(&evidence.id);
+        effect.baseline_count = Some(1);
+        effect.actual_count = Some(0);
+        effect.outcome = Some("reused_completed_evidence");
+        jev::record_effect(cfg, &state_dir, cfg.jev.review_reuse, &effect);
+        writeln!(
+            writer,
+            "reused completed review evidence {}; reviewer launch skipped",
+            evidence.id
+        )?;
+        return Ok(0);
+    }
     let package = match args.pr {
         Some(pr) => package_pull_request(&state, pr, args.github_repo.as_deref())?,
         None => package(&state_dir, &state, args.base.as_deref())?,
@@ -3139,7 +3380,25 @@ fn run_independent_review(
         &dispatch_event,
         &super::telemetry::TelemetryConfig::for_repo(&state.repo),
     );
-    let run = launch(runtime, &args.agent, &package)?;
+    let run_result = launch(runtime, &args.agent, &package);
+    if let Some(cfg) = reuse_cfg.as_ref() {
+        let mut effect = jev::JevEffect::new("workflow-review-reuse", "review_launch_attempted");
+        effect.subject_id = Some(&state.id);
+        effect.baseline_count = Some(1);
+        effect.actual_count = run_result.is_ok().then_some(1);
+        effect.outcome = Some(if run_result.is_ok() {
+            "returned"
+        } else {
+            "failed"
+        });
+        jev::record_effect(
+            cfg,
+            &state_dir,
+            cfg.jev.review || cfg.jev.review_reuse,
+            &effect,
+        );
+    }
+    let run = run_result?;
     let code = run.code;
 
     // Incoming PR review is deliberately inspection-only. Re-read its head
@@ -3261,10 +3520,18 @@ fn run_independent_review(
     // Only a completed round can have converged; a dashboard ack or a failed
     // launch reviewed nothing, so it is never mistaken for zero new findings.
     let mut incoming_findings = build_review_findings(parsed_findings, now_secs());
-    if recorded && let Ok(cfg) = CtxConfig::load(&state.repo, &|key| std::env::var(key).ok()) {
-        advise_dispositions(&cfg, &state_dir, &state.task, &mut incoming_findings);
+    let baseline_new_findings = if recorded {
+        new_finding_count(&state.review_findings, &incoming_findings)
+    } else {
+        0
+    };
+    let review_cfg = recorded
+        .then(|| CtxConfig::load(&state.repo, &|key| std::env::var(key).ok()).ok())
+        .flatten();
+    if recorded && let Some(cfg) = review_cfg.as_ref() {
+        advise_dispositions(cfg, &state_dir, &state.task, &mut incoming_findings);
         advise_duplicates(
-            &cfg,
+            cfg,
             &state_dir,
             &state.review_findings,
             &mut incoming_findings,
@@ -3282,6 +3549,11 @@ fn run_independent_review(
         new_findings,
         converged: recorded && new_findings == 0,
     };
+    let semantic_jev_convergence = outcome.converged
+        && baseline_new_findings > 0
+        && incoming_findings
+            .iter()
+            .any(|finding| finding.duplicate_of.is_some());
     if run.dashboard_spawn {
         writeln!(
             writer,
@@ -3302,6 +3574,46 @@ fn run_independent_review(
             .iter()
             .map(|finding| (finding.id.clone(), finding.disposition))
             .collect();
+        let jev_dedup_converged_for = if semantic_jev_convergence {
+            review_cfg.as_ref().and_then(|cfg| {
+                if !cfg.jev.review || !jev::available(&cfg.proxy.typesafe) {
+                    return None;
+                }
+                let before = reuse_cfg.as_ref().and_then(|before| {
+                    review_reuse_identity(
+                        before,
+                        runtime,
+                        &args.agent,
+                        &state,
+                        &package.base_sha,
+                        package.verification.as_ref(),
+                    )
+                });
+                let after = review_reuse_identity(
+                    cfg,
+                    runtime,
+                    &args.agent,
+                    &state,
+                    &package.base_sha,
+                    package.verification.as_ref(),
+                );
+                (before.is_some() && before == after)
+                    .then_some(after)
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        if jev_dedup_converged_for.is_some()
+            && let Some(cfg) = review_cfg.as_ref()
+        {
+            let mut effect = jev::JevEffect::new("workflow-review-dedup", "semantic_convergence");
+            effect.subject_id = Some(&state.id);
+            effect.baseline_count = Some(baseline_new_findings as u32);
+            effect.actual_count = Some(0);
+            effect.outcome = Some("findings_pending_disposition");
+            jev::record_effect(cfg, &state_dir, cfg.jev.review, &effect);
+        }
         state.review_evidence.push(ReviewRunEvidence {
             id: uuid::Uuid::new_v4().to_string(),
             change_fingerprint: package.change_fingerprint,
@@ -3313,6 +3625,7 @@ fn run_independent_review(
             // time, always `Some` for a local (non-PR) package.
             reviewed_tree_sha: package.reviewed_tree_sha.clone(),
             finding_dispositions,
+            jev_dedup_converged_for,
         });
         let overflow = state
             .review_evidence
@@ -3755,6 +4068,7 @@ mod tests {
             pr: None,
             github_repo: None,
             repo: Some(repo.path().to_path_buf()),
+            fresh: false,
         };
         let mut out = Vec::new();
         let code = run_independent_review(&args, &mut out, &reviewer);
@@ -3796,6 +4110,7 @@ mod tests {
             pr: None,
             github_repo: None,
             repo: Some(repo.path().to_path_buf()),
+            fresh: false,
         };
         let mut out = Vec::new();
         let code = run_independent_review(&args, &mut out, &|_, _, _| {
@@ -3851,6 +4166,7 @@ mod tests {
             pr: None,
             github_repo: None,
             repo: Some(repo.path().to_path_buf()),
+            fresh: false,
         };
         let mut out = Vec::new();
         let code = run_independent_review(&args, &mut out, &|_, _, _| {
@@ -3926,6 +4242,7 @@ mod tests {
             pr: None,
             github_repo: None,
             repo: Some(repo.path().to_path_buf()),
+            fresh: false,
         };
         let mut out = Vec::new();
         let code = run_independent_review(&args, &mut out, &reviewer);
@@ -3983,6 +4300,7 @@ mod tests {
             pr: None,
             github_repo: None,
             repo: Some(repo.path().to_path_buf()),
+            fresh: false,
         };
         // A valid structured result, so this test isolates the "parsed fine
         // but the process still exited non-zero" case from the separate
@@ -5161,10 +5479,10 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
         let mut findings = vec![
-            finding_at("src/reject.rs", 1, "reject"),
-            finding_at("src/fix.rs", 2, "fix"),
-            finding_at("src/verify.rs", 3, "verify"),
-            finding_at("src/defer.rs", 4, "defer"),
+            finding_at("src/reject.rs", 1, "rename this variable"),
+            finding_at("src/fix.rs", 2, "off-by-one bound"),
+            finding_at("src/verify.rs", 3, "error handling failure"),
+            finding_at("src/defer.rs", 4, "document this behavior"),
         ];
         findings[0].disposition = FindingDisposition::Accepted;
 
@@ -5211,7 +5529,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         )]);
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut findings = vec![finding_at("src/reject.rs", 1, "reject")];
+        let mut findings = vec![finding_at("src/reject.rs", 1, "rename this variable")];
 
         advise_dispositions(&cfg, &state_dir, "review the repository", &mut findings);
         request.recv().unwrap();
@@ -5237,9 +5555,17 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         )]);
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut previous = finding_at("src/old.rs", 8, "use clearer naming");
+        let mut previous = finding_at(
+            "src/sensitive-path-712.rs",
+            8,
+            "rename confidential-value-374 temporary variable for clarity",
+        );
         previous.severity = FindingSeverity::Note;
-        let mut incoming = finding_at("src/new.rs", 14, "rename the temporary");
+        let mut incoming = finding_at(
+            "src/sensitive-path-712.rs",
+            14,
+            "rename confidential-value-374 temporary variable for readability",
+        );
         incoming.severity = FindingSeverity::Note;
 
         advise_duplicates(
@@ -5248,10 +5574,217 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             std::slice::from_ref(&previous),
             std::slice::from_mut(&mut incoming),
         );
-        request.recv().unwrap();
+        let request = request.recv().unwrap();
+        assert!(
+            !request.contains("confidential-value-374"),
+            "finding text leaked to Jev"
+        );
+        assert!(
+            !request.contains("sensitive-path-712"),
+            "file path leaked to Jev"
+        );
 
         assert_eq!(incoming.duplicate_of, Some(finding_key(&previous)));
         assert_eq!(new_finding_count(&[previous], &[incoming]), 0);
+    }
+
+    #[test]
+    fn semantic_convergence_reuses_a_review_only_after_findings_are_disposed() {
+        let repo = git_repo_with_commits(&["base", "changed"]);
+        let root = tempdir().unwrap();
+        let home = root.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state_path = root.path().to_str().unwrap();
+        let body = r#"{"model":"jev-latest","answers":{"f0":{"type":"choice","choice":"verify","probabilities":{"verify":0.95,"other":0.05},"confidence":0.95},"p0":{"type":"noul","noul":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+        let (url, server) = crate::commands::ctx::jev::tests::multi_shot_server(200, body, 2);
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::state::STATE_ENV, Some(state_path)),
+            ("ZIRV_CTX_JEV_REVIEW", Some("true")),
+            ("ZIRV_CTX_JEV_REVIEW_REUSE", Some("true")),
+            ("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL", Some(&url)),
+            (
+                "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+                Some("REVIEW_TEST_SEMANTIC_REUSE_KEY"),
+            ),
+            ("REVIEW_TEST_SEMANTIC_REUSE_KEY", Some("secret")),
+        ]);
+        let mut state = review_workflow(repo.path(), &state_dir);
+        let mut previous = finding_at("src/lib.rs", 8, "rename temporary variable for clarity");
+        previous.severity = FindingSeverity::Note;
+        previous.disposition = FindingDisposition::Fixed;
+        state.review_findings.push(previous);
+        engine::save(&state_dir, &state, true).unwrap();
+        let args = RunReviewArgs {
+            id: state.id.clone(),
+            agent: "claude".into(),
+            runtime: "harness".into(),
+            base: None,
+            pr: None,
+            github_repo: None,
+            repo: Some(repo.path().to_path_buf()),
+            fresh: false,
+        };
+        let mut output = Vec::new();
+        let first = run_independent_review(
+            &args,
+            &mut output,
+            &|_: RuntimeKind, _: &str, _: &ReviewPackage| {
+                Ok(ReviewerRun {
+                    code: 0,
+                    dashboard_spawn: false,
+                    output: Some(format!(
+                        "{REVIEW_RESULT_PREFIX}{{\"findings\":[{{\"severity\":\"note\",\"summary\":\"rename temporary variable for readability\",\"path\":\"src/lib.rs\",\"line\":14}}]}}"
+                    )),
+                })
+            },
+        );
+        assert_eq!(first.unwrap(), 0);
+        server.join().unwrap();
+        let mut stored = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        assert!(stored.review_evidence[0].jev_dedup_converged_for.is_some());
+        assert_eq!(
+            stored.review_findings[1].disposition,
+            FindingDisposition::Open
+        );
+
+        let launched = std::cell::Cell::new(0);
+        let reviewer = |_: RuntimeKind, _: &str, _: &ReviewPackage| {
+            launched.set(launched.get() + 1);
+            Ok(ReviewerRun {
+                code: 0,
+                dashboard_spawn: false,
+                output: Some(format!("{REVIEW_RESULT_PREFIX}{{\"findings\":[]}}")),
+            })
+        };
+        run_independent_review(&args, &mut Vec::new(), &reviewer).unwrap();
+        assert_eq!(
+            launched.get(),
+            1,
+            "an Open duplicate still needs review handling"
+        );
+
+        stored = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        for finding in &mut stored.review_findings {
+            finding.disposition = FindingDisposition::Fixed;
+        }
+        engine::save(&state_dir, &stored, true).unwrap();
+        let mut reused_output = Vec::new();
+        assert_eq!(
+            run_independent_review(&args, &mut reused_output, &reviewer).unwrap(),
+            0
+        );
+        assert_eq!(
+            launched.get(),
+            1,
+            "the eligible retry never invokes the reviewer"
+        );
+        assert!(
+            String::from_utf8(reused_output)
+                .unwrap()
+                .contains("reviewer launch skipped")
+        );
+        let effects = std::fs::read_to_string(root.path().join("jev-effects.jsonl")).unwrap();
+        assert!(effects.contains("\"action\":\"reviewer_launch_reused\""));
+
+        let stored = engine::load(&state_dir, repo.path(), &state.id).unwrap();
+        let mut cfg = CtxConfig::load(repo.path(), &|key| std::env::var(key).ok()).unwrap();
+        assert!(
+            reusable_review_evidence(&args, RuntimeKind::Harness, &cfg, &state_dir, &stored)
+                .is_some()
+        );
+        cfg.review.claude = Some(
+            if reviewer_identity(&cfg, RuntimeKind::Harness, "claude")
+                .unwrap()
+                .ends_with(":opus")
+            {
+                "sonnet"
+            } else {
+                "opus"
+            }
+            .into(),
+        );
+        assert!(
+            reusable_review_evidence(&args, RuntimeKind::Harness, &cfg, &state_dir, &stored)
+                .is_none()
+        );
+        cfg.review.claude = None;
+        let mut fresh = args;
+        fresh.fresh = true;
+        assert!(
+            reusable_review_evidence(&fresh, RuntimeKind::Harness, &cfg, &state_dir, &stored)
+                .is_none()
+        );
+        fresh.fresh = false;
+        cfg.proxy.typesafe.credential_env = "JEV_REVIEW_REUSE_MISSING_KEY".into();
+        assert!(
+            reusable_review_evidence(&fresh, RuntimeKind::Harness, &cfg, &state_dir, &stored)
+                .is_none()
+        );
+
+        let mut changed_task = stored.clone();
+        changed_task
+            .task
+            .push_str(" with an additional requirement");
+        let active_cfg = CtxConfig::load(repo.path(), &|key| std::env::var(key).ok()).unwrap();
+        assert!(
+            reusable_review_evidence(
+                &fresh,
+                RuntimeKind::Harness,
+                &active_cfg,
+                &state_dir,
+                &changed_task,
+            )
+            .is_none()
+        );
+        let head = git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        fresh.base = Some(
+            if default_base(repo.path()).unwrap() == head {
+                "HEAD^"
+            } else {
+                "HEAD"
+            }
+            .into(),
+        );
+        assert!(
+            reusable_review_evidence(
+                &fresh,
+                RuntimeKind::Harness,
+                &active_cfg,
+                &state_dir,
+                &stored
+            )
+            .is_none()
+        );
+        engine::save(&state_dir, &changed_task, true).unwrap();
+        run_independent_review(&fresh, &mut Vec::new(), &reviewer).unwrap();
+        assert_eq!(
+            launched.get(),
+            2,
+            "changed review basis must launch a reviewer"
+        );
+
+        engine::save(&state_dir, &stored, true).unwrap();
+        fresh.base = None;
+        let fingerprint = verification::change_fingerprint(repo.path()).unwrap();
+        verification::save_report(
+            &state_dir,
+            &waivable_failing_report(repo.path(), fingerprint, &["new_failure"]),
+        )
+        .unwrap();
+        assert!(
+            reusable_review_evidence(
+                &fresh,
+                RuntimeKind::Harness,
+                &active_cfg,
+                &state_dir,
+                &stored
+            )
+            .is_none(),
+            "changed verification evidence invalidates the completed review"
+        );
+        run_independent_review(&fresh, &mut Vec::new(), &reviewer).unwrap();
+        assert_eq!(launched.get(), 3, "new failed check must launch a reviewer");
     }
 
     #[test]
@@ -5277,7 +5810,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         )]);
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut findings = vec![finding_at("src/lib.rs", 1, "finding")];
+        let mut findings = vec![finding_at("src/lib.rs", 1, "rename variable")];
         let expected = findings.clone();
 
         advise_dispositions(&cfg, &state_dir, "review the repository", &mut findings);
@@ -5478,6 +6011,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             pr: None,
             github_repo: None,
             repo: Some(repo.path().to_path_buf()),
+            fresh: false,
         };
         let mut out = Vec::new();
         // The reviewer reports the exact same finding again, just reworded --
@@ -5536,6 +6070,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: None,
             reviewed_tree_sha: None,
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
         assert_eq!(review_round(&state, 10), 1);
         assert_eq!(review_round(&state, 11), 2);
@@ -5548,6 +6083,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: None,
             reviewed_tree_sha: None,
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
         assert_eq!(review_round(&state, 12), 3);
     }
@@ -5572,6 +6108,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(shas[1].clone()),
             reviewed_tree_sha: Some(reviewed_tree.clone()),
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
 
         let base = delta_base(&state, repo.path(), 2).expect("a delta base for round 2");
@@ -5606,6 +6143,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(shas[1].clone()),
             reviewed_tree_sha: None,
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
         assert_eq!(delta_base(&no_tree, repo.path(), 2), None);
 
@@ -5620,6 +6158,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(shas[1].clone()),
             reviewed_tree_sha: Some("0".repeat(40)),
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
         assert_eq!(delta_base(&gone, repo.path(), 2), None);
 
@@ -5646,6 +6185,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(shas[1].clone()),
             reviewed_tree_sha: None,
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
         let state_dir =
             StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
@@ -6071,6 +6611,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(shas[1].clone()),
             reviewed_tree_sha: Some(reviewed_tree.clone()),
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
         let state_dir =
             StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
@@ -6170,6 +6711,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(shas[1].clone()),
             reviewed_tree_sha: Some(round_one_tree.clone()),
             finding_dispositions: [(finding1.id.clone(), FindingDisposition::Open)].into(),
+            jev_dedup_converged_for: None,
         });
         let state_dir =
             StateDir::from_root(tempfile::tempdir().expect("tempdir").path().to_path_buf());
@@ -6200,6 +6742,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
                 (finding2.id.clone(), FindingDisposition::Open),
             ]
             .into(),
+            jev_dedup_converged_for: None,
         });
 
         // Reviewer B: the second required reviewer of the SAME round 2.
@@ -6282,6 +6825,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(round_one.head_sha.clone()),
             reviewed_tree_sha: Some(round_one_tree.clone()),
             finding_dispositions: BTreeMap::new(),
+            jev_dedup_converged_for: None,
         });
 
         // Round 2's fix: a NEW untracked file, ALSO uncommitted, with
@@ -6397,6 +6941,7 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
             head_sha: Some(shas[1].clone()),
             reviewed_tree_sha: Some(tree_sha_of(repo.path(), &shas[1])),
             finding_dispositions,
+            jev_dedup_converged_for: None,
         });
         // Between round 1 and round 2 the operator fixes "now-fixed" but
         // leaves "keep-open" exactly as it was.

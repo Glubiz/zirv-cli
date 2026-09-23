@@ -7313,6 +7313,7 @@ mod tests {
                 head_sha: None,
                 reviewed_tree_sha: None,
                 finding_dispositions: std::collections::BTreeMap::new(),
+                jev_dedup_converged_for: None,
             });
         let after_review =
             advance_with_evidence(&state_dir, resolved, StepOutcome::Success, None, false)
@@ -8973,7 +8974,7 @@ mod tests {
     }
 
     #[test]
-    fn jev_artifact_refuses_template_copy_at_high_confidence() {
+    fn artifact_freeform_state_falls_back_without_sending_content_to_jev() {
         let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -8993,24 +8994,21 @@ mod tests {
         let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
         std::fs::write(&path, "# Intent\n\n## Problem\nChanged wording\n").unwrap();
 
-        let error = pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg))
-            .unwrap_err()
-            .to_string();
-        request.recv().unwrap();
-
+        let (stage, warning) =
+            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
         assert!(
-            error.contains("template_copy") && error.contains("0.95"),
-            "{error}"
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
         );
-        assert!(state.artifacts["intent"].accepted_hash.is_none());
+        assert_eq!(stage, ArtifactStage::Intent);
+        assert!(warning.is_none());
+        assert!(state.artifacts["intent"].accepted_hash.is_some());
+        assert!(!state_dir.root().join("jev-decisions.jsonl").exists());
     }
 
-    /// Jev determinism fix: a `template_copy` verdict with a confidence
-    /// (0.95) above `JEV_ARTIFACT_CONFIDENCE`, but a thin margin (0.51/0.49)
-    /// between its own top and runner-up probability, must NOT refuse the
-    /// artifact -- it falls through and pins exactly like the gate-off path.
     #[test]
-    fn jev_artifact_pins_a_thin_margin_template_copy_verdict() {
+    fn artifact_freeform_state_pins_under_the_privacy_guard() {
         let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.51,"substantive":0.49},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -9033,7 +9031,11 @@ mod tests {
 
         let (stage, warning) =
             pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
-        request.recv().unwrap();
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
 
         assert_eq!(stage, ArtifactStage::Intent);
         assert!(warning.is_none(), "{warning:?}");
@@ -9044,7 +9046,7 @@ mod tests {
     }
 
     #[test]
-    fn jev_artifact_warns_and_pins_thin_content_at_high_confidence() {
+    fn artifact_freeform_thin_content_does_not_leave_the_process() {
         let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"thin","probabilities":{"thin":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -9066,13 +9068,12 @@ mod tests {
 
         let (_, warning) =
             pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
-        request.recv().unwrap();
-
-        let warning = warning.expect("thin content warns");
         assert!(
-            warning.contains("thin") && warning.contains("0.95"),
-            "{warning}"
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
         );
+        assert!(warning.is_none());
         assert!(state.artifacts["intent"].accepted_hash.is_some());
     }
 
@@ -9109,7 +9110,7 @@ mod tests {
     }
 
     #[test]
-    fn jev_artifact_500_pins_exactly_like_gate_off() {
+    fn artifact_freeform_state_pins_without_network_access() {
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             500,
             "{}",
@@ -9131,7 +9132,11 @@ mod tests {
 
         let (stage, warning) =
             pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
-        request.recv().unwrap();
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
 
         assert_eq!(stage, ArtifactStage::Intent);
         assert!(warning.is_none());
@@ -9843,7 +9848,7 @@ mod tests {
     }
 
     #[test]
-    fn jev_gate_sensitive_surface_raises_medium_to_high() {
+    fn gate_freeform_state_cannot_raise_risk_through_jev() {
         let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -9870,13 +9875,17 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        request.recv().unwrap();
-
-        assert_eq!(measured.risk, RiskBand::High);
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert_eq!(measured.risk, RiskBand::Medium);
+        assert!(!state_dir.root().join("jev-decisions.jsonl").exists());
     }
 
     #[test]
-    fn jev_gate_frontend_choice_sets_an_unset_frontend_domain() {
+    fn gate_freeform_state_cannot_set_frontend_domain_through_jev() {
         let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -9902,17 +9911,16 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        request.recv().unwrap();
-
-        assert_eq!(measured.work_domain.domain, WorkDomain::Frontend);
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert_eq!(measured.work_domain.domain, WorkDomain::General);
     }
 
-    /// Jev determinism fix: a `frontend` choice with a confidence (0.95)
-    /// above `JEV_FRONTEND_CONFIDENCE`, but a thin margin (0.51/0.49)
-    /// between its own top and runner-up probability, must NOT set the
-    /// domain -- it falls through exactly like a low-confidence answer.
     #[test]
-    fn jev_gate_frontend_choice_with_a_thin_margin_never_sets_the_domain() {
+    fn gate_freeform_state_preserves_an_unset_frontend_domain() {
         let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.51,"backend":0.49},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -9938,13 +9946,17 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        request.recv().unwrap();
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
 
         assert_ne!(measured.work_domain.domain, WorkDomain::Frontend);
     }
 
     #[test]
-    fn jev_gate_permissive_answers_never_lower_risk_or_unset_frontend() {
+    fn gate_freeform_state_preserves_existing_high_risk_and_frontend() {
         let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.05},"work_domain":{"type":"choice","choice":"backend","probabilities":{"backend":0.99,"other":0.01},"confidence":0.99},"security":{"type":"noul","noul":0.05},"data":{"type":"noul","noul":0.05},"docs_only":{"type":"noul","noul":0.05},"devops":{"type":"noul","noul":0.05},"architecture":{"type":"noul","noul":0.05}},"usage":{"input_tokens":20,"output_tokens":7}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -9973,7 +9985,11 @@ mod tests {
         let mut measured = classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        request.recv().unwrap();
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
 
         assert_eq!(measured.risk, RiskBand::High);
         assert_eq!(measured.work_domain.domain, WorkDomain::Frontend);
@@ -9981,7 +9997,7 @@ mod tests {
     }
 
     #[test]
-    fn jev_gate_tags_accumulate_and_render_in_status() {
+    fn gate_freeform_state_cannot_add_jev_tags() {
         let body = r#"{"model":"jev-latest","answers":{"security":{"type":"noul","noul":0.95},"data":{"type":"noul","noul":0.95},"docs_only":{"type":"noul","noul":0.95},"devops":{"type":"noul","noul":0.95},"architecture":{"type":"noul","noul":0.95}},"usage":{"input_tokens":20,"output_tokens":5}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -10005,23 +10021,20 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        request.recv().unwrap();
-
-        assert_eq!(
-            state.jev_tags,
-            vec!["architecture", "data", "devops", "docs-only", "security"]
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
         );
+        assert!(state.jev_tags.is_empty());
         let mut output = Vec::new();
         write_state(&mut output, &state, false).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(
-            output.contains("jev tags: architecture, data, devops, docs-only, security"),
-            "{output}"
-        );
+        assert!(!output.contains("jev tags:"), "{output}");
     }
 
     #[test]
-    fn jev_gate_500_leaves_state_identical_to_gate_off() {
+    fn gate_freeform_state_matches_gate_off() {
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             500,
             "{}",
@@ -10046,7 +10059,11 @@ mod tests {
         let expected_measured = measured.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        request.recv().unwrap();
+        assert!(
+            request
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
 
         assert_eq!(state, expected_state);
         assert_eq!(measured, expected_measured);
@@ -12158,6 +12175,7 @@ present_as = "summary"
                                         head_sha: None,
                                         reviewed_tree_sha: None,
                                         finding_dispositions: std::collections::BTreeMap::new(),
+                                        jev_dedup_converged_for: None,
                                     },
                                 );
                             }

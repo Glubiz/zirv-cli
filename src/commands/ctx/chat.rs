@@ -22,6 +22,7 @@ use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::dash;
 use super::dash::pane::PaneSpec;
 use super::event::SessionId;
+use super::jev::{self, JevEffect};
 use super::prompt::PromptRole;
 use super::proxy::{
     self,
@@ -189,7 +190,7 @@ fn orchestrator_initial_prompt(
     let text = if adapter.system_prompt_supported(&[]) {
         initial_prompt.unwrap_or_default()
     } else {
-        let compiled = super::compile::compile(
+        let mut compiled = super::compile::compile(
             home,
             repo,
             simple,
@@ -201,6 +202,19 @@ fn orchestrator_initial_prompt(
             super::adapters::LaunchMode::Interactive,
             false,
         );
+        if let Some(task) = initial_prompt
+            .as_deref()
+            .filter(|task| !task.trim().is_empty())
+        {
+            super::compile::select_skill_descriptions_for_task(
+                &mut compiled,
+                cfg,
+                state,
+                repo,
+                home,
+                task,
+            );
+        }
         // Issue #537 (T2a): the harness proxy's own bounded layer, when an
         // active decision took over this launch -- a no-op for every other
         // launch (`proxy_layer` is `None`). Every adapter with verified
@@ -884,18 +898,46 @@ fn maybe_clarify<E: Write>(
     {
         return Ok((decision, request));
     }
+    let clarification = match decision.clarification_category.as_deref() {
+        Some("target") => {
+            "Which service or files should change? Add detail and press Enter, or press Enter to launch as is:"
+        }
+        Some("behavior") => {
+            "What should happen when the change is complete? Add detail and press Enter, or press Enter to launch as is:"
+        }
+        Some("constraint") => {
+            "Which constraint or compatibility requirement must hold? Add detail and press Enter, or press Enter to launch as is:"
+        }
+        _ => "Add detail and press Enter, or press Enter to launch as is:",
+    };
     writeln!(
         stderr,
-        "zirv \u{25b8} proxy: the request looks ambiguous ({:.2}). Add detail and press Enter, or \
-         press Enter to launch as is:",
-        decision.needs_clarification
+        "zirv \u{25b8} proxy: the request looks ambiguous ({:.2}). {clarification}",
+        decision.needs_clarification,
     )?;
+    let record_clarification = |action| {
+        if !matches!(decision.decider, proxy::decision::Decider::Typesafe) {
+            return;
+        }
+        let mut effect = JevEffect::new("intake_clarification", action);
+        effect.subject_id = Some(&decision.request_sha256);
+        effect.reason = Some(match decision.clarification_category.as_deref() {
+            Some("target") => "target",
+            Some("behavior") => "behavior",
+            Some("constraint") => "constraint",
+            _ => "generic",
+        });
+        jev::record_effect(cfg, state, cfg.jev.intake_savings, &effect);
+    };
+    record_clarification("requested");
     let mut line = String::new();
     let read = reader.read_line(&mut line).unwrap_or(0);
     let addition = line.trim_end_matches(['\n', '\r']);
     if read == 0 || addition.trim().is_empty() {
+        record_clarification("unanswered");
         return Ok((decision, request));
     }
+    record_clarification("answered");
     let combined_request = format!("{request}\n\n{addition}");
     let combined_decision = proxy::decide(cfg, state.root(), repo, &combined_request);
     Ok((combined_decision, combined_request))
@@ -1057,12 +1099,13 @@ fn run_dash_branch(
     session: &str,
     simple: bool,
     proxy_layer: Option<&str>,
+    task: Option<&str>,
     started_workflow_id: Option<&str>,
     force_pace: bool,
     announce: impl FnMut(String),
 ) -> CtxResult<i32> {
     close_proxy_workflow_on_failure(started_workflow_id, state, repo, announce, || {
-        let pane = dash_orchestrator_pane(
+        let pane = dash_orchestrator_pane_with_task(
             adapter,
             launch,
             cfg,
@@ -1071,6 +1114,7 @@ fn run_dash_branch(
             session,
             simple,
             proxy_layer,
+            task,
         )?;
         dash::run_dashboard(cfg, repo, env, state, pane, None, force_pace)
     })
@@ -1683,6 +1727,7 @@ pub fn run_with<W: Write, E: Write>(
             session.as_str(),
             args.simple,
             proxy_layer.as_deref(),
+            initial_prompt.as_deref(),
             started_workflow_id.as_deref(),
             args.force_pace,
             |text| {
@@ -1846,11 +1891,37 @@ pub(crate) fn dash_orchestrator_pane(
     simple: bool,
     proxy_layer: Option<&str>,
 ) -> CtxResult<PaneSpec> {
+    dash_orchestrator_pane_with_task(
+        adapter,
+        launch,
+        cfg,
+        state,
+        repo,
+        session,
+        simple,
+        proxy_layer,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dash_orchestrator_pane_with_task(
+    adapter: &dyn AgentAdapter,
+    launch: ChatLaunch,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    simple: bool,
+    proxy_layer: Option<&str>,
+    task: Option<&str>,
+) -> CtxResult<PaneSpec> {
     // Issue #44: gathers memory, the derived harness roster and the
     // canonical `.zirv/context/` layer, and attaches the policy report --
     // see `compile::compile`'s own doc comment.
-    let compiled = super::compile::compile(
-        crate::utils::home_dir().ok().as_deref(),
+    let home = crate::utils::home_dir().ok();
+    let mut compiled = super::compile::compile(
+        home.as_deref(),
         repo,
         simple,
         cfg,
@@ -1861,6 +1932,16 @@ pub(crate) fn dash_orchestrator_pane(
         super::adapters::LaunchMode::Interactive,
         true,
     );
+    if let Some(task) = task.filter(|task| !task.trim().is_empty()) {
+        super::compile::select_skill_descriptions_for_task(
+            &mut compiled,
+            cfg,
+            state,
+            repo,
+            home.as_deref(),
+            task,
+        );
+    }
     // Issue #537 (T2a): the harness proxy's own bounded layer, when an
     // active decision took over this launch -- a no-op otherwise.
     let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
@@ -2640,6 +2721,163 @@ mod tests {
             Some("/nonexistent/fake-claude"),
             "the launch program is still the adapter's own binary: {argv}"
         );
+    }
+
+    #[test]
+    fn task_selected_skill_descriptions_change_late_launch_bytes_but_not_discovery() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let skills = tmp.path().join(".zirv/skills");
+        std::fs::create_dir_all(&skills).expect("skills");
+        let descriptions = [
+            (
+                "aa-database-helper",
+                "database migration schema alpha ".repeat(28),
+            ),
+            (
+                "ab-security-helper",
+                "security credential audit beta ".repeat(28),
+            ),
+            (
+                "ac-database-helper",
+                "database migration schema gamma ".repeat(28),
+            ),
+            (
+                "ad-security-helper",
+                "security credential audit delta ".repeat(28),
+            ),
+        ];
+        for (id, description) in &descriptions {
+            std::fs::write(
+                skills.join(format!("{id}.yaml")),
+                format!(
+                    "schema_version: 1\nid: {id}\nversion: 1\nname: {id}\n\
+                     description: {description}\nimplicit_activation: true\n\
+                     context_budget_bytes: 64\nphases: [implement]\ninstructions: use safely\n"
+                ),
+            )
+            .expect("skill fixture");
+        }
+        let entries = super::super::prompt::skill_index_entries(tmp.path(), Some(&home))
+            .expect("skill entries");
+        let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
+        let task = "Fix the CSS frontend layout";
+        let credential_env = "CHAT_TEST_JEV_SKILL_DESCRIPTIONS_737";
+        // SAFETY (test-only): this test owns a unique environment variable.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let mut delivered = Vec::new();
+        for (case, kept_skill) in [
+            ("data", "aa-database-helper"),
+            ("security", "ab-security-helper"),
+        ] {
+            let answers = descriptions
+                .iter()
+                .map(|(id, _)| {
+                    let index = entries
+                        .iter()
+                        .position(|(entry_id, _, _)| entry_id == id)
+                        .expect("fixture skill");
+                    (
+                        format!("s{index}"),
+                        serde_json::json!({"type":"noul","noul": if *id == kept_skill {0.98} else {0.02}}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let body = serde_json::json!({"model":"jev-latest","answers":answers,"usage":{"input_tokens":8,"output_tokens":1}}).to_string();
+            let (url, handle) =
+                super::super::jev::tests::one_shot_server(200, Box::leak(body.into_boxed_str()));
+            let mut cfg = CtxConfig::default();
+            cfg.jev.context = true;
+            cfg.proxy.typesafe.base_url = url;
+            cfg.proxy.typesafe.credential_env = credential_env.into();
+            let state = StateDir::from_root(tmp.path().join(format!("state-{case}")));
+            let pane = dash_orchestrator_pane_with_task(
+                &adapter,
+                build_launch(&adapter, Some(task), &[]),
+                &cfg,
+                &state,
+                tmp.path(),
+                "11111111-2222-4333-8444-555555555555",
+                false,
+                None,
+                Some(task),
+            )
+            .expect("pane");
+            handle.join().expect("Jev fixture");
+            delivered.push(pane.argv.join(" "));
+        }
+        let header = super::super::prompt::SKILL_DESCRIPTIONS_HEADER;
+        let (first_prefix, first_late) = delivered[0].split_once(header).expect("late layer");
+        let (second_prefix, second_late) = delivered[1].split_once(header).expect("late layer");
+        assert_eq!(
+            first_prefix, second_prefix,
+            "task-independent launch prefix"
+        );
+        let index = first_prefix
+            .split_once(super::super::prompt::SKILL_INDEX_HEADER)
+            .expect("skill index")
+            .1
+            .split("\n\n---")
+            .next()
+            .expect("index body");
+        for (id, _, _) in &entries {
+            assert!(index.contains(&format!("- {id}")), "missing skill ID {id}");
+        }
+        assert!(first_prefix.contains("zirv skill load <id>"));
+        for (_, description) in &descriptions {
+            assert!(!index.contains(description));
+        }
+        assert!(first_late.contains(&descriptions[0].1));
+        assert!(!first_late.contains(&descriptions[1].1));
+        assert!(!second_late.contains(&descriptions[0].1));
+        assert!(second_late.contains(&descriptions[1].1));
+
+        let mut baseline_cfg = CtxConfig::default();
+        baseline_cfg.proxy.typesafe.credential_env = credential_env.into();
+        let baseline_state = StateDir::from_root(tmp.path().join("state-baseline"));
+        let baseline = dash_orchestrator_pane_with_task(
+            &adapter,
+            build_launch(&adapter, Some(task), &[]),
+            &baseline_cfg,
+            &baseline_state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+            None,
+            Some(task),
+        )
+        .expect("baseline pane")
+        .argv
+        .join(" ");
+        assert!(delivered.iter().all(|prompt| prompt.len() < baseline.len()));
+        assert!(
+            !baseline.contains(header),
+            "inactive gate keeps old prompt bytes"
+        );
+
+        let mut explicit_cfg = baseline_cfg;
+        explicit_cfg.jev.context = true;
+        explicit_cfg.proxy.typesafe.base_url = "http://127.0.0.1:0".into();
+        let explicit_state = StateDir::from_root(tmp.path().join("state-explicit"));
+        let explicit_task = "Use aa-database-helper for the frontend layout";
+        let explicit = dash_orchestrator_pane_with_task(
+            &adapter,
+            build_launch(&adapter, Some(explicit_task), &[]),
+            &explicit_cfg,
+            &explicit_state,
+            tmp.path(),
+            "11111111-2222-4333-8444-555555555555",
+            false,
+            None,
+            Some(explicit_task),
+        )
+        .expect("explicit pane")
+        .argv
+        .join(" ");
+        unsafe { std::env::remove_var(credential_env) };
+        assert!(explicit.contains(&descriptions[0].1));
+        assert!(!explicit_state.root().join("jev-decisions.jsonl").exists());
     }
 
     /// Issue #537 (T2a): the dashboard orchestrator pane folds the harness
@@ -4319,6 +4557,7 @@ mod tests {
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
             needs_clarification_decisive: false,
+            clarification_category: None,
             domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),
@@ -4744,6 +4983,78 @@ fix the flaky retry test
             stderr.is_empty(),
             "a non-decisive answer must never prompt, however high its raw value"
         );
+    }
+
+    #[test]
+    fn material_ambiguity_category_asks_a_fixed_question_before_launch() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_CHAT_CLARIFY_EMPTY".to_string();
+        unsafe { std::env::set_var("JEV_TEST_KEY_CHAT_CLARIFY_EMPTY", "test-key") };
+        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
+        decision.decider = proxy::decision::Decider::Typesafe;
+        decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = true;
+        decision.clarification_category = Some("target".to_string());
+        let mut stderr = Vec::new();
+        let (unchanged, request) = maybe_clarify(
+            &cfg,
+            &state,
+            repo.path(),
+            decision.clone(),
+            "change the service".to_string(),
+            &mut &b"\n"[..],
+            &mut stderr,
+        )
+        .expect("clarification prompt");
+        assert_eq!(unchanged, decision);
+        assert_eq!(request, "change the service");
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf8")
+                .contains("Which service or files")
+        );
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("clarification effects");
+        assert!(effects.contains("\"action\":\"requested\""));
+        assert!(effects.contains("\"action\":\"unanswered\""));
+        unsafe { std::env::remove_var("JEV_TEST_KEY_CHAT_CLARIFY_EMPTY") };
+    }
+
+    #[test]
+    fn nonempty_clarification_records_answer_before_redeciding() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.decider = crate::commands::ctx::config::ProxyDecider::Deterministic;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_CHAT_CLARIFY_ANSWER".to_string();
+        unsafe { std::env::set_var("JEV_TEST_KEY_CHAT_CLARIFY_ANSWER", "test-key") };
+        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
+        decision.decider = proxy::decision::Decider::Typesafe;
+        decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = true;
+        let (_, request) = maybe_clarify(
+            &cfg,
+            &state,
+            repo.path(),
+            decision,
+            "change service".to_string(),
+            &mut &b"service A; preserve API B\n"[..],
+            &mut Vec::new(),
+        )
+        .expect("clarify");
+        unsafe { std::env::remove_var("JEV_TEST_KEY_CHAT_CLARIFY_ANSWER") };
+        assert_eq!(request, "change service\n\nservice A; preserve API B");
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("clarification effects");
+        assert!(effects.contains("\"action\":\"requested\""));
+        assert!(effects.contains("\"action\":\"answered\""));
+        assert!(!effects.contains("service A"));
     }
 
     /// Issue #537 (A2): at or above the threshold, a non-empty answer is
@@ -5214,6 +5525,7 @@ fix the flaky retry test
             &|k| env.get(k).cloned(),
             "11111111-2222-4333-8444-555555555555",
             false,
+            None,
             None,
             started_id.as_deref(),
             false,

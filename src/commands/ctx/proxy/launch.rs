@@ -161,6 +161,7 @@ mod tests {
             worker_tier: Tier::Standard,
             needs_clarification: 0.0,
             needs_clarification_decisive: false,
+            clarification_category: None,
             domains: Vec::new(),
             decider: Decider::Deterministic,
             confidence: BTreeMap::new(),

@@ -1200,7 +1200,7 @@ fn run_with_clock_inner<W: Write>(
     // attaches the policy report -- see `compile::compile`'s own doc
     // comment. A Worker session never hears about the derived harness
     // roster either way; see `prompt::PromptSource::Harnesses`.
-    let composed = super::compile::compile(
+    let mut compiled = super::compile::compile(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         skip_injection,
@@ -1211,14 +1211,24 @@ fn run_with_clock_inner<W: Write>(
         now_secs(),
         super::adapters::LaunchMode::Headless,
         true,
-    )
-    .composed;
+    );
     // Known before argv is touched, because it decides how argv is read: the
     // token holding this exact text is the prompt, whatever it looks like.
     let prompt = args
         .prompt
         .clone()
         .or_else(|| extract_prompt(&args.command));
+    if let Some(task) = prompt.as_deref() {
+        super::compile::select_skill_descriptions_for_task(
+            &mut compiled,
+            &cfg,
+            &state,
+            repo,
+            crate::utils::home_dir().ok().as_deref(),
+            task,
+        );
+    }
+    let composed = compiled.composed;
     // An argv that names no program -- empty, or starting with a flag -- is
     // not a command to pass through: the adapter builds the launch and these
     // are extra flags for it. That is how an agent step arrives, holding its
@@ -2431,7 +2441,7 @@ fn run_with_clock_inner<W: Write>(
             // replaced), so this is not a correctness change -- a nudge that
             // lands after something new was remembered now picks it up
             // instead of seeing the launch-time snapshot.
-            let mut fresh = super::compile::compile(
+            let mut fresh_compiled = super::compile::compile(
                 crate::utils::home_dir().ok().as_deref(),
                 repo,
                 skip_injection,
@@ -2442,8 +2452,18 @@ fn run_with_clock_inner<W: Write>(
                 now_secs(),
                 super::adapters::LaunchMode::Headless,
                 true,
-            )
-            .composed;
+            );
+            if let Some(task) = prompt.as_deref() {
+                super::compile::select_skill_descriptions_for_task(
+                    &mut fresh_compiled,
+                    &cfg,
+                    &state,
+                    repo,
+                    crate::utils::home_dir().ok().as_deref(),
+                    task,
+                );
+            }
+            let mut fresh = fresh_compiled.composed;
             // C7: `registry_short`, not `short_id(session)` -- `session`
             // has just been rotated above, and the nudge's own payload was
             // addressed to the stable registry address the sender resolved.

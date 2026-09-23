@@ -228,6 +228,7 @@ mod tests {
             Question {
                 id: "intent".to_string(),
                 kind: QuestionKind::Choice,
+                metadata_signature: None,
                 instructions: "pick one".to_string(),
                 criteria: Criteria::Choice(vec![
                     ("feature".to_string(), Some("adds behavior".to_string())),
@@ -237,12 +238,14 @@ mod tests {
             Question {
                 id: "complexity".to_string(),
                 kind: QuestionKind::Score,
+                metadata_signature: None,
                 instructions: "how complex".to_string(),
                 criteria: Criteria::Score(vec!["trivial".to_string(), "bounded".to_string()]),
             },
             Question {
                 id: "needs_clarification".to_string(),
                 kind: QuestionKind::Noul,
+                metadata_signature: None,
                 instructions: "ambiguous?".to_string(),
                 criteria: Criteria::Noul {
                     when_true: Some("yes".to_string()),
