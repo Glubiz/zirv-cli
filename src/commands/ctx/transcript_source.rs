@@ -495,7 +495,7 @@ fn sqlite_uri(path: &Path) -> String {
 /// [`state::prune_to_newest`]: a directory that cannot be read, a file whose
 /// mtime cannot be read, or one that cannot be removed, is simply left
 /// alone. Neither `prune_to_newest` (keeps a fixed COUNT, not an age) nor
-/// `log::prune_safety_buckets` (parses a DAY out of the filename) fits a
+/// `log::prune_day_buckets` (parses a DAY out of the filename) fits a
 /// shadow directory, whose files are named after an opaque per-session short
 /// id rather than counted or day-bucketed -- so this reads each file's own
 /// mtime instead, the one signal common to both of those approaches.

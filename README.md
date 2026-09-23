@@ -1072,9 +1072,11 @@ multi-module tasks). Protocol, per-task results and the harness:
   package and high-confidence Nit/Minor duplicate matches can converge a round;
   stored severity and disposition remain authoritative.
 - **Maintenance and telemetry** — `maintain` (`scan`) runs deterministic
-  operator-configured maintenance detectors, and `stats` aggregates
-  privacy-conscious local workflow telemetry. See [Maintain
-  loop](#maintain-loop).
+  operator-configured maintenance detectors, `stats` aggregates
+  privacy-conscious local workflow telemetry, and `calibrate` reads recorded
+  workflow outcomes and proposes (never applies) one-step heavier/lighter
+  routing per complexity bucket. See [Maintain loop](#maintain-loop) and
+  [Outcome calibration](#outcome-calibration).
 - **Frontend quality** — `frontend` derives a design profile and drives
   autonomous frontend work end to end (`profile`, `capabilities`, `check`,
   `render`, `review`, `benchmark`). See [Frontend quality](#frontend-quality).
@@ -1718,7 +1720,35 @@ zirv workflow advance <id> --outcome success|failure
 zirv workflow review package <id> | run <id> --agent <name> | add | record <id> --model <name> [--finding <id>]... | ...
 zirv workflow maintain scan [--repo <path>] [--json]
 zirv workflow stats                               # local bounded telemetry: per-phase timing, the implement/validate wall-clock split, approval wait, and fix-round causes (issue #699 Phase 0)
+zirv workflow calibrate [--json] [--min-samples N] # read-only: outcome buckets and routing proposals (issue #757)
 ```
+
+### Outcome calibration
+
+When a workflow completes, fails, or is closed, zirv appends one metadata-only
+row to `<state>/logs/workflow-outcomes/<day>.jsonl` (daily buckets, kept 365
+days; recorded only while `[workflow] telemetry_enabled` is on). A row holds
+the schema version, workflow id, pack id, profile, complexity, risk band, seat
+tier (when known), the highest review round reached, whether Test/Verify steps
+passed on the first attempt and at all, the terminal state, and the duration.
+It never holds task text, prompts, or paths.
+
+`zirv workflow calibrate [--json] [--min-samples N]` (default N = 10) groups
+rows by complexity x profile x seat tier and prints each bucket's count,
+first-pass verification rate, mean review rounds, and abandon rate, plus one
+proposal per bucket:
+
+| Rule (bucket has >= N samples) | Proposal |
+|---|---|
+| first-pass rate < 60%, or mean review rounds >= 2 | one step heavier |
+| first-pass rate >= 95% and mean review rounds <= 0.2 | one step lighter |
+| anything else | no change |
+| fewer than N samples | insufficient evidence |
+
+The step moves the seat tier (`cheap` -> `standard` -> `deep` -> `frontier`)
+when the bucket knows it, otherwise the complexity class the `classify.rs`
+thresholds assign. The command is read-only: it never writes config or
+changes routing; an operator decides whether to act on a proposal.
 
 ### Workflow definitions v2 (issue #542)
 
