@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -911,12 +911,35 @@ fn render_memory_entry(entry: &MemoryLine) -> String {
 
 /// Ranks `entries` by `verified` then `written`, newest/most-recently-
 /// verified first: a fact re-confirmed today is worth more than one merely
-/// written today and never checked since.
-fn ranked_by_recency<'a>(entries: &[&'a MemoryLine]) -> Vec<&'a MemoryLine> {
+/// written today and never checked since. `relevance` is `None` for pure
+/// recency ordering (today's behaviour, unchanged); `Some(map)` layers a
+/// relevance score (keyed `(shared, key.to_lowercase())`, issue #760) ahead
+/// of it as the PRIMARY sort key, with recency demoted to the tiebreaker --
+/// an entry missing from `map` defaults to score `0`, so when every entry
+/// maps to the same score (an empty map, or every real score tied) this
+/// produces the EXACT SAME order `None` would: relevance ranking is a
+/// strict refinement of recency ranking, never a second, divergent code
+/// path to keep in sync with it.
+fn ranked_by_recency<'a>(
+    entries: &[&'a MemoryLine],
+    relevance: Option<&HashMap<(bool, String), i64>>,
+) -> Vec<&'a MemoryLine> {
     let mut sorted: Vec<&MemoryLine> = entries.to_vec();
+    let score_of = |line: &MemoryLine| -> i64 {
+        relevance
+            .and_then(|map| {
+                map.get(&(
+                    line.scope == super::memory::MemoryScope::Shared,
+                    line.key.to_lowercase(),
+                ))
+            })
+            .copied()
+            .unwrap_or(0)
+    };
     sorted.sort_by(|a, b| {
-        b.verified
-            .cmp(&a.verified)
+        score_of(b)
+            .cmp(&score_of(a))
+            .then(b.verified.cmp(&a.verified))
             .then(b.written.cmp(&a.written))
             .then(a.key.cmp(&b.key))
     });
@@ -927,12 +950,14 @@ fn ranked_by_recency<'a>(entries: &[&'a MemoryLine]) -> Vec<&'a MemoryLine> {
 /// greedy in rank order rather than best-fit packing, so one oversized entry
 /// is skipped instead of starving every smaller entry behind it. Returns the
 /// selected entries, how many were left out, and how many bytes were used --
-/// the last so a caller can offer a second group whatever is left.
+/// the last so a caller can offer a second group whatever is left. See
+/// `ranked_by_recency`'s own doc comment for `relevance`.
 fn rank_and_fill<'a>(
     entries: &[&'a MemoryLine],
     cap: usize,
+    relevance: Option<&HashMap<(bool, String), i64>>,
 ) -> (Vec<&'a MemoryLine>, usize, usize) {
-    let ranked = ranked_by_recency(entries);
+    let ranked = ranked_by_recency(entries, relevance);
     let mut selected: Vec<&MemoryLine> = Vec::new();
     let mut used = 0usize;
     for entry in ranked.iter().copied() {
@@ -1005,6 +1030,34 @@ pub(crate) fn select_memory_within_cap(
     entries: &[MemoryLine],
     cap: usize,
 ) -> (Vec<&MemoryLine>, usize) {
+    select_memory_within_cap_inner(entries, cap, None)
+}
+
+/// Issue #760: the same selection `select_memory_within_cap` performs --
+/// identical private/global/shared structural precedence, key-conflict
+/// suppression, closing-marker forgery suppression, and always-keep-one
+/// fallback -- except each group is filled in RELEVANCE order (score
+/// descending, recency as the tiebreaker) rather than pure recency.
+/// `relevance` is the precomputed retrieval-style score for entries this
+/// session has a signal for, keyed `(shared, key.to_lowercase())`
+/// (`compile::core_relevance_map`'s own doc comment); an entry absent from
+/// it scores `0`, the same as every other entry when the caller has no
+/// signal at all -- which is why `select_memory_within_cap` itself never
+/// needs its own separate relevance-aware code path (see `ranked_by_
+/// recency`'s own doc comment).
+pub(crate) fn select_memory_within_cap_relevance_ranked<'a>(
+    entries: &'a [MemoryLine],
+    cap: usize,
+    relevance: &HashMap<(bool, String), i64>,
+) -> (Vec<&'a MemoryLine>, usize) {
+    select_memory_within_cap_inner(entries, cap, Some(relevance))
+}
+
+fn select_memory_within_cap_inner<'a>(
+    entries: &'a [MemoryLine],
+    cap: usize,
+    relevance: Option<&HashMap<(bool, String), i64>>,
+) -> (Vec<&'a MemoryLine>, usize) {
     let private: Vec<&MemoryLine> = entries
         .iter()
         .filter(|e| e.scope == super::memory::MemoryScope::Private)
@@ -1029,24 +1082,24 @@ pub(crate) fn select_memory_within_cap(
         })
         .collect();
 
-    let (mut priv_sel, _, private_used) = rank_and_fill(&private, cap);
+    let (mut priv_sel, _, private_used) = rank_and_fill(&private, cap, relevance);
     let after_private = cap.saturating_sub(private_used);
     let global_cap = if priv_sel.is_empty() {
         after_private
     } else {
         after_private.saturating_sub(2)
     };
-    let (mut global_sel, _, global_used) = rank_and_fill(&global, global_cap);
+    let (mut global_sel, _, global_used) = rank_and_fill(&global, global_cap, relevance);
     let trusted_separator = usize::from(!priv_sel.is_empty() && !global_sel.is_empty()) * 2;
     let shared_cap = after_private.saturating_sub(trusted_separator + global_used);
-    let (mut shared_sel, _, _) = rank_and_fill(&shared, shared_cap);
+    let (mut shared_sel, _, _) = rank_and_fill(&shared, shared_cap, relevance);
 
     if priv_sel.is_empty() && global_sel.is_empty() && shared_sel.is_empty() {
-        if let Some(top) = ranked_by_recency(&private).into_iter().next() {
+        if let Some(top) = ranked_by_recency(&private, relevance).into_iter().next() {
             priv_sel.push(top);
-        } else if let Some(top) = ranked_by_recency(&global).into_iter().next() {
+        } else if let Some(top) = ranked_by_recency(&global, relevance).into_iter().next() {
             global_sel.push(top);
-        } else if let Some(top) = ranked_by_recency(&shared).into_iter().next() {
+        } else if let Some(top) = ranked_by_recency(&shared, relevance).into_iter().next() {
             shared_sel.push(top);
         }
     }
@@ -7157,6 +7210,62 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].key, "verified-today");
         assert_eq!(omitted, 1);
+    }
+
+    // Issue #760: `select_memory_within_cap_relevance_ranked` tests.
+
+    /// A relevant but older entry must beat an irrelevant but recent one
+    /// when a caller supplies a relevance signal -- the whole point of
+    /// issue #760. The cap admits only one of the two, so which survives
+    /// proves which one actually won the ranking, not merely that both
+    /// happened to fit.
+    #[test]
+    fn relevance_ranked_selection_prefers_a_relevant_older_entry_over_an_irrelevant_recent_one() {
+        let relevant_but_older = stamped_line("retry-limit", "retry body", 1_000);
+        let recent_but_irrelevant = stamped_line("unrelated-note", "unrelated body", 9_000);
+        let entries = [recent_but_irrelevant, relevant_but_older];
+        let cap = render_memory_entry(&entries[0]).len();
+        let mut relevance = HashMap::new();
+        relevance.insert((false, "retry-limit".to_string()), 40);
+
+        let (selected, omitted) =
+            select_memory_within_cap_relevance_ranked(&entries, cap, &relevance);
+        assert_eq!(
+            selected.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["retry-limit"],
+            "the relevant entry must win despite being older"
+        );
+        assert_eq!(omitted, 1);
+
+        // Determinism (issue #760's own acceptance criterion): repeating the
+        // identical call must produce the byte-identical result.
+        let (selected_again, omitted_again) =
+            select_memory_within_cap_relevance_ranked(&entries, cap, &relevance);
+        assert_eq!(selected, selected_again);
+        assert_eq!(omitted, omitted_again);
+    }
+
+    /// With NO relevance signal at all (an empty map -- every entry defaults
+    /// to score `0`), `select_memory_within_cap_relevance_ranked` must
+    /// select in the EXACT SAME order as plain `select_memory_within_cap`:
+    /// this is the "no signal, behave exactly like today" contract issue
+    /// #760 requires for cache stability, proven here as one function being
+    /// a strict refinement of the other rather than two independent
+    /// implementations that merely happen to agree today.
+    #[test]
+    fn relevance_ranked_selection_with_no_signal_matches_the_pure_recency_baseline() {
+        let entries = [
+            stamped_line("oldest", "body-oldest", 1_000),
+            stamped_line("older", "body-older", 2_000),
+            stamped_line("newer", "body-newer", 3_000),
+            stamped_line("newest", "body-newest", 4_000),
+        ];
+        let one = render_memory_entry(&entries[0]).len();
+        let cap = one * 2 + 2;
+
+        let baseline = select_memory_within_cap(&entries, cap);
+        let ranked = select_memory_within_cap_relevance_ranked(&entries, cap, &HashMap::new());
+        assert_eq!(ranked, baseline);
     }
 
     /// An entry bigger than the whole cap must still deliver something --

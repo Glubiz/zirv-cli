@@ -992,12 +992,39 @@ pub(crate) fn gather_memory(
     // (see `memory::LoadedMemory`'s own doc comment).
     let loaded = memory::load_all_scopes(repo, state, slug, cfg);
     let full_bank = memory::render_for_prompt_from_loaded(&loaded);
-    let core: Vec<prompt::MemoryLine> =
+    // Issue #760: gathered once here (rather than inside `changed_repo_
+    // paths` a second time, further down for `retrieval_context`) and
+    // shared by both the core-relevance signal below and the retrieval
+    // layer's own context -- one `git diff`/`git ls-files` pair per
+    // compile, not two. Empty on a clean tree, which is exactly the "no
+    // signal" half of the gate below.
+    let changed_paths = changed_repo_paths(repo);
+    let branch_tokens = branch_name_tokens(repo);
+    // Issue #760: with neither signal, core selection is BYTE-IDENTICAL to
+    // `select_memory_within_cap` alone -- no relevance map is even built,
+    // so a clean tree with no useful branch name keeps today's exact
+    // pure-recency prefix (cache-stability, this function's own explicit
+    // design goal). With a signal, each precedence group fills by
+    // relevance (recency as the tiebreaker) instead -- see `core_relevance_
+    // map`'s own doc comment for what "relevance" means here.
+    let core: Vec<prompt::MemoryLine> = if changed_paths.is_empty() && branch_tokens.is_empty() {
         prompt::select_memory_within_cap(&full_bank, cfg.memory.core_max_bytes)
             .0
             .into_iter()
             .cloned()
-            .collect();
+            .collect()
+    } else {
+        let relevance = core_relevance_map(&loaded, &changed_paths, &branch_tokens, now);
+        prompt::select_memory_within_cap_relevance_ranked(
+            &full_bank,
+            cfg.memory.core_max_bytes,
+            &relevance,
+        )
+        .0
+        .into_iter()
+        .cloned()
+        .collect()
+    };
     let core_keys: std::collections::HashSet<(bool, String)> = core
         .iter()
         .map(|entry| {
@@ -1035,7 +1062,10 @@ pub(crate) fn gather_memory(
             })
             .collect();
     let retrieval_context = retrieval::RetrievalContext {
-        changed_paths: changed_repo_paths(repo),
+        // Issue #760: the identical `changed_repo_paths(repo)` call this
+        // function already made once above, for the core-relevance signal --
+        // reused rather than shelling out to `git` a second time.
+        changed_paths: changed_paths.clone(),
         // Issue #241: when a `zirv workflow` is active for this repo, its
         // own task text plus current step name become the retrieval
         // query's keyword signal -- `retrieval.rs`'s own `select`/`score_
@@ -1152,6 +1182,91 @@ fn active_workflow_query(state: &StateDir, repo: &Path) -> String {
     let step = workflow.current().map(|s| s.id.as_str()).unwrap_or("");
     let combined = format!("{} {step}", workflow.task).trim().to_string();
     crate::utils::truncate_bytes(combined, Some(WORKFLOW_QUERY_MAX_BYTES))
+}
+
+/// Branch-name segments common enough across repos (default/trunk names,
+/// and the routine work-branch prefixes `zirv`'s own naming convention uses
+/// -- CLAUDE.md's "Git" section) to carry no distinguishing content signal
+/// on their own. Issue #760: a branch made ENTIRELY of these (plus short/
+/// numeric segments -- an issue number alone matches nothing in a memory
+/// body) degrades to "no useful branch tokens", the literal no-signal case
+/// `gather_memory`'s own core-relevance gate treats the same as an unset
+/// branch or a clean tree.
+const BRANCH_TOKEN_STOPWORDS: &[&str] = &[
+    "main", "master", "develop", "trunk", "head", "release", "hotfix", "feature", "feat", "fix",
+    "chore", "bug", "issue", "wip", "track", "rel",
+];
+
+/// Deterministic keyword tokens from `repo`'s current branch name (issue
+/// #760): lowercased, split on any non-alphanumeric run, dropping routine
+/// prefixes/default-branch words (`BRANCH_TOKEN_STOPWORDS`), anything
+/// shorter than 3 characters, and any run of digits only (an issue/PR
+/// number alone). Empty when the branch is unresolvable (detached HEAD, no
+/// git -- `verification::current_branch`'s own contract) or every segment
+/// was filtered out -- both read as "no useful branch tokens" to this
+/// function's one caller. No network, no clock: a plain local `git`
+/// subprocess call, the same category of signal `changed_repo_paths`
+/// already is.
+fn branch_name_tokens(repo: &Path) -> Vec<String> {
+    let branch = crate::commands::workflow::verification::current_branch(repo);
+    branch
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|word| {
+            word.len() >= 3
+                && !BRANCH_TOKEN_STOPWORDS.contains(&word.as_str())
+                && !word.bytes().all(|b| b.is_ascii_digit())
+        })
+        .collect()
+}
+
+/// Issue #760: precomputed retrieval-style relevance score for every entry
+/// in `loaded`, keyed `(shared, key.to_lowercase())` -- what `prompt::
+/// select_memory_within_cap_relevance_ranked` consults so core selection
+/// fills each precedence group by relevance instead of pure recency.
+/// Reuses `retrieval::rank` UNCHANGED (core and the retrieval layer never
+/// drift on what "relevant" means) against a core-specific context: the
+/// same `changed_paths` the retrieval layer's own context already carries
+/// (`gather_memory` computes it once and shares it), plus this repository's
+/// current branch name as keyword tokens (`branch_name_tokens`) standing in
+/// for a query -- core selection has no user-typed query to draw on, only
+/// the repo-local signals available at compile time without a network
+/// call. `include_archived: true`, deliberately unlike the retrieval
+/// layer's own context: lifecycle-based exclusion is a retrieval-layer
+/// concept core has never applied (`gather_memory`'s `full_bank` already
+/// includes every lifecycle state), and this function's only job is to
+/// REORDER core candidates already in play, never to newly exclude one
+/// just because a relevance signal happened to be present this session.
+/// The returned `score` is `Ranked::score` (the modifier-adjusted rank
+/// order retrieval selection itself sorts by), not `base_score` (that
+/// field only gates retrieval's own minimum-relevance floor, which core
+/// selection has no equivalent of -- every core candidate stays orderable,
+/// never dropped, exactly as `select_memory_within_cap` already behaves).
+fn core_relevance_map(
+    loaded: &memory::LoadedMemory,
+    changed_paths: &[String],
+    branch_tokens: &[String],
+    now: u64,
+) -> std::collections::HashMap<(bool, String), i64> {
+    let ctx = retrieval::RetrievalContext {
+        query: branch_tokens.join(" "),
+        changed_paths: changed_paths.to_vec(),
+        include_archived: true,
+        ..Default::default()
+    };
+    let candidates = retrieval::candidates_from_loaded(loaded, now);
+    retrieval::rank(&candidates, &ctx)
+        .into_iter()
+        .map(|ranked| {
+            (
+                (
+                    ranked.candidate.shared,
+                    ranked.candidate.entry.key.to_lowercase(),
+                ),
+                ranked.score,
+            )
+        })
+        .collect()
 }
 
 fn changed_repo_paths(repo: &Path) -> Vec<String> {
@@ -4013,6 +4128,186 @@ mod tests {
         assert!(
             text.contains("lib changes require the compatibility check"),
             "got {text}"
+        );
+    }
+
+    // Issue #760: core relevance-ranking tests.
+
+    /// Pure tokenization: routine prefixes, default-branch names, and bare
+    /// digit runs are all filtered; genuinely distinguishing segments
+    /// survive, lowercased.
+    #[test]
+    fn branch_name_tokens_filters_stopwords_and_bare_numbers_but_keeps_real_words() {
+        let repo = tempfile::tempdir().expect("repo");
+        init_repo_on_branch(repo.path(), "feat/JEV-746-retry-limit");
+        assert_eq!(
+            branch_name_tokens(repo.path()),
+            vec!["jev", "retry", "limit"],
+            "'feat' and the bare issue number are filtered; real words survive lowercased"
+        );
+
+        let boring = tempfile::tempdir().expect("repo");
+        init_repo_on_branch(boring.path(), "main");
+        assert!(
+            branch_name_tokens(boring.path()).is_empty(),
+            "a default-branch name alone carries no useful token"
+        );
+    }
+
+    fn init_repo_on_branch(repo: &Path, branch: &str) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["checkout", "-q", "-b", branch]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("README.md"), "placeholder\n").expect("write readme");
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    /// A relevant but three-weeks-stale entry must beat an irrelevant but
+    /// just-verified one for a CORE slot when the current branch name is the
+    /// only signal (a clean, committed tree -- `changed_paths` contributes
+    /// nothing here, isolating the branch-token half of issue #760's design
+    /// from the changed-path half `a_relevant_retrieval_entry_survives_an_
+    /// oversized_recent_core_bank` already covers for retrieval). The cap
+    /// admits only one of the two, so which one survives into `core` proves
+    /// which one actually won the ranking.
+    #[test]
+    fn gather_memory_core_ranks_a_relevant_older_entry_ahead_of_an_irrelevant_recent_one_via_branch_tokens()
+     {
+        let repo = tempfile::tempdir().expect("repo");
+        init_repo_on_branch(repo.path(), "feature/retry-limit-tuning");
+
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let mut cfg = CtxConfig::default();
+        // Tight enough to admit exactly one of the two ~39-byte entries
+        // below (39 < 45 < 39 + 2 + 39), forcing a real choice.
+        cfg.memory.core_max_bytes = 45;
+
+        let now = now_secs();
+        let entry = |key: &str, body: &str, verified: u64| memory::Entry {
+            key: key.to_string(),
+            body: body.to_string(),
+            written: verified,
+            verified,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            // "retry"/"limit" match two of the branch's own tokens (see
+            // `init_repo_on_branch`); "feature" is filtered as a routine
+            // prefix (`BRANCH_TOKEN_STOPWORDS`), so this entry's signal is
+            // the "tuning" match plus the two above -- comfortably ahead of
+            // the gentle one-point-per-week staleness penalty a 20-day-old
+            // entry takes.
+            &entry(
+                "retry-limit-note",
+                "retry limit tuning guidance",
+                now.saturating_sub(20 * 86_400),
+            ),
+        )
+        .expect("store relevant");
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &entry("unrelated-note", "totally different topic entirely", now),
+        )
+        .expect("store irrelevant");
+
+        let (core, _) = gather_memory(&state, repo.path(), &slug, &cfg, now);
+        let keys: Vec<&str> = core.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["retry-limit-note"],
+            "the branch-relevant entry must win the one available core slot: {keys:?}"
+        );
+    }
+
+    /// With a clean tree AND a branch name that carries no useful token
+    /// (`main`, in `BRANCH_TOKEN_STOPWORDS`) -- issue #760's "no signal"
+    /// case -- `gather_memory`'s core selection must be BYTE-IDENTICAL to
+    /// calling `select_memory_within_cap` directly on the same bank: the
+    /// exact pure-recency baseline this function's own design goal (cache-
+    /// stable prefix for the common case) requires, not merely "an
+    /// equivalent-looking order".
+    #[test]
+    fn gather_memory_core_matches_the_recency_baseline_on_a_clean_tree_with_no_useful_branch() {
+        let repo = tempfile::tempdir().expect("repo");
+        init_repo_on_branch(repo.path(), "main");
+
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 60;
+
+        let now = now_secs();
+        let entry = |key: &str, body: &str, verified: u64| memory::Entry {
+            key: key.to_string(),
+            body: body.to_string(),
+            written: verified,
+            verified,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        for (key, body, age_days) in [
+            // This body's own words ("retry limit") would score under a
+            // branch-token signal, deliberately -- proving the ABSENCE of a
+            // useful signal, not merely the absence of any keyword overlap
+            // at all, is what keeps this byte-identical to pure recency.
+            ("retry-limit-note", "retry limit tuning guidance", 20u64),
+            ("unrelated-note", "totally different topic entirely", 0u64),
+        ] {
+            memory::upsert_scoped(
+                memory::MemoryScope::Private,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                &entry(key, body, now.saturating_sub(age_days * 86_400)),
+            )
+            .expect("store entry");
+        }
+
+        let full_bank = memory::render_for_prompt(&state, repo.path(), &slug, &cfg);
+        let expected: Vec<prompt::MemoryLine> =
+            prompt::select_memory_within_cap(&full_bank, cfg.memory.core_max_bytes)
+                .0
+                .into_iter()
+                .cloned()
+                .collect();
+
+        let (core, _) = gather_memory(&state, repo.path(), &slug, &cfg, now);
+        assert_eq!(
+            core, expected,
+            "no useful signal must select exactly what pure recency would"
         );
     }
 
