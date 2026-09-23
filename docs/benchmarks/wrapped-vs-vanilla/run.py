@@ -22,11 +22,15 @@ import shutil
 import stat
 import subprocess
 import sys
-import threading
 import time
 import traceback
 from pathlib import Path
 
+CLAUDE_EXE = r"C:\Users\josj\.local\bin\claude.exe"
+ZIRV_FALLBACK = r"C:\ProgramData\chocolatey\bin\zirv.exe"
+PYTHON_EXE = r"C:\Python311\python.exe"
+GIT_EXE = r"C:\Program Files\Git\cmd\git.exe"
+TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
 DEFAULT_TIMEOUT_MIN = 20
 CANONICAL_CONDS = ["vanilla", "zirv", "zirv-proxy"]
 JUDGE_DISALLOWED = "Write,Edit,Bash,NotebookEdit,Read,Glob,Grep,Agent,WebFetch,WebSearch"
@@ -35,67 +39,23 @@ PROXY_CALL_TIMEOUT_S = 120
 WORKFLOW_START_TIMEOUT_S = 60
 PROXY_COST_PER_INPUT_TOKEN = 0.042 / 1_000_000
 
-# Fallbacks for this machine, used only when `which`/`sys.executable` can't
-# find the binary (e.g. a mangled or minimal shell environment).
-_CLAUDE_EXE_FALLBACK = r"C:\Users\josj\.local\bin\claude.exe"
-_ZIRV_EXE_FALLBACK = r"C:\ProgramData\chocolatey\bin\zirv.exe"
-_PYTHON_EXE_FALLBACK = r"C:\Python311\python.exe"
-_GIT_EXE_FALLBACK = r"C:\Program Files\Git\cmd\git.exe"
-_TASKKILL_EXE_FALLBACK = r"C:\Windows\System32\taskkill.exe"
-
 # The launching shell's PATH can be mangled (mixed `:`/`;` separators); give every
 # child -- and therefore both conditions equally -- one clean Windows PATH.
-# Windows-only, and only for directories that actually exist on this box.
-if os.name == "nt":
-    _CLEAN_PATH_CANDIDATES = [
-        r"C:\Users\josj\.local\bin", r"C:\ProgramData\chocolatey\bin",
-        r"C:\Program Files\Git\cmd", r"C:\Program Files\Git\usr\bin",
-        r"C:\Python311", r"C:\Python311\Scripts", r"C:\Program Files\nodejs",
-        r"C:\Users\josj\.cargo\bin", r"C:\Windows\System32", r"C:\Windows",
-        r"C:\Windows\System32\WindowsPowerShell\v1.0", r"C:\Program Files\PowerShell\7",
-    ]
-    _clean_path = [p for p in _CLEAN_PATH_CANDIDATES if os.path.isdir(p)]
-    os.environ["PATH"] = ";".join(_clean_path) + ";" + ";".join(
-        p for p in os.environ.get("PATH", "").split(";") if p and ":" not in p[2:]
-    )
-
-# Binary lookups, done AFTER the PATH-cleaning block above so `which` sees
-# the cleaned PATH on Windows too.
-CLAUDE_EXE = shutil.which("claude") or _CLAUDE_EXE_FALLBACK
-PYTHON_EXE = sys.executable or _PYTHON_EXE_FALLBACK
-GIT_EXE = shutil.which("git") or _GIT_EXE_FALLBACK
-TASKKILL_EXE = (shutil.which("taskkill") or _TASKKILL_EXE_FALLBACK) if os.name == "nt" else None
-
-_TEMPLATE_BOOTSTRAP_LOCK = threading.Lock()
+_CLEAN_PATH = [
+    r"C:\Users\josj\.local\bin", r"C:\ProgramData\chocolatey\bin",
+    r"C:\Program Files\Git\cmd", r"C:\Program Files\Git\usr\bin",
+    r"C:\Python311", r"C:\Python311\Scripts", r"C:\Program Files\nodejs",
+    r"C:\Users\josj\.cargo\bin", r"C:\Windows\System32", r"C:\Windows",
+    r"C:\Windows\System32\WindowsPowerShell\v1.0", r"C:\Program Files\PowerShell\7",
+]
+os.environ["PATH"] = ";".join(_CLEAN_PATH) + ";" + ";".join(
+    p for p in os.environ.get("PATH", "").split(";") if p and ":" not in p[2:]
+)
 
 
 def zirv_exe():
     found = shutil.which("zirv")
-    return found if found else _ZIRV_EXE_FALLBACK
-
-
-def ensure_template_git(template_dir):
-    """Idempotently `git init` the template in place so every run's copy has
-    a root commit to diff against -- the hidden graders and the judge diff
-    both rely on it existing. Guarded by a lock so parallel workers only do
-    this once."""
-    template_dir = Path(template_dir)
-    git_dir = template_dir / ".git"
-    if git_dir.exists():
-        return
-    with _TEMPLATE_BOOTSTRAP_LOCK:
-        if git_dir.exists():
-            return
-        subprocess.run([GIT_EXE, "init", "-q"], cwd=str(template_dir), check=True)
-        subprocess.run([GIT_EXE, "config", "core.autocrlf", "false"],
-                        cwd=str(template_dir), check=True)
-        subprocess.run([GIT_EXE, "config", "user.email", "bench@bench"],
-                        cwd=str(template_dir), check=True)
-        subprocess.run([GIT_EXE, "config", "user.name", "bench"],
-                        cwd=str(template_dir), check=True)
-        subprocess.run([GIT_EXE, "add", "-A"], cwd=str(template_dir), check=True)
-        subprocess.run([GIT_EXE, "commit", "-q", "-m", "ledgerlite initial"],
-                        cwd=str(template_dir), check=True)
+    return found if found else ZIRV_FALLBACK
 
 
 def read_text(path):
@@ -140,6 +100,11 @@ def build_run_list(tasks, conds, reps):
 
 
 RUNS_SUBDIR = "runs"
+# Same notice for every condition: headless -p has nobody to answer an approval question.
+NONINTERACTIVE = False
+NONINTERACTIVE_NOTE = ("You are running non-interactively: nobody will answer questions or approve plans. "
+                       "Make reasonable decisions yourself and complete the task end to end.\n\n")
+VANILLA_PLUGIN_DIR = None
 
 
 def run_dir_for(bench_root, task, cond, rep):
@@ -159,6 +124,15 @@ def result_is_valid(run_dir):
 
 def build_argv(cond, model, prompt_text):
     if cond == "vanilla":
+        if VANILLA_PLUGIN_DIR:
+            # Vanilla + a plugin (e.g. superpowers): drop the user settings layer
+            # (where the operator's global zirv hooks live) instead of disabling
+            # all hooks, so the plugin's own SessionStart hook still runs. The
+            # user layer's bypassPermissions default is restated explicitly.
+            return [CLAUDE_EXE, "-p", "--output-format", "json", "--model", model,
+                    "--setting-sources", "project,local",
+                    "--permission-mode", "bypassPermissions",
+                    "--plugin-dir", VANILLA_PLUGIN_DIR]
         settings = json.dumps({"disableAllHooks": True}, separators=(",", ":"))
         return [CLAUDE_EXE, "-p", "--output-format", "json", "--model", model,
                 "--settings", settings]
@@ -184,17 +158,14 @@ def _rmtree_onerror(func, path, exc_info):
 
 def rmtree_robust(path):
     shutil.rmtree(path, onerror=_rmtree_onerror)
+    if Path(path).exists():
+        # a file is still locked (e.g. an orphan from an interrupted run): move it aside
+        os.replace(path, f"{path}.stale-{int(time.time())}")
 
 
-def kill_tree(proc):
-    if os.name == "nt" and TASKKILL_EXE:
-        subprocess.run([TASKKILL_EXE, "/T", "/F", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+def kill_tree(pid):
+    subprocess.run([TASKKILL_EXE, "/T", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path):
@@ -493,8 +464,16 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
         rmtree_robust(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     repo_dir = run_dir / "repo"
-    ensure_template_git(template_dir)
+    dirty = subprocess.run([GIT_EXE, "-C", str(template_dir), "status", "--porcelain"],
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        raise RuntimeError(f"template is not pristine, refusing to copy:\n{dirty}")
     shutil.copytree(template_dir, repo_dir)
+
+    if NONINTERACTIVE:
+        prompt_text = NONINTERACTIVE_NOTE + prompt_text
+        prompt_path = run_dir / "prompt.txt"
+        prompt_path.write_text(prompt_text, encoding="utf-8")
 
     stdout_path = run_dir / "stdout.json"
     stderr_path = run_dir / "stderr.txt"
@@ -592,7 +571,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
             exit_code = proc.wait(timeout=remaining_budget)
         except subprocess.TimeoutExpired:
             timed_out = True
-            kill_tree(proc)
+            kill_tree(proc.pid)
             try:
                 exit_code = proc.wait(timeout=15)
             except Exception:
@@ -689,13 +668,21 @@ def main():
     ap.add_argument("--timeout-min", type=float, default=DEFAULT_TIMEOUT_MIN)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--vanilla-plugin-dir", default=None, help="load this plugin dir into the vanilla condition (user settings layer dropped)")
+    ap.add_argument("--zirv-dir", default=None, help="directory holding the zirv.exe to test; prepended to PATH so hooks resolve to it too")
     ap.add_argument("--runs-subdir", default="runs", help="subdirectory of bench root for run outputs")
     ap.add_argument("--bench-root", default=None,
                      help="defaults to this script's directory ($BENCH)")
+    ap.add_argument("--noninteractive", action="store_true", help="prefix every condition's prompt with NONINTERACTIVE_NOTE")
     args = ap.parse_args()
 
-    global RUNS_SUBDIR
+    global RUNS_SUBDIR, VANILLA_PLUGIN_DIR, NONINTERACTIVE
     RUNS_SUBDIR = args.runs_subdir
+    NONINTERACTIVE = args.noninteractive
+    VANILLA_PLUGIN_DIR = args.vanilla_plugin_dir
+    if args.zirv_dir:
+        os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + ";" + os.environ["PATH"]
+        print("zirv under test:", shutil.which("zirv"))
     bench_root = Path(args.bench_root) if args.bench_root else Path(__file__).resolve().parent
     tasks_dir = bench_root / "tasks"
 

@@ -1,14 +1,17 @@
 # ledgerlite benchmark tasks
 
-Twelve tasks against the `ledgerlite` template (see `../template/`, which
+Fifteen tasks against the `ledgerlite` template (see `../template/`, which
 is FROZEN as of t01-t09 -- t10/t11/t12 were added afterward as harder
-tasks and only target behaviour the frozen template already has, or spec
-new features/questions with an exact hidden-test or scoring contract; they
+tasks and t13/t14/t15 after that as LARGE tasks (10-25 minutes, 30-80 tool
+calls, several modules touched, for a strong model); all of t10-t15 only
+target behaviour the frozen template already has, or spec new
+features/questions with an exact hidden-test or scoring contract; they
 never modify template/). The
 template ships with one known-red visible test,
 `tests/test_rules.py::test_regex_rule_case_insensitive`, caused by D4 below;
 every grader that checks `visible_ok` treats that single failure as
-baseline and does not penalize it except in t07, whose job is to fix it.
+baseline and does not penalize it except in t07 and t14, whose job includes
+fixing it.
 
 Latent defects planted in the template: D1 `parse_money` mishandles
 parenthesized negatives and thousands separators (models.py); D2
@@ -18,7 +21,12 @@ correct but non-obvious (rules.py, sort key over (priority, -index)); D4
 regex rules are case-sensitive despite the docstring promising
 case-insensitive matching (rules.py); D5 `cli.py`'s `summary` command
 duplicates `report.category_totals()`/`summarize()` instead of calling
-them.
+them. D6 (found while building t14, not originally planted but genuinely
+present): `cli.py`'s `categorize` command unconditionally overwrites each
+transaction's category with whatever `categorize()` returns, including
+`None` when no rule matches -- so re-running `categorize` on an already
+(manually or CSV-column) categorized ledger silently erases any category
+that doesn't happen to match a current rule.
 
 | id | kind | measures | ground truth / notes |
 |---|---|---|---|
@@ -34,6 +42,9 @@ them.
 | t10_shares | tests | greenfield spec compliance: `report.category_shares(txns)` implementing the largest-remainder method so percentage shares always sum to exactly 100.00, described behaviourally in the prompt (never says "largest remainder") | hidden: 7 cases -- two distinct naive-rounding-fails scenarios (99.99 and 100.01), a dedicated 2-category alphabetical tie-break, zero spending, single category, positive-only-category exclusion, and uncategorised grouping; all verified against a Fraction-exact reference implementation |
 | t11_export | tests | greenfield CLI feature: `export --format csv\|json [--since] [--until]` with RFC-4180 CSV quoting, inclusive date bounds, (date, id) ordering, JSON string amounts + null category vs CSV blank category, empty-selection output, and an exit-code-2 error path | hidden: 9 cases covering quoting of a comma/quote/newline in memo, an unescaped unicode payee, inclusive bounds on both ends (with rows just outside excluded), empty selection in both formats, `--since` after `--until` exiting 2 with nothing on stdout, id-tiebreak ordering on a shared date, and JSON amount-is-a-string / null-category checks |
 | t12_deadcode | answer | precise code reading: which functions in the FROZEN template's `ledgerlite/` package have zero callers anywhere in the package/CLI (tests excluded) | ground truth: **`monthly_totals`, `summarize`** (see script + output below); scored as (correct/2) minus 0.25 per hallucinated live-function claim, floored at 0 |
+| t13_recurring | tests (LARGE) | greenfield feature spanning a new module + persistence + two CLI surfaces: `ledgerlite/recurring.py` (`Recurrence`, `expand()` with exact weekly/monthly/yearly clamping rules and a specified negative-id scheme), persistence under a `"recurring"` store key, `recurring add`/`recurring list`, and `list --include-recurring --since/--until` merging expanded rows sorted by `(date, id)` | hidden: 20 cases -- weekly/monthly/yearly expansion incl. day-31 and leap-day clamping, `until` and range clipping, id determinism/uniqueness, CLI persistence + list formatting, and the merged-list `--include-recurring` behaviour incl. its exit-2 argument-validation path |
+| t14_bugsweep | tests (LARGE) | one multi-issue bug report combining D2 (pagination), D1 (money parsing), D4 (case-sensitive regex rules), and D6 (`categorize` erasing an existing category when no rule matches) -- all reported symptom-first in a single prompt, no file names | hidden: 20 cases -- the full t02/t03/t07 hidden suites (7+6+3) plus 4 new cases for D6; grade.py forces score 0 if `tests/test_rules.py` is touched, same as t07 |
+| t15_reports | tests (LARGE) | reporting feature spanning report.py/cli.py/store.py: `report.monthly_breakdown(txns, year)` (month -> category -> net, gap months omitted) and `report.trend(txns, category, months)` (zero-filled, anchored on the latest transaction overall), plus a `report` CLI command with exactly specified `--year [--format table\|csv]` and `--trend/--months` output shapes | hidden: 17 cases -- both functions (incl. a gap month and empty input), both CLI output formats byte-exact, the empty-year header-only case, and the mutually-exclusive/missing-argument exit-2 paths |
 
 ## t09 ground truth: groceries rows in examples/sample.csv
 

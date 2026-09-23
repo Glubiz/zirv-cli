@@ -1,0 +1,36 @@
+I've been using this for a few weeks now and I've run into a handful of
+problems. Can you go through and fix all of these?
+
+1. When I list my transactions a page at a time, the very first page is
+   always missing its first row -- it just silently skips it, so I never
+   see transaction #1 unless I go dig for it another way. And if my total
+   number of transactions happens to divide evenly by my page size, the
+   very last page comes back completely empty instead of showing that
+   final full page.
+
+2. Importing a statement CSV mangles some amounts. Refunds and credits that
+   my bank prints wrapped in parentheses, like `(12.00)`, come in as a
+   positive `12.00` instead of a negative amount -- parentheses are
+   supposed to mean "this is negative," not "ignore the sign." And any
+   amount that has a thousands separator in it, like `1,234.50`, blows up
+   the whole import instead of just reading it as that number.
+
+3. My auto-categorization rules that use a regular expression pattern only
+   match when the case matches exactly. Everything else in the rule engine
+   is supposed to be case-insensitive, and I've written some of my rules
+   with lowercase patterns expecting them to still catch uppercase
+   merchant names (and vice versa) -- right now those silently fail to
+   match.
+
+4. This is the one that actually cost me data: I ran the recategorize
+   command to pick up a couple of new rules I'd added, and it wiped out
+   categories on transactions I'd carefully set by hand. Any transaction
+   whose payee/memo doesn't happen to match one of the current rules gets
+   its category cleared back to blank, even if I had explicitly given it a
+   category before. Recategorizing should only ever add or correct a
+   category when one of the rules actually matches something -- it should
+   never erase a category that's already there just because nothing
+   currently matches.
+
+Please fix the root cause of each of these -- I'd rather not have to work
+around any of them by hand.

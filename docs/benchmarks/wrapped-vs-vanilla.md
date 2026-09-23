@@ -1,4 +1,4 @@
-# Wrapped vs vanilla: what `zirv ctx` costs and buys on short tasks
+# Wrapped vs vanilla: what `zirv ctx` costs and buys
 
 Recorded-measurement protocol and results for the question "what does wrapping
 a Claude Code session in zirv do to speed, token cost and correctness?". Same
@@ -7,225 +7,240 @@ was observed on a real machine with the harness in
 `docs/benchmarks/wrapped-vs-vanilla/`, or the row says so and is absent. No
 estimated or "should be roughly" number belongs here.
 
-The headline, stated plainly: **on short headless tasks zirv is slower and
-more expensive, and no more correct.** Wrapping added +34% to +39% wall-clock
-and +25% to +41% list-price cost at the same model. Correctness did not move
-at a level this benchmark can distinguish from noise: Sonnet solved every
-task in every condition, and Haiku's improvement under zirv has a confidence
-interval that includes zero. What zirv is designed to protect against --
-context rot over long sessions, restarts with handoff, cross-harness
-supervision -- never engages on a task that finishes in under four minutes,
-so this benchmark measures the wrapper's **fixed overhead**, not its
-long-session value. That value is not yet measured; see §6.
+This is the third generation of this benchmark; §6 covers what changed and
+why the earlier grids aren't directly comparable to this one.
+
+**Current headline (2026-09-23, zirv 4.21.0 vs. vanilla `claude -p` with the
+obra/superpowers plugin loaded, 15 tasks, both sides given the same
+"finish the task, nobody will answer questions" notice):** on Sonnet, zirv is
+cheaper and faster overall (-22% to -24%) at no significant change in
+correctness; zirv-proxy (Jev-routed model/seat/workflow selection) is
+cheaper still (-46%). On Haiku, zirv is essentially the same speed and cost
+but significantly more correct (+18%). Split by size, the picture is not
+uniform: on the nine large-task runs per condition, zirv trades about 12
+points of Sonnet correctness for roughly half the cost and time, because
+superpowers' brainstorm/TDD discipline lets vanilla Sonnet score a perfect
+1.000 there. Much of zirv's score lead, on both models, comes from vanilla
+superpowers still stopping 8 times out of 75 to ask for approval despite the
+notice -- a failure mode zirv never exhibited. This remains a headless,
+single-session benchmark; see §7.
 
 ## 1. Conditions
 
-All three run the same Claude Code binary (2.1.278) headlessly with
+All conditions run the same Claude Code binary headlessly with
 `--output-format json` in a fresh copy of the same target repository.
 
 | Condition | Launch | What it exercises |
 |---|---|---|
-| `vanilla` | `claude -p --model <m> --settings '{"disableAllHooks":true}'`, prompt on stdin | Claude Code alone; the operator's global zirv hooks disabled so nothing of zirv leaks in |
-| `zirv` | `zirv ctx exec --agent claude --prompt <p> -- --output-format json --model <m>` | The supervised wrapper: compiled system prompt (engineering standard, meta-harness rules, skill index, harness roster), zirv's PreToolUse/PostToolUse/Stop hooks, safety policy, sandbox posture (`--permission-mode dontAsk` plus allow/deny lists), registered `zirv:*` skills, the read-only zirv MCP server, rot scoring and restart supervision. Same pinned model as vanilla, so the diff isolates the wrapper |
-| `zirv-proxy` | The runner replays `zirv chat`'s Jev intake, which headless `exec` skips: `zirv ctx proxy --json <p>` (TypeSafe Jev, `jev-1.13.0`) decides complexity/risk/workflow/seat tier; seat tier maps to `haiku`/`sonnet`/`opus`; the decided workflow is started with `zirv workflow start`; the `[zirv proxy]` layer is prepended to the prompt; then launched exactly like `zirv` | Everything in `zirv` plus Jev routing and workflow start. Its model is Jev's choice, not pinned |
+| `vanilla` | `claude -p --model <m> --setting-sources project,local --permission-mode bypassPermissions --plugin-dir <obra/superpowers>`, prompt on stdin | Claude Code with the obra/superpowers v6.4.1 plugin loaded (brainstorm/plan/TDD workflow) and its own `SessionStart` hook running; the operator's user-settings layer is dropped so zirv's global hooks can't leak in |
+| `zirv` | `zirv ctx exec --agent claude --prompt <p> -- --output-format json --model <m>` | The supervised wrapper: compiled system prompt, zirv's PreToolUse/PostToolUse/Stop hooks, safety policy, sandbox posture, registered `zirv:*` skills, the read-only zirv MCP server, rot scoring and restart supervision. Same pinned model as vanilla, so the diff isolates the wrapper |
+| `zirv-proxy` | `zirv ctx proxy --json <p>` (Jev) decides complexity/risk/workflow/seat tier; seat tier maps to `haiku`/`sonnet`/`opus`; the decided workflow is started with `zirv workflow start`; the `[zirv proxy]` layer is prepended to the prompt; then launched like `zirv` | Everything in `zirv` plus Jev routing and workflow start. Its model is Jev's choice, not pinned |
 
-`zirv ctx exec` compiles the **Worker** role prompt. The interactive
+Every condition's prompt is prefixed with the same fixed notice: "You are
+running non-interactively: nobody will answer questions or approve plans.
+Make reasonable decisions yourself and complete the task end to end." This is
+new since the previous grid (§6.2) and exists so neither side can look cheap
+or fast by stopping to ask instead of finishing.
+
+`zirv ctx exec` compiles the **Worker** role prompt; the interactive
 orchestrator prompt (`zirv chat`) is not what a headless run receives, so
 delegation conventions, the dashboard, mail and pane spawning are out of
 scope by construction.
 
 ## 2. Target project and tasks
 
-A synthetic, stdlib-only Python 3.11 package ("ledgerlite", 444 LOC, 30
-visible unit tests of which exactly one is deliberately red) with five
-planted defects and twelve tasks. Prompts are written the way a user writes
-them -- symptom first, never naming the file or function for bug tasks. The
-template is frozen and identical for every run; hidden graders live outside
-the repo the agent sees.
+A synthetic, stdlib-only Python 3.11 package ("ledgerlite", frozen template)
+with planted defects and fifteen tasks: t01-t12 are small (16 s to 5 min,
+answer/tests/judge graders), t13-t15 are large (10-25 min, multi-module
+features or a multi-bug sweep, 30-80 tool calls, hidden tests). Prompts are
+written the way a user writes them -- symptom first, never naming the file
+or function for bug tasks. Hidden graders live outside the repo the agent
+sees; every tests-kind grader was verified to score 0 or partial on the
+pristine template and 1.0 on a hand-applied correct fix before any run.
 
 | Task | Kind | Grader |
 |---|---|---|
-| t01 tiebreak | answer | 3 required regexes over the reply (module/function, priority, tie-break order) |
-| t02 pagination | tests | 7 hidden unittests (two planted off-by-one defects) |
+| t01 tiebreak | answer | 3 required regexes over the reply |
+| t02 pagination | tests | 7 hidden (two planted off-by-one defects) |
 | t03 money | tests | 6 hidden (parentheses negatives, thousands separators) |
-| t04 budget | tests | 6 hidden (new module + CLI subcommand against a stated API) |
-| t05 dedupe | judge | blind Sonnet judge, rubric: delegate to existing report functions, byte-identical output |
-| t06 currency | tests | 8 hidden (field threaded through model, store, CSV import, report, CLI) |
+| t04 budget | tests | 6 hidden (new module + CLI subcommand) |
+| t05 dedupe | judge | blind Sonnet judge, refactor quality |
+| t06 currency | tests | 8 hidden (field threaded through model/store/CSV/report/CLI) |
 | t07 redtest | tests | 3 hidden; score forced to 0 if the named test file was edited |
-| t08 usage doc | judge | blind Sonnet judge with the real argparse definitions in the rubric |
+| t08 usage doc | judge | blind Sonnet judge against the real argparse definitions |
 | t09 count | answer | exact integer computed from the template's actual behaviour |
-| t10 shares | tests | 7 hidden (largest-remainder rounding to exactly 100.00, tie-break by name) |
-| t11 export | tests | 9 hidden (RFC-4180 quoting, inclusive bounds, ordering, exit code on bad range) |
-| t12 dead code | answer | AST-derived truth; −0.25 per live function claimed dead on the final `DEAD:` line |
+| t10 shares | tests | 7 hidden (largest-remainder rounding, tie-break by name) |
+| t11 export | tests | 9 hidden (RFC-4180 quoting, bounds, ordering, exit code) |
+| t12 dead code | answer | AST-derived truth; penalty per live function claimed dead |
+| t13 recurring (large) | tests | 20 hidden -- new `recurring.py` module, persistence, two CLI surfaces, weekly/monthly/yearly expansion with clamping |
+| t14 bugsweep (large) | tests | 20 hidden -- one prompt reporting four bugs at once (pagination, money parsing, case-sensitive rules, a category-erasure regression); score forced to 0 if the protected test file is touched |
+| t15 reports (large) | tests | 17 hidden -- new monthly-breakdown and trend reporting functions plus a CLI command, byte-exact output in two formats |
 
-Score is 0..1 per run (share of hidden tests passed, share of required
-facts, or judge/10). "Solve rate" is the share of runs scoring exactly 1.0.
-Every tests-kind grader was verified to score 0 or partial on the pristine
-template and 1.0 on a hand-applied correct fix before any run.
+Score is 0..1 per run. "Solve rate" is the share of runs scoring exactly 1.0.
 
 ## 3. Protocol
 
-- Runs interleave conditions rep-major (rep 1: t01 vanilla, t01 zirv, t01
-  zirv-proxy, t02 vanilla, ...) so API-side drift lands on all conditions
-  alike. 3 to 5 runs were in flight at any time; wall-clock therefore
+- Runs interleave conditions rep-major so API-side drift lands on all
+  conditions alike; several runs were in flight at any time, so wall-clock
   includes equal contention for every condition.
 - Speed = wall-clock around the whole child process (for `zirv-proxy`,
-  including the Jev call and workflow start). `duration_api_ms` from
-  Claude's own result object is kept separately.
-- Cost = `total_cost_usd` from Claude Code's result object (list price,
-  `costBasis: "list"`), plus the Jev call priced at the catalogue's
-  $0.042/MTok input (≈$0.0002 per call; cache hits cost 0). Tokens are
-  the four raw classes summed (`input`, `cache_creation`, `cache_read`,
-  `output`), i.e. the `TranscriptUsage` basis in `token-cost.md` §1.
-- Intelligence = the per-run score above. Judge runs are re-scorable from
-  the kept repos (`regrade.py`); one grader defect was found and fixed this
-  way (an agent that *committed* its work made the judge's `git diff HEAD`
-  empty; the judge now diffs against the template's root commit).
-- Per-run timeout 20 min; 0 of 156 runs errored or timed out. No run hit a
-  usage limit (checked: every run has a normal turn count and cost, and no
-  output contains limit text).
-- Machine: Windows 11, i9-13900K, zirv 4.20.0 (Chocolatey), Claude Code
-  2.1.278, Python 3.11.0, 2026-09-22. Jev gates all on, credential present.
+  including the Jev call and workflow start).
+- Cost = `total_cost_usd` from Claude Code's result object (list price),
+  plus the Jev call for `zirv-proxy`.
+- Intelligence = the per-run score above.
+- Per-run timeout 20 min; 0 of 195 runs (135 Sonnet + 60 Haiku) errored or
+  timed out.
+- Machine: Windows 11, i9-13900K, a zirv 4.21.0 build under test (PR #736:
+  seat-tier recalibration, a skill pointer instead of the full skill index
+  for headless Worker/Single seats, adapter-readiness-probe skip cutting
+  hook start-up from ~290 ms to ~16 ms, and wider recursive temp-scratch
+  deletion), Claude Code, obra/superpowers v6.4.1, 2026-09-23.
 
 ## 4. Results
 
-### 4.1 Sonnet grid -- 12 tasks × 3 reps, n = 36 runs per condition
+### 4.1 Sonnet -- 15 tasks x 3 reps, n = 45 runs per condition
 
 | Metric | vanilla | zirv | zirv-proxy | zirv vs vanilla | zirv-proxy vs vanilla | better |
 |---|---|---|---|---|---|---|
-| Speed: mean wall (s) | 55.3 | 76.9 | 68.5 | **+39.1%** | **+23.8%** | lower |
-| Speed: median wall (s) | 40.9 | 54.8 | 54.8 | +33.8% | +33.8% | lower |
-| Cost: mean $/task (list) | 0.236 | 0.332 | 0.348 | **+40.6%** | **+47.2%** | lower |
-| Cost: mean tokens/task (4 classes) | 456,353 | 706,855 | 518,549 | +54.9% | +13.6% | lower |
-| Cost: mean output tokens | 4,640 | 5,510 | 4,901 | +18.8% | +5.6% | lower |
-| Intelligence: mean score | 0.986 | 1.000 | 1.000 | **+1.4%** | **+1.4%** | higher |
-| Intelligence: solve rate | 0.944 | 1.000 | 1.000 | +5.9% | +5.9% | higher |
-| Visible suite intact | 1.000 | 1.000 | 1.000 | 0 | 0 | higher |
+| Speed: mean wall (s) | 119.0 | 92.9 | 96.4 | **-22%** [-55, -3 s] | **-19%** [-51, +0.2 s] | lower |
+| Cost: mean $/task (list) | 0.501 | 0.380 | 0.273 | **-24%** [-0.29, -0.003] | **-46%** [-0.42, -0.08] | lower |
+| Intelligence: mean score | 0.933 | 0.972 | 0.984 | +4.1% [-0.046, +0.129] (n.s.) | +5.4% [-0.017, +0.133] (n.s.) | higher |
 
-Paired bootstrap (10,000 resamples, paired by task×rep, seed 0), zirv minus
-vanilla: score +0.014 [0.000, +0.035]; cost +$0.096 [+0.056, +0.140]; wall
-+21.6 s [+9.6, +34.1]. zirv-proxy minus vanilla: score +0.014 [0.000,
-+0.035]; cost +$0.112 [+0.056, +0.169]; wall +13.2 s [+1.0, +26.3].
+Intervals are paired bootstrap 95% CIs (10,000 resamples, paired by
+task x rep, seed 0); "n.s." = the interval straddles zero.
 
-The whole score difference is two vanilla runs of t12 that listed one live
-function as dead (−0.25 each). Every other one of the 108 runs scored 1.0.
-At this ceiling the intelligence column says "no measurable difference", not
-"zirv is 1.4% smarter".
-
-### 4.2 Haiku grid -- 12 tasks × 2 reps, n = 24 runs per condition
-
-Run because Sonnet saturated the suite; a weaker model gives correctness
-room to move. `zirv-proxy` is omitted (it chooses its own model).
+### 4.2 Haiku -- 15 tasks x 2 reps, n = 30 runs per condition
 
 | Metric | vanilla | zirv | zirv vs vanilla | better |
 |---|---|---|---|---|
-| Speed: mean wall (s) | 72.0 | 95.7 | **+33.0%** | lower |
-| Speed: median wall (s) | 61.5 | 80.9 | +31.5% | lower |
-| Cost: mean $/task (list) | 0.127 | 0.159 | **+24.9%** | lower |
-| Cost: mean tokens/task | 526,822 | 709,649 | +34.7% | lower |
-| Cost: mean output tokens | 6,578 | 7,044 | +7.1% | lower |
-| Intelligence: mean score | 0.959 | 0.990 | **+3.2%** | higher |
-| Intelligence: solve rate | 0.833 | 0.958 | +15.0% | higher |
-| Visible suite intact | 1.000 | 1.000 | 0 | higher |
+| Speed: mean wall (s) | 110.3 | 113.1 | +2.5% [-38, +39 s] (n.s.) | lower |
+| Cost: mean $/task (list) | 0.208 | 0.197 | -5.5% [-0.099, +0.063] (n.s.) | lower |
+| Intelligence: mean score | 0.822 | 0.972 | **+18.3%** [+0.031, +0.287] | higher |
 
-Paired bootstrap, zirv minus vanilla: score +0.031 [−0.015, +0.085]; cost
-+$0.032 [+0.012, +0.054]; wall +23.7 s [+13.7, +35.2]. The score interval
-includes zero: Haiku under zirv solved t04 and t10 where vanilla Haiku
-partially failed, and lost points on t12 where vanilla did not, over 24
-pairs. Suggestive, not established.
+### 4.3 Small (t01-t12) vs large (t13-t15) tasks
 
-### 4.3 Where the overhead comes from
+Large-task cells are n=9 per condition (Sonnet) or n=6 (Haiku) -- treat as
+indicative, not conclusive.
 
-From the Sonnet grid, means per run:
-
-| | vanilla | zirv | zirv-proxy |
+| Grid | wall_s | cost ($) | score |
 |---|---|---|---|
-| context tokens per model turn (input + both cache classes ÷ turns) | 34.6k | 45.9k | -- |
-| model turns | 12.7 | 15.1 | 11.8 |
-| tool calls | 11.8 | 13.9 | 10.7 |
-| API time (`duration_api_ms`) | 50 s | 59 s | 52 s |
-| wall minus API time | 5 s | 18 s | 16 s |
+| Sonnet small -- vanilla | 82.5 | 0.336 | 0.917 |
+| Sonnet small -- zirv | 77.2 (-6%) | 0.334 (-1%) | 0.994 (+8%) |
+| Sonnet small -- zirv-proxy | 72.0 (-13%) | 0.236 (-30%) | 1.000 (+9%) |
+| Sonnet large -- vanilla | 265.2 | 1.161 | 1.000 |
+| Sonnet large -- zirv | 155.4 (-41%) | 0.568 (-51%) | 0.882 (-12%) |
+| Sonnet large -- zirv-proxy | 194.0 (-27%) | 0.421 (-64%) | 0.919 (-8%) |
+| Haiku small -- vanilla | 81.6 | 0.145 | 0.865 |
+| Haiku small -- zirv | 88.9 (+9%) | 0.155 (+7%) | 0.981 (+13%) |
+| Haiku large -- vanilla | 225.1 | 0.461 | 0.649 |
+| Haiku large -- zirv | 209.7 (-7%) | 0.364 (-21%) | 0.933 (+44%) |
 
-Two mechanisms, roughly equal: (1) about 11k extra tokens of system prefix
-per turn (`zirv ctx compile --measure` reports 17 KB for the composed layers
-alone; the registered `zirv:*` skills and the MCP tool schemas add the rest),
-paid as cache reads on every turn and as a cache write on the first; (2)
-about 13 s of non-API wall time per run -- process supervision, prompt
-compilation, and a hook subprocess on every tool call -- versus 5 s for bare
-Claude. Wrapped runs also took two to three more turns on average.
+Full per-task tables, features-used counts and zirv-proxy's per-task
+seat/model/workflow decisions are in `report-opt-sonnet.md` and
+`report-opt-haiku.md`; the per-run rows behind every number above are in
+`results-opt-sonnet.csv` / `results-opt-haiku.csv`.
 
-### 4.4 What the zirv features actually did in a headless run
+## 5. Reading the results honestly
 
-Counted from the transcripts of the 72 wrapped Sonnet runs:
+- **Superpowers makes vanilla do more work.** Its brainstorm/plan/TDD flow
+  is slower and roughly 2x costlier than zirv on large tasks, but it scored
+  a perfect 1.000 there on Sonnet, where zirv lost points -- one t14 run
+  modified the protected test file (forced to 0), and t13/t15 runs passed
+  only part of the hidden suite. On large Sonnet tasks, zirv trades about
+  12 points of correctness for roughly half the cost and time; zirv-proxy
+  recovers some of that correctness (-8% vs vanilla, not -12%) while still
+  cutting cost by 64%.
+- **The notice didn't fully stop superpowers from asking.** Despite the
+  "nobody will answer, finish it yourself" prefix, vanilla+superpowers still
+  ended 8 of 75 runs by asking for approval instead of implementing -- all 3
+  Sonnet t06 runs, and Haiku t04, t06, t11, t13, t15 -- scoring 0 or near it.
+  zirv never did. Much of zirv's score lead in §4.1/4.2 comes directly from
+  this, not from zirv writing better code.
+- **Without the notice, vanilla looked artificially cheap.** The earlier
+  superpowers-baseline grid (zirv 4.20.0, no notice; §6.2) had vanilla stop
+  to ask in 10 of 36 Sonnet runs, producing a headline of 46 s / $0.21 mean
+  -- fast and cheap only because a third of its runs did nothing. That grid
+  is not comparable to this one; it's why the notice was added.
+- **The zirv-itself optimization effect is modest and partly confounded.**
+  Comparing zirv 4.20.0 to 4.21.0 on the small-task grid only (Sonnet): mean
+  wall 82.3 s -> 77.2 s (-6%), mean cost $0.347 -> $0.334 (-4%). The 4.20.0
+  grid lacked the notice, but zirv itself never asked questions in either
+  grid, so the confound from that difference is small. The Haiku 4.20.0 grid
+  ran during a usage-limit slowdown, so its before/after is not reported.
+- **Sample sizes.** Large-task cells are n=9 (Sonnet) or n=6 (Haiku) per
+  condition; treat those numbers as indicative, not conclusive. The small-task
+  cells (n=36 Sonnet, n=24 Haiku) are the same size as the historical grids.
+- **Selection.** This is still a headless benchmark: no long interactive
+  session, no context rot, no restart-with-handoff. It measures the
+  wrapper's overhead and its effect on one-shot task correctness, not the
+  long-session value zirv is built for (§7).
 
-| Per run | zirv | zirv-proxy |
-|---|---|---|
-| `zirv workflow …` calls by the agent | 0.00 | 0.00 |
-| `zirv skill …` calls | 0.17 | 0.06 |
-| `zirv ctx …` calls | 0.06 | 0.22 |
-| subagents spawned | 0 | 0 |
-| tool calls denied by the sandbox posture | 0.17 | 0.08 |
+## 6. History: earlier grids
 
-Jev routed every task deterministically across reps: t09 (count rows) to
-`haiku` ($0.073 vs $0.231 vanilla Sonnet, still 100% correct); t04 and t06
-to `opus` ($0.833 and $0.703 vs $0.485 and $0.322, no correctness gain
-available at the ceiling); the other nine stayed on `sonnet`. Jev started a
-workflow in 27 of 36 proxy runs (bugfix/feature/refactor/documentation
-packs) and **the agent never advanced or consulted any of them**. The Worker
-role prompt does not tell it to, and nothing gates a headless `-p` run on
-workflow state. Skill loads were rare (8 of 72 runs) and none changed an
-outcome that the grader could see.
+Two earlier grids used this same template and task set (minus t13-t15,
+which didn't exist yet) and are kept here for the record. Neither is
+directly comparable to §4 -- read why before citing either one.
 
-Two operator-facing observations from the runs, not benchmark results:
-`zirv ctx proxy` resolved the frontier seat to `gpt-5.6-sol` even for harness
-`claude` on this machine (the operator's `chat.model` profile), which the
-runner had to override with a tier→model map; and the sandbox posture denied
-a tool call in 8 of 72 wrapped runs (the agents recovered every time).
+### 6.1 Original grid (2026-09-22, zirv 4.20.0, disableAllHooks vanilla)
 
-## 5. Reading the numbers honestly
+The first version of this benchmark compared zirv to a completely bare
+`claude -p --settings '{"disableAllHooks":true}'` -- no plugin at all, no
+non-interactive notice, 12 tasks. On that comparison, wrapping was pure
+overhead: Sonnet wall +39% (55.3 s -> 76.9 s), cost +41% ($0.236 ->
+$0.332); Haiku wall +33% (72.0 s -> 95.7 s), cost +25% ($0.127 -> $0.159).
+Correctness didn't move outside noise on either grid (Sonnet was already at
+a 0.986-1.000 ceiling). Full protocol, per-task tables and CSVs:
+`report-sonnet.md`, `report-haiku.md`, `results-sonnet.csv`,
+`results-haiku.csv` in the harness directory.
 
-- The cost delta is a real, tight-CI **+25% to +41%** at equal model. The
-  wall delta is **+33% to +39%**. Anyone wrapping short, one-shot tasks
-  pays this for nothing this benchmark can see.
-- The correctness delta is **not distinguishable from zero** on either
-  grid. Twelve tasks and 2-3 reps give roughly 24-36 paired samples;
-  a 3-point mean-score shift with a CI straddling zero is exactly what
-  no-effect looks like at that n. Reporting the +15% Haiku solve rate
-  without its interval would be the base-rate mistake `statistical-sanity`
-  warns about: it is 20/24 versus 23/24.
-- Multiple comparisons: eight metrics × two grids × two contrasts were
-  computed; the two significant ones (cost, wall) are the ones with an
-  obvious mechanism (§4.3), the near-significant one (score) has none.
-- Selection: the tasks are short (16 s to 4 min), self-contained, in a
-  repo the model reads whole. That is the population this generalises to.
-  It says nothing about a 3-hour session, a 2M-token transcript, a crashed
-  harness, or a task that needs a second harness.
+This grid answers a narrower question than §4 -- "what does zirv cost over
+nothing at all" -- rather than "what does zirv cost over a comparably
+capable competing harness setup", which is why superpowers was added next.
 
-## 6. Not yet measured
+### 6.2 Superpowers-baseline grid (2026-09-22, zirv 4.20.0, no notice)
 
-- **Long-session value.** The thing zirv exists for -- rot scoring, compaction
-  advice, restart with handoff, cross-harness rollover -- needs sessions
-  long enough to rot. A recorded protocol for that is the natural next
-  benchmark: the same task set chained into one multi-hour session per
-  condition, scoring the last tasks in the chain.
+Same 12 tasks, vanilla now loads obra/superpowers, but neither side yet had
+the anti-stalling notice. Sonnet: vanilla mean wall 46.2 s, cost $0.208,
+score 0.715 (108 runs); zirv 82.3 s / $0.347 / 0.979; zirv-proxy 78.7 s /
+$0.339 / 0.993. Haiku: vanilla 95.7 s / $0.151 / 0.484 (48 runs); zirv
+145.0 s / $0.216 / 0.733. Vanilla's low wall-clock and cost here are not a
+sign of efficiency: it stopped to ask for approval in 10 of 36 Sonnet runs
+and a comparable share of Haiku runs, scoring nothing on those and exiting
+fast. That artifact is exactly why §1's notice exists in the current grid.
+Reports: `report-sp-sonnet.md`, `report-sp-haiku.md`.
+
+## 7. Not yet measured
+
+- **Long-session value.** The thing zirv exists for -- rot scoring,
+  compaction advice, restart with handoff, cross-harness rollover -- needs
+  sessions long enough to rot. A chained multi-hour version of this task set
+  is the natural next benchmark.
 - **Interactive `zirv chat`.** The orchestrator prompt, dashboard panes,
-  delegation and mail are not exercised by `-p`. `zirv chat` has no
-  headless mode today, so this needs a PTY driver.
-- **Release-build zirv.** The Chocolatey binary was used as installed; a
-  debug-vs-release delta on the 13 s of non-API overhead is unmeasured.
+  delegation and mail are not exercised by `-p`. `zirv chat` has no headless
+  mode today, so this needs a PTY driver.
+- **Release-build zirv.** This grid ran a locally-built zirv under test
+  (`--zirv-dir`), not the Chocolatey-installed release; that's the right
+  binary for isolating the wrapper's own changes but leaves any
+  packaging-specific overhead unmeasured.
 
-## 7. Reproduce
+## 8. Reproduce
 
 ```sh
 cd docs/benchmarks/wrapped-vs-vanilla
-python run.py --tasks all --conds vanilla,zirv,zirv-proxy --reps 3 --model sonnet --parallel 3
-python aggregate.py --runs runs --out report-sonnet.md
-python run.py --tasks all --conds vanilla,zirv --reps 2 --model haiku --runs-subdir runs-haiku --parallel 3
-python aggregate.py --runs runs-haiku --out report-haiku.md
+python run.py --tasks all --conds vanilla,zirv,zirv-proxy --reps 3 --model sonnet --parallel 3 \
+  --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
+python aggregate.py --runs runs --out report-opt-sonnet.md
+
+python run.py --tasks all --conds vanilla,zirv --reps 2 --model haiku --runs-subdir runs-haiku --parallel 3 \
+  --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
+python aggregate.py --runs runs-haiku --out report-opt-haiku.md
 ```
 
-`results-sonnet.csv` and `results-haiku.csv` are the per-run rows behind
-every number above; `report-*.md` are the aggregator's own output. The
+`results-opt-sonnet.csv` and `results-opt-haiku.csv` are the per-run rows
+behind §4; `report-opt-*.md` are the aggregator's own output. Passing
+`--tasks t01,t02,...,t12` and dropping `--vanilla-plugin-dir`/
+`--noninteractive` reproduces the §6.1 grid; keeping
+`--vanilla-plugin-dir` but dropping `--noninteractive` reproduces §6.2. The
 harness needs `claude`, `zirv` and `git` on PATH, a Jev credential for the
-`zirv-proxy` condition, and roughly $30 of list-price usage for the two
-grids as recorded.
+`zirv-proxy` condition, and roughly $65 of list-price usage for the two
+current grids as recorded (45 x (0.501+0.380+0.273) + 30 x (0.208+0.197)).

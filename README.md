@@ -1001,32 +1001,34 @@ to the section that documents it in depth.
 
 ### What wrapping costs (measured)
 
-Wrapping a session is not free, and on short tasks it buys nothing this
-benchmark can see. 156 headless runs of the same twelve tasks (bug fixes,
-features, a refactor, docs, code questions; hidden unittest graders and a
-blind judge) in a fresh copy of the same repository, vanilla `claude -p`
-versus `zirv ctx exec` at the same model, 2026-09-22, Claude Code 2.1.278,
-zirv 4.20.0. Change is zirv relative to vanilla; the 95% intervals are paired
-bootstraps over task×rep.
+Current grid (2026-09-23, zirv 4.21.0): 195 headless runs of 15 tasks
+(t01-t12 small, t13-t15 large multi-module features/bug sweeps, 10-25 min,
+hidden tests) against vanilla `claude -p` with the obra/superpowers plugin
+loaded, both sides given the same "finish it yourself, nobody will answer
+questions" notice. Change is zirv relative to vanilla; 95% intervals are
+paired bootstraps over task×rep; large-task cells are n=9 (Sonnet) or n=6
+(Haiku) per condition and indicative only.
 
-| Metric | Sonnet, 36 runs each | Haiku, 24 runs each | Better |
+| Grid | Wall Δ | Cost Δ | Score Δ |
 |---|---|---|---|
-| Speed (mean wall-clock per task) | 55.3 s → 76.9 s, **+39%** [+17%, +62%] | 72.0 s → 95.7 s, **+33%** [+19%, +49%] | lower |
-| Token cost (mean list price per task) | $0.236 → $0.332, **+41%** [+24%, +59%] | $0.127 → $0.159, **+25%** [+9%, +43%] | lower |
-| Intelligence (mean score, 0–1) | 0.986 → 1.000, **+1.4%** [0%, +3.5%] | 0.959 → 0.990, **+3.2%** [−1.6%, +8.8%] | higher |
+| Sonnet, small (t01-t12, n=36) | -6% | -1% | +8% |
+| Sonnet, large (t13-t15, n=9) | **-41%** | **-51%** | -12% |
+| Haiku, small (n=24) | +9% | +7% | +13% |
+| Haiku, large (n=6) | -7% | -21% | **+44%** |
 
-The overhead has two roughly equal halves: about 11k extra tokens of system
-prefix on every model turn (engineering standard, meta-harness rules, skill
-index, registered skills and MCP schemas), and about 13 s of non-API time
-per run (supervision, prompt compilation, a hook process per tool call). The
-correctness column is at ceiling for Sonnet and within noise for Haiku.
-Adding Jev intake routing (`zirv-proxy`: 36 more Sonnet runs) cut the tokens
-overhead to +14% by sending trivial tasks to Haiku, but sent two feature
-tasks to Opus and ended at **+47%** cost and **+24%** wall. What zirv is
-built for -- rot over long sessions, restart with handoff, cross-harness
-rollover -- never engages in a run that ends in four minutes and is not yet
-measured. Protocol, per-task tables, the harness and the raw per-run CSVs:
-[docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
+`zirv-proxy` (Jev-routed model/seat/workflow selection) does better still on
+large Sonnet tasks -- **-64%** cost, -27% wall, only -8% score -- by routing
+some work to cheaper seats. The large-task score losses are real: obra/
+superpowers' brainstorm/TDD discipline lets vanilla Sonnet hit a perfect
+1.000 there, where zirv modified a protected test file on one t14 run
+(forced to 0) and passed hidden tests only partially on others. Much of
+zirv's score *lead* elsewhere is not code quality: vanilla+superpowers still
+stopped to ask for approval instead of finishing in 8 of 75 runs despite the
+notice, scoring near zero on each; zirv never did. This is still a headless,
+single-session benchmark and says nothing about the long sessions zirv's
+rot-scoring and restart features target. Full protocol, per-task tables,
+history of two earlier (less comparable) grids, the harness and raw per-run
+CSVs: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
 
 ### Development workflow commands
 
