@@ -2603,6 +2603,18 @@ pub fn render_plain(
 pub struct NativeDashboardSpec {
     pub repo: PathBuf,
     pub role: String,
+    /// A CANDIDATE route name OR model alias -- not a guaranteed route.
+    /// `dash::mod.rs`'s worker spawn path feeds a delegation's own model
+    /// alias in here already; issue #703 adds `chat::native_pane_spec`,
+    /// which feeds it the harness proxy's decided model. Both are
+    /// harness-CLI-style aliases (`"sonnet"`, `"opus"`, ...) that select a
+    /// route either by naming it directly (`NativeConfig::routes`) or, more
+    /// commonly, by resolving to the SAME catalogue model as one of the
+    /// allowed routes' own configured `model` -- `NativePaneRuntime::spawn`'s
+    /// own `resolve_native_route` does both checks before this ever reaches
+    /// `InteractiveRequest::route`, and falls back to `None` (the role's own
+    /// default route) for anything that resolves to neither, rather than
+    /// failing the launch.
     pub route: Option<String>,
     /// Whether this session should hold a writer permit for `repo` -- see
     /// `runtime::native::InteractiveRequest::writing`. A plain `zirv chat
@@ -3043,6 +3055,79 @@ enum NativeStopState {
 
 const STOP_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Issue #703: validates `spec.route`'s candidate against the operator's own
+/// native provider configuration -- the SAME `NativeConfig` `resolve_billing`/
+/// `runtime::native::build_transport` already read -- before it ever reaches
+/// `InteractiveRequest::route`. `build_transport`'s own lookup hard-fails a
+/// route name that is not configured or not policy-allowed (`"unknown native
+/// route"`), which is the right answer for an operator's own explicit
+/// `--route`, but not for a candidate nobody asked for by name: a harness
+/// proxy decision's model (`"sonnet"`, `"opus"`, ...) or a delegation's own
+/// model alias are native-runtime-agnostic and only sometimes also happen to
+/// name a real route.
+///
+/// A candidate that IS itself an allowed, configured route name is used
+/// as-is. Otherwise -- the common case, since the proxy's harness-CLI-style
+/// aliases and an operator's own route names are independent vocabularies,
+/// so the exact-name match above almost never fires -- this resolves the
+/// candidate to a catalogue model (the SAME `provider/inventory.rs::
+/// resolve_model` that `NativeConfig::validate` itself uses to check every
+/// route's own `model` field, run once per allowed route under THAT route's
+/// own vendor) and picks the allowed route whose own configured `model`
+/// resolves to that same catalogue model: an operator who named a route
+/// `cheap` with `model = "sonnet"` still gets it picked for a decided
+/// `"sonnet"`, without also having to name the route `sonnet`. Several
+/// matching routes prefer the role's own default (`[roles].<role>`) when it
+/// is one of them, else the first by `RouteId` order -- `NativeConfig::
+/// routes` is a `BTreeMap`, so TOML declaration order is not recoverable,
+/// and route-id order is the only deterministic order left. No match at all
+/// -- blank, or nothing configured/allowed resolves to the same model --
+/// falls back to `None`: the role's own default route, exactly what a native
+/// launch resolved to before this seam existed.
+fn resolve_native_route(candidate: Option<&str>, role: &str, repo: &Path) -> Option<String> {
+    use super::super::provider::RouteId;
+    use super::super::provider::config::NativeConfig;
+    use super::super::provider::inventory;
+
+    let candidate = candidate?.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    let home = crate::utils::home_dir().ok()?;
+    let native = NativeConfig::load(&home, repo).ok().flatten()?;
+    let allowed = native.allowed_routes();
+
+    if let Ok(route_id) = RouteId::new(candidate)
+        && native.routes.contains_key(&route_id)
+        && allowed.contains(&route_id)
+    {
+        return Some(candidate.to_string());
+    }
+
+    let endpoints = native.effective_endpoints();
+    let matches: Vec<&RouteId> = native
+        .routes
+        .iter()
+        .filter(|(id, _)| allowed.contains(*id))
+        .filter_map(|(id, route)| {
+            let endpoint_id = native.route_endpoint(route)?;
+            let endpoint = endpoints.get(&endpoint_id)?;
+            let (route_model, _) =
+                inventory::resolve_model(id, &endpoint_id, &endpoint.vendor, &route.model).ok()?;
+            let (candidate_model, _) =
+                inventory::resolve_model(id, &endpoint_id, &endpoint.vendor, candidate).ok()?;
+            (route_model == candidate_model).then_some(id)
+        })
+        .collect();
+
+    let chosen = native
+        .roles
+        .get(role)
+        .filter(|role_route| matches.contains(role_route))
+        .or_else(|| matches.first().copied())?;
+    Some(chosen.to_string())
+}
+
 impl NativePaneRuntime {
     pub fn spawn(
         cfg: &CtxConfig,
@@ -3051,11 +3136,12 @@ impl NativePaneRuntime {
         spec: NativeDashboardSpec,
     ) -> CtxResult<Self> {
         let _ = cfg;
+        let route = resolve_native_route(spec.route.as_deref(), &spec.role, &spec.repo);
         let session = native::spawn_interactive(
             InteractiveRequest {
                 repo: spec.repo.clone(),
                 role: spec.role.clone(),
-                route: spec.route.clone(),
+                route,
                 limits: native::NativeLimits::default(),
                 task: None,
                 writing: spec.writing,
@@ -7538,6 +7624,147 @@ mod tests {
             self.lock().stopped = true;
             Ok(true)
         }
+    }
+
+    /// Issue #703: `None` (no candidate at all) and a blank one both leave the
+    /// pane's route unset without ever touching disk -- `resolve_native_
+    /// route` must not call `home_dir`/`NativeConfig::load` for a candidate
+    /// nobody supplied.
+    #[test]
+    fn resolve_native_route_returns_none_for_no_candidate_or_a_blank_one() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert_eq!(resolve_native_route(None, "orchestrator", repo.path()), None);
+        assert_eq!(
+            resolve_native_route(Some("   "), "orchestrator", repo.path()),
+            None
+        );
+    }
+
+    fn write_native_config(home: &Path, text: &str) {
+        let path = crate::commands::ctx::provider::config::NativeConfig::operator_path(home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    // `model = 'sonnet'` is a real catalogue alias for the `anthropic` vendor
+    // (`catalogue::vendor("anthropic")`'s own rungs) -- `NativeConfig::
+    // validate` resolves `route.model` against that catalogue, and an
+    // invented id like `claude-sonnet-4-5` is ambiguous against it (it
+    // contains the `sonnet` alias as a substring) and fails validation.
+    const SAMPLE_NATIVE_CONFIG: &str = "schema = 1\n\
+         [account.code]\n\
+         provider = 'anthropic'\n\
+         billing = 'api'\n\
+         [route.sonnet]\n\
+         account = 'code'\n\
+         model = 'sonnet'\n\
+         execution = { adapter = 'claude-code' }\n";
+
+    /// Issue #703: a candidate that names an existing, policy-allowed route
+    /// (the operator happens to have named it after the same alias the
+    /// harness proxy decided) is used as-is.
+    #[test]
+    fn resolve_native_route_passes_through_a_configured_allowed_route() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_native_config(home.path(), SAMPLE_NATIVE_CONFIG);
+
+        assert_eq!(
+            resolve_native_route(Some("sonnet"), "orchestrator", repo.path()),
+            Some("sonnet".to_string())
+        );
+    }
+
+    /// Issue #703 (orchestrator follow-up): the actual impact this closes --
+    /// the exact-name check above almost never fires, since the proxy's
+    /// aliases and an operator's route names are independent vocabularies.
+    /// An operator who named a route `cheap` (never `sonnet`) but configured
+    /// it with `model = "sonnet"` still gets it picked for a decided
+    /// `"sonnet"`, because both resolve to the SAME catalogue model.
+    #[test]
+    fn resolve_native_route_matches_a_route_by_its_resolved_catalogue_model() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_native_config(
+            home.path(),
+            "schema = 1\n\
+             [account.code]\n\
+             provider = 'anthropic'\n\
+             billing = 'api'\n\
+             [route.cheap]\n\
+             account = 'code'\n\
+             model = 'sonnet'\n\
+             execution = { adapter = 'claude-code' }\n",
+        );
+
+        assert_eq!(
+            resolve_native_route(Some("sonnet"), "orchestrator", repo.path()),
+            Some("cheap".to_string())
+        );
+    }
+
+    /// Issue #703 (orchestrator follow-up): several allowed routes can
+    /// resolve to the same catalogue model. The role's own default route
+    /// (`[roles].<role>`) wins even though it does not sort first by
+    /// `RouteId`, so a decided model never bumps an operator off the route
+    /// already picked for that role when any configured route would do;
+    /// with no matching default for the role asking, the first route by id
+    /// order wins instead, deterministically.
+    #[test]
+    fn resolve_native_route_prefers_the_roles_own_default_route_when_several_match() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_native_config(
+            home.path(),
+            "schema = 1\n\
+             [account.code]\n\
+             provider = 'anthropic'\n\
+             billing = 'api'\n\
+             [route.cheap]\n\
+             account = 'code'\n\
+             model = 'sonnet'\n\
+             execution = { adapter = 'claude-code' }\n\
+             [route.zzz-orchestrator]\n\
+             account = 'code'\n\
+             model = 'sonnet'\n\
+             execution = { adapter = 'claude-code' }\n\
+             [roles]\n\
+             orchestrator = 'zzz-orchestrator'\n",
+        );
+
+        assert_eq!(
+            resolve_native_route(Some("sonnet"), "orchestrator", repo.path()),
+            Some("zzz-orchestrator".to_string()),
+            "the role's own default route must win even though `cheap` sorts first"
+        );
+        assert_eq!(
+            resolve_native_route(Some("sonnet"), "worker", repo.path()),
+            Some("cheap".to_string()),
+            "with no matching default for this role, the first route by id order wins"
+        );
+    }
+
+    /// Issue #703: the actual bug this fixes -- a harness proxy decision
+    /// names a model alias (`"opus"`) with no corresponding `[route]` entry,
+    /// which is the common case since the proxy's aliases and an operator's
+    /// route names are independent vocabularies. This must fall back to
+    /// `None` (the role's own default route) rather than the whole session
+    /// failing the way `build_transport`'s "unknown native route" refusal
+    /// would if the candidate reached `InteractiveRequest::route` unvalidated.
+    #[test]
+    fn resolve_native_route_falls_back_when_the_candidate_names_no_configured_route() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        write_native_config(home.path(), SAMPLE_NATIVE_CONFIG);
+
+        assert_eq!(
+            resolve_native_route(Some("opus"), "orchestrator", repo.path()),
+            None
+        );
     }
 
     #[test]
