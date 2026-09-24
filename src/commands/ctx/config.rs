@@ -691,6 +691,25 @@ pub struct PromptConfig {
     /// dedupe_native` uses, never force it back on for an operator who
     /// turned it off.
     pub skill_index: bool,
+    /// Issue #753: whether the `UserPromptSubmit` hook classifies a
+    /// session's FIRST prompt (text only, no network) and, for a
+    /// substantial one, adds the one-turn plan/test discipline note
+    /// (`hook::INTAKE_DISCIPLINE_TEXT`). NOT `REPO_FORBIDDEN`: a repo
+    /// checkout may only narrow it to `false` (`narrow_intake_discipline_
+    /// bool`), never force it back on for an operator who turned it off.
+    pub intake_discipline: bool,
+    /// Issue #755: whether the standing skill index drops a skill family
+    /// the repository shows no signal for (`frontend-*` with no
+    /// `package.json`/frontend source files; the four Kibana/Elastic
+    /// operational skills with no Elastic/Kibana config) -- see
+    /// `prompt::filter_skill_entries_by_repo_signal`. A dropped skill stays
+    /// fully loadable through `zirv skill list`/`load`; only its passive
+    /// advertisement in this layer narrows. `REPO_FORBIDDEN`, the same
+    /// trust asymmetry as `harnesses`/`codex_orchestrator` above: disabling
+    /// this heuristic widens what a session sees (every skill listed again),
+    /// so only the operator may do it -- a repo checkout must not be able to
+    /// force its own family back into every session's standing prefix.
+    pub skill_index_repo_filter: bool,
     /// Whether a codex Orchestrator session's composed prompt gets codex's
     /// own `AgentAdapter::base_system_prompt` layer (issue #167,
     /// `adapters::codex::ORCHESTRATOR_PROMPT`) -- the codex analogue of
@@ -727,6 +746,8 @@ impl Default for PromptConfig {
             max_repo_bytes: 4096,
             harnesses: true,
             skill_index: true,
+            intake_discipline: true,
+            skill_index_repo_filter: true,
             codex_orchestrator: true,
             orchestrator_writes: OrchestratorWrites::Advise,
         }
@@ -3453,8 +3474,18 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_PROMPT_INTAKE_DISCIPLINE",
+        &["prompt", "intake_discipline"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
         &["prompt", "codex_orchestrator"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER",
+        &["prompt", "skill_index_repo_filter"],
         EnvKind::Bool,
     ),
     (
@@ -4279,6 +4310,13 @@ fn narrow_skill_index_bool(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
+/// Issue #753: the repo-narrowing fold for `prompt.intake_discipline` --
+/// `false` (no intake note) is this key's strict direction, exactly like
+/// `narrow_skill_index_bool`.
+fn narrow_intake_discipline_bool(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
 /// Issue #309: the repo-narrowing fold for `verify_on_stop.enabled` -- the
 /// same polarity as `narrow_dedupe_bool`, since `false` (the nudge is off) is
 /// this key's strict direction. `repo` absent contributes nothing (folds in
@@ -4544,6 +4582,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["prompt", "codex_orchestrator"],
         "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
+    ),
+    // Issue #755: disabling the repo-signal skill-family filter widens what
+    // every session sees (every skill family advertised again), the same
+    // trust asymmetry as `prompt.harnesses`/`prompt.codex_orchestrator`
+    // above -- only the operator may do it.
+    (
+        &["prompt", "skill_index_repo_filter"],
+        "ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER",
     ),
     // Issue #427: without this a repo checkout could simply raise its own
     // tier, making an operator's chosen `"minimal"`/`"standard"` decorative
@@ -5705,6 +5751,8 @@ impl CtxConfig {
         // lift-before-merge treatment, folded by `narrow_skill_index_bool` --
         // unlike every other `[prompt]` key, this one is not `REPO_FORBIDDEN`.
         let home_prompt_skill_index = bool_at(take_nested(&mut merged, "prompt", "skill_index"));
+        let home_prompt_intake_discipline =
+            bool_at(take_nested(&mut merged, "prompt", "intake_discipline"));
         // Issue #309: `verify_on_stop.enabled`/`max_nudges` get the identical
         // lift-before-merge treatment -- see `narrow_verify_on_stop_enabled`/
         // `narrow_max_nudges` below for each field's strict direction.
@@ -5908,6 +5956,8 @@ impl CtxConfig {
             bool_at(take_nested(&mut repo_layer, "context", "dedupe_native"));
         let repo_prompt_skill_index =
             bool_at(take_nested(&mut repo_layer, "prompt", "skill_index"));
+        let repo_prompt_intake_discipline =
+            bool_at(take_nested(&mut repo_layer, "prompt", "intake_discipline"));
         let repo_verify_on_stop_enabled =
             bool_at(take_nested(&mut repo_layer, "verify_on_stop", "enabled"));
         let repo_verify_on_stop_max_nudges =
@@ -6190,6 +6240,14 @@ impl CtxConfig {
             toml::Value::Boolean(narrow_skill_index_bool(
                 home_prompt_skill_index.unwrap_or(default_prompt.skill_index),
                 repo_prompt_skill_index,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["prompt", "intake_discipline"],
+            toml::Value::Boolean(narrow_intake_discipline_bool(
+                home_prompt_intake_discipline.unwrap_or(default_prompt.intake_discipline),
+                repo_prompt_intake_discipline,
             )),
         );
         let default_verify_on_stop = VerifyOnStopConfig::default();
@@ -8332,6 +8390,34 @@ mod tests {
         }
     }
 
+    /// Issue #755: disabling the repo-signal skill-family filter widens what
+    /// every session sees (every skill family advertised again, `REPO_
+    /// FORBIDDEN`'s own entry for this key says as much) -- a repository
+    /// checkout must not be able to flip it off for itself. Mirrors
+    /// `memory_session_enabled_and_journal_max_entries_are_repo_forbidden`
+    /// right above.
+    #[test]
+    fn prompt_skill_index_repo_filter_is_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[prompt]\nskill_index_repo_filter = false\n",
+        )
+        .expect("write");
+
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to set prompt.skill_index_repo_filter");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "prompt.skill_index_repo_filter must be rejected as REPO_FORBIDDEN: {err}"
+        );
+    }
+
     /// The operator-only escape hatches for the same two keys: `~/.zirv/
     /// ctx.toml` and `ZIRV_CTX_MEMORY_SESSION`/`ZIRV_CTX_MEMORY_JOURNAL_MAX_
     /// ENTRIES` may still set them, exactly like every other `memory.*` key.
@@ -9802,6 +9888,48 @@ mod tests {
             !cfg.context.dedupe_native,
             "the operator's own false must survive a repo layer's true"
         );
+    }
+
+    /// Issue #753: `prompt.intake_discipline` is narrow-only from the repo
+    /// layer -- a repo `false` turns it off, a repo `true` cannot undo the
+    /// operator's own `false`, and neither layer setting it keeps `true`.
+    #[test]
+    fn a_repo_layer_may_disable_intake_discipline_but_never_re_enable_it() {
+        let load = |home_text: Option<&str>, repo_text: &str| {
+            let home = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            if let Some(text) = home_text {
+                std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+                std::fs::write(home.path().join(".zirv").join(CTX_CONFIG_FILE), text)
+                    .expect("write home layer");
+            }
+            let repo = tempfile::tempdir().expect("repo");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv").join(CTX_CONFIG_FILE), repo_text)
+                .expect("write repo layer");
+            let empty: HashMap<String, String> = HashMap::new();
+            CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("loads")
+                .prompt
+                .intake_discipline
+        };
+        assert!(load(None, ""), "default is on");
+        assert!(!load(
+            None,
+            "[prompt]
+intake_discipline = false
+"
+        ));
+        assert!(!load(
+            Some(
+                "[prompt]
+intake_discipline = false
+"
+            ),
+            "[prompt]
+intake_discipline = true
+"
+        ));
     }
 
     /// The default, and the common case: neither layer mentions the key at
@@ -12929,6 +13057,7 @@ mod tests {
         ("prompt", "max_repo_bytes"),
         ("prompt", "harnesses"),
         ("prompt", "skill_index"),
+        ("prompt", "intake_discipline"),
         ("prompt", "codex_orchestrator"),
         ("prompt", "verbosity"),
         ("context", "max_common_bytes"),

@@ -16,8 +16,21 @@ import random
 import statistics
 from pathlib import Path
 
-CANONICAL_CONDS = ["vanilla", "zirv", "zirv-proxy"]
-NON_VANILLA_CONDS = ["zirv", "zirv-proxy"]
+# Issue #758: the zirv-jev-full/zirv-jev-<gate> ablation conditions run.py
+# can produce, mirrored here so the two scripts agree on condition names
+# without a shared module (same duplication CANONICAL_CONDS/JUDGE_DISALLOWED
+# etc. already had between the two files).
+JEV_GATE_KEYS = [
+    "memory", "supervisor", "dispatch", "review", "gates", "context",
+    "intake_savings", "review_reuse", "harvest_screen", "admin_dispatch",
+]
+JEV_ABLATION_CONDS = ["zirv-jev-full"] + [f"zirv-jev-{g}" for g in JEV_GATE_KEYS]
+# zirv-proxy and every jev ablation condition carry `proxy`/`model_used`
+# metadata from the same `zirv ctx proxy --json` call run.py makes for them.
+PROXY_LIKE_CONDS = {"zirv-proxy", *JEV_ABLATION_CONDS}
+
+CANONICAL_CONDS = ["vanilla", "zirv", "zirv-proxy", *JEV_ABLATION_CONDS]
+NON_VANILLA_CONDS = ["zirv", "zirv-proxy", *JEV_ABLATION_CONDS]
 N_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 0
 
@@ -245,12 +258,16 @@ def features_used_table(rows):
 
 
 def zirv_proxy_decision_table(rows):
-    rs = [r for r in rows if r.get("cond") == "zirv-proxy"]
+    # Grouped by (task, cond) rather than just task: a report can carry
+    # zirv-proxy alongside one or more zirv-jev-* ablations at once (issue
+    # #758), and each is its own independently proxy-routed condition --
+    # folding them together by task alone would silently blend their modes.
+    rs = [r for r in rows if r.get("cond") in PROXY_LIKE_CONDS]
     if not rs:
         return None
-    by_task = collections.defaultdict(list)
+    by_task_cond = collections.defaultdict(list)
     for r in rs:
-        by_task[r.get("task")].append(r)
+        by_task_cond[(r.get("task"), r.get("cond"))].append(r)
 
     def mode(values):
         values = [v for v in values if v is not None]
@@ -259,11 +276,11 @@ def zirv_proxy_decision_table(rows):
         c = collections.Counter(values)
         return c.most_common(1)[0][0]
 
-    header = ["Task", "mode complexity", "mode seat_tier", "mode model_used", "mode workflow",
+    header = ["Task", "Cond", "mode complexity", "mode seat_tier", "mode model_used", "mode workflow",
               "runs that started a workflow", "n runs"]
     lines = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
-    for task in sorted(by_task.keys()):
-        trs = by_task[task]
+    for task, cond in sorted(by_task_cond.keys()):
+        trs = by_task_cond[(task, cond)]
         n_started = sum(1 for r in trs if r.get("workflow_started"))
         # mode fields come from raw obj values stashed on each row (see main())
         complexities = [r.get("_proxy_complexity") for r in trs]
@@ -272,6 +289,7 @@ def zirv_proxy_decision_table(rows):
         workflows = [r.get("_proxy_workflow") for r in trs]
         row = [
             task,
+            cond,
             str(mode(complexities)),
             str(mode(seat_tiers)),
             str(mode(models_used)),
@@ -283,22 +301,22 @@ def zirv_proxy_decision_table(rows):
     return "\n".join(lines)
 
 
-def paired_bootstrap(rows, cond, metric_fn):
-    """Paired-by-(task,rep) bootstrap 95% CI of mean(cond) - mean(vanilla)."""
-    vanilla_vals = {}
+def paired_bootstrap(rows, cond, metric_fn, baseline="vanilla"):
+    """Paired-by-(task,rep) bootstrap 95% CI of mean(cond) - mean(baseline)."""
+    baseline_vals = {}
     cond_vals = {}
     for r in rows:
         if r.get("is_error"):
             continue
         key = (r.get("task"), r.get("rep"))
-        if r.get("cond") == "vanilla":
-            vanilla_vals[key] = metric_fn(r)
+        if r.get("cond") == baseline:
+            baseline_vals[key] = metric_fn(r)
         elif r.get("cond") == cond:
             cond_vals[key] = metric_fn(r)
-    keys = sorted(set(vanilla_vals) & set(cond_vals))
+    keys = sorted(set(baseline_vals) & set(cond_vals))
     diffs = []
     for key in keys:
-        a, b = cond_vals[key], vanilla_vals[key]
+        a, b = cond_vals[key], baseline_vals[key]
         if a is None or b is None:
             continue
         diffs.append(a - b)
@@ -329,14 +347,33 @@ def robustness_note(rows, conds_present):
             lines.append(f"\nPaired bootstrap 95% CI, mean({cond}) - mean(vanilla), "
                          f"{N_RESAMPLES} resamples seed {BOOTSTRAP_SEED}, paired by (task,rep):")
             for name, fn in metrics:
-                res = paired_bootstrap(rows, cond, fn)
+                res = paired_bootstrap(rows, cond, fn, baseline="vanilla")
                 if res is None:
                     lines.append(f"  - {name}: no matched (task,rep) pairs")
                     continue
                 point, lo, hi, n = res
                 lines.append(f"  - {name}: diff={point:+.4f}, 95% CI [{lo:+.4f}, {hi:+.4f}] (n={n} pairs)")
     else:
-        lines.append("(no vanilla condition present; skipping paired bootstrap)")
+        lines.append("(no vanilla condition present; skipping paired bootstrap vs vanilla)")
+
+    # Issue #758: zirv-proxy is already Jev-routed for model/seat/workflow,
+    # so "vs vanilla" alone doesn't isolate what a jev ablation buys ON TOP
+    # of that routing. Pair each present zirv-jev-* condition against
+    # zirv-proxy too, when both are in this report.
+    jev_conds_present = [c for c in JEV_ABLATION_CONDS if c in conds_present]
+    if "zirv-proxy" in conds_present and jev_conds_present:
+        for cond in jev_conds_present:
+            lines.append(f"\nPaired bootstrap 95% CI, mean({cond}) - mean(zirv-proxy), "
+                         f"{N_RESAMPLES} resamples seed {BOOTSTRAP_SEED}, paired by (task,rep):")
+            for name, fn in metrics:
+                res = paired_bootstrap(rows, cond, fn, baseline="zirv-proxy")
+                if res is None:
+                    lines.append(f"  - {name}: no matched (task,rep) pairs")
+                    continue
+                point, lo, hi, n = res
+                lines.append(f"  - {name}: diff={point:+.4f}, 95% CI [{lo:+.4f}, {hi:+.4f}] (n={n} pairs)")
+    elif jev_conds_present:
+        lines.append("\n(no zirv-proxy condition present; skipping paired bootstrap vs zirv-proxy)")
 
     lines.append("\nErrored/timed-out runs per condition:")
     err_counts = collections.Counter()

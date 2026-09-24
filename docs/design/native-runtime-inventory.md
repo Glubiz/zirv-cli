@@ -182,6 +182,7 @@ criterion).
 | `workflow show` | shared |  |
 | `workflow start` | shared |  |
 | `workflow stats` | shared |  |
+| `workflow calibrate` | shared |  |
 | `workflow status` | shared |  |
 | `workflow team` | N16 (#485) | compiles/persists/briefs a proportional `TeamPlan` from the execution profile and the agent/skill registries (issue #541) |
 

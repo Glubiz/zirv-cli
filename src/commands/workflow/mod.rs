@@ -24,6 +24,7 @@ pub mod frontend;
 pub mod frontend_detector;
 pub mod frontend_render;
 pub mod maintain;
+pub mod outcomes;
 pub mod profile;
 pub mod registry;
 pub mod review;

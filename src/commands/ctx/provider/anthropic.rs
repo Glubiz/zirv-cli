@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
 
@@ -29,6 +30,31 @@ use super::{OpaqueProviderData, Protocol, RouteId};
 use crate::commands::ctx::config::EnvLookup;
 
 const API_VERSION: &str = "2023-06-01";
+const CONTEXT_EDITING_BETA: &str = "context-management-2025-06-27";
+
+// Issue #756: server-side context editing for native Anthropic sessions
+// (https://platform.claude.com/docs/en/build-with-claude/context-editing).
+// `clear_tool_uses_20250919` clears stale tool_use/tool_result content once
+// a threshold is crossed, so a long tool-heavy session sheds dead weight
+// before it hits context exhaustion instead of being compacted or restarted.
+// Values below mirror the documented Anthropic defaults for `trigger` and
+// `keep`, so behaviour matches what the API already considers reasonable;
+// `clear_at_least` is set high enough that a clear is worth the cache
+// invalidation it causes, but well under `trigger` so it can actually be met.
+/// Only fires once a session is genuinely context-heavy, not on ordinary
+/// short turns.
+const CONTEXT_EDITING_TRIGGER_INPUT_TOKENS: u64 = 100_000;
+/// Keeps the most recent tool_use/tool_result pairs intact so the model
+/// still has immediate tool context to work from after a clear.
+const CONTEXT_EDITING_KEEP_TOOL_USES: u64 = 3;
+/// A clear below this many input tokens is not worth paying for the cache
+/// invalidation it causes; the strategy simply does not fire in that case.
+const CONTEXT_EDITING_CLEAR_AT_LEAST_INPUT_TOKENS: u64 = 5_000;
+
+/// Issue #756: set once Anthropic has rejected the context-editing beta for
+/// this process (a 400 naming it). A stale beta or field name should not
+/// cost every subsequent request a failed round-trip before falling back.
+static CONTEXT_EDITING_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// The direct providers share one timeout contract; the alias keeps the
 /// Anthropic call sites reading as Anthropic ones.
@@ -39,6 +65,11 @@ pub struct AnthropicMessagesAdapter {
     target: ProviderTarget,
     credential: Credential,
     timeouts: AnthropicTimeouts,
+    /// Issue #756: operator/repo-resolved policy for this route. Default
+    /// `true`; `from_config` overrides it from `native.toml`'s
+    /// `[policy].context_editing`. The process-wide `CONTEXT_EDITING_DISABLED`
+    /// kill switch is checked separately and always wins over this.
+    context_editing: bool,
 }
 
 impl std::fmt::Debug for AnthropicMessagesAdapter {
@@ -47,6 +78,7 @@ impl std::fmt::Debug for AnthropicMessagesAdapter {
             .field("target", &self.target)
             .field("credential", &"[redacted]")
             .field("timeouts", &self.timeouts)
+            .field("context_editing", &self.context_editing)
             .finish()
     }
 }
@@ -84,7 +116,9 @@ impl AnthropicMessagesAdapter {
                 ),
             )
         })?;
-        Self::new(target, credential, timeouts)
+        let mut adapter = Self::new(target, credential, timeouts)?;
+        adapter.context_editing = config.context_editing_enabled();
+        Ok(adapter)
     }
 
     pub fn new(
@@ -121,6 +155,7 @@ impl AnthropicMessagesAdapter {
             target,
             credential,
             timeouts,
+            context_editing: true,
         })
     }
 
@@ -277,9 +312,39 @@ impl AnthropicMessagesAdapter {
             beta_headers.push("thinking-display-updates-2026-08-18");
         }
 
+        // Issue #756: first-party Anthropic only, gated by both the
+        // operator/repo policy and the process-wide kill switch a prior 400
+        // may have tripped.
+        let context_editing =
+            self.context_editing && !CONTEXT_EDITING_DISABLED.load(Ordering::Relaxed);
+        if context_editing {
+            body.insert(
+                "context_management".into(),
+                json!({
+                    "edits": [{
+                        "type": "clear_tool_uses_20250919",
+                        "trigger": {
+                            "type": "input_tokens",
+                            "value": CONTEXT_EDITING_TRIGGER_INPUT_TOKENS,
+                        },
+                        "keep": {
+                            "type": "tool_uses",
+                            "value": CONTEXT_EDITING_KEEP_TOOL_USES,
+                        },
+                        "clear_at_least": {
+                            "type": "input_tokens",
+                            "value": CONTEXT_EDITING_CLEAR_AT_LEAST_INPUT_TOKENS,
+                        },
+                    }]
+                }),
+            );
+            beta_headers.push(CONTEXT_EDITING_BETA);
+        }
+
         Ok(EncodedRequest {
             body: Value::Object(body),
             beta_headers,
+            context_editing,
         })
     }
 
@@ -392,14 +457,56 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         sink: &mut dyn EventSink,
     ) -> Result<ProviderResponse, ProviderFailure> {
         let encoded = self.encode_request(request)?;
-        self.perform(&encoded, cancellation, sink)
+        let requested_context_editing = encoded.context_editing;
+        match self.perform(&encoded, cancellation, sink) {
+            Err(failure) if requested_context_editing && is_context_editing_rejection(&failure) => {
+                // Issue #756: never let an unrecognized beta/field name fail
+                // a request that would otherwise have succeeded. Disable it
+                // process-wide first so every adapter instance stops
+                // offering it, then retry this one request without it.
+                // `compare_exchange` (not `store`) so that when several
+                // concurrent requests each hit the 400 before any of them
+                // has flipped the flag, only the ONE that actually wins the
+                // false-to-true transition prints the diagnostic -- every
+                // other concurrent loser still disables (redundantly, but
+                // harmlessly) and retries, it just doesn't also print.
+                let this_call_disabled_it = CONTEXT_EDITING_DISABLED
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok();
+                if this_call_disabled_it {
+                    eprintln!(
+                        "zirv: Anthropic rejected server-side context editing (`{CONTEXT_EDITING_BETA}`); \
+                         disabling it for the rest of this process and retrying without it"
+                    );
+                }
+                let fallback = self.encode_request(request)?;
+                self.perform(&fallback, cancellation, sink)
+            }
+            other => other,
+        }
     }
+}
+
+/// Issue #756: a 400 whose message names the context-editing beta or its
+/// request field -- as opposed to any other bad-request cause -- is the only
+/// case worth retrying without it.
+fn is_context_editing_rejection(failure: &ProviderFailure) -> bool {
+    if failure.http_status != Some(400) {
+        return false;
+    }
+    let lower = failure.message.to_ascii_lowercase();
+    lower.contains("context_management")
+        || lower.contains("context-management")
+        || lower.contains("clear_tool_uses")
 }
 
 #[derive(Clone)]
 struct EncodedRequest {
     body: Value,
     beta_headers: Vec<&'static str>,
+    /// Issue #756: whether this encoding included `context_management`, so
+    /// `stream()` knows whether a 400 naming it is worth retrying without.
+    context_editing: bool,
 }
 
 fn display_name(display: ThinkingDisplay) -> &'static str {
@@ -974,6 +1081,31 @@ fn process_sse_event(
                 .cloned()
                 .map(OpaqueProviderData::new);
             merge_usage(&mut accumulator.usage, value.get("usage"));
+            // Issue #756: `context_management.applied_edits` reports on the
+            // final `message_delta` event whether the server actually
+            // cleared anything this turn. Sibling to `usage`, not nested
+            // under `delta`.
+            for edit in value
+                .pointer("/context_management/applied_edits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if edit.get("type").and_then(Value::as_str) == Some("clear_tool_uses_20250919") {
+                    let cleared_tool_uses = edit
+                        .get("cleared_tool_uses")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let cleared_input_tokens = edit
+                        .get("cleared_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    sink.push(ProviderStreamEvent::ContextEditApplied {
+                        cleared_tool_uses,
+                        cleared_input_tokens,
+                    });
+                }
+            }
         }
         "message_stop" => accumulator.saw_stop = true,
         "ping" => sink.push(ProviderStreamEvent::Ping),
@@ -1232,7 +1364,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -1251,6 +1383,23 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/provider/anthropic/v1/stream-malformed-tool.sse"
     ));
+
+    /// Issue #756: the three tests below read and write the process-wide
+    /// `CONTEXT_EDITING_DISABLED` flag directly (an `AtomicBool`, with no
+    /// synchronization of its own) rather than through a fresh
+    /// per-adapter value, so two of them running concurrently under
+    /// nextest's default parallelism could observe or clobber each other's
+    /// writes. `Mutex::new(())` guards nothing but ordering: acquired for
+    /// the whole body of each such test, released at scope end. Recovers
+    /// from poison rather than propagating it, so one of these tests
+    /// panicking never wedges the other two for the rest of the run.
+    static CONTEXT_EDITING_DISABLED_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_context_editing_disabled_for_test() -> std::sync::MutexGuard<'static, ()> {
+        CONTEXT_EDITING_DISABLED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn target(base_url: String) -> ProviderTarget {
         ProviderTarget {
@@ -1781,6 +1930,8 @@ mod tests {
 
     #[test]
     fn direct_http_request_uses_messages_api_and_excludes_tool_executor_metadata() {
+        let _guard = lock_context_editing_disabled_for_test();
+        CONTEXT_EDITING_DISABLED.store(false, Ordering::Relaxed);
         let (url, captured) = one_shot_server(200, STREAM, &[]);
         let adapter =
             AnthropicMessagesAdapter::new(target(url), credential(), AnthropicTimeouts::default())
@@ -1806,6 +1957,123 @@ mod tests {
         assert!(!request.contains("resource_claims"));
         assert!(!request.contains("execution_mode"));
         assert!(!request.contains("Claude Code"));
+        // Issue #756: server-side context editing is on by default for the
+        // first-party Anthropic adapter.
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("anthropic-beta: {CONTEXT_EDITING_BETA}"))
+        );
+        // serde_json's default `Map` sorts keys, so this is the exact wire
+        // shape rather than insertion order.
+        assert!(request.contains(
+            "\"context_management\":{\"edits\":[{\"clear_at_least\":{\"type\":\"input_tokens\",\"value\":5000},\
+             \"keep\":{\"type\":\"tool_uses\",\"value\":3},\
+             \"trigger\":{\"type\":\"input_tokens\",\"value\":100000},\
+             \"type\":\"clear_tool_uses_20250919\"}]}"
+        ));
+    }
+
+    #[test]
+    fn context_editing_is_omitted_when_the_operator_disabled_it() {
+        let _guard = lock_context_editing_disabled_for_test();
+        CONTEXT_EDITING_DISABLED.store(false, Ordering::Relaxed);
+        let (url, captured) = one_shot_server(200, STREAM, &[]);
+        let mut adapter =
+            AnthropicMessagesAdapter::new(target(url), credential(), AnthropicTimeouts::default())
+                .unwrap();
+        adapter.context_editing = false;
+        adapter
+            .stream(
+                &request(),
+                &super::super::adapter::NeverCancelled,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let request = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!request.contains("context_management"));
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains(&format!("anthropic-beta: {CONTEXT_EDITING_BETA}"))
+        );
+    }
+
+    #[test]
+    fn a_400_naming_context_management_falls_back_once_and_disables_it_for_the_process() {
+        let _guard = lock_context_editing_disabled_for_test();
+        CONTEXT_EDITING_DISABLED.store(false, Ordering::Relaxed);
+        let error_body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"context_management: unknown beta feature"},"request_id":"req_ce"}"#;
+        let (url, captured) = two_shot_server((400, error_body), (200, STREAM));
+        let adapter =
+            AnthropicMessagesAdapter::new(target(url), credential(), AnthropicTimeouts::default())
+                .unwrap();
+        let response = adapter
+            .stream(
+                &request(),
+                &super::super::adapter::NeverCancelled,
+                &mut Vec::new(),
+            )
+            .expect("the retried request without context editing must still succeed");
+        assert_eq!(response.finish_reason, FinishReason::ToolUse);
+        let first = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(first.contains("context_management"));
+        let second = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!second.contains("context_management"));
+        assert!(
+            !second
+                .to_ascii_lowercase()
+                .contains(&format!("anthropic-beta: {CONTEXT_EDITING_BETA}"))
+        );
+        assert!(CONTEXT_EDITING_DISABLED.load(Ordering::Relaxed));
+
+        // A brand-new adapter in this same process must also come up with
+        // it already off, without another round-trip.
+        let (fresh_url, fresh_captured) = one_shot_server(200, STREAM, &[]);
+        let fresh = AnthropicMessagesAdapter::new(
+            target(fresh_url),
+            credential(),
+            AnthropicTimeouts::default(),
+        )
+        .unwrap();
+        fresh
+            .stream(
+                &request(),
+                &super::super::adapter::NeverCancelled,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let fresh_request = fresh_captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!fresh_request.contains("context_management"));
+        CONTEXT_EDITING_DISABLED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn context_management_applied_edits_are_surfaced_as_a_stream_event() {
+        let target = target("https://api.anthropic.com".into());
+        let stream = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\
+             \"usage\":{\"input_tokens\":10,\"output_tokens\":5},\
+             \"context_management\":{\"applied_edits\":[{\"type\":\"clear_tool_uses_20250919\",\
+             \"cleared_tool_uses\":8,\"cleared_input_tokens\":50000}]}}\n\n",
+        );
+        let mut events = Vec::new();
+        process_sse_event(
+            "message_delta",
+            stream
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+            &mut Accumulator::default(),
+            &mut events,
+            &target,
+        )
+        .unwrap();
+        assert!(events.contains(&ProviderStreamEvent::ContextEditApplied {
+            cleared_tool_uses: 8,
+            cleared_input_tokens: 50_000,
+        }));
     }
 
     #[test]
@@ -1869,6 +2137,38 @@ mod tests {
                 write!(stream, "{name}: {value}\r\n").unwrap();
             }
             write!(stream, "\r\n{body}").unwrap();
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    /// Issue #756: serves two responses on two sequential connections, in
+    /// order -- for proving the context-editing 400 fallback actually
+    /// retries once rather than just failing.
+    fn two_shot_server(
+        first: (u16, &'static str),
+        second: (u16, &'static str),
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in [first, second] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let _ = sender.send(request);
+                let reason = if status == 200 { "OK" } else { "Error" };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                    body.len()
+                )
+                .unwrap();
+            }
         });
         (format!("http://{address}"), receiver)
     }

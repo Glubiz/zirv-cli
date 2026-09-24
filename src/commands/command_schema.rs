@@ -188,6 +188,8 @@ const READ_ONLY: &[&str] = &[
     "zirv workflow review package",
     "zirv workflow maintain scan",
     "zirv workflow stats",
+    // Issue #757: reads the outcome log only; proposals are printed, never applied.
+    "zirv workflow calibrate",
     "zirv test changed",
     "zirv test all",
     "zirv verify",

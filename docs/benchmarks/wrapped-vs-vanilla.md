@@ -35,6 +35,8 @@ All conditions run the same Claude Code binary headlessly with
 | `vanilla` | `claude -p --model <m> --setting-sources project,local --permission-mode bypassPermissions --plugin-dir <obra/superpowers>`, prompt on stdin | Claude Code with the obra/superpowers v6.4.1 plugin loaded (brainstorm/plan/TDD workflow) and its own `SessionStart` hook running; the operator's user-settings layer is dropped so zirv's global hooks can't leak in |
 | `zirv` | `zirv ctx exec --agent claude --prompt <p> -- --output-format json --model <m>` | The supervised wrapper: compiled system prompt, zirv's PreToolUse/PostToolUse/Stop hooks, safety policy, sandbox posture, registered `zirv:*` skills, the read-only zirv MCP server, rot scoring and restart supervision. Same pinned model as vanilla, so the diff isolates the wrapper |
 | `zirv-proxy` | `zirv ctx proxy --json <p>` (Jev) decides complexity/risk/workflow/seat tier; seat tier maps to `haiku`/`sonnet`/`opus`; the decided workflow is started with `zirv workflow start`; the `[zirv proxy]` layer is prepended to the prompt; then launched like `zirv` | Everything in `zirv` plus Jev routing and workflow start. Its model is Jev's choice, not pinned |
+| `zirv-jev-full` | Identical launch to `zirv-proxy`, with every `[jev]` advisory gate (memory, supervisor, dispatch, review, gates, context, intake_savings, review_reuse, harvest_screen, admin_dispatch) turned on via `ZIRV_CTX_JEV_*` env vars for the proxy call, workflow start, and exec launch alike | Everything in `zirv-proxy` plus every other Jev-gated advisory site (memory rerank, dispatch tier, context prune, review reuse/dedup, crash/judge supervisor, admin dispatch). Issue #758: not yet measured |
+| `zirv-jev-<gate>` | Same as `zirv-jev-full` but with only one `[jev]` gate on (e.g. `zirv-jev-memory`, `zirv-jev-dispatch`) | Per-gate ablation, to decide which gates earn default-on status. Issue #758: not yet measured |
 
 Every condition's prompt is prefixed with the same fixed notice: "You are
 running non-interactively: nobody will answer questions or approve plans.
@@ -218,6 +220,14 @@ fast. That artifact is exactly why §1's notice exists in the current grid.
   (`--zirv-dir`), not the Chocolatey-installed release; that's the right
   binary for isolating the wrapper's own changes but leaves any
   packaging-specific overhead unmeasured.
+- **Every `[jev]` gate beyond intake routing (issue #758).** `zirv-proxy`
+  above only exercises Jev-routed model/seat/workflow selection at intake;
+  memory rerank, dispatch tier, context prune, review reuse/dedup, the
+  crash/judge supervisor, and admin dispatch have no before/after
+  measurement of their own, only the `jev-effects.jsonl` byte-count proxy
+  `zirv ctx jev status` now rolls up. The `zirv-jev-full` and
+  `zirv-jev-<gate>` conditions in §1 and the commands in §8 exist to close
+  this gap; not yet run.
 
 ## 8. Reproduce
 
@@ -239,3 +249,35 @@ python aggregate.py --runs runs-haiku --out report-opt-haiku.md
 harness needs `claude`, `zirv` and `git` on PATH, a Jev credential for the
 `zirv-proxy` condition, and roughly $65 of list-price usage for the two
 current grids as recorded (45 x (0.501+0.380+0.273) + 30 x (0.208+0.197)).
+
+**Every `[jev]` gate (issue #758, not yet measured).** Add `zirv-jev-full`
+against the same baselines to measure every advisory gate at once:
+
+```sh
+cd docs/benchmarks/wrapped-vs-vanilla
+python run.py --tasks all --conds vanilla,zirv,zirv-proxy,zirv-jev-full --reps 3 --model sonnet --parallel 3 \
+  --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
+python aggregate.py --runs runs --out report-jev-full-sonnet.md
+```
+
+For per-gate ablations, list the `zirv-jev-<gate>` conditions to run
+alongside `zirv-proxy` (any subset of `memory`, `supervisor`, `dispatch`,
+`review`, `gates`, `context`, `intake_savings`, `review_reuse`,
+`harvest_screen`, `admin_dispatch`):
+
+```sh
+python run.py --tasks all --conds vanilla,zirv-proxy,zirv-jev-memory,zirv-jev-dispatch,zirv-jev-review \
+  --reps 3 --model sonnet --parallel 3 \
+  --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
+python aggregate.py --runs runs --out report-jev-ablation-sonnet.md
+```
+
+Every `zirv-jev-*` condition needs the same Jev credential as `zirv-proxy`
+(`TYPESAFE_API_KEY` by default) exported in the shell `run.py` runs in --
+the gate env vars alone never activate an advisory site without it. `zirv
+ctx proxy --json` still runs once per `zirv-jev-*` run, same as
+`zirv-proxy`, so its per-run cost/latency is on top of whatever the newly
+enabled gates themselves spend; `report-jev-full-sonnet.md`'s "Robustness"
+section pairs each `zirv-jev-*` condition against both `vanilla` and
+`zirv-proxy` so the gates' own marginal effect is visible separately from
+intake routing's.

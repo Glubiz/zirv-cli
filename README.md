@@ -203,6 +203,17 @@ with only `AGENTS.md` needs no migration at all: `zirv context sync
 plan — a `ZIRV.md` containing just `@AGENTS.md` — for anyone who would rather
 link than duplicate.
 
+**Canonical context can drift silently.** `compile.rs` dedupes the canonical
+`.zirv/context/` layer out of a session's prefix only when a managed
+`CLAUDE.md`/`AGENTS.md` byte-for-byte proves it already carries the current
+render — edit `.zirv/context/common.md` without regenerating, and that proof
+fails, so the canonical layer (several KB) is injected twice every session
+with no error, just a warning on `zirv ctx compile --measure`. `zirv context
+sync --check` is the CI-friendly form of `--report`: same read-only report,
+but it also exits non-zero when a managed native file has drifted from the
+canonical sources it claims to render, so a CI step can catch a forgotten
+`zirv context sync --generate` before it merges.
+
 ### `zirv chat` and `zirv agent`
 
 `zirv chat` and `zirv agent` are shorter top-level aliases for `zirv ctx
@@ -984,7 +995,10 @@ to the section that documents it in depth.
 - **Jev advisory status** — `jev` (`zirv ctx jev status`) reports whether
   the hosted TypeSafe Jev advisor is active: each of the `[jev]`
   gates (off by default), whether its credential is present (never its
-  value), and the endpoint and model in use. See [Harness
+  value), and the endpoint and model in use, plus a per-site usage rollup
+  (calls, cache-hit rate, p50/p95 latency, error count, and effect size —
+  bytes removed / rows changed) over the last 7 days, folded read-only from
+  `jev-decisions.jsonl` and `jev-effects.jsonl`. See [Harness
   proxy](#harness-proxy).
 - **Configured capabilities** — `capabilities` reports every non-shell
   integration a native session can use — MCP servers, web search/fetch,
@@ -1061,9 +1075,11 @@ multi-module tasks). Protocol, per-task results and the harness:
   package and high-confidence Nit/Minor duplicate matches can converge a round;
   stored severity and disposition remain authoritative.
 - **Maintenance and telemetry** — `maintain` (`scan`) runs deterministic
-  operator-configured maintenance detectors, and `stats` aggregates
-  privacy-conscious local workflow telemetry. See [Maintain
-  loop](#maintain-loop).
+  operator-configured maintenance detectors, `stats` aggregates
+  privacy-conscious local workflow telemetry, and `calibrate` reads recorded
+  workflow outcomes and proposes (never applies) one-step heavier/lighter
+  routing per complexity bucket. See [Maintain loop](#maintain-loop) and
+  [Outcome calibration](#outcome-calibration).
 - **Frontend quality** — `frontend` derives a design profile and drives
   autonomous frontend work end to end (`profile`, `capabilities`, `check`,
   `render`, `review`, `benchmark`). See [Frontend quality](#frontend-quality).
@@ -1707,7 +1723,35 @@ zirv workflow advance <id> --outcome success|failure
 zirv workflow review package <id> | run <id> --agent <name> | add | record <id> --model <name> [--finding <id>]... | ...
 zirv workflow maintain scan [--repo <path>] [--json]
 zirv workflow stats                               # local bounded telemetry: per-phase timing, the implement/validate wall-clock split, approval wait, and fix-round causes (issue #699 Phase 0)
+zirv workflow calibrate [--json] [--min-samples N] # read-only: outcome buckets and routing proposals (issue #757)
 ```
+
+### Outcome calibration
+
+When a workflow completes, fails, or is closed, zirv appends one metadata-only
+row to `<state>/logs/workflow-outcomes/<day>.jsonl` (daily buckets, kept 365
+days; recorded only while `[workflow] telemetry_enabled` is on). A row holds
+the schema version, workflow id, pack id, profile, complexity, risk band, seat
+tier (when known), the highest review round reached, whether Test/Verify steps
+passed on the first attempt and at all, the terminal state, and the duration.
+It never holds task text, prompts, or paths.
+
+`zirv workflow calibrate [--json] [--min-samples N]` (default N = 10) groups
+rows by complexity x profile x seat tier and prints each bucket's count,
+first-pass verification rate, mean review rounds, and abandon rate, plus one
+proposal per bucket:
+
+| Rule (bucket has >= N samples) | Proposal |
+|---|---|
+| first-pass rate < 60%, or mean review rounds >= 2 | one step heavier |
+| first-pass rate >= 95% and mean review rounds <= 0.2 | one step lighter |
+| anything else | no change |
+| fewer than N samples | insufficient evidence |
+
+The step moves the seat tier (`cheap` -> `standard` -> `deep` -> `frontier`)
+when the bucket knows it, otherwise the complexity class the `classify.rs`
+thresholds assign. The command is read-only: it never writes config or
+changes routing; an operator decides whether to act on a proposal.
 
 ### Workflow definitions v2 (issue #542)
 
@@ -2057,6 +2101,24 @@ so the CLI counts itself instead -- a successful load (never a refused or
 unknown id) bumps the calling session's own record directly, keyed off the
 same `SESSION_ENV` the hooks use, whenever one is set.
 
+#### Intake discipline
+
+On a session's first `UserPromptSubmit`, the Claude hook classifies the
+prompt with the same deterministic, text-only classifier `zirv ctx proxy`
+uses (no Git, no network, no model call). When the prompt is `substantial`
+or larger (a long request, or 8 or more enumerated requirements) or its risk
+is `high`, that one turn's `additionalContext` also carries a note of under
+400 bytes: plan ordered, verifiable steps before editing; write tests first
+for behaviour changes; never modify or weaken existing or protected tests; run
+the full suite before declaring done; and load the `plan`/`tdd`/`verify`
+skills. Trivial and bounded prompts, and every later turn,
+get nothing. The hook never starts a workflow. It skips sessions whose launch
+already applied a proxy decision (`ZIRV_CTX_PROXY_DECIDED=1`, set by `zirv
+chat` for its wrapped or dashboard seat), `single`/`worker`/`sub-orchestrator`
+seats, and delegated `zirv agent` runs. `prompt.intake_discipline`
+(`ZIRV_CTX_PROMPT_INTAKE_DISCIPLINE`, default `true`) turns it off; a
+repository may only narrow it to `false`.
+
 ### Agent registry
 
 Workflow seats are provider-neutral data, not harness-specific plugins: a
@@ -2241,8 +2303,24 @@ remains one `zirv skill list`/`show` call away. `prompt.skill_index` (`ZIRV_CTX_
 default `true`, not `REPO_FORBIDDEN` -- a repository may only narrow it to
 `false`, never force it back on) turns the layer off entirely when a host's
 own inline-argv limits make even the compact index too much; skills stay
-loadable through `zirv skill list`/`load` either way. The index's own
-loading instruction leads with
+loadable through `zirv skill list`/`load` either way. The index also drops a
+whole skill family the repository shows no signal for: the `frontend-*`
+family when there is no `package.json` (at the repo root or a few common
+nested locations) and no `*.tsx`/`*.jsx`/`*.vue`/`*.svelte`/`*.html` under a
+bounded, deterministic scan of the repository, and the four Kibana/Elastic
+operational skills (`kibana-log-investigation`, `saved-object-change-
+management`, `dashboard-review`, `alert-rule-diagnosis`) when there is no
+Elastic/Kibana marker file or manifest mention. Both probes only read the
+filesystem, so the same repository state always filters the same way. A
+dropped skill is never gone -- it stays fully loadable through `zirv skill
+list`/`load` and resolvable by an explicit workflow-step skill selection,
+which never goes through this index at all -- only its unprompted
+advertisement in the standing catalogue narrows. `prompt.
+skill_index_repo_filter` (`ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER`, default
+`true`, `REPO_FORBIDDEN`) is the operator-only opt-out: disabling it widens
+what every session sees, so only the operator may do it, the same trust
+asymmetry as `prompt.harnesses`. The index's own loading instruction leads
+with
 `zirv skill load <id>`, run from a shell: it works in every session,
 including a wrapped host where the `skill_load` tool is namespaced and
 deferred behind a tool-search lookup a small model rarely takes. `zirv skill
@@ -2583,7 +2661,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
-| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, and why it is or is not active — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
+| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
@@ -4125,6 +4203,7 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_ENTROPY` | operator environment | selects whether heuristic entropy findings are flagged or masked |
 | `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
+| `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 
@@ -4143,7 +4222,7 @@ A repository config is part of a checkout, so cloning a repository must not be
 enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
-`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
+`prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
@@ -4243,6 +4322,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
 | `prompt.harnesses` | `ZIRV_CTX_PROMPT_HARNESSES` |
 | `prompt.codex_orchestrator` | `ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR` |
+| `prompt.skill_index_repo_filter` | `ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER` |
 | `prompt.verbosity` | `ZIRV_CTX_PROMPT_VERBOSITY` |
 | `chat.claude_permission_mode` | `ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE` |
 | `context.max_common_bytes` | `ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES` |
@@ -4305,7 +4385,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
 | `route.<id>.execution` | `~/.zirv/native.toml` only; selects an official provider process and optional absolute executable path. Repository layers cannot select executables, login methods, billing or startup settings; all effects retain the native broker |
 | Claude Code authentication environment and public user settings | User-owned process environment and `~/.claude/settings.json` (or an absolute `CLAUDE_CONFIG_DIR` outside the repository); only authentication settings are carried into the restricted model invocation. Official login receives options after `--`. Inherited auth values are excluded from persisted settings and diagnostic output |
-| `native.toml` keys other than `policy.allowed_routes` and `policy.compaction` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, and repository `compaction` may only narrow `automatic` to `advisory`, never the reverse |
+| `native.toml` keys other than `policy.allowed_routes`, `policy.compaction` and `policy.context_editing` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set, repository `compaction` may only narrow `automatic` to `advisory`, and repository `context_editing` may only narrow `true` to `false` -- never the reverse for either |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
@@ -4555,10 +4635,10 @@ hosts and that live probe is skipped; loopback HTTP remains available for
 local runtimes.
 
 The optional repository layer `<repo>/.zirv/native.toml` may contain only
-`schema`, `[policy].allowed_routes` and `[policy].compaction`. Its routes are
-intersected with the operator's set, so a checkout can narrow access but
-cannot add accounts, endpoints, routes, role bindings, credentials, or
-permissions.
+`schema`, `[policy].allowed_routes`, `[policy].compaction` and
+`[policy].context_editing`. Its routes are intersected with the operator's
+set, so a checkout can narrow access but cannot add accounts, endpoints,
+routes, role bindings, credentials, or permissions.
 
 #### Provider-owned execution in the native UI
 
@@ -4869,6 +4949,28 @@ to `advisory` and can never widen it back — see [Trust
 boundary](#trust-boundary). `zirv ctx status` prints one line per native
 session that has compacted or resumed, with the newest reason, and `zirv ctx
 exec --runtime native` reports the same facts in its final-status JSON.
+
+#### Native context editing
+
+The first-party Anthropic Messages adapter (`anthropic-messages` routes only —
+not Bedrock, Vertex, or any other protocol) requests server-side context
+editing (`clear_tool_uses_20250919`, beta `context-management-2025-06-27`) on
+every request by default, so a long tool-heavy native session sheds stale
+tool results before it exhausts context instead of relying solely on
+compaction or a restart. The request asks Anthropic to clear once a turn
+crosses 100,000 input tokens, keeping the 3 most recent tool_use/tool_result
+pairs intact and requiring at least 5,000 tokens be reclaimed for a clear to
+fire at all (these mirror Anthropic's own documented defaults; see
+[Context editing](https://platform.claude.com/docs/en/build-with-claude/context-editing)).
+If Anthropic ever rejects the beta or field with a 400 naming it, zirv retries
+that one request without it and disables it for the rest of the process, with
+a single diagnostic line — it never turns a request that would have succeeded
+into a failure. When the server reports `context_management.applied_edits`,
+zirv surfaces it as a provider stream event.
+
+`[policy].context_editing` is `true` (the default) or `false` (never request
+it). A repository layer may narrow it to `false` and can never widen it back
+— see [Trust boundary](#trust-boundary).
 
 #### Route profiles
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -911,12 +911,35 @@ fn render_memory_entry(entry: &MemoryLine) -> String {
 
 /// Ranks `entries` by `verified` then `written`, newest/most-recently-
 /// verified first: a fact re-confirmed today is worth more than one merely
-/// written today and never checked since.
-fn ranked_by_recency<'a>(entries: &[&'a MemoryLine]) -> Vec<&'a MemoryLine> {
+/// written today and never checked since. `relevance` is `None` for pure
+/// recency ordering (today's behaviour, unchanged); `Some(map)` layers a
+/// relevance score (keyed `(shared, key.to_lowercase())`, issue #760) ahead
+/// of it as the PRIMARY sort key, with recency demoted to the tiebreaker --
+/// an entry missing from `map` defaults to score `0`, so when every entry
+/// maps to the same score (an empty map, or every real score tied) this
+/// produces the EXACT SAME order `None` would: relevance ranking is a
+/// strict refinement of recency ranking, never a second, divergent code
+/// path to keep in sync with it.
+fn ranked_by_recency<'a>(
+    entries: &[&'a MemoryLine],
+    relevance: Option<&HashMap<(bool, String), i64>>,
+) -> Vec<&'a MemoryLine> {
     let mut sorted: Vec<&MemoryLine> = entries.to_vec();
+    let score_of = |line: &MemoryLine| -> i64 {
+        relevance
+            .and_then(|map| {
+                map.get(&(
+                    line.scope == super::memory::MemoryScope::Shared,
+                    line.key.to_lowercase(),
+                ))
+            })
+            .copied()
+            .unwrap_or(0)
+    };
     sorted.sort_by(|a, b| {
-        b.verified
-            .cmp(&a.verified)
+        score_of(b)
+            .cmp(&score_of(a))
+            .then(b.verified.cmp(&a.verified))
             .then(b.written.cmp(&a.written))
             .then(a.key.cmp(&b.key))
     });
@@ -927,12 +950,14 @@ fn ranked_by_recency<'a>(entries: &[&'a MemoryLine]) -> Vec<&'a MemoryLine> {
 /// greedy in rank order rather than best-fit packing, so one oversized entry
 /// is skipped instead of starving every smaller entry behind it. Returns the
 /// selected entries, how many were left out, and how many bytes were used --
-/// the last so a caller can offer a second group whatever is left.
+/// the last so a caller can offer a second group whatever is left. See
+/// `ranked_by_recency`'s own doc comment for `relevance`.
 fn rank_and_fill<'a>(
     entries: &[&'a MemoryLine],
     cap: usize,
+    relevance: Option<&HashMap<(bool, String), i64>>,
 ) -> (Vec<&'a MemoryLine>, usize, usize) {
-    let ranked = ranked_by_recency(entries);
+    let ranked = ranked_by_recency(entries, relevance);
     let mut selected: Vec<&MemoryLine> = Vec::new();
     let mut used = 0usize;
     for entry in ranked.iter().copied() {
@@ -1005,6 +1030,34 @@ pub(crate) fn select_memory_within_cap(
     entries: &[MemoryLine],
     cap: usize,
 ) -> (Vec<&MemoryLine>, usize) {
+    select_memory_within_cap_inner(entries, cap, None)
+}
+
+/// Issue #760: the same selection `select_memory_within_cap` performs --
+/// identical private/global/shared structural precedence, key-conflict
+/// suppression, closing-marker forgery suppression, and always-keep-one
+/// fallback -- except each group is filled in RELEVANCE order (score
+/// descending, recency as the tiebreaker) rather than pure recency.
+/// `relevance` is the precomputed retrieval-style score for entries this
+/// session has a signal for, keyed `(shared, key.to_lowercase())`
+/// (`compile::core_relevance_map`'s own doc comment); an entry absent from
+/// it scores `0`, the same as every other entry when the caller has no
+/// signal at all -- which is why `select_memory_within_cap` itself never
+/// needs its own separate relevance-aware code path (see `ranked_by_
+/// recency`'s own doc comment).
+pub(crate) fn select_memory_within_cap_relevance_ranked<'a>(
+    entries: &'a [MemoryLine],
+    cap: usize,
+    relevance: &HashMap<(bool, String), i64>,
+) -> (Vec<&'a MemoryLine>, usize) {
+    select_memory_within_cap_inner(entries, cap, Some(relevance))
+}
+
+fn select_memory_within_cap_inner<'a>(
+    entries: &'a [MemoryLine],
+    cap: usize,
+    relevance: Option<&HashMap<(bool, String), i64>>,
+) -> (Vec<&'a MemoryLine>, usize) {
     let private: Vec<&MemoryLine> = entries
         .iter()
         .filter(|e| e.scope == super::memory::MemoryScope::Private)
@@ -1029,24 +1082,24 @@ pub(crate) fn select_memory_within_cap(
         })
         .collect();
 
-    let (mut priv_sel, _, private_used) = rank_and_fill(&private, cap);
+    let (mut priv_sel, _, private_used) = rank_and_fill(&private, cap, relevance);
     let after_private = cap.saturating_sub(private_used);
     let global_cap = if priv_sel.is_empty() {
         after_private
     } else {
         after_private.saturating_sub(2)
     };
-    let (mut global_sel, _, global_used) = rank_and_fill(&global, global_cap);
+    let (mut global_sel, _, global_used) = rank_and_fill(&global, global_cap, relevance);
     let trusted_separator = usize::from(!priv_sel.is_empty() && !global_sel.is_empty()) * 2;
     let shared_cap = after_private.saturating_sub(trusted_separator + global_used);
-    let (mut shared_sel, _, _) = rank_and_fill(&shared, shared_cap);
+    let (mut shared_sel, _, _) = rank_and_fill(&shared, shared_cap, relevance);
 
     if priv_sel.is_empty() && global_sel.is_empty() && shared_sel.is_empty() {
-        if let Some(top) = ranked_by_recency(&private).into_iter().next() {
+        if let Some(top) = ranked_by_recency(&private, relevance).into_iter().next() {
             priv_sel.push(top);
-        } else if let Some(top) = ranked_by_recency(&global).into_iter().next() {
+        } else if let Some(top) = ranked_by_recency(&global, relevance).into_iter().next() {
             global_sel.push(top);
-        } else if let Some(top) = ranked_by_recency(&shared).into_iter().next() {
+        } else if let Some(top) = ranked_by_recency(&shared, relevance).into_iter().next() {
             shared_sel.push(top);
         }
     }
@@ -1535,8 +1588,12 @@ fn first_sentence(description: &str) -> &str {
 /// runtime's own context compiler) calls this too, so the wrapped-harness
 /// and native paths can never list a different set of skills or word a
 /// line differently -- see that module's own `SourceKind::SkillIndex`.
-pub(super) fn skill_index_text(repo: &Path, home: Option<&Path>) -> Option<String> {
-    let lines = skill_index_entries(repo, home)?
+pub(super) fn skill_index_text(
+    repo: &Path,
+    home: Option<&Path>,
+    filter_by_repo_signal: bool,
+) -> Option<String> {
+    let lines = skill_index_entries(repo, home, filter_by_repo_signal)?
         .into_iter()
         .map(|(id, summary, repository)| {
             if repository {
@@ -1549,9 +1606,16 @@ pub(super) fn skill_index_text(repo: &Path, home: Option<&Path>) -> Option<Strin
     Some(lines.join("\n"))
 }
 
+/// `filter_by_repo_signal` applies [`filter_skill_entries_by_repo_signal`]
+/// (issue #755) when `true` -- both real callers pass `cfg.prompt.
+/// skill_index_repo_filter`/`cfg.skill_index_repo_filter` (the two structs
+/// keep the same field name); tests pass a literal so a fixture repo with no
+/// frontend/Elastic signal of its own does not have to grow one just to keep
+/// an unrelated assertion's entry count stable.
 pub(super) fn skill_index_entries(
     repo: &Path,
     home: Option<&Path>,
+    filter_by_repo_signal: bool,
 ) -> Option<Vec<(String, String, bool)>> {
     let registry =
         crate::commands::workflow::skill::SkillRegistry::load_for_repo(repo, home, true).ok()?;
@@ -1567,7 +1631,213 @@ pub(super) fn skill_index_entries(
             )
         })
         .collect();
+    let entries = if filter_by_repo_signal {
+        filter_skill_entries_by_repo_signal(repo, entries)
+    } else {
+        entries
+    };
     (!entries.is_empty()).then_some(entries)
+}
+
+/// Issue #755: the `frontend-*` id prefix already IS `compile.rs`'s
+/// `context_domain` "frontend" bucket -- reused directly here rather than
+/// re-derived from description text, since a skill id is already
+/// family-prefixed and there is nothing to infer. [`ELASTIC_SKILL_INDEX_
+/// IDS`] predates that five-bucket grouping and has no bucket of its own
+/// there (four ids do not earn `context_domain` a sixth category of its
+/// own) -- named explicitly instead of invented a second taxonomy, per this
+/// issue's own instruction to reuse the existing grouping.
+const FRONTEND_SKILL_ID_PREFIX: &str = "frontend-";
+const ELASTIC_SKILL_INDEX_IDS: &[&str] = &[
+    "kibana-log-investigation",
+    "saved-object-change-management",
+    "dashboard-review",
+    "alert-rule-diagnosis",
+];
+
+/// Bounded, sorted, deterministic search under `repo` for a file whose
+/// extension (case-insensitively) matches one of `extensions`. Sorting each
+/// directory's children before recursing -- the same technique `workflow::
+/// frontend_detector::collect_directory` already uses -- is what keeps a
+/// truncated walk deterministic: `std::fs::read_dir`'s own order is
+/// unspecified, so an unsorted walk could find (or miss) a match differently
+/// across two runs of the identical repository once the entry budget below
+/// is exhausted before every file has been visited. Capped on both depth and
+/// total directory entries visited, never a config-driven size some future
+/// caller could scale up into an actual full-repository walk -- this is a
+/// cheap signal probe, not a scanner.
+const SKILL_SIGNAL_WALK_MAX_ENTRIES: usize = 400;
+const SKILL_SIGNAL_WALK_MAX_DEPTH: usize = 4;
+const SKILL_SIGNAL_DENY_DIRS: &[&str] = &[
+    ".git",
+    ".zirv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "vendor",
+];
+
+fn skill_signal_walk_has_extension(repo: &Path, extensions: &[&str]) -> bool {
+    fn walk(dir: &Path, depth: usize, budget: &mut usize, extensions: &[&str]) -> bool {
+        if depth > SKILL_SIGNAL_WALK_MAX_DEPTH || *budget == 0 {
+            return false;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut children: Vec<_> = read.filter_map(Result::ok).collect();
+        children.sort_by_key(std::fs::DirEntry::file_name);
+        for child in children {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            let Ok(file_type) = child.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                let name = child.file_name();
+                if SKILL_SIGNAL_DENY_DIRS
+                    .iter()
+                    .any(|deny| name.to_str() == Some(*deny))
+                {
+                    continue;
+                }
+                if walk(&child.path(), depth + 1, budget, extensions) {
+                    return true;
+                }
+            } else if file_type.is_file() {
+                let path = child.path();
+                if path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|ext| {
+                        extensions
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+                    })
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut budget = SKILL_SIGNAL_WALK_MAX_ENTRIES;
+    walk(repo, 0, &mut budget, extensions)
+}
+
+/// A bounded, case-insensitive substring probe: skips (never partially
+/// reads) a file above `SKILL_SIGNAL_MANIFEST_READ_CAP`, the same "skip
+/// rather than truncate-read" shape `workflow::frontend_detector::bounded_
+/// manifest_contains` already uses for the identical reason -- a manifest
+/// this small that is somehow larger is not the file this probe is looking
+/// for.
+const SKILL_SIGNAL_MANIFEST_READ_CAP: u64 = 64 * 1024;
+
+fn skill_signal_file_mentions(path: &Path, needles: &[&str]) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > SKILL_SIGNAL_MANIFEST_READ_CAP
+    {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    needles.iter().any(|needle| lower.contains(needle))
+}
+
+/// Issue #755: whether `repo` shows any frontend signal at all -- the bar
+/// `frontend-*` skill ids are dropped from the standing skill index against
+/// when it is absent. Manifest files first (exact, no traversal needed);
+/// `*.tsx`/`*.jsx`/`*.vue`/`*.svelte`/`*.html` under a bounded, deterministic
+/// walk of the repository otherwise.
+fn skill_index_has_frontend_signal(repo: &Path) -> bool {
+    for candidate in [
+        "package.json",
+        "frontend/package.json",
+        "client/package.json",
+        "web/package.json",
+        "app/package.json",
+    ] {
+        if repo.join(candidate).is_file() {
+            return true;
+        }
+    }
+    skill_signal_walk_has_extension(repo, &["tsx", "jsx", "vue", "svelte", "html"])
+}
+
+/// Issue #755: whether `repo` shows any Elastic/Kibana signal -- the bar the
+/// four Kibana/Elastic operational skills are dropped against when absent. A
+/// handful of marker files and manifests, each read only up to `SKILL_
+/// SIGNAL_MANIFEST_READ_CAP` -- never a directory walk, since these markers
+/// live at fixed, well-known repository-root locations when present at all.
+fn skill_index_has_elastic_signal(repo: &Path) -> bool {
+    for candidate in [
+        "kibana.yml",
+        "kibana.yaml",
+        "elasticsearch.yml",
+        "elasticsearch.yaml",
+        ".kibana",
+    ] {
+        if repo.join(candidate).exists() {
+            return true;
+        }
+    }
+    for candidate in ["package.json", "docker-compose.yml", "docker-compose.yaml"] {
+        if skill_signal_file_mentions(
+            &repo.join(candidate),
+            &["kibana", "elasticsearch", "@elastic/"],
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Issue #755: drops the `frontend-*` family from `entries` when [`skill_
+/// index_has_frontend_signal`] finds nothing, and the four Elastic/Kibana
+/// ids when [`skill_index_has_elastic_signal`] finds nothing. Deterministic
+/// for identical repository state: both signal probes read only the
+/// filesystem (never the clock, the network, or a task string), so the same
+/// commit always yields the same filtered set -- a stable prefix a provider
+/// cache can still hit. Only ever narrows the passive catalogue this
+/// function builds, never what a skill can actually do: a dropped id stays
+/// fully loadable through `zirv skill list`/`zirv skill load <id>`
+/// (`SkillRegistry::list`/lookup by id, called directly, never through this
+/// function) and still resolvable by an explicit workflow-step skill
+/// selection (`workflow::selection`, also a registry lookup by id) -- so
+/// nothing an operator or a workflow step explicitly asked for is ever
+/// hidden by it, only its unprompted advertisement here.
+fn filter_skill_entries_by_repo_signal(
+    repo: &Path,
+    entries: Vec<(String, String, bool)>,
+) -> Vec<(String, String, bool)> {
+    let drop_frontend = !skill_index_has_frontend_signal(repo);
+    let drop_elastic = !skill_index_has_elastic_signal(repo);
+    if !drop_frontend && !drop_elastic {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|(id, _, _)| {
+            if drop_frontend && id.starts_with(FRONTEND_SKILL_ID_PREFIX) {
+                return false;
+            }
+            !(drop_elastic && ELASTIC_SKILL_INDEX_IDS.contains(&id.as_str()))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1626,7 +1896,7 @@ pub fn compose(
         if matches!(role, PromptRole::Worker | PromptRole::Single) {
             text.push_str(SKILL_POINTER_LAYER);
             sources.push(PromptSource::SkillPointer);
-        } else if let Some(index) = skill_index_text(repo, home) {
+        } else if let Some(index) = skill_index_text(repo, home, cfg.skill_index_repo_filter) {
             text.push_str(SKILL_INDEX_HEADER);
             text.push_str(&index);
             sources.push(PromptSource::SkillIndex);
@@ -3747,12 +4017,21 @@ mod tests {
     #[test]
     fn the_skill_index_appears_exactly_once_per_orchestrator_role_and_names_every_built_in() {
         let (_tmp, home, repo) = tree();
+        // Issue #755: this test's whole point is that every built-in id
+        // appears, regardless of this fixture repo's own (nonexistent)
+        // frontend/Elastic signal -- turn the new repo-signal family filter
+        // off so it stays about the invariant it names, not about which
+        // families this bare tempdir happens to have signal for.
+        let cfg = PromptConfig {
+            skill_index_repo_filter: false,
+            ..PromptConfig::default()
+        };
         for role in [PromptRole::SubOrchestrator, PromptRole::Orchestrator] {
             let composed = compose(
                 Some(&home),
                 &repo,
                 false,
-                &PromptConfig::default(),
+                &cfg,
                 role,
                 &[],
                 usize::MAX,
@@ -3778,7 +4057,7 @@ mod tests {
             Some(&home),
             &repo,
             false,
-            &PromptConfig::default(),
+            &cfg,
             PromptRole::Orchestrator,
             &[],
             usize::MAX,
@@ -3885,6 +4164,123 @@ mod tests {
             "got {}",
             composed.text
         );
+    }
+
+    // -- issue #755: deterministic repo-signal skill-family filtering -------
+
+    /// A bare, rust-only fixture repo (no `package.json`, no frontend source
+    /// files, no Elastic/Kibana marker) shows neither signal, so the
+    /// standing index drops the whole `frontend-*` family and the four
+    /// Kibana/Elastic operational skills, while an unrelated built-in
+    /// (`implement`) stays.
+    #[test]
+    fn a_rust_only_repo_drops_the_frontend_and_elastic_families() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Orchestrator,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+        for id in [
+            "frontend-craft",
+            "frontend-design",
+            "frontend-plan",
+            "frontend-implement",
+            "frontend-debug",
+            "frontend-test",
+            "frontend-review",
+            "frontend-verify",
+            "kibana-log-investigation",
+            "saved-object-change-management",
+            "dashboard-review",
+            "alert-rule-diagnosis",
+        ] {
+            assert!(
+                !composed.text.contains(&format!("- {id}:")),
+                "'{id}' must be dropped from a signal-less repo's index: got {}",
+                composed.text
+            );
+        }
+        assert!(
+            composed.text.contains("- implement:"),
+            "an unrelated built-in must still be listed: got {}",
+            composed.text
+        );
+    }
+
+    /// A repository with `package.json` and a `.tsx` file under `src/`
+    /// shows a real frontend signal, so the `frontend-*` family stays --
+    /// only the (still signal-less) Kibana/Elastic family is dropped.
+    #[test]
+    fn a_repo_with_package_json_and_tsx_keeps_the_frontend_family() {
+        let (_tmp, home, repo) = tree();
+        std::fs::write(repo.join("package.json"), "{\"name\": \"web\"}").expect("package.json");
+        std::fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        std::fs::write(repo.join("src/App.tsx"), "export default function App() {}")
+            .expect("tsx fixture");
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Orchestrator,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+        assert!(
+            composed.text.contains("- frontend-craft:"),
+            "the frontend family must stay once the repo shows frontend signal: got {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("- kibana-log-investigation:"),
+            "the still-signal-less Elastic family must stay dropped: got {}",
+            composed.text
+        );
+    }
+
+    /// `prompt.skill_index_repo_filter = false` is the opt-out: the same
+    /// signal-less fixture repo that drops both families with the default
+    /// keeps every one of them once the filter itself is disabled.
+    #[test]
+    fn the_opt_out_keeps_every_family() {
+        let (_tmp, home, repo) = tree();
+        let cfg = PromptConfig {
+            skill_index_repo_filter: false,
+            ..PromptConfig::default()
+        };
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &cfg,
+            PromptRole::Orchestrator,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+        for id in [
+            "frontend-craft",
+            "kibana-log-investigation",
+            "saved-object-change-management",
+            "dashboard-review",
+            "alert-rule-diagnosis",
+        ] {
+            assert!(
+                composed.text.contains(&format!("- {id}:")),
+                "'{id}' must stay listed once the filter is opted out: got {}",
+                composed.text
+            );
+        }
     }
 
     /// A repository-layer skill's index line carries the untrusted marker,
@@ -6814,6 +7210,62 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].key, "verified-today");
         assert_eq!(omitted, 1);
+    }
+
+    // Issue #760: `select_memory_within_cap_relevance_ranked` tests.
+
+    /// A relevant but older entry must beat an irrelevant but recent one
+    /// when a caller supplies a relevance signal -- the whole point of
+    /// issue #760. The cap admits only one of the two, so which survives
+    /// proves which one actually won the ranking, not merely that both
+    /// happened to fit.
+    #[test]
+    fn relevance_ranked_selection_prefers_a_relevant_older_entry_over_an_irrelevant_recent_one() {
+        let relevant_but_older = stamped_line("retry-limit", "retry body", 1_000);
+        let recent_but_irrelevant = stamped_line("unrelated-note", "unrelated body", 9_000);
+        let entries = [recent_but_irrelevant, relevant_but_older];
+        let cap = render_memory_entry(&entries[0]).len();
+        let mut relevance = HashMap::new();
+        relevance.insert((false, "retry-limit".to_string()), 40);
+
+        let (selected, omitted) =
+            select_memory_within_cap_relevance_ranked(&entries, cap, &relevance);
+        assert_eq!(
+            selected.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["retry-limit"],
+            "the relevant entry must win despite being older"
+        );
+        assert_eq!(omitted, 1);
+
+        // Determinism (issue #760's own acceptance criterion): repeating the
+        // identical call must produce the byte-identical result.
+        let (selected_again, omitted_again) =
+            select_memory_within_cap_relevance_ranked(&entries, cap, &relevance);
+        assert_eq!(selected, selected_again);
+        assert_eq!(omitted, omitted_again);
+    }
+
+    /// With NO relevance signal at all (an empty map -- every entry defaults
+    /// to score `0`), `select_memory_within_cap_relevance_ranked` must
+    /// select in the EXACT SAME order as plain `select_memory_within_cap`:
+    /// this is the "no signal, behave exactly like today" contract issue
+    /// #760 requires for cache stability, proven here as one function being
+    /// a strict refinement of the other rather than two independent
+    /// implementations that merely happen to agree today.
+    #[test]
+    fn relevance_ranked_selection_with_no_signal_matches_the_pure_recency_baseline() {
+        let entries = [
+            stamped_line("oldest", "body-oldest", 1_000),
+            stamped_line("older", "body-older", 2_000),
+            stamped_line("newer", "body-newer", 3_000),
+            stamped_line("newest", "body-newest", 4_000),
+        ];
+        let one = render_memory_entry(&entries[0]).len();
+        let cap = one * 2 + 2;
+
+        let baseline = select_memory_within_cap(&entries, cap);
+        let ranked = select_memory_within_cap_relevance_ranked(&entries, cap, &HashMap::new());
+        assert_eq!(ranked, baseline);
     }
 
     /// An entry bigger than the whole cap must still deliver something --

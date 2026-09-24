@@ -1135,7 +1135,16 @@ fn run_dash_branch(
             proxy_layer,
             task,
         )?;
-        dash::run_dashboard(cfg, repo, env, state, pane, None, force_pace)
+        // Issue #753: marks the first pane as proxy-decided (see
+        // `adapters::PROXY_DECIDED_ENV`); every other key reads through.
+        let proxied = |key: &str| {
+            if proxy_layer.is_some() && key == super::adapters::PROXY_DECIDED_ENV {
+                Some("1".to_string())
+            } else {
+                env(key)
+            }
+        };
+        dash::run_dashboard(cfg, repo, &proxied, state, pane, None, force_pace)
     })
 }
 
@@ -2789,7 +2798,7 @@ mod tests {
             )
             .expect("skill fixture");
         }
-        let entries = super::super::prompt::skill_index_entries(tmp.path(), Some(&home))
+        let entries = super::super::prompt::skill_index_entries(tmp.path(), Some(&home), false)
             .expect("skill entries");
         let adapter = ClaudeAdapter::new(Some("/nonexistent/fake-claude"));
         let task = "Fix the CSS frontend layout";
@@ -2819,6 +2828,13 @@ mod tests {
                 super::super::jev::tests::one_shot_server(200, Box::leak(body.into_boxed_str()));
             let mut cfg = CtxConfig::default();
             cfg.jev.context = true;
+            // Issue #755: this test's own `entries` above are computed
+            // unfiltered (`false`) and asserted against verbatim below, so
+            // the real launch must see the identical, unfiltered entry
+            // list -- unrelated to what this test is about (Jev-driven
+            // optional-description selection, not the repo-signal family
+            // filter).
+            cfg.prompt.skill_index_repo_filter = false;
             cfg.proxy.typesafe.base_url = url;
             cfg.proxy.typesafe.credential_env = credential_env.into();
             let state = StateDir::from_root(tmp.path().join(format!("state-{case}")));
@@ -2864,6 +2880,11 @@ mod tests {
         assert!(second_late.contains(&descriptions[1].1));
 
         let mut baseline_cfg = CtxConfig::default();
+        // Issue #755: keep the family filter off here too, so this baseline
+        // (jev disabled) differs from `delivered` only in the jev-driven
+        // optional-description trim this test is actually about, not also
+        // in family-filtered skill-index byte count.
+        baseline_cfg.prompt.skill_index_repo_filter = false;
         baseline_cfg.proxy.typesafe.credential_env = credential_env.into();
         let baseline_state = StateDir::from_root(tmp.path().join("state-baseline"));
         let baseline = dash_orchestrator_pane_with_task(

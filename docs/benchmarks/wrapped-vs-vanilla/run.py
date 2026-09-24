@@ -3,13 +3,31 @@
 the zirv proxy / Jev intake layer) wrapping claude.
 
 Conditions:
-  vanilla     -- claude -p directly, prompt on stdin.
-  zirv        -- zirv ctx exec --agent claude --prompt <prompt> -- ...
-  zirv-proxy  -- runs `zirv ctx proxy --json <prompt>` first (headless
-                 `zirv ctx exec` skips the `zirv chat` Jev intake step), maps
-                 the decided seat_tier to a claude model, optionally starts a
-                 workflow, prepends a `[zirv proxy]` layer to the prompt, then
-                 launches exactly like `zirv`.
+  vanilla        -- claude -p directly, prompt on stdin.
+  zirv           -- zirv ctx exec --agent claude --prompt <prompt> -- ...
+  zirv-proxy     -- runs `zirv ctx proxy --json <prompt>` first (headless
+                     `zirv ctx exec` skips the `zirv chat` Jev intake step),
+                     maps the decided seat_tier to a claude model, optionally
+                     starts a workflow, prepends a `[zirv proxy]` layer to the
+                     prompt, then launches exactly like `zirv`.
+  zirv-jev-full  -- identical to zirv-proxy (same proxy call, same launch),
+                     with every `[jev]` advisory gate (issue #537's site
+                     list: memory, supervisor, dispatch, review, gates,
+                     context, intake_savings, review_reuse, harvest_screen,
+                     admin_dispatch) turned on via `ZIRV_CTX_JEV_*` env vars
+                     for the proxy call, the workflow start, and the exec
+                     launch alike -- see `jev.rs`/`config.rs` for the gate
+                     list. Isolates every advisory site's combined effect
+                     beyond zirv-proxy's own model/seat/workflow routing.
+  zirv-jev-<gate> -- same as zirv-jev-full but with only that one `[jev]`
+                     gate on, e.g. zirv-jev-memory, zirv-jev-dispatch. Cheap
+                     per-gate ablations for deciding which gates earn
+                     default-on status (issue #758).
+
+Every `zirv-jev-*` condition needs a Jev credential (`TYPESAFE_API_KEY` by
+default) exported in the environment this script runs in, same as
+zirv-proxy -- gate env vars alone never make an advisory site active,
+`jev::available` also has to see the credential.
 
 See CONTRACT.md in this directory for the full spec. stdlib only (3.11).
 """
@@ -32,12 +50,48 @@ PYTHON_EXE = r"C:\Python311\python.exe"
 GIT_EXE = r"C:\Program Files\Git\cmd\git.exe"
 TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
 DEFAULT_TIMEOUT_MIN = 20
-CANONICAL_CONDS = ["vanilla", "zirv", "zirv-proxy"]
+
+# Issue #758: every `[jev]` advisory gate (config.rs::JevConfig / jev.rs),
+# named the same as the config key -- `ZIRV_CTX_JEV_<KEY.upper()>` is the
+# env var mechanism config.rs's REPO_FORBIDDEN table already reserves for
+# the operator to set these from outside a repo checkout (see config.rs
+# around "ZIRV_CTX_JEV_MEMORY" etc.).
+JEV_GATE_KEYS = [
+    "memory", "supervisor", "dispatch", "review", "gates", "context",
+    "intake_savings", "review_reuse", "harvest_screen", "admin_dispatch",
+]
+JEV_FULL_COND = "zirv-jev-full"
+JEV_GATE_CONDS = [f"zirv-jev-{g}" for g in JEV_GATE_KEYS]
+JEV_ABLATION_CONDS = [JEV_FULL_COND] + JEV_GATE_CONDS
+# zirv-jev-full/zirv-jev-<gate> launch exactly like zirv-proxy: a
+# `zirv ctx proxy --json` call first, then the same `zirv ctx exec` shape.
+JEV_PROXY_LIKE_CONDS = {"zirv-proxy", *JEV_ABLATION_CONDS}
+
+CANONICAL_CONDS = ["vanilla", "zirv", "zirv-proxy", *JEV_ABLATION_CONDS]
 JUDGE_DISALLOWED = "Write,Edit,Bash,NotebookEdit,Read,Glob,Grep,Agent,WebFetch,WebSearch"
 SEAT_MODEL_MAP = {"cheap": "haiku", "standard": "sonnet", "frontier": "opus"}
 PROXY_CALL_TIMEOUT_S = 120
 WORKFLOW_START_TIMEOUT_S = 60
 PROXY_COST_PER_INPUT_TOKEN = 0.042 / 1_000_000
+
+
+def jev_env_var(gate_key):
+    return "ZIRV_CTX_JEV_" + gate_key.upper()
+
+
+def jev_gate_env_for(cond):
+    """The `ZIRV_CTX_JEV_*` env additions a condition's subprocesses need:
+    every gate for `zirv-jev-full`, one gate for `zirv-jev-<gate>`, nothing
+    for every other condition (including plain `zirv-proxy`, which must stay
+    byte-identical to today -- no gate on means every `[jev]`-gated site's
+    deterministic path runs same as always, see jev.rs::advise_detailed).
+    """
+    if cond == JEV_FULL_COND:
+        return {jev_env_var(g): "true" for g in JEV_GATE_KEYS}
+    if cond in JEV_GATE_CONDS:
+        gate = cond[len("zirv-jev-"):]
+        return {jev_env_var(gate): "true"}
+    return {}
 
 # The launching shell's PATH can be mangled (mixed `:`/`;` separators); give every
 # child -- and therefore both conditions equally -- one clean Windows PATH.
@@ -136,9 +190,11 @@ def build_argv(cond, model, prompt_text):
         settings = json.dumps({"disableAllHooks": True}, separators=(",", ":"))
         return [CLAUDE_EXE, "-p", "--output-format", "json", "--model", model,
                 "--settings", settings]
-    elif cond in ("zirv", "zirv-proxy"):
-        # zirv-proxy launches exactly like zirv: same shape, different
-        # (proxy-decided) model and a prompt with the proxy layer prepended.
+    elif cond == "zirv" or cond in JEV_PROXY_LIKE_CONDS:
+        # zirv-proxy and every zirv-jev-* condition launch exactly like zirv:
+        # same shape, different (proxy-decided) model and a prompt with the
+        # proxy layer prepended. Which `[jev]` gates are on is carried by the
+        # subprocess environment (see jev_gate_env_for), never argv.
         return [zirv_exe(), "ctx", "exec", "--agent", "claude", "--prompt", prompt_text,
                 "--", "--output-format", "json", "--model", model]
     else:
@@ -168,8 +224,15 @@ def kill_tree(pid):
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path):
+def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path, env_extra=None):
     argv = build_argv(cond, model, prompt_text)
+    # env_extra carries the ZIRV_CTX_JEV_* gate vars for a zirv-jev-* run
+    # (jev_gate_env_for); {} for every other condition, so the child
+    # inherits this process's own environment unchanged, same as before
+    # issue #758. Built per-call, never via os.environ mutation: do_one_run
+    # runs inside a thread pool with interleaved conditions, and mutating
+    # the shared process environment would race across threads.
+    env = {**os.environ, **env_extra} if env_extra else None
     stdout_f = open(stdout_path, "wb")
     stderr_f = open(stderr_path, "wb")
     stdin_f = None
@@ -177,10 +240,10 @@ def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path)
         if cond == "vanilla":
             stdin_f = open(prompt_path, "rb")
             proc = subprocess.Popen(argv, cwd=str(cwd), stdin=stdin_f,
-                                     stdout=stdout_f, stderr=stderr_f)
+                                     stdout=stdout_f, stderr=stderr_f, env=env)
         else:
             proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
-                                     stdout=stdout_f, stderr=stderr_f)
+                                     stdout=stdout_f, stderr=stderr_f, env=env)
     except Exception:
         stdout_f.close()
         stderr_f.close()
@@ -367,12 +430,13 @@ def default_proxy_meta():
     }
 
 
-def call_proxy(repo_dir, prompt_text, timeout_s):
+def call_proxy(repo_dir, prompt_text, timeout_s, env_extra=None):
     """Run `zirv ctx proxy --json <prompt>`. Returns (obj, elapsed_s, error_note, raw_stdout)."""
     argv = [zirv_exe(), "ctx", "proxy", "--json", prompt_text]
+    env = {**os.environ, **env_extra} if env_extra else None
     t0 = time.time()
     try:
-        proc = subprocess.run(argv, cwd=str(repo_dir), capture_output=True, timeout=timeout_s)
+        proc = subprocess.run(argv, cwd=str(repo_dir), capture_output=True, timeout=timeout_s, env=env)
     except subprocess.TimeoutExpired:
         return None, time.time() - t0, "proxy call timed out", ""
     except Exception as e:
@@ -386,14 +450,15 @@ def call_proxy(repo_dir, prompt_text, timeout_s):
     return obj, elapsed, None, stdout_text
 
 
-def start_workflow(repo_dir, workflow, prompt_text, complexity, risk):
+def start_workflow(repo_dir, workflow, prompt_text, complexity, risk, env_extra=None):
     """Run `zirv workflow start <workflow> ...`. Returns (started, note, elapsed_s)."""
     argv = [zirv_exe(), "workflow", "start", workflow, "--task", prompt_text,
             "--repo", str(repo_dir), "--complexity", str(complexity), "--risk", str(risk)]
+    env = {**os.environ, **env_extra} if env_extra else None
     t0 = time.time()
     try:
         proc = subprocess.run(argv, cwd=str(repo_dir), capture_output=True,
-                               timeout=WORKFLOW_START_TIMEOUT_S)
+                               timeout=WORKFLOW_START_TIMEOUT_S, env=env)
     except subprocess.TimeoutExpired:
         return False, "workflow start timed out", time.time() - t0
     except Exception as e:
@@ -497,10 +562,16 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
     model_used = model
     prompt_for_launch = prompt_text
     remaining_budget = timeout_s
+    # Issue #758: zirv-jev-full/zirv-jev-<gate> set these on top of the
+    # already-empty {} every other condition gets; threaded through the
+    # proxy call, the workflow start, and the final launch below so a gate
+    # is on for the whole run, not just part of it.
+    env_extra = jev_gate_env_for(cond)
 
-    if cond == "zirv-proxy":
+    if cond in JEV_PROXY_LIKE_CONDS:
         proxy_obj, proxy_elapsed, proxy_err, _raw = call_proxy(
-            repo_dir, prompt_text, timeout_s=min(PROXY_CALL_TIMEOUT_S, timeout_s))
+            repo_dir, prompt_text, timeout_s=min(PROXY_CALL_TIMEOUT_S, timeout_s),
+            env_extra=env_extra)
         if proxy_obj is None:
             result["proxy"]["wall_s"] = proxy_elapsed
             result["wall_s"] = time.time() - start
@@ -533,7 +604,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
             complexity = proxy_obj.get("complexity")
             risk = proxy_obj.get("risk")
             workflow_started, workflow_note, workflow_elapsed = start_workflow(
-                repo_dir, workflow, prompt_text, complexity, risk)
+                repo_dir, workflow, prompt_text, complexity, risk, env_extra=env_extra)
 
         layer_text = build_proxy_layer(proxy_obj, model_used)
         prompt_for_launch = layer_text + "\n\n" + prompt_text
@@ -566,7 +637,8 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
     timed_out = False
     try:
         proc, argv, stdout_f, stderr_f, stdin_f = launch(
-            cond, model_used, prompt_for_launch, prompt_path, repo_dir, stdout_path, stderr_path)
+            cond, model_used, prompt_for_launch, prompt_path, repo_dir, stdout_path, stderr_path,
+            env_extra=env_extra)
         try:
             exit_code = proc.wait(timeout=remaining_budget)
         except subprocess.TimeoutExpired:
@@ -660,7 +732,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", required=True, help="'all' or comma-separated task ids")
     ap.add_argument("--conds", required=True,
-                     help="comma-separated subset of vanilla,zirv,zirv-proxy")
+                     help="comma-separated subset of " + ",".join(CANONICAL_CONDS))
     ap.add_argument("--reps", type=int, required=True)
     ap.add_argument("--model", required=True,
                      help="model for vanilla/zirv; ignored for zirv-proxy (seat_tier decides)")
@@ -712,14 +784,17 @@ def main():
                     prompt_text = read_text(task_dir / "prompt.txt")
                 except Exception:
                     prompt_text = "<PROMPT>"
-                if cond == "zirv-proxy":
-                    print("\nFirst zirv-proxy argv (model is decided at run time by the "
+                if cond in JEV_PROXY_LIKE_CONDS:
+                    print(f"\nFirst {cond} argv (model is decided at run time by the "
                           "proxy's seat_tier; shown here WITHOUT calling the proxy):")
                     argv = build_argv(cond, "<seat-tier-mapped-model>", prompt_text)
                 else:
                     print(f"\nFirst {cond} argv:")
                     argv = build_argv(cond, args.model, prompt_text)
                 print("  " + " ".join(repr(a) for a in argv))
+                env_extra = jev_gate_env_for(cond)
+                if env_extra:
+                    print("  env additions: " + ", ".join(f"{k}={v}" for k, v in sorted(env_extra.items())))
                 shown.add(cond)
         return
 

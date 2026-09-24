@@ -653,6 +653,18 @@ pub fn run_remember_with<W: Write>(
         // yet.
         paths: Vec::new(),
     };
+    // Issue #773: same pre-write duplicate/near-duplicate check `zirv ctx
+    // remember` runs, reused here (`memory::duplicate_write_warning`) so
+    // the two remember surfaces never drift on when they warn.
+    let duplicate_warning = memory::duplicate_write_warning(
+        "zirv memory remember",
+        scope,
+        repo,
+        &state,
+        &slug,
+        &cfg,
+        &entry,
+    );
     // Review round 2, finding 1: `--if-unchanged` needs the check and the
     // write under the SAME held bank lock (else a second writer could land
     // in between), so that path takes the lock itself and calls
@@ -682,6 +694,9 @@ pub fn run_remember_with<W: Write>(
     } else {
         memory::upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)?
     };
+    if let Some(warning) = duplicate_warning {
+        eprintln!("{warning}");
+    }
     let label = scope_label(scope);
     writeln!(
         w,

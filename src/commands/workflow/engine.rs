@@ -3009,6 +3009,9 @@ pub fn advance_with_evidence(
             &super::telemetry::TelemetryConfig::for_repo(&state.repo),
         );
     }
+    // Issue #757: `advance` only runs from `Running`, so a terminal status
+    // here is always a fresh transition -- exactly one outcome row.
+    let _ = super::outcomes::record_terminal(state_dir, &state);
     if outcome == StepOutcome::Success {
         try_auto_spawn(state_dir, &state);
     }
@@ -3069,6 +3072,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
             WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
         );
         save(state_dir, &state, active)?;
+        let _ = super::outcomes::record_terminal(state_dir, &state);
 
         let mut event = super::telemetry::TelemetryEvent::new(
             super::telemetry::TelemetryKind::ArtifactAccepted,
@@ -3288,6 +3292,7 @@ fn finish_close(
     state.closed_at = Some(now);
     state.updated_at = now;
     save_inactive_if_active(state_dir, &state)?;
+    let _ = super::outcomes::record_terminal(state_dir, &state);
 
     let mut event = super::telemetry::TelemetryEvent::new(super::telemetry::TelemetryKind::Closed);
     event.workflow_id = Some(state.id.clone());
@@ -3429,6 +3434,7 @@ pub fn reclassify(
         WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
     );
     save(state_dir, &state, active)?;
+    let _ = super::outcomes::record_terminal(state_dir, &state);
     Ok(state)
 }
 
@@ -3737,6 +3743,9 @@ pub enum WorkflowSubcommand {
     Maintain(super::maintain::MaintainArgs),
     /// Aggregate privacy-conscious local workflow telemetry.
     Stats(super::telemetry::StatsArgs),
+    /// Read-only: aggregate recorded workflow outcomes and propose one-step
+    /// heavier/lighter routing per bucket (issue #757). Never changes config.
+    Calibrate(super::outcomes::CalibrateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -5215,6 +5224,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         WorkflowSubcommand::Stats(args) => {
             return super::telemetry::run_stats(args, writer);
+        }
+        WorkflowSubcommand::Calibrate(args) => {
+            return super::outcomes::run_calibrate(args, writer);
         }
     }
     Ok(0)
@@ -10853,6 +10865,50 @@ mod tests {
             ),
             "{events:?}"
         );
+    }
+
+    /// Issue #757: a terminal transition appends exactly one metadata-only
+    /// outcome row; a refused second close appends nothing.
+    #[test]
+    fn a_terminal_transition_appends_exactly_one_outcome_row() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "secret task text".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &state, true).unwrap();
+        assert!(super::super::outcomes::read_all(&state_dir).is_empty());
+
+        let closed = close(&state_dir, state, Some("abandoned".into())).unwrap();
+        assert!(close(&state_dir, closed.clone(), None).is_err());
+
+        let dir = state_dir.logs().join(super::super::outcomes::OUTCOMES_DIR);
+        let lines: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .flat_map(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains("secret task text"), "{}", lines[0]);
+        let row: super::super::outcomes::OutcomeRow = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(row.workflow_id, closed.id);
+        assert_eq!(row.pack, "feature");
+        assert_eq!(row.terminal, WorkflowStatus::Closed);
+        assert_eq!(row.complexity, closed.classification.complexity);
+        assert_eq!(row.review_rounds, 0);
+        assert_eq!(row.verification_first_attempt, None);
     }
 
     #[test]

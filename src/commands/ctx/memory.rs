@@ -124,6 +124,70 @@ pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> 
     })
 }
 
+/// Issue #773: the most `duplicate_write_warning` will ever compare a new
+/// entry's body against on a single `remember` -- an uncapped `list_scoped`
+/// read plus a Jaccard comparison against every OTHER entry in the bank made
+/// every write's cost grow linearly with a bank that only ever grows. Capped
+/// to this many of the MOST RECENTLY WRITTEN other entries (`read_entries`
+/// sorts oldest-first by filename, so this keeps the tail of that list)
+/// rather than an arbitrary subset, since a near-duplicate of something
+/// remembered moments ago is the case this warning most needs to catch. A
+/// near-duplicate of an entry older than the window is simply never flagged
+/// -- an acceptable trade for a soft nudge, never a correctness guarantee.
+const DUPLICATE_CHECK_MAX_ENTRIES: usize = 200;
+
+/// Issue #773: the one-line stderr warning `zirv ctx remember`/`zirv memory
+/// remember` print when a new entry's body is an exact or near duplicate of
+/// one already in the same bank -- `zirv memory optimize`'s own duplicate/
+/// near-duplicate detectors otherwise only ever run when an operator
+/// remembers to invoke it manually. Reads the bank's OTHER existing entries
+/// (the key about to be written excluded, so an in-place update of the same
+/// key is never flagged against itself) through the same scope-aware
+/// `list_scoped` every other read in this module uses, so a disabled scope
+/// or an unreadable directory reads as "nothing to compare against" --
+/// `None`, never a hard error over a write that already succeeded or is
+/// about to. Capped to at most `DUPLICATE_CHECK_MAX_ENTRIES` (the most
+/// recently written) so this stays cheap for a bank that has grown large --
+/// see that constant's doc comment. The session tier has no scope-generic
+/// listing (`upsert_scoped`'s own `Session` doc comment) and is skipped
+/// outright: ephemeral, per-session notes are not the durable-bank
+/// duplication this exists to catch. `pub(super)`, the same cross-module
+/// reuse `truncation_warning` above gets, since `memory_cli.rs`'s own
+/// `--shared` handler needs it too. Never blocks or alters the write --
+/// `memory_optimize::duplicate_keys_for` does the actual comparison and this
+/// only formats its result.
+pub(super) fn duplicate_write_warning(
+    command: &str,
+    scope: MemoryScope,
+    repo: &Path,
+    state: &StateDir,
+    slug: &str,
+    cfg: &CtxConfig,
+    entry: &Entry,
+) -> Option<String> {
+    if scope == MemoryScope::Session {
+        return None;
+    }
+    let mut existing: Vec<(String, String)> = list_scoped(scope, repo, state, slug, cfg)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, other)| other.key != entry.key)
+        .map(|(_, other)| (other.key, other.body))
+        .collect();
+    if existing.len() > DUPLICATE_CHECK_MAX_ENTRIES {
+        existing = existing.split_off(existing.len() - DUPLICATE_CHECK_MAX_ENTRIES);
+    }
+    let hits = super::memory_optimize::duplicate_keys_for(&entry.body, &existing);
+    if hits.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{command}: '{}' looks like a duplicate or near-duplicate of existing key(s): {}",
+        entry.key,
+        hits.join(", ")
+    ))
+}
+
 fn cap_body(entry: &Entry, cap: usize) -> Entry {
     let mut entry = entry.clone();
     if entry.body.len() > cap {
@@ -2943,19 +3007,28 @@ pub fn filter_durable_candidates(
 /// it either way); 0.5 dropped a true positive.
 pub(crate) const MEMORY_RELEVANCE_FLOOR: f64 = 0.3;
 
-const HARVEST_ADVISE_SUMMARY_MAX_BYTES: usize = 300;
-
+/// Bounded numeric-only metadata state (issue #759's re-projection onto the
+/// `jev::safe_metadata_request` egress boundary issue #746 established):
+/// one fact row per candidate the keyword filter already accepted, in the
+/// same order as `accepted` -- `[content size bucket 0-4, durable-fact-
+/// shape line count, duplicate ratio per mille against existing memory]`.
+/// Never the candidate's own key or body -- computed with the same
+/// `harvest_screen_size_bucket`/`harvest_screen_durable_shape_count`/
+/// `harvest_screen_duplicate_permille` helpers `jev_harvest_prescreen`
+/// already uses on this same candidate text, so the two never drift on
+/// what those numbers mean.
 #[derive(Debug, Serialize)]
-struct HarvestAdviseCandidate<'a> {
-    id: &'a str,
-    key: &'a str,
-    summary: String,
+struct HarvestGateState {
+    _zirv_metadata_only: bool,
+    facts: Vec<Vec<u32>>,
 }
 
-#[derive(Debug, Serialize)]
-struct HarvestAdviseState<'a> {
-    candidates: Vec<HarvestAdviseCandidate<'a>>,
-}
+/// Static instructions naming the facts row order above -- see
+/// [`HarvestGateState`]'s own doc comment.
+const HARVEST_GATE_INSTRUCTIONS: &str = "Facts row N (0-based; id cN) is [content size bucket \
+    0-4, durable-fact-shape line count, duplicate ratio per mille against existing memory]. \
+    Based only on these counts, is this candidate a durable fact a future session cannot \
+    derive from the code or git history, rather than transient narration or a status update?";
 
 /// Issue #537 (A3): re-examines candidates the keyword filter
 /// (`filter_durable_candidates`) already accepted, with one BATCHED Jev
@@ -2973,41 +3046,61 @@ struct HarvestAdviseState<'a> {
 /// fallback below. Best-effort like every other `[jev]`-gated site: the gate
 /// being off, no credential, or any transport/parse error for the WHOLE call
 /// leaves `accepted` completely untouched (`jev::advise`'s own contract).
+///
+/// Issue #759: since issue #746's `jev::safe_metadata_request` egress
+/// boundary, the free-text state this used to send (each candidate's own
+/// key and a truncated body summary) was rejected before any cache read or
+/// network call -- this gate's own `[jev] memory` key was a dead deny-only
+/// fallback end to end, as its own now-replaced `..._rejects_text_state_
+/// without_egress` test documented. Re-projected onto the `_zirv_metadata_
+/// only`/`facts` contract every other `[jev]`-gated site uses; distinct
+/// from (and not superseded by) `jev_harvest_prescreen`'s own `harvest_
+/// screen` gate, which only ever decides whether to run the distiller AT
+/// ALL, before any candidate exists -- this gate re-examines the
+/// candidates the keyword filter already produced, one at a time.
 fn apply_jev_harvest_gate(
     accepted: Vec<(String, String)>,
     cfg: &CtxConfig,
     state: &StateDir,
+    repo: &Path,
+    slug: &str,
     now: u64,
 ) -> Vec<(String, String)> {
     if accepted.is_empty() {
         return accepted;
     }
-    let ids: Vec<String> = (0..accepted.len()).map(|i| i.to_string()).collect();
-    let candidates: Vec<HarvestAdviseCandidate> = accepted
+    let ids: Vec<String> = (0..accepted.len()).map(|i| format!("c{i}")).collect();
+    let existing = load_all_scopes(repo, state, slug, cfg);
+    let facts: Vec<Vec<u32>> = accepted
         .iter()
-        .zip(&ids)
-        .map(|((key, body), id)| HarvestAdviseCandidate {
-            id,
-            key: key.as_str(),
-            summary: crate::utils::truncate_bytes(
-                body.clone(),
-                Some(HARVEST_ADVISE_SUMMARY_MAX_BYTES),
-            ),
+        .map(|(_, body)| {
+            let lines: Vec<String> = body
+                .lines()
+                .map(normalize_for_dedup)
+                .filter(|line| !line.is_empty())
+                .collect();
+            vec![
+                harvest_screen_size_bucket(body.len()),
+                harvest_screen_durable_shape_count(&lines),
+                harvest_screen_duplicate_permille(&lines, &existing),
+            ]
         })
         .collect();
     let questions: Vec<jev::Question> = ids
         .iter()
         .map(|id| {
-            jev::Question::noul(
+            jev::Question::metadata_noul(
                 id,
-                "Is this a durable fact a future session cannot derive from the code or git \
-                 history, rather than transient narration or a status update?",
+                HARVEST_GATE_INSTRUCTIONS,
                 "yes, a durable fact",
                 "no, transient narration or a status update",
             )
         })
         .collect();
-    let advise_state = HarvestAdviseState { candidates };
+    let advise_state = HarvestGateState {
+        _zirv_metadata_only: true,
+        facts,
+    };
     let Some(answers) = jev::advise(
         cfg,
         state,
@@ -3526,7 +3619,7 @@ fn harvest_durable_with_tool_errors(
     // output with one batched Jev advisory call when `[jev] memory` is on;
     // a byte-identical pass-through otherwise (`apply_jev_harvest_gate`'s
     // own doc comment).
-    let accepted = apply_jev_harvest_gate(accepted, cfg, state, now_secs());
+    let accepted = apply_jev_harvest_gate(accepted, cfg, state, repo, slug, now_secs());
     let written = write_durable(repo, state, slug, &accepted, cfg, now_secs())?;
     // Issue #87: a one-line summary on the `zirv ▸` channel every time a
     // harvest actually ran (this function is the single choke point every
@@ -4383,6 +4476,20 @@ pub fn run_remember_with<W: Write>(
                 // exists to set it yet.
                 paths: Vec::new(),
             };
+            // Issue #773: computed before the write (see `duplicate_write_
+            // warning`'s own doc comment for why the key about to be
+            // written is excluded from the comparison), printed right
+            // after so it lands ahead of the success line below rather
+            // than being lost above it.
+            let duplicate_warning = duplicate_write_warning(
+                "zirv ctx remember",
+                scope,
+                repo,
+                &state,
+                &slug,
+                &cfg,
+                &entry,
+            );
             // Review round 2, finding 1: every write acquires this bank's
             // lock now. `--if-unchanged` needs the check and the write
             // under the SAME held lock (else a second writer could land in
@@ -4452,6 +4559,9 @@ pub fn run_remember_with<W: Write>(
                 upsert_scoped(scope, repo, &state, &slug, &cfg, &entry)
             }
             .map_err(|e| format!("zirv ctx remember: {e}"))?;
+            if let Some(warning) = duplicate_warning {
+                eprintln!("{warning}");
+            }
             writeln!(
                 w,
                 "zirv ctx remember: stored '{}' in the {bank_label} bank at {}{session_fallback_note}",
@@ -4842,6 +4952,219 @@ mod tests {
         assert!(warning.contains("zirv ctx remember"), "{warning}");
         assert!(warning.contains("600"), "{warning}");
         assert!(warning.contains("512"), "{warning}");
+    }
+
+    fn dedup_test_entry(key: &str, body: &str, written: u64) -> Entry {
+        Entry {
+            key: key.to_string(),
+            written_by: "claude".to_string(),
+            written,
+            verified: written,
+            source: "explicit".to_string(),
+            body: body.to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// Issue #773: `duplicate_write_warning` must name an existing key when
+    /// the new entry's body is a near-duplicate of one already in the same
+    /// bank (Jaccard word overlap at or above `memory_optimize::
+    /// NEAR_DUPLICATE_THRESHOLD`, the exact detector `zirv memory optimize`
+    /// itself uses), and must never fire against the entry's OWN key (an
+    /// in-place update is not a duplicate of itself).
+    #[test]
+    fn duplicate_write_warning_names_an_existing_near_duplicate_key() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        remember(
+            &state,
+            slug,
+            &dedup_test_entry(
+                "retry-limit",
+                "The retry limit is always three attempts before giving up on the request.",
+                1_700_000_000,
+            ),
+            &cfg,
+        )
+        .expect("remember existing");
+
+        let new_entry = dedup_test_entry(
+            "max-retries",
+            "The retry limit is always three attempts before giving up on the call.",
+            1_700_000_100,
+        );
+        let warning = duplicate_write_warning(
+            "zirv ctx remember",
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            slug,
+            &cfg,
+            &new_entry,
+        )
+        .expect("a near-duplicate body must warn");
+        assert!(warning.contains("max-retries"), "got {warning}");
+        assert!(warning.contains("retry-limit"), "got {warning}");
+
+        // Re-remembering the SAME key with the SAME body (an ordinary
+        // in-place update) must never warn against itself.
+        assert_eq!(
+            duplicate_write_warning(
+                "zirv ctx remember",
+                MemoryScope::Private,
+                repo.path(),
+                &state,
+                slug,
+                &cfg,
+                &dedup_test_entry(
+                    "retry-limit",
+                    "The retry limit is always three attempts before giving up on the request.",
+                    1_700_000_200,
+                ),
+            ),
+            None,
+            "an entry never counts as its own duplicate"
+        );
+    }
+
+    /// A body unrelated to anything already stored must never warn.
+    #[test]
+    fn duplicate_write_warning_is_none_for_a_distinct_body() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        remember(
+            &state,
+            slug,
+            &dedup_test_entry(
+                "retry-limit",
+                "The retry limit is three attempts.",
+                1_700_000_000,
+            ),
+            &cfg,
+        )
+        .expect("remember existing");
+
+        let new_entry = dedup_test_entry(
+            "deploy-window",
+            "Deploys only happen between 09:00 and 17:00 UTC on weekdays.",
+            1_700_000_100,
+        );
+        assert_eq!(
+            duplicate_write_warning(
+                "zirv ctx remember",
+                MemoryScope::Private,
+                repo.path(),
+                &state,
+                slug,
+                &cfg,
+                &new_entry,
+            ),
+            None
+        );
+    }
+
+    /// Issue #773: `duplicate_write_warning` must never compare against an
+    /// entry older than `DUPLICATE_CHECK_MAX_ENTRIES` other entries -- an
+    /// exact-duplicate body planted as the OLDEST file, with
+    /// `DUPLICATE_CHECK_MAX_ENTRIES` distinct, unrelated entries written
+    /// after it, must not be flagged, while the exact same body planted as
+    /// one of the most recent entries must be. Files are written directly
+    /// (bypassing `remember`, which would prune the bank down to
+    /// `cfg.memory.max_entries` long before this many accumulated) so the
+    /// bank actually holds more than the cap.
+    #[test]
+    fn duplicate_write_warning_never_compares_past_the_recency_cap() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        let dir = MemoryScope::Private
+            .dir(repo.path(), &state, slug)
+            .expect("private dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let target_body = "The retry limit is always three attempts before giving up.";
+        let base_written = 1_700_000_000u64;
+
+        // The oldest file in the bank: an EXACT duplicate of the body we'll
+        // later probe with. On its own this would always warn; it must stop
+        // warning once it has aged out past the cap.
+        let oldest = dedup_test_entry("old-duplicate", target_body, base_written);
+        std::fs::write(
+            dir.join(format!("{:010}-old-duplicate.md", base_written)),
+            oldest.to_markdown(),
+        )
+        .expect("write oldest");
+
+        // Exactly DUPLICATE_CHECK_MAX_ENTRIES unrelated, non-matching
+        // entries written after it -- enough to push the oldest file
+        // entirely outside the compare window.
+        for i in 0..DUPLICATE_CHECK_MAX_ENTRIES as u64 {
+            let entry = dedup_test_entry(
+                &format!("filler-{i}"),
+                &format!("Unrelated filler note number {i} about nothing in particular."),
+                base_written + 1 + i,
+            );
+            std::fs::write(
+                dir.join(format!("{:010}-filler-{i}.md", base_written + 1 + i)),
+                entry.to_markdown(),
+            )
+            .expect("write filler");
+        }
+
+        let probe = dedup_test_entry(
+            "new-probe",
+            target_body,
+            base_written + 1 + DUPLICATE_CHECK_MAX_ENTRIES as u64,
+        );
+        assert_eq!(
+            duplicate_write_warning(
+                "zirv ctx remember",
+                MemoryScope::Private,
+                repo.path(),
+                &state,
+                slug,
+                &cfg,
+                &probe,
+            ),
+            None,
+            "an exact duplicate older than the recency cap must not be compared"
+        );
+
+        // Now plant the same exact-duplicate body as the MOST RECENT filler
+        // entry instead (well within the cap) -- it must be flagged.
+        let recent_duplicate = dedup_test_entry(
+            "recent-duplicate",
+            target_body,
+            base_written + DUPLICATE_CHECK_MAX_ENTRIES as u64,
+        );
+        std::fs::write(
+            dir.join(format!(
+                "{:010}-recent-duplicate.md",
+                base_written + DUPLICATE_CHECK_MAX_ENTRIES as u64
+            )),
+            recent_duplicate.to_markdown(),
+        )
+        .expect("write recent duplicate");
+
+        let warning = duplicate_write_warning(
+            "zirv ctx remember",
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            slug,
+            &cfg,
+            &probe,
+        )
+        .expect("a duplicate within the recency cap must warn");
+        assert!(warning.contains("recent-duplicate"), "got {warning}");
     }
 
     // N2: the header block ends at the first blank line. Before this, a
@@ -7058,36 +7381,69 @@ This is part of the body too.\n";
 
     // Issue #537 (A3): `apply_jev_harvest_gate` tests.
 
-    /// A legacy harvest candidate body is free-form text. The shared
-    /// privacy boundary refuses that state even with gate and key present;
-    /// the keyword filter still drops its own rejection and the accepted
-    /// candidates remain unchanged, with no Jev cache, record, or HTTP.
+    /// Issue #759: since issue #746's `jev::safe_metadata_request` egress
+    /// boundary, the free-text state this used to send (each candidate's
+    /// own key and body) was rejected before any cache read or network
+    /// call -- the old version of this test (`..._rejects_text_state_
+    /// without_egress`) proved exactly that rejection, which made this
+    /// gate's own `[jev] memory` key a dead deny-only fallback end to end.
+    /// This is the success path re-projecting onto metadata-only facts
+    /// makes reachable: a decisive below-floor noul answer for one
+    /// candidate prunes it, a decisive above-floor answer for the other
+    /// keeps it, and the request actually reaching this fake server (the
+    /// `.join()` below, plus the recorded decision line) is what proves the
+    /// request `apply_jev_harvest_gate` builds passes `safe_metadata_
+    /// request` -- an unsafe state returns `UnsafeState` before any
+    /// connection is ever opened (`jev::ask`'s own doc comment).
     #[test]
-    fn apply_jev_harvest_gate_rejects_text_state_without_egress() {
-        let raw = vec![
+    fn apply_jev_harvest_gate_enabled_prunes_a_decisive_rejection() {
+        let accepted = vec![
             (
-                "noisy-status".to_string(),
-                "still need to wire this up".to_string(),
+                "fact-a".to_string(),
+                "a fact that Jev will reject".to_string(),
             ),
-            ("good-fact".to_string(), "a durable fact".to_string()),
+            (
+                "fact-b".to_string(),
+                "a fact that Jev will keep".to_string(),
+            ),
         ];
-        let accepted = filter_durable_candidates(&raw, &CtxConfig::default());
-        assert_eq!(accepted.len(), 1);
-        let credential_env = "MEMORY_TEST_HARVEST_PRIVACY_746";
+        let body = r#"{"model": "jev-latest", "answers": {
+            "c0": {"type": "noul", "noul": 0.05},
+            "c1": {"type": "noul", "noul": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "MEMORY_TEST_HARVEST_GATE_METADATA_759";
         // SAFETY (test-only): this test owns a unique env variable name.
         unsafe { std::env::set_var(credential_env, "secret") };
         let mut cfg = CtxConfig::default();
         cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = "http://127.0.0.1:9".into();
+        cfg.proxy.typesafe.base_url = url;
         cfg.proxy.typesafe.credential_env = credential_env.into();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        let repo = crate::commands::ctx::testenv::repo();
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let gated = apply_jev_harvest_gate(accepted.clone(), &cfg, &state, now_secs());
+        let gated = apply_jev_harvest_gate(
+            accepted.clone(),
+            &cfg,
+            &state,
+            repo.path(),
+            "-work-repo",
+            now_secs(),
+        );
+
         unsafe { std::env::remove_var(credential_env) };
-        assert_eq!(gated, accepted);
-        assert!(!state.root().join("jev-decisions.jsonl").exists());
-        assert!(!state.root().join("jev-cache").exists());
+        handle.join().expect("server thread must not panic");
+        assert_eq!(
+            gated,
+            vec![(
+                "fact-b".to_string(),
+                "a fact that Jev will keep".to_string()
+            )],
+            "the decisively-rejected candidate is pruned, the decisively-kept one survives: {gated:?}"
+        );
+        assert!(state.root().join("jev-decisions.jsonl").exists());
     }
 
     /// With the gate off, `apply_jev_harvest_gate` never even attempts a
@@ -7100,10 +7456,18 @@ This is part of the body too.\n";
             "good-fact".to_string(),
             "a genuinely durable fact".to_string(),
         )];
+        let repo = crate::commands::ctx::testenv::repo();
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let gated = apply_jev_harvest_gate(accepted.clone(), &cfg, &state, now_secs());
+        let gated = apply_jev_harvest_gate(
+            accepted.clone(),
+            &cfg,
+            &state,
+            repo.path(),
+            "-work-repo",
+            now_secs(),
+        );
 
         assert_eq!(gated, accepted);
     }

@@ -121,6 +121,14 @@ pub struct NativePolicy {
     /// turn automatic compaction off for work done in it, never turn an
     /// operator's `advisory` back on.
     pub compaction: Option<CompactionPolicy>,
+    /// Issue #756: whether the Anthropic Messages adapter requests
+    /// server-side context editing (`clear_tool_uses_20250919`) on native
+    /// sessions. `None` (the default) means enabled -- long tool-heavy
+    /// sessions should shed stale tool results before they exhaust context.
+    /// The third key a repository layer may set, and like `compaction` it
+    /// may only NARROW: a checkout can turn context editing off, never turn
+    /// an operator's `false` back on.
+    pub context_editing: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +180,14 @@ impl NativeConfig {
                             Some(repo_compaction),
                         ));
                     }
+                    if let Some(repo_context_editing) = repo_cfg.policy.context_editing {
+                        // Narrow-only AND fold: a repo `false` always wins,
+                        // and a repo `true` can never overturn an operator
+                        // `false`.
+                        config.policy.context_editing = Some(
+                            config.policy.context_editing.unwrap_or(true) && repo_context_editing,
+                        );
+                    }
                     if let Some(repo_allowed) = repo_cfg.policy.allowed_routes {
                         let operator_allowed = config
                             .policy
@@ -210,6 +226,14 @@ impl NativeConfig {
     /// session survives a long task, so the safe default is that it happens.
     pub fn compaction_policy(&self) -> CompactionPolicy {
         self.policy.compaction.unwrap_or_default()
+    }
+
+    /// Issue #756: resolved context-editing policy, after any repository
+    /// narrowing. Absent configuration is enabled -- the safe default is
+    /// that a long native session sheds stale tool results before it runs
+    /// out of context.
+    pub fn context_editing_enabled(&self) -> bool {
+        self.policy.context_editing.unwrap_or(true)
     }
 
     pub fn account_pool(&self, id: &AccountId) -> BillingPoolId {
@@ -616,11 +640,16 @@ fn reject_untrusted_keys(table: &toml::Table, path: &Path) -> CtxResult<()> {
             "policy" => {
                 if let Some(policy) = value.as_table() {
                     for policy_key in policy.keys() {
-                        // The only two keys a checkout may state, and both
-                        // only ever narrow: `allowed_routes` is intersected
-                        // with the operator's set, `compaction` can turn
-                        // automatic compaction off but never back on.
-                        if policy_key != "allowed_routes" && policy_key != "compaction" {
+                        // The only three keys a checkout may state, and all
+                        // three only ever narrow: `allowed_routes` is
+                        // intersected with the operator's set, `compaction`
+                        // can turn automatic compaction off but never back
+                        // on, and `context_editing` can turn context editing
+                        // off but never back on.
+                        if policy_key != "allowed_routes"
+                            && policy_key != "compaction"
+                            && policy_key != "context_editing"
+                        {
                             return Err(repo_forbidden(path, &format!("policy.{policy_key}")));
                         }
                     }
@@ -844,6 +873,48 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(cfg.compaction_policy(), expected);
+        }
+    }
+
+    /// Issue #756: `policy.context_editing` is the third key a checkout may
+    /// set, and like `compaction` it only ever narrows -- a repository
+    /// asking for `true` cannot turn an operator's `false` back on, and the
+    /// unset default resolves to enabled.
+    #[test]
+    fn a_repository_may_narrow_context_editing_but_never_widen_it() {
+        let operator = "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n\
+                        [route.a]\naccount='work'\nmodel='haiku'\n";
+        for (operator_policy, repo_policy, expected) in [
+            ("", "", true),
+            ("", "context_editing=false\n", false),
+            (
+                "[policy]\ncontext_editing=false\n",
+                "context_editing=true\n",
+                false,
+            ),
+            (
+                "[policy]\ncontext_editing=true\n",
+                "context_editing=true\n",
+                true,
+            ),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let _home = HomeGuard::set(home.path());
+            let repo = repo();
+            write(
+                &NativeConfig::operator_path(home.path()),
+                &format!("{operator}{operator_policy}"),
+            );
+            if !repo_policy.is_empty() {
+                write(
+                    &NativeConfig::repo_path(repo.path()),
+                    &format!("schema=1\n[policy]\n{repo_policy}"),
+                );
+            }
+            let cfg = NativeConfig::load(home.path(), repo.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(cfg.context_editing_enabled(), expected);
         }
     }
 

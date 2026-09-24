@@ -11394,6 +11394,14 @@ fn run_dashboard_inner(
     // Issues #328/#334: which seat role this pane runs as, for the same
     // guard -- unlike `seat_model_env`, unconditional for every role.
     turn_env.extend(super::adapters::seat_role_env(first.role));
+    // Issue #753: `chat::run_dash_branch` answers this key for a
+    // proxy-decided launch; the first pane's hook then skips intake.
+    if env(super::adapters::PROXY_DECIDED_ENV).as_deref() == Some("1") {
+        turn_env.push((
+            super::adapters::PROXY_DECIDED_ENV.to_string(),
+            "1".to_string(),
+        ));
+    }
     // Issue #358 (task 5): the seat's fencing generation, so a session an
     // automatic rollover later supersedes refuses to keep coordinating
     // (`seat::fence`). The seat itself is registered by `Pane::spawn` below,

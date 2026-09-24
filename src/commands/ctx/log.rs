@@ -415,7 +415,7 @@ pub fn append_safety(state: &StateDir, decision: &SafetyDecision<'_>) -> CtxResu
     let mut file = super::state::open_private_append(&path)?;
     writeln!(file, "{}", serde_json::to_string(decision)?)?;
     drop(file);
-    prune_safety_buckets(&dir, day);
+    prune_day_buckets(&dir, day, SAFETY_DECISION_RETENTION_DAYS);
     Ok(())
 }
 
@@ -424,8 +424,11 @@ pub fn append_safety(state: &StateDir, decision: &SafetyDecision<'_>) -> CtxResu
 /// a zero-padded day number is left alone (an operator's own file in there
 /// is not ours to delete), and a failed unlink is ignored rather than
 /// failing the append that a hook depends on.
-fn prune_safety_buckets(dir: &std::path::Path, newest_day: u64) {
-    let cutoff = newest_day.saturating_sub(SAFETY_DECISION_RETENTION_DAYS);
+/// Drops every `{day:010}.jsonl` bucket in `dir` older than `retention_days`
+/// before `newest_day`. Shared by the safety log and the workflow outcome log
+/// (issue #757), the two daily-bucketed jsonl logs.
+pub(crate) fn prune_day_buckets(dir: &std::path::Path, newest_day: u64, retention_days: u64) {
+    let cutoff = newest_day.saturating_sub(retention_days);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

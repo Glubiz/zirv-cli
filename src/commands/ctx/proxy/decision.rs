@@ -381,6 +381,14 @@ fn truncate_bytes(text: &str, max: usize) -> String {
 /// paths and so stay at their text-only/no-signal defaults here -- `zirv ctx
 /// proxy` decides BEFORE any code exists to measure, not after.
 pub fn classify_request(request: &str) -> Classification {
+    try_classify_request(request)
+        .expect("task truncated below classify's own byte limit; classify() cannot fail here")
+}
+
+/// [`classify_request`] without its `expect`, for a caller that must never
+/// panic (issue #753: the `UserPromptSubmit` hook's intake discipline, where
+/// any failure means "inject nothing"). Pure CPU on the request text.
+pub fn try_classify_request(request: &str) -> Option<Classification> {
     let task = truncate_bytes(request, CLASSIFY_TASK_MAX_BYTES);
     let mut classification = classify::classify(&classify::ClassificationInput {
         task,
@@ -391,7 +399,7 @@ pub fn classify_request(request: &str) -> Classification {
         complexity_override: None,
         risk_override: None,
     })
-    .expect("task truncated below classify's own byte limit; classify() cannot fail here");
+    .ok()?;
     classification.reasons.push(
         "classification: request text only; repository diff not measured at intake".to_string(),
     );
@@ -409,7 +417,7 @@ pub fn classify_request(request: &str) -> Classification {
         ));
     }
     classification.reasons.sort();
-    classification
+    Some(classification)
 }
 
 /// A long or enumerated request describes several requirements; never
