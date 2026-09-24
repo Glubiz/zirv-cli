@@ -2148,7 +2148,8 @@ impl AdminOp {
                 super::status::run_with(&args, &mut out, repo, env, false).ok()?;
             }
             AdminOp::JevStatus => {
-                super::jev::status(cfg, &mut out).ok()?;
+                let state = StateDir::resolve(env).ok()?;
+                super::jev::status(cfg, &state, &mut out).ok()?;
             }
             AdminOp::Inbox => {
                 let args = super::mail::InboxArgs {

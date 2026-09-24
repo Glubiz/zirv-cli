@@ -1067,6 +1067,180 @@ pub(crate) fn record_effect(
     }
 }
 
+/// How far back [`usage_rollup`] looks when folding `jev-decisions.jsonl`
+/// and `jev-effects.jsonl` into a per-site usage summary for `zirv ctx jev
+/// status`: the last 7 days. A wall-clock window is chosen over an N-rows
+/// cap because both logs are low-volume, best-effort advisory telemetry
+/// (one line per gated call or observed effect, not a hot-path log) --
+/// "usage this week" is what an operator deciding whether a gate earns its
+/// keep actually wants, and it doesn't depend on how busy the week was.
+const ROLLUP_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The subset of a `jev-decisions.jsonl` line (see [`DecisionRecord`])
+/// [`usage_rollup`] needs. Fields it doesn't list (`answers`, `usage`, the
+/// fallback reason text) are simply ignored by `serde_json` -- this is
+/// never `deny_unknown_fields`.
+#[derive(Debug, Deserialize)]
+struct DecisionRollupRow {
+    site: String,
+    ts: u64,
+    wall_ms: u64,
+    #[serde(default)]
+    cached: bool,
+    #[serde(default)]
+    fallbacks: Vec<String>,
+}
+
+/// The subset of a `jev-effects.jsonl` line (see [`EffectRecord`])
+/// [`usage_rollup`] needs.
+#[derive(Debug, Deserialize)]
+struct EffectRollupRow {
+    site: String,
+    ts: u64,
+    #[serde(default)]
+    removed_bytes: Option<u64>,
+}
+
+/// One site's folded usage over the rollup window: call volume, cache-hit
+/// rate and latency from `jev-decisions.jsonl` (every site that went
+/// through the shared [`ask`] client), plus observed-effect volume and
+/// bytes removed from `jev-effects.jsonl` (every site that recorded a
+/// [`JevEffect`]). The grouping key is the log's own `site` field, which is
+/// finer-grained than a `[jev]` config gate in a few places (`context` gates
+/// both `context-parent-reports` and `context-skill-descriptions`;
+/// `supervisor` gates `crash`, `judge` and `handoff`) -- grouping by site
+/// rather than by a hand-maintained site-to-gate table means a new call
+/// site shows up here automatically instead of silently going uncounted. A
+/// site that appears in only one of the two logs (e.g. `admin_dispatch`,
+/// which records an effect without ever calling `ask`) simply leaves the
+/// other half at its zero/`None` default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub(crate) struct JevSiteUsage {
+    pub calls: u64,
+    pub cache_hit_rate: Option<f64>,
+    pub wall_ms_p50: Option<u64>,
+    pub wall_ms_p95: Option<u64>,
+    pub errors: u64,
+    pub effect_rows: u64,
+    pub removed_bytes: u64,
+}
+
+#[derive(Default)]
+struct JevSiteUsageBuilder {
+    calls: u64,
+    cache_hits: u64,
+    errors: u64,
+    wall_ms_samples: Vec<u64>,
+    effect_rows: u64,
+    removed_bytes: u64,
+}
+
+impl JevSiteUsageBuilder {
+    fn finish(mut self) -> JevSiteUsage {
+        self.wall_ms_samples.sort_unstable();
+        JevSiteUsage {
+            calls: self.calls,
+            cache_hit_rate: if self.calls > 0 {
+                Some(self.cache_hits as f64 / self.calls as f64)
+            } else {
+                None
+            },
+            wall_ms_p50: percentile(&self.wall_ms_samples, 0.50),
+            wall_ms_p95: percentile(&self.wall_ms_samples, 0.95),
+            errors: self.errors,
+            effect_rows: self.effect_rows,
+            removed_bytes: self.removed_bytes,
+        }
+    }
+}
+
+/// Nearest-rank percentile over an already-sorted slice. `None` for an empty
+/// slice rather than a misleading `0`, so a site with zero decision rows
+/// renders as "no data" instead of "instant".
+fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = (((sorted.len() - 1) as f64) * pct).round() as usize;
+    Some(sorted[idx.min(sorted.len() - 1)])
+}
+
+/// Folds `<state>/jev-decisions.jsonl` and `<state>/jev-effects.jsonl` into
+/// a per-site [`JevSiteUsage`] map over [`ROLLUP_WINDOW_SECS`]. Read-only
+/// and best-effort: a missing file contributes nothing -- never an error --
+/// and a line that isn't valid JSON or doesn't match the expected shape is
+/// skipped rather than aborting the fold, since both logs are appended to
+/// by several call sites with no cross-process locking (see [`record`]/
+/// [`record_effect`]'s own doc comments), so a torn last line is expected,
+/// not exceptional. Must stay fast: `zirv ctx jev status` is a read-only
+/// diagnostic and this is the only I/O it does beyond loading config.
+pub(crate) fn usage_rollup(state: &StateDir) -> BTreeMap<String, JevSiteUsage> {
+    let now = state::now_secs();
+    let cutoff = now.saturating_sub(ROLLUP_WINDOW_SECS);
+    let mut builders: BTreeMap<String, JevSiteUsageBuilder> = BTreeMap::new();
+
+    if let Ok(text) = std::fs::read_to_string(state.root().join(JEV_DECISIONS_FILE)) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(row) = serde_json::from_str::<DecisionRollupRow>(line) else {
+                continue;
+            };
+            if row.ts < cutoff {
+                continue;
+            }
+            let entry = builders.entry(row.site).or_default();
+            entry.calls += 1;
+            if row.cached {
+                entry.cache_hits += 1;
+            }
+            if !row.fallbacks.is_empty() {
+                entry.errors += 1;
+            }
+            entry.wall_ms_samples.push(row.wall_ms);
+        }
+    }
+
+    if let Ok(text) = std::fs::read_to_string(state.root().join(JEV_EFFECTS_FILE)) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(row) = serde_json::from_str::<EffectRollupRow>(line) else {
+                continue;
+            };
+            if row.ts < cutoff {
+                continue;
+            }
+            let entry = builders.entry(row.site).or_default();
+            entry.effect_rows += 1;
+            entry.removed_bytes += row.removed_bytes.unwrap_or(0);
+        }
+    }
+
+    builders
+        .into_iter()
+        .map(|(site, builder)| (site, builder.finish()))
+        .collect()
+}
+
+fn fmt_rate(rate: Option<f64>) -> String {
+    match rate {
+        Some(r) => format!("{:.0}%", r * 100.0),
+        None => "n/a".to_string(),
+    }
+}
+
+fn fmt_ms(ms: Option<u64>) -> String {
+    match ms {
+        Some(v) => format!("{v}ms"),
+        None => "n/a".to_string(),
+    }
+}
+
 pub(crate) enum AdvisoryStatus {
     Disabled,
     MissingCredential,
@@ -1209,61 +1383,76 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
                 None => std::env::current_dir()?,
             };
             let cfg = CtxConfig::load(&resolved_repo, &|key| std::env::var(key).ok())?;
+            let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
 
             if *json {
-                let gates = [
-                    ("memory", cfg.jev.memory),
-                    ("supervisor", cfg.jev.supervisor),
-                    ("dispatch", cfg.jev.dispatch),
-                    ("review", cfg.jev.review),
-                    ("gates", cfg.jev.gates),
-                    ("context", cfg.jev.context),
-                    ("intake_savings", cfg.jev.intake_savings),
-                    ("review_reuse", cfg.jev.review_reuse),
-                    ("harvest_screen", cfg.jev.harvest_screen),
-                    ("admin_dispatch", cfg.jev.admin_dispatch),
-                ];
-                let any_gate_on = gates.iter().any(|(_, on)| *on);
-                let cred_present = available(&cfg.proxy.typesafe);
-                let cred_env = &cfg.proxy.typesafe.credential_env;
-
-                let verdict = if any_gate_on && cred_present {
-                    "active"
-                } else if any_gate_on && !cred_present {
-                    "inactive_credential_missing"
-                } else if !any_gate_on && cred_present {
-                    "inactive_no_gate"
-                } else {
-                    "inactive_both"
-                };
-
-                let json_output = serde_json::json!({
-                    "gates": {
-                        "memory": cfg.jev.memory,
-                        "supervisor": cfg.jev.supervisor,
-                        "dispatch": cfg.jev.dispatch,
-                        "review": cfg.jev.review,
-                        "gates": cfg.jev.gates,
-                        "context": cfg.jev.context,
-                        "intake_savings": cfg.jev.intake_savings,
-                        "review_reuse": cfg.jev.review_reuse,
-                        "harvest_screen": cfg.jev.harvest_screen,
-                        "admin_dispatch": cfg.jev.admin_dispatch,
-                    },
-                    "credential_env": cred_env,
-                    "credential_present": cred_present,
-                    "endpoint": cfg.proxy.typesafe.base_url,
-                    "model": cfg.proxy.typesafe.model,
-                    "status": verdict,
-                });
+                let rollup = usage_rollup(&state);
+                let json_output = status_json(&cfg, &rollup);
                 writeln!(writer, "{}", serde_json::to_string_pretty(&json_output)?)?;
                 Ok(0)
             } else {
-                status(&cfg, writer)?;
+                status(&cfg, &state, writer)?;
                 Ok(0)
             }
         }
     }
+}
+
+/// Builds the `--json` payload for [`run_jev`]'s `Status` subcommand: the
+/// same gates/credential/endpoint/verdict shape as before, plus a `usage`
+/// object carrying [`usage_rollup`]'s window and its per-site map. Factored
+/// out of `run_jev` so a test can assert its shape without going through
+/// `CtxConfig::load`/`StateDir::resolve`'s real filesystem and env lookups.
+fn status_json(cfg: &CtxConfig, rollup: &BTreeMap<String, JevSiteUsage>) -> serde_json::Value {
+    let gates = [
+        ("memory", cfg.jev.memory),
+        ("supervisor", cfg.jev.supervisor),
+        ("dispatch", cfg.jev.dispatch),
+        ("review", cfg.jev.review),
+        ("gates", cfg.jev.gates),
+        ("context", cfg.jev.context),
+        ("intake_savings", cfg.jev.intake_savings),
+        ("review_reuse", cfg.jev.review_reuse),
+        ("harvest_screen", cfg.jev.harvest_screen),
+        ("admin_dispatch", cfg.jev.admin_dispatch),
+    ];
+    let any_gate_on = gates.iter().any(|(_, on)| *on);
+    let cred_present = available(&cfg.proxy.typesafe);
+    let cred_env = &cfg.proxy.typesafe.credential_env;
+
+    let verdict = if any_gate_on && cred_present {
+        "active"
+    } else if any_gate_on && !cred_present {
+        "inactive_credential_missing"
+    } else if !any_gate_on && cred_present {
+        "inactive_no_gate"
+    } else {
+        "inactive_both"
+    };
+
+    serde_json::json!({
+        "gates": {
+            "memory": cfg.jev.memory,
+            "supervisor": cfg.jev.supervisor,
+            "dispatch": cfg.jev.dispatch,
+            "review": cfg.jev.review,
+            "gates": cfg.jev.gates,
+            "context": cfg.jev.context,
+            "intake_savings": cfg.jev.intake_savings,
+            "review_reuse": cfg.jev.review_reuse,
+            "harvest_screen": cfg.jev.harvest_screen,
+            "admin_dispatch": cfg.jev.admin_dispatch,
+        },
+        "credential_env": cred_env,
+        "credential_present": cred_present,
+        "endpoint": cfg.proxy.typesafe.base_url,
+        "model": cfg.proxy.typesafe.model,
+        "status": verdict,
+        "usage": {
+            "window_days": ROLLUP_WINDOW_SECS / 86_400,
+            "sites": rollup,
+        },
+    })
 }
 
 /// Prints a read-only status report of whether Jev is enabled and why or why
@@ -1272,8 +1461,14 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
 /// a one-line verdict. Never makes a network call, never reads the credential
 /// value, never writes config or creates directories. The output format
 /// matches the style of `zirv ctx capabilities` (available/unavailable lines
-/// with diagnosis underneath).
-pub fn status(cfg: &CtxConfig, writer: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
+/// with diagnosis underneath), followed by a [`usage_rollup`] section so an
+/// operator can see call volume, cache-hit rate, latency and effect size per
+/// site without a separate command.
+pub fn status(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    writer: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::fmt::Write as FmtWrite;
 
     // Determine if any gate is on
@@ -1352,6 +1547,30 @@ pub fn status(cfg: &CtxConfig, writer: &mut impl Write) -> Result<(), Box<dyn st
     if !diagnosis.is_empty() {
         for line in diagnosis.trim().lines() {
             writeln!(writer, "              {}", line)?;
+        }
+    }
+
+    // Print the usage rollup
+    let rollup = usage_rollup(state);
+    let window_days = ROLLUP_WINDOW_SECS / 86_400;
+    writeln!(writer)?;
+    writeln!(writer, "usage (last {window_days}d)")?;
+    if rollup.is_empty() {
+        writeln!(writer, "  (no calls or effects recorded)")?;
+    } else {
+        for (site, usage) in &rollup {
+            writeln!(
+                writer,
+                "  {:<30} calls={:<5} cache_hit={:<6} wall_p50={:<8} wall_p95={:<8} errors={:<4} effects={:<5} removed_bytes={}",
+                site,
+                usage.calls,
+                fmt_rate(usage.cache_hit_rate),
+                fmt_ms(usage.wall_ms_p50),
+                fmt_ms(usage.wall_ms_p95),
+                usage.errors,
+                usage.effect_rows,
+                usage.removed_bytes,
+            )?;
         }
     }
 
@@ -2600,7 +2819,7 @@ pub(crate) mod tests {
     #[test]
     fn credential_never_appears_in_status_output() {
         let state_dir = tempfile::tempdir().expect("tempdir");
-        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
         let mut ctx_cfg = CtxConfig::default();
         ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_CRED_SENTINEL_537".to_string();
 
@@ -2609,7 +2828,7 @@ pub(crate) mod tests {
             "sentinel-do-not-print-this-value",
             || {
                 let mut output = Vec::new();
-                let _ = status(&ctx_cfg, &mut output);
+                let _ = status(&ctx_cfg, &state, &mut output);
                 let output_str = String::from_utf8_lossy(&output);
                 assert!(
                     !output_str.contains("sentinel-do-not-print-this-value"),
@@ -2626,7 +2845,7 @@ pub(crate) mod tests {
     #[test]
     fn status_with_all_gates_off_names_both_reasons() {
         let state_dir = tempfile::tempdir().expect("tempdir");
-        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
         let mut ctx_cfg = CtxConfig::default();
         ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_BOTH_OFF".to_string();
 
@@ -2635,7 +2854,7 @@ pub(crate) mod tests {
         }
 
         let mut output = Vec::new();
-        let _ = status(&ctx_cfg, &mut output);
+        let _ = status(&ctx_cfg, &state, &mut output);
         let output_str = String::from_utf8_lossy(&output);
         assert!(
             output_str.contains("inactive"),
@@ -2650,7 +2869,7 @@ pub(crate) mod tests {
     #[test]
     fn status_with_gate_on_but_credential_missing_names_credential() {
         let state_dir = tempfile::tempdir().expect("tempdir");
-        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
         let mut ctx_cfg = CtxConfig::default();
         ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_CRED_MISSING".to_string();
         ctx_cfg.jev.memory = true;
@@ -2660,7 +2879,7 @@ pub(crate) mod tests {
         }
 
         let mut output = Vec::new();
-        let _ = status(&ctx_cfg, &mut output);
+        let _ = status(&ctx_cfg, &state, &mut output);
         let output_str = String::from_utf8_lossy(&output);
         assert!(
             output_str.contains("JEV_TEST_STATUS_CRED_MISSING"),
@@ -2675,19 +2894,129 @@ pub(crate) mod tests {
     #[test]
     fn status_with_gate_on_and_credential_present_is_active() {
         let state_dir = tempfile::tempdir().expect("tempdir");
-        let _state = StateDir::from_path(state_dir.path().to_path_buf());
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
         let mut ctx_cfg = CtxConfig::default();
         ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_ACTIVE".to_string();
         ctx_cfg.jev.memory = true;
 
         with_credential("JEV_TEST_STATUS_ACTIVE", "secret", || {
             let mut output = Vec::new();
-            let _ = status(&ctx_cfg, &mut output);
+            let _ = status(&ctx_cfg, &state, &mut output);
             let output_str = String::from_utf8_lossy(&output);
             assert!(
                 output_str.contains("active"),
                 "status should indicate active when gate is on and credential is present: {output_str}"
             );
         });
+    }
+
+    /// Issue #758: [`usage_rollup`] folds both logs, keyed by their shared
+    /// `site` field, over the rollup window.
+    #[test]
+    fn usage_rollup_folds_decisions_and_effects_per_site() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+
+        let decisions = format!(
+            "{{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":100,\"cached\":false,\"fallbacks\":[]}}\n\
+             {{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":200,\"cached\":true,\"fallbacks\":[]}}\n\
+             {{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":300,\"cached\":false,\"fallbacks\":[\"boom\"]}}\n"
+        );
+        std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
+            .expect("write decisions");
+
+        let effects = format!(
+            "{{\"ts\":{now},\"site\":\"memory\",\"action\":\"candidates_pruned\",\"removed_bytes\":500}}\n\
+             {{\"ts\":{now},\"site\":\"memory\",\"action\":\"candidates_pruned\",\"removed_bytes\":250}}\n"
+        );
+        std::fs::write(state.root().join("jev-effects.jsonl"), effects).expect("write effects");
+
+        let rollup = usage_rollup(&state);
+        let usage = rollup.get("memory").expect("memory site present");
+        assert_eq!(usage.calls, 3);
+        assert_eq!(
+            usage.errors, 1,
+            "one row carried a non-empty fallbacks list"
+        );
+        assert_eq!(usage.effect_rows, 2);
+        assert_eq!(usage.removed_bytes, 750);
+        assert_eq!(usage.wall_ms_p50, Some(200));
+        assert_eq!(usage.wall_ms_p95, Some(300));
+        let cache_hit_rate = usage.cache_hit_rate.expect("cache hit rate present");
+        assert!(
+            (cache_hit_rate - (1.0 / 3.0)).abs() < 1e-9,
+            "expected 1/3 cache hit rate, got {cache_hit_rate}"
+        );
+    }
+
+    /// Issue #758: a state dir with neither log file must roll up to empty,
+    /// never an error -- `zirv ctx jev status` is read-only diagnostics.
+    #[test]
+    fn usage_rollup_with_no_log_files_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let rollup = usage_rollup(&state);
+        assert!(
+            rollup.is_empty(),
+            "no log files should yield an empty rollup: {rollup:?}"
+        );
+    }
+
+    /// Issue #758: both logs are appended by several call sites with no
+    /// cross-process locking, so a torn/corrupt line is expected. It must be
+    /// skipped, not abort the fold or drop the well-formed rows around it.
+    #[test]
+    fn usage_rollup_skips_a_corrupt_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+        let decisions = format!(
+            "not json at all\n{{\"site\":\"dispatch\",\"ts\":{now},\"wall_ms\":50,\"cached\":false,\"fallbacks\":[]}}\n"
+        );
+        std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
+            .expect("write decisions");
+
+        let rollup = usage_rollup(&state);
+        let usage = rollup
+            .get("dispatch")
+            .expect("dispatch site present despite the corrupt line above it");
+        assert_eq!(usage.calls, 1);
+    }
+
+    /// Issue #758: the `--json` payload carries a `usage` object with the
+    /// window and the per-site rollup, alongside the existing gates/
+    /// credential/endpoint/verdict shape.
+    #[test]
+    fn status_json_includes_a_usage_section_with_the_rollup() {
+        let mut ctx_cfg = CtxConfig::default();
+        ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_JSON_USAGE".to_string();
+        ctx_cfg.jev.memory = true;
+
+        let mut rollup = BTreeMap::new();
+        rollup.insert(
+            "memory".to_string(),
+            JevSiteUsage {
+                calls: 3,
+                cache_hit_rate: Some(1.0 / 3.0),
+                wall_ms_p50: Some(200),
+                wall_ms_p95: Some(300),
+                errors: 1,
+                effect_rows: 2,
+                removed_bytes: 750,
+            },
+        );
+
+        let value = status_json(&ctx_cfg, &rollup);
+        assert_eq!(value["usage"]["window_days"], 7);
+        assert_eq!(value["usage"]["sites"]["memory"]["calls"], 3);
+        assert_eq!(value["usage"]["sites"]["memory"]["errors"], 1);
+        assert_eq!(value["usage"]["sites"]["memory"]["effect_rows"], 2);
+        assert_eq!(value["usage"]["sites"]["memory"]["removed_bytes"], 750);
+        assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p50"], 200);
+        assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p95"], 300);
+        assert!(value["gates"]["memory"].as_bool().unwrap());
     }
 }
