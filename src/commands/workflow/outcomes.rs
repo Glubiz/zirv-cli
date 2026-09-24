@@ -566,6 +566,58 @@ mod tests {
         assert_eq!(top.to, None, "already on the heaviest rung");
     }
 
+    /// Issue #757: pins the exact `<`/`<=`/`>=` choices `propose`'s threshold
+    /// comparisons use, evaluated AT the boundary value itself -- a value
+    /// comfortably inside or outside a threshold would still pass even if a
+    /// `<` here ever silently became a `<=` (or vice versa).
+    #[test]
+    fn propose_pins_exact_threshold_boundaries() {
+        // Exactly at HEAVIER_FIRST_PASS_BELOW (0.60): the comparison is a
+        // strict `<`, so a rate exactly on the floor must NOT by itself
+        // count as "low" -- with zero review rounds this must land on
+        // NoChange, never Heavier.
+        let at_heavier_floor = propose(
+            Complexity::Bounded,
+            None,
+            10,
+            Some(HEAVIER_FIRST_PASS_BELOW),
+            0.0,
+            10,
+        );
+        assert_eq!(
+            at_heavier_floor.verdict,
+            Verdict::NoChange,
+            "first-pass rate exactly at HEAVIER_FIRST_PASS_BELOW must not trigger Heavier"
+        );
+
+        // Exactly at BOTH LIGHTER_FIRST_PASS_AT_LEAST (0.95, `>=`) and
+        // LIGHTER_MEAN_REVIEW_ROUNDS_AT_MOST (0.2, `<=`): both boundaries
+        // are inclusive, so this combination must be Lighter.
+        let at_lighter_boundary = propose(
+            Complexity::Bounded,
+            None,
+            10,
+            Some(LIGHTER_FIRST_PASS_AT_LEAST),
+            LIGHTER_MEAN_REVIEW_ROUNDS_AT_MOST,
+            10,
+        );
+        assert_eq!(at_lighter_boundary.verdict, Verdict::Lighter);
+
+        // Exactly at HEAVIER_MEAN_REVIEW_ROUNDS_AT_LEAST (2.0, `>=`): the
+        // comparison is inclusive, so this alone -- with a first-pass rate
+        // far above the heavier floor, so only the rounds figure can be
+        // driving it -- must be Heavier.
+        let at_rounds_floor = propose(
+            Complexity::Bounded,
+            None,
+            10,
+            Some(1.0),
+            HEAVIER_MEAN_REVIEW_ROUNDS_AT_LEAST,
+            10,
+        );
+        assert_eq!(at_rounds_floor.verdict, Verdict::Heavier);
+    }
+
     #[test]
     fn below_the_minimum_sample_count_no_proposal_is_made() {
         let rows = many(9, Complexity::Bounded, false, 3);

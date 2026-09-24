@@ -124,6 +124,18 @@ pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> 
     })
 }
 
+/// Issue #773: the most `duplicate_write_warning` will ever compare a new
+/// entry's body against on a single `remember` -- an uncapped `list_scoped`
+/// read plus a Jaccard comparison against every OTHER entry in the bank made
+/// every write's cost grow linearly with a bank that only ever grows. Capped
+/// to this many of the MOST RECENTLY WRITTEN other entries (`read_entries`
+/// sorts oldest-first by filename, so this keeps the tail of that list)
+/// rather than an arbitrary subset, since a near-duplicate of something
+/// remembered moments ago is the case this warning most needs to catch. A
+/// near-duplicate of an entry older than the window is simply never flagged
+/// -- an acceptable trade for a soft nudge, never a correctness guarantee.
+const DUPLICATE_CHECK_MAX_ENTRIES: usize = 200;
+
 /// Issue #773: the one-line stderr warning `zirv ctx remember`/`zirv memory
 /// remember` print when a new entry's body is an exact or near duplicate of
 /// one already in the same bank -- `zirv memory optimize`'s own duplicate/
@@ -134,13 +146,16 @@ pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> 
 /// `list_scoped` every other read in this module uses, so a disabled scope
 /// or an unreadable directory reads as "nothing to compare against" --
 /// `None`, never a hard error over a write that already succeeded or is
-/// about to. The session tier has no scope-generic listing (`upsert_
-/// scoped`'s own `Session` doc comment) and is skipped outright: ephemeral,
-/// per-session notes are not the durable-bank duplication this exists to
-/// catch. `pub(super)`, the same cross-module reuse `truncation_warning`
-/// above gets, since `memory_cli.rs`'s own `--shared` handler needs it too.
-/// Never blocks or alters the write -- `memory_optimize::duplicate_keys_for`
-/// does the actual comparison and this only formats its result.
+/// about to. Capped to at most `DUPLICATE_CHECK_MAX_ENTRIES` (the most
+/// recently written) so this stays cheap for a bank that has grown large --
+/// see that constant's doc comment. The session tier has no scope-generic
+/// listing (`upsert_scoped`'s own `Session` doc comment) and is skipped
+/// outright: ephemeral, per-session notes are not the durable-bank
+/// duplication this exists to catch. `pub(super)`, the same cross-module
+/// reuse `truncation_warning` above gets, since `memory_cli.rs`'s own
+/// `--shared` handler needs it too. Never blocks or alters the write --
+/// `memory_optimize::duplicate_keys_for` does the actual comparison and this
+/// only formats its result.
 pub(super) fn duplicate_write_warning(
     command: &str,
     scope: MemoryScope,
@@ -153,12 +168,15 @@ pub(super) fn duplicate_write_warning(
     if scope == MemoryScope::Session {
         return None;
     }
-    let existing: Vec<(String, String)> = list_scoped(scope, repo, state, slug, cfg)
+    let mut existing: Vec<(String, String)> = list_scoped(scope, repo, state, slug, cfg)
         .unwrap_or_default()
         .into_iter()
         .filter(|(_, other)| other.key != entry.key)
         .map(|(_, other)| (other.key, other.body))
         .collect();
+    if existing.len() > DUPLICATE_CHECK_MAX_ENTRIES {
+        existing = existing.split_off(existing.len() - DUPLICATE_CHECK_MAX_ENTRIES);
+    }
     let hits = super::memory_optimize::duplicate_keys_for(&entry.body, &existing);
     if hits.is_empty() {
         return None;
@@ -5050,6 +5068,103 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Issue #773: `duplicate_write_warning` must never compare against an
+    /// entry older than `DUPLICATE_CHECK_MAX_ENTRIES` other entries -- an
+    /// exact-duplicate body planted as the OLDEST file, with
+    /// `DUPLICATE_CHECK_MAX_ENTRIES` distinct, unrelated entries written
+    /// after it, must not be flagged, while the exact same body planted as
+    /// one of the most recent entries must be. Files are written directly
+    /// (bypassing `remember`, which would prune the bank down to
+    /// `cfg.memory.max_entries` long before this many accumulated) so the
+    /// bank actually holds more than the cap.
+    #[test]
+    fn duplicate_write_warning_never_compares_past_the_recency_cap() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        let dir = MemoryScope::Private
+            .dir(repo.path(), &state, slug)
+            .expect("private dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let target_body = "The retry limit is always three attempts before giving up.";
+        let base_written = 1_700_000_000u64;
+
+        // The oldest file in the bank: an EXACT duplicate of the body we'll
+        // later probe with. On its own this would always warn; it must stop
+        // warning once it has aged out past the cap.
+        let oldest = dedup_test_entry("old-duplicate", target_body, base_written);
+        std::fs::write(
+            dir.join(format!("{:010}-old-duplicate.md", base_written)),
+            oldest.to_markdown(),
+        )
+        .expect("write oldest");
+
+        // Exactly DUPLICATE_CHECK_MAX_ENTRIES unrelated, non-matching
+        // entries written after it -- enough to push the oldest file
+        // entirely outside the compare window.
+        for i in 0..DUPLICATE_CHECK_MAX_ENTRIES as u64 {
+            let entry = dedup_test_entry(
+                &format!("filler-{i}"),
+                &format!("Unrelated filler note number {i} about nothing in particular."),
+                base_written + 1 + i,
+            );
+            std::fs::write(
+                dir.join(format!("{:010}-filler-{i}.md", base_written + 1 + i)),
+                entry.to_markdown(),
+            )
+            .expect("write filler");
+        }
+
+        let probe = dedup_test_entry(
+            "new-probe",
+            target_body,
+            base_written + 1 + DUPLICATE_CHECK_MAX_ENTRIES as u64,
+        );
+        assert_eq!(
+            duplicate_write_warning(
+                "zirv ctx remember",
+                MemoryScope::Private,
+                repo.path(),
+                &state,
+                slug,
+                &cfg,
+                &probe,
+            ),
+            None,
+            "an exact duplicate older than the recency cap must not be compared"
+        );
+
+        // Now plant the same exact-duplicate body as the MOST RECENT filler
+        // entry instead (well within the cap) -- it must be flagged.
+        let recent_duplicate = dedup_test_entry(
+            "recent-duplicate",
+            target_body,
+            base_written + DUPLICATE_CHECK_MAX_ENTRIES as u64,
+        );
+        std::fs::write(
+            dir.join(format!(
+                "{:010}-recent-duplicate.md",
+                base_written + DUPLICATE_CHECK_MAX_ENTRIES as u64
+            )),
+            recent_duplicate.to_markdown(),
+        )
+        .expect("write recent duplicate");
+
+        let warning = duplicate_write_warning(
+            "zirv ctx remember",
+            MemoryScope::Private,
+            repo.path(),
+            &state,
+            slug,
+            &cfg,
+            &probe,
+        )
+        .expect("a duplicate within the recency cap must warn");
+        assert!(warning.contains("recent-duplicate"), "got {warning}");
     }
 
     // N2: the header block ends at the first blank line. Before this, a

@@ -464,11 +464,21 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
                 // a request that would otherwise have succeeded. Disable it
                 // process-wide first so every adapter instance stops
                 // offering it, then retry this one request without it.
-                CONTEXT_EDITING_DISABLED.store(true, Ordering::Relaxed);
-                eprintln!(
-                    "zirv: Anthropic rejected server-side context editing (`{CONTEXT_EDITING_BETA}`); \
-                     disabling it for the rest of this process and retrying without it"
-                );
+                // `compare_exchange` (not `store`) so that when several
+                // concurrent requests each hit the 400 before any of them
+                // has flipped the flag, only the ONE that actually wins the
+                // false-to-true transition prints the diagnostic -- every
+                // other concurrent loser still disables (redundantly, but
+                // harmlessly) and retries, it just doesn't also print.
+                let this_call_disabled_it = CONTEXT_EDITING_DISABLED
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok();
+                if this_call_disabled_it {
+                    eprintln!(
+                        "zirv: Anthropic rejected server-side context editing (`{CONTEXT_EDITING_BETA}`); \
+                         disabling it for the rest of this process and retrying without it"
+                    );
+                }
                 let fallback = self.encode_request(request)?;
                 self.perform(&fallback, cancellation, sink)
             }
@@ -1354,7 +1364,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -1373,6 +1383,23 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/provider/anthropic/v1/stream-malformed-tool.sse"
     ));
+
+    /// Issue #756: the three tests below read and write the process-wide
+    /// `CONTEXT_EDITING_DISABLED` flag directly (an `AtomicBool`, with no
+    /// synchronization of its own) rather than through a fresh
+    /// per-adapter value, so two of them running concurrently under
+    /// nextest's default parallelism could observe or clobber each other's
+    /// writes. `Mutex::new(())` guards nothing but ordering: acquired for
+    /// the whole body of each such test, released at scope end. Recovers
+    /// from poison rather than propagating it, so one of these tests
+    /// panicking never wedges the other two for the rest of the run.
+    static CONTEXT_EDITING_DISABLED_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_context_editing_disabled_for_test() -> std::sync::MutexGuard<'static, ()> {
+        CONTEXT_EDITING_DISABLED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn target(base_url: String) -> ProviderTarget {
         ProviderTarget {
@@ -1903,6 +1930,7 @@ mod tests {
 
     #[test]
     fn direct_http_request_uses_messages_api_and_excludes_tool_executor_metadata() {
+        let _guard = lock_context_editing_disabled_for_test();
         CONTEXT_EDITING_DISABLED.store(false, Ordering::Relaxed);
         let (url, captured) = one_shot_server(200, STREAM, &[]);
         let adapter =
@@ -1948,6 +1976,7 @@ mod tests {
 
     #[test]
     fn context_editing_is_omitted_when_the_operator_disabled_it() {
+        let _guard = lock_context_editing_disabled_for_test();
         CONTEXT_EDITING_DISABLED.store(false, Ordering::Relaxed);
         let (url, captured) = one_shot_server(200, STREAM, &[]);
         let mut adapter =
@@ -1972,6 +2001,7 @@ mod tests {
 
     #[test]
     fn a_400_naming_context_management_falls_back_once_and_disables_it_for_the_process() {
+        let _guard = lock_context_editing_disabled_for_test();
         CONTEXT_EDITING_DISABLED.store(false, Ordering::Relaxed);
         let error_body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"context_management: unknown beta feature"},"request_id":"req_ce"}"#;
         let (url, captured) = two_shot_server((400, error_body), (200, STREAM));

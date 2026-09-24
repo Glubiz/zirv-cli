@@ -1520,7 +1520,12 @@ fn bounded_len(len: usize) -> u32 {
 /// `_zirv_metadata_only`/`facts` contract every other `[jev]`-gated site
 /// uses: five locally computed integers (see [`HandoffQualityState`]),
 /// never the handoff's own text.
-fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> bool {
+/// Issue #759: builds the exact `(state, questions)` pair [`jev_handoff_
+/// is_thin`] sends to `jev::advise` -- factored out of that function so a
+/// test can assert directly that this pair passes `jev::safe_metadata_
+/// request` (the egress boundary issue #746 established), rather than only
+/// exercising that boundary indirectly through a fake-server round-trip.
+fn handoff_quality_request(handoff: &Handoff) -> (HandoffQualityState, [jev::Question; 1]) {
     let facts = vec![vec![
         bounded_len(handoff.task.len()),
         bounded_len(handoff.next_step.len()),
@@ -1543,6 +1548,11 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
             ("adequate", "a restarted session could continue from this"),
         ],
     )];
+    (advise_state, questions)
+}
+
+fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> bool {
+    let (advise_state, questions) = handoff_quality_request(handoff);
     let Some(answers) = jev::advise(
         cfg,
         state,
@@ -2239,6 +2249,26 @@ mod tests {
         assert!(
             decisions.contains("\"site\":\"handoff\""),
             "got {decisions}"
+        );
+    }
+
+    /// Issue #759: direct proof that the exact `(state, questions)` pair
+    /// [`jev_handoff_is_thin`] builds (via [`handoff_quality_request`])
+    /// passes `jev::safe_metadata_request` -- the egress boundary issue
+    /// #746 established, and the one the test above only exercises
+    /// indirectly through a fake-server round-trip. An unsafe state never
+    /// reaches `ask` at all (`jev::JevError::UnsafeState` before any
+    /// connection opens), so this is the check that actually matters for
+    /// whether the "handoff" site is reachable rather than a dead
+    /// deny-only fallback.
+    #[test]
+    fn handoff_quality_request_passes_safe_metadata_request() {
+        let (state, questions) = handoff_quality_request(&sample());
+        let value = serde_json::to_value(&state).expect("HandoffQualityState always serializes");
+        let model = CtxConfig::default().proxy.typesafe.model;
+        assert!(
+            crate::commands::ctx::jev::safe_metadata_request(&value, &questions, &model),
+            "got state {value}"
         );
     }
 

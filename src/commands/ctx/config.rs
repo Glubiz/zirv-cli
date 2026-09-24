@@ -8390,6 +8390,34 @@ mod tests {
         }
     }
 
+    /// Issue #755: disabling the repo-signal skill-family filter widens what
+    /// every session sees (every skill family advertised again, `REPO_
+    /// FORBIDDEN`'s own entry for this key says as much) -- a repository
+    /// checkout must not be able to flip it off for itself. Mirrors
+    /// `memory_session_enabled_and_journal_max_entries_are_repo_forbidden`
+    /// right above.
+    #[test]
+    fn prompt_skill_index_repo_filter_is_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[prompt]\nskill_index_repo_filter = false\n",
+        )
+        .expect("write");
+
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to set prompt.skill_index_repo_filter");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "prompt.skill_index_repo_filter must be rejected as REPO_FORBIDDEN: {err}"
+        );
+    }
+
     /// The operator-only escape hatches for the same two keys: `~/.zirv/
     /// ctx.toml` and `ZIRV_CTX_MEMORY_SESSION`/`ZIRV_CTX_MEMORY_JOURNAL_MAX_
     /// ENTRIES` may still set them, exactly like every other `memory.*` key.

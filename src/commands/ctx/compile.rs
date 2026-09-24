@@ -1413,7 +1413,7 @@ fn native_context_path(adapter_name: &str, repo: &Path) -> Option<PathBuf> {
 /// what the caller was about to read anyway) -- passed in rather than
 /// re-read, so the two candidate files are each read from disk exactly once
 /// per compile.
-fn native_file_already_carries_canonical(
+pub(super) fn native_file_already_carries_canonical(
     adapter_name: &str,
     repo: &Path,
     cfg: &CtxConfig,

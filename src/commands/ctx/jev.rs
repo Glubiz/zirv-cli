@@ -600,7 +600,11 @@ fn encoded_request(
     Ok((payload, cache_key))
 }
 
-fn safe_metadata_request(state: &serde_json::Value, questions: &[Question], model: &str) -> bool {
+pub(super) fn safe_metadata_request(
+    state: &serde_json::Value,
+    questions: &[Question],
+    model: &str,
+) -> bool {
     let value = state;
     let Some(object) = value.as_object() else {
         return false;

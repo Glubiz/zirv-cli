@@ -359,23 +359,35 @@ fn import_one(
 /// caps it, not silently truncated to something smaller.
 const REPORT_MAX_SURFACE_BYTES: usize = 200_000;
 
-/// Issue #754: whether `native_path` is a zirv-managed file whose bytes no
-/// longer match a fresh render of the current canonical sources -- the exact
-/// condition that makes `compile.rs`'s `native_file_already_carries_
-/// canonical` return `false` and re-inject the canonical layer on top of
-/// what the native file already (almost) carries. `false` for anything that
-/// is not itself already a managed file: missing or hand-maintained is a
-/// different state, not "stale", and is `--report`'s drift/compatibility
-/// section's job to surface, not `--check`'s.
+/// Issue #754: whether `native_path` is a zirv-managed file for which
+/// compile.rs's own dedupe would NOT fire -- i.e. `--check` must call this
+/// stale in every case where `compile::native_file_already_carries_
+/// canonical` returns `false` and re-injects the canonical layer on top of
+/// what the native file already (almost) carries. Delegates the actual
+/// "would dedupe fire" proof to that same predicate (rather than
+/// re-deriving it here) so the two can never independently drift again --
+/// this was exactly issue #754: this function used to compare bytes
+/// directly and omit `native_file_already_carries_canonical`'s
+/// `would_truncate` gate (`common`/`harness` over
+/// `cfg.context.max_common_bytes`/`max_harness_bytes`), so an oversized
+/// common.md made `--check` pass while compile's real dedupe still missed
+/// and injected the layer twice. `false` for anything that is not itself
+/// already a managed file: missing or hand-maintained is a different
+/// state, not "stale", and is `--report`'s drift/compatibility section's
+/// job to surface, not `--check`'s.
 fn managed_native_is_stale(
     native_path: &Path,
+    adapter_name: &str,
+    repo: &Path,
+    cfg: &CtxConfig,
     common: Option<&str>,
     harness: Option<&str>,
 ) -> bool {
     let Ok(native_text) = fs::read_to_string(native_path) else {
         return false;
     };
-    is_managed(&native_text) && native_text != render_generated(common, harness)
+    is_managed(&native_text)
+        && !compile::native_file_already_carries_canonical(adapter_name, repo, cfg, common, harness)
 }
 
 fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
@@ -463,27 +475,39 @@ fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
     )?;
 
     // Issue #754: `--check` is a CI gate on canonical drift -- a managed
-    // native file whose bytes no longer match what `.zirv/context/` would
-    // render today. Computed unconditionally-cheap (two file reads) but only
-    // acted on (printed, folded into the exit code) when asked, so a plain
-    // `zirv context sync`/`--report` keeps its existing output and exit
-    // code exactly.
+    // native file for which compile.rs's own dedupe would not fire today
+    // (byte mismatch, or the same `would_truncate` budget gate compile.rs
+    // applies). Computed unconditionally (cheap: a config load plus a
+    // handful of file reads) but only acted on (printed, folded into the
+    // exit code) when asked, so a plain `zirv context sync`/`--report`
+    // keeps its existing output and exit code exactly.
+    let env = env_from_process();
+    let cfg = CtxConfig::load(repo, &env)?;
     let common = fs::read_to_string(context::common_path(repo)).ok();
     let mut stale_native_files: Vec<&str> = Vec::new();
-    for (label, canonical_path, native_path) in [
+    for (label, adapter_name, canonical_path, native_path) in [
         (
             "CLAUDE.md",
+            "claude",
             context::claude_path(repo),
             native_claude_path(repo),
         ),
         (
             "AGENTS.md",
+            "codex",
             context::codex_path(repo),
             native_codex_path(repo),
         ),
     ] {
         let harness = fs::read_to_string(&canonical_path).ok();
-        if managed_native_is_stale(&native_path, common.as_deref(), harness.as_deref()) {
+        if managed_native_is_stale(
+            &native_path,
+            adapter_name,
+            repo,
+            &cfg,
+            common.as_deref(),
+            harness.as_deref(),
+        ) {
             stale_native_files.push(label);
         }
     }
@@ -511,8 +535,6 @@ fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
     // never printed here; `zirv context lint` is the full report. Always at
     // the `Standard` budget profile: this report's pass/fail must match the
     // configured `ctx.toml` budgets exactly, never a `--budget`-scaled one.
-    let env = env_from_process();
-    let cfg = CtxConfig::load(repo, &env)?;
     let (layers, dedupe_leak) = gather_layers(repo, &cfg, BudgetProfile::Standard, &env);
     let lint_report = context_lint::analyze(&layers, cfg.context.lint_max_pairs, dedupe_leak);
     let blocking: Vec<&context_lint::Finding> = lint_report
@@ -2062,6 +2084,31 @@ mod tests {
         let (code, _) = run_sync(&generate_args(false), dir.path());
         assert_eq!(code, 0);
         write_canonical(dir.path(), "common.md", "updated instructions");
+
+        let (code, out) = run_sync(&check_args(), dir.path());
+        assert_eq!(code, 1, "got {out}");
+        assert!(out.contains("CLAUDE.md"), "got {out}");
+        assert!(out.contains("AGENTS.md"), "got {out}");
+    }
+
+    /// Issue #754's actual reported defect: `--generate` always writes the
+    /// FULL untruncated render (`native_file_already_carries_canonical`'s
+    /// own doc comment says as much), so once `common.md` exceeds the
+    /// default `context.max_common_bytes` (4096) budget, the native file's
+    /// bytes still match a fresh render byte-for-byte -- a plain byte
+    /// comparison (the pre-fix `managed_native_is_stale`) would call this
+    /// clean. But `compile.rs`'s real dedupe never fires here: its own
+    /// `would_truncate` gate (`common.len() > cfg.context.max_common_
+    /// bytes`) refuses to skip injecting this layer, so the canonical layer
+    /// is injected twice every session. `--check` must report this exact
+    /// case as stale.
+    #[test]
+    fn sync_check_exits_nonzero_when_common_md_exceeds_the_injection_budget() {
+        let (dir, _guard) = repo();
+        let oversized = "x".repeat(5_000);
+        write_canonical(dir.path(), "common.md", &oversized);
+        let (code, _) = run_sync(&generate_args(false), dir.path());
+        assert_eq!(code, 0);
 
         let (code, out) = run_sync(&check_args(), dir.path());
         assert_eq!(code, 1, "got {out}");
