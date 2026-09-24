@@ -206,6 +206,7 @@ means it runs on any supported OS with no provider configured at all.
 | `workflow agents` | `agents::dispatch_native_seat` (read-only seats) | `agents::dispatch_agent` + vendor CLI | a route for the `seat` role | `agents::tests::a_writable_seat_is_refused_by_the_native_dispatcher`, `agents::tests::an_unknown_dispatch_runtime_is_refused` | `unit` |
 | `workflow approve` | `engine::approve` + native `workflow_approve` tool | same zirv code | none | `engine::tests::approval_gate_must_be_explicitly_released` | `unit` |
 | `workflow artifacts` | `workflow::artifact` + native `artifact_register`/`artifact_present` tools | same zirv code | none | `engine::tests::workflow_artifact_status_reports_pending_accepted_and_drifted` | `unit` |
+| `workflow calibrate` | `workflow::outcomes` | same zirv code | none | `outcomes::tests::rule_table_yields_heavier_lighter_and_no_change`, `outcomes::tests::json_shape_is_stable` | `unit` |
 | `workflow classify` | `workflow::classify` | same zirv code | none | `classify::tests::identical_inputs_produce_identical_classification` | `unit` |
 | `workflow close` | `workflow::engine` | same zirv code | none | `engine::tests::close_succeeds_after_residual_dispositions_and_clears_active` | `unit` |
 | `workflow context` | `engine::render_current_context` + native `workflow_context` tool | same zirv code | none | `engine::tests::workflow_context_over_the_configured_cap_is_truncated_with_a_visible_marker` | `unit` |
