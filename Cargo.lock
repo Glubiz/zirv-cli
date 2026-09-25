@@ -3183,7 +3183,7 @@ checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 
 [[package]]
 name = "zirv"
-version = "4.41.0"
+version = "4.41.1"
 dependencies = [
  "cap-std",
  "chrono",
@@ -3193,7 +3193,6 @@ dependencies = [
  "dialoguer",
  "dirs",
  "flate2",
- "futures",
  "hashbrown 0.16.1",
  "libc",
  "portable-pty",
@@ -3205,7 +3204,6 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.11.0",
- "slab",
  "tar",
  "tempfile",
  "tokio",
