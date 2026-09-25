@@ -1281,7 +1281,9 @@ impl ParsedTool {
     }
 }
 
-fn non_empty(value: &str, field: &str) -> Result<(), ToolError> {
+/// Shared by every `tools` submodule; a trim-before-check caller (team.rs,
+/// delegation.rs) passes `value.trim()` in to get that behaviour.
+pub(super) fn non_empty(value: &str, field: &str) -> Result<(), ToolError> {
     if value.is_empty() {
         Err(ToolError::new(
             ToolErrorCode::InvalidArguments,
@@ -1324,8 +1326,22 @@ fn positive(value: usize, field: &str) -> Result<(), ToolError> {
     }
 }
 
-fn valid_idempotency(value: &str) -> Result<(), ToolError> {
+pub(super) fn valid_idempotency(value: &str) -> Result<(), ToolError> {
     if value.is_empty() || value.len() > 256 || value.contains('\0') {
+        Err(ToolError::new(
+            ToolErrorCode::InvalidArguments,
+            "idempotency_key must contain 1..=256 non-NUL bytes",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// [`valid_idempotency`] for callers (files.rs, process.rs) that treat a
+/// whitespace-only key as empty; length and the NUL check still apply to the
+/// untrimmed key, matching those modules' own former checks exactly.
+pub(super) fn valid_idempotency_trimmed(value: &str) -> Result<(), ToolError> {
+    if value.trim().is_empty() || value.len() > 256 || value.contains('\0') {
         Err(ToolError::new(
             ToolErrorCode::InvalidArguments,
             "idempotency_key must contain 1..=256 non-NUL bytes",

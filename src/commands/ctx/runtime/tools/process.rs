@@ -373,7 +373,7 @@ impl ProcessManager {
         launch: SandboxLaunch,
         args: &ProcessStartArgs,
     ) -> Result<ProcessSnapshot, ToolError> {
-        validate_key(&args.idempotency_key)?;
+        super::valid_idempotency_trimmed(&args.idempotency_key)?;
         if let Some(handle) = self
             .existing_for_key(&args.idempotency_key)
             .map(str::to_string)
@@ -886,17 +886,6 @@ fn infer_git_effects(program: &str, args: &[String]) -> (bool, bool) {
         || (command == "reset" && args.iter().any(|arg| arg == "--hard"))
         || (command == "branch" && args.iter().any(|arg| arg == "-D"));
     (write, destructive)
-}
-
-fn validate_key(key: &str) -> Result<(), ToolError> {
-    if key.trim().is_empty() || key.len() > 256 || key.contains('\0') {
-        Err(ToolError::new(
-            ToolErrorCode::InvalidArguments,
-            "idempotency_key must contain 1..=256 non-NUL bytes",
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn unknown(handle: &str) -> ToolError {

@@ -335,7 +335,7 @@ pub(super) fn search(
 }
 
 pub(super) fn write_file(path: &Path, args: &WriteFileArgs) -> Result<FileOutcome, ToolError> {
-    validate_key(&args.idempotency_key)?;
+    super::valid_idempotency_trimmed(&args.idempotency_key)?;
     let current = match std::fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -418,7 +418,7 @@ pub(super) fn write_file(path: &Path, args: &WriteFileArgs) -> Result<FileOutcom
 }
 
 pub(super) fn apply_patch(path: &Path, args: &ApplyPatchArgs) -> Result<FileOutcome, ToolError> {
-    validate_key(&args.idempotency_key)?;
+    super::valid_idempotency_trimmed(&args.idempotency_key)?;
     if args.expected_sha256.is_empty() || args.operations.is_empty() {
         return Err(ToolError::new(
             ToolErrorCode::InvalidArguments,
@@ -748,17 +748,6 @@ fn media_type(path: &Path, bytes: &[u8]) -> &'static str {
         "text/plain"
     } else {
         "application/octet-stream"
-    }
-}
-
-fn validate_key(key: &str) -> Result<(), ToolError> {
-    if key.trim().is_empty() || key.len() > 256 || key.contains('\0') {
-        Err(ToolError::new(
-            ToolErrorCode::InvalidArguments,
-            "idempotency_key must contain 1..=256 non-NUL bytes",
-        ))
-    } else {
-        Ok(())
     }
 }
 

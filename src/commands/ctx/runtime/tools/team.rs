@@ -137,25 +137,15 @@ pub(super) struct TeamPlanArgs {
 
 impl TeamPlanArgs {
     pub(super) fn validate(&self) -> Result<(), ToolError> {
-        non_empty(&self.objective, "objective")?;
+        super::non_empty(self.objective.trim(), "objective")?;
         if let Some(seat) = &self.seat {
-            non_empty(seat, "seat")?;
+            super::non_empty(seat.trim(), "seat")?;
         }
         if let Some(task) = &self.task {
-            non_empty(task, "task")?;
+            super::non_empty(task.trim(), "task")?;
         }
         Ok(())
     }
-}
-
-fn non_empty(value: &str, field: &str) -> Result<(), ToolError> {
-    if value.trim().is_empty() {
-        return Err(ToolError::new(
-            ToolErrorCode::InvalidArguments,
-            format!("{field} must not be empty"),
-        ));
-    }
-    Ok(())
 }
 
 /// A work group id names a FILE under the state directory
@@ -179,8 +169,8 @@ pub(super) fn validate_id(value: &str, field: &str) -> Result<(), ToolError> {
 
 impl TaskCreateArgs {
     pub(super) fn validate(&self) -> Result<(), ToolError> {
-        non_empty(&self.title, "title")?;
-        non_empty(&self.brief, "brief")?;
+        super::non_empty(self.title.trim(), "title")?;
+        super::non_empty(self.brief.trim(), "brief")?;
         for parent in &self.parents {
             validate_id(parent, "parents[]")?;
         }
@@ -188,7 +178,7 @@ impl TaskCreateArgs {
             validate_id(group, "group")?;
         }
         if let Some(role) = &self.role {
-            non_empty(role, "role")?;
+            super::non_empty(role.trim(), "role")?;
         }
         Ok(())
     }
@@ -204,7 +194,7 @@ impl TaskListArgs {
 
 impl GroupCreateArgs {
     pub(super) fn validate(&self) -> Result<(), ToolError> {
-        non_empty(&self.scope, "scope")?;
+        super::non_empty(self.scope.trim(), "scope")?;
         if self.child_limit == Some(0) {
             return Err(ToolError::new(
                 ToolErrorCode::InvalidArguments,
